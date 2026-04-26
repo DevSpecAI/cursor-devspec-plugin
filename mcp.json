@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "devspec": {
+      "url": "${DEVSPEC_API_URL}/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${DEVSPEC_MCP_TOKEN}"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "devspec-autopilot",
+  "displayName": "DevSpec Autopilot",
+  "version": "0.1.0",
+  "description": "Automatically pick up agent-ready action items from DevSpec, implement them, test them, and push to a target branch. Connects Cursor's AI agent to the DevSpec project management platform via MCP.",
+  "author": {
+    "name": "DevSpecAI",
+    "email": "hello@devspec.ai",
+    "url": "https://devspec.ai"
+  },
+  "license": "MIT",
+  "keywords": [
+    "devspec",
+    "autopilot",
+    "automation",
+    "mcp",
+    "action-items",
+    "project-management"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DevSpecAI/cursor-devspec-autopilot-plugin"
+  }
+}

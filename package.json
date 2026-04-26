@@ -1,0 +1,8 @@
+{
+  "name": "cursor-devspec-autopilot-plugin",
+  "version": "0.1.0",
+  "description": "DevSpec Autopilot plugin for Cursor",
+  "private": true,
+  "license": "MIT",
+  "author": "DevSpecAI"
+}
