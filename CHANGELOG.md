@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+### Added
+- Preflight MCP availability check in `devspec-work`, `devspec-brainstorm`, and `autopilot-process` skills. Each skill now calls `devspec__list_projects` before any other action and aborts with a clear message if the DevSpec MCP server isn't reachable from the chat thread. Prevents the silent fall-through where code shipped to staging without the action item being claimed or linked.
+- README "Troubleshooting" section covering stale chat MCP state, the most common failure mode after changing extension settings.
+
 ## 0.1.1
 
 ### Fixed

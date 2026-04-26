@@ -11,6 +11,22 @@ The DevSpec MCP server is registered as `devspec` in `mcp.json`, so all MCP tool
 
 ---
 
+## Preflight — Verify DevSpec MCP availability
+
+Before parsing the input or doing anything else, confirm the DevSpec MCP server is actually reachable from this chat:
+
+1. Call `devspec__list_projects` with no arguments.
+2. **If it succeeds**, continue to the next phase.
+3. **If the call fails, the tool is not available, or any `devspec__*` tool is missing from your tool list**, stop immediately and tell the user:
+
+   > **DevSpec MCP server is not reachable from this chat.** This usually means the chat thread was opened before the MCP server connected — for example, after editing `~/.cursor/mcp.json` or the DevSpec extension settings, or after fixing a misconfigured URL.
+   >
+   > **Fix:** Open a brand new Agent-mode chat and re-run this skill. Verify the `devspec` server shows green with all tools listed in **Cursor Settings → MCP & Integrations**.
+
+   Do **not** proceed to file edits, branch creation, or commits. Skipping this guard risks shipping code to staging without claiming the action item or recording the commit reference, which leaves the DevSpec record inconsistent with the codebase.
+
+---
+
 ## Input Parsing
 
 The user's invocation carries an **item identifier** — a full UUID, partial ID (first 8 characters), exact title, or title keywords.

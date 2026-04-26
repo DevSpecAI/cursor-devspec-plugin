@@ -63,6 +63,26 @@ After install, open the command palette (`Ctrl+Shift+P`) and start typing "DevSp
 
 This is the "v0.1" surface — clipboard copy/paste. Future versions will integrate directly with Cursor's chat agent so the skill kicks off automatically.
 
+## Troubleshooting
+
+### A skill says "DevSpec MCP server is not reachable from this chat"
+
+Cursor binds MCP tool availability at the moment a chat thread is opened. If you change the API URL or token, fix a broken MCP config, or the server reconnects after a hiccup, **chat threads opened during the broken state will not pick up the new tools** — they'll silently report no DevSpec tools available.
+
+The action-mutating skills (`devspec-work`, `devspec-brainstorm`, `autopilot-process`) preflight-check for `devspec__list_projects` and refuse to proceed when MCP is unreachable. If you see that error:
+
+1. Verify the `devspec` server is green with all tools listed in **Cursor Settings → MCP & Integrations**. If not, run **`DevSpec: Register MCP server in Cursor config`** from the command palette and restart Cursor.
+2. **Open a brand new Agent-mode chat** (not the one you were just in).
+3. Re-run the skill from the command palette.
+
+### After changing extension settings, the skill still doesn't work
+
+Same root cause — the chat thread you're in cached the old MCP state. Always start a fresh chat after changing `devspec.apiUrl` or `devspec.mcpToken`.
+
+### "Show status" works but "Work" doesn't
+
+Almost certainly a stale chat. Open a new chat. If the new chat *also* fails the preflight check, paste the chat output and check the MCP panel — there's a real connection problem, not a chat-state issue.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

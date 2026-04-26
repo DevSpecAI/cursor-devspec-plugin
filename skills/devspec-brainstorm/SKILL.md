@@ -11,6 +11,22 @@ MCP tools are the `devspec` server in this plugin's manifest; tool names are pre
 
 ---
 
+## Preflight — Verify DevSpec MCP availability
+
+Before resolving the action item, confirm the DevSpec MCP server is actually reachable from this chat:
+
+1. Call `devspec__list_projects` with no arguments.
+2. **If it succeeds**, continue to Step 1.
+3. **If the call fails, the tool is not available, or any `devspec__*` tool is missing from your tool list**, stop immediately and tell the user:
+
+   > **DevSpec MCP server is not reachable from this chat.** This usually means the chat thread was opened before the MCP server connected — for example, after editing `~/.cursor/mcp.json` or the DevSpec extension settings.
+   >
+   > **Fix:** Open a brand new Agent-mode chat and re-run this skill. Verify the `devspec` server shows green with all tools listed in **Cursor Settings → MCP & Integrations**.
+
+   Do **not** proceed to brainstorm Q&A or save any notes. Without DevSpec MCP this skill cannot persist findings.
+
+---
+
 ## Step 1 — Resolve the action item
 
 1. Extract an identifier from the user's input: a UUID, partial UUID prefix, title, or keywords. If nothing is provided, ask the user for an item name or ID.

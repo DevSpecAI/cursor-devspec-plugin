@@ -13,6 +13,22 @@ The DevSpec MCP server is registered as `devspec` in the plugin's `mcp.json`, so
 
 ---
 
+## Preflight — Verify DevSpec MCP availability
+
+Before loading settings or doing anything else, confirm the DevSpec MCP server is actually reachable from this chat:
+
+1. Call `devspec__list_projects` with no arguments.
+2. **If it succeeds**, continue to Step 0.
+3. **If the call fails, the tool is not available, or any `devspec__*` tool is missing from your tool list**, stop immediately and tell the user:
+
+   > **DevSpec MCP server is not reachable from this chat.** This usually means the chat thread was opened before the MCP server connected — for example, after editing `~/.cursor/mcp.json` or the DevSpec extension settings.
+   >
+   > **Fix:** Open a brand new Agent-mode chat and re-run this skill. Verify the `devspec` server shows green with all tools listed in **Cursor Settings → MCP & Integrations**.
+
+   Do **not** proceed to claim a work item, edit files, or commit. Skipping this guard risks shipping code to staging without claiming the action item or recording the commit reference, which leaves the DevSpec record inconsistent with the codebase.
+
+---
+
 ## Step 0 — Load Settings
 
 1. Capture the starting branch so it can be used as a merge target fallback:
