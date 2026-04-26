@@ -47,10 +47,10 @@ Settings (Cursor: `File → Preferences → Settings`, search "DevSpec"):
 
 | Setting | Default | Notes |
 |---|---|---|
-| `devspec.apiUrl` | `https://app.devspec.ai` | Use `https://staging.devspec.ai` for staging. |
-| `devspec.mcpToken` | _(empty)_ | DevSpec MCP token. Per-machine, never synced. |
+| `devspec.apiUrl` | _(empty)_ | DevSpec API URL. Prompted on first connect. Use `https://staging.devspec.ai` for staging or your production DevSpec URL. |
+| `devspec.mcpToken` | _(empty)_ | DevSpec MCP token (starts with `dvs_`). Per-machine, never synced. |
 
-When the token changes, the extension rewrites `~/.cursor/mcp.json` to point Cursor at the configured `apiUrl`. You can re-trigger registration any time with **`DevSpec: Register MCP server in Cursor config`**.
+On first activation the extension shows a "Connect now?" notification. Pick **Connect** to be walked through entering the API URL and token; the extension then writes the `devspec` server entry to `~/.cursor/mcp.json`. You can re-trigger registration any time with **`DevSpec: Register MCP server in Cursor config`**, or update the token alone with **`DevSpec: Set MCP token`**.
 
 ## Usage
 
