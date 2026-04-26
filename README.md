@@ -1,63 +1,67 @@
 # DevSpec Autopilot for Cursor
 
-Cursor IDE plugin that connects Cursor's AI agent to the [DevSpec](https://devspec.ai) project management platform via MCP. Pick up queued action items, implement them, run tests, commit with deployment-tracking metadata, and report results back — without leaving the editor.
+Cursor extension that connects Cursor's AI agent to the [DevSpec](https://devspec.ai) project management platform via MCP. Pick up queued action items, brainstorm scope, run autopilot, and ship work without leaving the editor.
 
 This is the Cursor counterpart to the [Claude Code](https://github.com/DevSpecAI/claude-code-devspec-autopilot) and [Gemini CLI](https://github.com/DevSpecAI/gemini-cli-devspec-autopilot-extension) autopilot extensions.
 
 ## What it does
 
-The plugin registers an MCP connection to your DevSpec workspace and ships five skills the agent invokes contextually:
+The extension does two things:
 
-| Skill | Purpose |
+1. **Auto-registers a DevSpec MCP server** in `~/.cursor/mcp.json` so Cursor's chat agent can call DevSpec tools (list action items, claim work, generate commit messages, link commits, etc.).
+2. **Adds five DevSpec commands** to Cursor's command palette. Each loads a curated SKILL.md prompt, optionally prompts for input (e.g. an action item title), and copies the combined prompt to the clipboard so you can paste it into Cursor chat.
+
+| Command | Purpose |
 |---|---|
-| `autopilot-process` | Fully autonomous: claims the next queued action item, implements it, tests, commits, pushes, merges, reports back. |
-| `devspec-work` | Interactive: pick up a specific item by name or ID, optional brainstorm, implement, push, report. Supports `--unattended` mode. |
-| `devspec-brainstorm` | Multi-round Q&A to explore scope, approach, edge cases, and acceptance criteria. Saves findings as implementation notes on the item. |
-| `autopilot-status` | Show queue counts, in-progress items, push/merge settings, and runner state. |
-| `autopilot-history` | Show recent autopilot runs — completed and failed items, timestamps, branches, merge status, errors. |
+| `DevSpec: Work on action item` | Pick up a specific item by name or ID, optional brainstorm, implement, push, report. |
+| `DevSpec: Brainstorm action item` | Multi-round Q&A to explore scope, approach, edge cases, acceptance criteria. |
+| `DevSpec Autopilot: Process next queued item` | Fully autonomous: claim the next queued item, implement, test, commit, push, merge, report. |
+| `DevSpec Autopilot: Show status` | Queue counts, in-progress items, push/merge settings, runner state. |
+| `DevSpec Autopilot: Show history` | Recent autopilot runs — completed and failed items, branches, merge status. |
 
 Commits include a `[devspec:<id>]` tag so DevSpec's deployment webhook can link successful deploys back to the action item.
 
 ## Installation
 
-1. Install the plugin in Cursor (marketplace listing forthcoming — for now, clone this repo and install via Cursor's local plugin loader).
-2. Set the following environment variables in your shell or Cursor settings:
+### From VSIX (recommended for clients today)
 
-   ```bash
-   DEVSPEC_API_URL=https://app.devspec.ai
-   DEVSPEC_MCP_TOKEN=<your DevSpec MCP token>
-   ```
+1. Download the latest `devspec-autopilot.vsix` from the [Releases](https://github.com/DevSpecAI/cursor-devspec-plugin/releases) page.
+2. In Cursor: `Ctrl+Shift+P` → **Extensions: Install from VSIX…** → select the file.
+3. After install, run the command **`DevSpec: Set MCP token`** and paste a token generated in your DevSpec project's **Settings → Integrations** page.
+4. Restart Cursor so the new MCP server is loaded.
 
-   Generate a token from your DevSpec workspace settings.
+### From source
 
-3. Restart Cursor. The `devspec` MCP server should connect automatically — verify in Cursor's MCP panel.
+```bash
+git clone https://github.com/DevSpecAI/cursor-devspec-plugin.git
+cd cursor-devspec-plugin
+npm install
+npm run package      # produces devspec-autopilot.vsix
+```
 
-## Usage
-
-Invoke skills naturally in Cursor's agent chat:
-
-- **"Process the next autopilot item"** → runs `autopilot-process`
-- **"Work on the OAuth login bug"** → runs `devspec-work` with that title
-- **"Brainstorm the rate-limiting feature"** → runs `devspec-brainstorm`
-- **"What's the autopilot queue look like?"** → runs `autopilot-status`
-- **"Show recent autopilot history"** → runs `autopilot-history`
+Then install the VSIX as above.
 
 ## Configuration
 
-`mcp.json` declares the DevSpec MCP server. Environment variables interpolate at runtime:
+Settings (Cursor: `File → Preferences → Settings`, search "DevSpec"):
 
-```json
-{
-  "mcpServers": {
-    "devspec": {
-      "url": "${DEVSPEC_API_URL}/api/mcp",
-      "headers": {
-        "Authorization": "Bearer ${DEVSPEC_MCP_TOKEN}"
-      }
-    }
-  }
-}
-```
+| Setting | Default | Notes |
+|---|---|---|
+| `devspec.apiUrl` | `https://app.devspec.ai` | Use `https://staging.devspec.ai` for staging. |
+| `devspec.mcpToken` | _(empty)_ | DevSpec MCP token. Per-machine, never synced. |
+
+When the token changes, the extension rewrites `~/.cursor/mcp.json` to point Cursor at the configured `apiUrl`. You can re-trigger registration any time with **`DevSpec: Register MCP server in Cursor config`**.
+
+## Usage
+
+After install, open the command palette (`Ctrl+Shift+P`) and start typing "DevSpec". Each skill command:
+
+1. Optionally prompts for an action item identifier.
+2. Loads the curated SKILL.md instructions for that command.
+3. Copies the combined prompt to your clipboard.
+4. Tells you to paste into Cursor chat (`Ctrl+L`) to run.
+
+This is the "v0.1" surface — clipboard copy/paste. Future versions will integrate directly with Cursor's chat agent so the skill kicks off automatically.
 
 ## License
 
