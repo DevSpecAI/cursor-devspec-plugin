@@ -2,7 +2,7 @@
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run autopilot, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "devspecai",
   "license": "MIT",
   "author": {
@@ -76,8 +76,8 @@
       "properties": {
         "devspec.apiUrl": {
           "type": "string",
-          "default": "https://app.devspec.ai",
-          "description": "Base URL of the DevSpec API. Use https://staging.devspec.ai for staging."
+          "default": "",
+          "description": "Base URL of the DevSpec API. Set during onboarding (e.g. https://staging.devspec.ai). Leave empty to be prompted on first connect."
         },
         "devspec.mcpToken": {
           "type": "string",

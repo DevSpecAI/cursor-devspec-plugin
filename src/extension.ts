@@ -63,7 +63,7 @@ async function runSkill(context: vscode.ExtensionContext, skillId: SkillId, prom
   )
 }
 
-async function promptAndStoreToken(): Promise<string | undefined> {
+async function promptAndStoreToken(opts: { skipReregister?: boolean } = {}): Promise<string | undefined> {
   const entered = await vscode.window.showInputBox({
     prompt: 'Paste your DevSpec MCP token (starts with dvs_)',
     password: true,
@@ -72,26 +72,44 @@ async function promptAndStoreToken(): Promise<string | undefined> {
   })
   if (!entered) return undefined
   await vscode.workspace.getConfiguration('devspec').update('mcpToken', entered, vscode.ConfigurationTarget.Global)
-  void vscode.window.showInformationMessage('DevSpec: token saved. Re-registering MCP server.')
-  await registerMcpServer({ force: true })
+  if (!opts.skipReregister) {
+    void vscode.window.showInformationMessage('DevSpec: token saved. Re-registering MCP server.')
+    await registerMcpServer({ force: true })
+  }
   return entered
 }
 
 async function registerMcpServer({ force }: { force: boolean }): Promise<void> {
   const config = vscode.workspace.getConfiguration('devspec')
-  const apiUrl = (config.get<string>('apiUrl') ?? 'https://app.devspec.ai').replace(/\/+$/, '')
+  let apiUrl = (config.get<string>('apiUrl') ?? '').replace(/\/+$/, '')
   let token = config.get<string>('mcpToken') ?? ''
 
-  if (!token) {
+  if (!apiUrl || !token) {
     if (!force) {
       const choice = await vscode.window.showInformationMessage(
-        'DevSpec: no MCP token configured. Set one to enable the integration.',
-        'Set token',
+        'DevSpec: not yet configured. Connect now?',
+        'Connect',
         'Later',
       )
-      if (choice !== 'Set token') return
+      if (choice !== 'Connect') return
     }
-    const entered = await promptAndStoreToken()
+  }
+
+  if (!apiUrl) {
+    const entered = await vscode.window.showInputBox({
+      prompt: 'DevSpec API URL',
+      placeHolder: 'e.g. https://staging.devspec.ai',
+      value: 'https://staging.devspec.ai',
+      ignoreFocusOut: true,
+      validateInput: (v) => /^https?:\/\/[^\s]+$/.test(v) ? null : 'Must be a valid http(s) URL',
+    })
+    if (!entered) return
+    apiUrl = entered.replace(/\/+$/, '')
+    await config.update('apiUrl', apiUrl, vscode.ConfigurationTarget.Global)
+  }
+
+  if (!token) {
+    const entered = await promptAndStoreToken({ skipReregister: true })
     if (!entered) return
     token = entered
   }
