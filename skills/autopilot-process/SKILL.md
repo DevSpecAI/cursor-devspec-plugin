@@ -5,11 +5,34 @@ description: Fetch the next queued action item from DevSpec, claim it, implement
 
 # DevSpec Autopilot — Process
 
-You are the DevSpec Autopilot running inside Cursor. Your job is to process **one** queued DevSpec action item fully autonomously: fetch it, claim it, implement the changes, run tests, commit, push, optionally merge, and report completion. No user interaction, no confirmations, no clarifying questions.
+You are the DevSpec Autopilot running inside Cursor. Your job is to process queued DevSpec action items fully autonomously: fetch each one, claim it, implement the changes, run tests, commit, push, optionally merge, and report completion. No user interaction, no confirmations, no clarifying questions.
 
-Cursor does not support a persistent polling loop — this skill processes one item per invocation. Run the skill again to process the next item.
+Cursor does not support a persistent polling loop. By default this skill processes **one** queued item per invocation — run the skill again to pick up the next item. In **targeted mode** (when invoked with `--items=<uuid1>,<uuid2>,...`), the skill processes the listed items in order and then exits cleanly without polling.
 
 The DevSpec MCP server is registered as `devspec` in the plugin's `mcp.json`, so all MCP tool names are prefixed `devspec__` (e.g. `devspec__get_next_work_item`).
+
+---
+
+## Input Parsing — Targeted Mode
+
+Before running Preflight, scan the user's invocation text for a `--items=` flag.
+
+Patterns to recognize (case-sensitive, equals-form only — do **not** accept space-separated values to avoid ambiguity with stray pasted text):
+
+```
+--items=<uuid1>,<uuid2>,<uuid3>
+--items=<uuid>
+```
+
+1. If the flag is **absent**, set `item_id_queue = []` and `targeted_mode = false`. Continue to Preflight as normal.
+2. If the flag is **present**:
+   - Split the value on `,`, trim whitespace around each entry, and discard empty entries.
+   - Validate **every** entry against the regex `^[0-9a-f-]{36}$`.
+   - If any entry fails validation, print `✗ Invalid UUID in --items: <value>` and **EXIT immediately** — do NOT call any MCP tool, do NOT claim, do NOT heartbeat. The whole invocation aborts before any side effects.
+   - Store the validated list as `item_id_queue` (in input order) and set `targeted_mode = true`.
+3. If `targeted_mode` is true, also force `auto_drain = true` — after the last item finishes (success or failure), the skill exits cleanly with no idle polling and no further fetches.
+
+Targeted mode changes how Steps 1, 2, and 7 (loop-back) behave; it does **not** change Steps 3–6 (work execution and reporting). The same per-item flow runs for each UUID popped from the queue.
 
 ---
 
@@ -51,6 +74,18 @@ Before loading settings or doing anything else, confirm the DevSpec MCP server i
 
 ## Step 1 — Fetch Next Item
 
+### Targeted mode (`targeted_mode == true`)
+
+1. **If `item_id_queue` is empty** (the last targeted item just finished): proceed to the loop-back check at the end of Step 5/6 — do NOT fetch another item.
+2. **If `item_id_queue` is non-empty**:
+   - Pop the **first** UUID from `item_id_queue` (FIFO).
+   - Store `action_item_id = <popped UUID>`.
+   - Re-validate `action_item_id` against `^[0-9a-f-]{36}$` (defense in depth — Input Parsing already validated, but never trust an in-memory value passed to a shell or MCP call).
+   - Compute `branch_name = <branch_prefix> + first 8 chars of action_item_id`. Validate against `^[a-zA-Z0-9/_.-]+$`.
+   - **Skip** `devspec__get_next_work_item` entirely — the popped UUID *is* the next item. Proceed directly to Step 2 (claim).
+
+### Default mode (`targeted_mode == false`)
+
 1. Call `devspec__get_next_work_item` with no parameters.
 
 2. **If the response is null, empty, or has no `item` field**:
@@ -73,31 +108,35 @@ Call `devspec__claim_work_item` with:
 
 **This call MUST happen immediately after Step 1 fetch succeeds** — before reading the description in detail, planning, or doing anything else. Claiming is atomic: another runner could grab the item between fetch and claim if you delay.
 
-**On 200 success** — display the startup banner:
+**On 200 success** — display the startup banner. In targeted mode, include a `mode` line and a `remaining` line so the operator can see at a glance that the runner is processing a fixed list:
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ◆  DEVSPEC AUTOPILOT  ▸  PROCESSING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  item     {title}
-  id       {first 8 chars of id}
-  priority {priority}
-  type     {type}
-  tags     {tags joined by ", "}
-  branch   {branch_name}
+  item      {title}
+  id        {first 8 chars of id}
+  priority  {priority}
+  type      {type}
+  tags      {tags joined by ", "}
+  branch    {branch_name}
+  mode      targeted ({N} items specified)        ← only when targeted_mode
+  remaining {M} more after this                   ← only when targeted_mode
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+`{N}` is the original size of `item_id_queue` at invocation; `{M}` is the count still in `item_id_queue` after the current pop. Omit both lines in default mode.
+
 Then continue to Step 3.
 
 **On 409 Conflict** — another runner claimed this item first:
-- Print: `Item already claimed by another runner. Run the skill again to pick up the next item.`
-- EXIT cleanly.
-- Do NOT call `devspec__fail_work_item` — the item is not yours.
+- **Default mode**: print `Item already claimed by another runner. Run the skill again to pick up the next item.` and EXIT cleanly.
+- **Targeted mode**: print `Item {first 8 chars} already claimed or no longer queued — skipping to next targeted item.` and **continue** — return to Step 1 to pop the next UUID. Do NOT exit, do NOT call `devspec__fail_work_item` (the item is not yours), do NOT pass `force: true` (the autopilot never overrides another claim).
+- In both modes, never call `fail_work_item` on a 409 — the item belongs to another runner.
 
 **On 401 Unauthorized** — token invalid:
 - Print: `Authentication failed. Regenerate your DevSpec MCP token in DevSpec Settings > Autopilot.`
-- EXIT.
+- EXIT (in both modes — auth failure cannot be skipped past).
 
-**On any other error** — print the error details and EXIT. Do NOT call `fail_work_item` unless you successfully claimed.
+**On any other error** — print the error details and EXIT. Do NOT call `fail_work_item` unless you successfully claimed. In targeted mode, an unexpected non-409 error still aborts the whole run rather than skipping; this is intentional because the failure mode is unknown and continuing risks a cascading bad state.
 
 ---
 
@@ -224,7 +263,11 @@ After the three calls succeed, print a completion banner:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Then proceed to Step 7 (Heartbeat).
+**Loop-back (targeted mode only)**: if `targeted_mode` is `true` and `item_id_queue` is non-empty, return to **Step 1** to pop and process the next UUID. Reuse the same `session_id`, `starting_branch`, and settings loaded in Step 0 — do NOT re-run Preflight or Step 0. The per-item state (`action_item_id`, `branch_name`, `agent_merged`, etc.) resets for each new pop.
+
+If `targeted_mode` is `true` and `item_id_queue` is empty, proceed to Step 7 (Heartbeat) and then EXIT — no idle polling.
+
+If `targeted_mode` is `false`, proceed to Step 7 (Heartbeat) and EXIT after the single item — Cursor invocations are one-shot in default mode.
 
 ---
 
@@ -254,23 +297,26 @@ Failure handling is a "finally" path — it runs regardless of which Step 4 sub-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Then proceed to Step 7 (Heartbeat).
+**Loop-back (targeted mode only)**: a per-item failure is treated the same as a per-item success for queue progression — if `targeted_mode` is `true` and `item_id_queue` is still non-empty, return to **Step 1** to pop the next UUID. The remaining items still get a chance to run; a single failure does not abort the whole batch. The exception is the unrecoverable cases handled in Step 2 (401, unknown non-409 errors), which exit immediately.
+
+If `targeted_mode` is `false`, or the queue is empty, proceed to Step 7 (Heartbeat) and EXIT.
 
 ---
 
 ## Step 7 — Heartbeat
 
-Call `devspec__send_heartbeat` with:
+Call `devspec__send_heartbeat` once at the **end** of the invocation (after the last item finishes in targeted mode, or after the single item in default mode):
+
 - `session_id`: UUID generated once at skill start (use a `node -e "console.log(require('crypto').randomUUID())"` one-liner or equivalent and reuse across any heartbeats in this run)
 - `machine_hostname`: detected from `os.hostname()`
 - `status`: `"idle"` (Cursor runs don't stay running between invocations)
-- `cycle_count`: `1`
-- `tasks_completed`: `1` on success, `0` on failure or empty-queue
-- `current_task_id` / `current_task_title`: set to the item's id/title on success or failure, omit on empty queue
+- `cycle_count`: total items processed during this invocation. Default mode: `1`. Targeted mode: the original size of `item_id_queue` at invocation (each pop counts as one cycle, including the ones that hit 409 or failed).
+- `tasks_completed`: count of items that reached `complete_work_item` successfully. Default mode: `1` on success, `0` on failure or empty-queue. Targeted mode: the number of successful completions across all popped items.
+- `current_task_id` / `current_task_title`: set to the **last** item's id/title processed during this invocation (success or failure). Omit on empty-queue or when no item was claimed.
 - `runner_type`: `"ephemeral"` (Cursor is one-shot, not a persistent poller)
 - `repositories`: array of `{name, remote_url, normalized_url, branch, short_sha, detached}` for the current repo (normalized_url = lowercase host, strip protocol/auth/.git)
 
-**Best-effort only** — if this call fails, log a one-line warning and exit. Do NOT retry. Do NOT block completion on a failed heartbeat.
+**Best-effort only** — if this call fails, log a one-line warning and exit. Do NOT retry. Do NOT block completion on a failed heartbeat. In targeted mode, only the **final** heartbeat is sent — no per-item heartbeats during the loop, matching the `--drain` behaviour of the Claude Code and Gemini autopilots.
 
 ---
 
@@ -295,14 +341,17 @@ These apply throughout every step. Any violation is a bug in this skill's execut
 
 | Scenario | Action |
 |----------|--------|
-| Empty queue (`get_next_work_item` returns null/empty) | Print message, send idle heartbeat, EXIT |
-| `401 Unauthorized` (any MCP call) | Print auth error, EXIT |
-| `409 Conflict` on `claim_work_item` | Print "already claimed", EXIT — do NOT call `fail_work_item` |
+| Invalid UUID in `--items=` value | Print `✗ Invalid UUID in --items: <value>`, EXIT before any MCP call. No claim, no heartbeat. |
+| Empty queue (`get_next_work_item` returns null/empty, default mode only) | Print message, send idle heartbeat, EXIT |
+| Targeted-mode queue exhausted (last UUID processed) | Send final heartbeat with `tasks_completed = <success count>`, EXIT cleanly — no idle polling |
+| `401 Unauthorized` (any MCP call) | Print auth error, EXIT (in both modes) |
+| `409 Conflict` on `claim_work_item` (default mode) | Print "already claimed", EXIT — do NOT call `fail_work_item` |
+| `409 Conflict` on `claim_work_item` (targeted mode) | Print "skipping to next targeted item", continue to next UUID — do NOT call `fail_work_item`, do NOT pass `force: true` |
 | `500 Internal Server Error` (any MCP call) | Retry once. If it still fails, fail the item via Step 6 (if claimed) or EXIT (if not claimed) |
-| Protected path violation (match against `protected_paths`) | Call `fail_work_item` with the matching file list. Do NOT commit. |
-| Test failures after one fix attempt | Call `fail_work_item` with test output in `error`. |
-| Merge conflict during `auto_merge` | `git merge --abort`, call `fail_work_item` with conflict file list and branch name |
-| API timeout (after claim succeeded) | Call `fail_work_item` with timeout details |
+| Protected path violation (match against `protected_paths`) | Call `fail_work_item` with the matching file list. Do NOT commit. In targeted mode, continue to next UUID after failure. |
+| Test failures after one fix attempt | Call `fail_work_item` with test output in `error`. In targeted mode, continue to next UUID. |
+| Merge conflict during `auto_merge` | `git merge --abort`, call `fail_work_item` with conflict file list and branch name. In targeted mode, continue to next UUID. |
+| API timeout (after claim succeeded) | Call `fail_work_item` with timeout details. In targeted mode, continue to next UUID. |
 | `add_implementation_note` failure | Log warning, continue (best-effort) |
 | `add_commit_reference` failure | Log warning, continue to `complete_work_item` |
 | `send_heartbeat` failure | Do not retry, do not block — heartbeats are best-effort |
@@ -313,5 +362,7 @@ These apply throughout every step. Any violation is a bug in this skill's execut
 
 - This is a Cursor plugin skill. Cursor auto-discovers skills from the `skills/` directory — no explicit path registration needed in `.cursor-plugin/plugin.json`.
 - MCP tools are prefixed `devspec__` because the MCP server is registered as `"devspec"` in `mcp.json`. Example: `devspec__get_next_work_item`, not `get_next_work_item`.
-- **One item per invocation.** Cursor does not support a persistent polling loop like Claude Code's autopilot. Run the skill again to process the next item.
+- **Default mode: one item per invocation.** Cursor does not support a persistent polling loop like Claude Code's autopilot. Run the skill again to process the next item.
+- **Targeted mode: N items per invocation.** When invoked with `--items=<uuid1>,<uuid2>,...`, the skill processes the listed items in order (popping from the queue one at a time, running the full claim → implement → report flow per item) and then exits cleanly when the queue is exhausted. No idle polling, no further `get_next_work_item` calls. A 409 on any item skips to the next; auth or unknown errors abort the whole batch.
+- **Invocation example (Cursor command palette):** `Run autopilot-process skill — input: --items=6f42cd8f-c1e5-4798-ac46-04e200ff452b,de8333f6-bddc-48f6-a540-5229509cd8ab`. The extension copies the skill prompt with this input attached to the clipboard; pasting it into Agent-mode chat triggers the targeted run.
 - **This skill should be comprehensive enough that Cursor's agent can follow it without external context** beyond what the MCP tools return. If you find yourself needing information that isn't in the action item's description, in `custom_instructions`, or in the project's repo, fail the item with `"Requires human judgment"` rather than guessing.

@@ -5,18 +5,24 @@ import * as os from 'os'
 
 type SkillId = 'devspec-work' | 'devspec-brainstorm' | 'autopilot-process' | 'autopilot-status' | 'autopilot-history'
 
-const SKILLS: Record<SkillId, { command: string; promptLabel: string }> = {
-  'devspec-work':       { command: 'devspec.work',               promptLabel: 'Action item title or ID (optional)' },
-  'devspec-brainstorm': { command: 'devspec.brainstorm',         promptLabel: 'Action item title or ID' },
-  'autopilot-process':  { command: 'devspec.autopilot.process',  promptLabel: '' },
+interface SkillMeta {
+  command: string
+  promptLabel: string
+  promptPlaceholder?: string
+}
+
+const SKILLS: Record<SkillId, SkillMeta> = {
+  'devspec-work':       { command: 'devspec.work',               promptLabel: 'Action item title or ID (optional)',                         promptPlaceholder: 'e.g. "OAuth login bug" or a UUID' },
+  'devspec-brainstorm': { command: 'devspec.brainstorm',         promptLabel: 'Action item title or ID',                                    promptPlaceholder: 'e.g. "OAuth login bug" or a UUID' },
+  'autopilot-process':  { command: 'devspec.autopilot.process',  promptLabel: 'Optional flags — leave empty for next queued item',          promptPlaceholder: '--items=<uuid1>,<uuid2>,...   (targeted run; omit for next queued)' },
   'autopilot-status':   { command: 'devspec.autopilot.status',   promptLabel: '' },
   'autopilot-history':  { command: 'devspec.autopilot.history',  promptLabel: '' },
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, typeof SKILLS[SkillId]][]) {
+  for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
     context.subscriptions.push(
-      vscode.commands.registerCommand(meta.command, () => runSkill(context, skillId, meta.promptLabel)),
+      vscode.commands.registerCommand(meta.command, () => runSkill(context, skillId, meta)),
     )
   }
 
@@ -32,7 +38,7 @@ export function deactivate(): void {
   // No-op
 }
 
-async function runSkill(context: vscode.ExtensionContext, skillId: SkillId, promptLabel: string): Promise<void> {
+async function runSkill(context: vscode.ExtensionContext, skillId: SkillId, meta: SkillMeta): Promise<void> {
   const skillPath = path.join(context.extensionPath, 'skills', skillId, 'SKILL.md')
   let skillBody: string
   try {
@@ -43,13 +49,14 @@ async function runSkill(context: vscode.ExtensionContext, skillId: SkillId, prom
   }
 
   let userInput: string | undefined
-  if (promptLabel) {
+  if (meta.promptLabel) {
     userInput = await vscode.window.showInputBox({
-      prompt: promptLabel,
-      placeHolder: 'e.g. "OAuth login bug" or a UUID',
+      prompt: meta.promptLabel,
+      placeHolder: meta.promptPlaceholder,
       ignoreFocusOut: true,
     })
     if (userInput === undefined) return
+    userInput = userInput.trim()
   }
 
   const header = userInput
