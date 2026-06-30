@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+### Added
+- **`devspec-verify-connection` skill** — proves the setup connection loop end-to-end. Given the setup-wizard verification UUID, it reads the per-repo branch map from `devspec__get_project_summary`, finds locally-cloned target repos by matching the `origin` remote, pushes a `chore: verify DevSpec [devspec-verify:<id>]` empty commit to each repo's target branch (reporting `pushed` only on a successful push), reports repos it can't find locally as `skipped: not cloned locally`, and posts every per-repo outcome via `devspec__report_connection_check`. Distinct from item verification — it never touches action items.
+
+> Maintainer note: `package.json` is in `protected_paths`, so this version bump is documented here only — bump `package.json` manually before publishing the new VSIX.
+
 ## 0.1.3
 
 ### Added
