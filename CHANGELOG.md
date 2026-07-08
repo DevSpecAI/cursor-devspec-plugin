@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0
+
+### Added — Claude plugin parity release
+
+- **12 skills** with dot notation matching Claude (`devspec.work`, `devspec.brainstorm`, `devspec.create`, `devspec.session-brainstorm`, `devspec.verify-connection`, `devspec.done`, `devspec.help`, `devspec.link`, `devspec.commit`, `autopilot.process`, `autopilot.status`, `autopilot.history`).
+- **7 new command-palette entries:** Create, Session brainstorm, Verify connection, Done, Help, Link, Commit.
+- **`devspec.verify-connection` ping mode** (`verify_agent_connection`) for git-free onboarding checks.
+- **`npm run sync`** script (`scripts/sync-from-claude.mjs`) to regenerate skills from the Claude plugin commands.
+
+### Changed
+
+- Skill instructions synced from Claude plugin: worktree isolation, project resolution via `list_projects`, `record_implementation` / `update_action_item` APIs, implementation quality standards, per-repo branch maps, merge-integrate protocol.
+- Renamed skill folders from hyphenated (`devspec-work`) to dot notation (`devspec.work`).
+- `autopilot.process` is one-shot (no background polling) — Cursor counterpart to a single Claude autopilot cycle, with `--items=` targeted batch support.
+
+### Not ported (by design)
+
+- `/autopilot:start` / `/autopilot:stop` background polling loop — use Claude Code for continuous autopilot.
+
 ## 0.1.4
 
 ### Added

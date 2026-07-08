@@ -3,7 +3,19 @@ import { promises as fs } from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 
-type SkillId = 'devspec-work' | 'devspec-brainstorm' | 'autopilot-process' | 'autopilot-status' | 'autopilot-history'
+type SkillId =
+  | 'devspec.work'
+  | 'devspec.brainstorm'
+  | 'devspec.create'
+  | 'devspec.session-brainstorm'
+  | 'devspec.verify-connection'
+  | 'devspec.done'
+  | 'devspec.help'
+  | 'devspec.link'
+  | 'devspec.commit'
+  | 'autopilot.process'
+  | 'autopilot.status'
+  | 'autopilot.history'
 
 interface SkillMeta {
   command: string
@@ -12,11 +24,64 @@ interface SkillMeta {
 }
 
 const SKILLS: Record<SkillId, SkillMeta> = {
-  'devspec-work':       { command: 'devspec.work',               promptLabel: 'Action item title or ID (optional)',                         promptPlaceholder: 'e.g. "OAuth login bug" or a UUID' },
-  'devspec-brainstorm': { command: 'devspec.brainstorm',         promptLabel: 'Action item title or ID',                                    promptPlaceholder: 'e.g. "OAuth login bug" or a UUID' },
-  'autopilot-process':  { command: 'devspec.autopilot.process',  promptLabel: 'Optional flags — leave empty for next queued item',          promptPlaceholder: '--items=<uuid1>,<uuid2>,...   (targeted run; omit for next queued)' },
-  'autopilot-status':   { command: 'devspec.autopilot.status',   promptLabel: '' },
-  'autopilot-history':  { command: 'devspec.autopilot.history',  promptLabel: '' },
+  'devspec.work': {
+    command: 'devspec.work',
+    promptLabel: 'Action item title or ID (optional)',
+    promptPlaceholder: 'e.g. "OAuth login bug", a UUID, or add --unattended',
+  },
+  'devspec.brainstorm': {
+    command: 'devspec.brainstorm',
+    promptLabel: 'Action item title or ID',
+    promptPlaceholder: 'e.g. "OAuth login bug" or a UUID',
+  },
+  'devspec.create': {
+    command: 'devspec.create',
+    promptLabel: 'Title and optional fields',
+    promptPlaceholder: 'title: Fix login bug  type: bug  priority: high',
+  },
+  'devspec.session-brainstorm': {
+    command: 'devspec.session-brainstorm',
+    promptLabel: 'Session handoff arguments',
+    promptPlaceholder: 'mode=answer session_id=<uuid>  or  mode=brainstorm session_id=<uuid>',
+  },
+  'devspec.verify-connection': {
+    command: 'devspec.verify-connection',
+    promptLabel: 'Verification UUID (leave empty for ping mode)',
+    promptPlaceholder: 'empty = ping mode  ·  or paste setup-wizard UUID for commit mode',
+  },
+  'devspec.done': {
+    command: 'devspec.done',
+    promptLabel: 'Optional description (auto-infers from git if empty)',
+    promptPlaceholder: 'leave empty to infer from recent commits',
+  },
+  'devspec.help': {
+    command: 'devspec.help',
+    promptLabel: 'Your question about using DevSpec',
+    promptPlaceholder: 'e.g. "How do I set up autopilot?"',
+  },
+  'devspec.link': {
+    command: 'devspec.link',
+    promptLabel: 'Commit SHA and action item ID',
+    promptPlaceholder: '<sha> <action_item_id>',
+  },
+  'devspec.commit': {
+    command: 'devspec.commit',
+    promptLabel: 'Action item ID and commit summary',
+    promptPlaceholder: '<action_item_id> <summary under 72 chars>',
+  },
+  'autopilot.process': {
+    command: 'devspec.autopilot.process',
+    promptLabel: 'Optional flags — leave empty for next staged item',
+    promptPlaceholder: '--items=<uuid1>,<uuid2>  ·  --mine  ·  --all  ·  --assigned-to=<uuid>',
+  },
+  'autopilot.status': {
+    command: 'devspec.autopilot.status',
+    promptLabel: '',
+  },
+  'autopilot.history': {
+    command: 'devspec.autopilot.history',
+    promptLabel: '',
+  },
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {

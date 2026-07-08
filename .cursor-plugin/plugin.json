@@ -1,8 +1,8 @@
 {
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
-  "version": "0.1.0",
-  "description": "Automatically pick up agent-ready action items from DevSpec, implement them, test them, and push to a target branch. Connects Cursor's AI agent to the DevSpec project management platform via MCP.",
+  "version": "0.2.0",
+  "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run one-shot autopilot, brainstorm scope, and ship work without leaving the editor.",
   "author": {
     "name": "DevSpecAI",
     "email": "hello@devspec.ai",
@@ -20,5 +20,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/DevSpecAI/cursor-devspec-plugin"
-  }
+  },
+  "skills": ["./skills"]
 }

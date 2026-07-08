@@ -2,7 +2,7 @@
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run autopilot, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "devspecai",
   "license": "MIT",
   "author": {
@@ -46,8 +46,43 @@
         "category": "DevSpec"
       },
       {
+        "command": "devspec.create",
+        "title": "DevSpec: Create action item",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.session-brainstorm",
+        "title": "DevSpec: Continue session in local agent",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.verify-connection",
+        "title": "DevSpec: Verify connection",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.done",
+        "title": "DevSpec: Log completed work",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.help",
+        "title": "DevSpec: Help",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.link",
+        "title": "DevSpec: Link commit to item",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.commit",
+        "title": "DevSpec: Commit with tracking tag",
+        "category": "DevSpec"
+      },
+      {
         "command": "devspec.autopilot.process",
-        "title": "DevSpec Autopilot: Process next queued item",
+        "title": "DevSpec Autopilot: Process next staged item",
         "category": "DevSpec"
       },
       {
@@ -92,6 +127,7 @@
     "build": "esbuild src/extension.ts --bundle --platform=node --target=node18 --external:vscode --outfile=dist/extension.js",
     "watch": "npm run build -- --watch",
     "typecheck": "tsc --noEmit",
+    "sync": "node scripts/sync-from-claude.mjs",
     "package": "npm run build && vsce package --out devspec-autopilot.vsix",
     "publish": "npm run build && vsce publish"
   },
