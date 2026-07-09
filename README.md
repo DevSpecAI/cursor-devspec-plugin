@@ -38,7 +38,7 @@ When you click **Open in Cursor** on the DevSpec web app, DevSpec opens:
 
 `http://127.0.0.1:42731/open?repo=owner/name`
 
-A small **open bridge** process (shipped with this extension) must be running on that port. Cursor’s Glass layout does not load user VSIX extensions, so the bridge runs as a standalone Node process instead of inside the extension host.
+A small **open bridge** process (shipped with this extension) must be running on that port. After opening the folder it can also pre-fill Cursor Agent chat via `cursor://anysphere.cursor-deeplink/prompt` when DevSpec passes a `prompt=` query param on the rocket link.
 
 **One-time setup** (after installing the VSIX):
 

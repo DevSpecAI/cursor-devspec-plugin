@@ -141,6 +141,43 @@ function resolveCursorExecutable() {
   return 'cursor'
 }
 
+/** Cursor official deeplink — pre-fills Agent chat (user confirms before send). */
+const CURSOR_PROMPT_DEEPLINK_BASE = 'cursor://anysphere.cursor-deeplink/prompt'
+/** Max per https://cursor.com/docs/reference/deeplinks */
+const CURSOR_PROMPT_DEEPLINK_MAX = 8000
+/** Wait for the folder window to open before pre-filling Agent chat. */
+const PROMPT_DEEPLINK_DELAY_MS = 1500
+
+function buildCursorPromptDeeplink(text) {
+  const trimmed =
+    text.length > CURSOR_PROMPT_DEEPLINK_MAX
+      ? text.slice(0, CURSOR_PROMPT_DEEPLINK_MAX)
+      : text
+  return `${CURSOR_PROMPT_DEEPLINK_BASE}?text=${encodeURIComponent(trimmed)}`
+}
+
+function openCursorDeeplink(url) {
+  if (process.platform === 'win32') {
+    spawn('cmd', ['/c', 'start', '', url], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    }).unref()
+    return
+  }
+  if (process.platform === 'darwin') {
+    spawn('open', [url], { detached: true, stdio: 'ignore' }).unref()
+    return
+  }
+  spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref()
+}
+
+function scheduleAgentPrompt(promptText) {
+  if (!promptText?.trim()) return
+  const deeplink = buildCursorPromptDeeplink(promptText.trim())
+  setTimeout(() => openCursorDeeplink(deeplink), PROMPT_DEEPLINK_DELAY_MS)
+}
+
 async function openInCursor(folderPath) {
   const cursorExe = resolveCursorExecutable()
   if (process.platform === 'win32' && !(await pathExists(cursorExe))) {
@@ -195,7 +232,7 @@ function missingMappingHtml(slug) {
 </html>`
 }
 
-async function handleOpen(slug, res) {
+async function handleOpen(slug, promptText, res) {
   const folderPath = await resolveRepoFolder(slug)
   if (!folderPath) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -204,9 +241,13 @@ async function handleOpen(slug, res) {
   }
 
   await openInCursor(folderPath)
+  scheduleAgentPrompt(promptText)
+  const promptNote = promptText?.trim()
+    ? '<p>Pre-filling Agent chat in Cursor — review the prompt and press Enter to send.</p>'
+    : ''
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(
-    `<!DOCTYPE html><html><head><title>DevSpec</title></head><body><p>Opening <strong>${escapeHtml(slug)}</strong> in Cursor. You can close this tab.</p></body></html>`,
+    `<!DOCTYPE html><html><head><title>DevSpec</title></head><body><p>Opening <strong>${escapeHtml(slug)}</strong> in Cursor. You can close this tab.</p>${promptNote}</body></html>`,
   )
 }
 
@@ -220,10 +261,12 @@ function startServer() {
 
     let pathname = '/'
     let repo = null
+    let prompt = null
     try {
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${DEVSPEC_LOCAL_OPEN_PORT}`)
       pathname = url.pathname
       repo = url.searchParams.get('repo')
+      prompt = url.searchParams.get('prompt')
     } catch {
       res.writeHead(400, { 'Content-Type': 'text/plain' })
       res.end('Bad request')
@@ -242,13 +285,14 @@ function startServer() {
     }
 
     const slug = decodeURIComponent(repo)
+    const promptText = prompt ? decodeURIComponent(prompt) : null
     if (req.method === 'HEAD') {
       res.writeHead(200)
       res.end()
       return
     }
 
-    void handleOpen(slug, res).catch((err) => {
+    void handleOpen(slug, promptText, res).catch((err) => {
       console.error('[devspec-open-bridge] open failed:', err)
       res.writeHead(500, { 'Content-Type': 'text/plain' })
       res.end('Failed to open repository')
