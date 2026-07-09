@@ -1,35 +1,42 @@
 ## Open in Cursor from DevSpec
 
-When you click **Open in Cursor** on the DevSpec web app, DevSpec opens:
-
-`http://127.0.0.1:42731/open?repo=owner/name&prompt=…`
+When you click **Open in Cursor** on the DevSpec web app, DevSpec opens a signed `devspec://` URL (Windows/Linux) or the macOS localhost bridge fallback.
 
 ### Automatic setup (recommended)
 
 Installing this extension and connecting DevSpec MCP **automatically**:
 
-1. Copies the open bridge to `~/.cursor/devspec/open-bridge.mjs`
-2. Starts it on port **42731**
-3. Registers **Windows login startup** so the bridge runs after reboot
+1. **Windows / Linux:** registers `devspec://` in the OS (per-user, no admin)
+2. **macOS:** starts the localhost bridge on port **42731** (until a signed `.app` helper ships)
+3. Copies the handler to `~/.cursor/devspec/`
+4. Removes the legacy always-on bridge + Windows login startup entry
 
-You can also run **DevSpec: Install open bridge** from the command palette at any time.
+You can also run **DevSpec: Install protocol handler** from the command palette.
 
-### Manual setup
+### Manual setup (extension not installed)
+
+**Windows:** double-click `scripts/install-protocol-handler.cmd`
+
+**Linux / macOS:**
 
 ```bash
-npm run open-bridge:install
+bash scripts/install-protocol-handler.sh
 ```
-
-Or double-click `scripts/install-open-bridge.cmd` from the extension folder.
 
 ### What happens when you click the rocket
 
-1. Browser hits the localhost bridge
-2. Cursor opens the mapped project folder
-3. ~1.5s later, Agent chat is pre-filled via `cursor://anysphere.cursor-deeplink/prompt` (you press Enter to send)
+1. DevSpec signs a short-lived handoff token via `/api/cursor-handoff/sign`
+2. Browser opens `devspec://open?t=…` (anchor click — no extra tab on Windows/Linux)
+3. OS spawns the handler once (no background daemon)
+4. Cursor opens the mapped project folder
+5. ~1.5s later, Agent chat is pre-filled via `cursor://anysphere.cursor-deeplink/prompt` (press Enter to send)
 
-### Health check
+### macOS health check
 
-`http://127.0.0.1:42731/health` should return `{"ok":true}`.
+`http://127.0.0.1:42731/health` should return `{"ok":true,"mode":"macos_bridge"}` when the fallback bridge is running.
 
 DevSpec never receives or stores your local filesystem paths.
+
+### Signing keys
+
+Production: set `CURSOR_HANDOFF_PRIVATE_KEY_PEM` on DevSpec servers. The handler bundles `scripts/handoff-public-key.pem` for offline verification.

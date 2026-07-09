@@ -6,6 +6,7 @@ Thumbs.db
 .idea/
 .env
 .env.*
+handoff-private-key.pem
 node_modules/
 dist/
 out/

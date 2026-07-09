@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+### Changed — `devspec://` protocol handler replaces always-on localhost bridge
+
+- **Windows / Linux:** extension activation registers `devspec://` (per-user, no admin). No background daemon or login startup entry.
+- **macOS:** keeps signed localhost bridge on port 42731 until a signed `.app` helper ships.
+- Rocket handoffs use **short-lived Ed25519-signed tokens** from DevSpec `/api/cursor-handoff/sign`.
+- Manual install: `scripts/install-protocol-handler.cmd` (Windows) / `install-protocol-handler.sh` (Linux/macOS).
+
+### Added
+
+- `DevSpec: Install protocol handler` command palette entry.
+- `scripts/open-handler.mjs` ephemeral handler (`--url` mode).
+- Optional `npm run handler:build-exe` for `bin/devspec-open-handler.exe` (Node fallback in `devspec-handler.cmd` when exe is absent).
+
 ## 0.2.0
 
 ### Added — Claude plugin parity release

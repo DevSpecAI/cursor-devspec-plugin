@@ -12,3 +12,4 @@ tsconfig.json
 !dist/**/*.js
 .cursor-plugin/**
 mcp.json
+scripts/handoff-private-key.pem

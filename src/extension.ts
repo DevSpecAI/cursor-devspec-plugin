@@ -6,7 +6,7 @@ import {
   installProjectRulesCommand,
   offerInstallProjectRules,
 } from './project-rules'
-import { installAndStartOpenBridge, registerOpenBridgeCommands } from './open-bridge-install'
+import { installProtocolHandler, registerProtocolHandlerCommands } from './protocol-handler-install'
 import { registerRepoFolderFeatures } from './repo-folder-map'
 
 type SkillId =
@@ -95,8 +95,8 @@ let extensionContext: vscode.ExtensionContext | undefined
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionContext = context
   registerRepoFolderFeatures(context)
-  registerOpenBridgeCommands(context)
-  installAndStartOpenBridge(context.extensionPath)
+  registerProtocolHandlerCommands(context)
+  installProtocolHandler(context.extensionPath)
 
   for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
     context.subscriptions.push(
@@ -235,7 +235,7 @@ async function registerMcpServer({
   if (!force && JSON.stringify(existing) === JSON.stringify(desired)) {
     if (context) {
       void offerInstallProjectRules(context, context.extensionPath)
-      installAndStartOpenBridge(context.extensionPath)
+      installProtocolHandler(context.extensionPath)
     }
     return
   }
@@ -251,6 +251,6 @@ async function registerMcpServer({
 
   if (context) {
     void offerInstallProjectRules(context, context.extensionPath)
-    installAndStartOpenBridge(context.extensionPath)
+    installProtocolHandler(context.extensionPath)
   }
 }
