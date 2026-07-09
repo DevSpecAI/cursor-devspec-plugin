@@ -110,6 +110,11 @@
         "command": "devspec.installProjectRules",
         "title": "DevSpec: Install rules",
         "category": "DevSpec"
+      },
+      {
+        "command": "devspec.forgetRepoFolder",
+        "title": "DevSpec: Manage repo folder mappings",
+        "category": "DevSpec"
       }
     ],
     "configuration": {

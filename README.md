@@ -30,6 +30,21 @@ The extension does two things:
 | `DevSpec: Help` | `devspec.help` | Search official DevSpec product docs. |
 | `DevSpec: Link commit to item` | `devspec.link` | Associate a git commit with an action item. |
 | `DevSpec: Commit with tracking tag` | `devspec.commit` | Generate a `[devspec:<id>]` commit message and commit. |
+| `DevSpec: Manage repo folder mappings` | — | View, re-point, or clear stored GitHub slug → local folder mappings for rocket-button deep links. |
+
+### Rocket-button deep links (open project from DevSpec)
+
+When you click **Open in Cursor** on the DevSpec web app, DevSpec sends:
+
+`cursor://devspecai.devspec-autopilot/open?repo=owner/name`
+
+This extension resolves that GitHub slug to a folder on your machine:
+
+1. **Auto-learn** — while active in a git workspace, it records `origin` → folder automatically.
+2. **One-time picker** — the first time a slug has no mapping, choose the local clone once; the choice is saved.
+3. **Manage mappings** — run **`DevSpec: Manage repo folder mappings`** to re-point or forget a stored path.
+
+DevSpec never receives or stores your local filesystem paths.
 
 ### Autopilot (one-shot — no background polling)
 

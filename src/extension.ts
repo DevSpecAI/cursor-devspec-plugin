@@ -6,6 +6,7 @@ import {
   installProjectRulesCommand,
   offerInstallProjectRules,
 } from './project-rules'
+import { registerRepoFolderFeatures } from './repo-folder-map'
 
 type SkillId =
   | 'devspec.work'
@@ -108,6 +109,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   )
 
+  registerRepoFolderFeatures(context)
   void registerMcpServer({ force: false, context })
 }
 
