@@ -13,7 +13,6 @@ import {
   handleProtocolUrl,
   appendHandlerLog,
 } from './open-handler-core.mjs'
-import { installProtocolHandler, uninstallLegacyBridge } from './register-protocol.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -27,6 +26,12 @@ async function copyInstalledArtifacts(sourceDir) {
     'handoff-verify.mjs',
     'handoff-public-key.pem',
     'devspec-handler.cmd',
+    // Needed only for --install / reinstall from the installed copy; URL
+    // handling does not import these (lazy-loaded below). Keep them so a
+    // reinstall from ~/.cursor/devspec still works.
+    'register-protocol.mjs',
+    'open-bridge.mjs',
+    'open-bridge-pages.mjs',
   ]
   for (const name of files) {
     const src = path.join(sourceDir, name)
@@ -61,6 +66,11 @@ async function main() {
 
   if (args.includes('--install')) {
     await copyInstalledArtifacts(__dirname)
+    // Lazy-load so URL-only invocations (OS protocol launches) do not require
+    // register-protocol.mjs to be present — that was the Windows crash.
+    const { installProtocolHandler, uninstallLegacyBridge } = await import(
+      './register-protocol.mjs'
+    )
     await uninstallLegacyBridge()
     if (process.platform === 'darwin') {
       const { startMacOsBridgeServer } = await import('./open-bridge.mjs')
