@@ -38,15 +38,30 @@ When you click **Open in Cursor** on the DevSpec web app, DevSpec opens:
 
 `http://127.0.0.1:42731/open?repo=owner/name`
 
-(in a small browser tab). The installed **DevSpec Autopilot** extension listens on that localhost port and resolves the GitHub slug to your local clone. We use localhost instead of `cursor://devspecai.devspec-autopilot/...` because Cursor treats extension-id deeplinks as marketplace install links.
+A small **open bridge** process (shipped with this extension) must be running on that port. Cursor’s Glass layout does not load user VSIX extensions, so the bridge runs as a standalone Node process instead of inside the extension host.
 
-This extension resolves that GitHub slug to a folder on your machine:
+**One-time setup** (after installing the VSIX):
+
+```bash
+cd path/to/cursor-devspec-plugin
+npm run open-bridge:install
+```
+
+Or from the installed extension folder:
+
+```bash
+node "%USERPROFILE%/.cursor/extensions/devspecai.devspec-autopilot-0.2.5/scripts/open-bridge.mjs"
+```
+
+Leave it running, or re-run after reboot. Command Palette → **DevSpec: Start open bridge** also works when the extension is loaded in classic Cursor windows.
+
+The bridge resolves the GitHub slug to a folder on your machine:
 
 1. **Auto-learn** — while active in a git workspace, it records `origin` → folder automatically.
 2. **One-time picker** — the first time a slug has no mapping, choose the local clone once; the choice is saved.
 3. **Manage mappings** — run **`DevSpec: Manage repo folder mappings`** to re-point or forget a stored path.
 
-You should see a brief **"DevSpec: opening Owner/Repo…"** toast in Cursor when the link is handled. If the browser tab says the connection was refused, reload Cursor after installing the extension — the localhost server starts on extension activation.
+You should see a brief browser confirmation and Cursor opening the project folder. If the browser says **connection refused**, start the open bridge (see above). If the repo is unmapped, use **DevSpec: Manage repo folder mappings** in Cursor.
 
 DevSpec never receives or stores your local filesystem paths.
 
