@@ -13,6 +13,7 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { renderOpenSuccess, renderMissingMapping } from './open-bridge-pages.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -50,7 +51,9 @@ function applyCors(req, res) {
 async function installBridgePersistence() {
   await ensureDevspecDir()
   const selfPath = fileURLToPath(import.meta.url)
+  const pagesPath = path.join(path.dirname(selfPath), 'open-bridge-pages.mjs')
   await fs.copyFile(selfPath, INSTALLED_BRIDGE)
+  await fs.copyFile(pagesPath, path.join(DEVSPEC_DIR, 'open-bridge-pages.mjs'))
 
   const nodeBridge = `node "${INSTALLED_BRIDGE.replace(/\\/g, '/')}" --force`
   const startScript = path.join(DEVSPEC_DIR, 'start-open-bridge.cmd')
@@ -268,23 +271,10 @@ function escapeHtml(value) {
 }
 
 function missingMappingHtml(slug) {
-  return `<!DOCTYPE html>
-<html>
-<head><title>DevSpec</title></head>
-<body>
-  <h1>DevSpec: map local folder for ${escapeHtml(slug)}</h1>
-  <p>Cursor is running, but this repo is not mapped yet.</p>
-  <ol>
-    <li>Open Cursor</li>
-    <li>Command Palette → <strong>DevSpec: Manage repo folder mappings</strong></li>
-    <li>Or open the repo folder once so DevSpec Autopilot can learn it</li>
-    <li>Click the rocket button again</li>
-  </ol>
-</body>
-</html>`
+  return renderMissingMapping(slug)
 }
 
-async function handleOpen(slug, promptText, res) {
+async function handleOpen(slug, promptText, itemTitle, res) {
   const folderPath = await resolveRepoFolder(slug)
   if (!folderPath) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -294,12 +284,13 @@ async function handleOpen(slug, promptText, res) {
 
   await openInCursor(folderPath)
   scheduleAgentPrompt(promptText)
-  const promptNote = promptText?.trim()
-    ? '<p>Pre-filling Agent chat in Cursor — review the prompt and press Enter to send.</p>'
-    : ''
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(
-    `<!DOCTYPE html><html><head><title>DevSpec</title></head><body><p>Opening <strong>${escapeHtml(slug)}</strong> in Cursor. You can close this tab.</p>${promptNote}</body></html>`,
+    renderOpenSuccess({
+      slug,
+      itemTitle: itemTitle?.trim() || null,
+      hasPrompt: Boolean(promptText?.trim()),
+    }),
   )
 }
 
@@ -322,11 +313,13 @@ function startServer() {
     let pathname = '/'
     let repo = null
     let prompt = null
+    let itemTitle = null
     try {
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${DEVSPEC_LOCAL_OPEN_PORT}`)
       pathname = url.pathname
       repo = url.searchParams.get('repo')
       prompt = url.searchParams.get('prompt')
+      itemTitle = url.searchParams.get('title')
     } catch {
       res.writeHead(400, { 'Content-Type': 'text/plain' })
       res.end('Bad request')
@@ -352,13 +345,14 @@ function startServer() {
 
     const slug = decodeURIComponent(repo)
     const promptText = prompt ? decodeURIComponent(prompt) : null
+    const displayTitle = itemTitle ? decodeURIComponent(itemTitle) : null
     if (req.method === 'HEAD') {
       res.writeHead(200)
       res.end()
       return
     }
 
-    void handleOpen(slug, promptText, res).catch((err) => {
+    void handleOpen(slug, promptText, displayTitle, res).catch((err) => {
       console.error('[devspec-open-bridge] open failed:', err)
       res.writeHead(500, { 'Content-Type': 'text/plain' })
       res.end('Failed to open repository')
