@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
-import { execFile, spawn } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { DEVSPEC_LOCAL_OPEN_BASE, startLocalOpenServer } from './local-open-server'
+import { DEVSPEC_LOCAL_OPEN_BASE } from './local-open-server'
 import {
   migrateGlobalRepoMapToSharedFile,
   persistRepoFolderMap,
@@ -203,19 +203,11 @@ export async function manageRepoFolderMappings(context: vscode.ExtensionContext)
 }
 
 export function registerRepoFolderFeatures(context: vscode.ExtensionContext): void {
-  void ensureStandaloneOpenBridge(context)
-  startLocalOpenServer(context, (slug) => openRepoBySlug(context, slug))
   context.subscriptions.push(vscode.window.registerUriHandler(createUriHandler(context)))
   context.subscriptions.push(
     vscode.commands.registerCommand('devspec.forgetRepoFolder', () =>
       manageRepoFolderMappings(context),
     ),
-    vscode.commands.registerCommand('devspec.startOpenBridge', () => {
-      void ensureStandaloneOpenBridge(context)
-      void vscode.window.showInformationMessage(
-        'DevSpec: open bridge start requested. If the rocket still fails, run: npm run open-bridge:install in the extension folder.',
-      )
-    }),
   )
 
   void learnWorkspaceMappings(context)
@@ -224,15 +216,4 @@ export function registerRepoFolderFeatures(context: vscode.ExtensionContext): vo
       void learnWorkspaceMappings(context)
     }),
   )
-}
-
-async function ensureStandaloneOpenBridge(context: vscode.ExtensionContext): Promise<void> {
-  const bridgeScript = vscode.Uri.joinPath(context.extensionUri, 'scripts', 'open-bridge.mjs').fsPath
-  const child = spawn('node', [bridgeScript], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-    shell: process.platform === 'win32',
-  })
-  child.unref()
 }

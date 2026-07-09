@@ -2,7 +2,7 @@
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run autopilot, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "devspecai",
   "license": "MIT",
   "author": {
@@ -118,6 +118,11 @@
         "category": "DevSpec"
       },
       {
+        "command": "devspec.installOpenBridge",
+        "title": "DevSpec: Install open bridge",
+        "category": "DevSpec"
+      },
+      {
         "command": "devspec.startOpenBridge",
         "title": "DevSpec: Start open bridge",
         "category": "DevSpec"
@@ -158,7 +163,7 @@
     "sync": "node scripts/sync-from-claude.mjs",
     "package": "npm run build && vsce package --out devspec-autopilot.vsix",
     "open-bridge": "node scripts/open-bridge.mjs",
-    "open-bridge:install": "node scripts/open-bridge.mjs --force",
+    "open-bridge:install": "node scripts/open-bridge.mjs --install --force",
     "publish": "npm run build && vsce publish"
   },
   "devDependencies": {

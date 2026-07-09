@@ -10,6 +10,7 @@ import http from 'node:http'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
@@ -19,9 +20,60 @@ export const DEVSPEC_LOCAL_OPEN_PORT = 42731
 const DEVSPEC_DIR = path.join(os.homedir(), '.cursor', 'devspec')
 const MAP_PATH = path.join(DEVSPEC_DIR, 'repo-folder-map.json')
 const PID_PATH = path.join(DEVSPEC_DIR, 'open-bridge.pid')
+const INSTALLED_BRIDGE = path.join(DEVSPEC_DIR, 'open-bridge.mjs')
 
 async function ensureDevspecDir() {
   await fs.mkdir(DEVSPEC_DIR, { recursive: true })
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin || typeof origin !== 'string') return false
+  return (
+    origin === 'https://devspec.ai' ||
+    origin === 'https://staging.devspec.ai' ||
+    origin.endsWith('.devspec.ai') ||
+    origin.startsWith('http://localhost:') ||
+    origin.startsWith('http://127.0.0.1:')
+  )
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  if (isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+}
+
+async function installBridgePersistence() {
+  await ensureDevspecDir()
+  const selfPath = fileURLToPath(import.meta.url)
+  await fs.copyFile(selfPath, INSTALLED_BRIDGE)
+
+  const nodeBridge = `node "${INSTALLED_BRIDGE.replace(/\\/g, '/')}" --force`
+  const startScript = path.join(DEVSPEC_DIR, 'start-open-bridge.cmd')
+  await fs.writeFile(startScript, `@echo off\r\n${nodeBridge}\r\n`, 'utf8')
+
+  if (process.platform === 'win32') {
+    const startupDir = path.join(
+      os.homedir(),
+      'AppData',
+      'Roaming',
+      'Microsoft',
+      'Windows',
+      'Start Menu',
+      'Programs',
+      'Startup',
+    )
+    const startupLink = path.join(startupDir, 'DevSpec Open Bridge.cmd')
+    await fs.mkdir(startupDir, { recursive: true })
+    await fs.writeFile(startupLink, `@echo off\r\nstart /min "" ${nodeBridge}\r\n`, 'utf8')
+    console.log(`[devspec-open-bridge] registered Windows login startup: ${startupLink}`)
+  }
+
+  console.log(`[devspec-open-bridge] installed to ${INSTALLED_BRIDGE}`)
 }
 
 async function readMap() {
@@ -253,6 +305,14 @@ async function handleOpen(slug, promptText, res) {
 
 function startServer() {
   const server = http.createServer((req, res) => {
+    applyCors(req, res)
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.writeHead(405, { 'Content-Type': 'text/plain' })
       res.end('Method not allowed')
@@ -270,6 +330,12 @@ function startServer() {
     } catch {
       res.writeHead(400, { 'Content-Type': 'text/plain' })
       res.end('Bad request')
+      return
+    }
+
+    if (pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ ok: true, port: DEVSPEC_LOCAL_OPEN_PORT }))
       return
     }
 
@@ -356,6 +422,10 @@ async function main() {
     }
   } catch {
     // no pid file
+  }
+
+  if (args.has('--install')) {
+    await installBridgePersistence()
   }
 
   startServer()
