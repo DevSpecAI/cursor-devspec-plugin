@@ -2,6 +2,10 @@ import * as vscode from 'vscode'
 import { promises as fs } from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import {
+  installProjectRulesCommand,
+  offerInstallProjectRules,
+} from './project-rules'
 
 type SkillId =
   | 'devspec.work'
@@ -84,7 +88,10 @@ const SKILLS: Record<SkillId, SkillMeta> = {
   },
 }
 
+let extensionContext: vscode.ExtensionContext | undefined
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  extensionContext = context
   for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(meta.command, () => runSkill(context, skillId, meta)),
@@ -93,10 +100,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.commands.registerCommand('devspec.setToken', () => promptAndStoreToken()),
-    vscode.commands.registerCommand('devspec.registerMcpServer', () => registerMcpServer({ force: true })),
+    vscode.commands.registerCommand('devspec.registerMcpServer', () =>
+      registerMcpServer({ force: true, context: extensionContext }),
+    ),
+    vscode.commands.registerCommand('devspec.installProjectRules', () =>
+      installProjectRulesCommand(context, context.extensionPath),
+    ),
   )
 
-  void registerMcpServer({ force: false })
+  void registerMcpServer({ force: false, context })
 }
 
 export function deactivate(): void {
@@ -146,12 +158,18 @@ async function promptAndStoreToken(opts: { skipReregister?: boolean } = {}): Pro
   await vscode.workspace.getConfiguration('devspec').update('mcpToken', entered, vscode.ConfigurationTarget.Global)
   if (!opts.skipReregister) {
     void vscode.window.showInformationMessage('DevSpec: token saved. Re-registering MCP server.')
-    await registerMcpServer({ force: true })
+    await registerMcpServer({ force: true, context: extensionContext })
   }
   return entered
 }
 
-async function registerMcpServer({ force }: { force: boolean }): Promise<void> {
+async function registerMcpServer({
+  force,
+  context,
+}: {
+  force: boolean
+  context?: vscode.ExtensionContext
+}): Promise<void> {
   const config = vscode.workspace.getConfiguration('devspec')
   let apiUrl = (config.get<string>('apiUrl') ?? '').replace(/\/+$/, '')
   let token = config.get<string>('mcpToken') ?? ''
@@ -209,6 +227,9 @@ async function registerMcpServer({ force }: { force: boolean }): Promise<void> {
   }
   const existing = mcpConfig.mcpServers!.devspec
   if (!force && JSON.stringify(existing) === JSON.stringify(desired)) {
+    if (context) {
+      void offerInstallProjectRules(context, context.extensionPath)
+    }
     return
   }
 
@@ -219,5 +240,9 @@ async function registerMcpServer({ force }: { force: boolean }): Promise<void> {
     void vscode.window.showInformationMessage(
       'DevSpec: MCP server registered in ~/.cursor/mcp.json. Restart Cursor to pick it up.',
     )
+  }
+
+  if (context) {
+    void offerInstallProjectRules(context, context.extensionPath)
   }
 }

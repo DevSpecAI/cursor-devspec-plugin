@@ -2,7 +2,7 @@
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run autopilot, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "publisher": "devspecai",
   "license": "MIT",
   "author": {
@@ -31,7 +31,8 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:devspec.installProjectRules"
   ],
   "contributes": {
     "commands": [
@@ -104,6 +105,11 @@
         "command": "devspec.registerMcpServer",
         "title": "DevSpec: Register MCP server in Cursor config",
         "category": "DevSpec"
+      },
+      {
+        "command": "devspec.installProjectRules",
+        "title": "DevSpec: Install rules",
+        "category": "DevSpec"
       }
     ],
     "configuration": {
@@ -118,7 +124,18 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "DevSpec MCP token (starts with `dvs_`). Generate one in **Project Settings → Integrations** in the DevSpec UI. Stored per-machine."
+          "markdownDescription": "DevSpec MCP token (starts with `dvs_`). Generate one at **You → Connections** in the DevSpec UI. Stored per-machine."
+        },
+        "devspec.autoInstallRules": {
+          "type": "string",
+          "enum": ["prompt", "always", "never"],
+          "default": "always",
+          "enumDescriptions": [
+            "Ask once per workspace when MCP is configured",
+            "Install `.cursor/rules/devspec.mdc` automatically in git repos",
+            "Never offer or install project rules"
+          ],
+          "description": "How the extension installs DevSpec agent rules into the workspace."
         }
       }
     }

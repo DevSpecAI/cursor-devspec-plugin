@@ -9,7 +9,8 @@ This is the Cursor counterpart to the [Claude Code](https://github.com/DevSpecAI
 The extension does two things:
 
 1. **Auto-registers a DevSpec MCP server** in `~/.cursor/mcp.json` so Cursor's chat agent can call DevSpec tools (list action items, claim work, generate commit messages, link commits, etc.).
-2. **Adds twelve DevSpec commands** to Cursor's command palette. Each loads a curated `SKILL.md` prompt (dot-named to match Claude), optionally prompts for input, and copies the combined prompt to the clipboard so you can paste it into Cursor chat.
+2. **Optionally installs project rules** at `.cursor/rules/devspec.mdc` — always-on guidance to check DevSpec first, create/claim action items before editing, and tag commits. Installed automatically in git repos on first connect (configurable); or run **`DevSpec: Install rules`** manually.
+3. **Adds twelve DevSpec commands** to Cursor's command palette. Each loads a curated `SKILL.md` prompt (dot-named to match Claude), optionally prompts for input, and copies the combined prompt to the clipboard so you can paste it into Cursor chat.
 
 ### Work & planning
 
@@ -46,12 +47,14 @@ Commits include a `[devspec:<id>]` tag so DevSpec's deployment webhook can link 
 
 ## Installation
 
-### From VSIX (recommended)
+### From VSIX
 
 1. Download the latest `devspec-autopilot.vsix` from the [Releases](https://github.com/DevSpecAI/cursor-devspec-plugin/releases) page.
 2. In Cursor: `Ctrl+Shift+P` → **Extensions: Install from VSIX…** → select the file.
-3. After install, run **`DevSpec: Set MCP token`** and paste a token from **Project Settings → Integrations**.
-4. Restart Cursor so the new MCP server is loaded.
+3. **Restart Cursor** (`Ctrl+Shift+P` → **Developer: Reload Window**). New commands and the MCP server do not load until the extension host reloads.
+4. Run **`DevSpec: Set MCP token`** and paste a token from **You → Connections** in DevSpec.
+5. **Install project rules** — the extension writes `.cursor/rules/devspec.mdc` (always-on DevSpec workflow guidance). It installs automatically by default when MCP connects; if missing, run **`DevSpec: Install rules`** from the command palette (git repo required).
+6. Open a **new Agent chat** (`Ctrl+L`) and run **DevSpec: Verify connection** to confirm everything works.
 
 ### From source
 
@@ -81,8 +84,17 @@ Settings (Cursor: `File → Preferences → Settings`, search "DevSpec"):
 |---|---|---|
 | `devspec.apiUrl` | _(empty)_ | DevSpec API URL. Prompted on first connect. |
 | `devspec.mcpToken` | _(empty)_ | DevSpec MCP token (starts with `dvs_`). Per-machine. |
+| `devspec.autoInstallRules` | `always` | `prompt` · `always` · `never` — install `.cursor/rules/devspec.mdc` in git repos. |
 
-On first activation the extension shows a "Connect now?" notification. You can re-register any time with **`DevSpec: Register MCP server in Cursor config`**, or update the token with **`DevSpec: Set MCP token`**.
+On first activation the extension shows a "Connect now?" notification. You can re-register any time with **`DevSpec: Register MCP server in Cursor config`**, update the token with **`DevSpec: Set MCP token`**, or install rules with **`DevSpec: Install rules`**.
+
+### DevSpec commands do not appear after install
+
+Restart Cursor (`Ctrl+Shift+P` → **Developer: Reload Window**). Installing a VSIX updates files on disk but the running extension host keeps the old version until reload.
+
+### Project rules file missing
+
+Run **`DevSpec: Install rules`** (`Ctrl+Shift+P`). The file lands at `.cursor/rules/devspec.mdc` in your git repo root. Default setting `devspec.autoInstallRules` is `always` — rules install on first connect; set to `prompt` to ask each workspace, or `never` to skip.
 
 ## Usage
 
