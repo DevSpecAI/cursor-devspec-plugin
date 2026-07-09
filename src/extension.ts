@@ -93,6 +93,9 @@ let extensionContext: vscode.ExtensionContext | undefined
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   extensionContext = context
+  // URI handler first — must be registered before other activate work when opened via onUri.
+  registerRepoFolderFeatures(context)
+
   for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(meta.command, () => runSkill(context, skillId, meta)),
@@ -109,7 +112,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
   )
 
-  registerRepoFolderFeatures(context)
   void registerMcpServer({ force: false, context })
 }
 

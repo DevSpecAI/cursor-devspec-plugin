@@ -9,7 +9,7 @@ This is the Cursor counterpart to the [Claude Code](https://github.com/DevSpecAI
 The extension does two things:
 
 1. **Auto-registers a DevSpec MCP server** in `~/.cursor/mcp.json` so Cursor's chat agent can call DevSpec tools (list action items, claim work, generate commit messages, link commits, etc.).
-2. **Optionally installs project rules** at `.cursor/rules/devspec.mdc` — always-on guidance to check DevSpec first, create/claim action items before editing, and tag commits. Installed automatically in git repos on first connect (configurable); or run **`DevSpec: Install rules`** manually.
+2. **Optionally installs project rules** at `.cursor/rules/devspec.mdc` — always-on guidance to check DevSpec first, create/claim action items before editing, commit/push per MCP execution settings, and tag commits. Installed automatically in git repos on first connect (configurable); upgraded automatically when the bundled rules version increases; or run **`DevSpec: Install rules`** manually.
 3. **Adds twelve DevSpec commands** to Cursor's command palette. Each loads a curated `SKILL.md` prompt (dot-named to match Claude), optionally prompts for input, and copies the combined prompt to the clipboard so you can paste it into Cursor chat.
 
 ### Work & planning
@@ -34,15 +34,19 @@ The extension does two things:
 
 ### Rocket-button deep links (open project from DevSpec)
 
-When you click **Open in Cursor** on the DevSpec web app, DevSpec sends:
+When you click **Open in Cursor** on the DevSpec web app, DevSpec opens:
 
-`cursor://devspecai.devspec-autopilot/open?repo=owner/name`
+`http://127.0.0.1:42731/open?repo=owner/name`
+
+(in a small browser tab). The installed **DevSpec Autopilot** extension listens on that localhost port and resolves the GitHub slug to your local clone. We use localhost instead of `cursor://devspecai.devspec-autopilot/...` because Cursor treats extension-id deeplinks as marketplace install links.
 
 This extension resolves that GitHub slug to a folder on your machine:
 
 1. **Auto-learn** — while active in a git workspace, it records `origin` → folder automatically.
 2. **One-time picker** — the first time a slug has no mapping, choose the local clone once; the choice is saved.
 3. **Manage mappings** — run **`DevSpec: Manage repo folder mappings`** to re-point or forget a stored path.
+
+You should see a brief **"DevSpec: opening Owner/Repo…"** toast in Cursor when the link is handled. If the browser tab says the connection was refused, reload Cursor after installing the extension — the localhost server starts on extension activation.
 
 DevSpec never receives or stores your local filesystem paths.
 

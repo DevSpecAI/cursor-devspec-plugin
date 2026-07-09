@@ -3,7 +3,7 @@ description: DevSpec workflow — track work, use MCP, tag commits
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:3 -->
+<!-- devspec-autopilot-rules:4 -->
 
 ## Working with DevSpec
 
@@ -16,6 +16,7 @@ This workspace is connected to DevSpec over MCP (`devspec` server). In Cursor, M
 1. Confirm DevSpec MCP is reachable (`devspec__list_projects` or `devspec__verify_agent_connection`). If not, tell the user and **do not proceed with tracked work** until it is fixed.
 2. If `.cursor/rules/devspec.mdc` is missing, run **DevSpec: Install rules** (or ask the user to) before other edits.
 3. Resolve the project from git (see below) before project-scoped calls.
+4. Load execution settings from MCP (see **Execution settings** below) before the first file edit on action-item work.
 
 ### Track work before you edit (hard gate)
 
@@ -30,6 +31,34 @@ Before the **first file edit**:
 If DevSpec MCP is unavailable, stop and tell the user — do not silently proceed.
 
 For structured workflows (implement, brainstorm, one-shot autopilot), use the command palette: **Ctrl+Shift+P** → **DevSpec** → pick a skill and paste into a **new** Agent chat.
+
+### Execution settings (MCP — read before implementing)
+
+At the start of any action-item implementation, call `devspec__get_project_summary({ project_id })` (or read `repos` + `execution` from `devspec__get_next_work_item` when picking up staged work).
+
+Read these fields — they override local assumptions about branches and whether to push:
+
+- **`execution`** (canonical; prefer over deprecated `local_plugin_settings` / `autopilot` execution fields):
+  - `auto_push` — when true, push after commit **without asking the user**
+  - `auto_merge` — when true, merge to the repo's target branch after push (implies push)
+  - `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `test_commands`, `protected_paths`
+- **`repos`** — each tracked repo: `{ full_name, target_branch, default_branch }`
+  - Match `git remote get-url origin` to `full_name` (case-insensitive; ignore `.git` and ssh vs https)
+  - Push/merge target = `target_branch` if set, else `default_branch`
+  - Multi-repo items: each changed repo pushes to **its own** resolved branch — never one global branch
+
+### Ship loop (do not stop at local changes)
+
+For claimed or staged action-item work, after tests pass:
+
+1. **Commit** — stage only your changed files; message ends with `[devspec:<full-item-uuid>]`
+2. **Push** — if `execution.auto_push` or `execution.auto_merge` is true, push to that repo's resolved `target_branch` **without waiting for the user to ask**
+3. **Merge** — if `execution.auto_merge` is true, merge the feature branch into the same repo's `target_branch` and push
+4. **Record** — `devspec__add_implementation_note`, `devspec__add_commit_reference`, then `devspec__record_implementation` (lands at **implemented**, not done — a human verifies)
+
+**Never** end action-item work with only local uncommitted or unpushed changes when `auto_push` is true — that leaves DevSpec out of sync and blocks deployment tracking.
+
+Non-DevSpec exploratory edits (no action item) may still wait for explicit user approval to commit.
 
 ### Everyday rules
 

@@ -1,12 +1,14 @@
 import * as vscode from 'vscode'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { DEVSPEC_LOCAL_OPEN_BASE, startLocalOpenServer } from './local-open-server'
 
 const execFileAsync = promisify(execFile)
 
-/** Matches DevSpec launch URLs: cursor://devspecai.devspec-autopilot/open?repo=owner/name */
+/** Legacy cursor:// handler (marketplace install on external links — prefer localhost). */
 export const CURSOR_URI_OPEN_SCHEME = 'cursor://devspecai.devspec-autopilot/open'
-
+/** Browser handoff URL — keep port/path in sync with DevSpecV2 connect-clients. */
+export { DEVSPEC_LOCAL_OPEN_BASE }
 const GLOBAL_STATE_KEY = 'devspec.repoFolderMap'
 
 export type RepoFolderMap = Record<string, string>
@@ -115,38 +117,45 @@ export async function openLocalFolder(folderPath: string): Promise<void> {
   })
 }
 
+export async function openRepoBySlug(
+  context: vscode.ExtensionContext,
+  slug: string,
+): Promise<void> {
+  void vscode.window.showInformationMessage(`DevSpec: opening ${slug}…`)
+
+  const stored = getRepoFolderMap(context)[slug]
+  const folderPath =
+    stored && (await folderPathExists(stored))
+      ? stored
+      : await resolveRepoFolder(context, slug)
+
+  if (!folderPath) {
+    void vscode.window.showInformationMessage(`DevSpec: no folder selected for ${slug}.`)
+    return
+  }
+
+  await openLocalFolder(folderPath)
+}
+
 export function createUriHandler(context: vscode.ExtensionContext): vscode.UriHandler {
   return {
     handleUri: async (uri: vscode.Uri) => {
       const route = uri.path.replace(/^\//, '')
-      if (route !== 'open') {
+      const repo = new URLSearchParams(uri.query).get('repo')
+
+      if (route && route !== 'open') {
         void vscode.window.showWarningMessage(`DevSpec: unrecognized URI route "${route}".`)
         return
       }
-
-      const repo = new URLSearchParams(uri.query).get('repo')
       if (!repo) {
         void vscode.window.showErrorMessage('DevSpec: missing repo query parameter.')
         return
       }
 
-      const slug = decodeURIComponent(repo)
-      const stored = getRepoFolderMap(context)[slug]
-      const folderPath =
-        stored && (await folderPathExists(stored))
-          ? stored
-          : await resolveRepoFolder(context, slug)
-
-      if (!folderPath) {
-        void vscode.window.showInformationMessage(`DevSpec: no folder selected for ${slug}.`)
-        return
-      }
-
-      await openLocalFolder(folderPath)
+      await openRepoBySlug(context, decodeURIComponent(repo))
     },
   }
 }
-
 export async function manageRepoFolderMappings(context: vscode.ExtensionContext): Promise<void> {
   const map = getRepoFolderMap(context)
   const slugs = Object.keys(map).sort()
@@ -189,8 +198,8 @@ export async function manageRepoFolderMappings(context: vscode.ExtensionContext)
 }
 
 export function registerRepoFolderFeatures(context: vscode.ExtensionContext): void {
+  startLocalOpenServer(context, (slug) => openRepoBySlug(context, slug))
   context.subscriptions.push(vscode.window.registerUriHandler(createUriHandler(context)))
-
   context.subscriptions.push(
     vscode.commands.registerCommand('devspec.forgetRepoFolder', () =>
       manageRepoFolderMappings(context),

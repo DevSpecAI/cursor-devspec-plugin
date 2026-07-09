@@ -7,8 +7,19 @@ export const RULES_MARKER = /<!-- devspec-autopilot-rules:(\d+) -->/
 
 export const RULES_RELATIVE_PATH = path.join('.cursor', 'rules', 'devspec.mdc')
 
+export function rulesVersion(content: string): number | null {
+  const match = content.match(RULES_MARKER)
+  return match ? Number(match[1]) : null
+}
+
 export async function readBundledRules(extensionPath: string): Promise<string> {
   return fs.readFile(path.join(extensionPath, 'rules', 'devspec.mdc'), 'utf8')
+}
+
+function shouldUpgradeRules(existing: string, bundled: string): boolean {
+  const installed = rulesVersion(existing)
+  const latest = rulesVersion(bundled)
+  return installed !== null && latest !== null && latest > installed
 }
 
 export async function installProjectRules(
@@ -31,11 +42,14 @@ export async function installProjectRules(
   try {
     const existing = await fs.readFile(targetPath, 'utf8')
     if (!opts.overwrite) {
-      if (RULES_MARKER.test(existing)) {
+      if (shouldUpgradeRules(existing, bundled)) {
+        // Bundled rules are newer — fall through and overwrite.
+      } else if (RULES_MARKER.test(existing)) {
+        return 'skipped_exists'
+      } else if (existing.trim().length > 0) {
+        // User-owned file at the canonical path — do not clobber.
         return 'skipped_exists'
       }
-      // User-owned file at the canonical path — do not clobber.
-      return 'skipped_exists'
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
@@ -62,34 +76,51 @@ export async function offerInstallProjectRules(
     if (context.workspaceState.get<boolean>(skipKey)) continue
 
     const targetPath = path.join(folder.uri.fsPath, RULES_RELATIVE_PATH)
+    const bundled = await readBundledRules(extensionPath)
+    let existing: string | null = null
     try {
-      const existing = await fs.readFile(targetPath, 'utf8')
-      if (RULES_MARKER.test(existing)) continue
-      if (existing.trim().length > 0) continue
+      existing = await fs.readFile(targetPath, 'utf8')
+      if (existing && !shouldUpgradeRules(existing, bundled)) {
+        if (RULES_MARKER.test(existing)) continue
+        if (existing.trim().length > 0) continue
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') continue
     }
+
+    const upgrading =
+      existing !== null && shouldUpgradeRules(existing, bundled)
+    const installedVer = existing ? rulesVersion(existing) : null
+    const bundledVer = rulesVersion(bundled)
 
     if (mode === 'always') {
       const result = await installProjectRules(extensionPath, folder)
       if (result === 'installed') {
         void vscode.window.showInformationMessage(
-          `DevSpec: installed ${RULES_RELATIVE_PATH} in ${folder.name}.`,
+          upgrading
+            ? `DevSpec: upgraded ${RULES_RELATIVE_PATH} in ${folder.name} (v${installedVer} → v${bundledVer}).`
+            : `DevSpec: installed ${RULES_RELATIVE_PATH} in ${folder.name}.`,
         )
       }
       continue
     }
 
     const choice = await vscode.window.showInformationMessage(
-      `DevSpec: install project rules in "${folder.name}" (${RULES_RELATIVE_PATH})?`,
-      'Install',
+      upgrading
+        ? `DevSpec: upgrade project rules in "${folder.name}" (v${installedVer} → v${bundledVer})?`
+        : `DevSpec: install project rules in "${folder.name}" (${RULES_RELATIVE_PATH})?`,
+      upgrading ? 'Upgrade' : 'Install',
       'Not now',
       "Don't ask again",
     )
-    if (choice === 'Install') {
+    if (choice === 'Install' || choice === 'Upgrade') {
       const result = await installProjectRules(extensionPath, folder)
       if (result === 'installed') {
-        void vscode.window.showInformationMessage(`DevSpec: installed ${RULES_RELATIVE_PATH}.`)
+        void vscode.window.showInformationMessage(
+          upgrading
+            ? `DevSpec: upgraded ${RULES_RELATIVE_PATH} (v${installedVer} → v${bundledVer}).`
+            : `DevSpec: installed ${RULES_RELATIVE_PATH}.`,
+        )
       } else if (result === 'skipped_no_git') {
         void vscode.window.showWarningMessage('DevSpec: open a git repository to install project rules.')
       } else {
