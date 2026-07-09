@@ -39,7 +39,8 @@ export async function installProtocolHandler(handlerCmdPath) {
 }
 
 async function installWindows(handlerCmdPath) {
-  const command = `${quoteWin(handlerCmdPath)} %1`
+  // Quote %1 so URLs with & / ? survive cmd.exe parsing (Windows protocol invoke).
+  const command = `${quoteWin(handlerCmdPath)} "%1"`
   const keys = [
     ['HKCU\\Software\\Classes\\devspec', '/ve', '/d', 'URL:DevSpec Protocol', '/f'],
     ['HKCU\\Software\\Classes\\devspec', '/v', 'URL Protocol', '/d', '', '/f'],
