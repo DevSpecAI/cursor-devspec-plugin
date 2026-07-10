@@ -67,6 +67,13 @@ async function runFromUrlArg(urlArg) {
 async function main() {
   const args = process.argv.slice(2)
 
+  // Always record invocations so silent Windows failures are diagnosable.
+  try {
+    await appendHandlerLog(`invoke argv=${JSON.stringify(args)}`)
+  } catch {
+    // ignore
+  }
+
   if (args.includes('--install')) {
     await copyInstalledArtifacts(__dirname)
     // Lazy-load so URL-only invocations (OS protocol launches) do not require
