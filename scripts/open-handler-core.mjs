@@ -221,6 +221,13 @@ export async function resolveRepoFolder(slug) {
 /** Normalize OS protocol invocations (devspec:open?x → devspec://open?x). */
 export function normalizeProtocolUrl(raw) {
   let value = String(raw ?? '').trim()
+  // Windows / Chrome sometimes wrap the URL in quotes when invoking the handler.
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim()
+  }
   if (!value) return null
   if (value.startsWith('devspec:') && !value.startsWith('devspec://')) {
     value = `devspec://${value.slice('devspec:'.length)}`
@@ -233,14 +240,28 @@ export function normalizeProtocolUrl(raw) {
 }
 
 /**
+ * True when the URL targets the handoff open path.
+ *
+ * Chrome often rewrites `devspec://open?t=…` to `devspec://open/?t=…`, which
+ * the WHATWG URL parser stores as hostname=`open` + pathname=`/`. Older forms
+ * use pathname `/open` with an empty host.
+ */
+export function isHandoffOpenUrl(url) {
+  if (!url || url.protocol !== 'devspec:') return false
+  const host = (url.hostname || '').toLowerCase()
+  const path = url.pathname || ''
+  if (host === 'open' && (path === '' || path === '/')) return true
+  if ((host === '' || host === 'localhost') && (path === '/open' || path === 'open')) return true
+  return false
+}
+
+/**
  * Parse devspec://open?repo=…&prompt=…&title=…&token=…
  * Returns null when the URL is not a supported handoff.
  */
 export function parseHandoffUrl(raw) {
   const url = normalizeProtocolUrl(raw)
-  if (!url || url.protocol !== 'devspec:') return null
-  const pathname = url.pathname || '/open'
-  if (pathname !== '/open' && pathname !== 'open') return null
+  if (!url || !isHandoffOpenUrl(url)) return null
 
   const token = url.searchParams.get('t') || url.searchParams.get('token')
   if (token) {
@@ -300,7 +321,11 @@ export async function executeHandoff({ slug, promptText, itemTitle, requireSigne
 
 export async function handleProtocolUrl(raw, opts = {}) {
   const parsed = parseHandoffUrl(raw)
-  if (!parsed) return { ok: false, error: 'bad_url' }
+  if (!parsed) {
+    const preview = String(raw ?? '').slice(0, 200)
+    await appendHandlerLog(`handoff failed: bad_url raw=${JSON.stringify(preview)}`)
+    return { ok: false, error: 'bad_url' }
+  }
   if ('error' in parsed && !parsed.slug) return { ok: false, error: parsed.error }
   if (parsed.error && !parsed.slug) return { ok: false, error: parsed.error }
 

@@ -56,7 +56,10 @@ async function runFromUrlArg(urlArg) {
     requireSignedToken: process.platform !== 'darwin',
   })
   if (!result.ok) {
-    await appendHandlerLog(`handoff failed: ${result.error}`)
+    // bad_url already logged with the raw URL preview in handleProtocolUrl
+    if (result.error !== 'bad_url') {
+      await appendHandlerLog(`handoff failed: ${result.error}`)
+    }
     process.exitCode = 1
   }
 }
