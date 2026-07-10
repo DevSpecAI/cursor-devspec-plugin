@@ -15,6 +15,7 @@ type SkillId =
   | 'devspec.create'
   | 'devspec.session-brainstorm'
   | 'devspec.remote'
+  | 'devspec.remote-stop'
   | 'devspec.verify-connection'
   | 'devspec.done'
   | 'devspec.help'
@@ -55,6 +56,10 @@ const SKILLS: Record<SkillId, SkillMeta> = {
     command: 'devspec.remote',
     promptLabel: 'Optional title or note (leave empty to connect)',
     promptPlaceholder: '--title="My local agent"  or a short note',
+  },
+  'devspec.remote-stop': {
+    command: 'devspec.remote-stop',
+    promptLabel: '',
   },
   'devspec.verify-connection': {
     command: 'devspec.verify-connection',

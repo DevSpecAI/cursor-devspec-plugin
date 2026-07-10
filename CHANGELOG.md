@@ -1,3 +1,9 @@
+## 0.3.4
+
+### Added
+
+- **`devspec.remote-stop`** — disconnect DevSpec remote control and clear the Agents-page live indicator.
+
 # Changelog
 
 ## 0.3.3

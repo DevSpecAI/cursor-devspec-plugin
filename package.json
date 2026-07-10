@@ -2,7 +2,7 @@
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, run autopilot, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "publisher": "devspecai",
   "license": "MIT",
   "author": {
@@ -60,6 +60,11 @@
       {
         "command": "devspec.remote",
         "title": "DevSpec: Connect remote control",
+        "category": "DevSpec"
+      },
+      {
+        "command": "devspec.remote-stop",
+        "title": "DevSpec: Disconnect remote control",
         "category": "DevSpec"
       },
       {
