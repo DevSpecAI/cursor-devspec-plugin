@@ -123,6 +123,11 @@
         "category": "DevSpec"
       },
       {
+        "command": "devspec.installRemoteControlHooks",
+        "title": "DevSpec: Install remote-control mirror hooks",
+        "category": "DevSpec"
+      },
+      {
         "command": "devspec.forgetRepoFolder",
         "title": "DevSpec: Manage repo folder mappings",
         "category": "DevSpec"

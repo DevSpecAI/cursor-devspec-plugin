@@ -1,10 +1,14 @@
+# Changelog
+
+## Unreleased
+
+- **Remote-control turn mirroring:** ship `hooks/scripts/mirror-turn.mjs` + poller suite; on activate, merge `UserPromptSubmit`/`beforeSubmitPrompt` + `Stop` hooks into `~/.cursor/hooks.json` so local prompts post literally (`turn_kind=local_prompt`) without model mediation. Command: **DevSpec: Install remote-control mirror hooks**.
+
 ## 0.3.4
 
 ### Added
 
 - **`devspec.remote-stop`** — disconnect DevSpec remote control and clear the Agents-page live indicator.
-
-# Changelog
 
 ## 0.3.3
 

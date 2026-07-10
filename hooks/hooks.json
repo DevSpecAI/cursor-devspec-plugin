@@ -1,0 +1,27 @@
+{
+  "description": "DevSpec remote-control turn mirroring (UserPromptSubmit/Stop). The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" user_prompt",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

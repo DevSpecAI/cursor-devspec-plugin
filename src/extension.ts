@@ -108,6 +108,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerRepoFolderFeatures(context)
   registerProtocolHandlerCommands(context)
   installProtocolHandler(context.extensionPath)
+  // Wire remote-control turn mirroring into Cursor Agent hooks (UserPromptSubmit/Stop).
+  void installRemoteControlHooks(context.extensionPath)
 
   for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
     context.subscriptions.push(
@@ -123,9 +125,110 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('devspec.installProjectRules', () =>
       installProjectRulesCommand(context, context.extensionPath),
     ),
+    vscode.commands.registerCommand('devspec.installRemoteControlHooks', () =>
+      installRemoteControlHooks(context.extensionPath, { forceNotify: true }),
+    ),
   )
 
   void registerMcpServer({ force: false, context })
+}
+
+/**
+ * Merge DevSpec remote-control mirror hooks into ~/.cursor/hooks.json so
+ * beforeSubmitPrompt / stop fire mirror-turn.mjs (literal local prompts + replies).
+ * Idempotent: rewrites only our marker-tagged entries; leaves other hooks alone.
+ */
+async function installRemoteControlHooks(
+  extensionPath: string,
+  opts: { forceNotify?: boolean } = {},
+): Promise<void> {
+  const mirrorScript = path.join(extensionPath, 'hooks', 'scripts', 'mirror-turn.mjs')
+  try {
+    await fs.access(mirrorScript)
+  } catch {
+    if (opts.forceNotify) {
+      void vscode.window.showWarningMessage(
+        'DevSpec: mirror-turn.mjs not found in the extension — reinstall the plugin.',
+      )
+    }
+    return
+  }
+
+  const hooksPath = path.join(os.homedir(), '.cursor', 'hooks.json')
+  type HookCmd = { command?: string; type?: string; timeout?: number; [k: string]: unknown }
+  type HookGroup = { hooks?: HookCmd[]; matcher?: string; [k: string]: unknown }
+  type HooksFile = { hooks?: Record<string, HookGroup[] | HookCmd[]>; [k: string]: unknown }
+
+  let file: HooksFile = { hooks: {} }
+  try {
+    const raw = await fs.readFile(hooksPath, 'utf8')
+    file = JSON.parse(raw) as HooksFile
+    if (!file.hooks || typeof file.hooks !== 'object') file.hooks = {}
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (opts.forceNotify) {
+        void vscode.window.showErrorMessage(`DevSpec: could not read ${hooksPath}`)
+      }
+      return
+    }
+    await fs.mkdir(path.dirname(hooksPath), { recursive: true })
+  }
+
+  const marker = 'devspec-remote-mirror'
+  const userPromptCmd = `node "${mirrorScript}" user_prompt # ${marker}`
+  const stopCmd = `node "${mirrorScript}" stop # ${marker}`
+
+  const isOurs = (cmd: unknown) =>
+    typeof cmd === 'string' && (cmd.includes(marker) || cmd.includes('mirror-turn.mjs'))
+
+  const stripOursFromGroups = (groups: unknown): HookGroup[] => {
+    if (!Array.isArray(groups)) return []
+    return groups
+      .map((g) => {
+        if (!g || typeof g !== 'object') return null
+        const group = g as HookGroup
+        if (Array.isArray(group.hooks)) {
+          const hooks = group.hooks.filter((h) => !isOurs(h?.command))
+          if (hooks.length === 0) return null
+          return { ...group, hooks }
+        }
+        // Flat Cursor style: { command: "..." }
+        if (isOurs((group as HookCmd).command)) return null
+        return group
+      })
+      .filter(Boolean) as HookGroup[]
+  }
+
+  const hooks = file.hooks!
+  // Cursor native: beforeSubmitPrompt / stop (camelCase). Also keep UserPromptSubmit/Stop
+  // for harnesses that load this file with Claude-compatible names.
+  for (const key of ['beforeSubmitPrompt', 'UserPromptSubmit', 'stop', 'Stop'] as const) {
+    hooks[key] = stripOursFromGroups(hooks[key])
+  }
+
+  const pushClaudeStyle = (event: string, command: string) => {
+    const list = (hooks[event] as HookGroup[]) || []
+    list.push({ hooks: [{ type: 'command', command, timeout: 30 }] })
+    hooks[event] = list
+  }
+  const pushCursorStyle = (event: string, command: string) => {
+    const list = (hooks[event] as HookGroup[]) || []
+    list.push({ command })
+    hooks[event] = list
+  }
+
+  pushCursorStyle('beforeSubmitPrompt', userPromptCmd)
+  pushCursorStyle('stop', stopCmd)
+  pushClaudeStyle('UserPromptSubmit', userPromptCmd)
+  pushClaudeStyle('Stop', stopCmd)
+
+  file.hooks = hooks
+  await fs.writeFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf8')
+  if (opts.forceNotify) {
+    void vscode.window.showInformationMessage(
+      'DevSpec: remote-control mirror hooks installed in ~/.cursor/hooks.json',
+    )
+  }
 }
 
 export function deactivate(): void {
