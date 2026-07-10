@@ -14,6 +14,7 @@ type SkillId =
   | 'devspec.brainstorm'
   | 'devspec.create'
   | 'devspec.session-brainstorm'
+  | 'devspec.remote'
   | 'devspec.verify-connection'
   | 'devspec.done'
   | 'devspec.help'
@@ -49,6 +50,11 @@ const SKILLS: Record<SkillId, SkillMeta> = {
     command: 'devspec.session-brainstorm',
     promptLabel: 'Session handoff arguments',
     promptPlaceholder: 'mode=answer session_id=<uuid>  or  mode=brainstorm session_id=<uuid>',
+  },
+  'devspec.remote': {
+    command: 'devspec.remote',
+    promptLabel: 'Optional title or note (leave empty to connect)',
+    promptPlaceholder: '--title="My local agent"  or a short note',
   },
   'devspec.verify-connection': {
     command: 'devspec.verify-connection',

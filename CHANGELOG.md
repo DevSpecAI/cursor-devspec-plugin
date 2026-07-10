@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+### Added
+
+- **`devspec.remote`** — connect this Cursor agent as a DevSpec remote-control target (private Agents-page channel). Command palette: **DevSpec: Connect remote control**. Distinct from Claude Code's built-in `/remote-control`.
+
 ## 0.3.0
 
 ### Changed — `devspec://` protocol handler replaces always-on localhost bridge
