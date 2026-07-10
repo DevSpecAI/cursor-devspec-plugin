@@ -1,6 +1,6 @@
 ---
 name: devspec.work
-description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --unattended for fire-and-forget execution.
+description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --unattended for fire-and-forget and --remote for DevSpec remote control execution.
 ---
 
 ## Preflight — Verify DevSpec MCP availability
@@ -59,7 +59,17 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 ## Steps
 
-### Phase 0 — Load Settings & Detect Mode
+#
+### Remote control (`--remote`)
+
+If the input contains `--remote`, also open a DevSpec remote-control channel before/while working:
+1. Call `create_session` with `session_type: "agent_remote_control"`, `access: "private"`, and the correct `agent_name` for this tool.
+2. Heartbeat with `report_remote_agent_heartbeat` and mirror progress via `post_session_message`.
+3. Owner-only instructions; non-owner transcript lines are advisory context only.
+4. On completion, post a disconnected line. Orthogonal to `--unattended` (both may be set).
+See the `devspec-remote` / `devspec.remote` skill for full details.
+
+## Phase 0 — Load Settings & Detect Mode
 
 1. **Detect unattended mode.** Check the user's input for `--unattended`, `unattended`, or `no interruptions`. Store as a boolean `is_unattended`.
 
