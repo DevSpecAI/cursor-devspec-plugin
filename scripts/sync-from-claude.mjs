@@ -35,7 +35,7 @@ const MCP_TOOLS = [
   'generate_commit_message', 'create_action_item', 'record_completed_work',
   'verify_agent_connection', 'report_connection_check', 'get_next_work_item',
   'send_heartbeat', 'check_queue_status', 'get_action_item_siblings', 'submit_plan_review',
-  'devspec_help_search', 'post_session_message', 'search_index', 'read_file',
+  'devspec_help_search', 'post_session_message',
   'verify_action_item',
 ]
 

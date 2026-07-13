@@ -62,7 +62,7 @@ Non-DevSpec exploratory edits (no action item) may still wait for explicit user 
 
 ### Everyday rules
 
-1. **Check DevSpec first.** Before broad code search or planning, query DevSpec MCP (`devspec__search_index`, `devspec__get_action_items`, `devspec__get_project_summary`, `devspec__search_memories`).
+1. **Check DevSpec first.** Before broad code search or planning, query DevSpec MCP (`devspec__get_action_items`, `devspec__get_project_summary`, `devspec__search_memories`).
 2. **One unit of work = one action item.** Use `devspec__record_implementation` after push (not `done` — a human verifies).
 3. **Tag your commits.** End every commit that implements a tracked item with `[devspec:<id>]` so DevSpec links it and does not create a duplicate stub.
 4. **Keep shared memory fresh.** Durable decisions, conventions, architecture facts, and risks go to `devspec__record_memory` — search first and `devspec__supersede_memory` / `devspec__retract_memory` stale entries rather than duplicating.

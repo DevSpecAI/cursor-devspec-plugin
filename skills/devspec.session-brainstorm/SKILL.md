@@ -54,7 +54,7 @@ This command is normally launched by the "Continue in Local Agent" button in the
 5. **Branch on `mode`:**
 
    ### mode = answer  (one-shot)
-   - Investigate here in this repository — read the relevant code (`Read`/`Grep`/`Glob`, `search_index`, `search_memories`, run read-only commands as needed) to ground your answer in the real codebase.
+   - Investigate here in this repository — read the relevant code (`Read`/`Grep`/`Glob`, `search_memories`, run read-only commands as needed) to ground your answer in the real codebase.
    - When you have findings, post them back **once**:
      `devspec__post_session_message(session_id: <session_id>, message: <your findings as markdown>)`.
    - Use clear markdown — a short summary line, then specifics (files, `code`, bullet lists). Post directly to the session; do not leave comments on items. Create action items only when the session conversation explicitly asks for them — and then follow the **Action items belong to the session** rule below.
