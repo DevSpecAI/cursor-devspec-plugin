@@ -10,7 +10,25 @@ import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const CURSOR_ROOT = join(__dirname, '..')
-const CLAUDE_ROOT = join(CURSOR_ROOT, '..', 'claude-code-devspec-autopilot')
+// Locate the Claude Code plugin (the source of truth). Prefer an explicit env
+// override, then known checkout layouts: the Claude plugin as a sibling of this
+// repo, or under a separate "DevSpec Autopilot Plugin" parent. Fail with a clear
+// message rather than an opaque ENOENT when none is found.
+const CLAUDE_ROOT = (() => {
+  const candidates = [
+    process.env.DEVSPEC_CLAUDE_PLUGIN_ROOT,
+    join(CURSOR_ROOT, '..', 'claude-code-devspec-autopilot'),
+    join(CURSOR_ROOT, '..', '..', 'DevSpec Autopilot Plugin', 'claude-code-devspec-autopilot'),
+  ].filter(Boolean)
+  const found = candidates.find((c) => existsSync(join(c, 'commands')))
+  if (found) return found
+  console.error(
+    '✗ Could not locate the Claude Code plugin (source of truth). Tried:\n' +
+      candidates.map((c) => '  - ' + c).join('\n') +
+      '\nSet DEVSPEC_CLAUDE_PLUGIN_ROOT to its path and re-run.',
+  )
+  process.exit(1)
+})()
 const SKILLS_DIR = join(CURSOR_ROOT, 'skills')
 
 const DIRECT_MAP = {
@@ -202,7 +220,7 @@ Scan the user's invocation for flags (same semantics as Claude \`autopilot.start
    - Multiple candidates → ask the user which project (or stop in unattended contexts).
    - No match → \`✗ No DevSpec project tracks this repo (<git_remote>).\` and stop.
 
-2. Call \`devspec__get_project_summary({ project_id })\` and read \`local_plugin_settings\` + \`repos\` + \`database_targets\`.
+2. Call \`devspec__get_project_summary({ project_id })\` and read the execution settings (the unified \`execution\` block — \`auto_push\`, \`auto_merge\`, \`custom_instructions\`, \`agent_rules\`, \`test_commands\`, \`protected_paths\`, … — plus the top-level \`owner_agent_rules\`; fall back to \`local_plugin_settings\` only if \`execution\` is absent) + \`repos\` + \`database_targets\`. Treat \`custom_instructions\` (team principles) and \`agent_rules\` + \`owner_agent_rules\` (execution mechanics) as mandatory when set.
 
 3. Record \`starting_branch\` via \`git branch --show-current\`.
 

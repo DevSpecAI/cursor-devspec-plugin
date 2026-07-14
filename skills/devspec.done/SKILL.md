@@ -34,7 +34,7 @@ Record work that was completed outside DevSpec's action item workflow. Creates a
    - `git branch --show-current` to get branch name
    - `git log --format="%H %s" -10` to get full SHAs and messages
 
-1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve the project per run — name the project this work belongs to. Call `devspec__list_projects({ git_remote: "<remote from step 1>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. Pass `project_id` on the `record_completed_work` call in step 4.
+1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so name the project this work belongs to. Call `devspec__list_projects({ git_remote: "<remote from step 1>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. Pass `project_id` on the `record_completed_work` call in step 4.
 
 2. **If no recent commits exist**, ask the user for a title and what they implemented, then skip to step 4.
 

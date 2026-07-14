@@ -43,7 +43,7 @@ Scan the user's invocation for flags (same semantics as Claude `autopilot.start`
    - Multiple candidates → ask the user which project (or stop in unattended contexts).
    - No match → `✗ No DevSpec project tracks this repo (<git_remote>).` and stop.
 
-2. Call `devspec__get_project_summary({ project_id })` and read the execution settings (the unified `execution` block, or `local_plugin_settings` as a fallback) + `repos` + `database_targets`. From the execution settings read `custom_instructions` (team **Principles** — philosophy/quality bar) and `agent_rules` (team **Agent Execution Rules** — build/test/ship mechanics), and also read the top-level **`owner_agent_rules`** (the runner owner's **Personal Agent Rules** — machine/tooling; `agent_rules: ""` / `owner_agent_rules` may be absent). Store all three and treat each as a mandatory requirement during implementation when set: `custom_instructions` shapes *how* you build, while `agent_rules` + `owner_agent_rules` are concrete execution mechanics for a coding agent — run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling (these apply to you). Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
+2. Call `devspec__get_project_summary({ project_id })` and read the execution settings (the unified `execution` block — `auto_push`, `auto_merge`, `custom_instructions`, `agent_rules`, `test_commands`, `protected_paths`, … — plus the top-level `owner_agent_rules`; fall back to `local_plugin_settings` only if `execution` is absent) + `repos` + `database_targets`. Treat `custom_instructions` (team principles) and `agent_rules` + `owner_agent_rules` (execution mechanics) as mandatory when set.
 
 3. Record `starting_branch` via `git branch --show-current`.
 
@@ -149,7 +149,7 @@ Processes only the items **you authored**, no matter who they are assigned to. B
 
 ### Force-claim is NOT used by default
 
-A `force: true` flag on `claim_work_item` bypasses the assignee-aware claim guard. The autopilot loop **MUST NOT** pass `force: true`. If `claim_work_item` rejects with an `assigned to other users` error, treat it like any other claim rejection: log it, move on to the next item, and let the assignee pick the work up themselves.
+`claim_work_item` accepts a `force: true` flag that bypasses the assignee-aware claim guard. The autopilot loop **MUST NOT** pass `force: true`. If `claim_work_item` rejects with an `assigned to other users` error, treat it like any other claim rejection: log it, move on to the next item, and let the assignee pick the work up themselves. The loop never overrides someone else's claim.
 
 ## Steps
 

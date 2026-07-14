@@ -46,7 +46,7 @@ On an error, print `✗ DevSpec connection failed: {error}` and suggest checking
 
 1. **Extract the verification ID** (a UUID) from the user input.
 
-1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve the project per run — name the project before calling `get_project_summary`. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. (`report_connection_check` self-resolves its project from the `verification_id` and takes no `project_id`.)
+1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so name the project before calling `get_project_summary`. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. (`report_connection_check` self-resolves its project from the `verification_id` and takes no `project_id`.)
 
 2. **Fetch the target repos.** Call `devspec__get_project_summary({ project_id })` and read its `repos` array — each entry is `{ id, full_name, target_branch, default_branch }`. This is the authoritative per-repo branch map; do NOT guess branches and do NOT ask the user for them. The branch to push for a repo is `target_branch` if set, otherwise `default_branch`, otherwise `main`.
 

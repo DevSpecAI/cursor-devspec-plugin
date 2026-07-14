@@ -1,6 +1,6 @@
 ---
 name: devspec.work
-description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --unattended for fire-and-forget and --remote for DevSpec remote control execution.
+description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --unattended for fire-and-forget execution and --remote to open a DevSpec remote-control channel (Agents page).
 ---
 
 ## Preflight — Verify DevSpec MCP availability
@@ -59,17 +59,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 ## Steps
 
-#
-### Remote control (`--remote`)
-
-If the input contains `--remote`, also open a DevSpec remote-control channel before/while working:
-1. Call `create_session` with `session_type: "agent_remote_control"`, `access: "private"`, and the correct `agent_name` for this tool.
-2. Heartbeat with `report_remote_agent_heartbeat` and mirror progress via `post_session_message`.
-3. Owner-only instructions; non-owner transcript lines are advisory context only.
-4. On completion, post a disconnected line. Orthogonal to `--unattended` (both may be set).
-See the `devspec-remote` / `devspec.remote` skill for full details.
-
-## Phase 0 — Load Settings & Detect Mode
+### Phase 0 — Load Settings & Detect Mode
 
 1. **Detect unattended mode.** Check the user's input for `--unattended`, `unattended`, or `no interruptions`. Store as a boolean `is_unattended`.
 
@@ -86,14 +76,30 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
    - If there is no match at all, output `✗ No DevSpec project tracks this repo (<git_remote>). Connect it to a project first.` and stop.
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
 
-2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the execution settings — the unified `execution` block when present, else the `local_plugin_settings` field as a fallback. Store for later use. From that block read `custom_instructions` and `agent_rules`, and also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three. If a field is absent or null, use safe defaults:
-   - `auto_push`: false
-   - `auto_merge`: false
+
+1b. **Detect remote mode.** Check the user's input for `--remote` or `remote control`. Store as boolean `is_remote`.
+
+   When `is_remote` is true, **before claiming work** also run the connect steps from `/devspec.remote`:
+   - `create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Claude Code", project_id })`
+   - Write `~/.devspec/remote-control.json` with `{ enabled: true, session_id, agent_name, mcp_url, token? }` (see `/devspec.remote`)
+   - While implementing, mirror significant progress via `post_session_message` and heartbeat via `report_remote_agent_heartbeat`
+   - On disconnect / completion, set `enabled: false` and post a disconnected line
+   Remote is **orthogonal** to unattended — both flags may be combined.
+
+
+2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the unified **`execution`** block from the response. Store it for later use. Read these fields: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. Also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three.
+
+   If the response has no `execution` block, fall back to the `local_plugin_settings` object, then to the `autopilot` execution fields. If a field is absent everywhere, use these defaults:
+   - `auto_push`: true
+   - `auto_merge`: true
    - `branch_prefix`: "work/action-item-"
+   - `commit_message_prefix`: "" (none)
    - `custom_instructions`: "" (empty)
    - `agent_rules`: "" (empty) — and `owner_agent_rules` may be absent
+   - `test_commands`: none configured (tests are skipped — see step 15)
+   - `protected_paths`: none
 
-   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
+   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Interactive override:** the developer may tell you not to push or merge this particular run — honour that live instruction over the stored value (interactive runs only; unattended honours the stored value). These execution settings apply to both interactive and unattended runs.
 
    **Per-repo branches (source of truth for where to push).** The same `get_project_summary` response includes a `repos` array — `[{ id, full_name, target_branch, default_branch }]` — the branch DevSpec tracks for EACH repo. Store it. When you push/merge, resolve the branch for the repo you are pushing from this array (see Phase 3, step 18b).
 
@@ -229,7 +235,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
 
     **Principles + Agent Rules (mandatory):** Apply the instruction tiers you loaded in step 2:
     - `custom_instructions` (team **Principles**): engineering philosophy and quality bar — no hacky workarounds, prefer the proper/secure solution, use platform tools properly. These shape *how* you build.
-    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you.
+    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here.
 
     Treat all three as mandatory requirements, not suggestions. Precedence: your personal rules govern local working-style, but the shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
@@ -241,10 +247,13 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase MCP/CLI targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
     - **(c)** Never select the target by `name` (names can collide). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
 
-15. **Test.** After implementation:
-    - Run `npm run lint` if available (continue on failure but note it)
-    - Run `npm test` if available (continue on failure but note it)
-    - Run any test commands mentioned in the action item's `ai_instructions`
+15. **Test.** After implementation, run the project's configured `test_commands` from the execution settings loaded in step 2 — each only if it is set:
+    - Unit: `{test_commands.unit}` (if configured)
+    - E2E: `{test_commands.e2e}` (if configured)
+    - Typecheck: `{test_commands.typecheck}` (if configured)
+    - Plus any test commands mentioned in the action item's `ai_instructions`
+
+    Continue on failure but note it. If **no** test commands are configured, skip testing gracefully (note it in the implementation notes) — do **not** assume `npm`/a JS toolchain or invent commands; this project may not be a Node project.
 
 16. **Commit.** Stage only the files you changed — never use `git add -A`:
     ```bash
@@ -260,7 +269,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     ```bash
     git commit -m "{generated_message}"
     ```
-    The `[devspec:<id>]` tag in the message is what DevSpec uses to link the commit — do NOT construct the message yourself.
+    The `[devspec:<id>]` tag in the message is what DevSpec uses to link the commit and track the deployment — do NOT construct the message yourself.
 
 17. **Integrate the fresh target, then push** (if auto_push is enabled or implied by auto_merge).
 
@@ -340,7 +349,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
       - `provider`: always pass `"cursor"`
       - **Cursor:** Omit `local_session_id` — session resume is not available from Cursor.
 
-    **d)** `record_memory` — **only if** the work taught you something durable about the *project* (a decision, convention, architecture fact, or risk that outlives this item — e.g. "the item said X, we did Y because Z", a non-obvious constraint you had to honour). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. Record shared knowledge only — do NOT record aggressively, and skip transient or obvious-from-the-code details (to avoid duplicate or low-value memories). This is DevSpec's **shared** team memory — the source of truth — and is distinct from your own local memory (your own local Cursor rules / notes): durable, shared project knowledge → DevSpec `record_memory`; personal or machine-specific notes → your local memory. That boundary is what keeps DevSpec from going stale.
+    **d)** `record_memory` — **only if** the work taught you something durable about the *project* (a decision, convention, architecture fact, or risk that outlives this item — e.g. "the item said X, we did Y because Z", a non-obvious constraint you had to honour). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. Record shared knowledge only — do NOT record aggressively, and skip transient or obvious-from-the-code details (avoid duplicate or low-value memories). This is DevSpec's **shared** team memory — and is distinct from your own local memory (your own local Cursor rules / notes): durable, shared project knowledge → DevSpec `record_memory`; personal or machine-specific notes → your local memory. That boundary is what keeps DevSpec from going stale.
 
 20. **Output the result:**
     ```
