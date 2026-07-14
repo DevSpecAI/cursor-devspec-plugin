@@ -9,7 +9,7 @@ Cleanly disconnect **this** local agent / **this** remote-control session so the
 
 ## Multi-session safety (non-negotiable)
 
-One machine may run **several** remote-control sessions at once (multiple Grok/Claude terminals).
+One machine may run **several** remote-control sessions at once (multiple Cursor terminals).
 
 - Stop **only** the session you intend to stop (from `~/.devspec/remote-control/sessions/<uuid>.json` or `--session`).
 - **Never** kill every `devspec-remote-poll` process on the machine.
@@ -54,4 +54,4 @@ One machine may run **several** remote-control sessions at once (multiple Grok/C
 
 - Always offline **this** session even if post fails.
 - Do not delete the DevSpec session — history remains.
-- Distinct from Claude's built-in `/remote-control`.
+- Distinct from any built-in remote-control feature of your host app.

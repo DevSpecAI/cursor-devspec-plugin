@@ -38,7 +38,7 @@ At the start of any action-item implementation, call `devspec__get_project_summa
 
 Read these fields — they override local assumptions about branches and whether to push:
 
-- **`execution`** (canonical; prefer over deprecated `local_plugin_settings` / `autopilot` execution fields):
+- **`execution`** (canonical; prefer over older/fallback `local_plugin_settings` / `autopilot` execution fields):
   - `auto_push` — when true, push after commit **without asking the user**
   - `auto_merge` — when true, merge to the repo's target branch after push (implies push)
   - `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands`, `protected_paths`

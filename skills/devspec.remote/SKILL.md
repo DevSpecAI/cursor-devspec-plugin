@@ -1,6 +1,6 @@
 ---
 name: devspec.remote
-description: Connect this Cursor agent as a DevSpec remote-control target — private channel on the Agents page, mirror turns, poll for owner instructions. Not Claude's /remote-control.
+description: Connect this Cursor agent as a DevSpec remote-control target — private channel on the Agents page, mirror turns, poll for owner instructions. Distinct from any built-in remote-control feature of your host app.
 ---
 
 ## Preflight — Verify DevSpec MCP availability
@@ -12,7 +12,7 @@ description: Connect this Cursor agent as a DevSpec remote-control target — pr
 
 Connect **this** local Cursor session to DevSpec so you can be driven from the **Agents page** (or phone/web) while your work is mirrored into a private DevSpec transcript.
 
-This is **DevSpec** remote control — not Claude Code's built-in `/remote-control` (Claude mobile/desktop apps).
+This is **DevSpec** remote control — distinct from any built-in remote-control feature of your host app.
 
 **Requirement:** preferred remote-control path needs **Node.js 18+** (`node` on PATH) for the packaged poller scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens. Without Node, use the fallback in-agent poll loop (less reliable).
 
@@ -86,7 +86,7 @@ Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are *
 ### A. Continuous heartbeat poller (nohup — never exit on owner message)
 
 ```bash
-PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-grok-build-extension-*
+PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-cursor-*
 SESSION="<uuid>"
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Cursor" --cwd "$(pwd)" \
@@ -121,7 +121,6 @@ How to run wait so the model actually turns:
 | Host | How |
 |---|---|
 | **Cursor** | `monitor` tool on the wait command (each stdout line notifies the chat). When you see `type":"wake"`, act, then **re-arm wait** with `monitor` again. |
-| **Claude Code** | `run_in_background: true` on the wait command. Exit **0** → read stdout owner_message lines → act → **re-arm wait** in background. |
 
 Wait contract:
 - Does **not** heartbeat (poller does)
@@ -145,7 +144,7 @@ Poller disables state and exits 1; wait also exits 1 if it sees disabled / UI en
 
 1. Heartbeat live; 2. transcript after cursor; 3. act on owner dispatch only; 4. short sleep loop; 5. offline + local_stop on disconnect.
 
-Resolve `mcp_url` from MCP config — never hardcode production when on staging.
+Resolve `mcp_url` from MCP config; never hardcode a server URL.
 
 
 ## Interactive knowledge capture (while remote — non-negotiable)

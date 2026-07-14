@@ -7,9 +7,9 @@ When you click **Open in Cursor** on the DevSpec web app, DevSpec opens a signed
 Installing this extension and connecting DevSpec MCP **automatically**:
 
 1. **Windows / Linux:** registers `devspec://` in the OS (per-user, no admin)
-2. **macOS:** starts the localhost bridge on port **42731** (until a signed `.app` helper ships)
+2. **macOS:** starts the localhost bridge on port **42731**
 3. Copies the handler to `~/.cursor/devspec/`
-4. Removes the legacy always-on bridge + Windows login startup entry
+4. Runs on demand — no always-on bridge or Windows login startup entry
 
 You can also run **DevSpec: Install protocol handler** from the command palette.
 
@@ -25,11 +25,8 @@ bash scripts/install-protocol-handler.sh
 
 ### What happens when you click the rocket
 
-1. DevSpec signs a short-lived handoff token via `/api/cursor-handoff/sign`
-2. Browser opens `devspec://open?t=…` (anchor click — no extra tab on Windows/Linux)
-3. OS spawns the handler once (no background daemon)
-4. Cursor opens the mapped project folder
-5. ~1.5s later, Agent chat is pre-filled via `cursor://anysphere.cursor-deeplink/prompt` (press Enter to send)
+1. Cursor opens the mapped project folder.
+2. A moment later, the Agent chat is pre-filled with your prompt — press Enter to send.
 
 ### macOS health check
 
@@ -39,4 +36,4 @@ DevSpec never receives or stores your local filesystem paths.
 
 ### Signing keys
 
-Production: set `CURSOR_HANDOFF_PRIVATE_KEY_PEM` on DevSpec servers. The handler bundles `scripts/handoff-public-key.pem` for offline verification.
+The handler bundles `scripts/handoff-public-key.pem` for offline verification of the signed handoff.
