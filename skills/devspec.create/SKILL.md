@@ -27,7 +27,7 @@ Create a new action item in DevSpec without leaving the terminal.
 
 ## Steps
 
-0. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide and no longer pin a project, so name the project the item belongs to. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. Pass `project_id` on the `create_action_item` call in step 3.
+0. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve the project per run — name the project the item belongs to. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. Pass `project_id` on the `create_action_item` call in step 3.
 
 1. Extract from the user's input:
    - `title`: required — the action item title

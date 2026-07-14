@@ -43,7 +43,7 @@ Scan the user's invocation for flags (same semantics as Claude `autopilot.start`
    - Multiple candidates → ask the user which project (or stop in unattended contexts).
    - No match → `✗ No DevSpec project tracks this repo (<git_remote>).` and stop.
 
-2. Call `devspec__get_project_summary({ project_id })` and read the execution settings (the unified `execution` block, or legacy `local_plugin_settings` on older MCP versions) + `repos` + `database_targets`. From the execution settings read `custom_instructions` (team **Principles** — philosophy/quality bar) and `agent_rules` (team **Agent Execution Rules** — build/test/ship mechanics), and also read the top-level **`owner_agent_rules`** (the runner owner's **Personal Agent Rules** — machine/tooling; `agent_rules: ""` / `owner_agent_rules` absent on older MCP versions). Store all three and treat each as a mandatory requirement during implementation when set: `custom_instructions` shapes *how* you build, while `agent_rules` + `owner_agent_rules` are concrete execution mechanics for a coding agent — run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling (deliberately hidden from the in-session Dev, so they apply to you here). Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
+2. Call `devspec__get_project_summary({ project_id })` and read the execution settings (the unified `execution` block, or `local_plugin_settings` as a fallback) + `repos` + `database_targets`. From the execution settings read `custom_instructions` (team **Principles** — philosophy/quality bar) and `agent_rules` (team **Agent Execution Rules** — build/test/ship mechanics), and also read the top-level **`owner_agent_rules`** (the runner owner's **Personal Agent Rules** — machine/tooling; `agent_rules: ""` / `owner_agent_rules` may be absent). Store all three and treat each as a mandatory requirement during implementation when set: `custom_instructions` shapes *how* you build, while `agent_rules` + `owner_agent_rules` are concrete execution mechanics for a coding agent — run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling (these apply to you). Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
 3. Record `starting_branch` via `git branch --show-current`.
 
@@ -95,16 +95,16 @@ Parse `$ARGUMENTS` into independent session variables. Flags can be combined fre
 - `--project-id=<uuid>` → `project_id_override = "<uuid>"`
 - nothing → `project_id_override = null`
 
-DevSpec MCP tokens are **account-wide** — they no longer pin a project, so the runner resolves which project to operate on at startup from the workspace git remote (see the skill's Startup step 1: `devspec__list_projects({ git_remote })` → `remote_match.resolved_project_id`). Pass `--project-id=<uuid>` **only when that resolution is ambiguous** — i.e. the repo is tracked by more than one DevSpec project, so `resolved_project_id` comes back null with multiple `candidate_project_ids`. The override skips git-remote resolution and pins the run to the given project. Validate the uuid against `^[0-9a-f-]{36}$`; on failure output `✗ Invalid UUID in --project-id: <value>` and stop before entering the loop.
+DevSpec MCP tokens are **account-wide**, so the runner resolves which project to operate on at startup from the workspace git remote (see the skill's Startup step 1: `devspec__list_projects({ git_remote })` → `remote_match.resolved_project_id`). Pass `--project-id=<uuid>` **only when that resolution is ambiguous** — i.e. the repo is tracked by more than one DevSpec project, so `resolved_project_id` comes back null with multiple `candidate_project_ids`. The override skips git-remote resolution and pins the run to the given project. Validate the uuid against `^[0-9a-f-]{36}$`; on failure output `✗ Invalid UUID in --project-id: <value>` and stop before entering the loop.
 
-### `assigned_to_filter` (NEW DEFAULT — assignee-based ownership)
+### `assigned_to_filter` (default — assignee-based ownership)
 
 - `--mine` → `assigned_to_filter = "me"` (explicit; same as default)
 - `--assigned-to=<user_id>` → `assigned_to_filter = "<user_id>"` (run on a specific teammate's queue)
 - `--all` → clear `assigned_to_filter` (legacy shared-queue behaviour — see precedence below)
-- nothing → `assigned_to_filter = "me"` (NEW DEFAULT)
+- nothing → `assigned_to_filter = "me"` (default)
 
-This is passed as the `assigned_to` argument on every `get_next_work_item` call. The server-side semantic (action item ownership v1):
+This is passed as the `assigned_to` argument on every `get_next_work_item` call. The server-side semantic:
 - `assigned_to: "me"` matches items where the caller is in the assignee set **OR** the item has zero assignees (the grab-bag pool).
 - `assigned_to: "<uuid>"` matches items where that user is in the assignee set **OR** the item has zero assignees.
 - Omitted (i.e. `--all`) → no assignee filter; every item the caller can see is eligible.
@@ -114,7 +114,7 @@ This is passed as the `assigned_to` argument on every `get_next_work_item` call.
 - `--created-by=<user_id>` → `created_by_filter = "<user_id>"` (filter to items authored by that user)
 - nothing → `created_by_filter = null` (no creator filter)
 
-`created_by` is layered on top of `assigned_to` — both must match when both are set. It survives the pivot as an explicit opt-in, but is **no longer the default ownership mechanism**.
+`created_by` is layered on top of `assigned_to` — both must match when both are set. It is an explicit opt-in filter, ANDed with `assigned_to`.
 
 ### `drain_on_empty`
 
@@ -149,7 +149,7 @@ Processes only the items **you authored**, no matter who they are assigned to. B
 
 ### Force-claim is NOT used by default
 
-Sibling `360b1202` added a `force: true` flag to `claim_work_item` that bypasses the assignee-aware claim guard. The autopilot loop **MUST NOT** pass `force: true` under normal operation. If `claim_work_item` rejects with an `assigned to other users` error, treat it like any other claim rejection: log it, move on to the next item, and let the assignee pick the work up themselves. A future `--force-claim` flag may opt callers into force claiming explicitly; until that ships, the loop never overrides someone else's claim.
+A `force: true` flag on `claim_work_item` bypasses the assignee-aware claim guard. The autopilot loop **MUST NOT** pass `force: true`. If `claim_work_item` rejects with an `assigned to other users` error, treat it like any other claim rejection: log it, move on to the next item, and let the assignee pick the work up themselves.
 
 ## Steps
 

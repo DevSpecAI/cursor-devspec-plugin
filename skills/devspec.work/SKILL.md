@@ -79,19 +79,19 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
    - If a decision requires human judgment, fail the item with a documented error rather than guessing
    - If the action item name matches multiple items, auto-select the highest-priority match (or the closest title match)
 
-1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide — they no longer pin a project, so resolve which project this run targets before any project-scoped call:
+1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve which project this run targets before any project-scoped call:
    - Run `git remote get-url origin` in the workspace root and call `devspec__list_projects({ git_remote: "<that remote>" })`.
    - Read `remote_match`: use `resolved_project_id` when non-null and store it as the session variable `project_id`.
    - If it is null with multiple `candidate_project_ids` (the repo is tracked by more than one project): **interactive mode** — present the candidate projects (use the `repos`/name info `list_projects` returns) and ask the user which one to use; **unattended mode** — fail the item with `"Requires human judgment: repo tracked by multiple DevSpec projects (<candidates>) — cannot pick one unattended"`.
    - If there is no match at all, output `✗ No DevSpec project tracks this repo (<git_remote>). Connect it to a project first.` and stop.
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
 
-2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the execution settings — the unified `execution` block when present, else the legacy `local_plugin_settings` field on older MCP versions. Store for later use. From that block read `custom_instructions` and `agent_rules`, and also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three. If a field is absent or null, use safe defaults:
+2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the execution settings — the unified `execution` block when present, else the `local_plugin_settings` field as a fallback. Store for later use. From that block read `custom_instructions` and `agent_rules`, and also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three. If a field is absent or null, use safe defaults:
    - `auto_push`: false
    - `auto_merge`: false
    - `branch_prefix`: "work/action-item-"
    - `custom_instructions`: "" (empty)
-   - `agent_rules`: "" (empty) — and `owner_agent_rules` absent on older MCP versions
+   - `agent_rules`: "" (empty) — and `owner_agent_rules` may be absent
 
    If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
 
@@ -229,7 +229,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
 
     **Principles + Agent Rules (mandatory):** Apply the instruction tiers you loaded in step 2:
     - `custom_instructions` (team **Principles**): engineering philosophy and quality bar — no hacky workarounds, prefer the proper/secure solution, use platform tools properly. These shape *how* you build.
-    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here (they are deliberately hidden from the in-session Dev).
+    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you.
 
     Treat all three as mandatory requirements, not suggestions. Precedence: your personal rules govern local working-style, but the shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
@@ -239,7 +239,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     **Database migrations (if this item adds or edits a DB migration).** Do NOT assume which database to apply it to — applying to the wrong one is a real, destructive failure. The `get_project_summary` response you loaded in Phase 0 includes a `database_targets` array: each connected database with its non-secret `identity` (for Supabase, `identity.externalId` is the project ref), declared `environment`, and the `branch_name` whose migrations target it.
     - **(a)** Pick the target whose `branch_name` matches the branch you push the migration's repo to — the repo's resolved branch from the `repos` map (Phase 0 step 2 / Phase 3 step 18b) — or one with `branch_name: null` (applies to all branches).
     - **(b)** Apply the migration with your OWN database tooling pointed at that target's `identity` — for Supabase, ensure your Supabase MCP/CLI targets that exact project ref, not whatever it defaults to. DevSpec does not apply migrations for you and never hands you the credential.
-    - **(c)** Never select the target by `name` (it can be misleading — that is the bug this prevents). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
+    - **(c)** Never select the target by `name` (names can collide). If the matching target has `needs_reconnect: true` / a null `identity`, or your tooling cannot reach it, STOP and fail the item (`"Requires human judgment: cannot reach migration target <identity.externalId>"`) rather than applying to a different or default database. Be especially careful when `environment` is `production`.
 
 15. **Test.** After implementation:
     - Run `npm run lint` if available (continue on failure but note it)
@@ -260,7 +260,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
     ```bash
     git commit -m "{generated_message}"
     ```
-    The `[devspec:<id>]` tag in the message is what the deployment webhook uses to track deployments — do NOT construct the message yourself.
+    The `[devspec:<id>]` tag in the message is what DevSpec uses to link the commit — do NOT construct the message yourself.
 
 17. **Integrate the fresh target, then push** (if auto_push is enabled or implied by auto_merge).
 
@@ -340,7 +340,7 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
       - `provider`: always pass `"cursor"`
       - **Cursor:** Omit `local_session_id` — session resume is not available from Cursor.
 
-    **d)** `record_memory` — **only if** the work taught you something durable about the *project* (a decision, convention, architecture fact, or risk that outlives this item — e.g. "the item said X, we did Y because Z", a non-obvious constraint you had to honour). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. Record shared knowledge only — do NOT record aggressively, and skip transient or obvious-from-the-code details (that reintroduces the duplicate-memory clutter we already fought). This is DevSpec's **shared** team memory — the source of truth the in-app DevSpec assistant reads every turn — and is distinct from your own local memory (your own local Cursor rules / notes): durable, shared project knowledge → DevSpec `record_memory`; personal or machine-specific notes → your local memory. That boundary is what keeps DevSpec from going stale.
+    **d)** `record_memory` — **only if** the work taught you something durable about the *project* (a decision, convention, architecture fact, or risk that outlives this item — e.g. "the item said X, we did Y because Z", a non-obvious constraint you had to honour). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. Record shared knowledge only — do NOT record aggressively, and skip transient or obvious-from-the-code details (to avoid duplicate or low-value memories). This is DevSpec's **shared** team memory — the source of truth — and is distinct from your own local memory (your own local Cursor rules / notes): durable, shared project knowledge → DevSpec `record_memory`; personal or machine-specific notes → your local memory. That boundary is what keeps DevSpec from going stale.
 
 20. **Output the result:**
     ```
