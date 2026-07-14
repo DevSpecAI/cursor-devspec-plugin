@@ -86,11 +86,12 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
    - If there is no match at all, output `✗ No DevSpec project tracks this repo (<git_remote>). Connect it to a project first.` and stop.
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
 
-2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the `local_plugin_settings` field from the response. Store for later use. If the field is absent or null, use safe defaults:
+2. **Load project settings.** Call `devspec__get_project_summary({ project_id })` and read the execution settings — the unified `execution` block when present, else the legacy `local_plugin_settings` field on older MCP versions. Store for later use. From that block read `custom_instructions` and `agent_rules`, and also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three. If a field is absent or null, use safe defaults:
    - `auto_push`: false
    - `auto_merge`: false
    - `branch_prefix`: "work/action-item-"
    - `custom_instructions`: "" (empty)
+   - `agent_rules`: "" (empty) — and `owner_agent_rules` absent on older MCP versions
 
    If `auto_merge` is true, treat `auto_push` as true regardless of its stored value.
 
@@ -226,7 +227,11 @@ See the `devspec-remote` / `devspec.remote` skill for full details.
 
 14. **Implement the changes.** Follow the action item description and any `ai_instructions`. Read existing files before editing. You are working inside the worktree from step 13 (a full checkout of the branch) — read and edit files there as normal. Follow existing code conventions. If the action item has brainstorm notes or prior implementation notes, use them to guide implementation. If returning to address verification feedback, focus specifically on the issues raised in the feedback.
 
-    **Custom Instructions:** If `custom_instructions` is set in the loaded settings, you MUST follow those instructions during implementation. These are project-owner-defined rules that apply to every action item — e.g., which tools to use, which files to update, testing requirements, or additional steps to perform alongside the main task. Treat them as mandatory requirements, not suggestions.
+    **Principles + Agent Rules (mandatory):** Apply the instruction tiers you loaded in step 2:
+    - `custom_instructions` (team **Principles**): engineering philosophy and quality bar — no hacky workarounds, prefer the proper/secure solution, use platform tools properly. These shape *how* you build.
+    - `agent_rules` (team **Agent Execution Rules**) + `owner_agent_rules` (**your** personal machine/tooling rules): concrete execution mechanics — e.g. run typecheck/build (and any test commands) before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling you have set up. These are mechanics for a coding agent, so they apply to you here (they are deliberately hidden from the in-session Dev).
+
+    Treat all three as mandatory requirements, not suggestions. Precedence: your personal rules govern local working-style, but the shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
     During implementation, whenever you complete a significant milestone (e.g., finished a major component, wired up an integration, completed a migration):
     - Call `devspec__add_implementation_note(action_item_id, content: <what was done and why>)` to keep a running log. Use markdown formatting — bullet lists, **bold** for key terms, `code` for file/function names. Never write as a single prose paragraph.

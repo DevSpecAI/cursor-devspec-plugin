@@ -43,7 +43,7 @@ Scan the user's invocation for flags (same semantics as Claude `autopilot.start`
    - Multiple candidates → ask the user which project (or stop in unattended contexts).
    - No match → `✗ No DevSpec project tracks this repo (<git_remote>).` and stop.
 
-2. Call `devspec__get_project_summary({ project_id })` and read `local_plugin_settings` + `repos` + `database_targets`.
+2. Call `devspec__get_project_summary({ project_id })` and read the execution settings (the unified `execution` block, or legacy `local_plugin_settings` on older MCP versions) + `repos` + `database_targets`. From the execution settings read `custom_instructions` (team **Principles** — philosophy/quality bar) and `agent_rules` (team **Agent Execution Rules** — build/test/ship mechanics), and also read the top-level **`owner_agent_rules`** (the runner owner's **Personal Agent Rules** — machine/tooling; `agent_rules: ""` / `owner_agent_rules` absent on older MCP versions). Store all three and treat each as a mandatory requirement during implementation when set: `custom_instructions` shapes *how* you build, while `agent_rules` + `owner_agent_rules` are concrete execution mechanics for a coding agent — run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch, plus any personal tooling (deliberately hidden from the in-session Dev, so they apply to you here). Precedence: personal rules govern local working-style; shared-repo-safety rules always hold. Skip any tier whose field is empty/absent.
 
 3. Record `starting_branch` via `git branch --show-current`.
 

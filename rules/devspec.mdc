@@ -41,7 +41,8 @@ Read these fields — they override local assumptions about branches and whether
 - **`execution`** (canonical; prefer over deprecated `local_plugin_settings` / `autopilot` execution fields):
   - `auto_push` — when true, push after commit **without asking the user**
   - `auto_merge` — when true, merge to the repo's target branch after push (implies push)
-  - `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `test_commands`, `protected_paths`
+  - `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands`, `protected_paths`
+  - **Instruction tiers:** `custom_instructions` is the team **Principles** (philosophy / quality bar — how you build); `agent_rules` (team) plus the top-level **`owner_agent_rules`** (yours) are **agent execution mechanics** (run typecheck/build before pushing, never `git stash`, commit only your own files, honour the target branch). All apply to you as a coding agent; personal rules govern local working-style, but shared-repo-safety rules always hold.
 - **`repos`** — each tracked repo: `{ full_name, target_branch, default_branch }`
   - Match `git remote get-url origin` to `full_name` (case-insensitive; ignore `.git` and ssh vs https)
   - Push/merge target = `target_branch` if set, else `default_branch`
