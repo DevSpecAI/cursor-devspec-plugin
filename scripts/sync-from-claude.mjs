@@ -52,7 +52,7 @@ const MCP_TOOLS = [
   'add_implementation_note', 'add_commit_reference', 'record_implementation',
   'generate_commit_message', 'create_action_item', 'record_completed_work',
   'verify_agent_connection', 'report_connection_check', 'get_next_work_item',
-  'send_heartbeat', 'check_queue_status', 'get_action_item_siblings', 'submit_plan_review',
+  'send_heartbeat', 'get_action_item_siblings', 'submit_plan_review',
   'devspec_help_search', 'post_session_message',
   'verify_action_item',
 ]
