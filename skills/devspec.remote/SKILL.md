@@ -165,7 +165,14 @@ When the conversation produces a durable decision, convention, architecture choi
 
 Be as proactive about memories/artifacts as you already are about **action items**. Losing decisions is a product failure mode of remote control.
 
+## Action items belong to this remote session (non-negotiable)
 
+When the owner asks you to create, update, or refine a brief/action item during remote control:
+
+1. **Every** `create_action_item` / `update_action_item` call **MUST** include `session_id: <session_id>` — the full remote-control chat-session UUID from step 3 (NOT a runner or local session id). That is what owns the item to this conversation: DevSpec appends the same action-item card the in-session AI would, and the item appears in the "This session" panel. An item created without it is orphaned from the transcript.
+2. After session-owned creates, keep the mirrored `post_session_message` reply **short** (e.g. "Created below — your call: implement now or park?"). **Do not** paste a markdown table of titles/IDs — the cards **are** the inventory.
+3. If a brief/items already exist and the owner wants them shown again, do **not** invent a markdown inventory. Prefer the MCP re-surface path when available; otherwise say they already exist and point at "This session" / the earlier cards — still no UUID dump table.
+4. Thinking-dots / TypingIndicator while you work is a separate product surface — do not invent a substitute in skill copy.
 
 ## Account + project instructions (on connect — non-negotiable)
 
@@ -189,6 +196,8 @@ Rules for all four:
 ## Rules
 
 - Full `session_id` UUID always — never truncate when calling tools.
+- **Action items belong to the session.** Every `create_action_item` / `update_action_item` during remote control MUST pass `session_id` (see section above). Never dump a markdown inventory of items the transcript cards already show.
 - Heartbeat at least every ~60s while connected (15s preferred) so the Agents page shows live.
 - Do not open `access: shared` unless the human explicitly asks.
 - Ground coding work in the real repo; remote instructions still require normal safety (no destructive commands without clear owner intent).
+- Claude / other-plugin remote command parity for this action-item card rule is a follow-up outside this Cursor skill file.
