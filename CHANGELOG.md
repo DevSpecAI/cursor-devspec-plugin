@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Agent-authoritative remote-control "working" state:** the connected agent now reports `busy:true` on turn start (plus a turn marker) and `busy:false` on turn end/interrupt; the long-lived poller re-asserts busy while a turn runs so long turns stay "working" and an interrupted turn decays instead of stranding a phantom "working". Poller backoff gains a `dormant` (~hourly) tier and the idle-disconnect lifetime extends from 24h to 72h.
 - **Remote-control turn mirroring:** ship `hooks/scripts/mirror-turn.mjs` + poller suite; on activate, merge `UserPromptSubmit`/`beforeSubmitPrompt` + `Stop` hooks into `~/.cursor/hooks.json` so local prompts post literally (`turn_kind=local_prompt`) without model mediation. Command: **DevSpec: Install remote-control mirror hooks**.
 
 ## 0.3.4
