@@ -50,8 +50,9 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
    ─────────────────────────────
    ```
 
-4. **Connected signal.** If create_session did not already post one, call:
-   `devspec__post_session_message(session_id, "🖥️ **Local agent connected** — ready for remote control from DevSpec. Will capture decisions as memories/artifacts interactively — not only action items.", agent_name: "Cursor")`.
+4. **Connected signal.** If create_session did not already post one, post **one short line only** — no memories/artifacts spiel, no "Context loaded…" follow-up. Resolve the token owner's first name from `verify_agent_connection` → `connected_as` (first word), then call:
+   `devspec__post_session_message(session_id, "You're connected to {FirstName}'s Cursor agent on their local machine.", agent_name: "Cursor")`.
+   Example when `connected_as` is `Brandon Caddow Young`: `You're connected to Brandon's Cursor agent on their local machine.`
 
 5. **Poll-and-react loop** (until the user says stop / disconnect / exit remote):
    - Keep a cursor: `after_message_id` (and/or `since_created_at`) from the last poll.
