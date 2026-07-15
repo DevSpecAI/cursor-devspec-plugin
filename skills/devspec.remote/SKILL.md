@@ -171,7 +171,7 @@ When the owner asks you to create, update, or refine a brief/action item during 
 
 1. **Every** `create_action_item` / `update_action_item` call **MUST** include `session_id: <session_id>` — the full remote-control chat-session UUID from step 3 (NOT a runner or local session id). That is what owns the item to this conversation: DevSpec appends the same action-item card the in-session AI would, and the item appears in the "This session" panel. An item created without it is orphaned from the transcript.
 2. After session-owned creates, keep the mirrored `post_session_message` reply **short** (e.g. "Created below — your call: implement now or park?"). **Do not** paste a markdown table of titles/IDs — the cards **are** the inventory.
-3. If a brief/items already exist and the owner wants them shown again, do **not** invent a markdown inventory. Prefer the MCP re-surface path when available; otherwise say they already exist and point at "This session" / the earlier cards — still no UUID dump table.
+3. If a brief/items already exist and the owner wants them shown again, call `devspec__surface_session_action_items({ session_id, action_item_ids: [<brief-or-item-uuids>], include_children: true, agent_name: "Cursor" })` — then keep the mirrored reply short. **Do not** invent a markdown inventory of titles/UUIDs.
 4. Thinking-dots / TypingIndicator while you work is a separate product surface — do not invent a substitute in skill copy.
 
 ## Account + project instructions (on connect — non-negotiable)
