@@ -42,7 +42,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
+import {
+  resolveDevspecMcpAuth,
+  resolveDevspecMcpAuthValidated,
+} from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
@@ -375,7 +379,7 @@ const isMain =
   Boolean(process.argv[1]) &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
-if (isMain) {
+async function runCli() {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
 
@@ -678,7 +682,19 @@ if (isMain) {
       process.exit(2)
     }
     const cwd = args.cwd || process.cwd()
-    const auth = resolveDevspecMcpAuth(cwd)
+    // Fail-fast auth smoke: probe candidates; on 401/403 fall back to the next
+    // source (e.g. stale DEVSPEC_MCP_TOKEN → project .mcp.json) before persisting.
+    const auth = await resolveDevspecMcpAuthValidated({
+      cwd,
+      probe: async ({ mcpUrl, token }) => {
+        await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'list_projects',
+          arguments: {},
+        })
+      },
+    })
     const prev = readJson(sessionPath(args.session)) || {}
     const agentName = args.agent || prev.agent_name || AGENT_NAME
     // The conversation this write belongs to — stamped INTO the per-session state
@@ -694,7 +710,8 @@ if (isMain) {
       mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
       token: auth.token || prev.token || undefined,
       auth_source: auth.source || auth.error || prev.auth_source || null,
-      auth_ok: !!auth.ok || !!prev.auth_ok,
+      auth_ok: !!auth.ok,
+      auth_validated: !!auth.validated,
       cwd,
       session_codename: args.codename || prev.session_codename || prev.codename || null,
       title: args.title || prev.title || null,
@@ -722,7 +739,7 @@ if (isMain) {
     }
 
     const result = {
-      ok: true,
+      ok: state.auth_ok,
       path: perPath,
       legacy_path: LEGACY_PATH,
       session_id: state.session_id,
@@ -731,21 +748,35 @@ if (isMain) {
       mcp_url: state.mcp_url,
       auth_ok: state.auth_ok,
       auth_source: state.auth_source,
+      auth_validated: state.auth_validated,
       token_present: !!state.token,
       local_id: localId,
       bond_path: bond ? localBondPath(agentName, localId) : null,
     }
+    if (auth.fallback_from?.length) {
+      result.auth_fallback = auth.fallback_from.map((f) => f.source)
+    }
     if (!state.auth_ok) {
       result.warning = auth.error
+      process.stderr.write(
+        `remote-control-state: auth smoke failed — ${auth.error}\n`,
+      )
     }
     if (!localId) {
       result.warning_local =
         'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
     }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-    process.exit(0)
+    process.exit(state.auth_ok ? 0 : 1)
   }
 
   process.stderr.write(`Unknown command: ${cmd}\n`)
   process.exit(2)
+}
+
+if (isMain) {
+  runCli().catch((err) => {
+    process.stderr.write(`remote-control-state: ${err?.stack || err}\n`)
+    process.exit(1)
+  })
 }

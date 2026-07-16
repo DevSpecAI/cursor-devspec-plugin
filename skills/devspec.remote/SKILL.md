@@ -92,6 +92,8 @@ SESSION="<uuid>"
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Cursor" --cwd "$(pwd)" \
   --codename "<session_codename>" --title "<title>"
+# write runs an auth smoke (list_projects). On HTTP 401/403 it falls back from a
+# stale env token to project .mcp.json. Exit 1 = fix credentials before poller.
 
 mkdir -p "$HOME/.devspec/remote-control/sessions"
 LOG="$HOME/.devspec/remote-control/sessions/${SESSION}.poll.log"
@@ -106,6 +108,7 @@ kill -0 "$(cat "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid")" 2>
 Never use plain shell `&` without `nohup`/detach inside a finishing tool shell.
 
 Poller contract:
+- Fail-fast auth smoke at startup; on 401/403 retries with the next auth source and rewrites session state
 - Stays up until disabled / UI End / idle_timeout / local_stop / auth failure
 - On owner dispatch: appends `*.inbox.jsonl`, advances cursor, **keeps heartbeating**
 - Idle = no LLM tokens; stepped backoff up to 24h then `idle_timeout`
