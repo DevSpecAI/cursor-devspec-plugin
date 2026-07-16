@@ -21,4 +21,12 @@ assert.equal(parseHandoffUrl('devspec://open/?t=abc')?.error, 'malformed_token')
 assert.equal(parseHandoffUrl('https://example.com'), null)
 assert.equal(parseHandoffUrl('devspec://other?t=abc'), null)
 
-console.log('ok: handoff URL parsing accepts Chrome open/? forms')
+const unsignedCli = parseHandoffUrl('devspec://open?repo=DevSpecAI%2FDevSpecV2&surface=cli')
+assert.equal(unsignedCli?.slug, 'DevSpecAI/DevSpecV2')
+assert.equal(unsignedCli?.surface, 'cli')
+assert.equal(unsignedCli?.unsigned, true)
+
+const unsignedIde = parseHandoffUrl('devspec://open?repo=DevSpecAI%2FDevSpecV2')
+assert.equal(unsignedIde?.surface, 'ide')
+
+console.log('ok: handoff URL parsing accepts Chrome open/? forms and surface=cli')

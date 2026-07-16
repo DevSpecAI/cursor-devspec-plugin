@@ -23,6 +23,7 @@ async function copyInstalledArtifacts(sourceDir) {
   const files = [
     'open-handler.mjs',
     'open-handler-core.mjs',
+    'launch-cli-session.mjs',
     'handoff-verify.mjs',
     'handoff-public-key.pem',
     'devspec-handler.cmd',
