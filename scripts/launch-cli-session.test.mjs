@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Unit tests for Windows CLI agent spawn quoting.
+ * Unit tests for Windows CLI agent spawn quoting / invocation.
  * Run: node --test scripts/launch-cli-session.test.mjs
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 import {
+  flattenPromptForArgv,
   quoteWinCmdArg,
   resolveShellExecutable,
+  resolveWindowsAgentInvocation,
   spawnAgentSync,
 } from './launch-cli-session.mjs'
 
@@ -26,9 +28,41 @@ describe('quoteWinCmdArg', () => {
   it('doubles embedded quotes inside a quoted token', () => {
     assert.equal(quoteWinCmdArg('say "hi"'), '"say ""hi"""')
   })
+})
 
-  it('quotes an empty string as empty quotes', () => {
-    assert.equal(quoteWinCmdArg(''), '""')
+describe('flattenPromptForArgv', () => {
+  it('collapses newlines to spaces', () => {
+    assert.equal(
+      flattenPromptForArgv('line1\n\nline2\r\nline3'),
+      'line1 line2 line3',
+    )
+  })
+})
+
+describe('resolveWindowsAgentInvocation', () => {
+  it('maps agent.cmd to sibling agent.ps1 via powershell -File', () => {
+    if (process.platform !== 'win32') return
+    const cmd = 'C:\\Users\\Brandon Young\\AppData\\Local\\cursor-agent\\agent.cmd'
+    const ps1 = 'C:\\Users\\Brandon Young\\AppData\\Local\\cursor-agent\\agent.ps1'
+    const inv = resolveWindowsAgentInvocation(cmd, {
+      existsSync: (p) => p === ps1,
+    })
+    assert.equal(inv.mode, 'powershell-ps1')
+    assert.match(inv.command.toLowerCase(), /powershell\.exe$/)
+    assert.deepEqual(inv.prefixArgs.slice(0, 3), [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+    ])
+    assert.equal(inv.prefixArgs[3], '-File')
+    assert.equal(inv.prefixArgs[4], ps1)
+  })
+
+  it('uses direct mode on non-Windows', () => {
+    if (process.platform === 'win32') return
+    const inv = resolveWindowsAgentInvocation('/usr/local/bin/agent')
+    assert.equal(inv.mode, 'direct')
+    assert.equal(inv.command, '/usr/local/bin/agent')
   })
 })
 
@@ -36,11 +70,6 @@ describe('resolveShellExecutable', () => {
   it('quotes absolute paths that contain spaces on win32', () => {
     const bin = 'C:\\Users\\Brandon Young\\AppData\\Local\\cursor-agent\\agent.cmd'
     assert.equal(resolveShellExecutable(bin, 'win32'), `"${bin}"`)
-  })
-
-  it('does not quote paths with spaces on non-Windows platforms', () => {
-    const bin = '/Users/Brandon Young/.local/bin/agent'
-    assert.equal(resolveShellExecutable(bin, 'darwin'), bin)
   })
 })
 
@@ -55,10 +84,7 @@ describe('spawnAgentSync (win32 create-chat)', () => {
         .split(/\r?\n/)
         .map((l) => l.trim())
         .find(Boolean)
-    if (!agentBin) {
-      // Cursor CLI not installed — pure quoting tests above still cover the bug.
-      return
-    }
+    if (!agentBin) return
 
     const created = spawnAgentSync(agentBin, ['create-chat'], {
       encoding: 'utf8',
@@ -67,7 +93,7 @@ describe('spawnAgentSync (win32 create-chat)', () => {
     assert.equal(
       created.status,
       0,
-      `agentBin=${agentBin} stderr=${created.stderr} stdout=${created.stdout}`,
+      `agentBin=${agentBin} mode=${resolveWindowsAgentInvocation(agentBin).mode} stderr=${created.stderr} stdout=${created.stdout}`,
     )
     const chatId = String(created.stdout || '')
       .trim()

@@ -7,7 +7,9 @@
  * Invoked by open-handler-core when surface=cli:
  *   node launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]
  */
-import fs from 'node:fs/promises'
+import fs from 'node:fs'
+import fsPromises from 'node:fs/promises'
+import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 
 function parseArgs(argv) {
@@ -27,22 +29,18 @@ function stampLine(sessionId) {
 
 /**
  * Quote a single Windows command-line argument for `cmd.exe /s /c`.
- * Doubles embedded quotes per Windows argv rules for a quoted token.
- *
  * @param {string} value
  * @returns {string}
  */
 export function quoteWinCmdArg(value) {
   const s = String(value)
   if (s.length === 0) return '""'
-  // Safe unquoted token: no whitespace / cmd metacharacters.
   if (!/[\s"&<>|^()]/.test(s)) return s
   return `"${s.replace(/"/g, '""')}"`
 }
 
 /**
- * @deprecated Prefer quoteWinCmdArg + spawnAgent*; kept for unit coverage of the
- * quoting rule that fixed spaced agent.cmd paths under shell:true.
+ * @deprecated Prefer resolveWindowsAgentInvocation + spawnAgent*.
  * @param {string} bin
  * @param {NodeJS.Platform} [platform]
  * @returns {string}
@@ -59,23 +57,86 @@ export function resolveShellExecutable(bin, platform = process.platform) {
 }
 
 /**
- * Spawn the Cursor agent CLI. On Windows, invoke via `cmd.exe /d /s /c` with the
- * entire command wrapped in an extra pair of quotes — required so absolute paths
- * containing spaces (e.g. `C:\Users\Brandon Young\...\agent.cmd`) and `.cmd`
- * shims resolve correctly without Node's `shell: true` (which splits unquoted
- * paths and triggers DEP0190).
+ * Resolve how to invoke the Cursor agent CLI without `shell: true` / nested `cmd /c`.
  *
+ * On Windows, `agent.cmd` re-enters PowerShell; wrapping that in `cmd /c` loses a real
+ * console TTY, so the interactive agent exits immediately and Windows Terminal
+ * flash-closes. Prefer `powershell.exe -File <sibling>.ps1` with a normal argv array.
+ *
+ * @param {string} agentBin
+ * @param {{ existsSync?: (p: string) => boolean }} [io]
+ * @returns {{ command: string, prefixArgs: string[], mode: 'powershell-ps1' | 'direct' | 'cmd-fallback' }}
+ */
+export function resolveWindowsAgentInvocation(agentBin, io = { existsSync: fs.existsSync }) {
+  const bin = String(agentBin ?? '').trim() || 'agent'
+  if (process.platform !== 'win32') {
+    return { command: bin, prefixArgs: [], mode: 'direct' }
+  }
+
+  const lower = bin.toLowerCase()
+  /** @type {string[]} */
+  const ps1Candidates = []
+  if (lower.endsWith('.ps1')) {
+    ps1Candidates.push(bin)
+  } else if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+    ps1Candidates.push(bin.replace(/\.(cmd|bat)$/i, '.ps1'))
+    // agent.cmd and cursor-agent.cmd both ship a matching .ps1 beside them.
+    const dir = path.dirname(bin)
+    const base = path.basename(bin, path.extname(bin))
+    ps1Candidates.push(path.join(dir, `${base}.ps1`))
+    if (base.toLowerCase() === 'agent') {
+      ps1Candidates.push(path.join(dir, 'cursor-agent.ps1'))
+    }
+  }
+
+  for (const candidate of ps1Candidates) {
+    if (candidate && io.existsSync(candidate)) {
+      return {
+        command: process.env.SystemRoot
+          ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+          : 'powershell.exe',
+        prefixArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', candidate],
+        mode: 'powershell-ps1',
+      }
+    }
+  }
+
+  // Bare `agent` on PATH — let cmd resolve it (no absolute spaced path).
+  if (!/[\\/]/.test(bin) && !/\.(cmd|bat|ps1|exe)$/i.test(bin)) {
+    return { command: bin, prefixArgs: [], mode: 'cmd-fallback' }
+  }
+
+  return { command: bin, prefixArgs: [], mode: 'cmd-fallback' }
+}
+
+/**
+ * Flatten multiline prompts for argv safety (newlines break `cmd /c` command lines).
+ * @param {string} text
+ * @returns {string}
+ */
+export function flattenPromptForArgv(text) {
+  return String(text).replace(/\r\n/g, '\n').replace(/\n+/g, ' ').trim()
+}
+
+/**
  * @param {string} agentBin
  * @param {string[]} args
  * @param {import('node:child_process').SpawnSyncOptionsWithStringEncoding} opts
  */
 export function spawnAgentSync(agentBin, args, opts) {
+  const inv = resolveWindowsAgentInvocation(agentBin)
+  if (inv.mode === 'powershell-ps1' || (process.platform !== 'win32' && inv.mode === 'direct')) {
+    return spawnSync(inv.command, [...inv.prefixArgs, ...args], {
+      ...opts,
+      shell: false,
+      windowsHide: true,
+    })
+  }
   if (process.platform !== 'win32') {
     return spawnSync(agentBin, args, { ...opts, shell: false })
   }
+  // Fallback for absolute .cmd without a sibling .ps1: keep the quoted cmd /c path.
   const cmdLine = [quoteWinCmdArg(agentBin), ...args.map(quoteWinCmdArg)].join(' ')
-  // Extra outer quotes: cmd's /s /c rule for commands whose first token is quoted
-  // and contains spaces (without them, cmd splits at the first space).
   return spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${cmdLine}"`], {
     ...opts,
     windowsVerbatimArguments: true,
@@ -88,6 +149,13 @@ export function spawnAgentSync(agentBin, args, opts) {
  * @param {import('node:child_process').SpawnOptions} opts
  */
 export function spawnAgent(agentBin, args, opts) {
+  const inv = resolveWindowsAgentInvocation(agentBin)
+  if (inv.mode === 'powershell-ps1' || (process.platform !== 'win32' && inv.mode === 'direct')) {
+    return spawn(inv.command, [...inv.prefixArgs, ...args], {
+      ...opts,
+      shell: false,
+    })
+  }
   if (process.platform !== 'win32') {
     return spawn(agentBin, args, { ...opts, shell: false })
   }
@@ -111,7 +179,7 @@ async function main() {
   const agentBin = args.agent || 'agent'
   let promptBody
   try {
-    promptBody = (await fs.readFile(args.promptFile, 'utf8')).trim()
+    promptBody = (await fsPromises.readFile(args.promptFile, 'utf8')).trim()
   } catch (err) {
     console.error(`[devspec-cli] could not read prompt file: ${err}`)
     process.exitCode = 1
@@ -143,27 +211,28 @@ async function main() {
     return
   }
 
-  const stamped = promptBody
-    ? `${promptBody}\n\n${stampLine(chatId)}`
-    : stampLine(chatId)
+  const stamped = flattenPromptForArgv(
+    promptBody ? `${promptBody}\n\n${stampLine(chatId)}` : stampLine(chatId),
+  )
 
-  console.log(`[devspec-cli] Resuming chat ${chatId} in ${args.folder}`)
+  const inv = resolveWindowsAgentInvocation(agentBin)
+  console.log(
+    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (invoke=${inv.mode})`,
+  )
+  // Interactive rocket: no -p / --force / --trust (--trust is print/headless-only).
   const child = spawnAgent(
     agentBin,
-    [
-      '--resume',
-      chatId,
-      '--workspace',
-      args.folder,
-      '--approve-mcps',
-      '--trust',
-      stamped,
-    ],
+    ['--resume', chatId, '--workspace', args.folder, '--approve-mcps', stamped],
     {
       cwd: args.folder,
       stdio: 'inherit',
     },
   )
+
+  child.on('error', (err) => {
+    console.error(`[devspec-cli] failed to start agent: ${err}`)
+    process.exitCode = 1
+  })
 
   child.on('exit', (code, signal) => {
     if (signal) {

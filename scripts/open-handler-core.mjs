@@ -215,11 +215,13 @@ export async function openInAgentCli({ folderPath, promptText, agentBin }) {
   ]
 
   if (process.platform === 'win32') {
-    // Prefer Windows Terminal; fall back to cmd /k so the window stays open.
+    // Always wrap in `cmd /k` so the tab stays open if the launcher/agent exits
+    // (otherwise Windows Terminal flash-closes and hides the error). Prefer WT
+    // when present; fall back to a titled `start` cmd window.
     const wt = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe')
     const quoted = [nodeBin, ...launchArgs].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
     if (await pathExists(wt)) {
-      spawn(wt, ['-d', folderPath, '--', nodeBin, ...launchArgs], {
+      spawn(wt, ['-d', folderPath, '--', 'cmd.exe', '/k', quoted], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
