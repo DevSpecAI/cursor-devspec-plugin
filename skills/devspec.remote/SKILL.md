@@ -84,28 +84,24 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are **split** so Live never dies when you are woken.
 
-### A. Continuous heartbeat poller (nohup — never exit on owner message)
+### A. Continuous heartbeat poller (mechanical — never exit on owner message)
 
 ```bash
 PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-cursor-*
 SESSION="<uuid>"
+# write auth-smokes, persists state, and by default starts the continuous poller
+# (ensure-poller: stops any prior session-scoped poller, then detaches a new one).
+# Opt out only with --no-poller. On HTTP 401/403 auth falls back to project .mcp.json.
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Cursor" --cwd "$(pwd)" \
-  --codename "<session_codename>" --title "<title>"
-# write runs an auth smoke (list_projects). On HTTP 401/403 it falls back from a
-# stale env token to project .mcp.json. Exit 1 = fix credentials before poller.
-
-mkdir -p "$HOME/.devspec/remote-control/sessions"
-LOG="$HOME/.devspec/remote-control/sessions/${SESSION}.poll.log"
-nohup node "$PLUGIN/hooks/scripts/devspec-remote-poll.mjs" --session "$SESSION" \
-  >> "$LOG" 2>&1 &
-echo $! > "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid"
-sleep 2
-kill -0 "$(cat "$HOME/.devspec/remote-control/sessions/${SESSION}.poll.pid")" 2>/dev/null \
-  || echo "✗ poller failed to stay up — check $LOG"
+  --codename "<session_codename>" --title "<title>" \
+  --local-id "<local_conversation_id>"
+# Confirm poller.ok / pid in the JSON stdout. If poller failed: check
+# ~/.devspec/remote-control/sessions/${SESSION}.poll.log
+# Manual re-arm (rare): node …/remote-control-state.mjs ensure-poller --session "$SESSION"
 ```
 
-Never use plain shell `&` without `nohup`/detach inside a finishing tool shell.
+Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 
 Poller contract:
 - Fail-fast auth smoke at startup; on 401/403 retries with the next auth source and rewrites session state
