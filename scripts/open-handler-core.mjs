@@ -7,6 +7,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -143,6 +144,132 @@ function resolveCursorExecutable() {
   return 'cursor'
 }
 
+/**
+ * Resolve the Cursor Agent CLI binary (`agent`). Prefer PATH, then known install dirs.
+ * @returns {Promise<string | null>}
+ */
+export async function resolveAgentExecutable() {
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which'
+  try {
+    const { stdout } = await execFileAsync(whichCmd, ['agent'], { timeout: 5000 })
+    const first = String(stdout)
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find(Boolean)
+    if (first && (await pathExists(first))) return first
+  } catch {
+    // fall through to known paths
+  }
+
+  const home = os.homedir()
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          path.join(home, 'AppData', 'Local', 'cursor-agent', 'agent.exe'),
+          path.join(home, 'AppData', 'Local', 'Programs', 'cursor', 'resources', 'app', 'bin', 'agent.exe'),
+          path.join(process.env.LOCALAPPDATA ?? '', 'cursor-agent', 'agent.exe'),
+        ]
+      : [
+          path.join(home, '.local', 'bin', 'agent'),
+          '/usr/local/bin/agent',
+          path.join(home, '.cursor', 'bin', 'agent'),
+        ]
+
+  for (const candidate of candidates) {
+    if (candidate && (await pathExists(candidate))) return candidate
+  }
+  return null
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
+ * @param {{ folderPath: string, promptText: string | null, agentBin: string }} opts
+ */
+export async function openInAgentCli({ folderPath, promptText, agentBin }) {
+  await ensureDevspecDir()
+  const launchesDir = path.join(DEVSPEC_DIR, 'launches')
+  await fs.mkdir(launchesDir, { recursive: true })
+
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
+  await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
+
+  // Prefer the installed copy under ~/.cursor/devspec; fall back to sibling of this module.
+  const installedLauncher = path.join(DEVSPEC_DIR, 'launch-cli-session.mjs')
+  const siblingLauncher = path.join(path.dirname(fileURLToPath(import.meta.url)), 'launch-cli-session.mjs')
+  const launcher = (await pathExists(installedLauncher)) ? installedLauncher : siblingLauncher
+
+  const nodeBin = process.execPath
+  const launchArgs = [
+    launcher,
+    '--folder',
+    folderPath,
+    '--prompt-file',
+    promptFile,
+    '--agent',
+    agentBin,
+  ]
+
+  if (process.platform === 'win32') {
+    // Prefer Windows Terminal; fall back to cmd /k so the window stays open.
+    const wt = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe')
+    const quoted = [nodeBin, ...launchArgs].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
+    if (await pathExists(wt)) {
+      spawn(wt, ['-d', folderPath, '--', nodeBin, ...launchArgs], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      }).unref()
+      return
+    }
+    spawn('cmd.exe', ['/c', 'start', 'DevSpec Cursor CLI', 'cmd.exe', '/k', quoted], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      cwd: folderPath,
+    }).unref()
+    return
+  }
+
+  if (process.platform === 'darwin') {
+    const cmd = `cd ${shellSingleQuote(folderPath)} && ${shellSingleQuote(nodeBin)} ${launchArgs
+      .map(shellSingleQuote)
+      .join(' ')}`
+    spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref()
+    return
+  }
+
+  // Linux — try common terminal emulators.
+  const linuxCmd = `${shellSingleQuote(nodeBin)} ${launchArgs.map(shellSingleQuote).join(' ')}`
+  const terminals = [
+    ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
+    ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
+    ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
+    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
+  ]
+  for (const [bin, args] of terminals) {
+    try {
+      await execFileAsync('which', [bin], { timeout: 2000 })
+      spawn(bin, args, {
+        detached: true,
+        stdio: 'ignore',
+        cwd: folderPath,
+      }).unref()
+      return
+    } catch {
+      // try next
+    }
+  }
+  throw new Error('No terminal emulator found to launch Cursor CLI')
+}
+
 const CURSOR_PROMPT_DEEPLINK_BASE = 'cursor://anysphere.cursor-deeplink/prompt'
 const CURSOR_PROMPT_DEEPLINK_MAX = 8000
 const PROMPT_DEEPLINK_DELAY_MS = 1500
@@ -271,11 +398,13 @@ export function parseHandoffUrl(raw) {
       slug: verified.data.repo,
       promptText: verified.data.prompt ?? null,
       itemTitle: verified.data.title ?? null,
+      surface: verified.data.surface === 'cli' ? 'cli' : 'ide',
     }
   }
 
   const repo = url.searchParams.get('repo')
   if (!repo) return { error: 'missing_repo' }
+  const surfaceRaw = url.searchParams.get('surface')
   return {
     slug: decodeURIComponent(repo),
     promptText: url.searchParams.get('prompt')
@@ -284,16 +413,24 @@ export function parseHandoffUrl(raw) {
     itemTitle: url.searchParams.get('title')
       ? decodeURIComponent(url.searchParams.get('title'))
       : null,
+    surface: surfaceRaw === 'cli' ? 'cli' : 'ide',
     /** Unsigned localhost bridge requests (macOS fallback only). */
     unsigned: true,
   }
 }
 
 /**
- * Execute the handoff: open folder in Cursor and pre-fill Agent chat.
+ * Execute the handoff: open Cursor IDE (default) or spawn interactive Cursor CLI.
  * @returns {{ ok: true } | { ok: false, error: string, slug?: string }}
  */
-export async function executeHandoff({ slug, promptText, itemTitle, requireSignedToken = true, unsigned = false }) {
+export async function executeHandoff({
+  slug,
+  promptText,
+  itemTitle,
+  surface = 'ide',
+  requireSignedToken = true,
+  unsigned = false,
+}) {
   if (requireSignedToken && unsigned) {
     await appendHandlerLog('rejected unsigned handoff')
     return { ok: false, error: 'unsigned_not_allowed', slug }
@@ -304,6 +441,25 @@ export async function executeHandoff({ slug, promptText, itemTitle, requireSigne
     await appendHandlerLog(`missing mapping for ${slug}`)
     openErrorPage(slug, 'missing_mapping')
     return { ok: false, error: 'missing_mapping', slug }
+  }
+
+  if (surface === 'cli') {
+    const agentBin = await resolveAgentExecutable()
+    if (!agentBin) {
+      await appendHandlerLog(`agent missing for CLI handoff ${slug}`)
+      openErrorPage(slug, 'agent_missing')
+      return { ok: false, error: 'agent_missing', slug }
+    }
+    try {
+      await openInAgentCli({ folderPath, promptText, agentBin })
+      await appendHandlerLog(`opened CLI ${slug} → ${folderPath} via ${agentBin}`)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await appendHandlerLog(`CLI open failed: ${message}`)
+      openErrorPage(slug, 'agent_launch_failed')
+      return { ok: false, error: 'agent_launch_failed', slug }
+    }
   }
 
   try {
@@ -333,6 +489,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     slug: parsed.slug,
     promptText: parsed.promptText,
     itemTitle: parsed.itemTitle,
+    surface: parsed.surface === 'cli' ? 'cli' : 'ide',
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
