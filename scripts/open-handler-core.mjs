@@ -215,19 +215,12 @@ export async function openInAgentCli({ folderPath, promptText, agentBin }) {
   ]
 
   if (process.platform === 'win32') {
-    // Always wrap in `cmd /k` so the tab stays open if the launcher/agent exits
-    // (otherwise Windows Terminal flash-closes and hides the error). Prefer WT
-    // when present; fall back to a titled `start` cmd window.
-    const wt = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe')
+    // Always open a titled cmd.exe /k window. Do NOT use
+    // %LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe — that path is an App Execution
+    // Alias: fs.access succeeds, but spawn fails silently (stat is EACCES / 0-byte
+    // stub). The protocol handler then logs success while the user only sees the
+    // brief handler console flash.
     const quoted = [nodeBin, ...launchArgs].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
-    if (await pathExists(wt)) {
-      spawn(wt, ['-d', folderPath, '--', 'cmd.exe', '/k', quoted], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      }).unref()
-      return
-    }
     spawn('cmd.exe', ['/c', 'start', 'DevSpec Cursor CLI', 'cmd.exe', '/k', quoted], {
       detached: true,
       stdio: 'ignore',
