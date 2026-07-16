@@ -9,8 +9,36 @@ import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
+import { quoteWinCmdArg } from './launch-cli-session.mjs'
 
 const execFileAsync = promisify(execFile)
+
+/**
+ * Build a Windows `.cmd` body that runs node + launch args (cmd-style quoting).
+ * @param {string} nodeBin
+ * @param {string[]} launchArgs
+ * @param {string} folderPath
+ * @returns {string}
+ */
+export function buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath) {
+  const cdLine = `cd /d ${quoteWinCmdArg(folderPath)}`
+  const runLine = [nodeBin, ...launchArgs].map(quoteWinCmdArg).join(' ')
+  return `@echo off\r\n${cdLine}\r\n${runLine}\r\n`
+}
+
+/**
+ * @deprecated Prefer writing buildWindowsCliLaunchBat to a .cmd and starting it.
+ * Kept for unit coverage of title/cmdline composition.
+ * @param {string} nodeBin
+ * @param {string[]} launchArgs
+ * @param {string} [title]
+ * @returns {string}
+ */
+export function buildWindowsCliStartCommand(nodeBin, launchArgs, title = 'DevSpec Cursor CLI') {
+  const safeTitle = String(title).replace(/"/g, '')
+  const cmdline = [nodeBin, ...launchArgs].map(quoteWinCmdArg).join(' ')
+  return `start "${safeTitle}" cmd.exe /k ${cmdline}`
+}
 
 export const DEVSPEC_PROTOCOL_SCHEME = 'devspec'
 export const DEVSPEC_OPEN_PATH = '/open'
@@ -220,8 +248,13 @@ export async function openInAgentCli({ folderPath, promptText, agentBin }) {
     // Alias: fs.access succeeds, but spawn fails silently (stat is EACCES / 0-byte
     // stub). The protocol handler then logs success while the user only sees the
     // brief handler console flash.
-    const quoted = [nodeBin, ...launchArgs].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')
-    spawn('cmd.exe', ['/c', 'start', 'DevSpec Cursor CLI', 'cmd.exe', '/k', quoted], {
+    //
+    // Write a .cmd launcher and `start` that file. Putting the full quoted node
+    // command into one spawn argv makes Node's Windows quoter emit bash-style
+    // `\"…\"`, and cmd fails with `'\"C:\…\node.exe\"' is not recognized`.
+    const batPath = path.join(launchesDir, `${stamp}.launch.cmd`)
+    await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
+    spawn('cmd.exe', ['/c', 'start', 'DevSpec Cursor CLI', 'cmd.exe', '/k', batPath], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
