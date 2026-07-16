@@ -69,6 +69,11 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - If a decision requires human judgment, fail the item with a documented error rather than guessing
    - If the action item name matches multiple items, auto-select the highest-priority match (or the closest title match)
 
+1a. **Resolve Cursor `local_session_id` for DevSpec resume** (store as `cursor_local_session_id`; omit the field later if empty):
+   1. If the user/prompt contains a line like `DevSpec local_session_id for this run …: <id>`, use that bare id (matches `agent create-chat` / `--resume` from DevSpec-generated CLI launches).
+   2. Else if this chat was started via Cursor CLI and you can see the chat id from the launch context, use that bare id.
+   3. Never invent an id, never use a DevSpec runner/heartbeat UUID, never guess from IDE history. Empty → omit `local_session_id` on stamp calls. IDE Agent chats without a CLI id stay omit (Resume falls back to `devspec.work` + item id).
+
 1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve which project this run targets before any project-scoped call:
    - Run `git remote get-url origin` in the workspace root and call `devspec__list_projects({ git_remote: "<that remote>" })`.
    - Read `remote_match`: use `resolved_project_id` when non-null and store it as the session variable `project_id`.
@@ -77,7 +82,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
 
 
-1b. **Detect remote mode.** Check the user's input for `--remote` or `remote control`. Store as boolean `is_remote`.
+1c. **Detect remote mode.** Check the user's input for `--remote` or `remote control`. Store as boolean `is_remote`.
 
    When `is_remote` is true, **before claiming work** also run the connect steps from `/devspec.remote`:
    - `create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Claude Code", project_id })`
@@ -347,7 +352,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
         - `human_review_needed`: list of things a human should verify and why, e.g. `["Visual layout of the new testing page — no automated visual regression tests", "Role-based access — requires logging in as different roles"]`. Be specific about *what* and *why*.
         - `confidence`: 0.0-1.0 score. 0.9+ = straightforward change with passing tests. 0.7-0.9 = tests pass but change is complex or touches critical paths. Below 0.7 = significant uncertainty.
       - `provider`: always pass `"cursor"`
-      - **Cursor:** Omit `local_session_id` — session resume is not available from Cursor.
+      - `local_session_id`: if `cursor_local_session_id` is set (Phase 0 step 1a), pass that bare chat id so DevSpec can render `agent --resume`. Omit the field entirely when empty. Do NOT pass `machine_user_id` (server defaults to you). Do NOT pass a DevSpec runner/heartbeat UUID here.
 
     **d)** `record_memory` — **only if** the work taught you something durable about the *project* (a decision, convention, architecture fact, or risk that outlives this item — e.g. "the item said X, we did Y because Z", a non-obvious constraint you had to honour). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. Record shared knowledge only — do NOT record aggressively, and skip transient or obvious-from-the-code details (avoid duplicate or low-value memories). This is DevSpec's **shared** team memory — and is distinct from your own local memory (your own local Cursor rules / notes): durable, shared project knowledge → DevSpec `record_memory`; personal or machine-specific notes → your local memory. That boundary is what keeps DevSpec from going stale.
 
@@ -381,7 +386,7 @@ Runs as a "finally" block — it MUST execute no matter which Phase 3 / Phase 4 
    ```
    Wait briefly and retry once if it fails. If the worktree was never created (the failure happened before step 13 added it), skip this silently. The feature branch and any pushed commits survive worktree removal, so the work can still be picked up.
 3. Call `add_implementation_note` documenting what was attempted, which step failed, and whether the worktree was cleaned up.
-4. Call `update_action_item` with `agent_activity: 'failed'` and `agent_error: <description>`.
+4. Call `update_action_item` with `agent_activity: 'failed'`, `agent_error: <description>`, and — when `cursor_local_session_id` is set — `local_session_id` set to that bare chat id (so a human can `agent --resume` the partial session). Omit `local_session_id` when empty. Do NOT pass `machine_user_id`.
 5. Output: `✗ Failed: {reason}`
 
 ## Rules

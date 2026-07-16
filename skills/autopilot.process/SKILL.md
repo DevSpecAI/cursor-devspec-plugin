@@ -38,6 +38,10 @@ Scan the user's invocation for flags (same semantics as Claude `autopilot.start`
 
 ## Step 0 — Resolve project & load settings
 
+0. **Resolve Cursor `local_session_id` for DevSpec resume** (store as `cursor_local_session_id`; omit later if empty):
+   1. If the user/prompt contains `DevSpec local_session_id for this run …: <id>`, use that bare id (from DevSpec `agent create-chat` launches).
+   2. Never invent an id; never reuse a DevSpec runner/heartbeat UUID as `local_session_id`.
+
 1. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<remote>" })`.
    - Use `project_id_override` if set, else `remote_match.resolved_project_id`.
    - Multiple candidates → ask the user which project (or stop in unattended contexts).
@@ -77,7 +81,7 @@ Pick planning / under_human_review / staged per the Claude autopilot skill prior
 
 
 
-On failure after a successful claim, call `devspec__update_action_item` with `agent_activity: 'failed'` and `agent_error`. **Never call `update_action_item` failed on a 409 claim rejection** — the item belongs to another runner.
+On failure after a successful claim, call `devspec__update_action_item` with `agent_activity: 'failed'`, `agent_error`, and — when `cursor_local_session_id` is set — `local_session_id` set to that bare chat id. Omit `local_session_id` when empty. **Never call `update_action_item` failed on a 409 claim rejection** — the item belongs to another runner.
 
 ## Argument reference (from autopilot.start)
 
@@ -185,4 +189,5 @@ When `drain_on_empty` is false (default) and `item_id_queue` is empty, the autop
 - **Windows `node_modules/.bin` fallback:** If `npm run <cmd>` fails with a PATH error in a worktree, retry once using `node ./node_modules/typescript/bin/tsc --noEmit` (for tsc) or `node ./node_modules/.bin/<cmd>` for other binaries.
 - **Stale chat MCP state:** If MCP was reconfigured, open a **new** Agent-mode chat — existing chats cache old tool availability.
 - **Provider:** Always pass `provider: "cursor"` on completion/recording calls.
+- **local_session_id:** When `cursor_local_session_id` is set (Step 0), pass it on `record_implementation` / failure `update_action_item` so DevSpec can render `agent --resume`. Omit when empty. Never stamp a runner heartbeat UUID.
 
