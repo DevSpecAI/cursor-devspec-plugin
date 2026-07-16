@@ -2,7 +2,9 @@
 /**
  * Interactive Cursor CLI session launcher (runs inside the user's terminal).
  * Mints a chat via `agent create-chat`, stamps local_session_id into the prompt,
- * then starts interactive `agent --resume` (no -p / --force — rocket is human-in-the-loop).
+ * then starts interactive `agent --resume` with DevSpec flag policy:
+ * work → `--force --approve-mcps`; brainstorm → `--plan --approve-mcps`
+ * (no `-p` / `--trust` — those are print/headless-only).
  *
  * Invoked by open-handler-core when surface=cli:
  *   node launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]
@@ -25,6 +27,48 @@ function parseArgs(argv) {
 
 function stampLine(sessionId) {
   return `DevSpec local_session_id for this run (stamp on record_implementation / failure update): ${sessionId}`
+}
+
+/**
+ * Infer run kind from a DevSpec skill / MCP paste prompt (mirrors
+ * DevSpecV2 `inferCursorAgentRunKindFromPrompt`).
+ * @param {string} prompt
+ * @returns {'work' | 'brainstorm' | 'ask'}
+ */
+export function inferCursorAgentRunKindFromPrompt(prompt) {
+  const p = String(prompt ?? '').toLowerCase()
+  if (
+    p.includes('devspec.brainstorm') ||
+    p.includes('brainstorm action item') ||
+    p.includes('brainstorm the following action items')
+  ) {
+    return 'brainstorm'
+  }
+  if (p.includes('devspec.verify') || /\b--mode\s+ask\b/.test(p)) {
+    return 'ask'
+  }
+  return 'work'
+}
+
+/**
+ * Interactive (non-print) Cursor Agent flags for DevSpec rocket launches.
+ * Keep in sync with DevSpecV2 `buildCursorAgentFlags` (headless=false).
+ * @param {'work' | 'brainstorm' | 'ask' | 'resume'} kind
+ * @param {{ approval?: 'force' | 'auto-review', worktree?: boolean }} [opts]
+ * @returns {string[]}
+ */
+export function buildInteractiveCursorAgentFlags(kind, opts = {}) {
+  const flags = []
+  if (kind === 'brainstorm') {
+    flags.push('--plan')
+  } else if (kind === 'ask') {
+    flags.push('--mode', 'ask')
+  } else {
+    flags.push(opts.approval === 'auto-review' ? '--auto-review' : '--force')
+  }
+  flags.push('--approve-mcps')
+  if (opts.worktree) flags.push('--worktree')
+  return flags
 }
 
 /**
@@ -215,14 +259,16 @@ async function main() {
     promptBody ? `${promptBody}\n\n${stampLine(chatId)}` : stampLine(chatId),
   )
 
+  const kind = inferCursorAgentRunKindFromPrompt(promptBody)
+  const policyFlags = buildInteractiveCursorAgentFlags(kind)
+
   const inv = resolveWindowsAgentInvocation(agentBin)
   console.log(
-    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (invoke=${inv.mode})`,
+    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} invoke=${inv.mode})`,
   )
-  // Interactive rocket: no -p / --force / --trust (--trust is print/headless-only).
   const child = spawnAgent(
     agentBin,
-    ['--resume', chatId, '--workspace', args.folder, '--approve-mcps', stamped],
+    ['--resume', chatId, '--workspace', args.folder, ...policyFlags, stamped],
     {
       cwd: args.folder,
       stdio: 'inherit',

@@ -7,12 +7,45 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 import {
+  buildInteractiveCursorAgentFlags,
   flattenPromptForArgv,
+  inferCursorAgentRunKindFromPrompt,
   quoteWinCmdArg,
   resolveShellExecutable,
   resolveWindowsAgentInvocation,
   spawnAgentSync,
 } from './launch-cli-session.mjs'
+
+describe('DevSpec Cursor CLI flag policy', () => {
+  it('infers brainstorm vs work from skill prompts', () => {
+    assert.equal(
+      inferCursorAgentRunKindFromPrompt(
+        'Run the `devspec.brainstorm` skill with this input: abc',
+      ),
+      'brainstorm',
+    )
+    assert.equal(
+      inferCursorAgentRunKindFromPrompt(
+        'Run the `devspec.work` skill with this input: abc',
+      ),
+      'work',
+    )
+  })
+
+  it('work interactive flags are YOLO + MCP approve', () => {
+    assert.deepEqual(buildInteractiveCursorAgentFlags('work'), [
+      '--force',
+      '--approve-mcps',
+    ])
+  })
+
+  it('brainstorm interactive flags are plan + MCP approve (no force)', () => {
+    assert.deepEqual(buildInteractiveCursorAgentFlags('brainstorm'), [
+      '--plan',
+      '--approve-mcps',
+    ])
+  })
+})
 
 describe('quoteWinCmdArg', () => {
   it('leaves safe bare tokens unquoted', () => {
