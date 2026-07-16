@@ -44,7 +44,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import {
+  isMcpAuthHttpError,
+  resolveDevspecMcpAuthValidated,
+} from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -298,11 +301,91 @@ async function main() {
 
   let token = state?.token || null
   let mcpUrl = state?.mcp_url || null
-  if (!token) {
-    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd())
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
+  let authSource = state?.auth_source || null
+  const cwd = state?.cwd || process.cwd()
+
+  async function smokeListProjects(url, tok) {
+    await mcpToolsCall({
+      mcpUrl: url,
+      token: tok,
+      name: 'list_projects',
+      arguments: {},
+    })
   }
+
+  // Fail-fast auth smoke before the long-lived loop. Prefer state credentials;
+  // on 401/403 re-resolve with fallback (stale env → .mcp.json) and rewrite state.
+  try {
+    if (token && mcpUrl) {
+      try {
+        await smokeListProjects(mcpUrl, token)
+      } catch (e) {
+        if (!isMcpAuthHttpError(e)) {
+          throw e
+        }
+        process.stderr.write(
+          `devspec-remote-poll: stored credentials rejected (${e.message}) — trying auth fallback\n`,
+        )
+        const validated = await resolveDevspecMcpAuthValidated({
+          cwd,
+          skipTokens: new Set([token]),
+          probe: async ({ mcpUrl: u, token: t }) => smokeListProjects(u, t),
+        })
+        if (!validated.ok || !validated.token) {
+          throw new Error(validated.error || 'auth fallback failed')
+        }
+        token = validated.token
+        mcpUrl = validated.mcp_url
+        authSource = validated.source
+        const nextState = {
+          ...(readState(sessionId) || {}),
+          token,
+          mcp_url: mcpUrl,
+          auth_source: authSource,
+          auth_ok: true,
+          auth_validated: true,
+          updated_at: new Date().toISOString(),
+        }
+        writeState(nextState, sessionId)
+        if (validated.fallback_from?.length) {
+          process.stderr.write(
+            `devspec-remote-poll: auth fallback → ${authSource}\n`,
+          )
+        }
+      }
+    } else {
+      const validated = await resolveDevspecMcpAuthValidated({
+        cwd,
+        probe: async ({ mcpUrl: u, token: t }) => smokeListProjects(u, t),
+      })
+      if (!validated.ok || !validated.token) {
+        process.stderr.write(
+          `devspec-remote-poll: auth smoke failed — ${validated.error || 'no token'}\n`,
+        )
+        process.exit(1)
+      }
+      token = validated.token
+      mcpUrl = validated.mcp_url
+      authSource = validated.source
+      const nextState = {
+        ...(readState(sessionId) || {}),
+        token,
+        mcp_url: mcpUrl,
+        auth_source: authSource,
+        auth_ok: true,
+        auth_validated: true,
+        updated_at: new Date().toISOString(),
+      }
+      writeState(nextState, sessionId)
+    }
+  } catch (e) {
+    process.stderr.write(
+      `devspec-remote-poll: auth smoke failed — ${e.message}\n` +
+        'Fix DEVSPEC_MCP_TOKEN / project .mcp.json, then re-run remote-control-state write.\n',
+    )
+    process.exit(1)
+  }
+
   if (!token) {
     process.stderr.write(
       'devspec-remote-poll: no token. Run remote-control-state.mjs write after connect, or set DEVSPEC_MCP_TOKEN.\n',
