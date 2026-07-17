@@ -40,7 +40,9 @@ Scan the user's invocation for flags (same semantics as Claude `autopilot.start`
 
 0. **Resolve Cursor `local_session_id` for DevSpec resume** (store as `cursor_local_session_id`; omit later if empty):
    1. If the user/prompt contains `DevSpec local_session_id for this run …: <id>`, use that bare id (from DevSpec `agent create-chat` launches).
-   2. Never invent an id; never reuse a DevSpec runner/heartbeat UUID as `local_session_id`.
+   2. Else if `CURSOR_CONVERSATION_ID` is set in the environment (IDE Agent / cursor-agent), use that bare id.
+   3. Never invent an id; never reuse a DevSpec runner/heartbeat UUID as `local_session_id`.
+   4. When resolved, stamp early after claim (`update_action_item` with `local_session_id`) and again on `record_implementation` / failure update.
 
 1. Run `git remote get-url origin` and call `devspec__list_projects({ git_remote: "<remote>" })`.
    - Use `project_id_override` if set, else `remote_match.resolved_project_id`.

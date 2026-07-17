@@ -71,8 +71,10 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 1a. **Resolve Cursor `local_session_id` for DevSpec resume** (store as `cursor_local_session_id`; omit the field later if empty):
    1. If the user/prompt contains a line like `DevSpec local_session_id for this run …: <id>`, use that bare id (matches `agent create-chat` / `--resume` from DevSpec-generated CLI launches).
-   2. Else if this chat was started via Cursor CLI and you can see the chat id from the launch context, use that bare id.
-   3. Never invent an id, never use a DevSpec runner/heartbeat UUID, never guess from IDE history. Empty → omit `local_session_id` on stamp calls. IDE Agent chats without a CLI id stay omit (Resume falls back to `devspec.work` + item id).
+   2. Else if the environment has `CURSOR_CONVERSATION_ID` (Cursor IDE Agent / `cursor-agent`), use that bare id — it is the current chat and is valid for `agent --resume`.
+   3. Else if this chat was started via Cursor CLI and you can see the chat id from the launch context, use that bare id.
+   4. Never invent an id, never use a DevSpec runner/heartbeat UUID, never guess from IDE history. Empty → omit `local_session_id` on stamp calls.
+   5. When resolved, pass `local_session_id` early (on `update_action_item` right after claim, or on `claim_work_item` when the tool accepts it) **and** again on `record_implementation` / failure `update_action_item` so Resume works even if a later call forgets.
 
 1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve which project this run targets before any project-scoped call:
    - Run `git remote get-url origin` in the workspace root and call `devspec__list_projects({ git_remote: "<that remote>" })`.
