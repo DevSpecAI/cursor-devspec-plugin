@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.14
+
+### Fixed
+
+- **Remote-control PLUGIN pin:** `devspec.remote` / `devspec.remote-stop` resolve scripts from the installed Cursor extension (`~/.cursor/extensions/devspecai.devspec-autopilot-*`) and forbid Claude marketplace caches. Command-palette paste injects absolute `PLUGIN=<extensionPath>` so Agent attach uses auth-smoke / `ensure-poller` instead of hunting wrong scripts.
+
 ## Unreleased
 
 - **Cursor CLI launch flags:** interactive rocket CLI now defaults to `--force --approve-mcps` for work (YOLO + MCP), and `--plan --approve-mcps` for brainstorm (no YOLO). Mirrors DevSpecV2 headless/resume policy.

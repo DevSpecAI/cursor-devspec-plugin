@@ -7,6 +7,15 @@ description: Disconnect DevSpec remote control — mark Agents page offline and 
 
 Cleanly disconnect **this** local agent / **this** remote-control session so the **Agents page** drops the live indicator immediately.
 
+## Plugin root (non-negotiable)
+
+Use the **installed Cursor DevSpec extension** scripts only.
+
+1. Prefer a prompt line `PLUGIN=<absolute-path>` when present (extension injects it).
+2. Otherwise: newest `~/.cursor/extensions/devspecai.devspec-autopilot-*` (Windows: `%USERPROFILE%\.cursor\extensions\…`).
+3. **Never** call `remote-control-state.mjs` from `~/.claude/plugins/**` or marketplace caches.
+4. Quote `"$PLUGIN"` in every shell command.
+
 ## Multi-session safety (non-negotiable)
 
 One machine may run **several** remote-control sessions at once (multiple Cursor terminals).
@@ -38,7 +47,7 @@ One machine may run **several** remote-control sessions at once (multiple Cursor
 
 4. **Disable local state + stop THIS poller only:**
    ```bash
-   node "<plugin>/hooks/scripts/remote-control-state.mjs" disable --session '<session_id>'
+   node "$PLUGIN/hooks/scripts/remote-control-state.mjs" disable --session '<session_id>'
    ```
    That writes `enabled: false` for that session file and SIGTERMs only pollers whose argv includes this UUID.
 

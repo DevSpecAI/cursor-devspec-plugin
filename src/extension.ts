@@ -8,6 +8,7 @@ import {
 } from './project-rules'
 import { installProtocolHandler, registerProtocolHandlerCommands } from './protocol-handler-install'
 import { registerRepoFolderFeatures } from './repo-folder-map'
+import { buildSkillPastePrompt } from './skill-paste-prompt'
 
 type SkillId =
   | 'devspec.work'
@@ -256,10 +257,7 @@ async function runSkill(context: vscode.ExtensionContext, skillId: SkillId, meta
     userInput = userInput.trim()
   }
 
-  const header = userInput
-    ? `Run the \`${skillId}\` skill with this input: ${userInput}`
-    : `Run the \`${skillId}\` skill.`
-  const prompt = `${header}\n\n---\n\n${skillBody}`
+  const prompt = buildSkillPastePrompt(skillId, skillBody, userInput, context.extensionPath)
 
   await vscode.env.clipboard.writeText(prompt)
   void vscode.window.showInformationMessage(
