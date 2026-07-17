@@ -89,23 +89,26 @@ Sequence: **poll MCP → write inbox → wake agent**. Heartbeats and wake are *
 ```bash
 PLUGIN="<plugin-root>"   # e.g. installed-plugins/devspec-cursor-*
 SESSION="<uuid>"
-# write auth-smokes, persists state, and by default starts the continuous poller
-# (ensure-poller: stops any prior session-scoped poller, then detaches a new one).
+# write auth-smokes, persists state, reaps provably-dead orphans, and by default starts
+# the continuous poller (ensure-poller: stops any prior session-scoped poller, then
+# detaches a new one) — anchored to --owner-pid ($PPID = the owning Cursor process), so it
+# self-terminates when this session's process dies (no zombie "Live" agents).
 # Opt out only with --no-poller. On HTTP 401/403 auth falls back to project .mcp.json.
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --session "$SESSION" --agent "Cursor" --cwd "$(pwd)" \
   --codename "<session_codename>" --title "<title>" \
-  --local-id "<local_conversation_id>"
+  --local-id "<local_conversation_id>" --owner-pid "$PPID"
 # Confirm poller.ok / pid in the JSON stdout. If poller failed: check
 # ~/.devspec/remote-control/sessions/${SESSION}.poll.log
-# Manual re-arm (rare): node …/remote-control-state.mjs ensure-poller --session "$SESSION"
+# Manual re-arm (rare): node …/remote-control-state.mjs ensure-poller --session "$SESSION" --owner-pid "$PPID"
 ```
 
 Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 
 Poller contract:
 - Fail-fast auth smoke at startup; on 401/403 retries with the next auth source and rewrites session state
-- Stays up until disabled / UI End / idle_timeout / local_stop / auth failure
+- Auto-started by `write`; stays up until disabled / UI End / idle_timeout / local_stop / **owner gone** / auth failure
+- **Self-terminates** (offline + exit) the moment its `--owner-pid` process dies — no zombie "Live" agents
 - On owner dispatch: appends `*.inbox.jsonl`, advances cursor, **keeps heartbeating**
 - Idle = no LLM tokens; stepped backoff up to 24h then `idle_timeout`
 
@@ -113,7 +116,7 @@ Poller contract:
 
 ```bash
 # After poller is up — start wait so a new owner instruction ends this process with stdout JSON:
-node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --from-end
+node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --session "$SESSION" --owner-pid "$PPID" --from-end
 ```
 
 How to run wait so the model actually turns:
