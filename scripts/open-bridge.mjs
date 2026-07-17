@@ -117,6 +117,8 @@ export async function startMacOsBridgeServer() {
     let displayTitle
     /** @type {'ide' | 'cli'} */
     let surface = 'ide'
+    /** @type {string | null} */
+    let model = null
 
     if (token) {
       const verified = verifyHandoffToken(decodeURIComponent(token))
@@ -129,6 +131,7 @@ export async function startMacOsBridgeServer() {
       promptText = verified.data.prompt ?? null
       displayTitle = verified.data.title ?? null
       surface = verified.data.surface === 'cli' ? 'cli' : 'ide'
+      model = verified.data.model ?? null
     } else {
       slug = decodeURIComponent(repo)
       promptText = prompt ? decodeURIComponent(prompt) : null
@@ -147,6 +150,7 @@ export async function startMacOsBridgeServer() {
       promptText,
       itemTitle: displayTitle,
       surface,
+      model,
       requireSignedToken: false,
       unsigned: true,
     })

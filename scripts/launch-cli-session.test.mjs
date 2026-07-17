@@ -39,6 +39,13 @@ describe('DevSpec Cursor CLI flag policy', () => {
     ])
   })
 
+  it('includes --model when set', () => {
+    assert.deepEqual(
+      buildInteractiveCursorAgentFlags('work', { model: 'cursor-grok-4.5-high' }),
+      ['--force', '--model', 'cursor-grok-4.5-high', '--approve-mcps'],
+    )
+  })
+
   it('brainstorm interactive flags are plan + MCP approve (no force)', () => {
     assert.deepEqual(buildInteractiveCursorAgentFlags('brainstorm'), [
       '--plan',

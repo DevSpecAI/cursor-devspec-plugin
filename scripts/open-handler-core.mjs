@@ -215,9 +215,9 @@ function shellSingleQuote(value) {
 
 /**
  * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
- * @param {{ folderPath: string, promptText: string | null, agentBin: string }} opts
+ * @param {{ folderPath: string, promptText: string | null, agentBin: string, model?: string | null }} opts
  */
-export async function openInAgentCli({ folderPath, promptText, agentBin }) {
+export async function openInAgentCli({ folderPath, promptText, agentBin, model }) {
   await ensureDevspecDir()
   const launchesDir = path.join(DEVSPEC_DIR, 'launches')
   await fs.mkdir(launchesDir, { recursive: true })
@@ -241,6 +241,10 @@ export async function openInAgentCli({ folderPath, promptText, agentBin }) {
     '--agent',
     agentBin,
   ]
+  const modelId = typeof model === 'string' ? model.trim() : ''
+  if (modelId) {
+    launchArgs.push('--model', modelId)
+  }
 
   if (process.platform === 'win32') {
     // Always open a titled cmd.exe /k window. Do NOT use
@@ -427,12 +431,14 @@ export function parseHandoffUrl(raw) {
       promptText: verified.data.prompt ?? null,
       itemTitle: verified.data.title ?? null,
       surface: verified.data.surface === 'cli' ? 'cli' : 'ide',
+      model: verified.data.model ?? null,
     }
   }
 
   const repo = url.searchParams.get('repo')
   if (!repo) return { error: 'missing_repo' }
   const surfaceRaw = url.searchParams.get('surface')
+  const modelRaw = url.searchParams.get('model')
   return {
     slug: decodeURIComponent(repo),
     promptText: url.searchParams.get('prompt')
@@ -442,6 +448,7 @@ export function parseHandoffUrl(raw) {
       ? decodeURIComponent(url.searchParams.get('title'))
       : null,
     surface: surfaceRaw === 'cli' ? 'cli' : 'ide',
+    model: modelRaw ? decodeURIComponent(modelRaw) : null,
     /** Unsigned localhost bridge requests (macOS fallback only). */
     unsigned: true,
   }
@@ -456,6 +463,7 @@ export async function executeHandoff({
   promptText,
   itemTitle,
   surface = 'ide',
+  model = null,
   requireSignedToken = true,
   unsigned = false,
 }) {
@@ -479,7 +487,7 @@ export async function executeHandoff({
       return { ok: false, error: 'agent_missing', slug }
     }
     try {
-      await openInAgentCli({ folderPath, promptText, agentBin })
+      await openInAgentCli({ folderPath, promptText, agentBin, model })
       await appendHandlerLog(`opened CLI ${slug} → ${folderPath} via ${agentBin}`)
       return { ok: true }
     } catch (err) {
@@ -518,6 +526,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     promptText: parsed.promptText,
     itemTitle: parsed.itemTitle,
     surface: parsed.surface === 'cli' ? 'cli' : 'ide',
+    model: parsed.model ?? null,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
