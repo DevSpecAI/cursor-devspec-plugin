@@ -31,6 +31,21 @@ describe('detectLocalId', () => {
     assert.equal(r.source, 'env:CODEX_THREAD_ID')
   })
 
+  it('reads CURSOR_CONVERSATION_ID for IDE Agent / cursor-agent', () => {
+    const r = detectLocalId({}, { CURSOR_CONVERSATION_ID: 'f2da434d-5613-4557-bf84-afac18b2c0df' })
+    assert.equal(r.local_id, 'f2da434d-5613-4557-bf84-afac18b2c0df')
+    assert.equal(r.source, 'env:CURSOR_CONVERSATION_ID')
+  })
+
+  it('prefers CURSOR_CONVERSATION_ID over SHELL_SESSION_ID', () => {
+    const r = detectLocalId(
+      {},
+      { CURSOR_CONVERSATION_ID: 'cursor-chat', SHELL_SESSION_ID: 'shell-1' },
+    )
+    assert.equal(r.local_id, 'cursor-chat')
+    assert.equal(r.source, 'env:CURSOR_CONVERSATION_ID')
+  })
+
   it('does not invent an id from cwd or empty env', () => {
     const r = detectLocalId({}, {})
     assert.equal(r.local_id, null)

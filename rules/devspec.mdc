@@ -3,7 +3,7 @@ description: DevSpec workflow — track work, use MCP, tag commits
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:4 -->
+<!-- devspec-autopilot-rules:5 -->
 
 ## Working with DevSpec
 
@@ -17,6 +17,15 @@ This workspace is connected to DevSpec over MCP (`devspec` server). In Cursor, M
 2. If `.cursor/rules/devspec.mdc` is missing, run **DevSpec: Install rules** (or ask the user to) before other edits.
 3. Resolve the project from git (see below) before project-scoped calls.
 4. Load execution settings from MCP (see **Execution settings** below) before the first file edit on action-item work.
+
+### Cursor session stamp (Resume)
+
+When claiming or finishing action-item work in Cursor, resolve a chat id and pass it as `local_session_id` on `update_action_item` / `record_implementation` (omit `machine_user_id` — the server defaults it):
+
+1. Prompt line `DevSpec local_session_id for this run …: <id>` (CLI `agent create-chat` launches), else
+2. Environment `CURSOR_CONVERSATION_ID` (IDE Agent / cursor-agent).
+
+Never invent an id. Without a stamp, Ask Agent Resume / Session target stay empty.
 
 ### Track work before you edit (hard gate)
 

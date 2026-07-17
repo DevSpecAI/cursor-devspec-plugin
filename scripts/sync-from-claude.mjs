@@ -134,19 +134,16 @@ function transformBody(body, skillName) {
 
   out = out.replace(/Claude Code's `CLAUDE\.md` \/ built-in notes/g, "your own local Cursor rules / notes")
   out = out.replace(/Claude Code's `CLAUDE\.md`/g, 'project docs (`CLAUDE.md`, `AGENTS.md`)')
-  out = out.replace(/`claude --resume <id>`/g, '(session resume is Claude Code only — omit `local_session_id` in Cursor)')
+  // Keep Claude resume phrasing mapped to Cursor stamp guidance — do NOT strip
+  // local_session_id (IDE uses CURSOR_CONVERSATION_ID; CLI uses create-chat stamps).
+  out = out.replace(
+    /`claude --resume <id>`/g,
+    '`agent --resume <id>` (Cursor: stamp line from create-chat, or `CURSOR_CONVERSATION_ID`)',
+  )
 
-  out = out.replace(
-    /- `local_session_id`:[\s\S]*?Do NOT pass `machine_user_id`[^\n]*\n/g,
-    '- **Cursor:** Omit `local_session_id` — session resume is not available from Cursor.\n',
-  )
-  out = out.replace(
-    /- `local_session_id`[^\n]*\n/g,
-    '',
-  )
-  out = out.replace(/\$\{CLAUDE_CODE_SESSION_ID[^}]*\}/g, '')
-  out = out.replace(/\$\{CLAUDE_SESSION_ID[^}]*\}/g, '')
-  out = out.replace(/echo "\$\{CLAUDE_CODE_SESSION_ID[^"]*"\}"/g, '')
+  out = out.replace(/\$\{CLAUDE_CODE_SESSION_ID[^}]*\}/g, '${CURSOR_CONVERSATION_ID}')
+  out = out.replace(/\$\{CLAUDE_SESSION_ID[^}]*\}/g, '${CURSOR_CONVERSATION_ID}')
+  out = out.replace(/echo "\$\{CLAUDE_CODE_SESSION_ID[^"]*"\}"/g, 'echo "$CURSOR_CONVERSATION_ID"')
   out = out.replace(/Get it by running this bash command[\s\S]*?Only if that command prints an empty line[^\n]*\n/g, '')
 
   if (skillName === 'devspec.work') {
