@@ -21,6 +21,7 @@ function parseArgs(argv) {
     if (a === '--folder' && argv[i + 1]) out.folder = argv[++i]
     else if (a === '--prompt-file' && argv[i + 1]) out.promptFile = argv[++i]
     else if (a === '--agent' && argv[i + 1]) out.agent = argv[++i]
+    else if (a === '--model' && argv[i + 1]) out.model = argv[++i]
   }
   return out
 }
@@ -54,7 +55,7 @@ export function inferCursorAgentRunKindFromPrompt(prompt) {
  * Interactive (non-print) Cursor Agent flags for DevSpec rocket launches.
  * Keep in sync with DevSpecV2 `buildCursorAgentFlags` (headless=false).
  * @param {'work' | 'brainstorm' | 'ask' | 'resume'} kind
- * @param {{ approval?: 'force' | 'auto-review', worktree?: boolean }} [opts]
+ * @param {{ approval?: 'force' | 'auto-review', worktree?: boolean, model?: string | null }} [opts]
  * @returns {string[]}
  */
 export function buildInteractiveCursorAgentFlags(kind, opts = {}) {
@@ -65,6 +66,10 @@ export function buildInteractiveCursorAgentFlags(kind, opts = {}) {
     flags.push('--mode', 'ask')
   } else {
     flags.push(opts.approval === 'auto-review' ? '--auto-review' : '--force')
+  }
+  const model = typeof opts.model === 'string' ? opts.model.trim() : ''
+  if (model) {
+    flags.push('--model', model)
   }
   flags.push('--approve-mcps')
   if (opts.worktree) flags.push('--worktree')
@@ -214,7 +219,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (!args.folder || !args.promptFile) {
     console.error(
-      'Usage: launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]',
+      'Usage: launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>] [--model <id>]',
     )
     process.exitCode = 1
     return
@@ -260,11 +265,13 @@ async function main() {
   )
 
   const kind = inferCursorAgentRunKindFromPrompt(promptBody)
-  const policyFlags = buildInteractiveCursorAgentFlags(kind)
+  const policyFlags = buildInteractiveCursorAgentFlags(kind, {
+    model: args.model ?? null,
+  })
 
   const inv = resolveWindowsAgentInvocation(agentBin)
   console.log(
-    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} invoke=${inv.mode})`,
+    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} model=${args.model || 'auto'} invoke=${inv.mode})`,
   )
   const child = spawnAgent(
     agentBin,

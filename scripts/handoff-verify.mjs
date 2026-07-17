@@ -21,7 +21,7 @@ function loadPublicKey() {
 
 /**
  * @param {string} token  base64url(payload).base64url(signature)
- * @returns {{ ok: true, data: { repo: string, prompt?: string, title?: string, surface?: 'ide' | 'cli', exp: number } } | { ok: false, error: string }}
+ * @returns {{ ok: true, data: { repo: string, prompt?: string, title?: string, surface?: 'ide' | 'cli', model?: string, exp: number } } | { ok: false, error: string }}
  */
 export function verifyHandoffToken(token) {
   if (!token || typeof token !== 'string') return { ok: false, error: 'missing_token' }
@@ -65,6 +65,9 @@ export function verifyHandoffToken(token) {
   let surface
   if (data.surface === 'cli' || data.surface === 'ide') surface = data.surface
 
+  const model =
+    typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined
+
   return {
     ok: true,
     data: {
@@ -72,6 +75,7 @@ export function verifyHandoffToken(token) {
       prompt: typeof data.prompt === 'string' ? data.prompt : undefined,
       title: typeof data.title === 'string' ? data.title : undefined,
       surface,
+      model,
       exp,
     },
   }
