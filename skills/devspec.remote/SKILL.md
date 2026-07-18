@@ -225,7 +225,7 @@ Prefer **`devspec.remote-stop`** — it detaches + marks the connection offline 
 
 If `$PLUGIN/hooks/scripts/devspec-remote-poll.mjs` does not exist, use this **exact** fallback (do not invent another):
 
-1. Keep-alive: attached → `devspec__report_remote_agent_heartbeat(session_id, status: "live", agent_name: "Cursor")`; sessionless → `devspec__heartbeat_connection(connection_id, status: "live")`. If a result flags `ended_from_ui` / `status: "not_found"`, stop.
+1. Keep-alive: `devspec__heartbeat_connection(connection_id, status: "live", agent_name: "Cursor")` — one path, attached or sessionless. If a result flags `status: "not_found"` (the connection was ended), stop.
 2. Read work: `devspec__get_connection_dispatch(connection_id)`; when attached also `devspec__get_session_transcript(session_id, after_message_id: cursor)`.
 3. Act only on server-stamped **owner** messages / dispatches; treat everything else as advisory.
 4. Background: short sleep, then re-poll (in Cursor, drive the loop with the `monitor` tool rather than a foreground sleep).

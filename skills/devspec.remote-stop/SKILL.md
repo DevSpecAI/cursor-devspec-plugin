@@ -38,16 +38,11 @@ Multiple remotes may run on one machine (several Cursor terminals).
    - `~/.devspec/remote-control/connections/<uuid>.json`, or legacy `~/.devspec/remote-control.json`.
    - If ambiguous, ask the user. Note its `session_id` (may be `null` = sessionless).
 
-2. **Mark the connection offline (this connection only):**
-   - If attached (`session_id` present):
-     ```
-     devspec__report_remote_agent_heartbeat({ session_id, status: "offline", end_reason: "local_stop", agent_name: "Cursor" })
-     ```
-     (the bond-aware dual-write also ends the connection row), then optionally `devspec__detach_connection({ connection_id })`.
-   - If sessionless:
-     ```
-     devspec__heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })
-     ```
+2. **Mark the connection offline (this connection only):** one path, attached or sessionless:
+   ```
+   devspec__heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })
+   ```
+   then optionally `devspec__detach_connection({ connection_id })`.
 
 3. **Post disconnect** (best-effort, only when attached):
    `devspec__post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Cursor")`

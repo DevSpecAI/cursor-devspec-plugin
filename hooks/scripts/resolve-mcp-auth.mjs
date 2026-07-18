@@ -2,18 +2,14 @@
 /**
  * Resolve DevSpec MCP URL + Bearer token for remote-control hooks/poller.
  *
- * Lookup order (first wins for sync resolve):
- * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL or DEVSPEC_API_URL)
+ * Lookup order:
+ * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL)
  * 2. Project .mcp.json (cwd and parents)
  * 3. ~/.claude.json project entries that match cwd (mcpServers.devspec)
  * 4. ~/.claude.json top-level mcpServers.devspec
  * 5. CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin userConfig token
  *    (keychain-stored; Claude Code exports it to hook/tool subprocesses).
  *    Lowest priority so a developer's own .mcp.json (e.g. staging) still wins.
- *
- * Validated resolve (`resolveDevspecMcpAuthValidated`) walks the same order but
- * probes each candidate: on HTTP 401/403 it tries the next source so a stale
- * shell env token cannot permanently override a good project `.mcp.json`.
  *
  * Prints JSON: { ok, token?, mcp_url?, source?, error? }
  * Never prints the full token in human logs — only to stdout JSON for piping.
@@ -39,23 +35,6 @@ function extractBearer(headers) {
   if (typeof auth !== 'string') return null
   const m = auth.match(/^Bearer\s+(.+)$/i)
   return m ? m[1].trim() : auth.trim() || null
-}
-
-/** Map DEVSPEC_API_URL (app origin) → MCP endpoint when DEVSPEC_MCP_URL is unset. */
-export function mcpUrlFromApiBase(apiBase) {
-  if (!apiBase || typeof apiBase !== 'string') return null
-  const trimmed = apiBase.trim().replace(/\/+$/, '')
-  if (!trimmed) return null
-  if (/\/api\/mcp$/i.test(trimmed)) return trimmed
-  return `${trimmed}/api/mcp`
-}
-
-function resolveEnvMcpUrl() {
-  return (
-    process.env.DEVSPEC_MCP_URL ||
-    mcpUrlFromApiBase(process.env.DEVSPEC_API_URL) ||
-    null
-  )
 }
 
 function fromServerEntry(entry) {
@@ -121,86 +100,53 @@ function fromClaudeJson(cwd) {
   return null
 }
 
-/** True when an MCP tools/call failed with HTTP 401 or 403 (stale/wrong token). */
-export function isMcpAuthHttpError(err) {
-  const msg = String(err?.message || err || '')
-  return /\bMCP HTTP 401\b/.test(msg) || /\bMCP HTTP 403\b/.test(msg)
-}
-
-/**
- * Ordered auth candidates (env → project → claude → plugin). Deduped by token+url.
- * Exported for tests and validated resolve.
- */
-export function listDevspecMcpAuthCandidates(cwd = process.cwd()) {
-  const envUrl = resolveEnvMcpUrl()
-  const candidates = []
-  const seen = new Set()
-
-  function push(entry) {
-    if (!entry?.token) return
-    const mcp_url = entry.mcp_url || envUrl || DEFAULT_PROD_URL
-    const key = `${entry.token}\0${mcp_url}`
-    if (seen.has(key)) return
-    seen.add(key)
-    candidates.push({
-      ok: true,
-      token: entry.token,
-      mcp_url,
-      source: entry.source,
-    })
-  }
-
+export function resolveDevspecMcpAuth(cwd = process.cwd()) {
   const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
+  const envUrl = process.env.DEVSPEC_MCP_URL || null
   if (envToken) {
-    push({
+    return {
+      ok: true,
       token: envToken,
       mcp_url: envUrl || DEFAULT_PROD_URL,
       source: 'env',
-    })
+    }
   }
 
   const fromProject = walkMcpJson(cwd)
   if (fromProject?.token) {
-    push({
+    return {
+      ok: true,
       token: fromProject.token,
       mcp_url: envUrl || fromProject.mcp_url || DEFAULT_PROD_URL,
       source: fromProject.source,
-    })
+    }
   }
 
   const fromClaude = fromClaudeJson(cwd)
   if (fromClaude?.token) {
-    push({
+    return {
+      ok: true,
       token: fromClaude.token,
       mcp_url: envUrl || fromClaude.mcp_url || DEFAULT_PROD_URL,
       source: fromClaude.source,
-    })
+    }
   }
 
+  // Plugin userConfig token (sensitive; stored in the OS keychain, exported to
+  // subprocesses as CLAUDE_PLUGIN_OPTION_<KEY>). This is how a marketplace-
+  // installed user's token reaches the remote-control hooks/poller — they never
+  // put it in .mcp.json. Kept last so an explicit local .mcp.json wins.
   const pluginOptionToken =
     process.env.CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN ||
     process.env.CLAUDE_PLUGIN_OPTION_devspec_token ||
     null
   if (pluginOptionToken) {
-    push({
+    return {
+      ok: true,
       token: pluginOptionToken,
       mcp_url: envUrl || fromProject?.mcp_url || DEFAULT_PROD_URL,
       source: 'plugin_user_config',
-    })
-  }
-
-  return { candidates, fromProject, envUrl }
-}
-
-/**
- * Sync resolve — first candidate wins (env still preferred for CI).
- * Does not probe the network; use resolveDevspecMcpAuthValidated when starting
- * a long-lived poller so a stale env token can fall back after 401.
- */
-export function resolveDevspecMcpAuth(cwd = process.cwd()) {
-  const { candidates, fromProject, envUrl } = listDevspecMcpAuthCandidates(cwd)
-  if (candidates.length > 0) {
-    return candidates[0]
+    }
   }
 
   // URL-only from project file (token missing)
@@ -219,78 +165,6 @@ export function resolveDevspecMcpAuth(cwd = process.cwd()) {
     mcp_url: envUrl || DEFAULT_PROD_URL,
     error:
       'No DevSpec MCP token found. Provide your token via the plugin configuration, set DEVSPEC_MCP_TOKEN, or configure mcpServers.devspec.headers.Authorization in project .mcp.json.',
-  }
-}
-
-/**
- * Probe each auth candidate; on HTTP 401/403 try the next source.
- * `probe` must be async ({ mcpUrl, token, source }) => void and throw on failure
- * (preferably via mcpToolsCall so messages include `MCP HTTP 401:`).
- */
-export async function resolveDevspecMcpAuthValidated({
-  cwd = process.cwd(),
-  probe,
-  skipTokens = null,
-} = {}) {
-  if (typeof probe !== 'function') {
-    throw new Error('resolveDevspecMcpAuthValidated requires an async probe({ mcpUrl, token, source })')
-  }
-
-  const { candidates, fromProject, envUrl } = listDevspecMcpAuthCandidates(cwd)
-  const skip = skipTokens instanceof Set ? skipTokens : new Set(skipTokens || [])
-
-  if (candidates.length === 0) {
-    if (fromProject?.mcp_url) {
-      return {
-        ok: false,
-        mcp_url: envUrl || fromProject.mcp_url,
-        source: fromProject.source,
-        error:
-          'Found DevSpec MCP URL but no Bearer token. Set DEVSPEC_MCP_TOKEN or add headers.Authorization on the devspec server in .mcp.json.',
-      }
-    }
-    return {
-      ok: false,
-      mcp_url: envUrl || DEFAULT_PROD_URL,
-      error:
-        'No DevSpec MCP token found. Provide your token via the plugin configuration, set DEVSPEC_MCP_TOKEN, or configure mcpServers.devspec.headers.Authorization in project .mcp.json.',
-    }
-  }
-
-  const failures = []
-  for (const c of candidates) {
-    if (skip.has(c.token)) continue
-    try {
-      await probe({ mcpUrl: c.mcp_url, token: c.token, source: c.source })
-      return {
-        ...c,
-        ok: true,
-        validated: true,
-        fallback_from: failures.length > 0 ? failures : undefined,
-      }
-    } catch (e) {
-      const message = String(e?.message || e)
-      failures.push({ source: c.source, message })
-      if (isMcpAuthHttpError(e)) {
-        continue
-      }
-      // Non-auth failure (network, 5xx, parse): fail fast — do not silently hop tokens.
-      return {
-        ok: false,
-        mcp_url: c.mcp_url,
-        source: c.source,
-        error: `Auth smoke failed (${c.source}): ${message}`,
-        failures,
-      }
-    }
-  }
-
-  const detail = failures.map((f) => `${f.source}: ${f.message}`).join(' | ')
-  return {
-    ok: false,
-    mcp_url: candidates[0]?.mcp_url || envUrl || DEFAULT_PROD_URL,
-    error: `All MCP auth candidates failed auth smoke (401/403). ${detail}`,
-    failures,
   }
 }
 
