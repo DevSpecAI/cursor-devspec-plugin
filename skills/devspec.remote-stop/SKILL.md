@@ -1,11 +1,11 @@
 ---
 name: devspec.remote-stop
-description: Disconnect DevSpec remote control — mark Agents page offline and clear local state. Use when done remote controlling or before exiting the agent.
+description: Disconnect DevSpec remote control for THIS conversation only — connection offline on the Agents page, stop the matching poller, leave other remotes alone.
 ---
 
 # DevSpec Remote Control — Stop / Disconnect
 
-Cleanly disconnect **this** local agent / **this** remote-control session so the **Agents page** drops the live indicator immediately.
+Cleanly disconnect **this** conversation's connection so the **Agents page** drops its live indicator immediately.
 
 ## Plugin root (non-negotiable)
 
@@ -16,51 +16,60 @@ Use the **installed Cursor DevSpec extension** scripts only.
 3. **Never** call `remote-control-state.mjs` from `~/.claude/plugins/**` or marketplace caches.
 4. Quote `"$PLUGIN"` in every shell command.
 
-## Multi-session safety (non-negotiable)
+## Multi-connection safety (non-negotiable)
 
-One machine may run **several** remote-control sessions at once (multiple Cursor terminals).
+Multiple remotes may run on one machine (several Cursor terminals).
 
-- Stop **only** the session you intend to stop (from `~/.devspec/remote-control/sessions/<uuid>.json` or `--session`).
+- Stop **only** the target `connection_id`.
 - **Never** kill every `devspec-remote-poll` process on the machine.
-- **Never** call offline heartbeat on any other session UUID.
-- Prefer: `node …/remote-control-state.mjs disable --session <uuid>` (session-scoped disable + kill).
+- **Never** offline any other connection.
+- Prefer: `node "$PLUGIN/hooks/scripts/remote-control-state.mjs" disable --connection-id <uuid>` (connection-scoped disable + kill).
 
 ## Steps
 
-1. **Resolve session id** (in order):
-   - Explicit arg / user-provided UUID
-   - Per-session file if known
-   - Legacy `~/.devspec/remote-control.json` → `session_id` (may be the *latest* connect only — if multiple remotes, ask which session)
+1. **Resolve connection id** (in order):
+   - Explicit arg / user-provided `connection_id`.
+   - This conversation's state:
+     ```bash
+     node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local \
+       --agent "Cursor" --local-id "$CURSOR_CONVERSATION_ID"
+     ```
+     (use its `connection_id`).
+   - `~/.devspec/remote-control/connections/<uuid>.json`, or legacy `~/.devspec/remote-control.json`.
+   - If ambiguous, ask the user. Note its `session_id` (may be `null` = sessionless).
 
-2. **Mark offline on DevSpec** — **only this session_id**:
-   ```
-   report_remote_agent_heartbeat({
-     session_id,
-     status: "offline",
-     end_reason: "local_stop",
-     agent_name: "Cursor"
-   })
-   ```
+2. **Mark the connection offline (this connection only):**
+   - If attached (`session_id` present):
+     ```
+     devspec__report_remote_agent_heartbeat({ session_id, status: "offline", end_reason: "local_stop", agent_name: "Cursor" })
+     ```
+     (the bond-aware dual-write also ends the connection row), then optionally `devspec__detach_connection({ connection_id })`.
+   - If sessionless:
+     ```
+     devspec__heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })
+     ```
 
-3. **Post disconnect** (best-effort, same session only):
-   `post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Cursor")`
+3. **Post disconnect** (best-effort, only when attached):
+   `devspec__post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Cursor")`
 
-4. **Disable local state + stop THIS poller only:**
+4. **Disable local state + kill only this poller + mark bond stopped:**
    ```bash
-   node "$PLUGIN/hooks/scripts/remote-control-state.mjs" disable --session '<session_id>'
+   node "$PLUGIN/hooks/scripts/remote-control-state.mjs" disable \
+     --connection-id '<connection_id>' --agent "Cursor" --local-id "$CURSOR_CONVERSATION_ID"
    ```
-   That writes `enabled: false` for that session file and SIGTERMs only pollers whose argv includes this UUID.
+   Connection-scoped: writes that connection's state `enabled: false`, marks matching local bonds `stopped` (soft-reconnect only for this conversation within the recovery window), and SIGTERMs pollers whose argv includes this connection UUID only.
 
 5. **Print:**
    ```
    ✓ DevSpec remote control stopped
-     Session:  {first 8}…
+     Connection: {first 8}…
      Agents page: offline
      Other remotes on this machine: left running
    ```
 
 ## Rules
 
-- Always offline **this** session even if post fails.
+- Always offline **this** connection even if the post fails.
 - Do not delete the DevSpec session — history remains.
+- Soft-reconnect is bond-scoped (same conversation id), never by cwd/repo.
 - Distinct from any built-in remote-control feature of your host app.
