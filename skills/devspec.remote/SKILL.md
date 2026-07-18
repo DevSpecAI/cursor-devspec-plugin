@@ -39,13 +39,30 @@ All poller / state scripts come from the **installed Cursor DevSpec extension** 
 ## Steps
 
 1. **Parse arguments.** Optional:
-   - `--title="…"` → session title override
-   - Remaining free text → opening note for the control channel
-   Store values in working memory.
+   - `--session=<uuid>` → **attach** to an existing DevSpec session (do **not** `create_session`)
+   - `--title="…"` → session title override (create path only)
+   - Remaining free text → opening note for the control channel (create path only)
+   Store values in working memory. When `--session` is present, treat this run as **reattach / session-first Connect**.
 
 2. **Resolve project.** Call `devspec__list_projects` with `git_remote` from `git remote get-url origin` (or omit if single-project context). Use `remote_match.resolved_project_id` as `project_id` when multi-project. If no match, stop with `✗ No DevSpec project tracks this repo`.
 
-3. **Open the remote-control session.** Call `devspec__create_session` with:
+3. **Open or attach the remote-control session.**
+
+   **A. Attach (`--session` present — Agents page / session-first Connect):**
+   - Do **not** call `create_session`.
+   - Call `devspec__report_remote_agent_heartbeat({ session_id, status: "live", reattach: true, agent_name: "Cursor" })` (first live heartbeat of a new attach only — ordinary keep-alives omit `reattach`).
+   - Seed context with `devspec__get_session_transcript(session_id)` (no cursor) — read instruction tiers from the response.
+   - Store the full **`session_id`** UUID. Print:
+     ```
+     ━━━ DevSpec Remote Control ━━━
+     Session:  {first 8 of session_id}…
+     Status:   attached (reattach)
+     Agent:    Cursor
+     Open:     Agents page → Remote control
+     ─────────────────────────────
+     ```
+
+   **B. Create (no `--session`):** Call `devspec__create_session` with:
    - `session_type: "agent_remote_control"`
    - `access: "private"` (unless the user explicitly asked otherwise)
    - `agent_name: "Cursor"`
@@ -62,9 +79,12 @@ All poller / state scripts come from the **installed Cursor DevSpec extension** 
    ─────────────────────────────
    ```
 
-4. **Connected signal.** If create_session did not already post one, post **one short line only** — no memories/artifacts spiel, no "Context loaded…" follow-up. Resolve the token owner's first name from `verify_agent_connection` → `connected_as` (first word), then call:
-   `devspec__post_session_message(session_id, "You're connected to {FirstName}'s Cursor agent on their local machine.", agent_name: "Cursor")`.
-   Example when `connected_as` is `Brandon Caddow Young`: `You're connected to Brandon's Cursor agent on their local machine.`
+4. **Connected signal (create path only — skip on reattach).**
+   - **Attach / reattach:** Do **not** post `"You're connected to {FirstName}'s Cursor agent…"`. The live heartbeat already stamps a system `remote_control_started` marker (e.g. "Cursor connected"). A second agent-posted connect line is redundant and, because the session UI groups consecutive external-agent bubbles, it steals the Cursor avatar from the first real reply.
+   - Also skip if the seed transcript already contains `message_type: "remote_control_started"` (or an equivalent connect marker) for this attach.
+   - **Fresh create only:** If `create_session` did not already post a connect line, post **one short line only** — no memories/artifacts spiel, no "Context loaded…" follow-up. Resolve the token owner's first name from `verify_agent_connection` → `connected_as` (first word), then call:
+     `devspec__post_session_message(session_id, "You're connected to {FirstName}'s Cursor agent on their local machine.", agent_name: "Cursor")`.
+     Example when `connected_as` is `Brandon Caddow Young`: `You're connected to Brandon's Cursor agent on their local machine.`
 
 5. **Poll-and-react loop** (until the user says stop / disconnect / exit remote):
    - Keep a cursor: `after_message_id` (and/or `since_created_at`) from the last poll.
