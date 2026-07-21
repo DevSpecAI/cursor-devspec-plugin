@@ -214,6 +214,43 @@ function shellSingleQuote(value) {
 }
 
 /**
+ * Resolve the OpenCode CLI binary (`opencode`). Prefer PATH, then known install dirs.
+ * Mirrors resolveAgentExecutable's where/which + known-path fallback pattern.
+ * @returns {Promise<string | null>}
+ */
+export async function resolveOpencodeExecutable() {
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which'
+  try {
+    const { stdout } = await execFileAsync(whichCmd, ['opencode'], { timeout: 5000 })
+    const first = String(stdout)
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find(Boolean)
+    if (first && (await pathExists(first))) return first
+  } catch {
+    // fall through to known paths
+  }
+
+  const home = os.homedir()
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          path.join(process.env.APPDATA ?? '', 'npm', 'opencode.cmd'),
+          path.join(home, 'AppData', 'Roaming', 'npm', 'opencode.cmd'),
+        ]
+      : [
+          path.join(home, '.local', 'bin', 'opencode'),
+          '/usr/local/bin/opencode',
+          path.join(home, '.opencode', 'bin', 'opencode'),
+        ]
+
+  for (const candidate of candidates) {
+    if (candidate && (await pathExists(candidate))) return candidate
+  }
+  return null
+}
+
+/**
  * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
  * @param {{ folderPath: string, promptText: string | null, agentBin: string, model?: string | null }} opts
  */
@@ -300,6 +337,87 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
     }
   }
   throw new Error('No terminal emulator found to launch Cursor CLI')
+}
+
+/**
+ * Open an OS terminal that runs launch-opencode-session.mjs. Simpler than
+ * openInAgentCli — OpenCode's `opencode run` starts a fresh session itself,
+ * no separate create+resume dance needed, so it's one spawn per platform
+ * instead of a titled-window wrapper around a multi-step CLI conversation.
+ * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null }} opts
+ */
+export async function openInOpenCode({ folderPath, promptText, opencodeBin, model }) {
+  await ensureDevspecDir()
+  const launchesDir = path.join(DEVSPEC_DIR, 'launches')
+  await fs.mkdir(launchesDir, { recursive: true })
+
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
+  await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
+
+  // Prefer the installed copy under ~/.cursor/devspec; fall back to sibling of this module.
+  const installedLauncher = path.join(DEVSPEC_DIR, 'launch-opencode-session.mjs')
+  const siblingLauncher = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'launch-opencode-session.mjs',
+  )
+  const launcher = (await pathExists(installedLauncher)) ? installedLauncher : siblingLauncher
+
+  const nodeBin = process.execPath
+  const launchArgs = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--opencode', opencodeBin]
+  const modelId = typeof model === 'string' ? model.trim() : ''
+  if (modelId) {
+    launchArgs.push('--model', modelId)
+  }
+
+  if (process.platform === 'win32') {
+    // Same App Execution Alias / quoting hazards as openInAgentCli — see its
+    // comments. Write a .cmd launcher and `start` that file rather than
+    // passing the full quoted node command as one spawn argv.
+    const batPath = path.join(launchesDir, `${stamp}.launch.cmd`)
+    await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
+    spawn('cmd.exe', ['/c', 'start', 'DevSpec OpenCode', 'cmd.exe', '/k', batPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      cwd: folderPath,
+    }).unref()
+    return
+  }
+
+  if (process.platform === 'darwin') {
+    const cmd = `cd ${shellSingleQuote(folderPath)} && ${shellSingleQuote(nodeBin)} ${launchArgs
+      .map(shellSingleQuote)
+      .join(' ')}`
+    spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref()
+    return
+  }
+
+  // Linux — try common terminal emulators.
+  const linuxCmd = `${shellSingleQuote(nodeBin)} ${launchArgs.map(shellSingleQuote).join(' ')}`
+  const terminals = [
+    ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
+    ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
+    ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
+    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
+  ]
+  for (const [bin, args] of terminals) {
+    try {
+      await execFileAsync('which', [bin], { timeout: 2000 })
+      spawn(bin, args, {
+        detached: true,
+        stdio: 'ignore',
+        cwd: folderPath,
+      }).unref()
+      return
+    } catch {
+      // try next
+    }
+  }
+  throw new Error('No terminal emulator found to launch OpenCode')
 }
 
 const CURSOR_PROMPT_DEEPLINK_BASE = 'cursor://anysphere.cursor-deeplink/prompt'
@@ -431,6 +549,7 @@ export function parseHandoffUrl(raw) {
       promptText: verified.data.prompt ?? null,
       itemTitle: verified.data.title ?? null,
       surface: verified.data.surface === 'cli' ? 'cli' : 'ide',
+      tool: verified.data.tool === 'opencode' ? 'opencode' : 'cursor',
       model: verified.data.model ?? null,
     }
   }
@@ -438,6 +557,7 @@ export function parseHandoffUrl(raw) {
   const repo = url.searchParams.get('repo')
   if (!repo) return { error: 'missing_repo' }
   const surfaceRaw = url.searchParams.get('surface')
+  const toolRaw = url.searchParams.get('tool')
   const modelRaw = url.searchParams.get('model')
   return {
     slug: decodeURIComponent(repo),
@@ -448,6 +568,7 @@ export function parseHandoffUrl(raw) {
       ? decodeURIComponent(url.searchParams.get('title'))
       : null,
     surface: surfaceRaw === 'cli' ? 'cli' : 'ide',
+    tool: toolRaw === 'opencode' ? 'opencode' : 'cursor',
     model: modelRaw ? decodeURIComponent(modelRaw) : null,
     /** Unsigned localhost bridge requests (macOS fallback only). */
     unsigned: true,
@@ -463,6 +584,7 @@ export async function executeHandoff({
   promptText,
   itemTitle,
   surface = 'ide',
+  tool = 'cursor',
   model = null,
   requireSignedToken = true,
   unsigned = false,
@@ -477,6 +599,28 @@ export async function executeHandoff({
     await appendHandlerLog(`missing mapping for ${slug}`)
     openErrorPage(slug, 'missing_mapping')
     return { ok: false, error: 'missing_mapping', slug }
+  }
+
+  // OpenCode has no separate "ide" surface — it's always a terminal, so it
+  // never falls through to the Cursor-app-open branch below regardless of
+  // the surface field.
+  if (tool === 'opencode') {
+    const opencodeBin = await resolveOpencodeExecutable()
+    if (!opencodeBin) {
+      await appendHandlerLog(`opencode missing for handoff ${slug}`)
+      openErrorPage(slug, 'opencode_missing')
+      return { ok: false, error: 'opencode_missing', slug }
+    }
+    try {
+      await openInOpenCode({ folderPath, promptText, opencodeBin, model })
+      await appendHandlerLog(`opened OpenCode ${slug} → ${folderPath} via ${opencodeBin}`)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await appendHandlerLog(`OpenCode open failed: ${message}`)
+      openErrorPage(slug, 'agent_launch_failed')
+      return { ok: false, error: 'agent_launch_failed', slug }
+    }
   }
 
   if (surface === 'cli') {
@@ -526,6 +670,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     promptText: parsed.promptText,
     itemTitle: parsed.itemTitle,
     surface: parsed.surface === 'cli' ? 'cli' : 'ide',
+    tool: parsed.tool === 'opencode' ? 'opencode' : 'cursor',
     model: parsed.model ?? null,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
