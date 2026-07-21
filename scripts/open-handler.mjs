@@ -28,6 +28,7 @@ async function copyInstalledArtifacts(sourceDir) {
     'handoff-verify.mjs',
     'handoff-public-key.pem',
     'devspec-handler.cmd',
+    'devspec-handler.vbs',
     // Needed only for --install / reinstall from the installed copy; URL
     // handling does not import these (lazy-loaded below). Keep them so a
     // reinstall from ~/.cursor/devspec still works.

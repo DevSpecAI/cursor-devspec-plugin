@@ -39,8 +39,14 @@ export async function installProtocolHandler(handlerCmdPath) {
 }
 
 async function installWindows(handlerCmdPath) {
+  // Route through the .vbs wrapper (sibling file, same install dir) via
+  // wscript.exe //B instead of invoking devspec-handler.cmd directly — a
+  // .cmd file always needs a console host, which briefly flashed a visible
+  // window on every single devspec:// launch. wscript.exe has no console of
+  // its own and WshShell.Run(...,0,...) launches the real handler hidden.
   // Quote %1 so URLs with & / ? survive cmd.exe parsing (Windows protocol invoke).
-  const command = `${quoteWin(handlerCmdPath)} "%1"`
+  const vbsPath = handlerCmdPath.replace(/\.cmd$/i, '.vbs')
+  const command = `wscript.exe //B ${quoteWin(vbsPath)} "%1"`
   const keys = [
     ['HKCU\\Software\\Classes\\devspec', '/ve', '/d', 'URL:DevSpec Protocol', '/f'],
     ['HKCU\\Software\\Classes\\devspec', '/v', 'URL Protocol', '/d', '', '/f'],
