@@ -22,6 +22,36 @@ function parseArgs(argv) {
   return out
 }
 
+/**
+ * Build the `opencode run` argv for a prompt body + optional model.
+ *
+ * `opencode run` does NOT expand a leading "/command args" string the way
+ * typing it into the interactive TUI does — passed as a plain positional
+ * message, the model just receives it as inert text (observed live: it
+ * tried to execute "/devspec.remote --session <uuid>" as a shell path).
+ * The registered-command form needs the dedicated --command flag instead,
+ * with "--" so yargs doesn't reparse the command's own flags (e.g.
+ * --session) as opencode's own.
+ * @param {string} promptBody
+ * @param {string} [model]
+ * @returns {string[]}
+ */
+export function buildOpencodeRunArgs(promptBody, model) {
+  const runArgs = ['run']
+  const trimmedModel = typeof model === 'string' ? model.trim() : ''
+  if (trimmedModel) runArgs.push('--model', trimmedModel)
+
+  const slashCommand = promptBody.match(/^\/([a-zA-Z0-9_.-]+)\s*(.*)$/s)
+  if (slashCommand) {
+    const [, commandName, commandArgs] = slashCommand
+    runArgs.push('--command', commandName)
+    if (commandArgs) runArgs.push('--', commandArgs)
+  } else {
+    runArgs.push(promptBody)
+  }
+  return runArgs
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (!args.folder || !args.promptFile) {
@@ -42,13 +72,10 @@ async function main() {
     return
   }
 
-  const runArgs = ['run']
-  const model = typeof args.model === 'string' ? args.model.trim() : ''
-  if (model) runArgs.push('--model', model)
-  runArgs.push(promptBody)
+  const runArgs = buildOpencodeRunArgs(promptBody, args.model)
 
   console.log(
-    `[devspec-opencode] Running in ${args.folder} (model=${model || 'auto'})`,
+    `[devspec-opencode] Running in ${args.folder} (model=${args.model || 'auto'})`,
   )
   // Reuses the Windows-safe invocation logic built for Cursor's `agent` binary
   // (prefer a sibling .ps1 over wrapping a .cmd in `cmd /c`, which loses the
