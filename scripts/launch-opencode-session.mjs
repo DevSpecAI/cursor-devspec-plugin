@@ -142,8 +142,16 @@ function isPidAlive(pid) {
  * tracking the right pid — tracking the right pid doesn't help if the kill
  * against it can quietly fail. Now verifies the pid is actually gone
  * afterward and retries once before giving up (logged either way).
+ *
+ * Round 8: killing is still required (one state file per directory), but it
+ * must never be silent when the prior server was attached to a *different*
+ * DevSpec session — warn in launcher.log and post into that displaced room
+ * (and the incoming room when known) before taskkill.
+ *
+ * @param {string} folder
+ * @param {{ incomingSessionId?: string | null, incomingModel?: string | null }} [ctx]
  */
-async function killExistingServer(folder) {
+async function killExistingServer(folder, ctx = {}) {
   const pidFile = serverPidFile(folder)
   let pid
   try {
@@ -152,6 +160,39 @@ async function killExistingServer(folder) {
     return
   }
   if (!Number.isInteger(pid) || pid <= 0) return
+
+  const prior = await readPriorRemoteState(folder)
+  const priorSessionId = typeof prior?.sessionId === 'string' ? prior.sessionId : null
+  const priorConnectionId = typeof prior?.connectionId === 'string' ? prior.connectionId : null
+  const incomingSessionId = ctx.incomingSessionId || null
+  const displacing =
+    Boolean(priorSessionId) &&
+    Boolean(incomingSessionId) &&
+    priorSessionId !== incomingSessionId &&
+    isPidAlive(pid)
+
+  if (displacing) {
+    const warn =
+      `OpenCode is replacing the live remote server for this project folder.\n\n` +
+      `Prior DevSpec session: ${priorSessionId}\n` +
+      `New DevSpec session: ${incomingSessionId}\n` +
+      (ctx.incomingModel ? `New model: ${ctx.incomingModel}\n` : '') +
+      (priorConnectionId ? `Prior connection: ${priorConnectionId}\n` : '') +
+      `\nOnly one OpenCode server can own this folder's remote-control state, so the prior server is being stopped. Re-attach the prior session if you still need it.`
+    await log(
+      `WARNING: displacing live server pid=${pid} priorSession=${priorSessionId} → incomingSession=${incomingSessionId}`,
+    )
+    await postToDevspecSession({ folder, sessionId: priorSessionId, message: `⚠️ ${warn}` })
+    await postToDevspecSession({
+      folder,
+      sessionId: incomingSessionId,
+      message: `⚠️ Starting OpenCode for this session will stop the live server still attached to session ${priorSessionId}.`,
+    })
+  } else if (isPidAlive(pid)) {
+    await log(
+      `replacing live server pid=${pid} priorSession=${priorSessionId || 'none'} incomingSession=${incomingSessionId || 'none'}`,
+    )
+  }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (!isPidAlive(pid)) {
@@ -235,6 +276,8 @@ export function buildOpencodeRunArgs(promptBody, model) {
 }
 
 const LAUNCHER_LOG_FILE = path.join(remoteControlDir(), 'launcher.log')
+const UUID_RE =
+  /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
 
 /**
  * This script is always spawned with `stdio: 'ignore'` by open-handler-core
@@ -244,6 +287,11 @@ const LAUNCHER_LOG_FILE = path.join(remoteControlDir(), 'launcher.log')
  * (server never came up, client errored) left zero trace anywhere, making
  * it indistinguishable from "still working, just slow." Persist the same
  * milestones to a log file instead of only stdio.
+ *
+ * Round 8 (stuck MiniMax + flash-closed window): client `stdio: 'ignore'`
+ * also threw away the ONLY copy of the failure reason (model/auth errors,
+ * session.error). We now tee client stdout/stderr into this same log and
+ * post non-zero exits into the DevSpec session when we can resolve a token.
  */
 async function log(line) {
   try {
@@ -252,6 +300,157 @@ async function log(line) {
   } catch {
     // best-effort — logging must never be why a launch fails
   }
+}
+
+/** Pull `--session <uuid>` (or bare uuid after /devspec.remote) from the connect prompt. */
+export function extractSessionIdFromPrompt(promptBody) {
+  if (typeof promptBody !== 'string' || !promptBody.trim()) return null
+  const flagged = promptBody.match(/--session\s+([0-9a-f-]{36})/i)
+  if (flagged?.[1]) return flagged[1]
+  const bare = promptBody.match(UUID_RE)
+  return bare?.[0] ?? null
+}
+
+async function readPriorRemoteState(folder) {
+  try {
+    const raw = await fsPromises.readFile(remoteControlStateFile(folder), 'utf8')
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function extractBearer(headers) {
+  if (!headers || typeof headers !== 'object') return null
+  const auth = headers.Authorization || headers.authorization
+  if (typeof auth !== 'string') return null
+  const m = auth.match(/^Bearer\s+(.+)$/i)
+  return m?.[1]?.trim() || null
+}
+
+/**
+ * Minimal self-contained MCP auth (this file is copied alone to
+ * ~/.cursor/devspec — cannot rely on hooks/scripts at runtime).
+ */
+async function resolveMcpAuthForFolder(folder) {
+  const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
+  const envUrl = process.env.DEVSPEC_MCP_URL || null
+  if (envToken) {
+    return {
+      ok: true,
+      token: envToken,
+      mcp_url: (envUrl || 'https://devspec.ai/api/mcp').replace(/\/+$/, ''),
+      source: 'env',
+    }
+  }
+
+  let dir = path.resolve(folder || process.cwd())
+  for (let i = 0; i < 12; i++) {
+    for (const name of ['.mcp.json', 'mcp.json']) {
+      try {
+        const raw = await fsPromises.readFile(path.join(dir, name), 'utf8')
+        const json = JSON.parse(raw)
+        const servers = json?.mcpServers || json?.mcp || {}
+        for (const [key, entry] of Object.entries(servers)) {
+          if (!/devspec/i.test(key) || !entry || typeof entry !== 'object') continue
+          const token = extractBearer(entry.headers) || entry.token || null
+          const url = typeof entry.url === 'string' ? entry.url.replace(/\/+$/, '') : null
+          if (token && url) {
+            return { ok: true, token, mcp_url: url, source: path.join(dir, name) }
+          }
+        }
+      } catch {
+        // missing / invalid — keep walking
+      }
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+
+  return { ok: false, token: null, mcp_url: null, source: null }
+}
+
+async function postToDevspecSession({ folder, sessionId, message, agentName = 'OpenCode' }) {
+  if (!sessionId || !message) {
+    await log(`postToDevspecSession skipped (sessionId=${sessionId || 'null'})`)
+    return false
+  }
+  const auth = await resolveMcpAuthForFolder(folder)
+  if (!auth.ok || !auth.token || !auth.mcp_url) {
+    await log(`postToDevspecSession auth failed — cannot notify session ${sessionId}`)
+    return false
+  }
+  await log(`postToDevspecSession → session=${sessionId} via ${auth.source}`)
+  try {
+    const body = {
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'tools/call',
+      params: {
+        name: 'post_session_message',
+        arguments: {
+          session_id: sessionId,
+          message,
+          agent_name: agentName,
+        },
+      },
+    }
+    const res = await fetch(auth.mcp_url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify(body),
+    })
+    const text = await res.text()
+    if (!res.ok) {
+      await log(`postToDevspecSession HTTP ${res.status}: ${text.slice(0, 300)}`)
+      return false
+    }
+    await log(`postToDevspecSession ok (${text.length} bytes)`)
+    return true
+  } catch (err) {
+    await log(`postToDevspecSession threw: ${err}`)
+    return false
+  }
+}
+
+/**
+ * Tee a child stream into launcher.log. Returns a buffer of the last ~8KB
+ * for inclusion in failure posts.
+ */
+function attachStreamLogging(stream, label, capture) {
+  if (!stream) return
+  stream.setEncoding('utf8')
+  stream.on('data', (chunk) => {
+    const text = String(chunk)
+    capture.chunks.push(text)
+    capture.bytes += text.length
+    // Keep a bounded tail for DevSpec posts
+    while (capture.bytes > 8192 && capture.chunks.length > 1) {
+      const dropped = capture.chunks.shift()
+      capture.bytes -= dropped.length
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue
+      void log(`client ${label}: ${line}`)
+    }
+  })
+}
+
+function captureTail(capture) {
+  return capture.chunks.join('').trim().slice(-2000)
+}
+
+function waitForChildExit(child) {
+  return new Promise((resolve) => {
+    child.once('error', (err) => resolve({ code: 1, signal: null, error: err }))
+    child.once('exit', (code, signal) => resolve({ code, signal, error: null }))
+  })
 }
 
 /** Find a free TCP port on localhost for the headless server to listen on. */
@@ -304,10 +503,18 @@ async function main() {
     return
   }
 
+  const sessionId = extractSessionIdFromPrompt(promptBody)
+  await log(
+    `prompt sessionId=${sessionId || 'none'} model=${args.model || 'auto'} promptBytes=${promptBody.length}`,
+  )
+
   // Must happen before spawning the new server — see "round 4" note above.
   // A second live server for the same directory means two processes racing
   // to write the same state file, not two independent connections.
-  await killExistingServer(args.folder)
+  await killExistingServer(args.folder, {
+    incomingSessionId: sessionId,
+    incomingModel: args.model || null,
+  })
   await log(`opencodeBin=${opencodeBin} folder=${args.folder}`)
 
   const port = await findFreePort()
@@ -342,6 +549,12 @@ async function main() {
   await log(`waitForServer ready=${ready}`)
   if (!ready) {
     console.error(`[devspec-opencode] server did not come up on port ${port} in time`)
+    await log(`FATAL: server did not come up on port ${port} in time`)
+    await postToDevspecSession({
+      folder: args.folder,
+      sessionId,
+      message: `⚠️ OpenCode launch failed: headless server did not come up on port ${port} in time. See launcher.log under ~/.devspec/opencode-remote-control/.`,
+    })
     process.exitCode = 1
     return
   }
@@ -369,29 +582,56 @@ async function main() {
   // (prefer a sibling .ps1 over wrapping a .cmd in `cmd /c`, which loses the
   // real console TTY and flash-closes the window) — the same shim-resolution
   // problem applies to any npm-installed .cmd binary, not just Cursor's.
+  //
+  // Round 8: pipe stdout/stderr into launcher.log so MiniMax/model failures
+  // are not lost when the invisible client exits code 1 in a few seconds.
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
-    stdio: 'ignore',
+    stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
   await log(`spawned client pid=${client.pid ?? 'unknown'}`)
 
-  client.on('error', (err) => {
-    console.error(`[devspec-opencode] failed to run connect command: ${err}`)
-    void log(`client error event: ${err}`)
-    process.exitCode = 1
-  })
+  const stdoutCapture = { chunks: [], bytes: 0 }
+  const stderrCapture = { chunks: [], bytes: 0 }
+  attachStreamLogging(client.stdout, 'stdout', stdoutCapture)
+  attachStreamLogging(client.stderr, 'stderr', stderrCapture)
 
-  client.on('exit', (code, signal) => {
-    // The persistent server (spawned above, detached+unref'd) is intentionally
-    // left running — only the one-shot connect/message client call is done.
-    void log(`client exit code=${code} signal=${signal}`)
-    if (signal) {
-      process.exitCode = 1
-      return
-    }
-    process.exitCode = code ?? 0
-  })
+  const exit = await waitForChildExit(client)
+  if (exit.error) {
+    console.error(`[devspec-opencode] failed to run connect command: ${exit.error}`)
+    await log(`client error event: ${exit.error}`)
+  }
+  await log(`client exit code=${exit.code} signal=${exit.signal}`)
+
+  const stderrTail = captureTail(stderrCapture)
+  const stdoutTail = captureTail(stdoutCapture)
+  if (stderrTail) await log(`client stderr tail (${stderrTail.length} chars):\n${stderrTail}`)
+  if (stdoutTail) await log(`client stdout tail (${stdoutTail.length} chars):\n${stdoutTail}`)
+
+  const failed = Boolean(exit.error) || Boolean(exit.signal) || (exit.code ?? 0) !== 0
+  if (failed) {
+    const modelLabel = args.model || 'auto'
+    const detailParts = [
+      `OpenCode connect failed (exit ${exit.code ?? 'n/a'}${exit.signal ? `, signal ${exit.signal}` : ''}).`,
+      `Model: ${modelLabel}`,
+      sessionId ? `Session: ${sessionId}` : null,
+      stderrTail ? `Stderr:\n${stderrTail}` : null,
+      !stderrTail && stdoutTail ? `Stdout:\n${stdoutTail}` : null,
+      `Full log: ~/.devspec/opencode-remote-control/launcher.log`,
+    ].filter(Boolean)
+    await postToDevspecSession({
+      folder: args.folder,
+      sessionId,
+      message: `⚠️ ${detailParts.join('\n\n')}`,
+    })
+    process.exitCode = 1
+    return
+  }
+
+  // The persistent server is intentionally left running — only the one-shot
+  // connect/message client call is done. Exit 0 here is normal.
+  process.exitCode = 0
 }
 
 const isDirectRun =

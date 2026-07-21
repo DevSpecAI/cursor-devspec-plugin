@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { buildOpencodeRunArgs } from './launch-opencode-session.mjs'
+import { buildOpencodeRunArgs, extractSessionIdFromPrompt } from './launch-opencode-session.mjs'
 
 describe('buildOpencodeRunArgs', () => {
   it('routes a leading slash-command through --command, not the plain message', () => {
@@ -29,5 +29,18 @@ describe('buildOpencodeRunArgs', () => {
       '--',
       '--session abc-123',
     ])
+  })
+})
+
+describe('extractSessionIdFromPrompt', () => {
+  it('reads --session <uuid>', () => {
+    const id = extractSessionIdFromPrompt(
+      '/devspec.remote --session 7e3afc79-abf4-48e4-ae33-aed27b00944d',
+    )
+    assert.equal(id, '7e3afc79-abf4-48e4-ae33-aed27b00944d')
+  })
+
+  it('returns null when no uuid is present', () => {
+    assert.equal(extractSessionIdFromPrompt('/devspec.remote'), null)
   })
 })
