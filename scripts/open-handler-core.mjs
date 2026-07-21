@@ -222,11 +222,23 @@ export async function resolveOpencodeExecutable() {
   const whichCmd = process.platform === 'win32' ? 'where' : 'which'
   try {
     const { stdout } = await execFileAsync(whichCmd, ['opencode'], { timeout: 5000 })
-    const first = String(stdout)
+    const lines = String(stdout)
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .find(Boolean)
-    if (first && (await pathExists(first))) return first
+      .filter(Boolean)
+    // Real bug found live-testing: on Windows, `where opencode` can list a
+    // bare extensionless file ahead of the real .cmd/.ps1 shim — npm always
+    // generates that extensionless one as a POSIX `#!/bin/sh` script for
+    // Git-Bash/WSL, which cmd.exe/PowerShell cannot execute at all. Taking
+    // the first line unconditionally resolved to that unusable shim, and
+    // the whole connect attempt failed completely silently (stdio was
+    // 'ignore' the entire way up the spawn chain, so nothing surfaced).
+    // Prefer a genuinely Windows-executable match when one exists.
+    const preferred =
+      process.platform === 'win32'
+        ? lines.find((l) => /\.(cmd|exe|bat|ps1)$/i.test(l)) ?? lines[0]
+        : lines[0]
+    if (preferred && (await pathExists(preferred))) return preferred
   } catch {
     // fall through to known paths
   }
