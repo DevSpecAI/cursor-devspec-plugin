@@ -24,6 +24,16 @@
  * startup banner) until closed. `windowsHide: true` on both spawn calls is
  * required in addition to `stdio: 'ignore'`.
  *
+ * Real bug found live-testing (round 3): windowsHide + stdio:'ignore' still
+ * wasn't enough on its own — one window (server's startup banner) stayed
+ * visible. Root cause was one level deeper, in launch-cli-session.mjs's
+ * resolveWindowsAgentInvocation: OpenCode ships a real compiled `.exe`, not
+ * an npm `.cmd`/`.ps1` shim trio like Cursor's `agent` — so it fell through
+ * to the generic cmd.exe-wrapping fallback (built for shim binaries that
+ * genuinely need a shell) instead of being spawned directly. That extra,
+ * unnecessary cmd.exe hop is what the visible console was attached to.
+ * Fixed by adding a dedicated `.exe` → direct-spawn branch there.
+ *
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */

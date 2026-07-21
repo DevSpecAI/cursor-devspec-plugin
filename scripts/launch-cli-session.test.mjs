@@ -104,6 +104,18 @@ describe('resolveWindowsAgentInvocation', () => {
     assert.equal(inv.mode, 'direct')
     assert.equal(inv.command, '/usr/local/bin/agent')
   })
+
+  it('spawns a real .exe directly on Windows, no cmd.exe wrapping', () => {
+    if (process.platform !== 'win32') return
+    // Real bug: OpenCode ships a compiled .exe, not an npm .cmd/.ps1 shim
+    // trio — routing it through the cmd.exe fallback added an unhideable
+    // console window. A bare .exe needs no shell at all.
+    const exe = 'C:\\Users\\Brandon Young\\.opencode\\bin\\opencode.exe'
+    const inv = resolveWindowsAgentInvocation(exe, { existsSync: () => false })
+    assert.equal(inv.mode, 'direct')
+    assert.equal(inv.command, exe)
+    assert.deepEqual(inv.prefixArgs, [])
+  })
 })
 
 describe('resolveShellExecutable', () => {

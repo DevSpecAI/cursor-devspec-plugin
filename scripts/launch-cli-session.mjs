@@ -150,6 +150,16 @@ export function resolveWindowsAgentInvocation(agentBin, io = { existsSync: fs.ex
     }
   }
 
+  // A real native .exe (e.g. OpenCode, which ships a compiled binary rather
+  // than an npm .cmd/.ps1 shim trio like Cursor's `agent`) needs no shell at
+  // all — spawn it directly. Real bug found live-testing: routing a bare
+  // .exe through the cmd.exe /c wrapping below added an unnecessary shell
+  // hop that a visible console window kept leaking through on regardless of
+  // windowsHide, even with stdio:'ignore' set on every spawn call.
+  if (lower.endsWith('.exe')) {
+    return { command: bin, prefixArgs: [], mode: 'direct' }
+  }
+
   // Bare `agent` on PATH — let cmd resolve it (no absolute spaced path).
   if (!/[\\/]/.test(bin) && !/\.(cmd|bat|ps1|exe)$/i.test(bin)) {
     return { command: bin, prefixArgs: [], mode: 'cmd-fallback' }
@@ -174,7 +184,7 @@ export function flattenPromptForArgv(text) {
  */
 export function spawnAgentSync(agentBin, args, opts) {
   const inv = resolveWindowsAgentInvocation(agentBin)
-  if (inv.mode === 'powershell-ps1' || (process.platform !== 'win32' && inv.mode === 'direct')) {
+  if (inv.mode === 'powershell-ps1' || inv.mode === 'direct') {
     return spawnSync(inv.command, [...inv.prefixArgs, ...args], {
       ...opts,
       shell: false,
@@ -199,7 +209,7 @@ export function spawnAgentSync(agentBin, args, opts) {
  */
 export function spawnAgent(agentBin, args, opts) {
   const inv = resolveWindowsAgentInvocation(agentBin)
-  if (inv.mode === 'powershell-ps1' || (process.platform !== 'win32' && inv.mode === 'direct')) {
+  if (inv.mode === 'powershell-ps1' || inv.mode === 'direct') {
     return spawn(inv.command, [...inv.prefixArgs, ...args], {
       ...opts,
       shell: false,
