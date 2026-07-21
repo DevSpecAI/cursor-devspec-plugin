@@ -48,15 +48,55 @@
  * any previously-recorded server (tracked via a PID sidecar file) and clear
  * its now-stale state before starting a fresh one.
  *
+ * Real bug found live-testing (round 6 — this is why round 4's fix kept
+ * failing): the pid recorded and killed was spawn()'s own return value —
+ * the PowerShell wrapper's pid (the powershell-ps1 invocation path in
+ * launch-cli-session.mjs). Confirmed live with Get-CimInstance: that
+ * wrapper process exits shortly after launching opencode.exe (opencode.ps1
+ * runs it as a foreground `&` call, but control returns to PowerShell well
+ * before the long-running `serve` command actually finishes) — leaving the
+ * REAL server process alive as an orphan, completely untracked by the pid
+ * we recorded. Every subsequent launch's killExistingServer call was
+ * therefore always targeting an already-dead pid, a guaranteed no-op, while
+ * the actual server piled up untouched — explaining why Axiom showed 3-4x
+ * the expected single-server call volume sustained for 20+ minutes. Fixed
+ * by looking up the ACTUAL listening pid for the port via `netstat -ano`
+ * once the server responds, and recording THAT instead of spawn()'s pid.
+ *
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */
-import { spawnSync } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import fsPromises from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { spawnAgent } from './launch-cli-session.mjs'
+
+const execFileAsync = promisify(execFile)
+
+/**
+ * Find the pid actually LISTENING on 127.0.0.1:<port> right now, via
+ * `netstat -ano`. See the "round 6" note above for why this — not
+ * spawn()'s own returned pid — is the only reliable thing to track and
+ * kill later.
+ */
+async function findListeningPid(port) {
+  if (process.platform !== 'win32') return null
+  try {
+    const { stdout } = await execFileAsync('netstat', ['-ano'])
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.includes(`127.0.0.1:${port}`) || !line.includes('LISTENING')) continue
+      const parts = line.trim().split(/\s+/)
+      const pid = Number(parts[parts.length - 1])
+      if (Number.isInteger(pid) && pid > 0) return pid
+    }
+  } catch {
+    // best-effort — fall back to spawn()'s pid if this fails
+  }
+  return null
+}
 
 /** Same key scheme as the plugin's own state file (src/remote-control.ts `stateFile`) — colocated, not shared code (different repos). */
 function directoryKey(folder) {
@@ -255,17 +295,23 @@ async function main() {
   server.unref()
   await log(`spawned server pid=${server.pid ?? 'unknown'}`)
 
-  if (server.pid) {
-    await fsPromises.mkdir(remoteControlDir(), { recursive: true })
-    await fsPromises.writeFile(serverPidFile(args.folder), String(server.pid), 'utf8')
-  }
-
   const ready = await waitForServer(port)
   await log(`waitForServer ready=${ready}`)
   if (!ready) {
     console.error(`[devspec-opencode] server did not come up on port ${port} in time`)
     process.exitCode = 1
     return
+  }
+
+  // Record the REAL listening pid, not spawn()'s own return value — see the
+  // "round 6" note at the top of this file for why that pid goes stale
+  // almost immediately and made every prior kill-existing-server attempt a
+  // silent no-op.
+  const realPid = (await findListeningPid(port)) ?? server.pid
+  await log(`recording server pid=${realPid ?? 'unknown'} (spawn returned ${server.pid ?? 'unknown'})`)
+  if (realPid) {
+    await fsPromises.mkdir(remoteControlDir(), { recursive: true })
+    await fsPromises.writeFile(serverPidFile(args.folder), String(realPid), 'utf8')
   }
 
   const attachUrl = `http://127.0.0.1:${port}`
