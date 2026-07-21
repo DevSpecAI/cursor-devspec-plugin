@@ -16,6 +16,14 @@
  * oversight: getting slash-command expansion to work reliably in OpenCode's
  * interactive TUI mode could not be cleanly verified in the time available.
  *
+ * Real bug found live-testing (round 2): `stdio: 'ignore'` alone does NOT
+ * suppress the window. spawnAgent's Windows fallback wraps the binary in a
+ * `cmd.exe /c` call, and cmd.exe opens its own visible console regardless of
+ * the child's stdio config — both the server and client spawns below popped
+ * a titled cmd window that then sat there (blank, or showing the server's
+ * startup banner) until closed. `windowsHide: true` on both spawn calls is
+ * required in addition to `stdio: 'ignore'`.
+ *
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */
@@ -117,11 +125,16 @@ async function main() {
 
   // Detached + unref'd so this server outlives launch-opencode-session.mjs
   // itself — it's the thing that must keep running for remote control to
-  // ever deliver anything after this script exits.
+  // ever deliver anything after this script exits. windowsHide is required
+  // here even with stdio:'ignore' — spawnAgent's Windows fallback wraps the
+  // binary in a `cmd.exe /c` invocation, and cmd.exe opens its own visible
+  // console window unless explicitly told not to (confirmed live: without
+  // this, both the server and the client below popped a visible cmd window).
   const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
     cwd: args.folder,
     stdio: 'ignore',
     detached: true,
+    windowsHide: true,
   })
   server.unref()
 
@@ -146,6 +159,7 @@ async function main() {
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
     stdio: 'ignore',
+    windowsHide: true,
   })
 
   client.on('error', (err) => {
