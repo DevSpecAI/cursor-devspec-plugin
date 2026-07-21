@@ -465,20 +465,50 @@ function findFreePort() {
   })
 }
 
-/** Poll the server's OpenAPI doc endpoint until it responds (or timeout). */
+/**
+ * Poll until the headless OpenCode server is accepting requests.
+ *
+ * Real bug found live-testing: this used to hit `/doc` (OpenAPI — ~480KB on
+ * OpenCode 1.18) with a bare `await fetch(...)` and no AbortSignal. When that
+ * first request hung, the while-loop never advanced, the overall timeout
+ * never fired, and the launcher sat forever after "spawned server" — no
+ * client, no `/devspec.remote`, session stuck on "connecting". Confirmed:
+ * `/global/health` returned `{"healthy":true}` while the launcher was still
+ * wedged on `/doc`. Prefer the tiny health endpoint, and abort each attempt
+ * so a hung fetch cannot outlive the deadline.
+ */
 async function waitForServer(port, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs
+  const healthUrl = `http://127.0.0.1:${port}/global/health`
   while (Date.now() < deadline) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    const attemptMs = Math.min(2000, remaining)
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/doc`)
-      if (res.ok) return true
+      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(attemptMs) })
+      if (res.ok) {
+        // Prefer a JSON healthy:true when present, but any 2xx means the
+        // server is accepting connections (older builds may differ).
+        try {
+          const body = await res.json()
+          if (body && body.healthy === false) {
+            await new Promise((r) => setTimeout(r, 300))
+            continue
+          }
+        } catch {
+          // non-JSON 2xx is still "up enough" to attach a client
+        }
+        return true
+      }
     } catch {
-      // not up yet
+      // not up yet / aborted — retry until deadline
     }
     await new Promise((r) => setTimeout(r, 300))
   }
   return false
 }
+
+export { waitForServer }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
