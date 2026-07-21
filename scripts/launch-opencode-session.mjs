@@ -115,12 +115,33 @@ function remoteControlStateFile(folder) {
   return path.join(remoteControlDir(), `${directoryKey(folder)}.json`)
 }
 
+/** True if a process with this pid currently exists (no signal actually sent on any platform). */
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * Enforce single-server-per-directory: kill whatever `opencode serve` this
  * directory's PID file points at (if it's still alive) before starting a
  * new one, and clear the now-stale connection state alongside it — carrying
  * a dead server's sessionId/connectionId into a fresh one is exactly how the
  * cross-connection state clobbering above happened.
+ *
+ * Real bug found live-testing (round 7): the previous version fired
+ * `taskkill` with `stdio: 'ignore'` and never checked whether it actually
+ * worked. Confirmed live: taskkill can fail silently against a pid that IS
+ * genuinely still alive — the process survived, untouched, forever, since
+ * no later launch's recorded pid ever points back to an orphan once a
+ * newer one has taken its place in the pid file. Two more zombie servers
+ * accumulated this exact way in one evening despite round 6's fix for
+ * tracking the right pid — tracking the right pid doesn't help if the kill
+ * against it can quietly fail. Now verifies the pid is actually gone
+ * afterward and retries once before giving up (logged either way).
  */
 async function killExistingServer(folder) {
   const pidFile = serverPidFile(folder)
@@ -131,16 +152,38 @@ async function killExistingServer(folder) {
     return
   }
   if (!Number.isInteger(pid) || pid <= 0) return
-  await log(`killing prior server pid=${pid}`)
-  try {
-    if (process.platform === 'win32') {
-      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-    } else {
-      process.kill(pid, 'SIGKILL')
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (!isPidAlive(pid)) {
+      await log(`prior server pid=${pid} already gone (attempt ${attempt})`)
+      break
     }
-  } catch {
-    // already dead — fine
+    await log(`killing prior server pid=${pid} (attempt ${attempt})`)
+    try {
+      if (process.platform === 'win32') {
+        const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          encoding: 'utf8',
+          windowsHide: true,
+        })
+        await log(
+          `taskkill pid=${pid} status=${result.status} stdout=${(result.stdout || '').trim()} stderr=${(result.stderr || '').trim()}`,
+        )
+      } else {
+        process.kill(pid, 'SIGKILL')
+      }
+    } catch (err) {
+      await log(`kill pid=${pid} threw: ${err}`)
+    }
+    await new Promise((r) => setTimeout(r, 300))
+    if (!isPidAlive(pid)) {
+      await log(`confirmed prior server pid=${pid} is gone`)
+      break
+    }
+    if (attempt === 2) {
+      await log(`WARNING: prior server pid=${pid} still alive after 2 kill attempts — giving up, may be orphaned`)
+    }
   }
+
   try {
     await fsPromises.unlink(remoteControlStateFile(folder))
   } catch {
