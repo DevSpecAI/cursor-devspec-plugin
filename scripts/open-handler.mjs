@@ -24,6 +24,7 @@ async function copyInstalledArtifacts(sourceDir) {
     'open-handler.mjs',
     'open-handler-core.mjs',
     'launch-cli-session.mjs',
+    'launch-opencode-session.mjs',
     'handoff-verify.mjs',
     'handoff-public-key.pem',
     'devspec-handler.cmd',
