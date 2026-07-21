@@ -340,10 +340,14 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
 }
 
 /**
- * Open an OS terminal that runs launch-opencode-session.mjs. Simpler than
- * openInAgentCli — OpenCode's `opencode run` starts a fresh session itself,
- * no separate create+resume dance needed, so it's one spawn per platform
- * instead of a titled-window wrapper around a multi-step CLI conversation.
+ * Run launch-opencode-session.mjs invisibly — no terminal window on any
+ * platform. Unlike Cursor's cold-launch (a real interactive terminal the
+ * user can see and keep typing into), OpenCode's launcher starts a
+ * persistent headless `opencode serve` + a one-shot connect client attached
+ * to it (see launch-opencode-session.mjs) — there's nothing for a visible
+ * terminal to show, and getting slash-command expansion to work reliably in
+ * OpenCode's interactive TUI mode could not be cleanly verified in the time
+ * available. "Definitely works, no window" was the explicit choice.
  * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null }} opts
  */
 export async function openInOpenCode({ folderPath, promptText, opencodeBin, model }) {
@@ -370,54 +374,15 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
     launchArgs.push('--model', modelId)
   }
 
-  if (process.platform === 'win32') {
-    // Same App Execution Alias / quoting hazards as openInAgentCli — see its
-    // comments. Write a .cmd launcher and `start` that file rather than
-    // passing the full quoted node command as one spawn argv.
-    const batPath = path.join(launchesDir, `${stamp}.launch.cmd`)
-    await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
-    spawn('cmd.exe', ['/c', 'start', 'DevSpec OpenCode', 'cmd.exe', '/k', batPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      cwd: folderPath,
-    }).unref()
-    return
-  }
-
-  if (process.platform === 'darwin') {
-    const cmd = `cd ${shellSingleQuote(folderPath)} && ${shellSingleQuote(nodeBin)} ${launchArgs
-      .map(shellSingleQuote)
-      .join(' ')}`
-    spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
-      detached: true,
-      stdio: 'ignore',
-    }).unref()
-    return
-  }
-
-  // Linux — try common terminal emulators.
-  const linuxCmd = `${shellSingleQuote(nodeBin)} ${launchArgs.map(shellSingleQuote).join(' ')}`
-  const terminals = [
-    ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
-    ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
-    ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
-    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
-  ]
-  for (const [bin, args] of terminals) {
-    try {
-      await execFileAsync('which', [bin], { timeout: 2000 })
-      spawn(bin, args, {
-        detached: true,
-        stdio: 'ignore',
-        cwd: folderPath,
-      }).unref()
-      return
-    } catch {
-      // try next
-    }
-  }
-  throw new Error('No terminal emulator found to launch OpenCode')
+  // No platform-specific terminal-emulator branching needed — the launcher
+  // itself is fully headless (it starts its own detached server), so this is
+  // just a plain hidden spawn on every platform.
+  spawn(nodeBin, launchArgs, {
+    cwd: folderPath,
+    stdio: 'ignore',
+    detached: true,
+    windowsHide: true,
+  }).unref()
 }
 
 const CURSOR_PROMPT_DEEPLINK_BASE = 'cursor://anysphere.cursor-deeplink/prompt'

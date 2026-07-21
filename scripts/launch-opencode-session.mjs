@@ -1,13 +1,26 @@
 #!/usr/bin/env node
 /**
- * OpenCode cold-launch session runner (runs inside the user's terminal).
- * Simpler than launch-cli-session.mjs (Cursor): `opencode run` starts a fresh
- * session itself — no separate create-then-resume dance needed.
+ * OpenCode cold-launch session runner (runs invisibly — no terminal window).
+ *
+ * Real bug found live-testing: a one-shot `opencode run ...` process exits
+ * the instant it finishes the connect handshake, leaving nothing running to
+ * ever receive a dispatched message afterward — the whole point of remote
+ * control. Proven fix: start a persistent `opencode serve` (detached,
+ * survives after this script exits), then run the connect/message command
+ * against it via `opencode run --attach <server-url> ...` — verified live
+ * twice that the server keeps responding after the attached run command
+ * completes.
+ *
+ * This trades a visible interactive terminal (Cursor's cold-launch opens
+ * one) for "definitely works, no window" — an explicit choice, not an
+ * oversight: getting slash-command expansion to work reliably in OpenCode's
+ * interactive TUI mode could not be cleanly verified in the time available.
  *
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */
 import fsPromises from 'node:fs/promises'
+import net from 'node:net'
 import { spawnAgent } from './launch-cli-session.mjs'
 
 function parseArgs(argv) {
@@ -23,7 +36,8 @@ function parseArgs(argv) {
 }
 
 /**
- * Build the `opencode run` argv for a prompt body + optional model.
+ * Build the `opencode run` argv (minus `--attach`, added by the caller) for a
+ * prompt body + optional model.
  *
  * `opencode run` does NOT expand a leading "/command args" string the way
  * typing it into the interactive TUI does — passed as a plain positional
@@ -52,6 +66,33 @@ export function buildOpencodeRunArgs(promptBody, model) {
   return runArgs
 }
 
+/** Find a free TCP port on localhost for the headless server to listen on. */
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address()
+      srv.close(() => resolve(typeof address === 'object' && address ? address.port : 0))
+    })
+    srv.on('error', reject)
+  })
+}
+
+/** Poll the server's OpenAPI doc endpoint until it responds (or timeout). */
+async function waitForServer(port, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/doc`)
+      if (res.ok) return true
+    } catch {
+      // not up yet
+    }
+    await new Promise((r) => setTimeout(r, 300))
+  }
+  return false
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (!args.folder || !args.promptFile) {
@@ -72,26 +113,49 @@ async function main() {
     return
   }
 
+  const port = await findFreePort()
+
+  // Detached + unref'd so this server outlives launch-opencode-session.mjs
+  // itself — it's the thing that must keep running for remote control to
+  // ever deliver anything after this script exits.
+  const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
+    cwd: args.folder,
+    stdio: 'ignore',
+    detached: true,
+  })
+  server.unref()
+
+  const ready = await waitForServer(port)
+  if (!ready) {
+    console.error(`[devspec-opencode] server did not come up on port ${port} in time`)
+    process.exitCode = 1
+    return
+  }
+
+  const attachUrl = `http://127.0.0.1:${port}`
   const runArgs = buildOpencodeRunArgs(promptBody, args.model)
+  runArgs.splice(1, 0, '--attach', attachUrl)
 
   console.log(
-    `[devspec-opencode] Running in ${args.folder} (model=${args.model || 'auto'})`,
+    `[devspec-opencode] Server up on ${attachUrl}; sending connect message (model=${args.model || 'auto'})`,
   )
   // Reuses the Windows-safe invocation logic built for Cursor's `agent` binary
   // (prefer a sibling .ps1 over wrapping a .cmd in `cmd /c`, which loses the
   // real console TTY and flash-closes the window) — the same shim-resolution
   // problem applies to any npm-installed .cmd binary, not just Cursor's.
-  const child = spawnAgent(opencodeBin, runArgs, {
+  const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
-    stdio: 'inherit',
+    stdio: 'ignore',
   })
 
-  child.on('error', (err) => {
-    console.error(`[devspec-opencode] failed to start opencode: ${err}`)
+  client.on('error', (err) => {
+    console.error(`[devspec-opencode] failed to run connect command: ${err}`)
     process.exitCode = 1
   })
 
-  child.on('exit', (code, signal) => {
+  client.on('exit', (code, signal) => {
+    // The persistent server (spawned above, detached+unref'd) is intentionally
+    // left running — only the one-shot connect/message client call is done.
     if (signal) {
       process.exitCode = 1
       return
