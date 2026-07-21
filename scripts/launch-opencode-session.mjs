@@ -91,6 +91,7 @@ async function killExistingServer(folder) {
     return
   }
   if (!Number.isInteger(pid) || pid <= 0) return
+  await log(`killing prior server pid=${pid}`)
   try {
     if (process.platform === 'win32') {
       spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
@@ -150,6 +151,26 @@ export function buildOpencodeRunArgs(promptBody, model) {
   return runArgs
 }
 
+const LAUNCHER_LOG_FILE = path.join(remoteControlDir(), 'launcher.log')
+
+/**
+ * This script is always spawned with `stdio: 'ignore'` by open-handler-core
+ * (it must run invisibly — see the file header) — which means every
+ * console.log/console.error call before this fix went straight into the
+ * void. Real gap found live-testing: a launch that failed partway through
+ * (server never came up, client errored) left zero trace anywhere, making
+ * it indistinguishable from "still working, just slow." Persist the same
+ * milestones to a log file instead of only stdio.
+ */
+async function log(line) {
+  try {
+    await fsPromises.mkdir(path.dirname(LAUNCHER_LOG_FILE), { recursive: true })
+    await fsPromises.appendFile(LAUNCHER_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8')
+  } catch {
+    // best-effort — logging must never be why a launch fails
+  }
+}
+
 /** Find a free TCP port on localhost for the headless server to listen on. */
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -179,10 +200,12 @@ async function waitForServer(port, timeoutMs = 15000) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
+  await log(`start argv=${JSON.stringify(process.argv.slice(2))}`)
   if (!args.folder || !args.promptFile) {
     console.error(
       'Usage: launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]',
     )
+    await log('missing --folder or --prompt-file')
     process.exitCode = 1
     return
   }
@@ -193,6 +216,7 @@ async function main() {
     promptBody = (await fsPromises.readFile(args.promptFile, 'utf8')).trim()
   } catch (err) {
     console.error(`[devspec-opencode] could not read prompt file: ${err}`)
+    await log(`could not read prompt file: ${err}`)
     process.exitCode = 1
     return
   }
@@ -201,23 +225,35 @@ async function main() {
   // A second live server for the same directory means two processes racing
   // to write the same state file, not two independent connections.
   await killExistingServer(args.folder)
+  await log(`opencodeBin=${opencodeBin} folder=${args.folder}`)
 
   const port = await findFreePort()
+  await log(`chose port ${port}`)
 
-  // Detached + unref'd so this server outlives launch-opencode-session.mjs
-  // itself — it's the thing that must keep running for remote control to
-  // ever deliver anything after this script exits. windowsHide is required
-  // here even with stdio:'ignore' — spawnAgent's Windows fallback wraps the
-  // binary in a `cmd.exe /c` invocation, and cmd.exe opens its own visible
-  // console window unless explicitly told not to (confirmed live: without
-  // this, both the server and the client below popped a visible cmd window).
+  // Real bug found live-testing (round 5): `detached: true` reliably killed
+  // the server on Windows before it ever bound its port — empty log, no
+  // process, no trace, regardless of stdio/windowsHide. Isolated by testing
+  // spawn configurations directly: `detached` alone (no windowsHide) failed
+  // the same way, and `windowsHide` alone (no `detached`) started and
+  // listened fine every time. Most likely cause: Windows' DETACHED_PROCESS
+  // creation flag (what `detached` maps to) means NO console at all, which
+  // conflicts with something PowerShell's own startup expects — whereas
+  // `windowsHide` maps to CREATE_NO_WINDOW, a console that merely isn't
+  // shown, which PowerShell tolerates fine.
+  //
+  // `detached` was never actually necessary for survival here: Windows does
+  // NOT kill a child process when its parent exits (unlike POSIX process
+  // groups) unless something explicitly ties their lifetimes together (e.g.
+  // a Job Object with kill-on-close, which a launch from Explorer/browser
+  // via the devspec:// protocol handler does not create). `windowsHide` +
+  // `stdio: 'ignore'` alone is sufficient for both invisibility and survival.
   const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
     cwd: args.folder,
     stdio: 'ignore',
-    detached: true,
     windowsHide: true,
   })
   server.unref()
+  await log(`spawned server pid=${server.pid ?? 'unknown'}`)
 
   if (server.pid) {
     await fsPromises.mkdir(remoteControlDir(), { recursive: true })
@@ -225,6 +261,7 @@ async function main() {
   }
 
   const ready = await waitForServer(port)
+  await log(`waitForServer ready=${ready}`)
   if (!ready) {
     console.error(`[devspec-opencode] server did not come up on port ${port} in time`)
     process.exitCode = 1
@@ -238,6 +275,7 @@ async function main() {
   console.log(
     `[devspec-opencode] Server up on ${attachUrl}; sending connect message (model=${args.model || 'auto'})`,
   )
+  await log(`spawning client runArgs=${JSON.stringify(runArgs)}`)
   // Reuses the Windows-safe invocation logic built for Cursor's `agent` binary
   // (prefer a sibling .ps1 over wrapping a .cmd in `cmd /c`, which loses the
   // real console TTY and flash-closes the window) — the same shim-resolution
@@ -247,15 +285,18 @@ async function main() {
     stdio: 'ignore',
     windowsHide: true,
   })
+  await log(`spawned client pid=${client.pid ?? 'unknown'}`)
 
   client.on('error', (err) => {
     console.error(`[devspec-opencode] failed to run connect command: ${err}`)
+    void log(`client error event: ${err}`)
     process.exitCode = 1
   })
 
   client.on('exit', (code, signal) => {
     // The persistent server (spawned above, detached+unref'd) is intentionally
     // left running — only the one-shot connect/message client call is done.
+    void log(`client exit code=${code} signal=${signal}`)
     if (signal) {
       process.exitCode = 1
       return
