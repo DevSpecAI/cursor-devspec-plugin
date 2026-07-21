@@ -34,12 +34,78 @@
  * unnecessary cmd.exe hop is what the visible console was attached to.
  * Fixed by adding a dedicated `.exe` → direct-spawn branch there.
  *
+ * Real bug found live-testing (round 4 — active incident, not just a delivery
+ * gap): the plugin's local state file (src/remote-control.ts's `stateFile`)
+ * is keyed ONLY by project directory, on the assumption of at most one live
+ * OpenCode remote-control connection per directory. Nothing enforced that
+ * assumption here — repeated cold-launches against the same project left
+ * MULTIPLE `opencode serve` processes running concurrently, all sharing and
+ * clobbering that one state file. Observed live: two servers stomping on
+ * each other's `sessionId` caused replies to mirror into a stale, already
+ * -archived session neither owner was watching, in a tight repost loop
+ * (every ~4s) — total silence on the real session, an actively growing mess
+ * on the wrong one. Fixed by enforcing a single server per directory: kill
+ * any previously-recorded server (tracked via a PID sidecar file) and clear
+ * its now-stale state before starting a fresh one.
+ *
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */
+import { spawnSync } from 'node:child_process'
 import fsPromises from 'node:fs/promises'
 import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
 import { spawnAgent } from './launch-cli-session.mjs'
+
+/** Same key scheme as the plugin's own state file (src/remote-control.ts `stateFile`) — colocated, not shared code (different repos). */
+function directoryKey(folder) {
+  return Buffer.from(path.resolve(folder)).toString('base64url').slice(0, 32)
+}
+
+function remoteControlDir() {
+  return path.join(os.homedir(), '.devspec', 'opencode-remote-control')
+}
+
+function serverPidFile(folder) {
+  return path.join(remoteControlDir(), `${directoryKey(folder)}.server.pid`)
+}
+
+function remoteControlStateFile(folder) {
+  return path.join(remoteControlDir(), `${directoryKey(folder)}.json`)
+}
+
+/**
+ * Enforce single-server-per-directory: kill whatever `opencode serve` this
+ * directory's PID file points at (if it's still alive) before starting a
+ * new one, and clear the now-stale connection state alongside it — carrying
+ * a dead server's sessionId/connectionId into a fresh one is exactly how the
+ * cross-connection state clobbering above happened.
+ */
+async function killExistingServer(folder) {
+  const pidFile = serverPidFile(folder)
+  let pid
+  try {
+    pid = Number((await fsPromises.readFile(pidFile, 'utf8')).trim())
+  } catch {
+    return
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    } else {
+      process.kill(pid, 'SIGKILL')
+    }
+  } catch {
+    // already dead — fine
+  }
+  try {
+    await fsPromises.unlink(remoteControlStateFile(folder))
+  } catch {
+    // already gone
+  }
+}
 
 function parseArgs(argv) {
   const out = {}
@@ -131,6 +197,11 @@ async function main() {
     return
   }
 
+  // Must happen before spawning the new server — see "round 4" note above.
+  // A second live server for the same directory means two processes racing
+  // to write the same state file, not two independent connections.
+  await killExistingServer(args.folder)
+
   const port = await findFreePort()
 
   // Detached + unref'd so this server outlives launch-opencode-session.mjs
@@ -147,6 +218,11 @@ async function main() {
     windowsHide: true,
   })
   server.unref()
+
+  if (server.pid) {
+    await fsPromises.mkdir(remoteControlDir(), { recursive: true })
+    await fsPromises.writeFile(serverPidFile(args.folder), String(server.pid), 'utf8')
+  }
 
   const ready = await waitForServer(port)
   if (!ready) {
