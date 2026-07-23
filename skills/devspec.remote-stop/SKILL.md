@@ -43,18 +43,16 @@ Multiple remotes may run on one machine (several Cursor terminals).
    devspec__heartbeat_connection({ connection_id, status: "offline", end_reason: "local_stop" })
    ```
    then optionally `devspec__detach_connection({ connection_id })`.
+   **Do not** `devspec__post_session_message` disconnect chrome — presence updates via the offline heartbeat / Agents page.
 
-3. **Post disconnect** (best-effort, only when attached):
-   `devspec__post_session_message(session_id, "🔌 **Local agent disconnected**.", agent_name: "Cursor")`
-
-4. **Disable local state + kill only this poller + mark bond stopped:**
+3. **Disable local state + kill only this poller + mark bond stopped:**
    ```bash
    node "$PLUGIN/hooks/scripts/remote-control-state.mjs" disable \
      --connection-id '<connection_id>' --agent "Cursor" --local-id "$CURSOR_CONVERSATION_ID"
    ```
    Connection-scoped: writes that connection's state `enabled: false`, marks matching local bonds `stopped` (soft-reconnect only for this conversation within the recovery window), and SIGTERMs pollers whose argv includes this connection UUID only.
 
-5. **Print:**
+4. **Print in this local terminal only** (never into the session transcript):
    ```
    ✓ DevSpec remote control stopped
      Connection: {first 8}…
@@ -64,7 +62,7 @@ Multiple remotes may run on one machine (several Cursor terminals).
 
 ## Rules
 
-- Always offline **this** connection even if the post fails.
+- Always offline **this** connection.
 - Do not delete the DevSpec session — history remains.
 - Soft-reconnect is bond-scoped (same conversation id), never by cwd/repo.
 - Distinct from any built-in remote-control feature of your host app.
