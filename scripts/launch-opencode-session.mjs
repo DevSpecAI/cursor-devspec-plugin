@@ -67,6 +67,7 @@
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
  */
 import { execFile, spawnSync } from 'node:child_process'
+import crypto from 'node:crypto'
 import fsPromises from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
@@ -106,11 +107,21 @@ async function findListeningPid(port) {
  * one — see killExistingServer's doc for why that's what lets two `opencode
  * serve` processes for the SAME folder coexist. A bare (sessionless) launch
  * keeps the folder-only key, unchanged from before.
+ *
+ * Round 10 (confirmed live, same day): plain `Buffer.from(raw).toString(
+ * 'base64url').slice(0, 32)` did NOT actually distinguish sessions — a
+ * typical resolved project path is already 100+ characters (130+ once
+ * base64-encoded), so truncating to 32 chars keeps only the folder's own
+ * encoding and never reaches the appended `:sessionId`. Three different
+ * sessions for one folder produced the byte-identical key, silently
+ * collapsing back to folder-only behavior. A real hash (sha256, not
+ * truncated raw encoding) is required so every input byte — including ones
+ * past position ~24 — affects every output character.
  */
 function directoryKey(folder, sessionId) {
   const base = path.resolve(folder)
   const raw = sessionId ? `${base}:${sessionId}` : base
-  return Buffer.from(raw).toString('base64url').slice(0, 32)
+  return crypto.createHash('sha256').update(raw).digest('base64url').slice(0, 32)
 }
 
 function remoteControlDir() {
