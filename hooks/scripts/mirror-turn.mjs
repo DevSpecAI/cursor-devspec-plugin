@@ -206,6 +206,66 @@ function isHarnessInjection(text) {
   )
 }
 
+const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
+
+/**
+ * Strip the terminal status block agents often paste into Stop output.
+ * Removes from the banner header through the trailing rule line.
+ */
+export function stripRemoteControlBanner(text) {
+  const t = String(text ?? '')
+  const start = t.indexOf(REMOTE_STATUS_BANNER)
+  if (start < 0) return t
+  const afterHeader = t.slice(start + REMOTE_STATUS_BANNER.length)
+  // Prefer the unicode rule line used in skills; fall back to ASCII dashes.
+  const ruleMatch = afterHeader.match(/\n[─-]{3,}\s*\n?/)
+  let end = start + REMOTE_STATUS_BANNER.length
+  if (ruleMatch && typeof ruleMatch.index === 'number') {
+    end += ruleMatch.index + ruleMatch[0].length
+  } else {
+    // No rule line — drop from banner to end of that paragraph block.
+    const nextBlank = afterHeader.search(/\n\s*\n/)
+    end = nextBlank >= 0 ? start + REMOTE_STATUS_BANNER.length + nextBlank : t.length
+  }
+  return `${t.slice(0, start)}${t.slice(end)}`.replace(/^\s+|\s+$/g, '')
+}
+
+/**
+ * True when Stop (or agent) text is operational chrome that must not become a
+ * session chat bubble. Fail open for ambiguous / real replies.
+ */
+export function isOperationalChrome(text) {
+  let t = String(text ?? '').trim()
+  if (!t) return true
+
+  if (/^🔌?\s*\*{0,2}Local agent disconnected\*{0,2}\.?\s*$/i.test(t)) return true
+  if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+  if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+
+  if (t.includes(REMOTE_STATUS_BANNER)) {
+    t = stripRemoteControlBanner(t).trim()
+    if (!t) return true
+    if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+    if (/^🔌?\s*\*{0,2}Local agent disconnected\*{0,2}\.?\s*$/i.test(t)) return true
+    if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+    // Banner plus a tiny leftover (e.g. "Open: Agents page") — still chrome.
+    if (t.length < 80 && /^(Agent|Connection|Session|Status|Open|Stop with):/m.test(t)) return true
+  }
+
+  return false
+}
+
+/**
+ * Prepare agent Stop text for mirroring: strip known chrome; return null to skip.
+ */
+export function prepareAgentMirrorText(text) {
+  let t = String(text ?? '').trim()
+  if (!t) return null
+  if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
+  if (!t || isOperationalChrome(t)) return null
+  return t.slice(0, 12000)
+}
+
 async function main() {
   const raw = readStdin()
   const conversationId = resolveHookConversationId(raw)
@@ -234,19 +294,23 @@ async function main() {
   try {
     // Mirror the turn into the attached session's transcript — only when attached.
     if (sessionId && text && String(text).trim() && !skipMirror) {
-      const cleaned = String(text).trim().slice(0, 12000)
       const isLocalPrompt = mode === 'user_prompt'
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name: 'post_session_message',
-        arguments: {
-          session_id: sessionId,
-          message: cleaned,
-          agent_name: agentName,
-          turn_kind: isLocalPrompt ? 'local_prompt' : 'agent',
-        },
-      })
+      const cleaned = isLocalPrompt
+        ? String(text).trim().slice(0, 12000)
+        : prepareAgentMirrorText(text)
+      if (cleaned) {
+        await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'post_session_message',
+          arguments: {
+            session_id: sessionId,
+            message: cleaned,
+            agent_name: agentName,
+            turn_kind: isLocalPrompt ? 'local_prompt' : 'agent',
+          },
+        })
+      }
     }
 
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +

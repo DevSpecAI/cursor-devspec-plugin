@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { resolveHookConversationId, selectBoundState } from './mirror-turn.mjs'
+import { resolveHookConversationId, selectBoundState, stripRemoteControlBanner, isOperationalChrome, prepareAgentMirrorText } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
   it('prefers CLAUDE_CODE_SESSION_ID env (the value write stamps)', () => {
@@ -117,6 +117,57 @@ describe('selectBoundState (connection-native)', () => {
     assert.equal(
       selectBoundState([mk(own, 5), mk(cur, 1)], 'conv-A', 'Claude Code')?.connection_id,
       'conn-A',
+    )
+  })
+})
+
+const BANNER = `━━━ DevSpec Remote Control ━━━
+Agent:      Claude Code · Climbing Toucan
+Connection: 7b3a74ae…
+Session:    46ef72c0… | attached
+Status:     registered + attached
+Open:       Agents page
+Stop with:  /devspec.remote-stop
+─────────────────────────────`
+
+describe('operational chrome filtering', () => {
+  it('strips the remote-control status banner', () => {
+    const out = stripRemoteControlBanner(`${BANNER}\n\n2`)
+    assert.equal(out, '2')
+  })
+
+  it('treats banner-only Stop text as chrome', () => {
+    assert.equal(isOperationalChrome(BANNER), true)
+    assert.equal(prepareAgentMirrorText(BANNER), null)
+  })
+
+  it('treats banner + waiting spiel as chrome', () => {
+    const t = `${BANNER}\nConnected and waiting for your next command from the session — I already replied to your "Hi" there.`
+    assert.equal(isOperationalChrome(t), true)
+    assert.equal(prepareAgentMirrorText(t), null)
+  })
+
+  it('skips connect / disconnect one-liners', () => {
+    assert.equal(
+      isOperationalChrome("You're connected to Brandon's Cursor agent on their local machine."),
+      true,
+    )
+    assert.equal(isOperationalChrome('🔌 **Local agent disconnected**.'), true)
+    assert.equal(prepareAgentMirrorText('🔌 **Local agent disconnected**.'), null)
+  })
+
+  it('keeps a real reply (fail open)', () => {
+    const reply = '1 + 1 is 2.'
+    assert.equal(isOperationalChrome(reply), false)
+    assert.equal(prepareAgentMirrorText(reply), reply)
+  })
+
+  it('keeps a real reply after stripping a leading banner', () => {
+    const mixed = `${BANNER}\n\nQueue same-tab Dev sends while streaming — done on staging.`
+    assert.equal(isOperationalChrome(mixed), false)
+    assert.equal(
+      prepareAgentMirrorText(mixed),
+      'Queue same-tab Dev sends while streaming — done on staging.',
     )
   })
 })
