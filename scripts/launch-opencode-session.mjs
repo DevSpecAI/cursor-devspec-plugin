@@ -98,21 +98,31 @@ async function findListeningPid(port) {
   return null
 }
 
-/** Same key scheme as the plugin's own state file (src/remote-control.ts `stateFile`) — colocated, not shared code (different repos). */
-function directoryKey(folder) {
-  return Buffer.from(path.resolve(folder)).toString('base64url').slice(0, 32)
+/**
+ * Same key scheme as the plugin's own state file (src/remote-control.ts
+ * `stateFile`) — colocated, not shared code (different repos). Round 9: folds
+ * the target DevSpec session id into the key when known, so each session
+ * gets its own pid/state file instead of every launch for a folder sharing
+ * one — see killExistingServer's doc for why that's what lets two `opencode
+ * serve` processes for the SAME folder coexist. A bare (sessionless) launch
+ * keeps the folder-only key, unchanged from before.
+ */
+function directoryKey(folder, sessionId) {
+  const base = path.resolve(folder)
+  const raw = sessionId ? `${base}:${sessionId}` : base
+  return Buffer.from(raw).toString('base64url').slice(0, 32)
 }
 
 function remoteControlDir() {
   return path.join(os.homedir(), '.devspec', 'opencode-remote-control')
 }
 
-function serverPidFile(folder) {
-  return path.join(remoteControlDir(), `${directoryKey(folder)}.server.pid`)
+function serverPidFile(folder, sessionId) {
+  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId)}.server.pid`)
 }
 
-function remoteControlStateFile(folder) {
-  return path.join(remoteControlDir(), `${directoryKey(folder)}.json`)
+function remoteControlStateFile(folder, sessionId) {
+  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId)}.json`)
 }
 
 /** True if a process with this pid currently exists (no signal actually sent on any platform). */
@@ -126,33 +136,35 @@ function isPidAlive(pid) {
 }
 
 /**
- * Enforce single-server-per-directory: kill whatever `opencode serve` this
- * directory's PID file points at (if it's still alive) before starting a
- * new one, and clear the now-stale connection state alongside it — carrying
- * a dead server's sessionId/connectionId into a fresh one is exactly how the
- * cross-connection state clobbering above happened.
+ * Replace THIS session's own prior server, if one is still alive — never a
+ * different session's. Round 9: now that pid/state files are keyed by
+ * (folder, sessionId) (see directoryKey), a live server for a DIFFERENT
+ * DevSpec session against the same folder lives in a completely separate pid
+ * file this call never even reads, so it's simply left running untouched.
+ * Free port allocation already means two servers for one folder can coexist
+ * (findFreePort, per launch) once each owns its own isolated pid/state file —
+ * the only thing actually stopping that before was this function reading and
+ * killing whatever ONE folder-wide pid happened to be recorded, regardless of
+ * which session it belonged to.
  *
- * Real bug found live-testing (round 7): the previous version fired
- * `taskkill` with `stdio: 'ignore'` and never checked whether it actually
- * worked. Confirmed live: taskkill can fail silently against a pid that IS
- * genuinely still alive — the process survived, untouched, forever, since
- * no later launch's recorded pid ever points back to an orphan once a
- * newer one has taken its place in the pid file. Two more zombie servers
- * accumulated this exact way in one evening despite round 6's fix for
- * tracking the right pid — tracking the right pid doesn't help if the kill
- * against it can quietly fail. Now verifies the pid is actually gone
- * afterward and retries once before giving up (logged either way).
+ * Round 8's cross-session warn-then-kill is gone along with the cross-session
+ * kill it was warning about — a different session's server is no longer
+ * touched at all, so there is nothing left to warn its owner about. A bare
+ * (sessionless) launch keeps the original folder-only single-server
+ * enforcement (unchanged, out of scope here — see the sibling item that
+ * makes connection identity itself session-scoped).
  *
- * Round 8: killing is still required (one state file per directory), but it
- * must never be silent when the prior server was attached to a *different*
- * DevSpec session — warn in launcher.log and post into that displaced room
- * (and the incoming room when known) before taskkill.
+ * Real bug found live-testing (round 7, still applies): `taskkill` can fail
+ * silently against a pid that IS genuinely still alive — verify the pid is
+ * actually gone afterward and retry once before giving up (logged either
+ * way), rather than trusting the exit status.
  *
  * @param {string} folder
  * @param {{ incomingSessionId?: string | null, incomingModel?: string | null }} [ctx]
  */
 async function killExistingServer(folder, ctx = {}) {
-  const pidFile = serverPidFile(folder)
+  const sessionId = ctx.incomingSessionId || null
+  const pidFile = serverPidFile(folder, sessionId)
   let pid
   try {
     pid = Number((await fsPromises.readFile(pidFile, 'utf8')).trim())
@@ -161,37 +173,8 @@ async function killExistingServer(folder, ctx = {}) {
   }
   if (!Number.isInteger(pid) || pid <= 0) return
 
-  const prior = await readPriorRemoteState(folder)
-  const priorSessionId = typeof prior?.sessionId === 'string' ? prior.sessionId : null
-  const priorConnectionId = typeof prior?.connectionId === 'string' ? prior.connectionId : null
-  const incomingSessionId = ctx.incomingSessionId || null
-  const displacing =
-    Boolean(priorSessionId) &&
-    Boolean(incomingSessionId) &&
-    priorSessionId !== incomingSessionId &&
-    isPidAlive(pid)
-
-  if (displacing) {
-    const warn =
-      `OpenCode is replacing the live remote server for this project folder.\n\n` +
-      `Prior DevSpec session: ${priorSessionId}\n` +
-      `New DevSpec session: ${incomingSessionId}\n` +
-      (ctx.incomingModel ? `New model: ${ctx.incomingModel}\n` : '') +
-      (priorConnectionId ? `Prior connection: ${priorConnectionId}\n` : '') +
-      `\nOnly one OpenCode server can own this folder's remote-control state, so the prior server is being stopped. Re-attach the prior session if you still need it.`
-    await log(
-      `WARNING: displacing live server pid=${pid} priorSession=${priorSessionId} → incomingSession=${incomingSessionId}`,
-    )
-    await postToDevspecSession({ folder, sessionId: priorSessionId, message: `⚠️ ${warn}` })
-    await postToDevspecSession({
-      folder,
-      sessionId: incomingSessionId,
-      message: `⚠️ Starting OpenCode for this session will stop the live server still attached to session ${priorSessionId}.`,
-    })
-  } else if (isPidAlive(pid)) {
-    await log(
-      `replacing live server pid=${pid} priorSession=${priorSessionId || 'none'} incomingSession=${incomingSessionId || 'none'}`,
-    )
+  if (isPidAlive(pid)) {
+    await log(`relaunch: replacing this session's own prior server pid=${pid} session=${sessionId || 'none'}`)
   }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -226,7 +209,7 @@ async function killExistingServer(folder, ctx = {}) {
   }
 
   try {
-    await fsPromises.unlink(remoteControlStateFile(folder))
+    await fsPromises.unlink(remoteControlStateFile(folder, sessionId))
   } catch {
     // already gone
   }
@@ -309,16 +292,6 @@ export function extractSessionIdFromPrompt(promptBody) {
   if (flagged?.[1]) return flagged[1]
   const bare = promptBody.match(UUID_RE)
   return bare?.[0] ?? null
-}
-
-async function readPriorRemoteState(folder) {
-  try {
-    const raw = await fsPromises.readFile(remoteControlStateFile(folder), 'utf8')
-    const parsed = JSON.parse(raw)
-    return parsed && typeof parsed === 'object' ? parsed : null
-  } catch {
-    return null
-  }
 }
 
 function extractBearer(headers) {
@@ -597,7 +570,7 @@ async function main() {
   await log(`recording server pid=${realPid ?? 'unknown'} (spawn returned ${server.pid ?? 'unknown'})`)
   if (realPid) {
     await fsPromises.mkdir(remoteControlDir(), { recursive: true })
-    await fsPromises.writeFile(serverPidFile(args.folder), String(realPid), 'utf8')
+    await fsPromises.writeFile(serverPidFile(args.folder, sessionId), String(realPid), 'utf8')
   }
 
   const attachUrl = `http://127.0.0.1:${port}`
