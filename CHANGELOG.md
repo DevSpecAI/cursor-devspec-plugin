@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.15 - 2026-07-24
+
+### Remote control — agent-canonical, connection-scoped, session optional
+
+- **Answers:** when attached, post via `post_session_message({ connection_id })` (server resolves current session). Sessionless: assignment / `report_progress` only — never invent a room.
+- **Stop hooks:** busy/heartbeat + optional local_prompt only — **no** full assistant mirror as primary path.
+- **`devspec.work --remote`:** defaults **sessionless**; optional `--session` / `--new` for a transcript.
+- Skills state a **single** delivery path (no “if hooks fail also post answers” dual).
+
 ## 0.3.14
 
 ### Fixed
