@@ -352,14 +352,22 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
 }
 
 /**
- * Run launch-opencode-session.mjs invisibly — no terminal window on any
- * platform. Unlike Cursor's cold-launch (a real interactive terminal the
- * user can see and keep typing into), OpenCode's launcher starts a
- * persistent headless `opencode serve` + a one-shot connect client attached
- * to it (see launch-opencode-session.mjs) — there's nothing for a visible
- * terminal to show, and getting slash-command expansion to work reliably in
- * OpenCode's interactive TUI mode could not be cleanly verified in the time
- * available. "Definitely works, no window" was the explicit choice.
+ * TEMP DEBUG toggle — headed OpenCode session launches (visible terminal).
+ *
+ * `true`  → open a real console (same pattern as Cursor CLI cold-launch) and
+ *           pass `--headed` so serve/client windows are visible too.
+ * `false` → production headless: hidden spawn, no console flash.
+ *
+ * To turn headed mode OFF / restore headless: set this to `false`.
+ */
+export const OPENCODE_LAUNCH_HEADED = true
+
+/**
+ * Launch OpenCode via launch-opencode-session.mjs.
+ *
+ * Production default is headless (hidden spawn). While `OPENCODE_LAUNCH_HEADED`
+ * is true, we open a visible terminal so serve/connect output can be diagnosed
+ * live — flip the constant back to false when debugging is done.
  * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null }} opts
  */
 export async function openInOpenCode({ folderPath, promptText, opencodeBin, model }) {
@@ -385,10 +393,59 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
   if (modelId) {
     launchArgs.push('--model', modelId)
   }
+  if (OPENCODE_LAUNCH_HEADED) {
+    launchArgs.push('--headed')
+  }
 
-  // No platform-specific terminal-emulator branching needed — the launcher
-  // itself is fully headless (it starts its own detached server), so this is
-  // just a plain hidden spawn on every platform.
+  // Headed: reuse Cursor CLI's visible-terminal path so the user can watch the
+  // launcher. Headless: keep the production hidden spawn (no console flash).
+  if (OPENCODE_LAUNCH_HEADED) {
+    if (process.platform === 'win32') {
+      const batPath = path.join(launchesDir, `${stamp}.opencode-launch.cmd`)
+      await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
+      spawn('cmd.exe', ['/c', 'start', 'DevSpec OpenCode', 'cmd.exe', '/k', batPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        cwd: folderPath,
+      }).unref()
+      return
+    }
+
+    if (process.platform === 'darwin') {
+      const cmd = `cd ${shellSingleQuote(folderPath)} && ${shellSingleQuote(nodeBin)} ${launchArgs
+        .map(shellSingleQuote)
+        .join(' ')}`
+      spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
+        detached: true,
+        stdio: 'ignore',
+      }).unref()
+      return
+    }
+
+    const linuxCmd = `${shellSingleQuote(nodeBin)} ${launchArgs.map(shellSingleQuote).join(' ')}`
+    const terminals = [
+      ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
+      ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
+      ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
+      ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
+    ]
+    for (const [bin, args] of terminals) {
+      try {
+        await execFileAsync('which', [bin], { timeout: 2000 })
+        spawn(bin, args, {
+          detached: true,
+          stdio: 'ignore',
+          cwd: folderPath,
+        }).unref()
+        return
+      } catch {
+        // try next
+      }
+    }
+    throw new Error('No terminal emulator found to launch OpenCode headed')
+  }
+
   spawn(nodeBin, launchArgs, {
     cwd: folderPath,
     stdio: 'ignore',

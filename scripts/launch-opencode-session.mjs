@@ -64,7 +64,11 @@
  * once the server responds, and recording THAT instead of spawn()'s pid.
  *
  * Invoked by open-handler-core when tool=opencode:
- *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]
+ *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>] [--headed]
+ *
+ * `--headed` is the TEMP DEBUG path (visible serve/client consoles). Production
+ * omits it. Flip `OPENCODE_LAUNCH_HEADED` in open-handler-core.mjs to false to
+ * stop passing `--headed` and restore headless launches.
  */
 import { execFile, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
@@ -227,13 +231,14 @@ async function killExistingServer(folder, ctx = {}) {
 }
 
 function parseArgs(argv) {
-  const out = {}
+  const out = { headed: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--folder' && argv[i + 1]) out.folder = argv[++i]
     else if (a === '--prompt-file' && argv[i + 1]) out.promptFile = argv[++i]
     else if (a === '--opencode' && argv[i + 1]) out.opencode = argv[++i]
     else if (a === '--model' && argv[i + 1]) out.model = argv[++i]
+    else if (a === '--headed') out.headed = true
   }
   return out
 }
@@ -499,7 +504,7 @@ async function main() {
   await log(`start argv=${JSON.stringify(process.argv.slice(2))}`)
   if (!args.folder || !args.promptFile) {
     console.error(
-      'Usage: launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>]',
+      'Usage: launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>] [--headed]',
     )
     await log('missing --folder or --prompt-file')
     process.exitCode = 1
@@ -551,13 +556,17 @@ async function main() {
   // a Job Object with kill-on-close, which a launch from Explorer/browser
   // via the devspec:// protocol handler does not create). `windowsHide` +
   // `stdio: 'ignore'` alone is sufficient for both invisibility and survival.
+  //
+  // TEMP DEBUG (`--headed`): show the serve console. Restore headless by
+  // omitting `--headed` (set OPENCODE_LAUNCH_HEADED=false in open-handler-core).
+  const headed = args.headed === true
   const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
     cwd: args.folder,
-    stdio: 'ignore',
-    windowsHide: true,
+    stdio: headed ? 'inherit' : 'ignore',
+    windowsHide: !headed,
   })
   server.unref()
-  await log(`spawned server pid=${server.pid ?? 'unknown'}`)
+  await log(`spawned server pid=${server.pid ?? 'unknown'} headed=${headed}`)
 
   const ready = await waitForServer(port)
   await log(`waitForServer ready=${ready}`)
@@ -599,12 +608,14 @@ async function main() {
   //
   // Round 8: pipe stdout/stderr into launcher.log so MiniMax/model failures
   // are not lost when the invisible client exits code 1 in a few seconds.
+  // TEMP DEBUG (`--headed`): still pipe (so failure capture keeps working)
+  // but leave the window visible via windowsHide:false.
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
     stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
+    windowsHide: !headed,
   })
-  await log(`spawned client pid=${client.pid ?? 'unknown'}`)
+  await log(`spawned client pid=${client.pid ?? 'unknown'} headed=${headed}`)
 
   const stdoutCapture = { chunks: [], bytes: 0 }
   const stderrCapture = { chunks: [], bytes: 0 }
