@@ -115,7 +115,31 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
   return null
 }
 
-function loadState(conversationId) {
+/**
+ * Marker set by mark-explicit-reply.mjs (PostToolUse on the devspec
+ * post_session_message tool) when the agent itself already posted a reply this
+ * turn. Checked here so Stop never ALSO mirrors the turn's end-of-turn
+ * narration as a second, redundant session message (item b9fb49a9 — the
+ * "double post, real reply missing" symptom was this narration landing
+ * alongside an explicit reply, not instead of one). Cleared unconditionally
+ * once read so it can never leak into a later turn.
+ */
+export function explicitReplyMarkerPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.explicit-reply`)
+}
+export function consumeExplicitReplyMarker(connectionId) {
+  if (!connectionId) return false
+  const p = explicitReplyMarkerPath(connectionId)
+  try {
+    const existed = fs.existsSync(p)
+    if (existed) fs.rmSync(p, { force: true })
+    return existed
+  } catch {
+    return false
+  }
+}
+
+export function loadState(conversationId) {
   // Gather every candidate (legacy singleton + per-connection files) but NEVER
   // trust "most recent" — selectBoundState keeps only THIS conversation's state.
   const candidates = []
@@ -291,24 +315,38 @@ async function main() {
   const text = extractLastText(raw, mode)
   const skipMirror = mode === 'user_prompt' && !!text && isHarnessInjection(text)
 
+  // Consume any explicit-reply marker so it cannot bleed into a later turn.
+  // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
+  // assistant text as a primary path — dual writers caused wrong-voice dupes
+  // and silent misses when bonding failed.
+  if (mode === 'stop') consumeExplicitReplyMarker(connectionId)
+
   try {
-    // Mirror the turn into the attached session's transcript — only when attached.
-    if (sessionId && text && String(text).trim() && !skipMirror) {
-      const isLocalPrompt = mode === 'user_prompt'
-      const cleaned = isLocalPrompt
-        ? String(text).trim().slice(0, 12000)
-        : prepareAgentMirrorText(text)
+    // LOCAL PROMPT only: mirror owner text typed in the terminal into the room
+    // when attached (two-sided transcript). Agent Stop text is NOT posted here —
+    // the skill must post_session_message the direct answer (prefer connection_id).
+    if (
+      mode === 'user_prompt' &&
+      sessionId &&
+      text &&
+      String(text).trim() &&
+      !skipMirror
+    ) {
+      const cleaned = String(text).trim().slice(0, 12000)
       if (cleaned) {
+        const postArgs = {
+          message: cleaned,
+          agent_name: agentName,
+          turn_kind: 'local_prompt',
+        }
+        // Prefer connection_id so reattach is server-resolved (delivery contract).
+        if (connectionId) postArgs.connection_id = connectionId
+        else postArgs.session_id = sessionId
         await mcpToolsCall({
           mcpUrl,
           token,
           name: 'post_session_message',
-          arguments: {
-            session_id: sessionId,
-            message: cleaned,
-            agent_name: agentName,
-            turn_kind: isLocalPrompt ? 'local_prompt' : 'agent',
-          },
+          arguments: postArgs,
         })
       }
     }

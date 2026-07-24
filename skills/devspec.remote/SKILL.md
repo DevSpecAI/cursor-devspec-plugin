@@ -188,7 +188,9 @@ Wait contract:
 - **`--pending`**: also deliver unconsumed inbox from the saved offset (use once after connect if needed).
 - Exit **0** = wake (act on messages). Exit **1** = disabled / UI end / owner gone / connection ended — do not re-arm.
 
-**Turn mirroring (hooks — automatic):** when connection state is enabled, plugin hooks post mechanically (no LLM) via `hooks/scripts/mirror-turn.mjs`: `UserPromptSubmit` → local-prompt bubble (raw owner text, right-aligned "You · local"), `Stop` → agent reply. When sessionless there is no room, so hooks only update the working indicator. Prefer hooks for reliability; still `post_session_message` important **reply-only** answers yourself if hooks fail (same shape rules as below) — and do **not** double-post a turn hooks already mirrored.
+**Delivery contract (ADR — binding):** Agent posts answers; Stop does **not** mirror full assistant text. Prefer `post_session_message({ connection_id, message })`. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
+
+**Turn mirroring (hooks — local_prompt only; Stop = busy):** when connection state is enabled, plugin hooks post mechanically (no LLM) via `hooks/scripts/mirror-turn.mjs`: `UserPromptSubmit` → local-prompt bubble (raw owner text, right-aligned "You · local"), `Stop` → busy/heartbeat only (you post the answer). When sessionless there is no room, so hooks only update the working indicator. Prefer hooks for reliability; still `post_session_message` important **reply-only** answers yourself if hooks fail (same shape rules as below) — and do **not** double-post a turn hooks already mirrored.
 
 ### Session transcript posts (non-negotiable)
 
