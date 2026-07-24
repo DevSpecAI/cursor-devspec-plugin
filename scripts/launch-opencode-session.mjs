@@ -411,8 +411,19 @@ async function postToDevspecSession({ folder, sessionId, message, agentName = 'O
 /**
  * Tee a child stream into launcher.log. Returns a buffer of the last ~8KB
  * for inclusion in failure posts.
+ *
+ * Real gap found live-testing (round 11): the client is always spawned with
+ * stdio ['ignore','pipe','pipe'] regardless of `--headed` — only the SERVER's
+ * stdio flips to 'inherit' when headed. So the "headed" console only ever
+ * showed the server's startup banner; the client's own output (the model's
+ * narration, register/attach calls, the final status block) went straight
+ * into launcher.log and was never visible in the window the owner opened
+ * specifically to watch it. When headed, also mirror each chunk to this
+ * script's own stdout/stderr (inherited by the visible console) IN ADDITION
+ * to the log — never instead of it, since the log capture is what round 8's
+ * failure-posting relies on.
  */
-function attachStreamLogging(stream, label, capture) {
+function attachStreamLogging(stream, label, capture, headed) {
   if (!stream) return
   stream.setEncoding('utf8')
   stream.on('data', (chunk) => {
@@ -423,6 +434,10 @@ function attachStreamLogging(stream, label, capture) {
     while (capture.bytes > 8192 && capture.chunks.length > 1) {
       const dropped = capture.chunks.shift()
       capture.bytes -= dropped.length
+    }
+    if (headed) {
+      const out = label === 'stderr' ? process.stderr : process.stdout
+      out.write(text)
     }
     for (const line of text.split(/\r?\n/)) {
       if (!line.trim()) continue
@@ -608,8 +623,9 @@ async function main() {
   //
   // Round 8: pipe stdout/stderr into launcher.log so MiniMax/model failures
   // are not lost when the invisible client exits code 1 in a few seconds.
-  // TEMP DEBUG (`--headed`): still pipe (so failure capture keeps working)
-  // but leave the window visible via windowsHide:false.
+  // TEMP DEBUG (`--headed`): still pipe (so failure capture keeps working),
+  // leave the window visible via windowsHide:false, and mirror the piped
+  // output live into that window (see round 11 note on attachStreamLogging).
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -619,8 +635,8 @@ async function main() {
 
   const stdoutCapture = { chunks: [], bytes: 0 }
   const stderrCapture = { chunks: [], bytes: 0 }
-  attachStreamLogging(client.stdout, 'stdout', stdoutCapture)
-  attachStreamLogging(client.stderr, 'stderr', stderrCapture)
+  attachStreamLogging(client.stdout, 'stdout', stdoutCapture, headed)
+  attachStreamLogging(client.stderr, 'stderr', stderrCapture, headed)
 
   const exit = await waitForChildExit(client)
   if (exit.error) {
