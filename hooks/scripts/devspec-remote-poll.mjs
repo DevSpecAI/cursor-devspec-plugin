@@ -573,8 +573,10 @@ async function main() {
 
   // --- Poll an attached session's room transcript ---------------------------
   // Owner instructions → commands (wake). Everything else → advisory (inbox only).
-  // seed:true = advance cursor only — do NOT re-wake / re-busy historical owner
-  // messages (reconnect was stranding Working forever when combined with busy-on-deliver).
+  // seed:true = catch up cursor; ALSO deliver unanswered owner commands (cold-launch
+  // dispatch landed before this poller started — skipping them left Working dark).
+  // Completed history (at-or-before the latest external_agent reply) stays skipped
+  // so reconnect does not re-wake / re-busy finished turns.
   async function pollRoom({ seed = false } = {}) {
     if (!sessionId) return
     try {
@@ -599,7 +601,41 @@ async function main() {
       const next = delta?.cursor?.next_after_message_id || msgs[msgs.length - 1]?.id || cursor
 
       if (seed) {
-        // Catch up the cursor so the next real poll only sees new mail.
+        // Cold-launch fix [devspec:5b1a08b3]: the dispatch that caused this attach
+        // landed BEFORE the poller started. A pure cursor advance would skip it —
+        // never delivering, never asserting busy — while the agent skill works from
+        // the transcript with no UserPromptSubmit hook. Result: idle UI (no typing
+        // dots / logo spinner) for the whole first turn.
+        //
+        // Still skip COMPLETED history (anything at-or-before the latest
+        // external_agent reply). Only unanswered owner commands after that reply
+        // are the live turn — deliver + busy so Working shows immediately.
+        let lastReplyIdx = -1
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i]?.message_type === 'external_agent') {
+            lastReplyIdx = i
+            break
+          }
+        }
+        const unanswered = []
+        for (let i = lastReplyIdx + 1; i < msgs.length; i++) {
+          if (classifyRoomMessage(msgs[i], ownerUserId) === 'command') unanswered.push(msgs[i])
+        }
+        if (unanswered.length > 0) {
+          deliverOwnerMessages(connectionId, unanswered, next, ownerUserId, sessionId)
+          cursor = next
+          idleStarted = Date.now()
+          try {
+            await sendHeartbeat({ status: 'live', busy: true })
+            lastHeartbeat = Date.now()
+            lastBusySent = true
+          } catch (e) {
+            process.stderr.write(`devspec-remote-poll: seed busy heartbeat failed: ${e.message}\n`)
+          }
+          return
+        }
+        // No live unanswered turn — catch up the cursor so the next real poll
+        // only sees new mail (reconnect must not re-wake completed history).
         if (next && next !== cursor) {
           cursor = next
           try {
