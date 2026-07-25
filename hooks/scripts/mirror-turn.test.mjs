@@ -7,8 +7,19 @@
  * belongs to a DIFFERENT conversation must never be selected for mirroring.
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, it } from 'node:test'
-import { resolveHookConversationId, selectBoundState, stripRemoteControlBanner, isOperationalChrome, prepareAgentMirrorText } from './mirror-turn.mjs'
+import {
+  resolveHookConversationId,
+  selectBoundState,
+  stripRemoteControlBanner,
+  isOperationalChrome,
+  prepareAgentMirrorText,
+  explicitReplyMarkerPath,
+  consumeExplicitReplyMarker,
+} from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
   it('prefers CLAUDE_CODE_SESSION_ID env (the value write stamps)', () => {
@@ -169,5 +180,55 @@ describe('operational chrome filtering', () => {
       prepareAgentMirrorText(mixed),
       'Queue same-tab Dev sends while streaming — done on staging.',
     )
+  })
+})
+
+describe('explicit-reply marker (double-post guard, item b9fb49a9)', () => {
+  // Use a non-UUID test id so this can never collide with a real connection's
+  // marker file under the shared ~/.devspec state dir.
+  const testConnectionId = 'test-conn-explicit-reply-marker'
+
+  function cleanup() {
+    try {
+      fs.rmSync(explicitReplyMarkerPath(testConnectionId), { force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+
+  it('reports absent when no marker was written', () => {
+    cleanup()
+    try {
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), false)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('reports present once, then absent (single-consume — cannot leak into a later turn)', () => {
+    cleanup()
+    try {
+      fs.mkdirSync(path.dirname(explicitReplyMarkerPath(testConnectionId)), { recursive: true })
+      fs.writeFileSync(explicitReplyMarkerPath(testConnectionId), `${Date.now()}\n`)
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(testConnectionId)), true)
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), true)
+      // Consumed — gone, and a second read never re-reports it.
+      assert.equal(fs.existsSync(explicitReplyMarkerPath(testConnectionId)), false)
+      assert.equal(consumeExplicitReplyMarker(testConnectionId), false)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('returns false for a missing/empty connection id rather than throwing', () => {
+    assert.equal(consumeExplicitReplyMarker(null), false)
+    assert.equal(consumeExplicitReplyMarker(undefined), false)
+    assert.equal(consumeExplicitReplyMarker(''), false)
+  })
+
+  it('marker path is scoped under the shared connections dir, keyed by connection id', () => {
+    const p = explicitReplyMarkerPath(testConnectionId)
+    assert.equal(path.basename(p), `${testConnectionId}.explicit-reply`)
+    assert.equal(path.dirname(p), path.join(os.homedir(), '.devspec', 'remote-control', 'connections'))
   })
 })
