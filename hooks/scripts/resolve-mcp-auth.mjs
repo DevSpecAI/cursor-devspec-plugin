@@ -1,32 +1,24 @@
 #!/usr/bin/env node
 /**
- * Resolve DevSpec MCP URL + Bearer token for remote-control hooks/poller.
+ * Resolve DevSpec MCP URL + Bearer token for Cursor remote-control hooks/poller.
+ *
+ * WHY THIS IS CURSOR-SPECIFIC (this plugin OWNS this file in sync-hooks). The Cursor
+ * extension stores the DevSpec token in Cursor's OWN MCP config —
+ * `~/.cursor/mcp.json` (written by the "DevSpec: Set MCP token" command) or a
+ * project `.cursor/mcp.json` — NOT in a `CLAUDE_PLUGIN_OPTION_*` env var. The
+ * detached poller and the turn-mirroring hooks run in a side channel that doesn't
+ * share Cursor's config, so they must resolve THAT token — otherwise
+ * register_connection ran on one token while the poller heartbeats another and the
+ * server rejects with "connection belongs to a different token" (dispatch delivery
+ * then spams). So Cursor's mcp.json is the source of truth and wins over a generic
+ * project `.mcp.json`. (The canonical Claude resolver reads
+ * `CLAUDE_PLUGIN_OPTION_*` + `~/.claude.json`, which are meaningless for Cursor.)
  *
  * Lookup order:
- * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit human override.
- * 2. opts.hostToken — the bearer the HOST MCP client used to call register_connection,
- *    when the caller can supply it (token symmetry, item 74b29c76). Wins over the
- *    .mcp.json / ~/.claude.json walk so the poller heartbeats the connection under
- *    the SAME identity register used — otherwise the server rejects with "This
- *    connection belongs to a different token" and dispatch delivery spams. Absent →
- *    resolution is unchanged (backward compatible).
- * 3. Project .mcp.json (cwd and parents)
- * 4. ~/.claude.json project entries that match cwd (mcpServers.devspec)
- * 5. ~/.claude.json top-level mcpServers.devspec
- * 6. CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin userConfig token
- *    (keychain-stored; Claude Code exports it to hook/tool subprocesses).
- *    Lowest priority so a developer's own .mcp.json (e.g. staging) still wins.
- *
- * MULTI-TOKEN SETUPS. When more than one DevSpec token is reachable (e.g. a
- * marketplace plugin userConfig token AND a project .mcp.json staging token), the
- * HOST MCP client and the poller could otherwise resolve DIFFERENT ones — the poller
- * then heartbeats a connection register created under another token and every
- * dispatch is rejected. hostTokenFromEnv() surfaces the host's own token (the plugin
- * userConfig env Claude Code exports — the token register_connection runs on for the
- * plugin-declared `devspec` server); passing it as opts.hostToken keeps register and
- * poller on ONE token from the start. To force a specific token regardless, set
- * DEVSPEC_MCP_TOKEN (step 1). On the non-Claude local-poller plugins the plugin env
- * is never set, so hostTokenFromEnv() returns null and nothing changes.
+ * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL) — explicit override.
+ * 2. opts.hostToken — an explicitly supplied host bearer.
+ * 3. Cursor MCP config — `<cwd>/.cursor/mcp.json` then `~/.cursor/mcp.json`.
+ * 4. Project `.mcp.json` (cwd and parents) — fallback for non-standard setups.
  *
  * Prints JSON: { ok, token?, mcp_url?, source?, error? }
  * Never prints the full token in human logs — only to stdout JSON for piping.
@@ -62,16 +54,19 @@ function fromServerEntry(entry) {
   return { mcp_url: url || DEFAULT_PROD_URL, token: token || null }
 }
 
+/** Pull the `devspec` server entry out of a parsed MCP-config JSON object. */
+function devspecEntry(j) {
+  const servers = j?.mcpServers || j?.mcp?.servers || {}
+  return servers.devspec || servers.DevSpec || servers['devspec-mcp']
+}
+
 function walkMcpJson(startDir) {
   let dir = path.resolve(startDir || process.cwd())
   for (let i = 0; i < 12; i++) {
     for (const name of ['.mcp.json', 'mcp.json']) {
       const file = path.join(dir, name)
       if (!fs.existsSync(file)) continue
-      const j = readJson(file)
-      const servers = j?.mcpServers || j?.mcp?.servers || {}
-      const entry = servers.devspec || servers.DevSpec || servers['devspec-mcp']
-      const got = fromServerEntry(entry)
+      const got = fromServerEntry(devspecEntry(readJson(file)))
       if (got?.token) return { ...got, source: file }
       if (got?.mcp_url) return { ...got, source: file }
     }
@@ -82,82 +77,69 @@ function walkMcpJson(startDir) {
   return null
 }
 
-function fromClaudeJson(cwd) {
-  const file = path.join(os.homedir(), '.claude.json')
-  const j = readJson(file)
-  if (!j) return null
-
-  const abs = path.resolve(cwd || process.cwd())
-
-  // Prefer project-scoped config matching cwd prefix (longest match wins)
-  const projects = j.projects || {}
-  const matches = Object.keys(projects)
-    .filter((p) => abs === p || abs.startsWith(p + path.sep) || p.startsWith(abs + path.sep))
-    .sort((a, b) => b.length - a.length)
-
-  for (const proj of matches) {
-    const servers = projects[proj]?.mcpServers || {}
-    const entry = servers.devspec || servers.DevSpec
-    const got = fromServerEntry(entry)
-    if (got?.token) return { ...got, source: `${file}#projects[${proj}]` }
+/**
+ * Cursor's own MCP config — where the extension writes the token: a project
+ * `<cwd>/.cursor/mcp.json` (more specific) then `~/.cursor/mcp.json`. First one
+ * carrying a token wins.
+ */
+function cursorConfigAuth(cwd = process.cwd()) {
+  const candidates = [
+    path.join(path.resolve(cwd || process.cwd()), '.cursor', 'mcp.json'),
+    path.join(os.homedir(), '.cursor', 'mcp.json'),
+  ]
+  let urlOnly = null
+  for (const file of candidates) {
+    const got = fromServerEntry(devspecEntry(readJson(file)))
+    if (got?.token) return { ...got, source: file }
+    if (got?.mcp_url && !urlOnly) urlOnly = { ...got, source: file }
   }
-
-  // Any project entry named for this path substring
-  for (const [proj, cfg] of Object.entries(projects)) {
-    if (!proj.includes('devspec') && !abs.includes(path.basename(proj))) continue
-    const servers = cfg?.mcpServers || {}
-    const entry = servers.devspec || servers.DevSpec
-    const got = fromServerEntry(entry)
-    if (got?.token) return { ...got, source: `${file}#projects[${proj}]` }
-  }
-
-  const top = fromServerEntry((j.mcpServers || {}).devspec)
-  if (top?.token) return { ...top, source: `${file}#mcpServers` }
-
-  return null
+  return urlOnly
 }
 
 /**
- * The bearer the HOST MCP client is expected to have used for register_connection,
- * drawn from the reachable process env. The one host-token carrier that reaches
- * hook/tool subprocesses today is CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN — the plugin
- * userConfig token Claude Code exports, which IS the token the host uses for the
- * plugin-declared `devspec` MCP server (so register_connection runs on it). Pass the
- * result as resolveDevspecMcpAuth(cwd, { hostToken }) at connect/write time to keep
- * the poller on the same token. Returns null where the plugin env is unset (a
- * dev-from-source .mcp.json setup, or the non-Claude local-poller plugins) → the
- * caller's resolution is unchanged.
+ * The token Cursor registers the connection with — its own `~/.cursor/mcp.json`
+ * (or a project `.cursor/mcp.json`) devspec bearer, or an explicit
+ * DEVSPEC_MCP_TOKEN override. Pass the result as
+ * `resolveDevspecMcpAuth(cwd, { hostToken })` so the poller and the in-session MCP
+ * stay on ONE token.
+ *
+ * Named `hostTokenFromEnv` because the SYNCED callers (poller, mirror, state) import
+ * this symbol — Cursor owns only the resolver, not those callers.
  */
 export function hostTokenFromEnv(env = process.env) {
-  const t = env.CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN || env.CLAUDE_PLUGIN_OPTION_devspec_token || null
-  return typeof t === 'string' && t.trim() ? t.trim() : null
+  const envTok = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN
+  if (typeof envTok === 'string' && envTok.trim()) return envTok.trim()
+  return cursorConfigAuth()?.token || null
 }
 
 export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
   const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
   const envUrl = process.env.DEVSPEC_MCP_URL || null
   if (envToken) {
-    return {
-      ok: true,
-      token: envToken,
-      mcp_url: envUrl || DEFAULT_PROD_URL,
-      source: 'env',
-    }
+    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
   }
 
+  const cursor = cursorConfigAuth(cwd)
   const fromProject = walkMcpJson(cwd)
 
-  // Host-provided token wins over the .mcp.json / ~/.claude.json walk (token
-  // symmetry, item 74b29c76) but stays below the explicit DEVSPEC_MCP_TOKEN
-  // override. Backward compatible: absent → the walk below is unchanged.
   const hostToken =
     typeof opts.hostToken === 'string' && opts.hostToken.trim() ? opts.hostToken.trim() : null
   if (hostToken) {
     return {
       ok: true,
       token: hostToken,
-      mcp_url: envUrl || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      mcp_url: envUrl || cursor?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
       source: 'host',
+    }
+  }
+
+  // Cursor's own config — the token register_connection ran on. Wins over .mcp.json.
+  if (cursor?.token) {
+    return {
+      ok: true,
+      token: cursor.token,
+      mcp_url: envUrl || cursor.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
+      source: cursor.source,
     }
   }
 
@@ -165,46 +147,19 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
     return {
       ok: true,
       token: fromProject.token,
-      mcp_url: envUrl || fromProject.mcp_url || DEFAULT_PROD_URL,
+      mcp_url: envUrl || fromProject.mcp_url || cursor?.mcp_url || DEFAULT_PROD_URL,
       source: fromProject.source,
     }
   }
 
-  const fromClaude = fromClaudeJson(cwd)
-  if (fromClaude?.token) {
-    return {
-      ok: true,
-      token: fromClaude.token,
-      mcp_url: envUrl || fromClaude.mcp_url || DEFAULT_PROD_URL,
-      source: fromClaude.source,
-    }
-  }
-
-  // Plugin userConfig token (sensitive; stored in the OS keychain, exported to
-  // subprocesses as CLAUDE_PLUGIN_OPTION_<KEY>). This is how a marketplace-
-  // installed user's token reaches the remote-control hooks/poller — they never
-  // put it in .mcp.json. Kept last so an explicit local .mcp.json wins.
-  const pluginOptionToken =
-    process.env.CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN ||
-    process.env.CLAUDE_PLUGIN_OPTION_devspec_token ||
-    null
-  if (pluginOptionToken) {
-    return {
-      ok: true,
-      token: pluginOptionToken,
-      mcp_url: envUrl || fromProject?.mcp_url || DEFAULT_PROD_URL,
-      source: 'plugin_user_config',
-    }
-  }
-
-  // URL-only from project file (token missing)
-  if (fromProject?.mcp_url) {
+  const urlOnly = cursor?.mcp_url ? cursor : fromProject
+  if (urlOnly?.mcp_url) {
     return {
       ok: false,
-      mcp_url: envUrl || fromProject.mcp_url,
-      source: fromProject.source,
+      mcp_url: envUrl || urlOnly.mcp_url,
+      source: urlOnly.source,
       error:
-        'Found DevSpec MCP URL but no Bearer token. Set DEVSPEC_MCP_TOKEN or add headers.Authorization on the devspec server in .mcp.json.',
+        'Found a DevSpec MCP URL but no Bearer token. Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.',
     }
   }
 
@@ -212,7 +167,7 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
     ok: false,
     mcp_url: envUrl || DEFAULT_PROD_URL,
     error:
-      'No DevSpec MCP token found. Provide your token via the plugin configuration, set DEVSPEC_MCP_TOKEN, or configure mcpServers.devspec.headers.Authorization in project .mcp.json.',
+      'No DevSpec MCP token found. Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.',
   }
 }
 

@@ -1,97 +1,123 @@
 #!/usr/bin/env node
 /**
- * Unit tests for MCP token resolution order — focus on the host-token symmetry
- * fix (item 74b29c76): the poller must resolve the SAME bearer the host used for
- * register_connection, or every dispatch is rejected as "connection belongs to a
- * different token".
+ * Unit tests for the Cursor DevSpec MCP auth resolver.
  * Run: node --test hooks/scripts/resolve-mcp-auth.test.mjs
+ *
+ * The load-bearing property: the Cursor extension writes the token to Cursor's own
+ * MCP config (~/.cursor/mcp.json, or a project .cursor/mcp.json), so that MUST win
+ * over a generic project .mcp.json — otherwise the poller heartbeats a different
+ * token and the server rejects "connection belongs to a different token".
  */
 import assert from 'node:assert/strict'
-import { after, before, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 
-describe('resolveDevspecMcpAuth token precedence (host symmetry, item 74b29c76)', () => {
-  let tmp
-  const saved = {}
+let root
+let fakeHome
+const savedEnv = {}
 
-  before(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-mcp-auth-'))
-    fs.writeFileSync(
-      path.join(tmp, '.mcp.json'),
-      JSON.stringify({
-        mcpServers: {
-          devspec: {
-            url: 'https://staging.devspec.ai/api/mcp',
-            headers: { Authorization: 'Bearer from-mcp-json' },
-          },
-        },
-      }),
-    )
-    // Neutralise ambient env overrides so precedence is deterministic on any machine.
-    for (const k of ['DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) {
-      saved[k] = process.env[k]
-      delete process.env[k]
-    }
-  })
-
-  after(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k]
-      else process.env[k] = v
-    }
-    try {
-      fs.rmSync(tmp, { recursive: true, force: true })
-    } catch {
-      /* ignore */
-    }
-  })
-
-  it('host token wins over the project .mcp.json walk', () => {
-    const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
-    assert.equal(r.ok, true)
-    assert.equal(r.token, 'from-host')
-    assert.equal(r.source, 'host')
-  })
-
-  it('falls back to .mcp.json when no host token (backward compatible)', () => {
-    const r = resolveDevspecMcpAuth(tmp, {})
-    assert.equal(r.ok, true)
-    assert.equal(r.token, 'from-mcp-json')
-    assert.match(String(r.source), /\.mcp\.json$/)
-  })
-
-  it('a blank/whitespace host token is ignored (backward compatible)', () => {
-    const r = resolveDevspecMcpAuth(tmp, { hostToken: '   ' })
-    assert.equal(r.token, 'from-mcp-json')
-  })
-
-  it('explicit DEVSPEC_MCP_TOKEN still overrides even a host token', () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'from-env'
-    try {
-      const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
-      assert.equal(r.token, 'from-env')
-      assert.equal(r.source, 'env')
-    } finally {
-      delete process.env.DEVSPEC_MCP_TOKEN
-    }
-  })
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'cursorres-'))
+  fakeHome = path.join(root, 'home')
+  fs.mkdirSync(fakeHome, { recursive: true })
+  for (const k of ['HOME', 'USERPROFILE', 'DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) savedEnv[k] = process.env[k]
+  process.env.HOME = fakeHome
+  process.env.USERPROFILE = fakeHome
+  delete process.env.DEVSPEC_MCP_TOKEN
+  delete process.env.DEVSPEC_TOKEN
+  delete process.env.DEVSPEC_MCP_URL
 })
 
-describe('hostTokenFromEnv', () => {
-  it('reads the plugin userConfig token Claude Code exports', () => {
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: 'plug' }), 'plug')
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_devspec_token: 'plug2' }), 'plug2')
+afterEach(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+function proj(name) {
+  const d = path.join(root, name)
+  fs.mkdirSync(d, { recursive: true })
+  return d
+}
+function cursorJson(dir, token, url = 'https://devspec.ai/api/mcp') {
+  const c = path.join(dir, '.cursor')
+  fs.mkdirSync(c, { recursive: true })
+  fs.writeFileSync(
+    path.join(c, 'mcp.json'),
+    JSON.stringify({ mcpServers: { devspec: { url, headers: { Authorization: `Bearer ${token}` } } } }),
+  )
+}
+function mcpJson(dir, token) {
+  fs.writeFileSync(
+    path.join(dir, '.mcp.json'),
+    JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: `Bearer ${token}` } } } }),
+  )
+}
+
+describe('resolveDevspecMcpAuth (Cursor)', () => {
+  it('prefers .cursor/mcp.json over a generic project .mcp.json (the fix)', () => {
+    const d = proj('both')
+    mcpJson(d, 'dvs_from_mcpjson')
+    cursorJson(d, 'dvs_from_cursor')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_from_cursor')
+    assert.match(auth.source, /\.cursor[\\/]mcp\.json$/)
   })
 
-  it('returns null where the plugin env is unset (dev-from-source / non-Claude plugins)', () => {
-    assert.equal(hostTokenFromEnv({}), null)
+  it('reads ~/.cursor/mcp.json (home) when the project has none', () => {
+    const d = proj('homeonly')
+    cursorJson(fakeHome, 'dvs_home_cursor')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_home_cursor')
+    assert.equal(hostTokenFromEnv(process.env), 'dvs_home_cursor')
   })
 
-  it('trims and ignores blank', () => {
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '  x ' }), 'x')
-    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '   ' }), null)
+  it('project .cursor/mcp.json wins over home ~/.cursor/mcp.json', () => {
+    const d = proj('projwins')
+    cursorJson(fakeHome, 'dvs_home')
+    cursorJson(d, 'dvs_project')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_project')
+  })
+
+  it('falls back to .mcp.json when no .cursor config token is reachable', () => {
+    const d = proj('mcponly')
+    mcpJson(d, 'dvs_only_mcp')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_only_mcp')
+    assert.match(auth.source, /\.mcp\.json$/)
+  })
+
+  it('DEVSPEC_MCP_TOKEN overrides the config files', () => {
+    const d = proj('envwin')
+    cursorJson(d, 'dvs_cursor')
+    process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_override'
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_env_override')
+    assert.equal(auth.source, 'env')
+  })
+
+  it('an explicit opts.hostToken wins over the Cursor config (below env)', () => {
+    const d = proj('hosttok')
+    cursorJson(d, 'dvs_cursor')
+    const auth = resolveDevspecMcpAuth(d, { hostToken: 'dvs_explicit_host' })
+    assert.equal(auth.token, 'dvs_explicit_host')
+    assert.equal(auth.source, 'host')
+  })
+
+  it('reports a Cursor-shaped error when a URL is present but no token', () => {
+    const d = proj('urlonly')
+    const c = path.join(d, '.cursor')
+    fs.mkdirSync(c, { recursive: true })
+    fs.writeFileSync(path.join(c, 'mcp.json'), JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }))
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, false)
+    assert.match(auth.error, /DevSpec: Set MCP token/)
   })
 })
