@@ -1,141 +1,97 @@
 #!/usr/bin/env node
 /**
- * Unit tests for MCP auth resolve + 401 fallback.
+ * Unit tests for MCP token resolution order — focus on the host-token symmetry
+ * fix (item 74b29c76): the poller must resolve the SAME bearer the host used for
+ * register_connection, or every dispatch is rejected as "connection belongs to a
+ * different token".
  * Run: node --test hooks/scripts/resolve-mcp-auth.test.mjs
  */
 import assert from 'node:assert/strict'
-import { describe, it, beforeEach, afterEach } from 'node:test'
+import { after, before, describe, it } from 'node:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import {
-  isMcpAuthHttpError,
-  listDevspecMcpAuthCandidates,
-  mcpUrlFromApiBase,
-  resolveDevspecMcpAuth,
-  resolveDevspecMcpAuthValidated,
-} from './resolve-mcp-auth.mjs'
+import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 
-describe('mcpUrlFromApiBase', () => {
-  it('appends /api/mcp to an app origin', () => {
-    assert.equal(mcpUrlFromApiBase('https://staging.devspec.ai'), 'https://staging.devspec.ai/api/mcp')
-  })
-
-  it('leaves an already-MCP URL alone', () => {
-    assert.equal(
-      mcpUrlFromApiBase('https://staging.devspec.ai/api/mcp'),
-      'https://staging.devspec.ai/api/mcp',
-    )
-  })
-
-  it('returns null for empty', () => {
-    assert.equal(mcpUrlFromApiBase(''), null)
-    assert.equal(mcpUrlFromApiBase(null), null)
-  })
-})
-
-describe('isMcpAuthHttpError', () => {
-  it('detects 401 and 403 from mcpToolsCall errors', () => {
-    assert.equal(isMcpAuthHttpError(new Error('MCP HTTP 401: {"error":"Invalid"}')), true)
-    assert.equal(isMcpAuthHttpError(new Error('MCP HTTP 403: forbidden')), true)
-    assert.equal(isMcpAuthHttpError(new Error('MCP HTTP 500: boom')), false)
-    assert.equal(isMcpAuthHttpError(new Error('fetch failed')), false)
-  })
-})
-
-describe('resolveDevspecMcpAuthValidated', () => {
+describe('resolveDevspecMcpAuth token precedence (host symmetry, item 74b29c76)', () => {
   let tmp
-  let prevEnv
+  const saved = {}
 
-  beforeEach(() => {
-    prevEnv = {
-      DEVSPEC_MCP_TOKEN: process.env.DEVSPEC_MCP_TOKEN,
-      DEVSPEC_TOKEN: process.env.DEVSPEC_TOKEN,
-      DEVSPEC_MCP_URL: process.env.DEVSPEC_MCP_URL,
-      DEVSPEC_API_URL: process.env.DEVSPEC_API_URL,
-    }
-    delete process.env.DEVSPEC_MCP_TOKEN
-    delete process.env.DEVSPEC_TOKEN
-    delete process.env.DEVSPEC_MCP_URL
-    delete process.env.DEVSPEC_API_URL
-
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-auth-'))
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-mcp-auth-'))
     fs.writeFileSync(
       path.join(tmp, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
           devspec: {
-            url: 'https://example.test/api/mcp',
-            headers: { Authorization: 'Bearer project-good-token' },
+            url: 'https://staging.devspec.ai/api/mcp',
+            headers: { Authorization: 'Bearer from-mcp-json' },
           },
         },
       }),
     )
+    // Neutralise ambient env overrides so precedence is deterministic on any machine.
+    for (const k of ['DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) {
+      saved[k] = process.env[k]
+      delete process.env[k]
+    }
   })
 
-  afterEach(() => {
-    for (const [k, v] of Object.entries(prevEnv)) {
+  after(() => {
+    for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k]
       else process.env[k] = v
     }
-    fs.rmSync(tmp, { recursive: true, force: true })
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
   })
 
-  it('falls back to .mcp.json when env token gets 401', async () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'stale-env-token'
-    process.env.DEVSPEC_MCP_URL = 'https://example.test/api/mcp'
-
-    const probed = []
-    const result = await resolveDevspecMcpAuthValidated({
-      cwd: tmp,
-      probe: async ({ token, source }) => {
-        probed.push({ token, source })
-        if (token === 'stale-env-token') {
-          throw new Error('MCP HTTP 401: {"error":"Invalid or revoked API token"}')
-        }
-      },
-    })
-
-    assert.equal(result.ok, true)
-    assert.equal(result.token, 'project-good-token')
-    assert.equal(result.validated, true)
-    assert.equal(probed.length, 2)
-    assert.equal(probed[0].source, 'env')
-    assert.ok(String(probed[1].source).endsWith('.mcp.json'))
-    assert.ok(result.fallback_from?.length >= 1)
-  })
-
-  it('does not fall back on non-auth failures', async () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'env-token'
-    process.env.DEVSPEC_MCP_URL = 'https://example.test/api/mcp'
-
-    const result = await resolveDevspecMcpAuthValidated({
-      cwd: tmp,
-      probe: async () => {
-        throw new Error('fetch failed')
-      },
-    })
-
-    assert.equal(result.ok, false)
-    assert.match(result.error, /Auth smoke failed \(env\)/)
-  })
-
-  it('sync resolve still prefers env first (CI path)', () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'env-token'
-    process.env.DEVSPEC_API_URL = 'https://staging.example'
-    const r = resolveDevspecMcpAuth(tmp)
+  it('host token wins over the project .mcp.json walk', () => {
+    const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
     assert.equal(r.ok, true)
-    assert.equal(r.token, 'env-token')
-    assert.equal(r.source, 'env')
-    assert.equal(r.mcp_url, 'https://staging.example/api/mcp')
+    assert.equal(r.token, 'from-host')
+    assert.equal(r.source, 'host')
   })
 
-  it('lists env before project candidates', () => {
-    process.env.DEVSPEC_MCP_TOKEN = 'env-token'
-    process.env.DEVSPEC_MCP_URL = 'https://example.test/api/mcp'
-    const { candidates } = listDevspecMcpAuthCandidates(tmp)
-    assert.equal(candidates[0].source, 'env')
-    assert.equal(candidates[0].token, 'env-token')
-    assert.equal(candidates[1].token, 'project-good-token')
+  it('falls back to .mcp.json when no host token (backward compatible)', () => {
+    const r = resolveDevspecMcpAuth(tmp, {})
+    assert.equal(r.ok, true)
+    assert.equal(r.token, 'from-mcp-json')
+    assert.match(String(r.source), /\.mcp\.json$/)
+  })
+
+  it('a blank/whitespace host token is ignored (backward compatible)', () => {
+    const r = resolveDevspecMcpAuth(tmp, { hostToken: '   ' })
+    assert.equal(r.token, 'from-mcp-json')
+  })
+
+  it('explicit DEVSPEC_MCP_TOKEN still overrides even a host token', () => {
+    process.env.DEVSPEC_MCP_TOKEN = 'from-env'
+    try {
+      const r = resolveDevspecMcpAuth(tmp, { hostToken: 'from-host' })
+      assert.equal(r.token, 'from-env')
+      assert.equal(r.source, 'env')
+    } finally {
+      delete process.env.DEVSPEC_MCP_TOKEN
+    }
+  })
+})
+
+describe('hostTokenFromEnv', () => {
+  it('reads the plugin userConfig token Claude Code exports', () => {
+    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: 'plug' }), 'plug')
+    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_devspec_token: 'plug2' }), 'plug2')
+  })
+
+  it('returns null where the plugin env is unset (dev-from-source / non-Claude plugins)', () => {
+    assert.equal(hostTokenFromEnv({}), null)
+  })
+
+  it('trims and ignores blank', () => {
+    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '  x ' }), 'x')
+    assert.equal(hostTokenFromEnv({ CLAUDE_PLUGIN_OPTION_DEVSPEC_TOKEN: '   ' }), null)
   })
 })
