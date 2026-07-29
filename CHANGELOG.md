@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.7 - 2026-07-29
+
+### Improved
+
+- **Faster Cursor CLI cold attach:** protocol-handler / CLI launches now embed the Cursor `devspec.remote` skill body (in addition to the `PLUGIN=` pin from 0.4.6). Web cold-starts were spending ~1–2 minutes globbing for the skill and often landing on the Claude marketplace copy; the agent now gets the skill inline and can register/attach immediately.
+
 ## 0.4.6 - 2026-07-29
 
 ### Fixed

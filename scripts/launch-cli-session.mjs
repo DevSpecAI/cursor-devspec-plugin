@@ -13,6 +13,7 @@ import fs from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
 function parseArgs(argv) {
   const out = {}
@@ -270,11 +271,15 @@ async function main() {
     return
   }
 
+  // Belt-and-suspenders: open-handler usually expands already, but re-run here
+  // so a direct CLI invoke still gets PLUGIN= + skill body (item 57d8b288).
+  const expandedBody = expandRemoteControlLaunchPrompt(promptBody) ?? promptBody
+
   const stamped = flattenPromptForArgv(
-    promptBody ? `${promptBody}\n\n${stampLine(chatId)}` : stampLine(chatId),
+    expandedBody ? `${expandedBody}\n\n${stampLine(chatId)}` : stampLine(chatId),
   )
 
-  const kind = inferCursorAgentRunKindFromPrompt(promptBody)
+  const kind = inferCursorAgentRunKindFromPrompt(expandedBody)
   const policyFlags = buildInteractiveCursorAgentFlags(kind, {
     model: args.model ?? null,
   })

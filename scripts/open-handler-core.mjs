@@ -10,7 +10,7 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
 import { quoteWinCmdArg } from './launch-cli-session.mjs'
-import { pinRemotePluginInPrompt } from './pin-remote-plugin.mjs'
+import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -659,9 +659,9 @@ export async function executeHandoff({
   }
 
   // Session/web remote-control prompts cannot include a machine-local PLUGIN=
-  // path. Pin it here so Cursor agents never fall through to Claude marketplace
-  // poller scripts and mislabel the connection as Claude Code.
-  const pinnedPrompt = pinRemotePluginInPrompt(promptText)
+  // path or the Cursor skill body. Expand here so Cursor agents never hunt
+  // Claude marketplace caches (item 57d8b288) or mislabel as Claude Code.
+  const pinnedPrompt = expandRemoteControlLaunchPrompt(promptText)
 
   if (surface === 'cli') {
     const agentBin = await resolveAgentExecutable()

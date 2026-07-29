@@ -9,8 +9,11 @@ import path from 'node:path'
 import { describe, it, before, after } from 'node:test'
 import {
   buildPluginPinBlock,
+  expandRemoteControlLaunchPrompt,
+  parseRemoteSkillIdFromPrompt,
   pinRemotePluginInPrompt,
   promptAlreadyHasPluginPin,
+  promptAlreadyHasSkillBody,
   promptNeedsRemotePluginPin,
   resolveCursorDevspecExtensionPath,
 } from './pin-remote-plugin.mjs'
@@ -96,5 +99,76 @@ describe('pinRemotePluginInPrompt', () => {
   it('is a no-op for non-remote prompts', () => {
     const prompt = 'Run the `devspec.work` skill with this input: abc'
     assert.equal(pinRemotePluginInPrompt(prompt, { homeDir: tmpHome }), prompt)
+  })
+})
+
+describe('expandRemoteControlLaunchPrompt', () => {
+  /** @type {string} */
+  let tmpHome
+  /** @type {string} */
+  let extensionPath
+
+  before(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-expand-'))
+    extensionPath = path.join(
+      tmpHome,
+      '.cursor',
+      'extensions',
+      'devspecai.devspec-autopilot-0.4.7',
+    )
+    fs.mkdirSync(path.join(extensionPath, 'hooks', 'scripts'), { recursive: true })
+    fs.writeFileSync(
+      path.join(extensionPath, 'hooks', 'scripts', 'remote-control-state.mjs'),
+      '// stub\n',
+    )
+    fs.mkdirSync(path.join(extensionPath, 'skills', 'devspec.remote'), { recursive: true })
+    fs.writeFileSync(
+      path.join(extensionPath, 'skills', 'devspec.remote', 'SKILL.md'),
+      [
+        '---',
+        'name: devspec.remote',
+        '---',
+        '',
+        '# DevSpec Remote Control',
+        '',
+        '## Plugin root',
+        '',
+        'Call register_connection then attach_connection.',
+        '',
+      ].join('\n'),
+    )
+  })
+
+  after(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  it('parses remote skill ids from web headers', () => {
+    assert.equal(
+      parseRemoteSkillIdFromPrompt('Run the `devspec.remote` skill with this input: x'),
+      'devspec.remote',
+    )
+    assert.equal(parseRemoteSkillIdFromPrompt('Run the `devspec.remote-stop` skill.'), 'devspec.remote-stop')
+    assert.equal(parseRemoteSkillIdFromPrompt('Run the `devspec.work` skill'), null)
+  })
+
+  it('embeds PLUGIN= and the Cursor skill body for cold attach prompts', () => {
+    const prompt = 'Run the `devspec.remote` skill with this input: --session abc'
+    const expanded = expandRemoteControlLaunchPrompt(prompt, { homeDir: tmpHome })
+    assert.ok(expanded.startsWith(`PLUGIN=${extensionPath}`))
+    assert.ok(expanded.includes('Do NOT glob for the skill'))
+    assert.ok(expanded.includes('# DevSpec Remote Control'))
+    assert.ok(expanded.includes('Plugin root'))
+    assert.ok(expanded.includes('register_connection'))
+    assert.ok(promptAlreadyHasSkillBody(expanded, 'devspec.remote'))
+  })
+
+  it('does not double-embed when the skill body is already present', () => {
+    const once = expandRemoteControlLaunchPrompt(
+      'Run the `devspec.remote` skill with this input: --session abc',
+      { homeDir: tmpHome },
+    )
+    const twice = expandRemoteControlLaunchPrompt(once, { homeDir: tmpHome })
+    assert.equal(twice, once)
   })
 })
