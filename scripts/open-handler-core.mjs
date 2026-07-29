@@ -10,6 +10,7 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
 import { quoteWinCmdArg } from './launch-cli-session.mjs'
+import { pinRemotePluginInPrompt } from './pin-remote-plugin.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -657,6 +658,11 @@ export async function executeHandoff({
     }
   }
 
+  // Session/web remote-control prompts cannot include a machine-local PLUGIN=
+  // path. Pin it here so Cursor agents never fall through to Claude marketplace
+  // poller scripts and mislabel the connection as Claude Code.
+  const pinnedPrompt = pinRemotePluginInPrompt(promptText)
+
   if (surface === 'cli') {
     const agentBin = await resolveAgentExecutable()
     if (!agentBin) {
@@ -665,7 +671,7 @@ export async function executeHandoff({
       return { ok: false, error: 'agent_missing', slug }
     }
     try {
-      await openInAgentCli({ folderPath, promptText, agentBin, model })
+      await openInAgentCli({ folderPath, promptText: pinnedPrompt, agentBin, model })
       await appendHandlerLog(`opened CLI ${slug} → ${folderPath} via ${agentBin}`)
       return { ok: true }
     } catch (err) {
@@ -678,7 +684,7 @@ export async function executeHandoff({
 
   try {
     await openInCursor(folderPath)
-    scheduleAgentPrompt(promptText)
+    scheduleAgentPrompt(pinnedPrompt)
     await appendHandlerLog(`opened ${slug} → ${folderPath}`)
     return { ok: true }
   } catch (err) {

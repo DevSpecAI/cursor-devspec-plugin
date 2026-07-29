@@ -23,6 +23,7 @@ async function copyInstalledArtifacts(sourceDir) {
   const files = [
     'open-handler.mjs',
     'open-handler-core.mjs',
+    'pin-remote-plugin.mjs',
     'launch-cli-session.mjs',
     'launch-opencode-session.mjs',
     'handoff-verify.mjs',

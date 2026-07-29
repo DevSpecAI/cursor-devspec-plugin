@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.6 - 2026-07-29
+
+### Fixed
+
+- **Cursor CLI / IDE session launch mislabel:** protocol-handler launches now inject `PLUGIN=<extension path>` into remote-control prompts (same pin command-palette paste already had). Without it, agents often ran Claude marketplace poller scripts and every heartbeat overwrote the connection as "Claude Code".
+
 ## 0.4.0 - 2026-07-25
 
 ### Remote control — long-poll transport, and the room arrives with the command
