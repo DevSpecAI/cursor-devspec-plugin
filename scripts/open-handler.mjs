@@ -26,6 +26,7 @@ async function copyInstalledArtifacts(sourceDir) {
     'pin-remote-plugin.mjs',
     'launch-cli-session.mjs',
     'launch-opencode-session.mjs',
+    'opencode-mapped-permissions.mjs',
     'handoff-verify.mjs',
     'handoff-public-key.pem',
     'devspec-handler.cmd',

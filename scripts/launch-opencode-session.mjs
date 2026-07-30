@@ -78,6 +78,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { spawnAgent } from './launch-cli-session.mjs'
+import { buildOpenCodeLaunchEnv } from './opencode-mapped-permissions.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -551,6 +552,22 @@ async function main() {
   })
   await log(`opencodeBin=${opencodeBin} folder=${args.folder}`)
 
+  // Multi-repo playbooks need sibling mapped checkouts outside the launch
+  // cwd. Derive OPENCODE_PERMISSION.external_directory from this user's
+  // repo-folder-map — never hardcoded machine paths (SaaS-safe).
+  const mapPath = path.join(os.homedir(), '.cursor', 'devspec', 'repo-folder-map.json')
+  const permissionLaunch = await buildOpenCodeLaunchEnv({
+    launchFolder: args.folder,
+    mapPath,
+  })
+  const allowCount = Object.keys(permissionLaunch.externalDirectoryRules).length
+  await log(
+    `mappedFolders=${permissionLaunch.mappedFolderCount} externalDirectoryAllows=${allowCount}` +
+      (allowCount
+        ? ` patterns=${JSON.stringify(Object.keys(permissionLaunch.externalDirectoryRules))}`
+        : ''),
+  )
+
   const port = await findFreePort()
   await log(`chose port ${port}`)
 
@@ -577,6 +594,7 @@ async function main() {
   const headed = args.headed === true
   const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
     cwd: args.folder,
+    env: permissionLaunch.env,
     stdio: headed ? 'inherit' : 'ignore',
     windowsHide: !headed,
   })
@@ -628,6 +646,7 @@ async function main() {
   // output live into that window (see round 11 note on attachStreamLogging).
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
+    env: permissionLaunch.env,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: !headed,
   })
