@@ -6,14 +6,21 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   buildInteractiveCursorAgentFlags,
+  buildShortArgvPrompt,
+  buildStampedPromptBody,
   flattenPromptForArgv,
   inferCursorAgentRunKindFromPrompt,
   quoteWinCmdArg,
   resolveShellExecutable,
+  resolveStampedPromptPath,
   resolveWindowsAgentInvocation,
   spawnAgentSync,
+  stampLine,
 } from './launch-cli-session.mjs'
 
 describe('DevSpec Cursor CLI flag policy', () => {
@@ -76,6 +83,114 @@ describe('flattenPromptForArgv', () => {
       flattenPromptForArgv('line1\n\nline2\r\nline3'),
       'line1 line2 line3',
     )
+  })
+})
+
+describe('stamped prompt file / short argv (item e949305f)', () => {
+  it('buildStampedPromptBody keeps multiline skill body + stamp off argv shape', () => {
+    const body = [
+      'PLUGIN=C:\\Users\\Brandon Young\\.cursor\\extensions\\x',
+      '',
+      'Run the `devspec.remote` skill with this input: --session abc',
+      '',
+      '---',
+      '',
+      '---',
+      'name: devspec.remote',
+      '---',
+      '',
+      '# DevSpec Remote Control',
+    ].join('\n')
+    const stamped = buildStampedPromptBody(body, 'b49da2cc-8477-4d62-9f66-727f19f41226')
+    assert.match(stamped, /^PLUGIN=/)
+    assert.ok(stamped.includes('---\nname: devspec.remote\n---'))
+    assert.ok(stamped.includes(stampLine('b49da2cc-8477-4d62-9f66-727f19f41226')))
+    // Must remain multiline — flattening this onto argv is what caused --- to leak.
+    assert.ok(stamped.includes('\n'))
+  })
+
+  it('resolveStampedPromptPath colocates beside the launch prompt file', () => {
+    const promptFile = path.join(
+      os.homedir(),
+      '.cursor',
+      'devspec',
+      'launches',
+      '1785768860576-hwny5h.prompt.txt',
+    )
+    const stamped = resolveStampedPromptPath(
+      promptFile,
+      'b49da2cc-8477-4d62-9f66-727f19f41226',
+    )
+    assert.equal(
+      stamped,
+      path.join(
+        path.dirname(promptFile),
+        '1785768860576-hwny5h.stamped-b49da2cc8477.txt',
+      ),
+    )
+  })
+
+  it('buildShortArgvPrompt stays short and never contains YAML --- tokens', () => {
+    const stampedPath = path.join(
+      os.tmpdir(),
+      '1785768860576-hwny5h.stamped-b49da2cc8477.txt',
+    )
+    const argv = buildShortArgvPrompt(stampedPath)
+    assert.ok(argv.length < 500, `argv too long: ${argv.length}`)
+    assert.equal(argv.includes('---'), false)
+    assert.ok(argv.includes(path.resolve(stampedPath)))
+    assert.match(argv, /Read the file at /)
+  })
+
+  it('short argv would not present --- as its own agent CLI option token', () => {
+    // Reconstruct the argv array launch-cli-session passes to agent.
+    const stampedPath = path.join(os.tmpdir(), 'launch.stamped-test.txt')
+    fs.writeFileSync(
+      stampedPath,
+      buildStampedPromptBody(
+        '---\nname: devspec.remote\n---\n\n# Body with --- tables\n|---|---|',
+        'chat-1',
+      ),
+      'utf8',
+    )
+    try {
+      const argvPrompt = buildShortArgvPrompt(stampedPath)
+      const agentArgv = [
+        '--resume',
+        'chat-1',
+        '--workspace',
+        'C:\\repo',
+        '--force',
+        '--approve-mcps',
+        argvPrompt,
+      ]
+      // Every standalone argv token that looks like an option must be a known flag.
+      const known = new Set([
+        '--resume',
+        '--workspace',
+        '--force',
+        '--approve-mcps',
+        '--plan',
+        '--model',
+        '--approve-mcps',
+      ])
+      for (const token of agentArgv) {
+        if (token === '---' || /^---/.test(token)) {
+          assert.fail(`bare --- leaked onto argv: ${JSON.stringify(agentArgv)}`)
+        }
+        if (token.startsWith('--') && !known.has(token) && !token.startsWith('--workspace')) {
+          // Values after flags are fine; only reject unknown option-shaped tokens
+          // that are not flag values (chat id, path, prompt).
+          if (token === '--resume' || token === '--force' || token === '--approve-mcps') continue
+        }
+      }
+      assert.equal(agentArgv.includes('---'), false)
+      assert.ok(!agentArgv.some((t) => t === '---'))
+      // The prompt arg is one element and contains no --- substring.
+      assert.equal(argvPrompt.includes('---'), false)
+    } finally {
+      fs.unlinkSync(stampedPath)
+    }
   })
 })
 

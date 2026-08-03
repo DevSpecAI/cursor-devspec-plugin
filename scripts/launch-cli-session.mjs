@@ -27,8 +27,57 @@ function parseArgs(argv) {
   return out
 }
 
-function stampLine(sessionId) {
+export function stampLine(sessionId) {
   return `DevSpec local_session_id for this run (stamp on record_implementation / failure update): ${sessionId}`
+}
+
+/**
+ * Full multiline prompt written to disk for the agent to read.
+ * Never put this on argv — remote-control embeds (~28KB SKILL.md with YAML
+ * `---`) and Windows/PowerShell argv forwarding turns a bare `---` into
+ * `error: unknown option '---'` (session aa5090bc / item e949305f).
+ * @param {string} expandedBody
+ * @param {string} chatId
+ * @returns {string}
+ */
+export function buildStampedPromptBody(expandedBody, chatId) {
+  const stamp = stampLine(chatId)
+  const body = typeof expandedBody === 'string' ? expandedBody.trim() : ''
+  return body ? `${body}\n\n${stamp}\n` : `${stamp}\n`
+}
+
+/**
+ * Path for the stamped prompt file, colocated with the launch prompt.
+ * @param {string} promptFile
+ * @param {string} chatId
+ * @returns {string}
+ */
+export function resolveStampedPromptPath(promptFile, chatId) {
+  const dir = path.dirname(promptFile)
+  let base = path.basename(promptFile)
+  // Launch files are `*.prompt.txt` — strip that compound suffix so we do not
+  // produce `foo.prompt.stamped-….txt`.
+  if (base.toLowerCase().endsWith('.prompt.txt')) {
+    base = base.slice(0, -'.prompt.txt'.length)
+  } else {
+    base = path.basename(promptFile, path.extname(promptFile))
+  }
+  const shortId =
+    String(chatId ?? '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .slice(0, 12) || 'chat'
+  return path.join(dir, `${base}.stamped-${shortId}.txt`)
+}
+
+/**
+ * Short argv prompt that only points at the stamped file — no skill body,
+ * no YAML `---`, safe under Windows CreateProcess / PowerShell forwarding.
+ * @param {string} stampedPromptPath
+ * @returns {string}
+ */
+export function buildShortArgvPrompt(stampedPromptPath) {
+  const p = path.resolve(String(stampedPromptPath ?? ''))
+  return `Read the file at ${p} and follow every instruction in it exactly, then begin.`
 }
 
 /**
@@ -275,9 +324,20 @@ async function main() {
   // so a direct CLI invoke still gets PLUGIN= + skill body (item 57d8b288).
   const expandedBody = expandRemoteControlLaunchPrompt(promptBody) ?? promptBody
 
-  const stamped = flattenPromptForArgv(
-    expandedBody ? `${expandedBody}\n\n${stampLine(chatId)}` : stampLine(chatId),
-  )
+  // Write the full expanded+stamped prompt to disk; pass only a short argv
+  // pointer. Embedding SKILL.md (with YAML ---) on argv broke Windows launches
+  // with `unknown option '---'` (item e949305f).
+  const stampedBody = buildStampedPromptBody(expandedBody, chatId)
+  const stampedPath = resolveStampedPromptPath(args.promptFile, chatId)
+  try {
+    await fsPromises.writeFile(stampedPath, stampedBody, 'utf8')
+  } catch (err) {
+    console.error(`[devspec-cli] could not write stamped prompt file: ${err}`)
+    process.exitCode = 1
+    return
+  }
+  const argvPrompt = buildShortArgvPrompt(stampedPath)
+  console.log(`[devspec-cli] Stamped prompt → ${stampedPath} (${stampedBody.length} chars; argv ${argvPrompt.length} chars)`)
 
   const kind = inferCursorAgentRunKindFromPrompt(expandedBody)
   const policyFlags = buildInteractiveCursorAgentFlags(kind, {
@@ -290,7 +350,7 @@ async function main() {
   )
   const child = spawnAgent(
     agentBin,
-    ['--resume', chatId, '--workspace', args.folder, ...policyFlags, stamped],
+    ['--resume', chatId, '--workspace', args.folder, ...policyFlags, argvPrompt],
     {
       cwd: args.folder,
       stdio: 'inherit',
