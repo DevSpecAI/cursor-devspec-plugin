@@ -180,7 +180,7 @@
     "build": "esbuild src/extension.ts --bundle --platform=node --target=node18 --external:vscode --outfile=dist/extension.js",
     "watch": "npm run build -- --watch",
     "typecheck": "tsc --noEmit",
-    "sync": "node scripts/sync-from-claude.mjs",
+    "test": "node --test hooks/scripts/*.test.mjs scripts/*.test.mjs",
     "package": "npm run build && node scripts/build-handler-exe.mjs && vsce package --out devspec-autopilot.vsix",
     "open-bridge": "node scripts/open-bridge.mjs",
     "open-handler:install": "node scripts/open-handler.mjs --install",

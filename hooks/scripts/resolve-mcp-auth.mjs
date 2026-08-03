@@ -2,7 +2,8 @@
 /**
  * Resolve DevSpec MCP URL + Bearer token for Cursor remote-control hooks/poller.
  *
- * WHY THIS IS CURSOR-SPECIFIC (this plugin OWNS this file in sync-hooks). The Cursor
+ * WHY THIS IS CURSOR-SPECIFIC (this repo owns every script in it — the plugins are
+ * independent implementations and nothing is synced between them). The Cursor
  * extension stores the DevSpec token in Cursor's OWN MCP config —
  * `~/.cursor/mcp.json` (written by the "DevSpec: Set MCP token" command) or a
  * project `.cursor/mcp.json` — NOT in a `CLAUDE_PLUGIN_OPTION_*` env var. The
@@ -11,7 +12,7 @@
  * register_connection ran on one token while the poller heartbeats another and the
  * server rejects with "connection belongs to a different token" (dispatch delivery
  * then spams). So Cursor's mcp.json is the source of truth and wins over a generic
- * project `.mcp.json`. (The canonical Claude resolver reads
+ * project `.mcp.json`. (The Claude Code plugin's resolver reads
  * `CLAUDE_PLUGIN_OPTION_*` + `~/.claude.json`, which are meaningless for Cursor.)
  *
  * Lookup order:
