@@ -280,7 +280,7 @@ When the conversation produces a durable decision, convention, architecture choi
 1. **Memories (primary)** — interactive, human-in-the-loop (do **not** pass `runner_session_id`; absence = interactive authority):
    - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then call `devspec__record_memory` (or `devspec__supersede_memory` if updating).
    - If the owner already clearly decided, propose the memory text in your mirrored reply and record after a clear yes (or record immediately when they said "please capture that").
-   - Always `devspec__search_memories` first; never duplicate — `devspec__supersede_memory` the closest match.
+   - Always `devspec__search_memories` first; never duplicate — `devspec__supersede_memory` the closest match. `devspec__search_memories` returns a CARD (title, one-line summary, id) — `devspec__get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight` as appropriate.
 2. **Artifacts (when durable docs are needed)** — short plans/ADRs/runbooks via `devspec__create_resource` / `devspec__update_resource` / `devspec__supersede_resource` (interactive, no runner stamp).
 3. **Do not** rely on autopilot post-session pending-memory extraction for this channel.
