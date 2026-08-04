@@ -175,28 +175,69 @@ function findPollerPidsForConnection(connectionId) {
   return [...pids]
 }
 
+/** Durable Cursor / Claude agent hosts — never short-lived tool shells (item f3a88333). */
+export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
+
+/** Short-lived shells that must not be used as `--owner-pid` anchors on Windows. */
+export const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
+
+export function isWin32OwnerHostName(name) {
+  return WIN32_OWNER_HOST_NAMES.has(String(name || '').toLowerCase())
+}
+
+export function isWin32ShellName(name) {
+  return WIN32_SHELL_NAMES.has(String(name || '').toLowerCase())
+}
+
 /**
- * Windows-only owner-pid self-resolution (item 3cddb3b4). On win32 this process is
- * commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are MSYS-internal
- * numbers that do NOT correspond to any real Win32 process — querying Win32_Process
- * for bash's reported pid returns nothing, so a caller-supplied `--owner-pid "$PPID"`
- * from that shell is never a trustworthy anchor (verified: MSYS bash reports PPID=1,
- * an orphan sentinel, not a resolvable process). node.exe itself, unlike the MSYS
- * shell, IS a genuine Win32 process, so `process.pid` (this script's own pid) is a
- * real, queryable anchor — walk its Win32_Process ancestry until we reach the owning
- * `claude.exe`, however many shell layers sit in between. A single short-lived
- * PowerShell call does the whole walk (fast: one process spawn, no polling).
+ * Look up a Win32 process image name by pid. Returns null when the process is gone
+ * or the query fails. Injectable via resolveOwnerPid opts for unit tests.
+ */
+export function win32ProcessName(pid, { timeoutMs = 2000 } = {}) {
+  if (process.platform !== 'win32') return null
+  const id = Number.parseInt(String(pid), 10)
+  if (!Number.isInteger(id) || id < 1) return null
+  const script =
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${id}" -ErrorAction SilentlyContinue; ` +
+    'if ($p) { Write-Output $p.Name }'
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+    return out || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Windows-only owner-pid self-resolution (items 3cddb3b4 / f3a88333). On win32 this
+ * process is commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are
+ * MSYS-internal numbers that do NOT correspond to any real Win32 process — querying
+ * Win32_Process for bash's reported pid returns nothing, so a caller-supplied
+ * `--owner-pid "$PPID"` from that shell is never a trustworthy anchor (verified:
+ * MSYS bash reports PPID=1, an orphan sentinel, not a resolvable process). node.exe
+ * itself, unlike the MSYS shell, IS a genuine Win32 process, so `process.pid` (this
+ * script's own pid) is a real, queryable anchor — walk its Win32_Process ancestry
+ * until we reach a durable host (`Cursor.exe`, CLI `agent.exe`, or `claude.exe`),
+ * however many shell layers sit in between. A single short-lived PowerShell call
+ * does the whole walk (fast: one process spawn, no polling).
  */
 export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
   if (process.platform !== 'win32') return null
   const pid = Number.parseInt(String(startPid), 10)
   if (!Number.isInteger(pid) || pid < 1) return null
+  const hosts = [...WIN32_OWNER_HOST_NAMES].map((n) => `'${n.replace(/'/g, "''")}'`).join(', ')
   const script = [
+    // Avoid `$hosts` — it is a PowerShell automatic variable.
+    `$ownerHosts = @(${hosts})`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
+    '  if ($ownerHosts -contains $proc.Name.ToLowerInvariant()) { Write-Output $proc.ProcessId; break }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -215,15 +256,34 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
 }
 
 /**
- * Resolve the effective owner-pid for this call: an explicit, valid `--owner-pid`
- * always wins (any platform); otherwise attempt the Windows self-resolution above;
- * otherwise fall back to a previously-recorded value (still better than nothing on
- * a platform/setup where auto-resolution isn't available). Returns null if none.
+ * Resolve the effective owner-pid for this call.
+ *
+ * On POSIX, an explicit valid `--owner-pid` wins. On win32, an explicit pid that is
+ * clearly a short-lived tool shell (powershell / pwsh / cmd / bash) is ignored and
+ * we walk up to Cursor/agent instead — those shells exit when the tool call ends
+ * and would otherwise fire `owner_gone` mid-session (item f3a88333). Otherwise
+ * attempt Windows self-resolution; otherwise fall back to a previously-recorded
+ * value. Returns null if none.
+ *
+ * `opts.processNameOf` / `opts.resolveAuto` are test hooks only.
  */
-export function resolveOwnerPid(explicitArg, prevValue) {
+export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
-  if (Number.isInteger(explicit) && explicit > 1) return explicit
-  const auto = resolveOwnerPidAutoWindows()
+  if (Number.isInteger(explicit) && explicit > 1) {
+    if (process.platform === 'win32') {
+      const nameFn = opts.processNameOf ?? win32ProcessName
+      const name = nameFn(explicit)
+      if (name && isWin32ShellName(name)) {
+        // Fall through — shell PID is not a durable owner anchor.
+      } else {
+        return explicit
+      }
+    } else {
+      return explicit
+    }
+  }
+  const resolveAuto = opts.resolveAuto ?? resolveOwnerPidAutoWindows
+  const auto = resolveAuto()
   if (auto) return auto
   const prev = Number.parseInt(String(prevValue ?? ''), 10)
   return Number.isInteger(prev) && prev > 1 ? prev : null
@@ -306,7 +366,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
     return {
       ok: false,
       error:
-        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows this is normally self-resolved automatically; if you see this, the automatic walk to claude.exe failed too.',
+        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows prefer omit or $PPID and let self-resolve walk to Cursor.exe/agent.exe; never pass a tool-shell $PID. If you see this, the automatic host walk failed too.',
     }
   }
 

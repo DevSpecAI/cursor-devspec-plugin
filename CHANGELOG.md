@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.9 - 2026-08-04
+
+### Fixed
+
+- **Windows owner-pid flaps (`owner_gone`):** ancestry walk now stops on durable Cursor hosts (`Cursor.exe`, CLI `agent.exe`, still `claude.exe`), not only Claude. Explicit `--owner-pid` that names a short-lived tool shell (`powershell` / `pwsh` / `cmd` / `bash`) is ignored so self-resolve can climb to the real host — passing tool-shell `$PID` was ending the poller mid-session (item f3a88333).
+
 ## 0.4.8 - 2026-08-04
 
 ### Fixed
