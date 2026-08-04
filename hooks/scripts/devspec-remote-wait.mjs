@@ -201,18 +201,43 @@ function parseArgs(argv) {
  * On Windows the caller's `--owner-pid "$PPID"` is usually an MSYS-internal number
  * that maps to no real Win32 process, so an explicit value is validated before it is
  * trusted and we otherwise walk this process's genuine ancestry to the owning host
- * (item 3cddb3b4). `remote-control-state.mjs` keeps its own copy for the write path.
+ * (items 3cddb3b4 / f3a88333). Keep host/shell lists in sync with
+ * `remote-control-state.mjs` (write path).
  */
+const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
+const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
+
+function win32ProcessName(pid, { timeoutMs = 2000 } = {}) {
+  if (process.platform !== 'win32') return null
+  const id = Number.parseInt(String(pid), 10)
+  if (!Number.isInteger(id) || id < 1) return null
+  const script =
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${id}" -ErrorAction SilentlyContinue; ` +
+    'if ($p) { Write-Output $p.Name }'
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+    return out || null
+  } catch {
+    return null
+  }
+}
+
 function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, timeoutMs = 4000 } = {}) {
   if (process.platform !== 'win32') return null
   const pid = Number.parseInt(String(startPid), 10)
   if (!Number.isInteger(pid) || pid < 1) return null
+  const hosts = [...WIN32_OWNER_HOST_NAMES].map((n) => `'${n.replace(/'/g, "''")}'`).join(', ')
   const script = [
+    `$ownerHosts = @(${hosts})`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    "  if ($proc.Name -ieq 'claude.exe') { Write-Output $proc.ProcessId; break }",
+    '  if ($ownerHosts -contains $proc.Name.ToLowerInvariant()) { Write-Output $proc.ProcessId; break }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -230,10 +255,23 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
   }
 }
 
-export function resolveOwnerPid(explicitArg, prevValue) {
+export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
-  if (Number.isInteger(explicit) && explicit > 1) return explicit
-  const auto = resolveOwnerPidAutoWindows()
+  if (Number.isInteger(explicit) && explicit > 1) {
+    if (process.platform === 'win32') {
+      const nameFn = opts.processNameOf ?? win32ProcessName
+      const name = nameFn(explicit)
+      if (name && WIN32_SHELL_NAMES.has(String(name).toLowerCase())) {
+        // Fall through — shell PID is not a durable owner anchor (item f3a88333).
+      } else {
+        return explicit
+      }
+    } else {
+      return explicit
+    }
+  }
+  const resolveAuto = opts.resolveAuto ?? resolveOwnerPidAutoWindows
+  const auto = resolveAuto()
   if (auto) return auto
   const prev = Number.parseInt(String(prevValue ?? ''), 10)
   return Number.isInteger(prev) && prev > 1 ? prev : null

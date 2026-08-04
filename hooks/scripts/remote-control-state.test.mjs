@@ -13,6 +13,8 @@ import {
   ownerAlive,
   reapDeadPollers,
   resolveLocalAction,
+  isWin32OwnerHostName,
+  isWin32ShellName,
   resolveOwnerPid,
   resolveOwnerPidAutoWindows,
 } from './remote-control-state.mjs'
@@ -529,16 +531,63 @@ describe('ensurePollerForConnection (reuse, item b9e02835)', () => {
   })
 })
 
-describe('resolveOwnerPid / resolveOwnerPidAutoWindows (item 3cddb3b4)', () => {
-  it('explicit valid arg always wins, no auto-resolution attempted', () => {
-    // A bogus prevValue proves the explicit arg short-circuits before any fallback.
-    assert.equal(resolveOwnerPid(555, 999), 555)
+describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a88333)', () => {
+  it('classifies durable hosts and short-lived shells', () => {
+    assert.equal(isWin32OwnerHostName('Cursor.exe'), true)
+    assert.equal(isWin32OwnerHostName('agent.exe'), true)
+    assert.equal(isWin32OwnerHostName('claude.exe'), true)
+    assert.equal(isWin32OwnerHostName('powershell.exe'), false)
+    assert.equal(isWin32ShellName('powershell.exe'), true)
+    assert.equal(isWin32ShellName('pwsh.exe'), true)
+    assert.equal(isWin32ShellName('cmd.exe'), true)
+    assert.equal(isWin32ShellName('bash.exe'), true)
+    assert.equal(isWin32ShellName('Cursor.exe'), false)
+  })
+
+  it('explicit valid non-shell arg wins (mocked name lookup)', () => {
+    assert.equal(
+      resolveOwnerPid(555, 999, {
+        processNameOf: () => 'Cursor.exe',
+        resolveAuto: () => {
+          throw new Error('auto should not run')
+        },
+      }),
+      555,
+    )
+  })
+
+  it('ignores explicit Windows shell pid and falls through to auto/prev (item f3a88333)', () => {
+    if (process.platform !== 'win32') {
+      // Off Windows, explicit still wins — shell rejection is win32-only.
+      assert.equal(
+        resolveOwnerPid(31240, 999, {
+          processNameOf: () => 'powershell.exe',
+          resolveAuto: () => 777,
+        }),
+        31240,
+      )
+      return
+    }
+    assert.equal(
+      resolveOwnerPid(31240, 999, {
+        processNameOf: () => 'powershell.exe',
+        resolveAuto: () => 777,
+      }),
+      777,
+    )
+    assert.equal(
+      resolveOwnerPid(31240, 999, {
+        processNameOf: () => 'pwsh.exe',
+        resolveAuto: () => null,
+      }),
+      999,
+    )
   })
 
   it('never returns an invalid (<=1) explicit arg as-is', () => {
     // 1 fails the >1 validity check, so it must fall through to auto-resolution
     // or prevValue rather than being returned literally.
-    assert.notEqual(resolveOwnerPid(1, 999), 1)
+    assert.notEqual(resolveOwnerPid(1, 999, { resolveAuto: () => null }), 1)
   })
 
   it('resolveOwnerPidAutoWindows returns null off-Windows and for a made-up start pid', () => {
@@ -552,9 +601,9 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (item 3cddb3b4)', () => {
     assert.equal(resolveOwnerPidAutoWindows(999_999_999), null)
   })
 
-  it('resolveOwnerPidAutoWindows walks to a real claude.exe ancestor on win32', { skip: process.platform !== 'win32' }, () => {
-    // This test process is itself running under a real claude.exe (item
-    // 3cddb3b4's whole premise) — the walk from its own real pid should find it.
+  it('resolveOwnerPidAutoWindows walks to a durable host ancestor on win32', { skip: process.platform !== 'win32' }, () => {
+    // Under Cursor IDE / cursor-agent / Claude the walk may find a host; under a
+    // bare node test runner it may legitimately return null.
     const found = resolveOwnerPidAutoWindows(process.pid)
     assert.ok(found === null || (Number.isInteger(found) && found > 1))
   })
