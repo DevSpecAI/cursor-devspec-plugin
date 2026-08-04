@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.8 - 2026-08-04
+
+### Fixed
+
+- **Cursor CLI Working spinner stuck after reply:** re-arm wait with `--pending --after-reply` after posting the answer so the turn marker clears and DevSpec drops Working/dots. Cursor CLI often never fires the IDE Stop hook; plain `--pending` correctly kept Working mid-turn (68f7b30c) but left it stuck forever after the reply (fe456bf9).
+- **Mirror hooks survive VSIX bumps:** `~/.cursor/hooks.json` now points at stable `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed `devspecai.devspec-autopilot-*` extension each run (2097651e).
+
 ## 0.4.7 - 2026-07-29
 
 ### Improved

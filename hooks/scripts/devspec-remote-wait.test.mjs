@@ -360,6 +360,26 @@ describe('arming and the working indicator (item 68f7b30c)', () => {
     })
   })
 
+  it('--pending --after-reply clears it — Cursor CLI turn-end without Stop (fe456bf9)', () => {
+    withMarker(({ dir, conn, marker }) => {
+      const ended = applyArmTurnSemantics(
+        conn,
+        { pending: true, afterReply: true, fromEnd: false },
+        dir,
+      )
+      assert.equal(ended, true)
+      assert.equal(fs.existsSync(marker), false)
+    })
+  })
+
+  it('--after-reply alone does NOT clear (must be paired with --pending)', () => {
+    withMarker(({ dir, conn, marker }) => {
+      const ended = applyArmTurnSemantics(conn, { afterReply: true }, dir)
+      assert.equal(ended, false)
+      assert.equal(fs.existsSync(marker), true)
+    })
+  })
+
   it('turn completion clears it — the Stop hook path still ends "working"', () => {
     withMarker(({ dir, conn, marker }) => {
       // mirror-turn.mjs stop does exactly this; asserted here so the pair
@@ -369,10 +389,11 @@ describe('arming and the working indicator (item 68f7b30c)', () => {
     })
   })
 
-  it('--pending wins if both flags are passed (never hide real work)', () => {
+  it('--pending wins if both flags are passed without --after-reply (never hide real work)', () => {
     assert.equal(armEndsTurn({ fromEnd: true, pending: true }), false)
     assert.equal(armEndsTurn({ fromEnd: true }), true)
     assert.equal(armEndsTurn({ pending: true }), false)
+    assert.equal(armEndsTurn({ pending: true, afterReply: true }), true)
     assert.equal(armEndsTurn({}), false)
   })
 

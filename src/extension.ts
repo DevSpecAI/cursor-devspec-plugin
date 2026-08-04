@@ -135,21 +135,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 /**
+ * Copy the version-stable mirror-turn launcher into ~/.cursor/devspec/hooks/
+ * and return its absolute path. Hooks.json must point here — never at a
+ * version-numbered extension directory (item 2097651e / fe456bf9).
+ */
+async function installStableMirrorLauncher(extensionPath: string): Promise<string | null> {
+  const source = path.join(extensionPath, 'hooks', 'scripts', 'run-mirror-turn.mjs')
+  try {
+    await fs.access(source)
+  } catch {
+    return null
+  }
+  const destDir = path.join(os.homedir(), '.cursor', 'devspec', 'hooks')
+  const dest = path.join(destDir, 'run-mirror-turn.mjs')
+  await fs.mkdir(destDir, { recursive: true })
+  await fs.copyFile(source, dest)
+  return dest
+}
+
+/**
  * Merge DevSpec remote-control mirror hooks into ~/.cursor/hooks.json so
- * beforeSubmitPrompt / stop fire mirror-turn.mjs (literal local prompts + replies).
- * Idempotent: rewrites only our marker-tagged entries; leaves other hooks alone.
+ * beforeSubmitPrompt / stop fire the stable run-mirror-turn launcher (literal
+ * local prompts + busy/turn-end). Idempotent: rewrites only our marker-tagged
+ * entries; leaves other hooks alone.
  */
 async function installRemoteControlHooks(
   extensionPath: string,
   opts: { forceNotify?: boolean } = {},
 ): Promise<void> {
-  const mirrorScript = path.join(extensionPath, 'hooks', 'scripts', 'mirror-turn.mjs')
-  try {
-    await fs.access(mirrorScript)
-  } catch {
+  const stableLauncher = await installStableMirrorLauncher(extensionPath)
+  if (!stableLauncher) {
     if (opts.forceNotify) {
       void vscode.window.showWarningMessage(
-        'DevSpec: mirror-turn.mjs not found in the extension — reinstall the plugin.',
+        'DevSpec: run-mirror-turn.mjs not found in the extension — reinstall the plugin.',
       )
     }
     return
@@ -176,11 +194,14 @@ async function installRemoteControlHooks(
   }
 
   const marker = 'devspec-remote-mirror'
-  const userPromptCmd = `node "${mirrorScript}" user_prompt # ${marker}`
-  const stopCmd = `node "${mirrorScript}" stop # ${marker}`
+  const userPromptCmd = `node "${stableLauncher}" user_prompt # ${marker}`
+  const stopCmd = `node "${stableLauncher}" stop # ${marker}`
 
   const isOurs = (cmd: unknown) =>
-    typeof cmd === 'string' && (cmd.includes(marker) || cmd.includes('mirror-turn.mjs'))
+    typeof cmd === 'string' &&
+    (cmd.includes(marker) ||
+      cmd.includes('mirror-turn.mjs') ||
+      cmd.includes('run-mirror-turn.mjs'))
 
   const stripOursFromGroups = (groups: unknown): HookGroup[] => {
     if (!Array.isArray(groups)) return []
@@ -227,7 +248,7 @@ async function installRemoteControlHooks(
   await fs.writeFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf8')
   if (opts.forceNotify) {
     void vscode.window.showInformationMessage(
-      'DevSpec: remote-control mirror hooks installed in ~/.cursor/hooks.json',
+      'DevSpec: remote-control mirror hooks installed (stable path under ~/.cursor/devspec/hooks/).',
     )
   }
 }

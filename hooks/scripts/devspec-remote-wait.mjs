@@ -30,7 +30,7 @@
  * indicator alone, because a re-arm happens mid-turn by design (see armEndsTurn).
  *
  * Usage:
- *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--owner-pid <pid>]
+ *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--after-reply] [--owner-pid <pid>]
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
@@ -65,27 +65,25 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
 /**
  * Does THIS arm mean "the agent is idle", and so end any in-flight working phase?
  *
- * Only a FIRST arm does (item 68f7b30c). Arming is not a turn end: `--pending`
- * exists precisely because the documented pattern is to re-arm the instant the
- * agent wakes, so owner mail arriving mid-turn is not dropped — so a re-arm
- * happens DURING most turns, seconds into them. Treating every arm as idle made
- * the poller clear the marker it had just written on delivery, drop busy, and
- * emit `report_complete` while the agent worked on for another five minutes with
- * the driver's UI showing nothing. **Turn end is owned by the Stop hook**
- * (`mirror-turn.mjs stop`), which every plugin registers, plus MAX_TURN_MS in the
- * poller as the backstop for a host whose Stop hook never fires.
+ * Plain `--pending` does NOT end a turn (item 68f7b30c). Mid-turn re-arm exists so
+ * owner mail arriving while the agent works is not dropped — clearing the marker
+ * there dropped busy and hid real work for minutes.
  *
- * A first arm (`--from-end`) genuinely is idle: the agent is connecting or
- * reconnecting and deliberately discarding the historical inbox, so a marker left
- * by a seed delivery belongs to a turn nobody will ever wake for, and must be
- * cleared or the connection shows a phantom "working" until MAX_TURN_MS elapses.
- * That is the case the original unconditional clear was written for.
+ * Ends the working phase when:
+ *   1. **First arm** (`--from-end`, not `--pending`) — connect/reconnect discards
+ *      historical inbox; any leftover seed marker is phantom Working.
+ *   2. **Reply-complete re-arm** (`--pending --after-reply`) — Cursor CLI often
+ *      never fires the IDE Stop hook, so Working would stick until MAX_TURN_MS.
+ *      After `post_session_message`, the skill re-arms with `--after-reply` to
+ *      clear the marker mechanically (item fe456bf9). Do NOT pass `--after-reply`
+ *      on an early mid-turn re-arm.
  *
- * `--pending` wins over `--from-end` if both are somehow passed, matching the
- * offset precedence below — the safe direction, since keeping a live marker
- * costs a stale badge while dropping one hides real work.
+ * Stop (`mirror-turn.mjs stop`) remains the primary turn-end when the host fires
+ * it; MAX_TURN_MS is the poller backstop. `--pending` alone still wins over
+ * `--from-end` if both are passed (keep real work visible).
  */
-export function armEndsTurn({ fromEnd, pending } = {}) {
+export function armEndsTurn({ fromEnd, pending, afterReply } = {}) {
+  if (pending === true && afterReply === true) return true
   return fromEnd === true && pending !== true
 }
 
@@ -102,7 +100,7 @@ function parseArgs(argv) {
   // first arm after connect (ignore historical inbox). Live bug 2026-07-24:
   // re-arm with --from-end after a wake permanently dropped concurrent owner
   // mail that the poller had already written to the inbox.
-  const out = { fromEnd: false, pending: false }
+  const out = { fromEnd: false, pending: false, afterReply: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
@@ -111,6 +109,8 @@ function parseArgs(argv) {
     else if (a === '--pending') {
       out.pending = true
       out.fromEnd = false
+    } else if (a === '--after-reply' || a === '--after_reply') {
+      out.afterReply = true
     } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
     else if (a === '--owner-pid') out.ownerPid = argv[++i]
   }
@@ -507,8 +507,8 @@ async function main() {
     offset = fileSize(file)
   }
 
-  // Only a FIRST arm ends the working phase — a re-arm happens mid-turn by design
-  // (see armEndsTurn). Turn end is the Stop hook's job, not the wait's.
+  // First arm (--from-end) or reply-complete re-arm (--pending --after-reply)
+  // ends Working; plain --pending keeps the turn marker (see armEndsTurn).
   applyArmTurnSemantics(connectionId, args)
 
   const pollMs = args.pollMs || POLL_MS

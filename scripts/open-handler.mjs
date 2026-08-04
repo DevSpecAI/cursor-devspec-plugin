@@ -54,6 +54,26 @@ async function copyInstalledArtifacts(sourceDir) {
   } catch {
     // exe built separately
   }
+
+  // Stable mirror-turn launcher for ~/.cursor/hooks.json (item 2097651e / fe456bf9).
+  // Prefer the sibling hooks/scripts copy in the plugin checkout; fall back to a
+  // previously installed copy under DEVSPEC_DIR/hooks.
+  const hooksDestDir = path.join(DEVSPEC_DIR, 'hooks')
+  await fs.mkdir(hooksDestDir, { recursive: true })
+  const launcherName = 'run-mirror-turn.mjs'
+  const launcherCandidates = [
+    path.join(sourceDir, '..', 'hooks', 'scripts', launcherName),
+    path.join(sourceDir, 'hooks', launcherName),
+    path.join(DEVSPEC_DIR, 'hooks', launcherName),
+  ]
+  for (const src of launcherCandidates) {
+    try {
+      await fs.copyFile(src, path.join(hooksDestDir, launcherName))
+      break
+    } catch {
+      // try next
+    }
+  }
 }
 
 async function runFromUrlArg(urlArg) {
