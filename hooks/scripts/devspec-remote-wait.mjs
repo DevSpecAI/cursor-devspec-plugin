@@ -43,6 +43,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { mcpToolsCall } from './mcp-call.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { AGENT_NAME } from './agent-identity.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -51,7 +54,8 @@ const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
 /**
  * Remove the connection turn marker, so the continuous poller stops re-asserting
- * busy and emits `report_complete` on its next tick.
+ * busy. Pair with `notifyWorkingEnded` so Working/dots clear immediately — the
+ * poller's own `report_complete` only runs on its next long-poll tick (~25–30s).
  */
 export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
@@ -75,8 +79,8 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  *   2. **Reply-complete re-arm** (`--pending --after-reply`) — Cursor CLI often
  *      never fires the IDE Stop hook, so Working would stick until MAX_TURN_MS.
  *      After `post_session_message`, the skill re-arms with `--after-reply` to
- *      clear the marker mechanically (item fe456bf9). Do NOT pass `--after-reply`
- *      on an early mid-turn re-arm.
+ *      clear the marker AND immediately `report_complete` (items fe456bf9 +
+ *      cd989606). Do NOT pass `--after-reply` on an early mid-turn re-arm.
  *
  * Stop (`mirror-turn.mjs stop`) remains the primary turn-end when the host fires
  * it; MAX_TURN_MS is the poller backstop. `--pending` alone still wins over
@@ -92,6 +96,72 @@ export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR)
   if (!armEndsTurn(args)) return false
   clearTurnMarker(connectionId, dir)
   return true
+}
+
+/**
+ * Tell DevSpec the turn is over *now* — same sequence as `mirror-turn.mjs stop`.
+ *
+ * Clearing the `.turn` marker alone is not enough: the continuous poller only
+ * emits `report_complete` / `busy:false` on its next long-poll tick, so Working
+ * / transcript dots linger ~25–30s after the answer already landed. Cursor often
+ * never fires Stop for remote turns, so `--after-reply` must do this itself
+ * (item cd989606). Idempotent if Stop already completed the attempt.
+ *
+ * @param {{ connectionId: string, state?: object|null, call?: typeof mcpToolsCall, resolveAuth?: typeof resolveDevspecMcpAuth }} opts
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
+export async function notifyWorkingEnded({
+  connectionId,
+  state = null,
+  call = mcpToolsCall,
+  resolveAuth = resolveDevspecMcpAuth,
+} = {}) {
+  if (!connectionId) return { ok: false, reason: 'missing_connection_id' }
+
+  let token = state?.token || null
+  let mcpUrl = state?.mcp_url || null
+  if (!token) {
+    try {
+      const auth = resolveAuth(state?.cwd || process.cwd())
+      token = auth?.token || null
+      mcpUrl = mcpUrl || auth?.mcp_url || null
+    } catch {
+      /* fall through — fail soft below */
+    }
+  }
+  if (!token) return { ok: false, reason: 'no_token' }
+  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+
+  try {
+    await call({
+      mcpUrl,
+      token,
+      name: 'heartbeat_connection',
+      arguments: {
+        connection_id: connectionId,
+        agent_name: AGENT_NAME,
+        status: 'live',
+        busy: false,
+      },
+    })
+  } catch {
+    /* non-fatal — report_complete is the durable clear */
+  }
+
+  try {
+    await call({
+      mcpUrl,
+      token,
+      name: 'report_complete',
+      arguments: { connection_id: connectionId, reason: 'turn_end' },
+    })
+    return { ok: true }
+  } catch (e) {
+    return {
+      ok: false,
+      reason: e instanceof Error ? e.message : String(e),
+    }
+  }
 }
 
 function parseArgs(argv) {
@@ -509,7 +579,16 @@ async function main() {
 
   // First arm (--from-end) or reply-complete re-arm (--pending --after-reply)
   // ends Working; plain --pending keeps the turn marker (see armEndsTurn).
-  applyArmTurnSemantics(connectionId, args)
+  // Marker clear + immediate report_complete (mirror-turn stop parity) — do not
+  // wait for the poller's next long-poll tick or dots linger ~30s (cd989606).
+  if (applyArmTurnSemantics(connectionId, args)) {
+    const ended = await notifyWorkingEnded({ connectionId, state })
+    if (!ended.ok && ended.reason && ended.reason !== 'no_token') {
+      process.stderr.write(
+        `devspec-remote-wait: notifyWorkingEnded soft-fail: ${ended.reason}\n`,
+      )
+    }
+  }
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()

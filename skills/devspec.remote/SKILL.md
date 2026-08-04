@@ -196,7 +196,7 @@ Wait contract:
 - Wakes **only** on `owner_messages` (server-stamped owner commands / dispatches). Advisory never *wakes* you — but it is no longer withheld from you either: the room rides on the `owner_messages` entry and is printed with the command.
 - **`--from-end`**: ignore old mail (**first arm after connect only**).
 - **`--pending`** (or no flag): deliver from the saved offset — **required on every re-arm** so concurrent owner commands while busy are not lost.
-- **`--after-reply`**: pass with `--pending` **after** you have posted the direct answer (or finished sessionless work for this wake). Clears the local turn marker so DevSpec drops Working/dots. Cursor CLI often does not fire the IDE Stop hook — without `--after-reply`, Working sticks until the 1h backstop. Do **not** pass `--after-reply` on an early mid-turn re-arm (that would hide real work — item 68f7b30c).
+- **`--after-reply`**: pass with `--pending` **after** you have posted the direct answer (or finished sessionless work for this wake). Clears the local turn marker **and** immediately calls `report_complete` + `busy:false` (same as the Stop hook) so DevSpec drops Working/dots without waiting for the next long-poll tick. Cursor CLI often does not fire the IDE Stop hook — without `--after-reply`, Working sticks until the 1h backstop. Do **not** pass `--after-reply` on an early mid-turn re-arm (that would hide real work — item 68f7b30c).
 - Exit **0** = wake (act on messages) → re-arm with **`--pending --after-reply`** once the reply is done. Exit **1** = disabled / UI end / owner gone / connection ended — do not re-arm.
 
 **Exit 1 → check WHY before you stand down.** "Ended" and "ended by a human" are not the same thing:

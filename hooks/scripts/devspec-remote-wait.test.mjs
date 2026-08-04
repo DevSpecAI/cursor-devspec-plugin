@@ -23,6 +23,7 @@ import {
   applyArmTurnSemantics,
   armEndsTurn,
   clearTurnMarker,
+  notifyWorkingEnded,
 } from './devspec-remote-wait.mjs'
 
 describe('parseOwnerBatches', () => {
@@ -212,7 +213,7 @@ describe('attachments: payload to disk, descriptor to the model', () => {
       writeFile: (t, b) => written.push([t, b.length]),
     })
     assert.equal(d.delivery, 'file')
-    assert.equal(d.path, '/att/m1-0-shot.png')
+    assert.equal(d.path, path.join('/att', 'm1-0-shot.png'))
     assert.equal(d.content, undefined)
     assert.equal(d.dataUrl, undefined)
     // Decoded to the true byte length, not the inflated base64 length.
@@ -279,7 +280,7 @@ describe('attachments: payload to disk, descriptor to the model', () => {
       dir: '/att', messageId: 'm', index: 0, writeFile: () => {},
     })
     assert.equal(d.path.includes('..'), false)
-    assert.equal(d.path, '/att/m-0-passwd')
+    assert.equal(d.path, path.join('/att', 'm-0-passwd'))
   })
 
   it('says so when it cannot write, rather than silently inlining base64', () => {
@@ -402,5 +403,58 @@ describe('arming and the working indicator (item 68f7b30c)', () => {
       assert.equal(applyArmTurnSemantics(null, { fromEnd: true }, dir), true)
       assert.equal(fs.existsSync(marker), true)
     })
+  })
+})
+
+describe('notifyWorkingEnded (item cd989606 — immediate report_complete)', () => {
+  it('calls heartbeat busy:false then report_complete (Stop parity)', async () => {
+    const calls = []
+    const result = await notifyWorkingEnded({
+      connectionId: 'conn-1',
+      state: { token: 'dvs_test', mcp_url: 'https://example.test/api/mcp' },
+      call: async (opts) => {
+        calls.push(opts)
+        return { ok: true }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].name, 'heartbeat_connection')
+    assert.equal(calls[0].arguments.busy, false)
+    assert.equal(calls[0].arguments.connection_id, 'conn-1')
+    assert.equal(calls[1].name, 'report_complete')
+    assert.equal(calls[1].arguments.connection_id, 'conn-1')
+    assert.equal(calls[1].arguments.reason, 'turn_end')
+  })
+
+  it('returns no_token without calling MCP when auth is missing', async () => {
+    let called = 0
+    const result = await notifyWorkingEnded({
+      connectionId: 'conn-1',
+      state: {},
+      resolveAuth: () => ({ token: null }),
+      call: async () => {
+        called++
+        return { ok: true }
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, 'no_token')
+    assert.equal(called, 0)
+  })
+
+  it('still reports complete if heartbeat fails', async () => {
+    const calls = []
+    const result = await notifyWorkingEnded({
+      connectionId: 'conn-1',
+      state: { token: 'dvs_test', mcp_url: 'https://example.test/api/mcp' },
+      call: async (opts) => {
+        calls.push(opts.name)
+        if (opts.name === 'heartbeat_connection') throw new Error('network')
+        return { ok: true }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.deepEqual(calls, ['heartbeat_connection', 'report_complete'])
   })
 })
