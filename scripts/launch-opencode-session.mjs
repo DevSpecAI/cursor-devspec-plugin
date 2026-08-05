@@ -82,6 +82,77 @@ import { buildOpenCodeLaunchEnv } from './opencode-mapped-permissions.mjs'
 
 const execFileAsync = promisify(execFile)
 
+/** Default OpenCode serve basic-auth username (OpenCode docs). */
+export const OPENCODE_SERVER_USERNAME_DEFAULT = 'opencode'
+
+/**
+ * Resolve the local OpenCode HTTP basic-auth password for a rocket launch.
+ *
+ * Prefer a non-empty `OPENCODE_SERVER_PASSWORD` already in the environment
+ * (power users / interactive habits). Otherwise mint a strong one-time secret
+ * for this serve process only. Never upload this to DevSpec — it only locks
+ * the laptop-local `opencode serve` door between launcher and attach client.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ password: string, username: string, source: 'env' | 'minted' }}
+ */
+export function resolveServeAuth(env = process.env) {
+  const usernameRaw = String(env.OPENCODE_SERVER_USERNAME || '').trim()
+  const username = usernameRaw || OPENCODE_SERVER_USERNAME_DEFAULT
+  const existing = String(env.OPENCODE_SERVER_PASSWORD || '').trim()
+  if (existing) {
+    return { password: existing, username, source: 'env' }
+  }
+  return {
+    password: crypto.randomBytes(32).toString('base64url'),
+    username,
+    source: 'minted',
+  }
+}
+
+/**
+ * HTTP `Authorization: Basic …` header value for OpenCode serve health/API.
+ * @param {string} username
+ * @param {string} password
+ */
+export function basicAuthHeaderValue(username, password) {
+  const token = Buffer.from(`${username}:${password}`, 'utf8').toString('base64')
+  return `Basic ${token}`
+}
+
+/**
+ * Apply serve auth onto a child env without mutating the caller's object.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {{ username: string, password: string }} auth
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function withServeAuthEnv(env, auth) {
+  return {
+    ...env,
+    OPENCODE_SERVER_USERNAME: auth.username,
+    OPENCODE_SERVER_PASSWORD: auth.password,
+  }
+}
+
+/**
+ * Redact secrets from argv before logging (defence in depth if `--password` is ever added).
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+export function redactArgsForLog(args) {
+  const out = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '--password' || a === '-p') {
+      out.push(a, '<redacted>')
+      if (i + 1 < args.length) i++
+      continue
+    }
+    out.push(a)
+  }
+  return out
+}
+
 /**
  * Find the pid actually LISTENING on 127.0.0.1:<port> right now, via
  * `netstat -ano`. See the "round 6" note above for why this — not
@@ -482,15 +553,23 @@ function findFreePort() {
  * wedged on `/doc`. Prefer the tiny health endpoint, and abort each attempt
  * so a hung fetch cannot outlive the deadline.
  */
-async function waitForServer(port, timeoutMs = 15000) {
+async function waitForServer(port, timeoutMs = 15000, auth = null) {
   const deadline = Date.now() + timeoutMs
   const healthUrl = `http://127.0.0.1:${port}/global/health`
+  /** @type {Record<string, string> | undefined} */
+  const headers =
+    auth && auth.password
+      ? { Authorization: basicAuthHeaderValue(auth.username, auth.password) }
+      : undefined
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) break
     const attemptMs = Math.min(2000, remaining)
     try {
-      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(attemptMs) })
+      const res = await fetch(healthUrl, {
+        signal: AbortSignal.timeout(attemptMs),
+        headers,
+      })
       if (res.ok) {
         // Prefer a JSON healthy:true when present, but any 2xx means the
         // server is accepting connections (older builds may differ).
@@ -568,6 +647,14 @@ async function main() {
         : ''),
   )
 
+  // Local HTTP basic auth for `opencode serve` ↔ attach client only.
+  // DevSpec's long-poll uses the MCP token and never sees this password.
+  const serveAuth = resolveServeAuth(permissionLaunch.env)
+  const launchEnv = withServeAuthEnv(permissionLaunch.env, serveAuth)
+  await log(
+    `serveAuth source=${serveAuth.source} username=${serveAuth.username} (password not logged)`,
+  )
+
   const port = await findFreePort()
   await log(`chose port ${port}`)
 
@@ -594,14 +681,14 @@ async function main() {
   const headed = args.headed === true
   const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
     cwd: args.folder,
-    env: permissionLaunch.env,
+    env: launchEnv,
     stdio: headed ? 'inherit' : 'ignore',
     windowsHide: !headed,
   })
   server.unref()
   await log(`spawned server pid=${server.pid ?? 'unknown'} headed=${headed}`)
 
-  const ready = await waitForServer(port)
+  const ready = await waitForServer(port, 15000, serveAuth)
   await log(`waitForServer ready=${ready}`)
   if (!ready) {
     console.error(`[devspec-opencode] server did not come up on port ${port} in time`)
@@ -629,11 +716,13 @@ async function main() {
   const attachUrl = `http://127.0.0.1:${port}`
   const runArgs = buildOpencodeRunArgs(promptBody, args.model)
   runArgs.splice(1, 0, '--attach', attachUrl)
+  // Password stays in env (`OPENCODE_SERVER_PASSWORD`); OpenCode's CLI defaults
+  // `--password` from that env. Avoid putting the secret on argv (and logs).
 
   console.log(
     `[devspec-opencode] Server up on ${attachUrl}; sending connect message (model=${args.model || 'auto'})`,
   )
-  await log(`spawning client runArgs=${JSON.stringify(runArgs)}`)
+  await log(`spawning client runArgs=${JSON.stringify(redactArgsForLog(runArgs))}`)
   // Reuses the Windows-safe invocation logic built for Cursor's `agent` binary
   // (prefer a sibling .ps1 over wrapping a .cmd in `cmd /c`, which loses the
   // real console TTY and flash-closes the window) — the same shim-resolution
@@ -646,7 +735,7 @@ async function main() {
   // output live into that window (see round 11 note on attachStreamLogging).
   const client = spawnAgent(opencodeBin, runArgs, {
     cwd: args.folder,
-    env: permissionLaunch.env,
+    env: launchEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: !headed,
   })

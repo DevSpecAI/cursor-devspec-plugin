@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { buildOpencodeRunArgs, extractSessionIdFromPrompt } from './launch-opencode-session.mjs'
+import {
+  basicAuthHeaderValue,
+  buildOpencodeRunArgs,
+  extractSessionIdFromPrompt,
+  redactArgsForLog,
+  resolveServeAuth,
+  withServeAuthEnv,
+} from './launch-opencode-session.mjs'
 
 describe('buildOpencodeRunArgs', () => {
   it('routes a leading slash-command through --command, not the plain message', () => {
@@ -42,5 +49,56 @@ describe('extractSessionIdFromPrompt', () => {
 
   it('returns null when no uuid is present', () => {
     assert.equal(extractSessionIdFromPrompt('/devspec.remote'), null)
+  })
+})
+
+describe('resolveServeAuth', () => {
+  it('reuses a non-empty OPENCODE_SERVER_PASSWORD from env', () => {
+    const auth = resolveServeAuth({
+      OPENCODE_SERVER_PASSWORD: ' already-set ',
+      OPENCODE_SERVER_USERNAME: 'custom',
+    })
+    assert.equal(auth.source, 'env')
+    assert.equal(auth.password, 'already-set')
+    assert.equal(auth.username, 'custom')
+  })
+
+  it('mints a strong password when env password is missing', () => {
+    const auth = resolveServeAuth({})
+    assert.equal(auth.source, 'minted')
+    assert.equal(auth.username, 'opencode')
+    assert.ok(auth.password.length >= 32)
+  })
+
+  it('mints when env password is whitespace-only', () => {
+    const auth = resolveServeAuth({ OPENCODE_SERVER_PASSWORD: '   ' })
+    assert.equal(auth.source, 'minted')
+  })
+})
+
+describe('withServeAuthEnv + basicAuthHeaderValue + redactArgsForLog', () => {
+  it('copies auth into child env without mutating the parent', () => {
+    const parent = { PATH: '/bin', OPENCODE_PERMISSION: '{}' }
+    const next = withServeAuthEnv(parent, { username: 'opencode', password: 'secret' })
+    assert.equal(next.OPENCODE_SERVER_PASSWORD, 'secret')
+    assert.equal(next.OPENCODE_SERVER_USERNAME, 'opencode')
+    assert.equal(parent.OPENCODE_SERVER_PASSWORD, undefined)
+  })
+
+  it('builds a Basic auth header', () => {
+    assert.equal(
+      basicAuthHeaderValue('opencode', 'secret'),
+      `Basic ${Buffer.from('opencode:secret', 'utf8').toString('base64')}`,
+    )
+  })
+
+  it('redacts --password values in argv logs', () => {
+    assert.deepEqual(redactArgsForLog(['run', '--password', 's3cret', '--attach', 'http://x']), [
+      'run',
+      '--password',
+      '<redacted>',
+      '--attach',
+      'http://x',
+    ])
   })
 })
