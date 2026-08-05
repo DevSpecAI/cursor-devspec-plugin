@@ -74,3 +74,28 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/remote-control-state.mjs`
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)
 - `hooks/scripts/agent-identity.mjs`
+
+## Logging — reconstructing a connection story
+
+Fragile remote sessions are debugged from two places that share one phase vocabulary:
+
+| Source | Where | What |
+|---|---|---|
+| **Axiom (server)** | DevSpec MCP tool logs | `msg == "Remote-control story"` with `connectionId`, `sessionId`, `data.phase`, `data.outcome`, `reason` |
+| **Local poll.log** | `~/.devspec/remote-control/connections/<connection_id>.poll.log` | Poller stderr/stdout (spawn redirect). Structured lines prefixed `story ` plus human poller messages. Kept for offline debug. |
+
+**Shared phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
+
+Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, inject/wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
+
+**Axiom recipe** (dataset `devspec`):
+
+```
+['devspec']
+| where msg == "Remote-control story"
+| where connectionId == "<connection-uuid>"
+| sort by _time asc
+| project _time, ['data.phase'], ['data.outcome'], reason, sessionId, ['data.agent'], ['data.tool']
+```
+
+**Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.

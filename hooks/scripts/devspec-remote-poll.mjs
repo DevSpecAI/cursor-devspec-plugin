@@ -71,6 +71,7 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { logRemoteControlStory } from './remote-control-story.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -898,6 +899,19 @@ async function main() {
       roomContext,
       seed,
     })
+    if (seed && roomCommands.length > 0) {
+      const dropped = roomCommands.length - roomWake.length
+      logRemoteControlStory({
+        phase: 'seed_filter',
+        outcome: dropped > 0 ? 'dropped' : 'kept',
+        connectionId,
+        sessionId,
+        agent: AGENT_NAME,
+        tool: 'poll_connection',
+        reason: dropped > 0 ? 'already_answered' : 'unanswered',
+        data: { dropped, kept: roomWake.length, offered: roomCommands.length },
+      })
+    }
     const commands = [...dispatchCommands, ...roomWake]
     const advisoryCount = advisory.length
 
@@ -909,9 +923,35 @@ async function main() {
     }
 
     if (commands.length > 0) {
+      logRemoteControlStory({
+        phase: 'inject',
+        outcome: 'delivered',
+        connectionId,
+        sessionId,
+        agent: AGENT_NAME,
+        tool: 'inbox',
+        reason: 'owner_commands',
+        data: {
+          commands: commands.length,
+          advisory: advisoryCount,
+          dispatches: freshDispatches.length,
+          seed,
+        },
+      })
       // deliverOwnerMessages stamps the message cursor + wake time into state itself.
       deliverOwnerMessages(connectionId, commands, cursor, ownerUserId, sessionId, takeCarriedContext())
       idleStarted = Date.now()
+    } else if (advisoryCount > 0 || freshDispatches.length > 0) {
+      logRemoteControlStory({
+        phase: 'wake',
+        outcome: 'advisory_only',
+        connectionId,
+        sessionId,
+        agent: AGENT_NAME,
+        tool: 'poll_connection',
+        reason: advisoryCount > 0 ? 'room_delta' : 'dispatch_deduped',
+        data: { advisory: advisoryCount, dispatches: freshDispatches.length },
+      })
     }
 
     dispatchCursor = nextDispatchCursor
@@ -987,7 +1027,20 @@ async function main() {
 
     // Agent-authoritative "working": re-assert busy while a fresh turn marker exists.
     const marker = readTurnMarker(connectionId)
-    const turnActive = !!marker && Date.now() - marker.startedAt < MAX_TURN_MS
+    const turnElapsed = marker ? Date.now() - marker.startedAt : 0
+    const turnActive = !!marker && turnElapsed < MAX_TURN_MS
+    if (marker && turnElapsed >= MAX_TURN_MS && prevTurnActive) {
+      logRemoteControlStory({
+        phase: 'stall',
+        outcome: 'stalled',
+        connectionId,
+        sessionId,
+        agent: AGENT_NAME,
+        tool: 'turn_marker',
+        reason: 'max_turn_ms',
+        data: { elapsed_ms: turnElapsed, max_turn_ms: MAX_TURN_MS },
+      })
+    }
     if (turnActive) idleStarted = Date.now()
     let busyArg = null
     if (turnActive) busyArg = true
@@ -1042,6 +1095,16 @@ async function main() {
       process.stderr.write(
         `devspec-remote-poll: poll failed (${consecutiveErrors}): ${e.message} — retrying in ${backoff}ms\n`,
       )
+      logRemoteControlStory({
+        phase: 'poll_error',
+        outcome: 'error',
+        connectionId,
+        sessionId,
+        agent: AGENT_NAME,
+        tool: 'poll_connection',
+        reason: rateLimited ? 'rate_limited' : 'poll_failed',
+        data: { consecutiveErrors, backoff_ms: backoff },
+      })
       await sleep(backoff)
       continue
     }

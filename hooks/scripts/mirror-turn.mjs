@@ -19,6 +19,7 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
+import { logRemoteControlStory } from './remote-control-story.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -383,6 +384,14 @@ async function main() {
             token,
             name: 'report_complete',
             arguments: { connection_id: connectionId, reason: 'turn_end' },
+          })
+          logRemoteControlStory({
+            phase: 'complete_turn',
+            outcome: 'completed',
+            connectionId,
+            agent: agentName || AGENT_NAME,
+            tool: 'mirror-turn.stop',
+            reason: 'turn_end',
           })
         } catch {
           /* non-fatal — the poller's marker-driven backstop still runs */
