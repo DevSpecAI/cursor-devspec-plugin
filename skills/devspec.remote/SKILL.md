@@ -214,7 +214,9 @@ Read `~/.devspec/remote-control/connections/<connection_id>.json` and look at `e
 
 **Delivery contract (ADR — binding):** Agent posts answers; Stop does **not** mirror full assistant text. Prefer `post_session_message({ connection_id, message, complete_turn: true })` on the **final** answer. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
 
-**Delivery (one path):** you post answers when attached via `post_session_message({ connection_id, message })`. On the **final** direct answer also pass **`complete_turn: true`** so Working/dots clear in the same request as the bubble (item d4014e58). Mid-turn progress posts omit it (item 5e7aac1c). Hooks never post assistant text — `UserPromptSubmit` may mirror local_prompt only; **Stop = busy/heartbeat only**. Sessionless: assignment / `report_progress` only — no chat posts. Wait `--after-reply` remains the backstop.
+**Delivery (one path):** you post answers when attached via `post_session_message({ connection_id, message })`. On the **final** direct answer also pass **`complete_turn: true`** so Working/dots clear in the same request as the bubble (item d4014e58). Mid-turn progress posts omit it (item 5e7aac1c). Hooks never post assistant text — `UserPromptSubmit` may mirror local_prompt only. **Stop** (when IDE hooks fire) clears the local turn marker, heartbeats `busy:false`, and `report_complete` — same Working clear as wait `--after-reply`. Cursor CLI often never fires Stop; **`--pending --after-reply` after the reply is the required backstop**. Sessionless: assignment / `report_progress` only — no chat posts.
+
+**Owner attachments:** wait materialises images/files onto disk under `~/.devspec/remote-control/connections/<connection_id>.attachments/` and puts `delivery` + `path` (or `inline`) on the `owner_message` — base64 is stripped from wake stdout. For `delivery: "file"`, **open/read `path`** (especially images); they are part of the command, not decoration.
 
 ### Attribute your writes (non-negotiable when connected)
 

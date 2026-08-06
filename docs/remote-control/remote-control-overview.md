@@ -24,6 +24,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
 | Answers (sessionless) | Assignment / `report_progress` only — never invent chat. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
+| Presence chrome | Session `agent_status` broadcasts carry `connection_id` for pending/busy asserts; the web UI patches **only that connection**. Sibling same-owner agents must not flash Working/Pending. Broadcasts without `connection_id` are ignored for chrome mutation (inventory refresh converges). |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
 | Slash commands | Host UI commands (e.g. `/clear`) are **not** remote-control. Injecting `"/clear"` as prompt text does not run them. |
 

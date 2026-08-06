@@ -2,7 +2,8 @@
 
 **Family:** local-poller.  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
-**Plugin repo:** `cursor-devspec-plugin` (VSIX; hooks under `hooks/scripts/`).
+**Plugin repo:** `cursor-devspec-plugin` (VSIX; hooks under `hooks/scripts/`).  
+**Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md` (re-arm, redeploy recovery, room tiers — deeper than this primer).
 
 ## How a message reaches Cursor
 
@@ -12,6 +13,30 @@
 4. Wait exits on owner command; Cursor notifies the Agent chat on matching stdout.
 5. Model acts; when attached, model `post_session_message({ connection_id, complete_turn: true })` on the **final** answer (omit `complete_turn` on mid-turn progress posts).
 6. Model **must re-arm** wait with `--pending --after-reply` after the reply (never `--from-end` on re-arm) — backstop for Working clear + local turn marker.
+
+### Wake stdout (what you see when wait exits)
+
+Wait prints events in order (each carries the batch’s `session_id` — trust **this** value after a server-side reattach; do not cache the session id from connect time):
+
+1. Optional `{ "type": "room_context", "advisory": true, "owner_ambient": [...], "room_context": [...], "dropped": N, "session_id": "…" }` — inert context only.
+2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — the command(s) to act on (`addressed_to` + `authority`).
+3. `{ "type": "wake", …, "session_id": "…" }` — signal that the batch is complete.
+
+Act **only** on `owner_message` / owner authority. Treat both room tiers as context. If `dropped > 0`, pull `get_session_transcript` for older history.
+
+Prefer `post_session_message({ connection_id, … })` so the server resolves the connection’s **current** attached session after reattach.
+
+### Owner attachments
+
+Owner commands may include images/files. Wait **materialises** them to disk and strips large base64 from stdout:
+
+| `delivery` | Meaning |
+|---|---|
+| `file` | Open/read `path` under `~/.devspec/remote-control/connections/<connection_id>.attachments/` (images are part of the command, not decoration). |
+| `inline` | Small text may be inlined on the descriptor. |
+| `unavailable` | Could not write the file — say so; do not invent content. |
+
+Do not expect raw base64 blobs in the wake JSON.
 
 ## Why one-shot here
 
@@ -32,6 +57,8 @@ Working (dots / logo spinner) is driven by connection activity + busy, seeded by
 
 Do **not** clear Working on interim `post_session_message` alone (omit `complete_turn` — item 5e7aac1c). Do **not** clear on plain `--pending` re-arm.
 
+**Re-arm rule of thumb:** mid-turn / early re-arm → `--pending` only. After the final answer → `--pending --after-reply`. Never pass `--after-reply` while still working.
+
 **Why `complete_turn` on the final post:** ending Working only via wait `--after-reply` still leaves dots for several seconds after the answer bubble (post → agent re-arm → MCP complete). Ending in the same `post_session_message` request clears them with the bubble. Keep `--after-reply` as the backstop for clients that have not adopted the flag yet.
 
 ## Host specifics
@@ -40,7 +67,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 |---|---|
 | Invoke remote | `devspec.remote` skill / Agent prompt (IDE) |
 | Bond id | Prefer `CURSOR_CONVERSATION_ID` or explicit `--local-id`; shell often lacks it — do not silently mint then lose the bond |
-| Token | This repo’s own `resolve-mcp-auth.mjs` — reads `~/.cursor/mcp.json` (not Claude plugin env) |
+| Token | Plugin-owned `resolve-mcp-auth.mjs` — lookup order: env → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → walk `.mcp.json` (not Claude plugin env) |
 | Agent name | `AGENT_NAME = 'Cursor'` |
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe`. **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
 | Mirror hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path) |
@@ -64,16 +91,19 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Wrong local_id mint vs conversation id → duplicate connections / Resume empty.
 - Tool-shell `$PID` as `--owner-pid` on Windows → poller dies with `owner_gone` mid-session; reconnect without bond revival used to mint a new connection and orphan targeted dispatches.
 - Version-pinned hook path → Stop never runs; Working and local-prompt mirroring go silent.
+- Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
+- Ignoring `attachments[].path` on `owner_message` → miss screenshots/docs the owner sent with the command.
 
 ## Key files
 
 - `hooks/scripts/devspec-remote-poll.mjs`
-- `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end)
+- `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end; attachment materialisation)
 - `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher)
-- `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt)
+- `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — Stop clears turn + `report_complete` when hooks fire)
 - `hooks/scripts/remote-control-state.mjs`
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)
 - `hooks/scripts/agent-identity.mjs`
+- `hooks/scripts/remote-control-story.mjs` (shared phase vocabulary + local `story ` emitter)
 
 ## Logging — reconstructing a connection story
 
@@ -86,7 +116,7 @@ Fragile remote sessions are debugged from two places that share one phase vocabu
 
 **Shared phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
 
-Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, inject/wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
+Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
 
 **Axiom recipe** (dataset `devspec`):
 
