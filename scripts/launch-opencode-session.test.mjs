@@ -11,8 +11,8 @@ import {
 } from './launch-opencode-session.mjs'
 
 describe('buildOpencodeServeArgs', () => {
-  it('includes --auto before --port for unattended DevSpec launches', () => {
-    assert.deepEqual(buildOpencodeServeArgs(4096), ['serve', '--auto', '--port', '4096'])
+  it('passes --port only — serve rejects --auto (OpenCode 1.18+)', () => {
+    assert.deepEqual(buildOpencodeServeArgs(4096), ['serve', '--port', '4096'])
   })
 })
 

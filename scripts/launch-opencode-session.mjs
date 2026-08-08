@@ -318,23 +318,26 @@ function parseArgs(argv) {
 /**
  * Build `opencode serve` argv for a DevSpec cold-launch.
  *
- * Always includes `--auto` so permission prompts that would hang an
- * unattended remote session (notably `external_directory` for Temp paths)
- * are auto-approved unless explicitly denied in config/env. Interactive
- * `opencode` TUI launches (not via this script) are unchanged.
+ * Do NOT pass `--auto` here. OpenCode 1.18+ `serve` rejects unknown flags
+ * (yargs prints help and exits), so `serve --auto --port N` never binds and
+ * waitForServer times out. Permission auto-approve belongs on `run` — see
+ * {@link buildOpencodeRunArgs} — which is where prompts actually happen.
  *
  * @param {number|string} port
  * @returns {string[]}
  */
 export function buildOpencodeServeArgs(port) {
-  return ['serve', '--auto', '--port', String(port)]
+  return ['serve', '--port', String(port)]
 }
 
 /**
  * Build the `opencode run` argv (minus `--attach`, added by the caller) for a
  * prompt body + optional model.
  *
- * Always includes `--auto` (same rationale as {@link buildOpencodeServeArgs}).
+ * Always includes `--auto` so permission prompts that would hang an
+ * unattended remote session (notably `external_directory` for Temp paths)
+ * are auto-approved unless explicitly denied in config/env. Interactive
+ * `opencode` TUI launches (not via this script) are unchanged.
  *
  * `opencode run` does NOT expand a leading "/command args" string the way
  * typing it into the interactive TUI does — passed as a plain positional
