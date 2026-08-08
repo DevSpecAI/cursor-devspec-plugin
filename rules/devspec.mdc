@@ -11,6 +11,8 @@ This workspace is connected to DevSpec over MCP (`devspec` server). In Cursor, M
 
 **What the MCP server offers:** project intelligence (search the indexed repo, read files, docs, conventions, decisions, memories), action-item queue and lifecycle (create, claim, implement, verify), commit tagging (`generate_commit_message`, `add_commit_reference`), shared team memory (`record_memory` and related), sessions/messaging, and product help (`devspec__devspec_help_search`). Prefer MCP reads before broad local search — the project is already indexed in DevSpec.
 
+**This file is not your project's rules.** `.cursor/rules/devspec.mdc` exists to connect Cursor to DevSpec and nothing more. The team's actual operating rules — how to build, test and ship here — live in DevSpec as Project Agent Rules and arrive with the work (`devspec__claim_work_item`, `devspec__get_project_summary`) plus your own Personal Agent Rules on connect. Do not treat this file, or a leftover `CLAUDE.md`/`AGENTS.md`, as the authority on how the team works; where such a file holds team rules, offer `devspec__import_instruction_rules` so they become rules everyone's agents actually receive.
+
 ### Session start
 
 1. Confirm DevSpec MCP is reachable (`devspec__list_projects` or `devspec__verify_agent_connection`). If not, tell the user and **do not proceed with tracked work** until it is fixed.

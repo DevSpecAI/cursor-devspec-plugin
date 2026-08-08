@@ -124,6 +124,8 @@ Interactively brainstorm on an action item to sharpen its scope, surface edge ca
 
 7. **Persist durable conclusions.** If the brainstorm settled something durable about the *project itself* — a decision, convention, architecture fact, or risk that outlives this item — record it to DevSpec with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating. `search_memories` returns a CARD (title, one-line summary, id), so `get_memory` the match and read it in full before superseding: a card is enough to choose WHICH memory you mean, not enough to justify replacing it.; record shared knowledge only, not transient or obvious details. DevSpec memory is the team's **shared** source of truth, so don't let a durable conclusion be lost or kept only in your own local notes (project docs (`CLAUDE.md`, `AGENTS.md`) / built-in memory), where personal or machine-specific notes belong.
 
+**Memory or rule?** The boundary above does not settle this — a rule is durable and shared as well. Ask what the thing IS: a decision with a reason someone may revisit is a **memory**; a standing instruction to act on every time is a **rule** (`devspec__write_project_instruction_rule`). A rule recorded as a memory is one nobody follows. Report a rule write by its returned `outcome` — `queued_for_review` is not in force until a maintainer accepts it.
+
 ## Rules
 
 - Do NOT output filler text before or after structured output
