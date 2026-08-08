@@ -3,32 +3,47 @@ import { describe, it } from 'node:test'
 import {
   basicAuthHeaderValue,
   buildOpencodeRunArgs,
+  buildOpencodeServeArgs,
   extractSessionIdFromPrompt,
   redactArgsForLog,
   resolveServeAuth,
   withServeAuthEnv,
 } from './launch-opencode-session.mjs'
 
+describe('buildOpencodeServeArgs', () => {
+  it('includes --auto before --port for unattended DevSpec launches', () => {
+    assert.deepEqual(buildOpencodeServeArgs(4096), ['serve', '--auto', '--port', '4096'])
+  })
+})
+
 describe('buildOpencodeRunArgs', () => {
   it('routes a leading slash-command through --command, not the plain message', () => {
     const args = buildOpencodeRunArgs('/devspec.remote --session abc-123')
-    assert.deepEqual(args, ['run', '--command', 'devspec.remote', '--', '--session abc-123'])
+    assert.deepEqual(args, [
+      'run',
+      '--auto',
+      '--command',
+      'devspec.remote',
+      '--',
+      '--session abc-123',
+    ])
   })
 
   it('omits the -- separator when the command has no arguments', () => {
     const args = buildOpencodeRunArgs('/devspec.remote-stop')
-    assert.deepEqual(args, ['run', '--command', 'devspec.remote-stop'])
+    assert.deepEqual(args, ['run', '--auto', '--command', 'devspec.remote-stop'])
   })
 
   it('passes a plain (non-command) prompt through as the positional message', () => {
     const args = buildOpencodeRunArgs('Say hello and tell me which model you are.')
-    assert.deepEqual(args, ['run', 'Say hello and tell me which model you are.'])
+    assert.deepEqual(args, ['run', '--auto', 'Say hello and tell me which model you are.'])
   })
 
   it('includes --model before the command/message when set', () => {
     const args = buildOpencodeRunArgs('/devspec.remote --session abc-123', 'minimax/MiniMax-M3')
     assert.deepEqual(args, [
       'run',
+      '--auto',
       '--model',
       'minimax/MiniMax-M3',
       '--command',

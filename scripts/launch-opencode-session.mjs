@@ -316,8 +316,25 @@ function parseArgs(argv) {
 }
 
 /**
+ * Build `opencode serve` argv for a DevSpec cold-launch.
+ *
+ * Always includes `--auto` so permission prompts that would hang an
+ * unattended remote session (notably `external_directory` for Temp paths)
+ * are auto-approved unless explicitly denied in config/env. Interactive
+ * `opencode` TUI launches (not via this script) are unchanged.
+ *
+ * @param {number|string} port
+ * @returns {string[]}
+ */
+export function buildOpencodeServeArgs(port) {
+  return ['serve', '--auto', '--port', String(port)]
+}
+
+/**
  * Build the `opencode run` argv (minus `--attach`, added by the caller) for a
  * prompt body + optional model.
+ *
+ * Always includes `--auto` (same rationale as {@link buildOpencodeServeArgs}).
  *
  * `opencode run` does NOT expand a leading "/command args" string the way
  * typing it into the interactive TUI does — passed as a plain positional
@@ -331,7 +348,7 @@ function parseArgs(argv) {
  * @returns {string[]}
  */
 export function buildOpencodeRunArgs(promptBody, model) {
-  const runArgs = ['run']
+  const runArgs = ['run', '--auto']
   const trimmedModel = typeof model === 'string' ? model.trim() : ''
   if (trimmedModel) runArgs.push('--model', trimmedModel)
 
@@ -679,12 +696,14 @@ async function main() {
   // TEMP DEBUG (`--headed`): show the serve console. Restore headless by
   // omitting `--headed` (set OPENCODE_LAUNCH_HEADED=false in open-handler-core).
   const headed = args.headed === true
-  const server = spawnAgent(opencodeBin, ['serve', '--port', String(port)], {
+  const serveArgs = buildOpencodeServeArgs(port)
+  const server = spawnAgent(opencodeBin, serveArgs, {
     cwd: args.folder,
     env: launchEnv,
     stdio: headed ? 'inherit' : 'ignore',
     windowsHide: !headed,
   })
+  await log(`serve argv=${JSON.stringify(serveArgs)}`)
   server.unref()
   await log(`spawned server pid=${server.pid ?? 'unknown'} headed=${headed}`)
 
