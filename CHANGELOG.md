@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.10 - 2026-08-10
+
+### Fixed
+
+- **Ship OpenCode serve `--auto` removal into installs:** source already dropped unsupported `serve --auto` (item `79a01caf`) while keeping `--auto` on `run`, but the installed `0.4.9` VSIX still had the old launcher. This release packages that fix so cold launches bind again and permission auto-approve stays on `run` only. Pair with OpenCode plugin `0.3.8` (`permission.ask` auto-allow while bonded) so later `promptAsync` remote turns do not hang (item `1514baa3`).
+
 ## 0.4.9 - 2026-08-04
 
 ### Fixed
