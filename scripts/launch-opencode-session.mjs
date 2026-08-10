@@ -66,9 +66,10 @@
  * Invoked by open-handler-core when tool=opencode:
  *   node launch-opencode-session.mjs --folder <path> --prompt-file <path> [--opencode <path>] [--model <id>] [--headed]
  *
- * `--headed` is the TEMP DEBUG path (visible serve/client consoles). Production
- * omits it. Flip `OPENCODE_LAUNCH_HEADED` in open-handler-core.mjs to false to
- * stop passing `--headed` and restore headless launches.
+ * `--headed` is an optional DEBUG escape hatch (visible serve/client consoles).
+ * Production omits it. The open-handler default is headless (`OPENCODE_LAUNCH_HEADED=false`
+ * in open-handler-core.mjs) now that DevSpec streams the live work trail — set
+ * that constant to true only while diagnosing launch, then flip it back.
  */
 import { execFile, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'

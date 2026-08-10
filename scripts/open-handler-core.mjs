@@ -353,22 +353,26 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
 }
 
 /**
- * TEMP DEBUG toggle — headed OpenCode session launches (visible terminal).
+ * OpenCode session launches — production default is headless.
  *
- * `true`  → open a real console (same pattern as Cursor CLI cold-launch) and
- *           pass `--headed` so serve/client windows are visible too.
- * `false` → production headless: hidden spawn, no console flash.
+ * `false` → production headless: hidden spawn, no console flash. DevSpec's live
+ * work trail (and needs-your-input) is the visibility surface for remote turns.
+ * `true`  → TEMP DEBUG only: open a real console and pass `--headed` so
+ *           serve/client windows are visible. Do not leave this on for normal
+ *           remote use — flip back to `false` when finished debugging.
  *
- * To turn headed mode OFF / restore headless: set this to `false`.
+ * Escape hatch: pass `--headed` to launch-opencode-session.mjs directly.
+ *
+ * Restored headless after live trail shipped (item 63662a98; supersedes the
+ * temporary headed default from f93617d8).
  */
-export const OPENCODE_LAUNCH_HEADED = true
+export const OPENCODE_LAUNCH_HEADED = false
 
 /**
  * Launch OpenCode via launch-opencode-session.mjs.
  *
- * Production default is headless (hidden spawn). While `OPENCODE_LAUNCH_HEADED`
- * is true, we open a visible terminal so serve/connect output can be diagnosed
- * live — flip the constant back to false when debugging is done.
+ * Default is headless (hidden spawn). Set `OPENCODE_LAUNCH_HEADED` true only
+ * while diagnosing serve/connect — then flip it back to false.
  * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null }} opts
  */
 export async function openInOpenCode({ folderPath, promptText, opencodeBin, model }) {
