@@ -41,11 +41,11 @@ Before the **first file edit**:
 
 If DevSpec MCP is unavailable, stop and tell the user — do not silently proceed.
 
-For structured workflows (implement, brainstorm, one-shot autopilot), use the command palette: **Ctrl+Shift+P** → **DevSpec** → pick a skill and paste into a **new** Agent chat.
+For structured workflows (implement, brainstorm, remote control), use the command palette: **Ctrl+Shift+P** → **DevSpec** → pick a skill and paste into a **new** Agent chat.
 
 ### Execution settings (MCP — read before implementing)
 
-At the start of any action-item implementation, call `devspec__get_project_summary({ project_id })` (or read `repos` + `execution` from `devspec__get_next_work_item` when picking up staged work).
+At the start of any action-item implementation, call `devspec__get_project_summary({ project_id })`.
 
 Read these fields — they override local assumptions about branches and whether to push:
 
