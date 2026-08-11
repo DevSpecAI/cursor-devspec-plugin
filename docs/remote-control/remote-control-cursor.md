@@ -11,7 +11,7 @@
 2. Detached `devspec-remote-poll.mjs` long-polls and writes the inbox.
 3. `devspec-remote-wait.mjs` runs **one-shot** (no `--stream` in the Cursor plugin copy).
 4. Wait exits on owner command; Cursor notifies the Agent chat on matching stdout.
-5. Model acts; when attached, model `post_session_message({ connection_id, complete_turn: true })` on the **final** answer (omit `complete_turn` on mid-turn progress posts).
+5. Model acts; when attached, model `post_session_message({ connection_id, phase: "answer", complete_turn: true })` on the **final** answer (omit `complete_turn` on any rare mid-turn narrative posts — **trail is plugin-owned**).
 6. Model **must re-arm** wait with `--pending --after-reply` after the reply (never `--from-end` on re-arm) — backstop for Working clear + local turn marker.
 
 ### Wake stdout (what you see when wait exits)
@@ -46,10 +46,12 @@ Cursor has no Claude-style persistent Monitor for session-scoped stdout wakes. E
 
 Working (dots / logo spinner) is driven by connection activity + busy, seeded by the per-connection `.turn` marker the poller writes on owner-command delivery.
 
+**Work-trail bubble (OpenCode parity):** while attached, the plugin posts `phase: "trail"` mechanically — seed `"Working…"` on `user_prompt`, then grow via mid-turn hooks (`postToolUse`, shell, file edit, MCP, optional `afterAgentThought`). The live bubble collapses under **Show work** when the model posts `phase: "answer"` with `complete_turn: true`. Do **not** rely on the model to push trail text; CLI often skips thought/response hooks — tool-level hooks are the reliable path.
+
 | Path | When | Clears Working? |
 |---|---|---|
-| `post_session_message({ complete_turn: true })` | Final agent answer (same MCP request as the bubble) | Yes — **preferred**: activity complete + `busy:false` broadcast with the insert so phone/web clear when the answer lands (item d4014e58). Mid-turn progress posts omit the flag (item 5e7aac1c) |
-| Stop hook → `mirror-turn.mjs stop` | IDE Agent turn end (when hooks fire) | Yes — clears marker **and** immediately `report_complete` + `busy:false` |
+| `post_session_message({ phase: "answer", complete_turn: true })` | Final agent answer (same MCP request as the bubble) | Yes — **preferred**: activity complete + `busy:false` broadcast with the insert so phone/web clear when the answer lands (item d4014e58). Mid-turn progress posts omit the flag (item 5e7aac1c) |
+| Stop hook → `mirror-turn.mjs stop` | IDE Agent turn end (when hooks fire) | Yes — clears marker **and** immediately `report_complete` + `busy:false` (+ clears local `.trail.json`) |
 | Wait `--pending --after-reply` | After the model posts the reply and re-arms (Cursor skill) | Yes — **backstop on Cursor CLI** (Stop often never fires): clears marker **and** immediately `report_complete` + `busy:false` (item cd989606). Without `complete_turn` on the post, this is what ends Working (~agent overhead + MCP RTT after the bubble) |
 | Wait plain `--pending` | Mid-turn re-arm only | **No** — keeps Working (item 68f7b30c) |
 | Wait `--from-end` | First arm after connect | Yes — clears seed/phantom markers **and** immediately completes any leftover working attempt |
@@ -70,7 +72,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 | Token | Plugin-owned `resolve-mcp-auth.mjs` — lookup order: env → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → walk `.mcp.json` (not Claude plugin env) |
 | Agent name | `AGENT_NAME = 'Cursor'` |
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe` / `claude.exe`, or `node.exe` hosting `cursor-agent` (Cursor CLI often has no `agent.exe` — item c57dc381). **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
-| Mirror hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path) |
+| Mirror / trail hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
 
 ## What not to change lightly
 
@@ -98,8 +100,10 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 
 - `hooks/scripts/devspec-remote-poll.mjs`
 - `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end; attachment materialisation)
-- `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher)
-- `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — Stop clears turn + `report_complete` when hooks fire)
+- `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher — also dispatches trail modes)
+- `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — seeds trail; Stop clears turn + trail state + `report_complete` when hooks fire)
+- `hooks/scripts/trail-turn.mjs` (mid-turn `phase=trail` posts)
+- `hooks/scripts/work-trail.mjs` (throttle / render / transcript helpers)
 - `hooks/scripts/remote-control-state.mjs`
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)
 - `hooks/scripts/agent-identity.mjs`

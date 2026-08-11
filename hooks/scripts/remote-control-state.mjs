@@ -704,6 +704,7 @@ export function detectLocalId(args = {}, env = process.env) {
 
   const envPairs = [
     ['DEVSPEC_REMOTE_LOCAL_ID', env.DEVSPEC_REMOTE_LOCAL_ID],
+    ['CURSOR_CONVERSATION_ID', env.CURSOR_CONVERSATION_ID],
     ['CODEX_THREAD_ID', env.CODEX_THREAD_ID],
     ['CLAUDE_CODE_SESSION_ID', env.CLAUDE_CODE_SESSION_ID],
     ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],

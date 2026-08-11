@@ -154,10 +154,11 @@ async function installStableMirrorLauncher(extensionPath: string): Promise<strin
 }
 
 /**
- * Merge DevSpec remote-control mirror hooks into ~/.cursor/hooks.json so
+ * Merge DevSpec remote-control hooks into ~/.cursor/hooks.json so
  * beforeSubmitPrompt / stop fire the stable run-mirror-turn launcher (literal
- * local prompts + busy/turn-end). Idempotent: rewrites only our marker-tagged
- * entries; leaves other hooks alone.
+ * local prompts + trail seed + busy/turn-end), and mid-turn tool/shell/file/MCP
+ * hooks grow phase=trail. Idempotent: rewrites only our marker-tagged entries;
+ * leaves other hooks alone.
  */
 async function installRemoteControlHooks(
   extensionPath: string,
@@ -196,11 +197,25 @@ async function installRemoteControlHooks(
   const marker = 'devspec-remote-mirror'
   const userPromptCmd = `node "${stableLauncher}" user_prompt # ${marker}`
   const stopCmd = `node "${stableLauncher}" stop # ${marker}`
+  const trailCmd = (mode: string) => `node "${stableLauncher}" ${mode} # ${marker}`
+
+  /** Mid-turn work-trail events (Cursor camelCase). CLI may skip some; tool hooks are the reliable path. */
+  const trailEvents = [
+    'postToolUse',
+    'postToolUseFailure',
+    'afterShellExecution',
+    'beforeShellExecution',
+    'afterMCPExecution',
+    'beforeMCPExecution',
+    'afterFileEdit',
+    'afterAgentThought',
+  ] as const
 
   const isOurs = (cmd: unknown) =>
     typeof cmd === 'string' &&
     (cmd.includes(marker) ||
       cmd.includes('mirror-turn.mjs') ||
+      cmd.includes('trail-turn.mjs') ||
       cmd.includes('run-mirror-turn.mjs'))
 
   const stripOursFromGroups = (groups: unknown): HookGroup[] => {
@@ -223,8 +238,14 @@ async function installRemoteControlHooks(
 
   const hooks = file.hooks!
   // Cursor native: beforeSubmitPrompt / stop (camelCase). Also keep UserPromptSubmit/Stop
-  // for harnesses that load this file with Claude-compatible names.
-  for (const key of ['beforeSubmitPrompt', 'UserPromptSubmit', 'stop', 'Stop'] as const) {
+  // for harnesses that load this file with Claude-compatible names. Strip + re-add trail events.
+  for (const key of [
+    'beforeSubmitPrompt',
+    'UserPromptSubmit',
+    'stop',
+    'Stop',
+    ...trailEvents,
+  ] as const) {
     hooks[key] = stripOursFromGroups(hooks[key])
   }
 
@@ -243,12 +264,15 @@ async function installRemoteControlHooks(
   pushCursorStyle('stop', stopCmd)
   pushClaudeStyle('UserPromptSubmit', userPromptCmd)
   pushClaudeStyle('Stop', stopCmd)
+  for (const event of trailEvents) {
+    pushCursorStyle(event, trailCmd(event))
+  }
 
   file.hooks = hooks
   await fs.writeFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf8')
   if (opts.forceNotify) {
     void vscode.window.showInformationMessage(
-      'DevSpec: remote-control mirror hooks installed (stable path under ~/.cursor/devspec/hooks/).',
+      'DevSpec: remote-control mirror + work-trail hooks installed (stable path under ~/.cursor/devspec/hooks/).',
     )
   }
 }
