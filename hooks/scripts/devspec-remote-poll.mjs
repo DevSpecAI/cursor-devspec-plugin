@@ -73,6 +73,7 @@ import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
+import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -586,6 +587,22 @@ async function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUs
   appendInbox(connectionId, ownerMsgs, { type: 'owner_messages', nextCursor, sessionId, context })
   // Turn start at pickup — poller re-asserts busy while the marker is fresh.
   writeTurnMarker(connectionId)
+  // Cursor CLI often never fires mid-turn hooks; start a transcript-tail trail
+  // watcher so Show work still grows while the turn marker is alive.
+  if (sessionId) {
+    try {
+      const watch = ensureCliTrailWatch({ connectionId })
+      if (watch.started) {
+        process.stderr.write(
+          `devspec-remote-poll: cli trail watch started pid=${watch.pid} connection=${connectionId}\n`,
+        )
+      }
+    } catch (e) {
+      process.stderr.write(
+        `devspec-remote-poll: cli trail watch failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      )
+    }
+  }
   try {
     const s = readState(connectionId) || {}
     s.cursor_after_message_id = nextCursor

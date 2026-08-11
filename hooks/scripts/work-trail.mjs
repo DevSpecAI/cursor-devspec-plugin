@@ -111,7 +111,9 @@ export function advanceTrailState({
     if (cumulative.trim() && cumulative.trim() !== TRAIL_SEED_TEXT) return null
     cumulative = TRAIL_SEED_TEXT
   } else if (typeof transcriptText === 'string' && transcriptText.trim()) {
-    cumulative = serializeTranscriptJsonl(transcriptText)
+    const serialized = serializeTranscriptJsonl(transcriptText)
+    if (!serialized.trim()) return null
+    cumulative = serialized
   } else if (part) {
     if (cumulative === TRAIL_SEED_TEXT) cumulative = ''
     cumulative = clampTrail(cumulative ? `${cumulative}\n\n${part}` : part)
@@ -229,8 +231,42 @@ export function renderHookTrailPart(mode, data) {
 }
 
 /**
+ * Resolve Cursor agent-transcript JSONL for a conversation / bond id.
+ * Shape: ~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl
+ * @param {string} conversationId
+ * @param {{ home?: string }} [opts]
+ * @returns {string | null}
+ */
+export function resolveAgentTranscriptPath(conversationId, opts = {}) {
+  const id = String(conversationId || '').trim()
+  if (!id || id.includes('..') || id.includes('/') || id.includes('\\')) return null
+  const home = opts.home || os.homedir()
+  const projectsRoot = path.join(home, '.cursor', 'projects')
+  let projectDirs = []
+  try {
+    projectDirs = fs.readdirSync(projectsRoot, { withFileTypes: true }).filter((d) => d.isDirectory())
+  } catch {
+    return null
+  }
+  /** @type {{ path: string, mtimeMs: number }[]} */
+  const hits = []
+  for (const d of projectDirs) {
+    const candidate = path.join(projectsRoot, d.name, 'agent-transcripts', id, `${id}.jsonl`)
+    try {
+      const st = fs.statSync(candidate)
+      if (st.isFile()) hits.push({ path: candidate, mtimeMs: st.mtimeMs })
+    } catch {
+      /* miss */
+    }
+  }
+  if (!hits.length) return null
+  hits.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return hits[0]?.path ?? null
+}
+
+/**
  * Best-effort serialize of Cursor agent-transcript JSONL (conversation dump).
- * Keeps assistant tool_use + short text; skips user prompts.
+ * Keeps assistant tool_use + short text; skips user prompts and DevSpec trail posts.
  * @param {string} jsonl
  * @param {number} [maxChars]
  */
@@ -252,6 +288,14 @@ export function serializeTranscriptJsonl(jsonl, maxChars = TRAIL_MAX_CHARS) {
       if (!part || typeof part !== 'object') continue
       if (part.type === 'tool_use') {
         const name = String(part.name || 'tool')
+        if (
+          isDevspecPostSessionTool({
+            tool_name: name,
+            tool_input: part.input,
+          })
+        ) {
+          continue
+        }
         const input = summarizeInput(part.input)
         blocks.push(`$ ${name}${input ? ` ${input}` : ''}`)
       } else if (part.type === 'text') {

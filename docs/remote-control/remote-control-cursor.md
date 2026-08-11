@@ -73,6 +73,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 | Agent name | `AGENT_NAME = 'Cursor'` |
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe` / `claude.exe`, or `node.exe` hosting `cursor-agent` (Cursor CLI often has no `agent.exe` — item c57dc381). **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
 | Mirror / trail hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
+| CLI trail feed | Cursor Agents CLI (`agent --resume`) often **does not** invoke mid-turn hooks. On attached owner-command pickup the poller starts `cli-trail-watch.mjs`, which tails `~/.cursor/projects/*/agent-transcripts/<local_id>/<local_id>.jsonl` and posts throttled `phase=trail` until the turn marker clears. Hook path stays for IDE; transcript watcher is the CLI-safe path (item 63f3db87). |
 
 ## What not to change lightly
 
@@ -104,6 +105,8 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — seeds trail; Stop clears turn + trail state + `report_complete` when hooks fire)
 - `hooks/scripts/seed-work-trail.mjs` (shared `phase=trail` Working… seed used by mirror + poller)
 - `hooks/scripts/trail-turn.mjs` (mid-turn `phase=trail` posts)
+- `hooks/scripts/cli-trail-watch.mjs` (CLI transcript-tail trail; started by poller on pickup)
+- `hooks/scripts/post-trail-from-transcript.mjs` (shared transcript → phase=trail poster)
 - `hooks/scripts/devspec-remote-poll.mjs` (seeds trail on attached owner-command delivery before wake)
 - `hooks/scripts/work-trail.mjs` (throttle / render / transcript helpers)
 - `hooks/scripts/remote-control-state.mjs`

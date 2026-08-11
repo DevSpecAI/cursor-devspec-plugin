@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.15 - 2026-08-11
+
+### Fixed
+
+- **Cursor CLI Show work stays thin:** Agents interactive `--resume` often never fires mid-turn hooks from `~/.cursor/hooks.json`, so `trail-turn.mjs` never runs even though it works when invoked manually. On attached owner-command pickup the poller now starts `cli-trail-watch.mjs`, which tails the bonded agent-transcript JSONL and posts throttled `phase=trail` while the turn marker is alive (item 63f3db87). IDE hook path unchanged.
+
 ## 0.4.12 - 2026-08-11
 
 ### Fixed
