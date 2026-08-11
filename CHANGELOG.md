@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-08-11
+
+### Removed — the `DevSpec Autopilot:` commands are gone; staged batches arrive at any idle connection
+
+**Migration:** if you used **DevSpec Autopilot: Process next staged item** (or its queue flags), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep a remote-control session idle — DevSpec hands the batch to it. Status is the Agents page; stop is **DevSpec: Disconnect remote control**; history is the assignment and item record.
+
+- **The extension no longer chooses its own work.** The three autopilot palette commands and their skills are deleted, and with them the `get_next_work_item` self-selection path; the server routes a staged batch to a connection and the plugin only works what it was handed.
+- **Unattended is a mode, not a command.** The dispatch-protocol section of `devspec.remote` (step 8a) and the poller's injected dispatch text now state the batch contract explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- The extension *id* (`devspec-autopilot`) and rules marker keep their names — they are install identity, not the command surface; renaming them would break upgrades for no functional gain.
+- No replacement command or flag is created. Same deletion across the Claude Code, OpenCode, Grok, Antigravity and Codex plugins under the same item (`3f2f390c`).
+
 ## 0.4.15 - 2026-08-11
 
 ### Fixed

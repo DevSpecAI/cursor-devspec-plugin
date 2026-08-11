@@ -930,7 +930,7 @@ async function main() {
       content:
         d.kind === 'playbook_run'
           ? playbookRunCommandText(d)
-          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member → resolve_assignment.`,
+          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member (in position order) → implement → record_implementation → resolve_assignment. Until resolve_assignment lands, batch mode overrides conversation mode: do not answer the room, do not react to ambient chatter, do not pause for clarification — there may be nobody watching. A member that cannot be implemented safely is failed loudly with fail_work_item (precise error + partial_work_notes), then CONTINUE with the next member — a blocked member fails the member, not the batch. When the batch resolves you are ordinary available capacity again; nothing about the connection changed.`,
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 

@@ -9,7 +9,7 @@ Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, 
 ## What you can do with it
 
 - **Work a task in chat.** Point the agent at an action item and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
-- **Run autopilot on approved work.** Stage a batch of tasks in DevSpec, then let autopilot process them one at a time from the editor.
+- **Let a queue clear itself.** Stage a batch of tasks in DevSpec, and any idle remote-control session of yours is handed it — Cursor works the members one at a time, unattended.
 - **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
 - **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
 - **Small conveniences.** Create tasks, make tracked commits, link commits to tasks, and ask DevSpec's docs questions — all from the command palette.
@@ -26,7 +26,7 @@ You'll need:
   - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
   - It's **retrievable.** Reveal and copy it again any time at **You → Connections** (no more show-once).
   - You don't paste a project id — the project for a run is resolved from your repo's git remote.
-- **Node.js 18+** — only needed for **autopilot** and **remote control** (check with `node --version`). Plain MCP tool access — working a task in chat, creating items, asking the docs — doesn't require it, but you'll want it installed for the full feature set.
+- **Node.js 18+** — only needed for **remote control** and working dispatched batches (check with `node --version`). Plain MCP tool access — working a task in chat, creating items, asking the docs — doesn't require it, but you'll want it installed for the full feature set.
 
 ## Install
 
@@ -63,7 +63,7 @@ That clipboard-paste flow is how every DevSpec skill runs: a **DevSpec: …** pa
 
 ### Commands
 
-Every command is under the **DevSpec:** (and **DevSpec Autopilot:**) prefix in the command palette.
+Every command is under the **DevSpec:** prefix in the command palette.
 
 | Command | What it does |
 |---|---|
@@ -77,9 +77,6 @@ Every command is under the **DevSpec:** (and **DevSpec Autopilot:**) prefix in t
 | DevSpec: Verify connection | Confirm the plugin is connected |
 | DevSpec: Connect remote control | Connect this session to DevSpec's Agents page |
 | DevSpec: Disconnect remote control | Disconnect this session from the Agents page |
-| DevSpec Autopilot: Process next staged item | Work the next staged task (or `--items=<id,…>` for a targeted batch) |
-| DevSpec Autopilot: Show status | Show what autopilot is doing |
-| DevSpec Autopilot: Show history | Show recent autopilot runs and outcomes |
 
 Setup and utility commands are also in the palette: **DevSpec: Set MCP token**, **DevSpec: Register MCP server in Cursor config**, **DevSpec: Install rules**, **DevSpec: Install remote-control mirror hooks**, and **DevSpec: Manage repo folder mappings**.
 

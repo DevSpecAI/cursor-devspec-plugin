@@ -256,6 +256,10 @@ A dispatch arrives as an owner command carrying an **assignment reference** (UUI
 3. For each member **in `position` order**: **`devspec__claim_work_item(action_item_id, agent_branch)`** (the reservation is recognised for you; a claim rejected as reserved-for-someone-else is a normal non-fatal skip). Implement in an isolated worktree as `devspec.work` prescribes; **`devspec__record_implementation`** when done (`report_progress` for long items; `release_work_item` to hand one back).
 4. When the batch is done: **`devspec__resolve_assignment(assignment_id, outcome: "completed")`** (or `"released"`).
 
+**Batch mode overrides conversation mode — explicitly, and only for the batch.** From `acknowledge_assignment` to `resolve_assignment`, this section wins over the conversational rules above: do not answer the room, do not react to ambient chatter, do not pause for clarification. There may be nobody watching — a staged batch is exactly the case where the owner walked away. The conflict resolves in the batch's favour for its duration, then lapses: when `resolve_assignment` lands you are ordinary available capacity again, nothing about the connection has changed. This is why there is no separate unattended command, skill or flag — the mode is the dispatch, not the launch.
+
+**Fail loudly, never silently, never by chatting.** If a member cannot be implemented safely — too ambiguous to do without guessing, a gate keeps failing, a dependency is missing — call `devspec__fail_work_item` with a precise `error` (and `partial_work_notes` for what you tried), then CONTINUE with the next member: a blocked member fails the member, not the batch. What you must never do is post a question into the room and wait — nobody may be there, and the batch stalls dead.
+
 Settle a `possible_conflict` yourself when the facts are plain: `related` / `not_a_conflict` close nothing and reverse nothing, so resolve them via `resolve_action_item_conflict` with a recorded `basis`. Ask first only for `supersedes` (something gets closed), a counterpart authored by someone else, or a user who has not shown they grasp — at the INTENT level, never the code level — what would be reversed; then state the consequence, not that a flag exists. A flag informs your reasoning; it is not a permission slip. Never force blindly. Progress: attached → optional `post_session_message({ connection_id, … })`; sessionless → `report_progress` only.
 
 ### 9. Stopping
@@ -289,7 +293,7 @@ When the conversation produces a durable decision, convention, architecture choi
    - Always `devspec__search_memories` first; never duplicate — `devspec__supersede_memory` the closest match. `devspec__search_memories` returns a CARD (title, one-line summary, id) — `devspec__get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight` as appropriate.
 2. **Artifacts (when durable docs are needed)** — short plans/ADRs/runbooks via `devspec__create_resource` / `devspec__update_resource` / `devspec__supersede_resource` (interactive, no runner stamp).
-3. **Do not** rely on autopilot post-session pending-memory extraction for this channel.
+3. **Do not** rely on post-session pending-memory extraction for this channel.
 4. Mirror the offer and the capture confirmation into `devspec__post_session_message` (when attached) as a **short reply-only** line so the phone transcript shows knowledge landing — never paste status chrome or thinking.
 
 Be as proactive about memories/artifacts as you already are about **action items**. Losing decisions is a product failure mode of remote control.

@@ -22,9 +22,6 @@ type SkillId =
   | 'devspec.help'
   | 'devspec.link'
   | 'devspec.commit'
-  | 'autopilot.process'
-  | 'autopilot.status'
-  | 'autopilot.history'
 
 interface SkillMeta {
   command: string
@@ -86,19 +83,6 @@ const SKILLS: Record<SkillId, SkillMeta> = {
     command: 'devspec.commit',
     promptLabel: 'Action item ID and commit summary',
     promptPlaceholder: '<action_item_id> <summary under 72 chars>',
-  },
-  'autopilot.process': {
-    command: 'devspec.autopilot.process',
-    promptLabel: 'Optional flags — leave empty for next staged item',
-    promptPlaceholder: '--items=<uuid1>,<uuid2>  ·  --mine  ·  --all  ·  --assigned-to=<uuid>',
-  },
-  'autopilot.status': {
-    command: 'devspec.autopilot.status',
-    promptLabel: '',
-  },
-  'autopilot.history': {
-    command: 'devspec.autopilot.history',
-    promptLabel: '',
   },
 }
 
