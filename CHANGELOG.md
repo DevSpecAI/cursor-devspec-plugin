@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0 - 2026-08-11
+
+### Removed — the `DevSpec Autopilot:` commands are gone; staged batches arrive at any idle connection
+
+**Migration:** if you used **DevSpec Autopilot: Process next staged item** (or its queue flags), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep a remote-control session idle — DevSpec hands the batch to it. Status is the Agents page; stop is **DevSpec: Disconnect remote control**; history is the assignment and item record.
+
+- **The extension no longer chooses its own work.** The three autopilot palette commands and their skills are deleted, and with them the `get_next_work_item` self-selection path; the server routes a staged batch to a connection and the plugin only works what it was handed.
+- **Unattended is a mode, not a command.** The dispatch-protocol section of `devspec.remote` (step 8a) and the poller's injected dispatch text now state the batch contract explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- The extension *id* (`devspec-autopilot`) and rules marker keep their names — they are install identity, not the command surface; renaming them would break upgrades for no functional gain.
+- No replacement command or flag is created. Same deletion across the Claude Code, OpenCode, Grok, Antigravity and Codex plugins under the same item (`3f2f390c`).
+
+## 0.4.15 - 2026-08-11
+
+### Fixed
+
+- **Cursor CLI Show work stays thin:** Agents interactive `--resume` often never fires mid-turn hooks from `~/.cursor/hooks.json`, so `trail-turn.mjs` never runs even though it works when invoked manually. On attached owner-command pickup the poller now starts `cli-trail-watch.mjs`, which tails the bonded agent-transcript JSONL and posts throttled `phase=trail` while the turn marker is alive (item 63f3db87). IDE hook path unchanged.
+
+## 0.4.12 - 2026-08-11
+
+### Fixed
+
+- **Windows Cursor CLI poller idle_timeout (no `agent.exe`):** owner-pid ancestry walk now treats `node.exe` whose CommandLine hosts `cursor-agent` (e.g. `AppData\Local\cursor-agent\…\index.js`) as a durable host. Name-only matching (`Cursor.exe` / `agent.exe` / `claude.exe`) missed Cursor CLI attaches that run entirely under node — `ensure-poller` refused to start, heartbeats never fired, and the connection left with `idle_timeout` ~90s later (Calm Kingfisher / item c57dc381). Ephemeral plugin scripts (`remote-control-state`, poll/wait, `launch-cli-session`) stay rejected.
+
+## 0.4.10 - 2026-08-10
+
+### Fixed
+
+- **Ship OpenCode serve `--auto` removal into installs:** source already dropped unsupported `serve --auto` (item `79a01caf`) while keeping `--auto` on `run`, but the installed `0.4.9` VSIX still had the old launcher. This release packages that fix so cold launches bind again and permission auto-approve stays on `run` only. Pair with OpenCode plugin `0.3.8` (`permission.ask` auto-allow while bonded) so later `promptAsync` remote turns do not hang (item `1514baa3`).
+
 ## 0.4.9 - 2026-08-04
 
 ### Fixed

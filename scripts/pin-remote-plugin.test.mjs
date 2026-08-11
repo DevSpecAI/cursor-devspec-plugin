@@ -102,6 +102,43 @@ describe('pinRemotePluginInPrompt', () => {
   })
 })
 
+describe('resolveCursorDevspecExtensionPath semver', () => {
+  /** @type {string} */
+  let tmpHome
+
+  before(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pin-semver-'))
+  })
+
+  after(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  it('picks 0.4.14 over 0.4.9 (lexicographic trap)', () => {
+    // Lex sort ranks "…-0.4.9" after "…-0.4.14" because '9' > '1'. Semver must not.
+    const v49 = path.join(
+      tmpHome,
+      '.cursor',
+      'extensions',
+      'devspecai.devspec-autopilot-0.4.9',
+    )
+    const v414 = path.join(
+      tmpHome,
+      '.cursor',
+      'extensions',
+      'devspecai.devspec-autopilot-0.4.14',
+    )
+    for (const dir of [v49, v414]) {
+      fs.mkdirSync(path.join(dir, 'hooks', 'scripts'), { recursive: true })
+      fs.writeFileSync(
+        path.join(dir, 'hooks', 'scripts', 'remote-control-state.mjs'),
+        '// stub\n',
+      )
+    }
+    assert.equal(resolveCursorDevspecExtensionPath(tmpHome), v414)
+  })
+})
+
 describe('expandRemoteControlLaunchPrompt', () => {
   /** @type {string} */
   let tmpHome

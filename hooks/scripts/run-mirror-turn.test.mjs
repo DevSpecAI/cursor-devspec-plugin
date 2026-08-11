@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import {
   compareSemverTuples,
   parseExtensionVersion,
+  resolveInstalledHookScript,
   resolveInstalledMirrorTurn,
   stableMirrorTurnPath,
 } from './run-mirror-turn.mjs'
@@ -67,5 +68,23 @@ describe('stableMirrorTurnPath', () => {
   it('is under ~/.cursor/devspec/hooks', () => {
     const p = stableMirrorTurnPath('/tmp/home')
     assert.equal(p, path.join('/tmp/home', '.cursor', 'devspec', 'hooks', 'run-mirror-turn.mjs'))
+  })
+})
+
+describe('resolveInstalledHookScript', () => {
+  it('resolves trail-turn.mjs from the newest install', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-trail-resolve-'))
+    try {
+      const ext = path.join(home, '.cursor', 'extensions')
+      const dir = path.join(ext, 'devspecai.devspec-autopilot-0.4.12')
+      const scriptDir = path.join(dir, 'hooks', 'scripts')
+      fs.mkdirSync(scriptDir, { recursive: true })
+      fs.writeFileSync(path.join(scriptDir, 'trail-turn.mjs'), '// stub\n')
+      const resolved = resolveInstalledHookScript('trail-turn.mjs', home)
+      assert.ok(resolved)
+      assert.match(resolved, /trail-turn\.mjs$/)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
   })
 })

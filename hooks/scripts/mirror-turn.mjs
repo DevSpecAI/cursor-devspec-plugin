@@ -5,8 +5,10 @@
  * machine-global "latest" pointer. Posts mechanically — no LLM tokens.
  *
  * user_prompt → optional local_prompt bubble when attached (literal owner text)
- * stop        → busy/heartbeat + turn marker only (NO assistant text)
+ *             → also seeds phase=trail "Working…" so the live bubble opens immediately
+ * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state
  *
+ * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
  * ADR b98a39a9 — no dual writers.
  */
@@ -20,6 +22,8 @@ import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
+import { clearTrailState } from './work-trail.mjs'
+import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -67,6 +71,17 @@ function readStdin() {
  * exposes), then the hook stdin session_id. Tool-agnostic and SYMMETRIC with connect.
  */
 export function resolveHookConversationId(hookInput, env = process.env) {
+  // Cursor agent hooks stamp conversation_id — prefer that over env so CLI/IDE
+  // mid-turn events bond correctly even when CURSOR_CONVERSATION_ID is absent.
+  try {
+    const parsed = JSON.parse(hookInput || '{}')
+    if (typeof parsed.conversation_id === 'string' && parsed.conversation_id.trim()) {
+      return parsed.conversation_id.trim()
+    }
+  } catch {
+    /* fall through */
+  }
+  // Claude/Grok/Codex: env id is what remote-control-state write stamps.
   const fromEnv = detectLocalId({}, env).local_id
   if (fromEnv) return fromEnv
   try {
@@ -75,7 +90,7 @@ export function resolveHookConversationId(hookInput, env = process.env) {
       return parsed.session_id.trim()
     }
   } catch {
-    /* fall through — fail closed below */
+    /* fail closed */
   }
   return null
 }
@@ -349,6 +364,24 @@ async function main() {
         })
       }
     }
+
+    // Seed the live work-trail bubble when attached (OpenCode parity). Mid-turn
+    // hooks grow it; the model's phase=answer + complete_turn collapses it.
+    // Shared with the poller's remote-wake seed (phone/web never hits user_prompt).
+    if (mode === 'user_prompt' && sessionId && connectionId && !skipMirror) {
+      try {
+        await seedWorkTrailForConnection({
+          connectionId,
+          mcpUrl,
+          token,
+          agentName,
+        })
+      } catch {
+        /* non-fatal — final answer path still works without a trail seed */
+      }
+    }
+
+    if (mode === 'stop' && connectionId) clearTrailState(connectionId)
 
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +
     // marker so the poller re-asserts); stop ends it (busy:false + clear marker).

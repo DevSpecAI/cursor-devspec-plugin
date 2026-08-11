@@ -15,6 +15,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  compareSemverTuples,
+  parseExtensionVersion,
+} from '../hooks/scripts/run-mirror-turn.mjs'
 
 const EXTENSION_DIR_PREFIX = 'devspecai.devspec-autopilot-'
 
@@ -100,16 +104,20 @@ export function resolveCursorDevspecExtensionPath(homeDir = os.homedir()) {
   } catch {
     return null
   }
-  const matches = entries
+  // Semver order — NOT lexicographic `.sort()`. Lex puts 0.4.9 above 0.4.14
+  // (string '9' > '1'), which pinned every Agents launch to the stale VSIX.
+  const candidates = entries
     .filter((e) => e.isDirectory() && e.name.startsWith(EXTENSION_DIR_PREFIX))
-    .map((e) => e.name)
-    .sort()
-  const newest = matches.at(-1)
-  if (!newest) return null
-  const full = path.join(extensionsRoot, newest)
-  const stateScript = path.join(full, 'hooks', 'scripts', 'remote-control-state.mjs')
-  if (!fs.existsSync(stateScript)) return null
-  return full
+    .map((e) => ({
+      name: e.name,
+      version: parseExtensionVersion(e.name),
+      full: path.join(extensionsRoot, e.name),
+    }))
+    .filter((c) =>
+      fs.existsSync(path.join(c.full, 'hooks', 'scripts', 'remote-control-state.mjs')),
+    )
+    .sort((a, b) => compareSemverTuples(b.version, a.version))
+  return candidates[0]?.full ?? null
 }
 
 /**

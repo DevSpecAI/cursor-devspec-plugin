@@ -222,13 +222,13 @@ Fix real issues before committing. If a fix would expand scope beyond the action
     **Read the originating conversation.** The claim response carries a `session_context` object when the item is tied to a session. If `session_context.transcript_is_authoritative` is `true` — the item was *born* in that session — and you have not already read that conversation, call `devspec__get_session_transcript({ session_id: session_context.originating_session_id })` **before implementing**; it carries the human intent and nuance behind the item. Do NOT skip this because the spec fields "look complete": fully-specified fields can still have lost the conversation's nuance, which is exactly what this recovers. Because ``devspec.work`` is usually a cold pickup of a named item, this normally fires — skip it only when you're continuing that same session interactively and already have it in context. If `transcript_is_authoritative` is `false` (filed externally then attributed), the item fields are canonical; pull the transcript only as optional background. When the transcript reveals intent or criteria the item lacks, persist it back with `devspec__update_action_item({ action_item_id, intent, acceptance_criteria })` so it's captured for next time.
 
 13. **Create an isolated worktree (not a branch-in-place).**
-    All implementation work happens inside a git worktree — a sibling directory with its own working tree that shares the main repo's object database. This is what makes concurrent ``devspec.work`` sessions safe: the main repo never switches branches and never holds another session's uncommitted changes, so a commit here captures only *this* item's work. (This matches how ``autopilot.process`` already isolates each item.)
+    All implementation work happens inside a git worktree — a sibling directory with its own working tree that shares the main repo's object database. This is what makes concurrent ``devspec.work`` sessions safe: the main repo never switches branches and never holds another session's uncommitted changes, so a commit here captures only *this* item's work.
 
     a. **Record the main repo path:** run `pwd` and store as `main_repo`. Every path below is derived from it, and you return here before merging.
 
     b. **Compute `branch_name`** = `{branch_prefix}{id_first_8_chars}`. If `branch_prefix` is empty, fall back to `work/action-item-`.
 
-    c. **Compute `worktree_path`** as a hidden sibling directory of the main repo (the same convention ``autopilot.process`` uses):
+    c. **Compute `worktree_path`** as a hidden sibling directory of the main repo:
     ```
     <parent_of_main_repo>/.<basename(main_repo)>-worktrees/task-<id_first_8_chars>-<unix_timestamp>
     ```
@@ -297,7 +297,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 17. **Integrate the fresh target, then push** (if auto_push is enabled or implied by auto_merge).
 
-    When `auto_merge` is enabled, first integrate the target branch into your work branch **in the worktree** — another session or a parallel autopilot runner may have landed work since you branched (resolve `{merge_target}` per step 18b):
+    When `auto_merge` is enabled, first integrate the target branch into your work branch **in the worktree** — another session or agent may have landed work since you branched (resolve `{merge_target}` per step 18b):
     ```bash
     git fetch origin {merge_target}
     git merge origin/{merge_target} --no-edit

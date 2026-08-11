@@ -10,6 +10,7 @@
  * Usage (hooks.json):
  *   node "%USERPROFILE%\.cursor\devspec\hooks\run-mirror-turn.mjs" stop
  *   node "%USERPROFILE%\.cursor\devspec\hooks\run-mirror-turn.mjs" user_prompt
+ *   node "%USERPROFILE%\.cursor\devspec\hooks\run-mirror-turn.mjs" postToolUse
  */
 
 import fs from 'node:fs'
@@ -19,6 +20,18 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const EXT_PREFIX = 'devspecai.devspec-autopilot-'
+
+const TRAIL_MODES = new Set([
+  'seed',
+  'postToolUse',
+  'postToolUseFailure',
+  'afterShellExecution',
+  'beforeShellExecution',
+  'afterMCPExecution',
+  'beforeMCPExecution',
+  'afterFileEdit',
+  'afterAgentThought',
+])
 
 /**
  * Parse `devspecai.devspec-autopilot-0.4.7` → [0,4,7] (non-numeric tails → 0).
@@ -47,12 +60,13 @@ export function compareSemverTuples(a, b) {
 }
 
 /**
- * Pick the newest installed DevSpec Cursor extension that still has mirror-turn.mjs.
+ * Pick the newest installed DevSpec Cursor extension that still has the script.
+ * @param {string} scriptName relative under hooks/scripts/
  * @param {string} [home]
  * @param {{ readdirSync?: typeof fs.readdirSync, existsSync?: typeof fs.existsSync }} [io]
- * @returns {string | null} absolute path to mirror-turn.mjs
+ * @returns {string | null} absolute path to the script
  */
-export function resolveInstalledMirrorTurn(home = os.homedir(), io = {}) {
+export function resolveInstalledHookScript(scriptName, home = os.homedir(), io = {}) {
   const readdirSync = io.readdirSync || fs.readdirSync
   const existsSync = io.existsSync || fs.existsSync
   const extRoot = path.join(home, '.cursor', 'extensions')
@@ -67,11 +81,16 @@ export function resolveInstalledMirrorTurn(home = os.homedir(), io = {}) {
     .map((name) => ({
       name,
       version: parseExtensionVersion(name),
-      script: path.join(extRoot, name, 'hooks', 'scripts', 'mirror-turn.mjs'),
+      script: path.join(extRoot, name, 'hooks', 'scripts', scriptName),
     }))
     .filter((c) => existsSync(c.script))
     .sort((a, b) => compareSemverTuples(b.version, a.version))
   return candidates[0]?.script ?? null
+}
+
+/** @deprecated prefer resolveInstalledHookScript('mirror-turn.mjs') */
+export function resolveInstalledMirrorTurn(home = os.homedir(), io = {}) {
+  return resolveInstalledHookScript('mirror-turn.mjs', home, io)
 }
 
 /** Stable install path refreshed on extension activate / open-handler --install. */
@@ -80,11 +99,14 @@ export function stableMirrorTurnPath(home = os.homedir()) {
 }
 
 function main() {
-  const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
-  const target = resolveInstalledMirrorTurn()
+  const modeArg = String(process.argv[2] || 'stop')
+  const isTrail = TRAIL_MODES.has(modeArg)
+  const mode = isTrail ? modeArg : modeArg === 'user_prompt' ? 'user_prompt' : 'stop'
+  const scriptName = isTrail ? 'trail-turn.mjs' : 'mirror-turn.mjs'
+  const target = resolveInstalledHookScript(scriptName)
   if (!target) {
     process.stderr.write(
-      '[devspec-remote] no installed mirror-turn.mjs under ~/.cursor/extensions/devspecai.devspec-autopilot-*\n',
+      `[devspec-remote] no installed ${scriptName} under ~/.cursor/extensions/devspecai.devspec-autopilot-*\n`,
     )
     process.exit(0)
   }

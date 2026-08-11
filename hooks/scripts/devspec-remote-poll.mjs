@@ -72,6 +72,8 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
+import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
+import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -538,8 +540,32 @@ export function isDeliverableCommand(msg, connectionId) {
  * heartbeat) flips UI pending → working the moment the command lands here —
  * not when/if a UserPromptSubmit hook fires. Remote phone/web wakes never go
  * through that hook; this is the one reliable pickup signal.
+ *
+ * When attached (`sessionId`), also seeds phase=trail "Working…" before the
+ * wake so the live bubble opens without relying on Cursor's user_prompt hook.
  */
-function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUserId, sessionId, context = null) {
+async function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUserId, sessionId, context = null) {
+  // Open the Working trail BEFORE waking the model (attached only). Sessionless
+  // dispatches have no room bubble to grow.
+  if (sessionId) {
+    try {
+      const s = readState(connectionId) || {}
+      const token = s.token || s.mcp_token || null
+      const mcpUrl = s.mcp_url || null
+      if (token && mcpUrl) {
+        await seedWorkTrailForConnection({
+          connectionId,
+          mcpUrl,
+          token,
+          agentName: AGENT_NAME,
+        })
+      }
+    } catch (e) {
+      process.stderr.write(
+        `devspec-remote-poll: trail seed failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      )
+    }
+  }
   if (context && (context.owner_ambient?.length || context.room_context?.length)) {
     // Printed BEFORE the commands so the room reads as background and the command
     // the agent must act on is the last thing in the payload.
@@ -561,6 +587,22 @@ function deliverOwnerMessages(connectionId, ownerMsgs, nextCursor, ownerUserId, 
   appendInbox(connectionId, ownerMsgs, { type: 'owner_messages', nextCursor, sessionId, context })
   // Turn start at pickup — poller re-asserts busy while the marker is fresh.
   writeTurnMarker(connectionId)
+  // Cursor CLI often never fires mid-turn hooks; start a transcript-tail trail
+  // watcher so Show work still grows while the turn marker is alive.
+  if (sessionId) {
+    try {
+      const watch = ensureCliTrailWatch({ connectionId })
+      if (watch.started) {
+        process.stderr.write(
+          `devspec-remote-poll: cli trail watch started pid=${watch.pid} connection=${connectionId}\n`,
+        )
+      }
+    } catch (e) {
+      process.stderr.write(
+        `devspec-remote-poll: cli trail watch failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      )
+    }
+  }
   try {
     const s = readState(connectionId) || {}
     s.cursor_after_message_id = nextCursor
@@ -860,7 +902,7 @@ async function main() {
    * that were already answered before this poller existed, so only the unanswered
    * tail is delivered (advisory is never filtered — that IS the orientation).
    */
-  function consumePollResult(res, { seed = false } = {}) {
+  async function consumePollResult(res, { seed = false } = {}) {
     const offered = Array.isArray(res.commands) ? res.commands : []
     // Fail closed: only commands this endpoint addressed to US, with an authority we
     // recognise, may wake the agent. A rejected entry is logged, never silently eaten.
@@ -888,7 +930,7 @@ async function main() {
       content:
         d.kind === 'playbook_run'
           ? playbookRunCommandText(d)
-          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member → resolve_assignment.`,
+          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member (in position order) → implement → record_implementation → resolve_assignment. Until resolve_assignment lands, batch mode overrides conversation mode: do not answer the room, do not react to ambient chatter, do not pause for clarification — there may be nobody watching. A member that cannot be implemented safely is failed loudly with fail_work_item (precise error + partial_work_notes), then CONTINUE with the next member — a blocked member fails the member, not the batch. When the batch resolves you are ordinary available capacity again; nothing about the connection changed.`,
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
@@ -939,7 +981,8 @@ async function main() {
         },
       })
       // deliverOwnerMessages stamps the message cursor + wake time into state itself.
-      deliverOwnerMessages(connectionId, commands, cursor, ownerUserId, sessionId, takeCarriedContext())
+      // Awaits trail seed so Working opens before the model wake.
+      await deliverOwnerMessages(connectionId, commands, cursor, ownerUserId, sessionId, takeCarriedContext())
       idleStarted = Date.now()
     } else if (advisoryCount > 0 || freshDispatches.length > 0) {
       logRemoteControlStory({
@@ -1190,7 +1233,7 @@ async function main() {
     }
 
     if (res.changed === true) {
-      const delivered = consumePollResult(res, { seed: needsSeed })
+      const delivered = await consumePollResult(res, { seed: needsSeed })
       needsSeed = false
       if (delivered) {
         consecutiveEmpty = 0

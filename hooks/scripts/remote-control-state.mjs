@@ -181,6 +181,17 @@ export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claud
 /** Short-lived shells that must not be used as `--owner-pid` anchors on Windows. */
 export const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
 
+/**
+ * Plugin / launcher node scripts that look like `node.exe` but die when the tool call
+ * ends — never durable owner anchors (item c57dc381). Keep in sync with the PowerShell
+ * walk in resolveOwnerPidAutoWindows and the duplicate in devspec-remote-wait.mjs.
+ */
+export const WIN32_NODE_EPHEMERAL_CMD_RE =
+  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
+
+/** Cursor CLI often runs as node.exe with cursor-agent in CommandLine (not agent.exe). */
+export const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
+
 export function isWin32OwnerHostName(name) {
   return WIN32_OWNER_HOST_NAMES.has(String(name || '').toLowerCase())
 }
@@ -190,38 +201,84 @@ export function isWin32ShellName(name) {
 }
 
 /**
- * Look up a Win32 process image name by pid. Returns null when the process is gone
- * or the query fails. Injectable via resolveOwnerPid opts for unit tests.
+ * True when CommandLine proves this node.exe is the Cursor CLI agent host
+ * (AppData\\Local\\cursor-agent\\…\\index.js), not an ephemeral plugin script.
  */
-export function win32ProcessName(pid, { timeoutMs = 2000 } = {}) {
+export function isWin32CursorAgentNodeCommand(commandLine) {
+  const cmd = String(commandLine || '')
+  if (!cmd) return false
+  if (WIN32_NODE_EPHEMERAL_CMD_RE.test(cmd)) return false
+  return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
+}
+
+/** Name (+ optional CommandLine) is a durable Windows owner host. */
+export function isWin32DurableOwnerProcess(name, commandLine = '') {
+  const n = String(name || '').toLowerCase()
+  if (WIN32_OWNER_HOST_NAMES.has(n)) return true
+  if (n === 'node.exe') return isWin32CursorAgentNodeCommand(commandLine)
+  return false
+}
+
+/**
+ * Explicit --owner-pid values that must not be trusted on win32 — fall through to
+ * ancestry walk instead (shells: f3a88333; plain/ephemeral node.exe: c57dc381).
+ */
+export function shouldIgnoreExplicitWin32Owner(name, commandLine = '') {
+  if (isWin32ShellName(name)) return true
+  const n = String(name || '').toLowerCase()
+  if (n === 'node.exe') return !isWin32CursorAgentNodeCommand(commandLine)
+  return false
+}
+
+/**
+ * Look up Win32 process Name + CommandLine by pid. Returns null when gone / query fails.
+ * Injectable via resolveOwnerPid opts for unit tests.
+ */
+export function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
   if (process.platform !== 'win32') return null
   const id = Number.parseInt(String(pid), 10)
   if (!Number.isInteger(id) || id < 1) return null
+  // Two lines: Name then CommandLine (CommandLine may be empty).
   const script =
     `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${id}" -ErrorAction SilentlyContinue; ` +
-    'if ($p) { Write-Output $p.Name }'
+    'if ($p) { Write-Output $p.Name; Write-Output ([string]$p.CommandLine) }'
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
-    }).trim()
-    return out || null
+    })
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+    const lines = out.split('\n')
+    const name = (lines[0] || '').trim()
+    if (!name) return null
+    const commandLine = lines.slice(1).join('\n').replace(/\n$/, '')
+    return { name, commandLine }
   } catch {
     return null
   }
 }
 
 /**
- * Windows-only owner-pid self-resolution (items 3cddb3b4 / f3a88333). On win32 this
- * process is commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are
+ * Look up a Win32 process image name by pid. Returns null when the process is gone
+ * or the query fails. Injectable via resolveOwnerPid opts for unit tests.
+ */
+export function win32ProcessName(pid, opts = {}) {
+  return win32ProcessInfo(pid, opts)?.name ?? null
+}
+
+/**
+ * Windows-only owner-pid self-resolution (items 3cddb3b4 / f3a88333 / c57dc381). On win32
+ * this process is commonly invoked from Git Bash (MSYS), whose own `$$`/`$PPID` are
  * MSYS-internal numbers that do NOT correspond to any real Win32 process — querying
  * Win32_Process for bash's reported pid returns nothing, so a caller-supplied
  * `--owner-pid "$PPID"` from that shell is never a trustworthy anchor (verified:
  * MSYS bash reports PPID=1, an orphan sentinel, not a resolvable process). node.exe
  * itself, unlike the MSYS shell, IS a genuine Win32 process, so `process.pid` (this
  * script's own pid) is a real, queryable anchor — walk its Win32_Process ancestry
- * until we reach a durable host (`Cursor.exe`, CLI `agent.exe`, or `claude.exe`),
+ * until we reach a durable host (`Cursor.exe`, CLI `agent.exe`, `claude.exe`, or
+ * `node.exe` whose CommandLine hosts cursor-agent — Cursor CLI often has no agent.exe),
  * however many shell layers sit in between. A single short-lived PowerShell call
  * does the whole walk (fast: one process spawn, no polling).
  */
@@ -233,11 +290,17 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
   const script = [
     // Avoid `$hosts` — it is a PowerShell automatic variable.
     `$ownerHosts = @(${hosts})`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    '  if ($ownerHosts -contains $proc.Name.ToLowerInvariant()) { Write-Output $proc.ProcessId; break }',
+    '  $name = $proc.Name.ToLowerInvariant()',
+    '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
+    '  if ($name -eq "node.exe") {',
+    '    $cmd = [string]$proc.CommandLine',
+    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -259,22 +322,33 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
  * Resolve the effective owner-pid for this call.
  *
  * On POSIX, an explicit valid `--owner-pid` wins. On win32, an explicit pid that is
- * clearly a short-lived tool shell (powershell / pwsh / cmd / bash) is ignored and
- * we walk up to Cursor/agent instead — those shells exit when the tool call ends
- * and would otherwise fire `owner_gone` mid-session (item f3a88333). Otherwise
- * attempt Windows self-resolution; otherwise fall back to a previously-recorded
- * value. Returns null if none.
+ * clearly a short-lived tool shell (powershell / pwsh / cmd / bash) or a non-
+ * cursor-agent `node.exe` is ignored and we walk up to Cursor/agent/cursor-agent
+ * instead — those processes exit when the tool call ends and would otherwise fire
+ * `owner_gone` mid-session (items f3a88333 / c57dc381). Otherwise attempt Windows
+ * self-resolution; otherwise fall back to a previously-recorded value. Returns null
+ * if none.
  *
- * `opts.processNameOf` / `opts.resolveAuto` are test hooks only.
+ * `opts.processInfoOf` / `opts.processNameOf` / `opts.processCommandLineOf` /
+ * `opts.resolveAuto` are test hooks only.
  */
 export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
   if (Number.isInteger(explicit) && explicit > 1) {
     if (process.platform === 'win32') {
-      const nameFn = opts.processNameOf ?? win32ProcessName
-      const name = nameFn(explicit)
-      if (name && isWin32ShellName(name)) {
-        // Fall through — shell PID is not a durable owner anchor.
+      let name = null
+      let commandLine = ''
+      if (opts.processNameOf || opts.processCommandLineOf) {
+        name = opts.processNameOf ? opts.processNameOf(explicit) : null
+        commandLine = opts.processCommandLineOf ? String(opts.processCommandLineOf(explicit) ?? '') : ''
+      } else {
+        const infoFn = opts.processInfoOf ?? win32ProcessInfo
+        const info = infoFn(explicit)
+        name = info?.name ?? null
+        commandLine = info?.commandLine ?? ''
+      }
+      if (name && shouldIgnoreExplicitWin32Owner(name, commandLine)) {
+        // Fall through — not a durable owner anchor.
       } else {
         return explicit
       }
@@ -366,7 +440,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
     return {
       ok: false,
       error:
-        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows prefer omit or $PPID and let self-resolve walk to Cursor.exe/agent.exe; never pass a tool-shell $PID. If you see this, the automatic host walk failed too.',
+        'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows prefer omit or $PPID and let self-resolve walk to Cursor.exe/agent.exe/claude.exe or node.exe hosting cursor-agent; never pass a tool-shell $PID. If you see this, the automatic host walk failed too.',
     }
   }
 
@@ -630,6 +704,7 @@ export function detectLocalId(args = {}, env = process.env) {
 
   const envPairs = [
     ['DEVSPEC_REMOTE_LOCAL_ID', env.DEVSPEC_REMOTE_LOCAL_ID],
+    ['CURSOR_CONVERSATION_ID', env.CURSOR_CONVERSATION_ID],
     ['CODEX_THREAD_ID', env.CODEX_THREAD_ID],
     ['CLAUDE_CODE_SESSION_ID', env.CLAUDE_CODE_SESSION_ID],
     ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],

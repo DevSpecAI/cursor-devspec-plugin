@@ -31,6 +31,15 @@ describe('resolveHookConversationId', () => {
     )
   })
 
+  it('prefers Cursor conversation_id from the hook over env', () => {
+    assert.equal(
+      resolveHookConversationId('{"conversation_id":"hook-conv"}', {
+        CURSOR_CONVERSATION_ID: 'env-conv',
+      }),
+      'hook-conv',
+    )
+  })
+
   it('falls back to CLAUDE_SESSION_ID', () => {
     assert.equal(resolveHookConversationId('{}', { CLAUDE_SESSION_ID: 'alt-conv' }), 'alt-conv')
   })
