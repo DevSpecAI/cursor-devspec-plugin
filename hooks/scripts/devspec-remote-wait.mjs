@@ -201,26 +201,48 @@ function parseArgs(argv) {
  * On Windows the caller's `--owner-pid "$PPID"` is usually an MSYS-internal number
  * that maps to no real Win32 process, so an explicit value is validated before it is
  * trusted and we otherwise walk this process's genuine ancestry to the owning host
- * (items 3cddb3b4 / f3a88333). Keep host/shell lists in sync with
- * `remote-control-state.mjs` (write path).
+ * (items 3cddb3b4 / f3a88333 / c57dc381). Keep host/shell/node-command rules in sync
+ * with `remote-control-state.mjs` (write path).
  */
 const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
 const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
+const WIN32_NODE_EPHEMERAL_CMD_RE =
+  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
+const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
 
-function win32ProcessName(pid, { timeoutMs = 2000 } = {}) {
+function isWin32CursorAgentNodeCommand(commandLine) {
+  const cmd = String(commandLine || '')
+  if (!cmd) return false
+  if (WIN32_NODE_EPHEMERAL_CMD_RE.test(cmd)) return false
+  return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
+}
+
+function shouldIgnoreExplicitWin32Owner(name, commandLine = '') {
+  if (WIN32_SHELL_NAMES.has(String(name || '').toLowerCase())) return true
+  if (String(name || '').toLowerCase() === 'node.exe') return !isWin32CursorAgentNodeCommand(commandLine)
+  return false
+}
+
+function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
   if (process.platform !== 'win32') return null
   const id = Number.parseInt(String(pid), 10)
   if (!Number.isInteger(id) || id < 1) return null
   const script =
     `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${id}" -ErrorAction SilentlyContinue; ` +
-    'if ($p) { Write-Output $p.Name }'
+    'if ($p) { Write-Output $p.Name; Write-Output ([string]$p.CommandLine) }'
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
-    }).trim()
-    return out || null
+    })
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+    const lines = out.split('\n')
+    const name = (lines[0] || '').trim()
+    if (!name) return null
+    const commandLine = lines.slice(1).join('\n').replace(/\n$/, '')
+    return { name, commandLine }
   } catch {
     return null
   }
@@ -233,11 +255,17 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
   const hosts = [...WIN32_OWNER_HOST_NAMES].map((n) => `'${n.replace(/'/g, "''")}'`).join(', ')
   const script = [
     `$ownerHosts = @(${hosts})`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
     '  if (-not $proc) { break }',
-    '  if ($ownerHosts -contains $proc.Name.ToLowerInvariant()) { Write-Output $proc.ProcessId; break }',
+    '  $name = $proc.Name.ToLowerInvariant()',
+    '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
+    '  if ($name -eq "node.exe") {',
+    '    $cmd = [string]$proc.CommandLine',
+    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
     '}',
@@ -259,10 +287,19 @@ export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
   if (Number.isInteger(explicit) && explicit > 1) {
     if (process.platform === 'win32') {
-      const nameFn = opts.processNameOf ?? win32ProcessName
-      const name = nameFn(explicit)
-      if (name && WIN32_SHELL_NAMES.has(String(name).toLowerCase())) {
-        // Fall through — shell PID is not a durable owner anchor (item f3a88333).
+      let name = null
+      let commandLine = ''
+      if (opts.processNameOf || opts.processCommandLineOf) {
+        name = opts.processNameOf ? opts.processNameOf(explicit) : null
+        commandLine = opts.processCommandLineOf ? String(opts.processCommandLineOf(explicit) ?? '') : ''
+      } else {
+        const infoFn = opts.processInfoOf ?? win32ProcessInfo
+        const info = infoFn(explicit)
+        name = info?.name ?? null
+        commandLine = info?.commandLine ?? ''
+      }
+      if (name && shouldIgnoreExplicitWin32Owner(name, commandLine)) {
+        // Fall through — not a durable owner anchor (items f3a88333 / c57dc381).
       } else {
         return explicit
       }

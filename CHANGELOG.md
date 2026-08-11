@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.12 - 2026-08-11
+
+### Fixed
+
+- **Windows Cursor CLI poller idle_timeout (no `agent.exe`):** owner-pid ancestry walk now treats `node.exe` whose CommandLine hosts `cursor-agent` (e.g. `AppData\Local\cursor-agent\…\index.js`) as a durable host. Name-only matching (`Cursor.exe` / `agent.exe` / `claude.exe`) missed Cursor CLI attaches that run entirely under node — `ensure-poller` refused to start, heartbeats never fired, and the connection left with `idle_timeout` ~90s later (Calm Kingfisher / item c57dc381). Ephemeral plugin scripts (`remote-control-state`, poll/wait, `launch-cli-session`) stay rejected.
+
 ## 0.4.10 - 2026-08-10
 
 ### Fixed

@@ -4,6 +4,7 @@
  * Run: node --test hooks/scripts/remote-control-state.test.mjs
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 import {
   detectLocalId,
@@ -15,6 +16,9 @@ import {
   resolveLocalAction,
   isWin32OwnerHostName,
   isWin32ShellName,
+  isWin32CursorAgentNodeCommand,
+  isWin32DurableOwnerProcess,
+  shouldIgnoreExplicitWin32Owner,
   resolveOwnerPid,
   resolveOwnerPidAutoWindows,
 } from './remote-control-state.mjs'
@@ -531,17 +535,40 @@ describe('ensurePollerForConnection (reuse, item b9e02835)', () => {
   })
 })
 
-describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a88333)', () => {
+describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a88333 / c57dc381)', () => {
   it('classifies durable hosts and short-lived shells', () => {
     assert.equal(isWin32OwnerHostName('Cursor.exe'), true)
     assert.equal(isWin32OwnerHostName('agent.exe'), true)
     assert.equal(isWin32OwnerHostName('claude.exe'), true)
+    assert.equal(isWin32OwnerHostName('node.exe'), false)
     assert.equal(isWin32OwnerHostName('powershell.exe'), false)
     assert.equal(isWin32ShellName('powershell.exe'), true)
     assert.equal(isWin32ShellName('pwsh.exe'), true)
     assert.equal(isWin32ShellName('cmd.exe'), true)
     assert.equal(isWin32ShellName('bash.exe'), true)
     assert.equal(isWin32ShellName('Cursor.exe'), false)
+  })
+
+  it('treats node.exe + cursor-agent CommandLine as durable (item c57dc381)', () => {
+    const cursorAgentCmd =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.04-aaa8809\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.04-aaa8809\\index.js" --resume abc'
+    assert.equal(isWin32CursorAgentNodeCommand(cursorAgentCmd), true)
+    assert.equal(isWin32DurableOwnerProcess('node.exe', cursorAgentCmd), true)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', cursorAgentCmd), false)
+
+    assert.equal(isWin32CursorAgentNodeCommand(''), false)
+    assert.equal(isWin32DurableOwnerProcess('node.exe', ''), false)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', ''), true)
+
+    const ephemeral =
+      'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\extensions\\devspecai.devspec-autopilot-0.4.9\\hooks\\scripts\\remote-control-state.mjs ensure-poller'
+    assert.equal(isWin32CursorAgentNodeCommand(ephemeral), false)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', ephemeral), true)
+
+    const launcher =
+      'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\devspec\\launch-cli-session.mjs --folder x'
+    assert.equal(isWin32CursorAgentNodeCommand(launcher), false)
   })
 
   it('explicit valid non-shell arg wins (mocked name lookup)', () => {
@@ -553,6 +580,48 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
         },
       }),
       555,
+    )
+  })
+
+  it('explicit cursor-agent node.exe wins; plain/ephemeral node falls through (item c57dc381)', () => {
+    if (process.platform !== 'win32') {
+      assert.equal(
+        resolveOwnerPid(10804, 999, {
+          processNameOf: () => 'node.exe',
+          processCommandLineOf: () => 'C:\\x\\cursor-agent\\versions\\1\\index.js',
+          resolveAuto: () => 777,
+        }),
+        10804,
+      )
+      return
+    }
+    assert.equal(
+      resolveOwnerPid(10804, 999, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () =>
+          '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" "C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js"',
+        resolveAuto: () => {
+          throw new Error('auto should not run')
+        },
+      }),
+      10804,
+    )
+    assert.equal(
+      resolveOwnerPid(31240, 999, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () =>
+          'node.exe C:\\ext\\hooks\\scripts\\remote-control-state.mjs ensure-poller',
+        resolveAuto: () => 777,
+      }),
+      777,
+    )
+    assert.equal(
+      resolveOwnerPid(31240, 999, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () => 'node.exe C:\\proj\\vitest.mjs',
+        resolveAuto: () => null,
+      }),
+      999,
     )
   })
 
@@ -607,4 +676,32 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
     const found = resolveOwnerPidAutoWindows(process.pid)
     assert.ok(found === null || (Number.isInteger(found) && found > 1))
   })
+
+  it(
+    'resolveOwnerPidAutoWindows recognizes a live cursor-agent node.exe host (item c57dc381)',
+    { skip: process.platform !== 'win32' },
+    () => {
+      // Prefer a real cursor-agent process on this machine; skip when none are running
+      // (CI / bare runners) so the suite stays deterministic.
+      let startPid = null
+      try {
+        const out = execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -notmatch 'remote-control-state|launch-cli-session' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
+          ],
+          { encoding: 'utf8', timeout: 8000, windowsHide: true },
+        ).trim()
+        const n = Number.parseInt(out, 10)
+        if (Number.isInteger(n) && n > 1) startPid = n
+      } catch {
+        /* no host */
+      }
+      if (startPid == null) return
+      assert.equal(resolveOwnerPidAutoWindows(startPid), startPid)
+    },
+  )
 })
