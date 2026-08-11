@@ -46,7 +46,7 @@ Cursor has no Claude-style persistent Monitor for session-scoped stdout wakes. E
 
 Working (dots / logo spinner) is driven by connection activity + busy, seeded by the per-connection `.turn` marker the poller writes on owner-command delivery.
 
-**Work-trail bubble (OpenCode parity):** while attached, the plugin posts `phase: "trail"` mechanically — seed `"Working…"` on `user_prompt`, then grow via mid-turn hooks (`postToolUse`, shell, file edit, MCP, optional `afterAgentThought`). The live bubble collapses under **Show work** when the model posts `phase: "answer"` with `complete_turn: true`. Do **not** rely on the model to push trail text; CLI often skips thought/response hooks — tool-level hooks are the reliable path.
+**Work-trail bubble (OpenCode parity):** while attached, the plugin posts `phase: "trail"` mechanically — seed `"Working…"` on `user_prompt` **and** on remote owner-command delivery in `devspec-remote-poll` (phone/web wakes never hit Cursor's user_prompt hook), then grow via mid-turn hooks (`postToolUse`, shell, file edit, MCP, optional `afterAgentThought`). The live bubble collapses under **Show work** when the model posts `phase: "answer"` with `complete_turn: true`. Do **not** rely on the model to push trail text; CLI often skips thought/response hooks — tool-level hooks are the reliable path.
 
 | Path | When | Clears Working? |
 |---|---|---|
@@ -102,7 +102,9 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end; attachment materialisation)
 - `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher — also dispatches trail modes)
 - `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — seeds trail; Stop clears turn + trail state + `report_complete` when hooks fire)
+- `hooks/scripts/seed-work-trail.mjs` (shared `phase=trail` Working… seed used by mirror + poller)
 - `hooks/scripts/trail-turn.mjs` (mid-turn `phase=trail` posts)
+- `hooks/scripts/devspec-remote-poll.mjs` (seeds trail on attached owner-command delivery before wake)
 - `hooks/scripts/work-trail.mjs` (throttle / render / transcript helpers)
 - `hooks/scripts/remote-control-state.mjs`
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)

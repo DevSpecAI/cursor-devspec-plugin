@@ -22,12 +22,8 @@ import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
-import {
-  TRAIL_SEED_TEXT,
-  advanceTrailState,
-  clearTrailState,
-  writeTrailState,
-} from './work-trail.mjs'
+import { clearTrailState } from './work-trail.mjs'
+import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -371,34 +367,15 @@ async function main() {
 
     // Seed the live work-trail bubble when attached (OpenCode parity). Mid-turn
     // hooks grow it; the model's phase=answer + complete_turn collapses it.
+    // Shared with the poller's remote-wake seed (phone/web never hits user_prompt).
     if (mode === 'user_prompt' && sessionId && connectionId && !skipMirror) {
       try {
-        const advanced = advanceTrailState({
-          prev: null,
-          part: TRAIL_SEED_TEXT,
-          mode: 'seed',
+        await seedWorkTrailForConnection({
+          connectionId,
+          mcpUrl,
+          token,
+          agentName,
         })
-        if (advanced?.shouldPost) {
-          writeTrailState(connectionId, {
-            cumulative: advanced.nextState.cumulative,
-            lastPostedHash: advanced.nextState.lastPostedHash,
-            lastPostedAt: advanced.nextState.lastPostedAt,
-            updatedAt: advanced.nextState.updatedAt,
-          })
-          await mcpToolsCall({
-            mcpUrl,
-            token,
-            name: 'post_session_message',
-            arguments: {
-              connection_id: connectionId,
-              message: TRAIL_SEED_TEXT,
-              agent_name: agentName,
-              turn_kind: 'agent',
-              phase: 'trail',
-            },
-            timeoutMs: 15_000,
-          })
-        }
       } catch {
         /* non-fatal — final answer path still works without a trail seed */
       }
