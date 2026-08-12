@@ -17,6 +17,8 @@ describe('REMOTE_CONTROL_STORY_PHASES', () => {
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('poll_error'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('stall'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('wake'))
+    assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('create_chat'))
+    assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('wait_armed'))
   })
 })
 

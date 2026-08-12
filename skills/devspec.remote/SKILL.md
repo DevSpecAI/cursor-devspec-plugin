@@ -62,10 +62,10 @@ Call `devspec__list_projects` with `git_remote` from `git remote get-url origin`
 ### 3. Resolve local conversation id (bond key)
 
 ```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Cursor"
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Cursor" [--launch-id "<launch_id>"]
 ```
 
-Prefers `CURSOR_CONVERSATION_ID` (Cursor IDE Agent / `cursor-agent`). Keep `local_id` in working memory; pass `--local-id` on every subsequent call.
+Prefers `CURSOR_CONVERSATION_ID` (Cursor IDE Agent / `cursor-agent`). Keep `local_id` in working memory; pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass that same id as `--launch-id` on resolve/register/attach/write/wait so Axiom can join launcher + connect phases.
 
 ### 4. Decide the action, then register the connection
 
@@ -83,18 +83,27 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local \
 | `register` | Register a fresh **sessionless** connection. |
 | `create_and_attach` | `--new`: create a session, then attach. |
 
-Then **register the connection** (idempotent on the conversation bond — returns the same `connection_id` if already live):
+Then **register the connection** via the Node-measured helper (preferred — emits Axiom `connect_phase` timings; item 383de0cd). Fall back to the MCP tool only if the helper is missing:
 
-```
-devspec__register_connection({ project_id, local_id: "<local_id>", agent_name: "Cursor", machine_hostname?, cwd?, name?: "<--name value, only if the user passed one>" })
+```bash
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" register \
+  --local-id "<local_id>" --project-id "<project_id>" --agent "Cursor" \
+  --cwd "$(pwd)" [--git-remote "<url>"] [--codename "<--name>"] [--launch-id "<launch_id>"]
 ```
 
-Store the returned **`connection_id`** (full UUID) **and the returned `codename`** — this agent's own adjective-animal identity (e.g. `Brave Otter`), auto-minted server-side so two of your Cursor agents are never confused. If `--name "…"` was passed, that becomes the codename instead. **Tell the user which agent this terminal is** (see the status block), so a phone/web driver can pick the right one.
+Or MCP: `devspec__register_connection({ project_id, local_id: "<local_id>", agent_name: "Cursor", machine_hostname?, cwd?, name?: "<--name value, only if the user passed one>" })`
+
+Store the returned **`connection_id`** (full UUID) **and the returned `codename`** — this agent's own adjective-animal identity (e.g. `Brave Otter`), auto-minted server-side so two of your Cursor agents are never confused. If `--name "…"` was passed, that becomes the codename instead. **Tell the user which agent this terminal is** (see the status block), so a phone/web driver can pick the right one. Apply any instruction tiers returned in the JSON (`owner_*` / `project_*`).
 
 Now handle the session attachment by invocation:
 - **bare** → nothing more; the connection is available and sessionless.
-- **`--session <uuid>`** → `devspec__attach_connection({ connection_id, session_id: <uuid> })`.
-- **`--new`** → `devspec__create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Cursor", project_id, title?, initial_message? })`, then `devspec__attach_connection({ connection_id, session_id })`.
+- **`--session <uuid>`** → prefer Node-measured attach:
+  ```bash
+  node "$PLUGIN/hooks/scripts/remote-control-state.mjs" attach \
+    --connection-id "<connection_id>" --session "<uuid>" [--launch-id "<launch_id>"]
+  ```
+  Or MCP: `devspec__attach_connection({ connection_id, session_id: <uuid> })`.
+- **`--new`** → `devspec__create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Cursor", project_id, title?, initial_message? })`, then attach as above.
 
 Never scan by cwd. Other agents' files under `~/.devspec` are irrelevant.
 
@@ -125,6 +134,7 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
   --cwd "$(pwd)" \
   --local-id '<local_id>' \
   --owner-pid "$PPID" \
+  [--launch-id '<launch_id>'] \
   [--codename '<session_codename if any>'] [--title '<title>']
 ```
 
@@ -176,7 +186,7 @@ The poller (no LLM tokens while idle) runs **one long-poll** (`poll_connection`)
 
 ```bash
 # FIRST arm only (just connected) — skip historical inbox:
-node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --from-end
+node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --from-end [--launch-id "<launch_id>"]
 
 # EVERY re-arm after finishing this wake's reply — MUST use --pending so owner
 # commands that arrived while you were mid-turn are not skipped, AND --after-reply

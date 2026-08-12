@@ -109,6 +109,13 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.ok(stamped.includes('\n'))
   })
 
+  it('buildStampedPromptBody can stamp launch_id for Axiom phase join (item 383de0cd)', () => {
+    const stamped = buildStampedPromptBody('hi', 'chat-1', { launchId: 'launch-uuid-1' })
+    assert.ok(stamped.includes(stampLine('chat-1')))
+    assert.ok(stamped.includes('DevSpec launch_id for this run'))
+    assert.ok(stamped.includes('launch-uuid-1'))
+  })
+
   it('resolveStampedPromptPath colocates beside the launch prompt file', () => {
     const promptFile = path.join(
       os.homedir(),

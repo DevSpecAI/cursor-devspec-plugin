@@ -14,6 +14,12 @@ import fsPromises from 'node:fs/promises'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
+import {
+  durationMs,
+  emitConnectPhase,
+  newLaunchId,
+} from '../hooks/scripts/connect-phase-timing.mjs'
+import { resolveDevspecMcpAuth } from '../hooks/scripts/resolve-mcp-auth.mjs'
 
 function parseArgs(argv) {
   const out = {}
@@ -32,18 +38,33 @@ export function stampLine(sessionId) {
 }
 
 /**
+ * Correlate launcher + connect Axiom phase rows (item 383de0cd).
+ * @param {string} launchId
+ * @returns {string}
+ */
+export function launchIdStampLine(launchId) {
+  return `DevSpec launch_id for this run (pass --launch-id on remote-control-state / wait): ${launchId}`
+}
+
+/**
  * Full multiline prompt written to disk for the agent to read.
  * Never put this on argv — remote-control embeds (~28KB SKILL.md with YAML
  * `---`) and Windows/PowerShell argv forwarding turns a bare `---` into
  * `error: unknown option '---'` (session aa5090bc / item e949305f).
  * @param {string} expandedBody
  * @param {string} chatId
+ * @param {{ launchId?: string | null }} [opts]
  * @returns {string}
  */
-export function buildStampedPromptBody(expandedBody, chatId) {
+export function buildStampedPromptBody(expandedBody, chatId, opts = {}) {
   const stamp = stampLine(chatId)
+  const launchStamp =
+    typeof opts.launchId === 'string' && opts.launchId.trim()
+      ? launchIdStampLine(opts.launchId.trim())
+      : null
+  const footer = launchStamp ? `${stamp}\n${launchStamp}` : stamp
   const body = typeof expandedBody === 'string' ? expandedBody.trim() : ''
-  return body ? `${body}\n\n${stamp}\n` : `${stamp}\n`
+  return body ? `${body}\n\n${footer}\n` : `${footer}\n`
 }
 
 /**
@@ -286,6 +307,14 @@ async function main() {
   }
 
   const agentBin = args.agent || 'agent'
+  const launchId = newLaunchId()
+  const auth = resolveDevspecMcpAuth(args.folder)
+  const timingCtx = {
+    launch_id: launchId,
+    agent: 'Cursor',
+    mcpUrl: auth.mcp_url || null,
+  }
+
   let promptBody
   try {
     promptBody = (await fsPromises.readFile(args.promptFile, 'utf8')).trim()
@@ -295,10 +324,18 @@ async function main() {
     return
   }
 
-  console.log('[devspec-cli] Creating Cursor CLI chat…')
+  console.log(`[devspec-cli] Creating Cursor CLI chat… (launch_id=${launchId})`)
+  const createStarted = Date.now()
   const created = spawnAgentSync(agentBin, ['create-chat'], {
     cwd: args.folder,
     encoding: 'utf8',
+  })
+  await emitConnectPhase({
+    ...timingCtx,
+    phase: 'create_chat',
+    outcome: created.status === 0 ? 'ok' : 'error',
+    duration_ms: durationMs(createStarted),
+    reason: created.status === 0 ? null : `exit_${created.status || 1}`,
   })
   if (created.status !== 0) {
     console.error(
@@ -322,20 +359,43 @@ async function main() {
 
   // Belt-and-suspenders: open-handler usually expands already, but re-run here
   // so a direct CLI invoke still gets PLUGIN= + skill body (item 57d8b288).
+  const expandStarted = Date.now()
   const expandedBody = expandRemoteControlLaunchPrompt(promptBody) ?? promptBody
+  await emitConnectPhase({
+    ...timingCtx,
+    phase: 'expand_stamp',
+    outcome: 'ok',
+    duration_ms: durationMs(expandStarted),
+    extra: { stamp_chars: String(expandedBody || '').length },
+  })
 
   // Write the full expanded+stamped prompt to disk; pass only a short argv
   // pointer. Embedding SKILL.md (with YAML ---) on argv broke Windows launches
   // with `unknown option '---'` (item e949305f).
-  const stampedBody = buildStampedPromptBody(expandedBody, chatId)
+  const stampedBody = buildStampedPromptBody(expandedBody, chatId, { launchId })
   const stampedPath = resolveStampedPromptPath(args.promptFile, chatId)
+  const writeStarted = Date.now()
   try {
     await fsPromises.writeFile(stampedPath, stampedBody, 'utf8')
   } catch (err) {
+    await emitConnectPhase({
+      ...timingCtx,
+      phase: 'write_stamp',
+      outcome: 'error',
+      duration_ms: durationMs(writeStarted),
+      reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+    })
     console.error(`[devspec-cli] could not write stamped prompt file: ${err}`)
     process.exitCode = 1
     return
   }
+  await emitConnectPhase({
+    ...timingCtx,
+    phase: 'write_stamp',
+    outcome: 'ok',
+    duration_ms: durationMs(writeStarted),
+    extra: { stamp_chars: stampedBody.length },
+  })
   const argvPrompt = buildShortArgvPrompt(stampedPath)
   console.log(`[devspec-cli] Stamped prompt → ${stampedPath} (${stampedBody.length} chars; argv ${argvPrompt.length} chars)`)
 
@@ -348,14 +408,29 @@ async function main() {
   console.log(
     `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} model=${args.model || 'auto'} invoke=${inv.mode})`,
   )
+  const spawnStarted = Date.now()
   const child = spawnAgent(
     agentBin,
     ['--resume', chatId, '--workspace', args.folder, ...policyFlags, argvPrompt],
     {
       cwd: args.folder,
       stdio: 'inherit',
+      env: {
+        ...process.env,
+        DEVSPEC_LAUNCH_ID: launchId,
+        CURSOR_CONVERSATION_ID: process.env.CURSOR_CONVERSATION_ID || chatId,
+      },
     },
   )
+  // Spawn itself is synchronous; duration covers resolve + process create.
+  await emitConnectPhase({
+    ...timingCtx,
+    phase: 'agent_spawn',
+    outcome: 'ok',
+    duration_ms: durationMs(spawnStarted),
+    local_id: chatId,
+    extra: { invoke_mode: inv.mode, chat_id: chatId },
+  })
 
   child.on('error', (err) => {
     console.error(`[devspec-cli] failed to start agent: ${err}`)

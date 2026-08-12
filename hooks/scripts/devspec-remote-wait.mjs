@@ -46,6 +46,11 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import {
+  durationMs,
+  emitConnectPhase,
+  resolveLaunchId,
+} from './connect-phase-timing.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -183,6 +188,7 @@ function parseArgs(argv) {
       out.afterReply = true
     } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
     else if (a === '--owner-pid') out.ownerPid = argv[++i]
+    else if (a === '--launch-id' || a === '--launch_id') out.launchId = argv[++i]
   }
   return out
 }
@@ -613,6 +619,7 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
 }
 
 async function main() {
+  const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
   const connectionId = args.connectionId
   if (!connectionId) {
@@ -670,6 +677,22 @@ async function main() {
   process.stderr.write(
     `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
   )
+
+  // First connect arm only — mid-turn --pending re-arms are not cold-launch phases.
+  if (args.fromEnd && !args.pending) {
+    await emitConnectPhase({
+      phase: 'wait_armed',
+      outcome: 'ok',
+      duration_ms: durationMs(armStarted),
+      launch_id: resolveLaunchId(args.launchId),
+      connectionId,
+      sessionId: state?.session_id || null,
+      local_id: state?.local_id || null,
+      agent: state?.agent_name || AGENT_NAME,
+      mcpUrl: state?.mcp_url || null,
+      extra: { from_end: true, offset },
+    })
+  }
 
   while (Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)

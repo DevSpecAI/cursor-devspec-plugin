@@ -133,20 +133,38 @@ Fragile remote sessions are debugged from two places that share one phase vocabu
 | Source | Where | What |
 |---|---|---|
 | **Axiom (server)** | DevSpec MCP tool logs | `msg == "Remote-control story"` with `connectionId`, `sessionId`, `data.phase`, `data.outcome`, `reason` |
+| **Axiom (client phases)** | Plugin POST `/api/log` | Same message; payload under `['data']['client']` with `kind == "connect_phase"`, `duration_ms`, `launch_id` (item 383de0cd) |
 | **Local poll.log** | `~/.devspec/remote-control/connections/<connection_id>.poll.log` | Poller stderr/stdout (spawn redirect). Structured lines prefixed `story ` plus human poller messages. Kept for offline debug. |
 
-**Shared phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
+**Shared lifecycle phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
 
-Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
+**Cold-launch / connect timing phases** (Node-measured): `create_chat` · `expand_stamp` · `write_stamp` · `agent_spawn` · `resolve_local_id` · `resolve_local` · `register_connection` · `attach_connection` · `write_state` · `wait_armed`
 
-**Axiom recipe** (dataset `devspec`):
+Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). Launcher + connect timings ship via `connect-phase-timing.mjs` → `/api/log`. The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
+
+**Axiom recipe** — connection lifecycle (dataset `devspec`):
 
 ```
 ['devspec']
-| where msg == "Remote-control story"
-| where connectionId == "<connection-uuid>"
+| where message == "Remote-control story" or ['data']['client']['kind'] == "connect_phase"
+| where connectionId == "<connection-uuid>" or ['data']['client']['connectionId'] == "<connection-uuid>"
 | sort by _time asc
-| project _time, ['data.phase'], ['data.outcome'], reason, sessionId, ['data.agent'], ['data.tool']
+| project _time, message, source, ['data'], connectionId, sessionId
+```
+
+**Axiom recipe** — one cold launch timeline by `launch_id`:
+
+```
+['devspec']
+| where ['data']['client']['kind'] == "connect_phase"
+| where ['data']['client']['launch_id'] == "<launch-uuid>"
+| sort by _time asc
+| project _time,
+    phase = ['data']['client']['phase'],
+    outcome = ['data']['client']['outcome'],
+    duration_ms = toint(['data']['client']['duration_ms']),
+    connectionId = ['data']['client']['connectionId'],
+    local_id = ['data']['client']['local_id']
 ```
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.

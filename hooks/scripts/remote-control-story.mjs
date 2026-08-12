@@ -23,6 +23,17 @@ export const REMOTE_CONTROL_STORY_PHASES = [
   'poll_error',
   'stall',
   'ended',
+  // Cold-launch / connect timing (item 383de0cd) — also emitted via /api/log.
+  'create_chat',
+  'expand_stamp',
+  'write_stamp',
+  'agent_spawn',
+  'resolve_local_id',
+  'resolve_local',
+  'register_connection',
+  'attach_connection',
+  'write_state',
+  'wait_armed',
 ]
 
 /**

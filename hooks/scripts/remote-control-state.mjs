@@ -46,6 +46,13 @@
  *   node remote-control-state.mjs resolve-local --agent "Cursor" [--local-id <id>]
  *       [--max-age-minutes 30] [--force-new]
  *     → action: already_live | reconnect | register | create_and_attach
+ *   node remote-control-state.mjs register --local-id <id> --project-id <uuid>
+ *       [--agent "Cursor"] [--cwd <path>] [--codename "…"] [--hostname <host>]
+ *       [--git-remote <url>] [--launch-id <uuid>]
+ *     → Node-measured register_connection (item 383de0cd)
+ *   node remote-control-state.mjs attach --connection-id <uuid> --session <uuid>
+ *       [--launch-id <uuid>]
+ *     → Node-measured attach_connection
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -58,6 +65,12 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
+import {
+  durationMs,
+  emitConnectPhase,
+  resolveLaunchId,
+} from './connect-phase-timing.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
@@ -121,6 +134,14 @@ function parseArgs(argv) {
       out.noPoller = true
     } else if (a === '--force-new' || a === '--new') {
       out.forceNew = true
+    } else if (a === '--launch-id' || a === '--launch_id') {
+      out['launch-id'] = argv[++i]
+    } else if (a === '--project-id' || a === '--project_id') {
+      out['project-id'] = argv[++i]
+    } else if (a === '--git-remote' || a === '--git_remote') {
+      out['git-remote'] = argv[++i]
+    } else if (a === '--hostname' || a === '--machine-hostname' || a === '--machine_hostname') {
+      out.hostname = argv[++i]
     } else out._.push(a)
   }
   return out
@@ -937,8 +958,16 @@ const isMain =
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
 if (isMain) {
+  void runCli().catch((err) => {
+    process.stderr.write(`remote-control-state: ${err?.message || err}\n`)
+    process.exit(1)
+  })
+}
+
+async function runCli() {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
+  const launchId = resolveLaunchId(args['launch-id'])
 
   if (cmd === 'resolve-auth') {
     const hostToken =
@@ -1053,28 +1082,39 @@ if (isMain) {
   }
 
   if (cmd === 'resolve-local-id') {
+    const started = Date.now()
     const detected = detectLocalId(args, process.env)
+    const cwd = args.cwd || process.cwd()
+    const auth = resolveDevspecMcpAuth(cwd)
+    let payload
     if (detected.local_id) {
-      process.stdout.write(
-        JSON.stringify({
-          ok: true,
-          local_id: detected.local_id,
-          source: detected.source,
-          minted: false,
-        }) + '\n',
-      )
-      process.exit(0)
-    }
-    const id = mintLocalId()
-    process.stdout.write(
-      JSON.stringify({
+      payload = {
+        ok: true,
+        local_id: detected.local_id,
+        source: detected.source,
+        minted: false,
+      }
+    } else {
+      const id = mintLocalId()
+      payload = {
         ok: true,
         local_id: id,
         source: 'minted',
         minted: true,
         note: 'No conversation id in env. Hold this local_id in working memory for the rest of this agent chat; pass --local-id on every remote-control-state call.',
-      }) + '\n',
-    )
+      }
+    }
+    await emitConnectPhase({
+      phase: 'resolve_local_id',
+      outcome: 'ok',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      local_id: payload.local_id,
+      agent: args.agent || AGENT_NAME,
+      mcpUrl: auth.mcp_url || null,
+      extra: { local_id_source: payload.source, minted: payload.minted },
+    })
+    process.stdout.write(JSON.stringify(payload) + '\n')
     process.exit(0)
   }
 
@@ -1123,6 +1163,7 @@ if (isMain) {
 
   if (cmd === 'resolve-local' || cmd === 'find-reconnect') {
     // find-reconnect is a deprecated alias — same bond-scoped logic, never cwd scan.
+    const started = Date.now()
     const agentName = args.agent || AGENT_NAME
     const detected = detectLocalId(args, process.env)
     const localId = detected.local_id
@@ -1158,6 +1199,20 @@ if (isMain) {
           ]
         : []
     result.rejected = { no_local_id: !localId ? 1 : 0, cwd_scan_removed: 1 }
+
+    const auth = resolveDevspecMcpAuth(result.cwd)
+    await emitConnectPhase({
+      phase: 'resolve_local',
+      outcome: 'ok',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      local_id: localId || result.local_id || null,
+      connectionId: result.connection_id || null,
+      sessionId: result.session_id || null,
+      agent: agentName,
+      mcpUrl: auth.mcp_url || null,
+      extra: { action: result.action },
+    })
 
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(0)
@@ -1271,6 +1326,7 @@ if (isMain) {
   }
 
   if (cmd === 'write') {
+    const writeStarted = Date.now()
     const connectionId = args['connection-id']
     if (!connectionId) {
       process.stderr.write(
@@ -1399,8 +1455,199 @@ if (isMain) {
       result.poller = { ok: true, skipped: true, reason: 'no-poller' }
     }
 
+    await emitConnectPhase({
+      phase: 'write_state',
+      outcome: state.auth_ok ? 'ok' : 'error',
+      duration_ms: durationMs(writeStarted),
+      launch_id: launchId,
+      local_id: localId || null,
+      connectionId,
+      sessionId,
+      agent: agentName,
+      mcpUrl: state.mcp_url || auth.mcp_url || null,
+      reason: state.auth_ok ? null : auth.error || 'auth_failed',
+      extra: {
+        poller_started: !!(result.poller && result.poller.ok && !result.poller.skipped),
+        auth_ok: !!state.auth_ok,
+      },
+    })
+
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(state.auth_ok ? 0 : 1)
+  }
+
+  if (cmd === 'register') {
+    const started = Date.now()
+    const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
+    const localId = detectLocalId(args, process.env).local_id
+    const projectId = typeof args['project-id'] === 'string' ? args['project-id'].trim() : ''
+    if (!localId || !projectId) {
+      process.stderr.write(
+        'Usage: remote-control-state.mjs register --local-id <id> --project-id <uuid> [--git-remote <url>] [--launch-id <uuid>]\n',
+      )
+      process.exit(2)
+    }
+    const hostToken =
+      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+        ? args['host-token'].trim()
+        : null) || hostTokenFromEnv(process.env)
+    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
+    if (!auth.ok || !auth.token || !auth.mcp_url) {
+      await emitConnectPhase({
+        phase: 'register_connection',
+        outcome: 'error',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        local_id: localId,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url || null,
+        reason: auth.error || 'auth_failed',
+      })
+      process.stdout.write(JSON.stringify({ ok: false, error: auth.error || 'auth_failed' }) + '\n')
+      process.exit(1)
+    }
+    const toolArgs = {
+      local_id: localId,
+      project_id: projectId,
+      agent_name: args.agent || AGENT_NAME,
+      cwd,
+      machine_hostname: args.hostname || os.hostname(),
+    }
+    if (typeof args.codename === 'string' && args.codename.trim()) {
+      toolArgs.codename = args.codename.trim()
+    }
+    if (typeof args['git-remote'] === 'string' && args['git-remote'].trim()) {
+      toolArgs.git_remote = args['git-remote'].trim()
+    }
+    try {
+      const result = await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'register_connection',
+        arguments: toolArgs,
+        timeoutMs: 60_000,
+      })
+      const connectionId = result?.connection_id || result?.connectionId || null
+      await emitConnectPhase({
+        phase: 'register_connection',
+        outcome: connectionId ? 'ok' : 'error',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        local_id: localId,
+        connectionId,
+        sessionId: result?.session_id || null,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url,
+        extra: {
+          created: !!result?.created,
+          codename: result?.codename || result?.session_codename || null,
+        },
+      })
+      process.stdout.write(
+        JSON.stringify({
+          ok: !!connectionId,
+          ...result,
+          connection_id: connectionId,
+          local_id: localId,
+          launch_id: launchId,
+        }, null, 2) + '\n',
+      )
+      process.exit(connectionId ? 0 : 1)
+    } catch (err) {
+      await emitConnectPhase({
+        phase: 'register_connection',
+        outcome: 'error',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        local_id: localId,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url,
+        reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+      })
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }) + '\n',
+      )
+      process.exit(1)
+    }
+  }
+
+  if (cmd === 'attach') {
+    const started = Date.now()
+    const connectionId = args['connection-id']
+    const sessionId = args.session
+    if (!connectionId || !sessionId) {
+      process.stderr.write(
+        'Usage: remote-control-state.mjs attach --connection-id <uuid> --session <uuid> [--launch-id <uuid>]\n',
+      )
+      process.exit(2)
+    }
+    const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
+    const hostToken =
+      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+        ? args['host-token'].trim()
+        : null) || hostTokenFromEnv(process.env)
+    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
+    if (!auth.ok || !auth.token || !auth.mcp_url) {
+      await emitConnectPhase({
+        phase: 'attach_connection',
+        outcome: 'error',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        connectionId,
+        sessionId,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url || null,
+        reason: auth.error || 'auth_failed',
+      })
+      process.stdout.write(JSON.stringify({ ok: false, error: auth.error || 'auth_failed' }) + '\n')
+      process.exit(1)
+    }
+    try {
+      const result = await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'attach_connection',
+        arguments: { connection_id: connectionId, session_id: sessionId },
+        timeoutMs: 60_000,
+      })
+      await emitConnectPhase({
+        phase: 'attach_connection',
+        outcome: 'ok',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        connectionId: result?.connection_id || connectionId,
+        sessionId: result?.session_id || sessionId,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url,
+        extra: { reattached: !!result?.reattached },
+      })
+      process.stdout.write(
+        JSON.stringify({ ok: true, ...result, launch_id: launchId }, null, 2) + '\n',
+      )
+      process.exit(0)
+    } catch (err) {
+      await emitConnectPhase({
+        phase: 'attach_connection',
+        outcome: 'error',
+        duration_ms: durationMs(started),
+        launch_id: launchId,
+        connectionId,
+        sessionId,
+        agent: args.agent || AGENT_NAME,
+        mcpUrl: auth.mcp_url,
+        reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+      })
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }) + '\n',
+      )
+      process.exit(1)
+    }
   }
 
   process.stderr.write(`Unknown command: ${cmd}\n`)
