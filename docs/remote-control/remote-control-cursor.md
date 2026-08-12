@@ -3,7 +3,36 @@
 **Family:** local-poller.  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
 **Plugin repo:** `cursor-devspec-plugin` (VSIX; hooks under `hooks/scripts/`).  
-**Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md` (re-arm, redeploy recovery, room tiers — deeper than this primer).
+**Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md` (manual Connect + post-Live; Agents launches use mechanical Connect + thin brief).
+
+## Cold Connect is mechanical (plugin-owned)
+
+On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no longer asks the model to walk `register_connection` / `attach_connection`. After `agent create-chat` and **before** `agent --resume`, Node runs **fast-connect**:
+
+1. Resolve `local_id` (chat id / `CURSOR_CONVERSATION_ID`)
+2. Resolve project (`git remote` + `list_projects`)
+3. `register_connection`
+4. `attach_connection` when the launch prompt has `--session <uuid>`
+5. Write connection state + auto-start poller
+6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + arm-wait / answer / re-arm) — **not** the full ~32k skill body
+
+The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). Do **not** re-register on a stamped “already Live” launch.
+
+**Invoke fast-connect manually:**
+
+```bash
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
+  --local-id "<chat-id>" \
+  [--session "<uuid>"] \
+  [--cwd "$(pwd)"] \
+  [--launch-id "<uuid>"] \
+  [--project-id "<uuid>"] \
+  [--prompt-file path/to/launch.prompt.txt]
+```
+
+JSON stdout: `connection_id`, `session_id`, `codename`, `local_id`, `launch_id`.
+
+Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `resolve-local` → `already_live` (re-arm only) or the Node `register` / `attach` helpers when cold.
 
 ## How a message reaches Cursor
 
@@ -74,14 +103,14 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 
 | Topic | Cursor |
 |---|---|
-| Invoke remote | `devspec.remote` skill / Agent prompt (IDE) |
+| Invoke remote | Agents launch: mechanical fast-connect + thin brief. Manual: `devspec.remote` skill / Agent prompt (IDE) |
 | Bond id | Prefer `CURSOR_CONVERSATION_ID` or explicit `--local-id`; shell often lacks it — do not silently mint then lose the bond |
 | Token | Plugin-owned `resolve-mcp-auth.mjs` — lookup order: env → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → walk `.mcp.json` (not Claude plugin env) |
 | Agent name | `AGENT_NAME = 'Cursor'` |
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe` / `claude.exe`, or `node.exe` hosting `cursor-agent` (Cursor CLI often has no `agent.exe` — item c57dc381). **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
 | Mirror / trail hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
 | CLI trail feed | Cursor Agents CLI (`agent --resume`) often **does not** invoke mid-turn hooks. On attached owner-command pickup the poller starts `cli-trail-watch.mjs`, which tails `~/.cursor/projects/*/agent-transcripts/<local_id>/<local_id>.jsonl` and posts throttled `phase=trail` until the turn marker clears. Hook path stays for IDE; transcript watcher is the CLI-safe path (item 63f3db87). |
-| PLUGIN pin (Agents launch) | Cold Agents launches stamp `PLUGIN=<extension-root>` into the prompt via `scripts/pin-remote-plugin.mjs` (also copied to stable `~/.cursor/devspec/pin-remote-plugin.mjs`). Resolution uses **semver** (`parseExtensionVersion` / `compareSemverTuples`) — never lexicographic folder sort (`0.4.9` wrongly beat `0.4.14` before item `0688ff96`). |
+| PLUGIN pin (Agents launch) | Cold Agents launches stamp `PLUGIN=<extension-root>` via `scripts/pin-remote-plugin.mjs` (also copied to stable `~/.cursor/devspec/pin-remote-plugin.mjs`). Resolution uses **semver** (`parseExtensionVersion` / `compareSemverTuples`) — never lexicographic folder sort (`0.4.9` wrongly beat `0.4.14` before item `0688ff96`). Connect stamps a **thin post-Live brief**, not the full skill. |
 
 ## What not to change lightly
 
@@ -93,6 +122,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Pointing hooks.json at `…/extensions/devspecai.devspec-autopilot-<version>/…` (dies on every VSIX bump).
 - Sorting installed extensions by folder-name string order when picking PLUGIN (pins stale patch versions).
 - Assuming CLI mid-turn hooks fire because IDE hooks do — always keep the transcript watcher for Agents attaches.
+- Re-introducing LLM-walked register/attach on cold Agents Connect (mechanical fast-connect owns that).
 
 ## Failure modes
 
@@ -108,9 +138,13 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
 - Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
 - Ignoring `attachments[].path` on `owner_message` → miss screenshots/docs the owner sent with the command.
+- Fast-connect abort (auth / project / register / attach / poller) → launcher exits **before** `--resume` (no half-Live agent).
 
 ## Key files
 
+- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect** → thin stamp → `--resume`)
+- `hooks/scripts/fast-connect.mjs` (mechanical Connect orchestrator)
+- `scripts/pin-remote-plugin.mjs` (PLUGIN= + thin post-Live brief)
 - `hooks/scripts/devspec-remote-poll.mjs`
 - `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end; attachment materialisation)
 - `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher — also dispatches trail modes)
@@ -119,11 +153,11 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/trail-turn.mjs` (mid-turn `phase=trail` posts)
 - `hooks/scripts/cli-trail-watch.mjs` (CLI transcript-tail trail; started by poller on pickup)
 - `hooks/scripts/post-trail-from-transcript.mjs` (shared transcript → phase=trail poster)
-- `hooks/scripts/devspec-remote-poll.mjs` (seeds trail on attached owner-command delivery before wake)
 - `hooks/scripts/work-trail.mjs` (throttle / render / transcript helpers)
-- `hooks/scripts/remote-control-state.mjs`
+- `hooks/scripts/remote-control-state.mjs` (`register` / `attach` / `write` / `fast-connect`)
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)
 - `hooks/scripts/agent-identity.mjs`
+- `hooks/scripts/connect-phase-timing.mjs` (dense `connect_phase` → Axiom)
 - `hooks/scripts/remote-control-story.mjs` (shared phase vocabulary + local `story ` emitter)
 
 ## Logging — reconstructing a connection story
@@ -133,12 +167,12 @@ Fragile remote sessions are debugged from two places that share one phase vocabu
 | Source | Where | What |
 |---|---|---|
 | **Axiom (server)** | DevSpec MCP tool logs | `msg == "Remote-control story"` with `connectionId`, `sessionId`, `data.phase`, `data.outcome`, `reason` |
-| **Axiom (client phases)** | Plugin POST `/api/log` | Same message; payload under `['data']['client']` with `kind == "connect_phase"`, `duration_ms`, `launch_id` (item 383de0cd) |
+| **Axiom (client phases)** | Plugin POST `/api/log` | Same message; payload under `['data']['client']` with `kind == "connect_phase"`, `duration_ms`, `launch_id` (item 383de0cd / mechanical Connect) |
 | **Local poll.log** | `~/.devspec/remote-control/connections/<connection_id>.poll.log` | Poller stderr/stdout (spawn redirect). Structured lines prefixed `story ` plus human poller messages. Kept for offline debug. |
 
 **Shared lifecycle phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
 
-**Cold-launch / connect timing phases** (Node-measured): `create_chat` · `expand_stamp` · `write_stamp` · `agent_spawn` · `resolve_local_id` · `resolve_local` · `register_connection` · `attach_connection` · `write_state` · `wait_armed`
+**Cold-launch / connect timing phases** (Node-measured): `create_chat` · `expand_stamp` / `skip_stamp` · `write_stamp` · `agent_resume` · `resolve_local_id` · `resolve_local` · `project_resolve` · `register_connection` · `attach_connection` · `write_state` · `ensure_poller` · `wait_armed`
 
 Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). Launcher + connect timings ship via `connect-phase-timing.mjs` → `/api/log`. The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
 
@@ -152,7 +186,7 @@ Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **
 | project _time, message, source, ['data'], connectionId, sessionId
 ```
 
-**Axiom recipe** — one cold launch timeline by `launch_id`:
+**Axiom recipe** — one cold launch timeline by `launch_id` (primary Connect debug):
 
 ```
 ['devspec']
@@ -164,7 +198,10 @@ Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **
     outcome = ['data']['client']['outcome'],
     duration_ms = toint(['data']['client']['duration_ms']),
     connectionId = ['data']['client']['connectionId'],
-    local_id = ['data']['client']['local_id']
+    local_id = ['data']['client']['local_id'],
+    reason = ['data']['client']['reason']
 ```
+
+The stamped prompt and launcher log print `launch_id=…` so you can paste that UUID into the filter. Expect a dense chain: `create_chat` → `project_resolve` → `register_connection` → optional `attach_connection` → `write_state` → `ensure_poller` → `expand_stamp` → `write_stamp` → `agent_resume` (then model-side `wait_armed`).
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.

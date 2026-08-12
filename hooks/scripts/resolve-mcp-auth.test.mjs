@@ -115,7 +115,17 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     const d = proj('urlonly')
     const c = path.join(d, '.cursor')
     fs.mkdirSync(c, { recursive: true })
-    fs.writeFileSync(path.join(c, 'mcp.json'), JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }))
+    fs.writeFileSync(
+      path.join(c, 'mcp.json'),
+      JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+    )
+    // Stop walkMcpJson from climbing into a real ancestor ~/.mcp.json that has a
+    // token (common on developer machines) — project .mcp.json with URL-only wins
+    // the walk without a bearer.
+    fs.writeFileSync(
+      path.join(d, '.mcp.json'),
+      JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+    )
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, false)
     assert.match(auth.error, /DevSpec: Set MCP token/)

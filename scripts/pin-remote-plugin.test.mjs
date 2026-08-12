@@ -9,10 +9,12 @@ import path from 'node:path'
 import { describe, it, before, after } from 'node:test'
 import {
   buildPluginPinBlock,
+  buildPostLiveRemoteBrief,
   expandRemoteControlLaunchPrompt,
   parseRemoteSkillIdFromPrompt,
   pinRemotePluginInPrompt,
   promptAlreadyHasPluginPin,
+  promptAlreadyHasPostLiveBrief,
   promptAlreadyHasSkillBody,
   promptNeedsRemotePluginPin,
   resolveCursorDevspecExtensionPath,
@@ -189,18 +191,71 @@ describe('expandRemoteControlLaunchPrompt', () => {
     assert.equal(parseRemoteSkillIdFromPrompt('Run the `devspec.work` skill'), null)
   })
 
-  it('embeds PLUGIN= and the Cursor skill body for cold attach prompts', () => {
+  it('embeds PLUGIN= but NOT the full Connect skill body (thin path)', () => {
     const prompt = 'Run the `devspec.remote` skill with this input: --session abc'
     const expanded = expandRemoteControlLaunchPrompt(prompt, { homeDir: tmpHome })
     assert.ok(expanded.startsWith(`PLUGIN=${extensionPath}`))
-    assert.ok(expanded.includes('Do NOT glob for the skill'))
-    assert.ok(expanded.includes('# DevSpec Remote Control'))
-    assert.ok(expanded.includes('Plugin root'))
-    assert.ok(expanded.includes('register_connection'))
-    assert.ok(promptAlreadyHasSkillBody(expanded, 'devspec.remote'))
+    assert.ok(expanded.includes('Do NOT glob for the skill') || expanded.includes('mechanical Connect'))
+    // Fat skill must NOT be embedded on cold expand — launch stamps post-Live after fast-connect.
+    assert.equal(expanded.includes('Call register_connection then attach_connection.'), false)
+    assert.equal(/#\s*DevSpec Remote Control\b/.test(expanded) && /Plugin root/i.test(expanded), false)
   })
 
-  it('does not double-embed when the skill body is already present', () => {
+  it('stamps thin post-Live brief when connect result is provided', () => {
+    const prompt =
+      'Run the `devspec.remote` skill with this input: --session 7e3afc79-abf4-48e4-ae33-aed27b00944d'
+    const expanded = expandRemoteControlLaunchPrompt(prompt, {
+      homeDir: tmpHome,
+      connect: {
+        connectionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        sessionId: '7e3afc79-abf4-48e4-ae33-aed27b00944d',
+        codename: 'Brave Otter',
+        localId: 'chat-1',
+        launchId: 'launch-1',
+      },
+    })
+    assert.ok(promptAlreadyHasPostLiveBrief(expanded))
+    assert.ok(expanded.includes('already Live'))
+    assert.ok(expanded.includes('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
+    assert.ok(expanded.includes('Brave Otter'))
+    assert.ok(expanded.includes('--from-end'))
+    assert.ok(expanded.includes('--pending --after-reply'))
+    assert.ok(expanded.includes('Do **NOT** call `register_connection`'))
+    assert.ok(expanded.length < 8_000, `thin brief too large: ${expanded.length}`)
+    assert.equal(expanded.includes('Call register_connection then attach_connection.'), false)
+    const brief = buildPostLiveRemoteBrief({
+      pluginPath: extensionPath,
+      connectionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      sessionId: '7e3afc79-abf4-48e4-ae33-aed27b00944d',
+      codename: 'Brave Otter',
+    })
+    assert.ok(brief.includes('already Live'))
+  })
+
+  it('still embeds stop skill body for remote-stop', () => {
+    fs.mkdirSync(path.join(extensionPath, 'skills', 'devspec.remote-stop'), { recursive: true })
+    fs.writeFileSync(
+      path.join(extensionPath, 'skills', 'devspec.remote-stop', 'SKILL.md'),
+      [
+        '---',
+        'name: devspec.remote-stop',
+        '---',
+        '',
+        '# DevSpec Remote Control — Stop',
+        '',
+        'Set end_reason and disable.',
+        '',
+      ].join('\n'),
+    )
+    const expanded = expandRemoteControlLaunchPrompt('Run the `devspec.remote-stop` skill.', {
+      homeDir: tmpHome,
+    })
+    assert.ok(expanded.includes('# DevSpec Remote Control — Stop'))
+    assert.ok(expanded.includes('end_reason'))
+  })
+
+  it('does not double-embed when the pin is already present', () => {
+    // Connect path is pin-only so re-expand is idempotent.
     const once = expandRemoteControlLaunchPrompt(
       'Run the `devspec.remote` skill with this input: --session abc',
       { homeDir: tmpHome },
@@ -209,3 +264,4 @@ describe('expandRemoteControlLaunchPrompt', () => {
     assert.equal(twice, once)
   })
 })
+

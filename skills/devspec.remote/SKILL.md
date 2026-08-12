@@ -16,6 +16,16 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 **Requirement:** the preferred remote-control path needs **Node.js 18+** (`node` on PATH) for the packaged poller scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens. Without Node, use the fallback in-agent poll loop (less reliable).
 
+## Prefer the fast path (read this first)
+
+| Situation | What to do |
+|---|---|
+| **Stamped “already Live” brief** (Agents launch / protocol handoff) | Mechanical Connect **already ran** in `launch-cli-session` (`fast-connect`). Bond IDs are in the prompt. **Do not** call `register_connection` / `attach_connection`. Arm wait with `--from-end`, handle owner commands, re-arm with `--pending --after-reply`. |
+| **`resolve-local` → `already_live`** | Re-arm wait only (attach only if `--session` changed). |
+| **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers (Axiom `connect_phase`). Fall back to MCP only if helpers are missing. |
+
+Cold **Agents** Connect does **not** need the LLM to walk register/attach — the launcher already did.
+
 ## Plugin root (non-negotiable)
 
 All poller / state scripts come from the **installed Cursor DevSpec extension** — never from Claude Code or marketplace caches.
@@ -46,7 +56,7 @@ All poller / state scripts come from the **installed Cursor DevSpec extension** 
 
 Never rejoin/attach a session because it shared a repo/cwd or another agent stopped recently. The bond is conversation-scoped (`CURSOR_CONVERSATION_ID` / local id), never cwd-scoped. Multiple terminals own independent connections.
 
-## Steps (do not invent alternatives)
+## Steps (manual cold Connect only — skip if already Live / stamped brief)
 
 ### 1. Parse arguments
 
@@ -83,7 +93,15 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local \
 | `register` | Register a fresh **sessionless** connection. |
 | `create_and_attach` | `--new`: create a session, then attach. |
 
-Then **register the connection** via the Node-measured helper (preferred — emits Axiom `connect_phase` timings; item 383de0cd). Fall back to the MCP tool only if the helper is missing:
+**One-shot (preferred for cold manual Connect):**
+
+```bash
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
+  --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" \
+  [--session "<uuid>"] [--project-id "<project_id>"] [--launch-id "<launch_id>"]
+```
+
+Or **register** via the Node-measured helper (emits Axiom `connect_phase`; item 383de0cd). Fall back to MCP only if the helper is missing:
 
 ```bash
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" register \
@@ -124,7 +142,7 @@ Stop with:  devspec.remote-stop
 
 ### 5. Write state file (token resolution + poller — required)
 
-Run **exactly** (never hand-write JSON with a hardcoded prod URL). Pass `--session` only when attached:
+If you used `fast-connect`, state + poller are already done — skip to step 6/7. Otherwise run **exactly** (never hand-write JSON with a hardcoded prod URL). Pass `--session` only when attached:
 
 ```bash
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \

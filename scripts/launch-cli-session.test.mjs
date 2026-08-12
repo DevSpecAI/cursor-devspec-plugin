@@ -91,19 +91,14 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     const body = [
       'PLUGIN=C:\\Users\\Brandon Young\\.cursor\\extensions\\x',
       '',
-      'Run the `devspec.remote` skill with this input: --session abc',
+      '# DevSpec Remote Control — already Live',
       '',
-      '---',
-      '',
-      '---',
-      'name: devspec.remote',
-      '---',
-      '',
-      '# DevSpec Remote Control',
+      'connection_id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'Arm wait with --from-end then --pending --after-reply.',
     ].join('\n')
     const stamped = buildStampedPromptBody(body, 'b49da2cc-8477-4d62-9f66-727f19f41226')
     assert.match(stamped, /^PLUGIN=/)
-    assert.ok(stamped.includes('---\nname: devspec.remote\n---'))
+    assert.ok(stamped.includes('already Live'))
     assert.ok(stamped.includes(stampLine('b49da2cc-8477-4d62-9f66-727f19f41226')))
     // Must remain multiline — flattening this onto argv is what caused --- to leak.
     assert.ok(stamped.includes('\n'))

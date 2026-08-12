@@ -53,6 +53,9 @@
  *   node remote-control-state.mjs attach --connection-id <uuid> --session <uuid>
  *       [--launch-id <uuid>]
  *     → Node-measured attach_connection
+ *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
+ *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
+ *     → Mechanical register → optional attach → write/poller (Cursor launch path)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -142,6 +145,8 @@ function parseArgs(argv) {
       out['git-remote'] = argv[++i]
     } else if (a === '--hostname' || a === '--machine-hostname' || a === '--machine_hostname') {
       out.hostname = argv[++i]
+    } else if (a === '--prompt-file' || a === '--prompt_file') {
+      out['prompt-file'] = argv[++i]
     } else out._.push(a)
   }
   return out
@@ -952,6 +957,356 @@ export function resolveLocalAction({
   }
 }
 
+/**
+ * Node-measured register_connection (item 383de0cd / mechanical Connect).
+ * @param {{
+ *   localId: string,
+ *   projectId: string,
+ *   cwd?: string,
+ *   launchId?: string | null,
+ *   agent?: string,
+ *   hostToken?: string | null,
+ *   codename?: string | null,
+ *   gitRemote?: string | null,
+ *   hostname?: string | null,
+ *   mcpCall?: typeof mcpToolsCall,
+ *   resolveAuth?: typeof resolveDevspecMcpAuth,
+ *   emitPhase?: typeof emitConnectPhase,
+ * }} opts
+ */
+export async function registerConnection(opts) {
+  const started = Date.now()
+  const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd()
+  const localId = opts.localId
+  const projectId = opts.projectId
+  const launchId = resolveLaunchId(opts.launchId)
+  const agent = opts.agent || AGENT_NAME
+  const mcpCall = opts.mcpCall || mcpToolsCall
+  const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
+  const emitPhase = opts.emitPhase || emitConnectPhase
+
+  const hostToken =
+    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+      ? opts.hostToken.trim()
+      : null) || hostTokenFromEnv(process.env)
+  const auth = resolveAuth(cwd, { hostToken })
+  if (!auth.ok || !auth.token || !auth.mcp_url) {
+    await emitPhase({
+      phase: 'register_connection',
+      outcome: 'error',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      local_id: localId,
+      agent,
+      mcpUrl: auth.mcp_url || null,
+      reason: auth.error || 'auth_failed',
+    })
+    return { ok: false, error: auth.error || 'auth_failed' }
+  }
+
+  const toolArgs = {
+    local_id: localId,
+    project_id: projectId,
+    agent_name: agent,
+    cwd,
+    machine_hostname: opts.hostname || os.hostname(),
+  }
+  if (typeof opts.codename === 'string' && opts.codename.trim()) {
+    toolArgs.codename = opts.codename.trim()
+  }
+  if (typeof opts.gitRemote === 'string' && opts.gitRemote.trim()) {
+    toolArgs.git_remote = opts.gitRemote.trim()
+  }
+
+  try {
+    const result = await mcpCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'register_connection',
+      arguments: toolArgs,
+      timeoutMs: 60_000,
+    })
+    const connectionId = result?.connection_id || result?.connectionId || null
+    await emitPhase({
+      phase: 'register_connection',
+      outcome: connectionId ? 'ok' : 'error',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      local_id: localId,
+      connectionId,
+      sessionId: result?.session_id || null,
+      agent,
+      mcpUrl: auth.mcp_url,
+      extra: {
+        created: !!result?.created,
+        codename: result?.codename || result?.session_codename || null,
+      },
+    })
+    return {
+      ok: !!connectionId,
+      ...result,
+      connection_id: connectionId,
+      codename: result?.codename || result?.session_codename || null,
+      local_id: localId,
+      launch_id: launchId,
+      ...(connectionId ? {} : { error: 'register_connection returned no connection_id' }),
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    await emitPhase({
+      phase: 'register_connection',
+      outcome: 'error',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      local_id: localId,
+      agent,
+      mcpUrl: auth.mcp_url,
+      reason,
+    })
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Node-measured attach_connection.
+ * @param {{
+ *   connectionId: string,
+ *   sessionId: string,
+ *   cwd?: string,
+ *   launchId?: string | null,
+ *   agent?: string,
+ *   hostToken?: string | null,
+ *   mcpCall?: typeof mcpToolsCall,
+ *   resolveAuth?: typeof resolveDevspecMcpAuth,
+ *   emitPhase?: typeof emitConnectPhase,
+ * }} opts
+ */
+export async function attachConnection(opts) {
+  const started = Date.now()
+  const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd()
+  const connectionId = opts.connectionId
+  const sessionId = opts.sessionId
+  const launchId = resolveLaunchId(opts.launchId)
+  const agent = opts.agent || AGENT_NAME
+  const mcpCall = opts.mcpCall || mcpToolsCall
+  const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
+  const emitPhase = opts.emitPhase || emitConnectPhase
+
+  const hostToken =
+    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+      ? opts.hostToken.trim()
+      : null) || hostTokenFromEnv(process.env)
+  const auth = resolveAuth(cwd, { hostToken })
+  if (!auth.ok || !auth.token || !auth.mcp_url) {
+    await emitPhase({
+      phase: 'attach_connection',
+      outcome: 'error',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      connectionId,
+      sessionId,
+      agent,
+      mcpUrl: auth.mcp_url || null,
+      reason: auth.error || 'auth_failed',
+    })
+    return { ok: false, error: auth.error || 'auth_failed' }
+  }
+
+  try {
+    const result = await mcpCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'attach_connection',
+      arguments: { connection_id: connectionId, session_id: sessionId },
+      timeoutMs: 60_000,
+    })
+    await emitPhase({
+      phase: 'attach_connection',
+      outcome: 'ok',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      connectionId: result?.connection_id || connectionId,
+      sessionId: result?.session_id || sessionId,
+      agent,
+      mcpUrl: auth.mcp_url,
+      extra: { reattached: !!result?.reattached },
+    })
+    return {
+      ok: true,
+      ...result,
+      connection_id: result?.connection_id || connectionId,
+      session_id: result?.session_id || sessionId,
+      launch_id: launchId,
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    await emitPhase({
+      phase: 'attach_connection',
+      outcome: 'error',
+      duration_ms: durationMs(started),
+      launch_id: launchId,
+      connectionId,
+      sessionId,
+      agent,
+      mcpUrl: auth.mcp_url,
+      reason,
+    })
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Write connection state + conversation bond; auto-start poller unless noPoller.
+ * Emits write_state connect_phase.
+ * @param {{
+ *   connectionId: string,
+ *   sessionId?: string | null,
+ *   cwd?: string,
+ *   launchId?: string | null,
+ *   agent?: string,
+ *   localId?: string | null,
+ *   ownerPid?: string | number | null,
+ *   hostToken?: string | null,
+ *   codename?: string | null,
+ *   title?: string | null,
+ *   url?: string | null,
+ *   noPoller?: boolean,
+ *   resolveAuth?: typeof resolveDevspecMcpAuth,
+ *   emitPhase?: typeof emitConnectPhase,
+ * }} opts
+ */
+export async function writeConnectionState(opts) {
+  const writeStarted = Date.now()
+  const connectionId = opts.connectionId
+  const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd()
+  const launchId = resolveLaunchId(opts.launchId)
+  const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
+  const emitPhase = opts.emitPhase || emitConnectPhase
+
+  const hostToken =
+    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+      ? opts.hostToken.trim()
+      : null) || hostTokenFromEnv(process.env)
+  const auth = resolveAuth(cwd, { hostToken })
+  const prev = readJson(connectionPath(connectionId)) || {}
+  const agentName = opts.agent || prev.agent_name || AGENT_NAME
+  const localId =
+    (typeof opts.localId === 'string' && opts.localId.trim()
+      ? opts.localId.trim()
+      : null) || detectLocalId({}, process.env).local_id
+  const sessionId =
+    typeof opts.sessionId === 'string' && opts.sessionId.length >= 8
+      ? opts.sessionId
+      : prev.session_id ?? null
+  const ownerPid = resolveOwnerPid(opts.ownerPid, prev.owner_pid)
+  const state = {
+    ...prev,
+    enabled: true,
+    connection_id: connectionId,
+    session_id: sessionId,
+    agent_name: agentName,
+    local_id: localId ?? prev.local_id ?? null,
+    owner_pid: ownerPid,
+    mcp_url: opts.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
+    token: auth.token || prev.token || undefined,
+    auth_source: auth.source || auth.error || prev.auth_source || null,
+    auth_ok: !!auth.ok || !!prev.auth_ok,
+    cwd,
+    session_codename: opts.codename || prev.session_codename || prev.codename || null,
+    title: opts.title || prev.title || null,
+    ended_from_ui: false,
+    end_reason: null,
+    updated_at: new Date().toISOString(),
+  }
+  const perPath = connectionPath(connectionId)
+  writeJson(perPath, state)
+  writeJson(LEGACY_PATH, state)
+
+  let bond = null
+  if (localId) {
+    bond = writeLocalBond(agentName, localId, {
+      status: 'live',
+      connection_id: connectionId,
+      session_id: sessionId,
+      session_codename: state.session_codename,
+      title: state.title,
+      cwd,
+      end_reason: null,
+      cursor_after_message_id: prev.cursor_after_message_id || null,
+    })
+  }
+
+  const result = {
+    ok: !!state.auth_ok,
+    path: perPath,
+    legacy_path: LEGACY_PATH,
+    connection_id: state.connection_id,
+    session_id: state.session_id,
+    session_codename: state.session_codename,
+    title: state.title,
+    mcp_url: state.mcp_url,
+    auth_ok: state.auth_ok,
+    auth_source: state.auth_source,
+    token_present: !!state.token,
+    local_id: localId,
+    bond_path: bond ? localBondPath(agentName, localId) : null,
+  }
+  if (!state.auth_ok) {
+    result.warning = auth.error
+    result.error = auth.error || 'auth_failed'
+  }
+  if (!localId) {
+    result.warning_local =
+      'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
+  }
+
+  const wantPoller = state.auth_ok && !opts.noPoller
+  if (wantPoller) {
+    try {
+      const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
+      if (reaped.length) result.reaped = reaped
+    } catch {
+      /* non-fatal */
+    }
+    const reuseRunning =
+      !!prev.token &&
+      prev.token === state.token &&
+      (prev.mcp_url || null) === (state.mcp_url || null) &&
+      (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
+    const poller = ensurePollerForConnection(connectionId, {
+      cwd,
+      ownerPid,
+      sessionId,
+      reuseRunning,
+    })
+    result.poller = poller
+    if (!poller.ok) {
+      result.warning_poller = poller.error
+    }
+  } else if (opts.noPoller) {
+    result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+  }
+
+  await emitPhase({
+    phase: 'write_state',
+    outcome: state.auth_ok ? 'ok' : 'error',
+    duration_ms: durationMs(writeStarted),
+    launch_id: launchId,
+    local_id: localId || null,
+    connectionId,
+    sessionId,
+    agent: agentName,
+    mcpUrl: state.mcp_url || auth.mcp_url || null,
+    reason: state.auth_ok ? null : auth.error || 'auth_failed',
+    extra: {
+      poller_started: !!(result.poller && result.poller.ok && !result.poller.skipped),
+      auth_ok: !!state.auth_ok,
+    },
+  })
+
+  return result
+}
+
 // --- CLI entry (skipped when imported for tests) ---
 const isMain =
   Boolean(process.argv[1]) &&
@@ -968,6 +1323,12 @@ async function runCli() {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
+
+  if (cmd === 'fast-connect') {
+    const { runFastConnectCli } = await import('./fast-connect.mjs')
+    await runFastConnectCli(args)
+    return
+  }
 
   if (cmd === 'resolve-auth') {
     const hostToken =
@@ -1326,7 +1687,6 @@ async function runCli() {
   }
 
   if (cmd === 'write') {
-    const writeStarted = Date.now()
     const connectionId = args['connection-id']
     if (!connectionId) {
       process.stderr.write(
@@ -1334,151 +1694,33 @@ async function runCli() {
       )
       process.exit(2)
     }
-    const cwd = args.cwd || process.cwd()
-    // Token symmetry (item 74b29c76): prefer the SAME bearer the host MCP client
-    // used for register_connection so the poller heartbeats THIS connection under
-    // the same identity — otherwise the server rejects with "connection belongs to
-    // a different token" and dispatch delivery spams. The host token comes from an
-    // explicit --host-token (the write "receives one") or the reachable plugin
-    // userConfig env Claude Code exports (an env "carries it"); it wins over the
-    // .mcp.json walk but not an explicit DEVSPEC_MCP_TOKEN. Absent on non-Claude
-    // plugins / dev-from-source setups → resolution is unchanged. See resolve-mcp-auth.mjs.
+    const localId = detectLocalId(args, process.env).local_id
     const hostToken =
       (typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
         : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
-    const prev = readJson(connectionPath(connectionId)) || {}
-    const agentName = args.agent || prev.agent_name || AGENT_NAME
-    // The conversation this write belongs to — stamped INTO the per-connection state
-    // so the mirror hook can bind strictly to THIS conversation.
-    const localId = detectLocalId(args, process.env).local_id
-    // Optional attached session (present for --session / --new; absent = sessionless).
-    const sessionId =
-      typeof args.session === 'string' && args.session.length >= 8 ? args.session : prev.session_id ?? null
-    // Owner-process anchor for self-termination (see devspec-remote-poll.mjs and
-    // resolveOwnerPid / resolveOwnerPidAutoWindows above for the win32 self-resolve path).
-    const ownerPid = resolveOwnerPid(args['owner-pid'], prev.owner_pid)
-    const state = {
-      ...prev,
-      enabled: true,
-      connection_id: connectionId,
-      session_id: sessionId,
-      agent_name: agentName,
-      local_id: localId ?? prev.local_id ?? null,
-      owner_pid: ownerPid,
-      mcp_url: args.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
-      token: auth.token || prev.token || undefined,
-      auth_source: auth.source || auth.error || prev.auth_source || null,
-      auth_ok: !!auth.ok || !!prev.auth_ok,
-      cwd,
-      session_codename: args.codename || prev.session_codename || prev.codename || null,
-      title: args.title || prev.title || null,
-      ended_from_ui: false,
-      end_reason: null,
-      updated_at: new Date().toISOString(),
-    }
-    const perPath = connectionPath(connectionId)
-    writeJson(perPath, state)
-    // Legacy pointer = most recently connected connection (backward compatible).
-    writeJson(LEGACY_PATH, state)
-
-    // Bind local conversation → this connection (live).
-    let bond = null
-    if (localId) {
-      bond = writeLocalBond(agentName, localId, {
-        status: 'live',
-        connection_id: connectionId,
-        session_id: sessionId,
-        session_codename: state.session_codename,
-        title: state.title,
-        cwd,
-        end_reason: null,
-        cursor_after_message_id: prev.cursor_after_message_id || null,
-      })
-    }
-
-    const result = {
-      ok: true,
-      path: perPath,
-      legacy_path: LEGACY_PATH,
-      connection_id: state.connection_id,
-      session_id: state.session_id,
-      session_codename: state.session_codename,
-      title: state.title,
-      mcp_url: state.mcp_url,
-      auth_ok: state.auth_ok,
-      auth_source: state.auth_source,
-      token_present: !!state.token,
-      local_id: localId,
-      bond_path: bond ? localBondPath(agentName, localId) : null,
-    }
-    if (!state.auth_ok) {
-      result.warning = auth.error
-    }
-    if (!localId) {
-      result.warning_local =
-        'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
-    }
-
-    // Default: start the continuous heartbeat poller after a successful write.
-    const wantPoller = state.auth_ok && !args.noPoller
-    if (wantPoller) {
-      try {
-        const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
-        if (reaped.length) result.reaped = reaped
-      } catch {
-        /* non-fatal */
-      }
-      // Same token/url/owner → the live poller keeps serving this connection
-      // (session attach/detach reaches it via the server heartbeat echo), so a
-      // `write --session` never restarts it. Only a real identity change takes
-      // the kill→respawn path — and even then the dying poller exits silently
-      // (item b9e02835).
-      const reuseRunning =
-        !!prev.token &&
-        prev.token === state.token &&
-        (prev.mcp_url || null) === (state.mcp_url || null) &&
-        (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
-      const poller = ensurePollerForConnection(connectionId, {
-        cwd,
-        ownerPid,
-        sessionId,
-        reuseRunning,
-      })
-      result.poller = poller
-      if (!poller.ok) {
-        result.warning_poller = poller.error
-        process.stderr.write(`remote-control-state: ensure-poller failed — ${poller.error}\n`)
-      }
-    } else if (args.noPoller) {
-      result.poller = { ok: true, skipped: true, reason: 'no-poller' }
-    }
-
-    await emitConnectPhase({
-      phase: 'write_state',
-      outcome: state.auth_ok ? 'ok' : 'error',
-      duration_ms: durationMs(writeStarted),
-      launch_id: launchId,
-      local_id: localId || null,
+    const result = await writeConnectionState({
       connectionId,
-      sessionId,
-      agent: agentName,
-      mcpUrl: state.mcp_url || auth.mcp_url || null,
-      reason: state.auth_ok ? null : auth.error || 'auth_failed',
-      extra: {
-        poller_started: !!(result.poller && result.poller.ok && !result.poller.skipped),
-        auth_ok: !!state.auth_ok,
-      },
+      sessionId: args.session || null,
+      cwd: args.cwd || process.cwd(),
+      launchId,
+      agent: args.agent || AGENT_NAME,
+      localId,
+      ownerPid: args['owner-pid'],
+      hostToken,
+      codename: args.codename || null,
+      title: args.title || null,
+      url: args.url || null,
+      noPoller: !!args.noPoller,
     })
-
+    if (result.warning_poller) {
+      process.stderr.write(`remote-control-state: ensure-poller failed — ${result.warning_poller}\n`)
+    }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-    process.exit(state.auth_ok ? 0 : 1)
+    process.exit(result.ok ? 0 : 1)
   }
 
   if (cmd === 'register') {
-    const started = Date.now()
-    const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
     const localId = detectLocalId(args, process.env).local_id
     const projectId = typeof args['project-id'] === 'string' ? args['project-id'].trim() : ''
     if (!localId || !projectId) {
@@ -1491,91 +1733,22 @@ async function runCli() {
       (typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
         : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
-    if (!auth.ok || !auth.token || !auth.mcp_url) {
-      await emitConnectPhase({
-        phase: 'register_connection',
-        outcome: 'error',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        local_id: localId,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url || null,
-        reason: auth.error || 'auth_failed',
-      })
-      process.stdout.write(JSON.stringify({ ok: false, error: auth.error || 'auth_failed' }) + '\n')
-      process.exit(1)
-    }
-    const toolArgs = {
-      local_id: localId,
-      project_id: projectId,
-      agent_name: args.agent || AGENT_NAME,
-      cwd,
-      machine_hostname: args.hostname || os.hostname(),
-    }
-    if (typeof args.codename === 'string' && args.codename.trim()) {
-      toolArgs.codename = args.codename.trim()
-    }
-    if (typeof args['git-remote'] === 'string' && args['git-remote'].trim()) {
-      toolArgs.git_remote = args['git-remote'].trim()
-    }
-    try {
-      const result = await mcpToolsCall({
-        mcpUrl: auth.mcp_url,
-        token: auth.token,
-        name: 'register_connection',
-        arguments: toolArgs,
-        timeoutMs: 60_000,
-      })
-      const connectionId = result?.connection_id || result?.connectionId || null
-      await emitConnectPhase({
-        phase: 'register_connection',
-        outcome: connectionId ? 'ok' : 'error',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        local_id: localId,
-        connectionId,
-        sessionId: result?.session_id || null,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url,
-        extra: {
-          created: !!result?.created,
-          codename: result?.codename || result?.session_codename || null,
-        },
-      })
-      process.stdout.write(
-        JSON.stringify({
-          ok: !!connectionId,
-          ...result,
-          connection_id: connectionId,
-          local_id: localId,
-          launch_id: launchId,
-        }, null, 2) + '\n',
-      )
-      process.exit(connectionId ? 0 : 1)
-    } catch (err) {
-      await emitConnectPhase({
-        phase: 'register_connection',
-        outcome: 'error',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        local_id: localId,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url,
-        reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
-      })
-      process.stdout.write(
-        JSON.stringify({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        }) + '\n',
-      )
-      process.exit(1)
-    }
+    const result = await registerConnection({
+      localId,
+      projectId,
+      cwd: args.cwd ? path.resolve(args.cwd) : process.cwd(),
+      launchId,
+      agent: args.agent || AGENT_NAME,
+      hostToken,
+      codename: args.codename || null,
+      gitRemote: args['git-remote'] || null,
+      hostname: args.hostname || null,
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
   }
 
   if (cmd === 'attach') {
-    const started = Date.now()
     const connectionId = args['connection-id']
     const sessionId = args.session
     if (!connectionId || !sessionId) {
@@ -1584,70 +1757,20 @@ async function runCli() {
       )
       process.exit(2)
     }
-    const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd()
     const hostToken =
       (typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
         : null) || hostTokenFromEnv(process.env)
-    const auth = resolveDevspecMcpAuth(cwd, { hostToken })
-    if (!auth.ok || !auth.token || !auth.mcp_url) {
-      await emitConnectPhase({
-        phase: 'attach_connection',
-        outcome: 'error',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        connectionId,
-        sessionId,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url || null,
-        reason: auth.error || 'auth_failed',
-      })
-      process.stdout.write(JSON.stringify({ ok: false, error: auth.error || 'auth_failed' }) + '\n')
-      process.exit(1)
-    }
-    try {
-      const result = await mcpToolsCall({
-        mcpUrl: auth.mcp_url,
-        token: auth.token,
-        name: 'attach_connection',
-        arguments: { connection_id: connectionId, session_id: sessionId },
-        timeoutMs: 60_000,
-      })
-      await emitConnectPhase({
-        phase: 'attach_connection',
-        outcome: 'ok',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        connectionId: result?.connection_id || connectionId,
-        sessionId: result?.session_id || sessionId,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url,
-        extra: { reattached: !!result?.reattached },
-      })
-      process.stdout.write(
-        JSON.stringify({ ok: true, ...result, launch_id: launchId }, null, 2) + '\n',
-      )
-      process.exit(0)
-    } catch (err) {
-      await emitConnectPhase({
-        phase: 'attach_connection',
-        outcome: 'error',
-        duration_ms: durationMs(started),
-        launch_id: launchId,
-        connectionId,
-        sessionId,
-        agent: args.agent || AGENT_NAME,
-        mcpUrl: auth.mcp_url,
-        reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
-      })
-      process.stdout.write(
-        JSON.stringify({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        }) + '\n',
-      )
-      process.exit(1)
-    }
+    const result = await attachConnection({
+      connectionId,
+      sessionId,
+      cwd: args.cwd ? path.resolve(args.cwd) : process.cwd(),
+      launchId,
+      agent: args.agent || AGENT_NAME,
+      hostToken,
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
   }
 
   process.stderr.write(`Unknown command: ${cmd}\n`)

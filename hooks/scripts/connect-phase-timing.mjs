@@ -16,13 +16,17 @@ import { logRemoteControlStory } from './remote-control-story.mjs'
 export const CONNECT_PHASE_NAMES = [
   'create_chat',
   'expand_stamp',
+  'skip_stamp',
   'write_stamp',
   'agent_spawn',
+  'agent_resume',
   'resolve_local_id',
   'resolve_local',
+  'project_resolve',
   'register_connection',
   'attach_connection',
   'write_state',
+  'ensure_poller',
   'wait_armed',
 ]
 

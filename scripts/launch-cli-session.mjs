@@ -6,6 +6,10 @@
  * work → `--force --approve-mcps`; brainstorm → `--plan --approve-mcps`
  * (no `-p` / `--trust` — those are print/headless-only).
  *
+ * For remote Connect prompts: runs mechanical fast-connect (register → optional
+ * attach → write/poller) AFTER create-chat and BEFORE --resume, then stamps a
+ * thin post-Live brief (not the full skill body).
+ *
  * Invoked by open-handler-core when surface=cli:
  *   node launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]
  */
@@ -13,13 +17,17 @@ import fs from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
-import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
+import {
+  expandRemoteControlLaunchPrompt,
+  promptIsRemoteConnect,
+} from './pin-remote-plugin.mjs'
 import {
   durationMs,
   emitConnectPhase,
   newLaunchId,
 } from '../hooks/scripts/connect-phase-timing.mjs'
 import { resolveDevspecMcpAuth } from '../hooks/scripts/resolve-mcp-auth.mjs'
+import { fastConnect } from '../hooks/scripts/fast-connect.mjs'
 
 function parseArgs(argv) {
   const out = {}
@@ -357,16 +365,71 @@ async function main() {
     return
   }
 
-  // Belt-and-suspenders: open-handler usually expands already, but re-run here
-  // so a direct CLI invoke still gets PLUGIN= + skill body (item 57d8b288).
+  /** @type {{ connection_id: string, session_id?: string | null, codename?: string | null, local_id?: string | null, launch_id?: string | null } | null} */
+  let connectResult = null
+  const isRemoteConnect = promptIsRemoteConnect(promptBody)
+
+  if (isRemoteConnect) {
+    console.log(`[devspec-cli] Mechanical fast-connect (local_id=${chatId})…`)
+    const connected = await fastConnect({
+      localId: chatId,
+      cwd: args.folder,
+      launchId,
+      promptText: promptBody,
+    })
+    if (!connected.ok) {
+      await emitConnectPhase({
+        ...timingCtx,
+        phase: 'register_connection',
+        outcome: 'error',
+        duration_ms: 0,
+        local_id: chatId,
+        reason: connected.error || 'fast_connect_failed',
+      })
+      console.error(`[devspec-cli] fast-connect failed: ${connected.error || 'unknown'}`)
+      process.exitCode = 1
+      return
+    }
+    connectResult = {
+      connection_id: connected.connection_id,
+      session_id: connected.session_id,
+      codename: connected.codename,
+      local_id: connected.local_id || chatId,
+      launch_id: connected.launch_id || launchId,
+    }
+    console.log(
+      `[devspec-cli] Live as ${connectResult.codename || connectResult.connection_id.slice(0, 8)}…` +
+        (connectResult.session_id ? ` (session ${connectResult.session_id.slice(0, 8)}…)` : ' (sessionless)'),
+    )
+  }
+
+  // Remote Connect: thin post-Live brief with IDs. Other prompts: pin/expand as before
+  // (stop still embeds skill; work/brainstorm unchanged).
   const expandStarted = Date.now()
-  const expandedBody = expandRemoteControlLaunchPrompt(promptBody) ?? promptBody
+  const expandedBody =
+    expandRemoteControlLaunchPrompt(promptBody, {
+      connect: connectResult
+        ? {
+            connectionId: connectResult.connection_id,
+            sessionId: connectResult.session_id,
+            codename: connectResult.codename,
+            localId: connectResult.local_id,
+            launchId: connectResult.launch_id,
+          }
+        : null,
+    }) ?? promptBody
   await emitConnectPhase({
     ...timingCtx,
-    phase: 'expand_stamp',
+    phase: isRemoteConnect && connectResult ? 'expand_stamp' : isRemoteConnect ? 'skip_stamp' : 'expand_stamp',
     outcome: 'ok',
     duration_ms: durationMs(expandStarted),
-    extra: { stamp_chars: String(expandedBody || '').length },
+    local_id: chatId,
+    connectionId: connectResult?.connection_id || null,
+    sessionId: connectResult?.session_id || null,
+    extra: {
+      stamp_chars: String(expandedBody || '').length,
+      thin_brief: !!(isRemoteConnect && connectResult),
+    },
   })
 
   // Write the full expanded+stamped prompt to disk; pass only a short argv
@@ -383,6 +446,7 @@ async function main() {
       phase: 'write_stamp',
       outcome: 'error',
       duration_ms: durationMs(writeStarted),
+      local_id: chatId,
       reason: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
     })
     console.error(`[devspec-cli] could not write stamped prompt file: ${err}`)
@@ -394,6 +458,8 @@ async function main() {
     phase: 'write_stamp',
     outcome: 'ok',
     duration_ms: durationMs(writeStarted),
+    local_id: chatId,
+    connectionId: connectResult?.connection_id || null,
     extra: { stamp_chars: stampedBody.length },
   })
   const argvPrompt = buildShortArgvPrompt(stampedPath)
@@ -425,10 +491,12 @@ async function main() {
   // Spawn itself is synchronous; duration covers resolve + process create.
   await emitConnectPhase({
     ...timingCtx,
-    phase: 'agent_spawn',
+    phase: 'agent_resume',
     outcome: 'ok',
     duration_ms: durationMs(spawnStarted),
     local_id: chatId,
+    connectionId: connectResult?.connection_id || null,
+    sessionId: connectResult?.session_id || null,
     extra: { invoke_mode: inv.mode, chat_id: chatId },
   })
 
