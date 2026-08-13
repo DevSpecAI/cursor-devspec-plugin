@@ -25,6 +25,7 @@ import {
   resolveOwnerPidFromChildTree,
   walkChildTreeForDurableOwner,
   ensurePollerAfterAgentSpawn,
+  CLI_SPAWN_OWNER_WALK_TIMEOUT_MS,
 } from './remote-control-state.mjs'
 
 describe('detectLocalId', () => {
@@ -749,6 +750,35 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
       ),
       51,
     )
+  })
+
+  it('accepts cursor-agent.exe as a CLI spawn owner (item 833df74e)', () => {
+    assert.equal(isWin32CliSpawnOwnerProcess('cursor-agent.exe', ''), true)
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        100,
+        treeOpts({
+          100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [201] },
+          201: { name: 'cursor-agent.exe', commandLine: 'cursor-agent.exe --resume x', children: [] },
+        }),
+      ),
+      201,
+    )
+  })
+
+  it('post-resume owner walk default timeout is above the Ibis 2.5s miss (item 833df74e)', () => {
+    assert.ok(CLI_SPAWN_OWNER_WALK_TIMEOUT_MS >= 15_000)
+    let t = 0
+    const found = resolveOwnerPidFromChildTree(100, {
+      platform: 'win32',
+      now: () => t,
+      sleepMs: (ms) => {
+        t += ms
+      },
+      walkOnce: () => null,
+    })
+    assert.equal(found, null)
+    assert.ok(t >= 15_000, `default wait was only ${t}ms`)
   })
 
   it('rejects ephemeral launch-cli-session as the owner', () => {

@@ -204,7 +204,7 @@ function findPollerPidsForConnection(connectionId) {
 }
 
 /** Durable Cursor / Claude agent hosts — never short-lived tool shells (item f3a88333). */
-export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
+export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe', 'cursor-agent.exe'])
 
 /**
  * Durable hosts that may appear as children of `agent --resume` (item f099fc6e).
@@ -212,7 +212,10 @@ export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claud
  * but never a valid *descendant* of the CLI spawn (that would pin the poller to
  * the editor instead of the terminal agent).
  */
-export const WIN32_CLI_SPAWN_OWNER_NAMES = new Set(['agent.exe', 'claude.exe'])
+export const WIN32_CLI_SPAWN_OWNER_NAMES = new Set(['agent.exe', 'claude.exe', 'cursor-agent.exe'])
+
+/** Ibis: 2.5s ended before agent.exe appeared under powershell-ps1 (item 833df74e). */
+export const CLI_SPAWN_OWNER_WALK_TIMEOUT_MS = 15_000
 
 /** Short-lived shells that must not be used as `--owner-pid` anchors on Windows. */
 export const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
@@ -310,7 +313,7 @@ export function walkChildTreeForDurableOwner(rootPid, opts = {}) {
  * process until cursor-agent/agent.exe appears (or timeout). Does not walk
  * parents (that finds Cursor.exe the IDE, or nothing).
  */
-export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, timeoutMs = 2500 } = {}) {
+export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, timeoutMs = CLI_SPAWN_OWNER_WALK_TIMEOUT_MS } = {}) {
   if (process.platform !== 'win32') return null
   const pid = Number.parseInt(String(startPid), 10)
   if (!Number.isInteger(pid) || pid < 1) return null
@@ -334,7 +337,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     '    if ($proc) {',
     '      $name = $proc.Name.ToLowerInvariant()',
     '      $cmd = [string]$proc.CommandLine',
-    '      if ($name -eq "agent.exe" -or $name -eq "claude.exe") { Write-Output $proc.ProcessId; exit 0 }',
+    '      if ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe") { Write-Output $proc.ProcessId; exit 0 }',
     '      if ($name -eq "node.exe" -and $cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; exit 0 }',
     '    }',
     '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
@@ -385,7 +388,7 @@ export function resolveOwnerPidFromChildTree(rootPid, opts = {}) {
   const pid = Number.parseInt(String(rootPid ?? ''), 10)
   if (!Number.isInteger(pid) || pid <= 1) return null
   const platform = opts.platform ?? process.platform
-  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 2500
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : CLI_SPAWN_OWNER_WALK_TIMEOUT_MS
   const intervalMs = Number.isFinite(opts.intervalMs) ? opts.intervalMs : 50
   const now = opts.now ?? Date.now
   const sleepMs = opts.sleepMs ?? defaultSleepMs

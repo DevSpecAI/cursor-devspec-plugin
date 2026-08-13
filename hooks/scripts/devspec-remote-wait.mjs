@@ -220,7 +220,7 @@ function parseArgs(argv) {
  * (items 3cddb3b4 / f3a88333 / c57dc381). Keep host/shell/node-command rules in sync
  * with `remote-control-state.mjs` (write path).
  */
-const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
+const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe', 'cursor-agent.exe'])
 const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
 const WIN32_NODE_EPHEMERAL_CMD_RE =
   /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
