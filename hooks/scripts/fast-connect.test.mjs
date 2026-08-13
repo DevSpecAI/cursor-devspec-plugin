@@ -323,4 +323,89 @@ describe('fastConnect', () => {
     assert.equal(r.codename, 'Colorful Possum')
     assert.deepEqual(calls, ['write'])
   })
+
+  it('noPoller: register/attach/write succeed even when poller is skipped (item f099fc6e)', async () => {
+    const phases = []
+    const r = await fastConnect({
+      localId,
+      cwd: process.cwd(),
+      sessionId,
+      launchId,
+      projectId,
+      noPoller: true,
+      resolveAuth: () => ({
+        ok: true,
+        token: 'test-token',
+        mcp_url: 'https://example.test/api/mcp',
+        source: 'test',
+      }),
+      resolveGitRemoteFn: () => 'https://github.com/DevSpecAI/cursor-devspec-plugin.git',
+      resolveLocalFn: () => ({ action: 'register', connection_id: null }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async (p) => {
+        phases.push(p)
+      },
+      registerFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        codename: 'Restless Owl',
+      }),
+      attachFn: async () => ({ ok: true, connection_id: connectionId, session_id: sessionId }),
+      writeFn: async (opts) => {
+        assert.equal(opts.noPoller, true)
+        return {
+          ok: true,
+          connection_id: connectionId,
+          session_id: sessionId,
+          session_codename: 'Restless Owl',
+          mcp_url: 'https://example.test/api/mcp',
+          auth_ok: true,
+          poller: { ok: true, skipped: true, reason: 'no-poller' },
+        }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.connection_id, connectionId)
+    const ensure = phases.find((p) => p.phase === 'ensure_poller')
+    assert.equal(ensure.outcome, 'ok')
+    assert.equal(ensure.extra.deferred_until_resume, true)
+  })
+
+  it('poller failure remains fatal when noPoller is not set', async () => {
+    const r = await fastConnect({
+      localId,
+      launchId,
+      projectId,
+      sessionId,
+      resolveAuth: () => ({
+        ok: true,
+        token: 't',
+        mcp_url: 'https://example.test/api/mcp',
+      }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({ action: 'register' }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async () => {},
+      registerFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        codename: 'Restless Owl',
+      }),
+      attachFn: async () => ({ ok: true, session_id: sessionId }),
+      writeFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: 'Restless Owl',
+        auth_ok: true,
+        poller: {
+          ok: false,
+          error: 'refusing to spawn a poller without a valid --owner-pid',
+        },
+      }),
+    })
+    assert.equal(r.ok, false)
+    assert.match(r.error, /owner-pid/)
+    assert.equal(r.connection_id, connectionId)
+  })
 })
