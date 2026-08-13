@@ -7,6 +7,7 @@
 ### Improved
 
 - **Cold Connect first ping:** argv is now an imperative `devspec-remote-wait.mjs --from-end` command. The model must not read the stamp/skill before that Shell call. Full stamp stays on disk for recovery (item 1586a9e4). Keeps the e949305f argv-vs-stamp split (no YAML `---` on argv).
+- **Wait argv path with spaces (Sprinting Ibis):** when the extension lives under `C:\Users\Brandon Young\…`, Connect wait argv now junctions the plugin to `%ProgramData%\DevSpec\cursor-plugin` so `node <script>` has no whitespace. Cursor TUI wrap was splitting the quoted path and the model dropped quotes (item dc3fb0f5). Stamp `PLUGIN=` is still the real extension path.
 
 ## 0.5.3 - 2026-08-13
 

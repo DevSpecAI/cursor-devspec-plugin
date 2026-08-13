@@ -17,7 +17,9 @@ import {
   flattenPromptForArgv,
   inferCursorAgentRunKindFromPrompt,
   pluginRootFromLauncher,
+  pathHasWhitespace,
   quotePathForPrompt,
+  spaceSafePluginRoot,
   quoteWinCmdArg,
   resolveShellExecutable,
   resolveStampedPromptPath,
@@ -25,6 +27,7 @@ import {
   spawnAgentSync,
   stampLine,
 } from './launch-cli-session.mjs'
+import { buildPostLiveRemoteBrief } from './pin-remote-plugin.mjs'
 
 describe('DevSpec Cursor CLI flag policy', () => {
   it('infers brainstorm vs work from skill prompts', () => {
@@ -149,7 +152,7 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
 
   it('Connect argv is wait-first and does not say read the stamp first (item 1586a9e4)', () => {
     const stampedPath = path.join(os.tmpdir(), 'connect.stamped-waitfirst.txt')
-    const pluginRoot = path.join(os.tmpdir(), 'Users', 'Brandon Young', 'ext')
+    const pluginRoot = path.join(os.tmpdir(), 'ext-root')
     const waitCommand = buildRemoteWaitCommand({
       pluginRoot,
       connectionId: '4f088b52-0f2c-4a8a-abb6-758e96cf5061',
@@ -172,6 +175,68 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
       fs.existsSync(path.join(pluginRootFromLauncher(), 'hooks', 'scripts', 'devspec-remote-wait.mjs')),
       'launcher plugin root must resolve wait script',
     )
+  })
+
+  it('Connect wait argv uses a space-free pin when pluginRoot has spaces (item dc3fb0f5)', () => {
+    const pluginRoot = path.join(os.tmpdir(), 'Users', 'Brandon Young', 'ext')
+    assert.equal(pathHasWhitespace(pluginRoot), true)
+    const pinRoot = path.join(os.tmpdir(), 'DevSpecPin', 'cursor-plugin')
+    assert.equal(pathHasWhitespace(pinRoot), false)
+    let linked = null
+    const waitCommand = buildRemoteWaitCommand({
+      pluginRoot,
+      connectionId: '1ae93936-69bb-4a27-9cfe-9480e4a221ff',
+      launchId: 'bbddf870-8ae6-42dc-a244-666df32d00a0',
+      spaceSafe: {
+        platform: 'win32',
+        pinRoot,
+        mkdirSync: () => {},
+        existsSync: () => false,
+        lstatSync: () => ({ isSymbolicLink: () => false, isDirectory: () => false }),
+        rmSync: () => {},
+        symlinkSync: (target, dest) => {
+          linked = { target, dest }
+        },
+        readlinkSync: () => '',
+      },
+    })
+    assert.equal(linked?.target, path.resolve(pluginRoot))
+    assert.equal(linked?.dest, path.resolve(pinRoot))
+    const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+    assert.ok(scriptToken, waitCommand)
+    assert.equal(pathHasWhitespace(scriptToken), false)
+    assert.equal(scriptToken.includes('Brandon Young'), false)
+    assert.match(waitCommand, /--from-end/)
+    assert.match(waitCommand, /1ae93936-69bb-4a27-9cfe-9480e4a221ff/)
+    assert.match(waitCommand, /bbddf870-8ae6-42dc-a244-666df32d00a0/)
+
+    const argv = buildShortArgvPrompt(path.join(os.tmpdir(), 'stamp.txt'), {
+      waitFirst: true,
+      waitCommand,
+    })
+    assert.match(argv, /^Arm wait FIRST/)
+    const nodeScript = argv.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+    assert.ok(nodeScript)
+    assert.equal(pathHasWhitespace(nodeScript), false)
+
+    const stamp = buildPostLiveRemoteBrief({
+      pluginPath: pluginRoot,
+      connectionId: '1ae93936-69bb-4a27-9cfe-9480e4a221ff',
+      launchId: 'bbddf870-8ae6-42dc-a244-666df32d00a0',
+    })
+    assert.match(stamp, /^PLUGIN=/)
+    assert.ok(stamp.includes(`PLUGIN=${pluginRoot}`))
+    assert.ok(stamp.includes('Brandon Young'))
+  })
+
+  it('spaceSafePluginRoot leaves a space-free root unchanged', () => {
+    const root = path.join(os.tmpdir(), 'ext-root')
+    assert.equal(spaceSafePluginRoot(root, { platform: 'win32' }), path.resolve(root))
+  })
+
+  it('spaceSafePluginRoot leaves spaced POSIX roots unchanged', () => {
+    const root = path.join(os.tmpdir(), 'Brandon Young', 'ext')
+    assert.equal(spaceSafePluginRoot(root, { platform: 'linux' }), path.resolve(root))
   })
 
   it('short argv would not present --- as its own agent CLI option token', () => {
