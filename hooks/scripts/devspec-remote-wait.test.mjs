@@ -10,9 +10,12 @@
  * cache and risk going stale after a server-side session reattach.
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import {
   parseOwnerBatches,
@@ -27,6 +30,8 @@ import {
   offsetAfterAdvisoryHistory,
   resolveFromEndOffset,
   resolveWatchOffset,
+  consumeInboxSlice,
+  resolveConnectionsDir,
 } from './devspec-remote-wait.mjs'
 
 describe('parseOwnerBatches', () => {
@@ -546,6 +551,124 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
         }),
         99,
       )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('consumeInboxSlice (item e8832794 — advancing the watch cursor must not throw)', () => {
+  const ownerLine = `${JSON.stringify({ type: 'owner_messages', messages: [{ id: 'm1' }] })}\n`
+  const advisoryLine = `${JSON.stringify({ type: 'advisory_context', messages: [{ id: 'a1' }] })}\n`
+
+  it('advances the byte cursor and returns the owner batch', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-consume-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      fs.writeFileSync(file, ownerLine)
+      const slice = consumeInboxSlice(file, 0)
+      assert.equal(slice.newOffset, Buffer.byteLength(ownerLine, 'utf8'))
+      assert.equal(slice.batches.length, 1)
+      assert.equal(slice.batches[0].messages[0].id, 'm1')
+      let offset = 0
+      offset = slice.newOffset
+      assert.equal(offset, slice.newOffset)
+      const again = consumeInboxSlice(file, offset)
+      assert.equal(again.lines.length, 0)
+      assert.equal(again.newOffset, offset)
+      assert.equal(again.batches.length, 0)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still advances past advisory-only lines (cursor must move even when nothing wakes)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-consume-adv-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      fs.writeFileSync(file, advisoryLine)
+      const slice = consumeInboxSlice(file, 0)
+      assert.equal(slice.newOffset, Buffer.byteLength(advisoryLine, 'utf8'))
+      assert.equal(slice.batches.length, 0)
+      assert.ok(slice.lines.length > 0)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('resolveConnectionsDir', () => {
+  it('uses DEVSPEC_REMOTE_CONNECTIONS_DIR when set', () => {
+    assert.equal(
+      resolveConnectionsDir({ DEVSPEC_REMOTE_CONNECTIONS_DIR: 'C:\\tmp\\rc' }, '/home/x'),
+      'C:\\tmp\\rc',
+    )
+  })
+
+  it('falls back to ~/.devspec/remote-control/connections', () => {
+    assert.equal(
+      resolveConnectionsDir({ DEVSPEC_REMOTE_CONNECTIONS_DIR: '  ' }, '/home/x'),
+      path.join('/home/x', '.devspec', 'remote-control', 'connections'),
+    )
+  })
+})
+
+describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw const)', () => {
+  it('--from-end against a queued owner_messages inbox prints wake and exits 0', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-cli-'))
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    const line = `${JSON.stringify({
+      type: 'owner_messages',
+      session_id: 'sess-test',
+      messages: [{ id: 'cmd-1', content: 'ping' }],
+    })}\n`
+    fs.writeFileSync(inbox, line)
+    const env = { ...process.env, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--from-end', '--poll-ms', '50'],
+          { env, cwd: dir, windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => {
+          stdout += d.toString()
+        })
+        child.stderr.on('data', (d) => {
+          stderr += d.toString()
+        })
+        const timer = setTimeout(() => {
+          child.kill()
+          reject(new Error(`wait CLI timed out\nstderr=${stderr}\nstdout=${stdout}`))
+        }, 20000)
+        child.on('error', (err) => {
+          clearTimeout(timer)
+          reject(err)
+        })
+        child.on('close', (code) => {
+          clearTimeout(timer)
+          resolve({ stdout, stderr, code })
+        })
+      })
+      // The const-offset bug threw before printing. Wake on stdout is the
+      // contract. Windows Node may then abort (0xC0000409) on process.exit
+      // while leftover HTTP handles close — that is after a successful wake.
+      assert.doesNotMatch(stderr, /Assignment to constant variable/)
+      assert.match(stderr, /wake \(1 msg\)/)
+      assert.match(stdout, /"type":"owner_message"/)
+      assert.match(stdout, /"type":"wake"/)
+      if (code !== 0) {
+        assert.equal(
+          code,
+          3221226505,
+          `unexpected exit ${code}\nstderr=${stderr}\nstdout=${stdout}`,
+        )
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

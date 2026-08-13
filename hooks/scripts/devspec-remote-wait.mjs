@@ -52,7 +52,15 @@ import {
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
 
-const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
+  const override =
+    typeof env.DEVSPEC_REMOTE_CONNECTIONS_DIR === 'string'
+      ? env.DEVSPEC_REMOTE_CONNECTIONS_DIR.trim()
+      : ''
+  return override || path.join(homedir, '.devspec', 'remote-control', 'connections')
+}
+
+const CONNECTIONS_DIR = resolveConnectionsDir()
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const POLL_MS = 500
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000
@@ -470,7 +478,7 @@ export function resolveWatchOffset({ pending, fromEnd, inboxByteOffset, file }) 
  * Read new bytes from offset; return { lines, newOffset }.
  * Incomplete trailing line (no final \n) is left for the next read.
  */
-function readNewLines(file, offset) {
+export function readNewLines(file, offset) {
   const size = fileSize(file)
   if (size <= offset) return { lines: [], newOffset: offset }
   const fd = fs.openSync(file, 'r')
@@ -487,6 +495,21 @@ function readNewLines(file, offset) {
     return { lines, newOffset }
   } finally {
     fs.closeSync(fd)
+  }
+}
+
+/**
+ * Consume complete inbox lines after `offset` and parse owner-command batches.
+ * Always returns the advanced byte cursor when lines arrived — including when
+ * every line is advisory — so the watcher can assign `offset = newOffset`
+ * without throwing (item e8832794).
+ */
+export function consumeInboxSlice(file, offset) {
+  const { lines, newOffset } = readNewLines(file, offset)
+  return {
+    lines,
+    newOffset,
+    batches: lines.length > 0 ? parseOwnerBatches(lines) : [],
   }
 }
 
@@ -711,7 +734,7 @@ async function main() {
     fs.writeFileSync(file, '', { mode: 0o600 })
   }
 
-  const offset = resolveWatchOffset({
+  let offset = resolveWatchOffset({
     pending: args.pending,
     fromEnd: args.fromEnd,
     inboxByteOffset: state?.inbox_byte_offset,
@@ -776,9 +799,8 @@ async function main() {
       process.exit(1)
     }
 
-    const { lines, newOffset } = readNewLines(file, offset)
+    const { lines, newOffset, batches } = consumeInboxSlice(file, offset)
     if (lines.length > 0) {
-      const batches = parseOwnerBatches(lines)
       offset = newOffset
       writeStatePatch(connectionId, { inbox_byte_offset: offset })
 
