@@ -24,6 +24,9 @@ import {
   armEndsTurn,
   clearTurnMarker,
   notifyWorkingEnded,
+  offsetAfterAdvisoryHistory,
+  resolveFromEndOffset,
+  resolveWatchOffset,
 } from './devspec-remote-wait.mjs'
 
 describe('parseOwnerBatches', () => {
@@ -456,5 +459,95 @@ describe('notifyWorkingEnded (item cd989606 — immediate report_complete)', () 
     })
     assert.equal(result.ok, true)
     assert.deepEqual(calls, ['heartbeat_connection', 'report_complete'])
+  })
+})
+
+describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued owner_messages)', () => {
+  const advisory = (extra = {}) =>
+    `${JSON.stringify({ type: 'advisory_context', messages: [{ id: 'a1', ...extra }] })}\n`
+  const owner = (id = 'm1') =>
+    `${JSON.stringify({ type: 'owner_messages', messages: [{ id }] })}\n`
+
+  it('empty inbox seeks to EOF (0)', () => {
+    assert.equal(offsetAfterAdvisoryHistory(''), 0)
+    assert.equal(offsetAfterAdvisoryHistory(null), 0)
+  })
+
+  it('advisory-only inbox seeks to EOF (no phantom wake)', () => {
+    const text = advisory() + advisory({ content: 'café' })
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
+  })
+
+  it('advisory then owner_messages starts at the owner_messages line', () => {
+    const prefix = advisory({ content: 'café' })
+    const text = prefix + owner('7cc60994')
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(prefix, 'utf8'))
+  })
+
+  it('owner_messages at the start of the file starts at 0', () => {
+    assert.equal(offsetAfterAdvisoryHistory(owner()), 0)
+  })
+
+  it('empty owner_messages array is treated as advisory (not a wake)', () => {
+    const emptyOwner = `${JSON.stringify({ type: 'owner_messages', messages: [] })}\n`
+    const text = advisory() + emptyOwner
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
+  })
+
+  it('incomplete trailing owner_messages line (no newline) is not a wake', () => {
+    const prefix = advisory()
+    const incomplete = '{"type":"owner_messages","messages":[{"id":"x"}]}'
+    const text = prefix + incomplete
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
+  })
+
+  it('two owner_messages batches start at the first', () => {
+    const prefix = advisory()
+    const text = prefix + owner('first') + owner('second')
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(prefix, 'utf8'))
+  })
+
+  it('resolveFromEndOffset reads a file with the same contract', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      fs.writeFileSync(file, '')
+      assert.equal(resolveFromEndOffset(file), 0)
+      const prefix = advisory()
+      fs.writeFileSync(file, prefix + owner())
+      assert.equal(resolveFromEndOffset(file), Buffer.byteLength(prefix, 'utf8'))
+      fs.writeFileSync(file, prefix)
+      assert.equal(resolveFromEndOffset(file), Buffer.byteLength(prefix, 'utf8'))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('--pending keeps the saved inbox_byte_offset even when unread owner_messages exist', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pending-offset-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      fs.writeFileSync(file, advisory() + owner())
+      assert.equal(
+        resolveWatchOffset({
+          pending: true,
+          fromEnd: true,
+          inboxByteOffset: 42,
+          file,
+        }),
+        42,
+      )
+      assert.equal(
+        resolveWatchOffset({
+          pending: true,
+          fromEnd: false,
+          inboxByteOffset: 99,
+          file,
+        }),
+        99,
+      )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

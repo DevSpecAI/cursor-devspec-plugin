@@ -17,7 +17,7 @@ On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no long
 6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + arm-wait / answer / re-arm) — **not** the full ~32k skill body
 7. Spawn `agent --resume`, then `ensure-poller` anchored to a durable host **in that child tree** (`cursor-agent` node.exe / `agent.exe`). Walking ancestors of `launch-cli-session` cannot see the CLI agent; pinning to `Cursor.exe` (the IDE) would not reap when the terminal closes (item f099fc6e).
 
-The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). Do **not** re-register on a stamped “already Live” launch.
+The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). `--from-end` skips advisory inbox history but **does not** skip `owner_messages` the poller already queued (item 1f177af4). Do **not** re-register on a stamped “already Live” launch.
 
 **Launcher path (item 94b11df6):** `open-handler --install` / extension activate writes `~/.cursor/devspec/extension-root.json`. Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a VSIX update.
 
@@ -93,7 +93,7 @@ Both use the same throttle/hash/cap helpers in `work-trail.mjs`. The live bubble
 | Stop hook → `mirror-turn.mjs stop` | IDE Agent turn end (when hooks fire) | Yes — clears marker **and** immediately `report_complete` + `busy:false` (+ clears local `.trail.json`) |
 | Wait `--pending --after-reply` | After the model posts the reply and re-arms (Cursor skill) | Yes — **backstop on Cursor CLI** (Stop often never fires): clears marker **and** immediately `report_complete` + `busy:false` (item cd989606). Without `complete_turn` on the post, this is what ends Working (~agent overhead + MCP RTT after the bubble) |
 | Wait plain `--pending` | Mid-turn re-arm only | **No** — keeps Working (item 68f7b30c) |
-| Wait `--from-end` | First arm after connect | Yes — clears seed/phantom markers **and** immediately completes any leftover working attempt |
+| Wait `--from-end` | First arm after connect | Yes — clears seed/phantom markers **and** immediately completes any leftover working attempt. Offset skips advisory history but keeps unread `owner_messages` already in the inbox (item 1f177af4) |
 | `MAX_TURN_MS` (1h) | Poller backstop | Yes — last resort |
 
 Do **not** clear Working on interim `post_session_message` alone (omit `complete_turn` — item 5e7aac1c). Do **not** clear on plain `--pending` re-arm.
@@ -119,7 +119,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 
 - Copying Claude’s `--stream` wait into Cursor — there is no Monitor primitive here, and no file crosses a repo boundary anyway.
 - Overwriting Cursor’s auth resolver with Claude’s.
-- Using `--from-end` after the first arm (drops pending inbox mail).
+- Using `--from-end` after the first arm (drops pending inbox mail). First-arm `--from-end` itself must not seek past unread `owner_messages` the poller already wrote (item 1f177af4).
 - Re-arming with plain `--pending` after a finished reply (leaves Live-but-Working forever on CLI).
 - Hand-writing connection JSON with a hardcoded prod MCP URL.
 - Pointing hooks.json at `…/extensions/devspecai.devspec-autopilot-<version>/…` (dies on every VSIX bump).
@@ -143,6 +143,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Ignoring `attachments[].path` on `owner_message` → miss screenshots/docs the owner sent with the command.
 - Fast-connect abort (auth / project / register / attach) → launcher exits **before** `--resume` (no half-Live agent). Missing owner-pid at pre-resume poller time is **not** fatal; poller starts after spawn (item f099fc6e).
 - Mechanical Connect `ensure-poller` before `--resume` on Windows → refuse owner-pid, launcher exits, connection idle_timeout (Restless Owl). Fixed in 0.5.2: defer poller until the CLI child tree exists.
+- First dispatch after Connect skipped (Emerald Ocelot). Wait `--from-end` seeked to EOF past `owner_messages` the poller already queued. Fixed in 0.5.3: skip advisory history only (item 1f177af4).
 
 ## Key files
 

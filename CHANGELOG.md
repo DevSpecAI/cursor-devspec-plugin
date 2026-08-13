@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3 - 2026-08-13
+
+### Fixed
+
+- **First dispatch after mechanical Connect was skipped (Emerald Ocelot):** wait `--from-end` seeked to EOF, so `owner_messages` the poller had already written (join chip is live before the model arms wait) were never woken. `--from-end` still skips `advisory_context` history; unread owner commands in the inbox are kept (item 1f177af4).
+
 ## 0.5.2 - 2026-08-13
 
 ### Fixed

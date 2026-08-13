@@ -80,7 +80,8 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  *
  * Ends the working phase when:
  *   1. **First arm** (`--from-end`, not `--pending`) — connect/reconnect discards
- *      historical inbox; any leftover seed marker is phantom Working.
+ *      advisory history; any leftover seed marker is phantom Working. Unread
+ *      `owner_messages` already in the inbox are NOT discarded (item 1f177af4).
  *   2. **Reply-complete re-arm** (`--pending --after-reply`) — Cursor CLI often
  *      never fires the IDE Stop hook, so Working would stick until MAX_TURN_MS.
  *      After `post_session_message`, the skill re-arms with `--after-reply` to
@@ -172,9 +173,10 @@ export async function notifyWorkingEnded({
 function parseArgs(argv) {
   // Default: resume from saved inbox_byte_offset so owner commands that arrived
   // while the agent was mid-turn are NOT skipped. --from-end is only for the
-  // first arm after connect (ignore historical inbox). Live bug 2026-07-24:
-  // re-arm with --from-end after a wake permanently dropped concurrent owner
-  // mail that the poller had already written to the inbox.
+  // first arm after connect (ignore advisory history, keep queued owner_messages).
+  // Live bug 2026-07-24: re-arm with --from-end after a wake permanently dropped
+  // concurrent owner mail. Live bug 2026-08-13 (Emerald Ocelot / 1f177af4): first
+  // arm seek-to-EOF skipped owner_messages the mechanical poller wrote before wait.
   const out = { fromEnd: false, pending: false, afterReply: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -400,6 +402,68 @@ function fileSize(p) {
   } catch {
     return 0
   }
+}
+
+/**
+ * First-arm `--from-end` offset: skip `advisory_context` history, but do not skip
+ * `owner_messages` the poller already wrote. Mechanical Connect starts the poller
+ * before the model arms wait, so a first dispatch is often already in the inbox
+ * (Emerald Ocelot / item 1f177af4). Incomplete trailing lines (no final `\n`) are
+ * ignored, matching `readNewLines`.
+ *
+ * @param {string} text inbox file contents (utf8)
+ * @returns {number} byte offset to start watching from
+ */
+export function offsetAfterAdvisoryHistory(text) {
+  const src = String(text ?? '')
+  let searchFrom = 0
+  while (searchFrom < src.length) {
+    const nl = src.indexOf('\n', searchFrom)
+    if (nl === -1) break
+    const line = src.slice(searchFrom, nl)
+    let parsed = null
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      parsed = null
+    }
+    if (
+      parsed?.type === 'owner_messages' &&
+      Array.isArray(parsed.messages) &&
+      parsed.messages.length > 0
+    ) {
+      return Buffer.byteLength(src.slice(0, searchFrom), 'utf8')
+    }
+    searchFrom = nl + 1
+  }
+  return Buffer.byteLength(src, 'utf8')
+}
+
+/** @param {string} file */
+export function resolveFromEndOffset(file) {
+  try {
+    return offsetAfterAdvisoryHistory(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Inbox watch start. `--pending` always wins (saved offset, including mid-turn
+ * mail). `--from-end` skips advisory history but keeps unread owner_messages.
+ * @param {{ pending?: boolean, fromEnd?: boolean, inboxByteOffset?: number, file: string }} opts
+ */
+export function resolveWatchOffset({ pending, fromEnd, inboxByteOffset, file }) {
+  if (pending === true && typeof inboxByteOffset === 'number') {
+    return inboxByteOffset
+  }
+  if (fromEnd === true) {
+    return resolveFromEndOffset(file)
+  }
+  if (typeof inboxByteOffset === 'number') {
+    return inboxByteOffset
+  }
+  return fileSize(file)
 }
 
 /**
@@ -647,16 +711,14 @@ async function main() {
     fs.writeFileSync(file, '', { mode: 0o600 })
   }
 
-  let offset = 0
-  if (args.pending && typeof state?.inbox_byte_offset === 'number') {
-    offset = state.inbox_byte_offset
-  } else if (args.fromEnd) {
-    offset = fileSize(file)
+  const offset = resolveWatchOffset({
+    pending: args.pending,
+    fromEnd: args.fromEnd,
+    inboxByteOffset: state?.inbox_byte_offset,
+    file,
+  })
+  if (args.fromEnd && !args.pending) {
     writeStatePatch(connectionId, { inbox_byte_offset: offset })
-  } else if (typeof state?.inbox_byte_offset === 'number') {
-    offset = state.inbox_byte_offset
-  } else {
-    offset = fileSize(file)
   }
 
   // First arm (--from-end) or reply-complete re-arm (--pending --after-reply)
