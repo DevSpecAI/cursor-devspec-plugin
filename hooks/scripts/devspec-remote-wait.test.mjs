@@ -32,6 +32,7 @@ import {
   resolveWatchOffset,
   consumeInboxSlice,
   resolveConnectionsDir,
+  resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
 
 describe('parseOwnerBatches', () => {
@@ -672,5 +673,47 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('resolveOwnerPid (item 5c884554 — wait copy skips worker-server)', () => {
+  const workerCmd =
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" "C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" worker-server'
+  const resumeCmd =
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" "C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume abc'
+
+  it('explicit worker-server pid falls through to auto/--resume', () => {
+    if (process.platform !== 'win32') {
+      assert.equal(
+        resolveOwnerPid(20196, 22808, {
+          processNameOf: () => 'node.exe',
+          processCommandLineOf: () => workerCmd,
+          resolveAuto: () => 22808,
+        }),
+        20196,
+      )
+      return
+    }
+    assert.equal(
+      resolveOwnerPid(20196, 22808, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () => workerCmd,
+        resolveAuto: () => 22808,
+      }),
+      22808,
+    )
+  })
+
+  it('explicit --resume cursor-agent node.exe is kept', () => {
+    assert.equal(
+      resolveOwnerPid(22808, 999, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () => resumeCmd,
+        resolveAuto: () => {
+          throw new Error('auto should not run')
+        },
+      }),
+      22808,
+    )
   })
 })

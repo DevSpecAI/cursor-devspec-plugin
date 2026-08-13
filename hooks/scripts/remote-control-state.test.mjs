@@ -17,6 +17,8 @@ import {
   isWin32OwnerHostName,
   isWin32ShellName,
   isWin32CursorAgentNodeCommand,
+  isWin32CursorAgentWorkerServerCommand,
+  isWin32CursorAgentDurableNodeCommand,
   isWin32DurableOwnerProcess,
   isWin32CliSpawnOwnerProcess,
   shouldIgnoreExplicitWin32Owner,
@@ -576,6 +578,51 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
     assert.equal(isWin32CursorAgentNodeCommand(launcher), false)
   })
 
+  it('rejects cursor-agent worker-server as a durable owner (item 5c884554)', () => {
+    const resumeCmd =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" --resume abc'
+    const workerCmd =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" worker-server'
+    assert.equal(isWin32CursorAgentNodeCommand(workerCmd), true)
+    assert.equal(isWin32CursorAgentWorkerServerCommand(workerCmd), true)
+    assert.equal(isWin32CursorAgentDurableNodeCommand(workerCmd), false)
+    assert.equal(isWin32DurableOwnerProcess('node.exe', workerCmd), false)
+    assert.equal(isWin32CliSpawnOwnerProcess('node.exe', workerCmd), false)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', workerCmd), true)
+
+    assert.equal(isWin32CursorAgentWorkerServerCommand(resumeCmd), false)
+    assert.equal(isWin32CursorAgentDurableNodeCommand(resumeCmd), true)
+    assert.equal(isWin32DurableOwnerProcess('node.exe', resumeCmd), true)
+    assert.equal(isWin32CliSpawnOwnerProcess('node.exe', resumeCmd), true)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', resumeCmd), false)
+  })
+
+  it('explicit worker-server pid falls through to auto/--resume (item 5c884554)', () => {
+    const workerCmd =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" "C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" worker-server'
+    if (process.platform !== 'win32') {
+      assert.equal(
+        resolveOwnerPid(20196, 22808, {
+          processNameOf: () => 'node.exe',
+          processCommandLineOf: () => workerCmd,
+          resolveAuto: () => 22808,
+        }),
+        20196,
+      )
+      return
+    }
+    assert.equal(
+      resolveOwnerPid(20196, 22808, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () => workerCmd,
+        resolveAuto: () => 22808,
+      }),
+      22808,
+    )
+  })
+
   it('explicit valid non-shell arg wins (mocked name lookup)', () => {
     assert.equal(
       resolveOwnerPid(555, 999, {
@@ -696,7 +743,7 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -notmatch 'remote-control-state|launch-cli-session' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
+            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -match '(?i)\\b--resume\\b' -and $_.CommandLine -notmatch '(?i)\\bworker-server\\b' -and $_.CommandLine -notmatch 'remote-control-state|launch-cli-session' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
           ],
           { encoding: 'utf8', timeout: 8000, windowsHide: true },
         ).trim()
@@ -715,6 +762,9 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
   const cursorAgentCmd =
     '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
     '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" --resume abc'
+  const workerServerCmd =
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" worker-server'
   const launcherCmd =
     'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\extensions\\devspecai.devspec-autopilot-0.5.1\\scripts\\launch-cli-session.mjs --folder x'
   const treeOpts = (tree) => ({
@@ -737,6 +787,50 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
       }),
     )
     assert.equal(found, 200)
+  })
+
+  it('prefers --resume over a worker-server sibling listed first (item 5c884554)', () => {
+    // Live bug: BFS returned the first cursor-agent node.exe. Get-CimInstance
+    // can enqueue worker-server before --resume; that child then dies and the
+    // poller fires owner_gone while --resume is still alive.
+    assert.equal(isWin32CliSpawnOwnerProcess('node.exe', workerServerCmd), false)
+    const found = resolveOwnerPidFromChildTree(
+      100,
+      treeOpts({
+        100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [201, 200] },
+        201: { name: 'node.exe', commandLine: workerServerCmd, children: [] },
+        200: { name: 'node.exe', commandLine: cursorAgentCmd, children: [] },
+      }),
+    )
+    assert.equal(found, 200)
+  })
+
+  it('does not pin to worker-server when it is the only cursor-agent node', () => {
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        100,
+        treeOpts({
+          100: { name: 'powershell.exe', children: [201] },
+          201: { name: 'node.exe', commandLine: workerServerCmd, children: [] },
+        }),
+      ),
+      null,
+    )
+  })
+
+  it('walks past a worker-server child to its --resume parent', () => {
+    assert.equal(
+      walkChildTreeForDurableOwner(100, {
+        processInfoOf: (pid) => {
+          if (pid === 100) return { name: 'powershell.exe', commandLine: '' }
+          if (pid === 200) return { name: 'node.exe', commandLine: cursorAgentCmd }
+          if (pid === 201) return { name: 'node.exe', commandLine: workerServerCmd }
+          return null
+        },
+        childrenOf: (pid) => (pid === 100 ? [201, 200] : []),
+      }),
+      200,
+    )
   })
 
   it('accepts agent.exe as a CLI spawn owner', () => {

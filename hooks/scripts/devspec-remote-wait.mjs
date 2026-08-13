@@ -217,14 +217,16 @@ function parseArgs(argv) {
  * On Windows the caller's `--owner-pid "$PPID"` is usually an MSYS-internal number
  * that maps to no real Win32 process, so an explicit value is validated before it is
  * trusted and we otherwise walk this process's genuine ancestry to the owning host
- * (items 3cddb3b4 / f3a88333 / c57dc381). Keep host/shell/node-command rules in sync
- * with `remote-control-state.mjs` (write path).
+ * (items 3cddb3b4 / f3a88333 / c57dc381 / 5c884554). Keep host/shell/node-command
+ * rules in sync with `remote-control-state.mjs` (write path). Never treat
+ * `index.js worker-server` as durable — it exits while `--resume` lives.
  */
 const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe', 'cursor-agent.exe'])
 const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
 const WIN32_NODE_EPHEMERAL_CMD_RE =
   /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
 const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
+const WIN32_CURSOR_AGENT_WORKER_SERVER_RE = /\bworker-server\b/i
 
 function isWin32CursorAgentNodeCommand(commandLine) {
   const cmd = String(commandLine || '')
@@ -233,9 +235,14 @@ function isWin32CursorAgentNodeCommand(commandLine) {
   return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
 }
 
+function isWin32CursorAgentDurableNodeCommand(commandLine) {
+  if (!isWin32CursorAgentNodeCommand(commandLine)) return false
+  return !WIN32_CURSOR_AGENT_WORKER_SERVER_RE.test(String(commandLine || ''))
+}
+
 function shouldIgnoreExplicitWin32Owner(name, commandLine = '') {
   if (WIN32_SHELL_NAMES.has(String(name || '').toLowerCase())) return true
-  if (String(name || '').toLowerCase() === 'node.exe') return !isWin32CursorAgentNodeCommand(commandLine)
+  if (String(name || '').toLowerCase() === 'node.exe') return !isWin32CursorAgentDurableNodeCommand(commandLine)
   return false
 }
 
@@ -272,6 +279,7 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
   const script = [
     `$ownerHosts = @(${hosts})`,
     `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$workerServer = '(?i)\\bworker-server\\b'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
@@ -280,7 +288,7 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
     '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
     '  if ($name -eq "node.exe") {',
     '    $cmd = [string]$proc.CommandLine',
-    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
     '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
@@ -315,7 +323,7 @@ export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
         commandLine = info?.commandLine ?? ''
       }
       if (name && shouldIgnoreExplicitWin32Owner(name, commandLine)) {
-        // Fall through — not a durable owner anchor (items f3a88333 / c57dc381).
+        // Fall through — not a durable owner anchor (items f3a88333 / c57dc381 / 5c884554).
       } else {
         return explicit
       }

@@ -231,6 +231,13 @@ export const WIN32_NODE_EPHEMERAL_CMD_RE =
 /** Cursor CLI often runs as node.exe with cursor-agent in CommandLine (not agent.exe). */
 export const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
 
+/**
+ * Cursor CLI helper `index.js worker-server` — a child of `agent --resume` that
+ * exits on its own while the resume session stays up. Pinning the poller to it
+ * fires `owner_gone` (Copper Sparrow / Azure Bison / Azure Raccoon, item 5c884554).
+ */
+export const WIN32_CURSOR_AGENT_WORKER_SERVER_RE = /\bworker-server\b/i
+
 export function isWin32OwnerHostName(name) {
   return WIN32_OWNER_HOST_NAMES.has(String(name || '').toLowerCase())
 }
@@ -250,22 +257,35 @@ export function isWin32CursorAgentNodeCommand(commandLine) {
   return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
 }
 
+export function isWin32CursorAgentWorkerServerCommand(commandLine) {
+  return WIN32_CURSOR_AGENT_WORKER_SERVER_RE.test(String(commandLine || ''))
+}
+
+/**
+ * Cursor CLI node.exe that may own the poller: cursor-agent path, not a plugin
+ * script, and not the short-lived worker-server helper (item 5c884554).
+ */
+export function isWin32CursorAgentDurableNodeCommand(commandLine) {
+  if (!isWin32CursorAgentNodeCommand(commandLine)) return false
+  return !isWin32CursorAgentWorkerServerCommand(commandLine)
+}
+
 /** Name (+ optional CommandLine) is a durable Windows owner host. */
 export function isWin32DurableOwnerProcess(name, commandLine = '') {
   const n = String(name || '').toLowerCase()
   if (WIN32_OWNER_HOST_NAMES.has(n)) return true
-  if (n === 'node.exe') return isWin32CursorAgentNodeCommand(commandLine)
+  if (n === 'node.exe') return isWin32CursorAgentDurableNodeCommand(commandLine)
   return false
 }
 
 /**
  * Durable owner inside a just-spawned CLI process tree (walk DOWN from spawn PID).
- * Rejects Cursor.exe (IDE), shells, and ephemeral plugin scripts.
+ * Rejects Cursor.exe (IDE), shells, ephemeral plugin scripts, and worker-server.
  */
 export function isWin32CliSpawnOwnerProcess(name, commandLine = '') {
   const n = String(name || '').toLowerCase()
   if (WIN32_CLI_SPAWN_OWNER_NAMES.has(n)) return true
-  if (n === 'node.exe') return isWin32CursorAgentNodeCommand(commandLine)
+  if (n === 'node.exe') return isWin32CursorAgentDurableNodeCommand(commandLine)
   return false
 }
 
@@ -323,6 +343,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     `$maxNodes = ${maxNodes}`,
     `$deadline = (Get-Date).AddMilliseconds(${timeout})`,
     `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$workerServer = '(?i)\\bworker-server\\b'`,
     'do {',
     '  $queue = New-Object System.Collections.Generic.Queue[int]',
     '  $queue.Enqueue($root)',
@@ -338,7 +359,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     '      $name = $proc.Name.ToLowerInvariant()',
     '      $cmd = [string]$proc.CommandLine',
     '      if ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe") { Write-Output $proc.ProcessId; exit 0 }',
-    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; exit 0 }',
+    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; exit 0 }',
     '    }',
     '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
     '  }',
@@ -452,7 +473,7 @@ export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
     return {
       ok: false,
       error:
-        'no durable owner-pid in spawned agent tree (waited for cursor-agent/agent.exe descendant; powershell/cmd/launch-cli-session/Cursor.exe are not anchors)',
+        'no durable owner-pid in spawned agent tree (waited for cursor-agent --resume / agent.exe descendant; powershell/cmd/launch-cli-session/Cursor.exe/worker-server are not anchors)',
       owner_pid: null,
     }
   }
@@ -472,7 +493,7 @@ export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
 export function shouldIgnoreExplicitWin32Owner(name, commandLine = '') {
   if (isWin32ShellName(name)) return true
   const n = String(name || '').toLowerCase()
-  if (n === 'node.exe') return !isWin32CursorAgentNodeCommand(commandLine)
+  if (n === 'node.exe') return !isWin32CursorAgentDurableNodeCommand(commandLine)
   return false
 }
 
@@ -524,7 +545,8 @@ export function win32ProcessName(pid, opts = {}) {
  * itself, unlike the MSYS shell, IS a genuine Win32 process, so `process.pid` (this
  * script's own pid) is a real, queryable anchor — walk its Win32_Process ancestry
  * until we reach a durable host (`Cursor.exe`, CLI `agent.exe`, `claude.exe`, or
- * `node.exe` whose CommandLine hosts cursor-agent — Cursor CLI often has no agent.exe),
+ * `node.exe` whose CommandLine hosts cursor-agent `--resume` — never `worker-server`,
+ * which exits independently of the resume session — Cursor CLI often has no agent.exe),
  * however many shell layers sit in between. A single short-lived PowerShell call
  * does the whole walk (fast: one process spawn, no polling).
  */
@@ -537,6 +559,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
     // Avoid `$hosts` — it is a PowerShell automatic variable.
     `$ownerHosts = @(${hosts})`,
     `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$workerServer = '(?i)\\bworker-server\\b'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
     '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
@@ -545,7 +568,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
     '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
     '  if ($name -eq "node.exe") {',
     '    $cmd = [string]$proc.CommandLine',
-    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
     '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
