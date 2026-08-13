@@ -7,8 +7,9 @@
  * (no `-p` / `--trust` — those are print/headless-only).
  *
  * For remote Connect prompts: runs mechanical fast-connect (register → optional
- * attach → write/poller) AFTER create-chat and BEFORE --resume, then stamps a
- * thin post-Live brief (not the full skill body).
+ * attach → write state, poller deferred) AFTER create-chat and BEFORE --resume,
+ * stamps a thin post-Live brief, then starts the poller once `agent --resume`
+ * has a durable owner PID in its process tree (item f099fc6e).
  *
  * Invoked by open-handler-core when surface=cli:
  *   node launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]
@@ -28,6 +29,7 @@ import {
 } from '../hooks/scripts/connect-phase-timing.mjs'
 import { resolveDevspecMcpAuth } from '../hooks/scripts/resolve-mcp-auth.mjs'
 import { fastConnect } from '../hooks/scripts/fast-connect.mjs'
+import { ensurePollerAfterAgentSpawn } from '../hooks/scripts/remote-control-state.mjs'
 
 function parseArgs(argv) {
   const out = {}
@@ -376,6 +378,9 @@ async function main() {
       cwd: args.folder,
       launchId,
       promptText: promptBody,
+      // Poller needs a durable owner PID. That process does not exist until
+      // agent --resume is spawned (item f099fc6e / Restless Owl).
+      noPoller: true,
     })
     if (!connected.ok) {
       await emitConnectPhase({
@@ -504,6 +509,37 @@ async function main() {
     console.error(`[devspec-cli] failed to start agent: ${err}`)
     process.exitCode = 1
   })
+
+  if (connectResult?.connection_id && child.pid) {
+    const pollerStarted = Date.now()
+    const poller = ensurePollerAfterAgentSpawn(connectResult.connection_id, child.pid, {
+      cwd: args.folder,
+      sessionId: connectResult.session_id || null,
+    })
+    await emitConnectPhase({
+      ...timingCtx,
+      phase: 'ensure_poller',
+      outcome: poller.ok ? 'ok' : 'error',
+      duration_ms: durationMs(pollerStarted),
+      local_id: chatId,
+      connectionId: connectResult.connection_id,
+      sessionId: connectResult.session_id || null,
+      reason: poller.ok ? null : poller.error || 'ensure_poller_failed',
+      extra: {
+        poller_pid: poller.pid || null,
+        owner_pid: poller.owner_pid || null,
+        deferred_until_resume: true,
+        spawn_pid: child.pid,
+      },
+    })
+    if (!poller.ok) {
+      console.error(`[devspec-cli] ensure-poller after resume failed: ${poller.error}`)
+    } else {
+      console.log(
+        `[devspec-cli] Poller pid ${poller.pid} anchored to owner ${poller.owner_pid}`,
+      )
+    }
+  }
 
   child.on('exit', (code, signal) => {
     if (signal) {

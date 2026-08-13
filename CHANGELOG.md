@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2 - 2026-08-13
+
+### Fixed
+
+- **Windows mechanical Connect died before `--resume` (Restless Owl):** fast-connect ran `ensure-poller` from `launch-cli-session` *before* the CLI agent existed. The owner-pid walk starts at the launcher (explicitly ephemeral) and `cursor-agent` is not an ancestor yet, so poller spawn refused, the launcher exited 1, and the connection left with no heartbeats. Register/attach/write-state still run before resume (join chip + thin Live stamp). The poller starts after `agent --resume` is spawned, anchored to a durable host in that child tree (`cursor-agent` node.exe / `agent.exe` — not powershell, `launch-cli-session`, or `Cursor.exe` the IDE) (item f099fc6e).
+
 ## 0.5.0 - 2026-08-11
 
 ### Removed — the `DevSpec Autopilot:` commands are gone; staged batches arrive at any idle connection

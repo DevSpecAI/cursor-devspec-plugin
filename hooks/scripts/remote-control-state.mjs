@@ -55,7 +55,9 @@
  *     → Node-measured attach_connection
  *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
  *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
- *     → Mechanical register → optional attach → write/poller (Cursor launch path)
+ *       [--no-poller]
+ *     → Mechanical register → optional attach → write (poller optional; Cursor
+ *       launch defers it until after agent --resume)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -204,6 +206,14 @@ function findPollerPidsForConnection(connectionId) {
 /** Durable Cursor / Claude agent hosts — never short-lived tool shells (item f3a88333). */
 export const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe'])
 
+/**
+ * Durable hosts that may appear as children of `agent --resume` (item f099fc6e).
+ * `Cursor.exe` is the IDE — it is a valid *ancestor* for in-session skill connect,
+ * but never a valid *descendant* of the CLI spawn (that would pin the poller to
+ * the editor instead of the terminal agent).
+ */
+export const WIN32_CLI_SPAWN_OWNER_NAMES = new Set(['agent.exe', 'claude.exe'])
+
 /** Short-lived shells that must not be used as `--owner-pid` anchors on Windows. */
 export const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
 
@@ -243,6 +253,213 @@ export function isWin32DurableOwnerProcess(name, commandLine = '') {
   if (WIN32_OWNER_HOST_NAMES.has(n)) return true
   if (n === 'node.exe') return isWin32CursorAgentNodeCommand(commandLine)
   return false
+}
+
+/**
+ * Durable owner inside a just-spawned CLI process tree (walk DOWN from spawn PID).
+ * Rejects Cursor.exe (IDE), shells, and ephemeral plugin scripts.
+ */
+export function isWin32CliSpawnOwnerProcess(name, commandLine = '') {
+  const n = String(name || '').toLowerCase()
+  if (WIN32_CLI_SPAWN_OWNER_NAMES.has(n)) return true
+  if (n === 'node.exe') return isWin32CursorAgentNodeCommand(commandLine)
+  return false
+}
+
+function defaultSleepMs(ms) {
+  if (!(ms > 0)) return
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * BFS descendants of `rootPid` for a CLI-spawn durable owner.
+ * Injectable `processInfoOf` / `childrenOf` keep unit tests off Win32_Process.
+ * @param {number} rootPid
+ * @param {{
+ *   processInfoOf?: (pid: number) => { name?: string, commandLine?: string } | null,
+ *   childrenOf?: (pid: number) => number[],
+ *   maxNodes?: number,
+ * }} [opts]
+ * @returns {number | null}
+ */
+export function walkChildTreeForDurableOwner(rootPid, opts = {}) {
+  const processInfoOf = opts.processInfoOf
+  const childrenOf = opts.childrenOf || (() => [])
+  const maxNodes = opts.maxNodes ?? 40
+  const queue = [rootPid]
+  const seen = new Set()
+  while (queue.length && seen.size < maxNodes) {
+    const p = queue.shift()
+    if (!Number.isInteger(p) || p < 1 || seen.has(p)) continue
+    seen.add(p)
+    const info = processInfoOf ? processInfoOf(p) : null
+    if (info && isWin32CliSpawnOwnerProcess(info.name, info.commandLine)) return p
+    const kids = childrenOf(p)
+    if (Array.isArray(kids)) {
+      for (const k of kids) {
+        const child = Number.parseInt(String(k), 10)
+        if (Number.isInteger(child) && child > 1) queue.push(child)
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Windows: one PowerShell invocation BFS-walks descendants of the spawned CLI
+ * process until cursor-agent/agent.exe appears (or timeout). Does not walk
+ * parents (that finds Cursor.exe the IDE, or nothing).
+ */
+export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, timeoutMs = 2500 } = {}) {
+  if (process.platform !== 'win32') return null
+  const pid = Number.parseInt(String(startPid), 10)
+  if (!Number.isInteger(pid) || pid < 1) return null
+  const timeout = Math.max(0, Number(timeoutMs) || 0)
+  const script = [
+    `$root = ${pid}`,
+    `$maxNodes = ${maxNodes}`,
+    `$deadline = (Get-Date).AddMilliseconds(${timeout})`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    'do {',
+    '  $queue = New-Object System.Collections.Generic.Queue[int]',
+    '  $queue.Enqueue($root)',
+    '  $seen = @{}',
+    '  $n = 0',
+    '  while ($queue.Count -gt 0 -and $n -lt $maxNodes) {',
+    '    $p = $queue.Dequeue()',
+    '    if ($seen.ContainsKey($p)) { continue }',
+    '    $seen[$p] = $true',
+    '    $n++',
+    '    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
+    '    if ($proc) {',
+    '      $name = $proc.Name.ToLowerInvariant()',
+    '      $cmd = [string]$proc.CommandLine',
+    '      if ($name -eq "agent.exe" -or $name -eq "claude.exe") { Write-Output $proc.ProcessId; exit 0 }',
+    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; exit 0 }',
+    '    }',
+    '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
+    '  }',
+    '  if ((Get-Date) -ge $deadline) { break }',
+    '  Start-Sleep -Milliseconds 50',
+    '} while ((Get-Date) -lt $deadline)',
+  ].join('\n')
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: Math.max(timeout + 4000, 5000),
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+    const found = Number.parseInt(out, 10)
+    return Number.isInteger(found) && found > 1 ? found : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve a durable owner PID from a process we just spawned (item f099fc6e).
+ *
+ * Mechanical Connect runs *before* `agent --resume`, so walking *ancestors* of
+ * launch-cli-session never sees cursor-agent. After spawn, walk *descendants*
+ * of the child PID (often powershell.exe wrapping agent.ps1 on Windows).
+ *
+ * POSIX: the spawn PID is the agent — return it.
+ * Windows: wait briefly for cursor-agent/agent.exe in the child tree; never
+ * treat powershell/cmd/launch-cli-session or Cursor.exe (IDE) as the owner.
+ *
+ * @param {string | number | null | undefined} rootPid
+ * @param {{
+ *   platform?: NodeJS.Platform,
+ *   processInfoOf?: (pid: number) => { name?: string, commandLine?: string } | null,
+ *   childrenOf?: (pid: number) => number[],
+ *   walkOnce?: (pid: number) => number | null,
+ *   sleepMs?: (ms: number) => void,
+ *   now?: () => number,
+ *   timeoutMs?: number,
+ *   intervalMs?: number,
+ *   maxNodes?: number,
+ * }} [opts]
+ * @returns {number | null}
+ */
+export function resolveOwnerPidFromChildTree(rootPid, opts = {}) {
+  const pid = Number.parseInt(String(rootPid ?? ''), 10)
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  const platform = opts.platform ?? process.platform
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 2500
+  const intervalMs = Number.isFinite(opts.intervalMs) ? opts.intervalMs : 50
+  const now = opts.now ?? Date.now
+  const sleepMs = opts.sleepMs ?? defaultSleepMs
+  const injectable = !!(opts.processInfoOf || opts.childrenOf || opts.walkOnce)
+
+  if (injectable) {
+    const deadline = now() + Math.max(0, timeoutMs)
+    while (true) {
+      const found = opts.walkOnce
+        ? opts.walkOnce(pid)
+        : walkChildTreeForDurableOwner(pid, opts)
+      if (found) return found
+      if (now() >= deadline) return null
+      sleepMs(intervalMs)
+    }
+  }
+
+  if (platform !== 'win32') return pid
+  return resolveOwnerPidFromChildTreeWin32(pid, {
+    timeoutMs,
+    maxNodes: opts.maxNodes ?? 40,
+  })
+}
+
+function persistOwnerPidOnConnection(connectionId, ownerPid) {
+  try {
+    const prev = readJson(connectionPath(connectionId))
+    if (!prev) return
+    writeJson(connectionPath(connectionId), {
+      ...prev,
+      owner_pid: ownerPid,
+      updated_at: new Date().toISOString(),
+    })
+  } catch {
+    /* poller still receives --owner-pid on argv */
+  }
+}
+
+/**
+ * After `agent --resume` is spawned, find a durable owner in that child tree
+ * and start the poller. Does not abort the CLI on failure — the agent is already
+ * running; a warning is the caller's job.
+ *
+ * @param {string} connectionId
+ * @param {string | number | null | undefined} spawnPid
+ * @param {{
+ *   cwd?: string,
+ *   sessionId?: string | null,
+ *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
+ *   ensurePoller?: typeof ensurePollerForConnection,
+ *   childTreeOpts?: object,
+ * }} [opts]
+ */
+export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
+  if (!connectionId || connectionId.length < 8) {
+    return { ok: false, error: 'missing connection id', owner_pid: null }
+  }
+  const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
+  const ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
+  if (!ownerPid) {
+    return {
+      ok: false,
+      error:
+        'no durable owner-pid in spawned agent tree (waited for cursor-agent/agent.exe descendant; powershell/cmd/launch-cli-session/Cursor.exe are not anchors)',
+      owner_pid: null,
+    }
+  }
+  const ensure = opts.ensurePoller || ensurePollerForConnection
+  const poller = ensure(connectionId, {
+    cwd: opts.cwd,
+    sessionId: opts.sessionId || null,
+    ownerPid,
+  })
+  return { ...poller, owner_pid: ownerPid }
 }
 
 /**
@@ -469,6 +686,7 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
         'refusing to spawn a poller without a valid --owner-pid (no trustworthy owner anchor → the reaper could never prove it dead → zombie "Live" agent). Pass --owner-pid "$PPID" (POSIX) — on Windows prefer omit or $PPID and let self-resolve walk to Cursor.exe/agent.exe/claude.exe or node.exe hosting cursor-agent; never pass a tool-shell $PID. If you see this, the automatic host walk failed too.',
     }
   }
+  persistOwnerPidOnConnection(connectionId, ownerPid)
 
   const stopped = stopPollerForConnection(connectionId)
   fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })

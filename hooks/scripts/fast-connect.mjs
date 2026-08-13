@@ -1,7 +1,8 @@
 /**
  * Mechanical Cursor Connect (item 1cc2a2d5) — register / optional attach / write
- * state / ensure poller BEFORE the agent resumes. The model only arms wait and
- * handles owner commands (thin post-Live brief).
+ * state BEFORE the agent resumes. The poller is started after `agent --resume`
+ * has a durable owner PID (item f099fc6e). The model only arms wait and handles
+ * owner commands (thin post-Live brief).
  *
  * Usage (CLI via remote-control-state.mjs):
  *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
@@ -216,6 +217,7 @@ export async function resolveProjectForConnect(opts) {
  *   projectId?: string | null,
  *   agent?: string,
  *   ownerPid?: string | number | null,
+ *   noPoller?: boolean,
  *   hostToken?: string | null,
  *   codename?: string | null,
  *   forceNew?: boolean,
@@ -458,6 +460,7 @@ export async function fastConnect(opts = {}) {
     agent,
     localId,
     ownerPid: opts.ownerPid,
+    noPoller: !!opts.noPoller,
     hostToken,
     codename,
     resolveAuth,
@@ -475,11 +478,13 @@ export async function fastConnect(opts = {}) {
     }
   }
 
-  // Dense ensure_poller phase (write already started it; record outcome separately).
+  // Dense ensure_poller phase (write already started it unless noPoller deferred
+  // it until after agent --resume — item f099fc6e).
   const poller = written.poller || null
+  const pollerDeferred = !!(opts.noPoller || poller?.skipped)
   await emitPhase({
     phase: 'ensure_poller',
-    outcome: poller?.ok ? 'ok' : poller?.skipped ? 'ok' : 'error',
+    outcome: poller?.ok || pollerDeferred ? 'ok' : 'error',
     duration_ms: 0,
     launch_id: launchId,
     local_id: localId,
@@ -487,15 +492,16 @@ export async function fastConnect(opts = {}) {
     sessionId: attachedSessionId,
     agent,
     mcpUrl: written.mcp_url || auth.mcp_url || null,
-    reason: poller?.ok || poller?.skipped ? null : poller?.error || written.warning_poller || null,
+    reason: poller?.ok || pollerDeferred ? null : poller?.error || written.warning_poller || null,
     extra: {
       poller_pid: poller?.pid || null,
       reused: !!poller?.reused,
-      skipped: !!poller?.skipped,
+      skipped: !!(poller?.skipped || pollerDeferred),
+      deferred_until_resume: pollerDeferred,
     },
   })
 
-  if (poller && !poller.ok && !poller.skipped) {
+  if (poller && !poller.ok && !poller.skipped && !opts.noPoller) {
     return {
       ok: false,
       error: poller.error || written.warning_poller || 'ensure_poller_failed',
@@ -545,6 +551,7 @@ export async function runFastConnectCli(args) {
     projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
     agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
     ownerPid: args['owner-pid'] ?? null,
+    noPoller: !!args.noPoller,
     hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
     codename: typeof args.codename === 'string' ? args.codename : null,
     forceNew: !!args.forceNew,

@@ -18,9 +18,13 @@ import {
   isWin32ShellName,
   isWin32CursorAgentNodeCommand,
   isWin32DurableOwnerProcess,
+  isWin32CliSpawnOwnerProcess,
   shouldIgnoreExplicitWin32Owner,
   resolveOwnerPid,
   resolveOwnerPidAutoWindows,
+  resolveOwnerPidFromChildTree,
+  walkChildTreeForDurableOwner,
+  ensurePollerAfterAgentSpawn,
 } from './remote-control-state.mjs'
 
 describe('detectLocalId', () => {
@@ -704,4 +708,155 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
       assert.equal(resolveOwnerPidAutoWindows(startPid), startPid)
     },
   )
+})
+
+describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
+  const cursorAgentCmd =
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
+    '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" --resume abc'
+  const launcherCmd =
+    'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\extensions\\devspecai.devspec-autopilot-0.5.1\\scripts\\launch-cli-session.mjs --folder x'
+  const treeOpts = (tree) => ({
+    platform: 'win32',
+    timeoutMs: 0,
+    sleepMs: () => {},
+    processInfoOf: (pid) => {
+      const n = tree[pid]
+      return n ? { name: n.name, commandLine: n.commandLine || '' } : null
+    },
+    childrenOf: (pid) => tree[pid]?.children ?? [],
+  })
+
+  it('prefers a cursor-agent descendant over a powershell wrapper PID', () => {
+    const found = resolveOwnerPidFromChildTree(
+      100,
+      treeOpts({
+        100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [200] },
+        200: { name: 'node.exe', commandLine: cursorAgentCmd, children: [] },
+      }),
+    )
+    assert.equal(found, 200)
+  })
+
+  it('accepts agent.exe as a CLI spawn owner', () => {
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        50,
+        treeOpts({
+          50: { name: 'cmd.exe', children: [51] },
+          51: { name: 'agent.exe', commandLine: 'agent.exe --resume x', children: [] },
+        }),
+      ),
+      51,
+    )
+  })
+
+  it('rejects ephemeral launch-cli-session as the owner', () => {
+    assert.equal(isWin32CliSpawnOwnerProcess('node.exe', launcherCmd), false)
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        10,
+        treeOpts({
+          10: { name: 'node.exe', commandLine: launcherCmd, children: [] },
+        }),
+      ),
+      null,
+    )
+  })
+
+  it('rejects Cursor.exe the IDE even if it appears in the spawn tree', () => {
+    assert.equal(isWin32CliSpawnOwnerProcess('Cursor.exe', ''), false)
+    assert.equal(isWin32DurableOwnerProcess('Cursor.exe'), true)
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        100,
+        treeOpts({
+          100: { name: 'powershell.exe', children: [300] },
+          300: { name: 'Cursor.exe', commandLine: 'Cursor.exe', children: [] },
+        }),
+      ),
+      null,
+    )
+  })
+
+  it('does not treat powershell with no durable child as an owner', () => {
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        100,
+        treeOpts({
+          100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [] },
+        }),
+      ),
+      null,
+    )
+  })
+
+  it('retries until a cursor-agent child appears', () => {
+    let ticks = 0
+    const found = resolveOwnerPidFromChildTree(100, {
+      platform: 'win32',
+      timeoutMs: 1000,
+      intervalMs: 1,
+      now: () => {
+        ticks += 1
+        return ticks
+      },
+      sleepMs: () => {},
+      processInfoOf: (pid) => {
+        if (pid === 100) return { name: 'powershell.exe', commandLine: '' }
+        if (pid === 200 && ticks >= 3) return { name: 'node.exe', commandLine: cursorAgentCmd }
+        return null
+      },
+      childrenOf: (pid) => (pid === 100 && ticks >= 3 ? [200] : []),
+    })
+    assert.equal(found, 200)
+    assert.ok(ticks >= 3)
+  })
+
+  it('POSIX spawn PID is the owner when no injectors are used', () => {
+    assert.equal(resolveOwnerPidFromChildTree(4242, { platform: 'linux' }), 4242)
+    assert.equal(resolveOwnerPidFromChildTree(1, { platform: 'linux' }), null)
+  })
+
+  it('walkChildTreeForDurableOwner does not pick the wrapper itself', () => {
+    assert.equal(
+      walkChildTreeForDurableOwner(100, {
+        processInfoOf: (pid) =>
+          pid === 100
+            ? { name: 'powershell.exe', commandLine: '' }
+            : { name: 'node.exe', commandLine: cursorAgentCmd },
+        childrenOf: (pid) => (pid === 100 ? [200] : []),
+      }),
+      200,
+    )
+  })
+
+  it('ensurePollerAfterAgentSpawn passes the descendant owner pid', () => {
+    const r = ensurePollerAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
+      cwd: '/tmp',
+      sessionId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      resolveOwnerPidFromChildTree: () => 200,
+      ensurePoller: (connectionId, opts) => {
+        assert.equal(connectionId, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+        assert.equal(opts.ownerPid, 200)
+        assert.equal(opts.sessionId, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+        return { ok: true, pid: 999 }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.owner_pid, 200)
+    assert.equal(r.pid, 999)
+  })
+
+  it('ensurePollerAfterAgentSpawn fails closed when the child tree has no owner', () => {
+    const r = ensurePollerAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
+      resolveOwnerPidFromChildTree: () => null,
+      ensurePoller: () => {
+        throw new Error('must not spawn')
+      },
+    })
+    assert.equal(r.ok, false)
+    assert.equal(r.owner_pid, null)
+    assert.match(r.error, /spawned agent tree/)
+  })
 })

@@ -13,8 +13,9 @@ On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no long
 2. Resolve project (`git remote` + `list_projects`)
 3. `register_connection`
 4. `attach_connection` when the launch prompt has `--session <uuid>`
-5. Write connection state + auto-start poller
+5. Write connection state (**poller deferred** — no durable owner PID exists yet)
 6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + arm-wait / answer / re-arm) — **not** the full ~32k skill body
+7. Spawn `agent --resume`, then `ensure-poller` anchored to a durable host **in that child tree** (`cursor-agent` node.exe / `agent.exe`). Walking ancestors of `launch-cli-session` cannot see the CLI agent; pinning to `Cursor.exe` (the IDE) would not reap when the terminal closes (item f099fc6e).
 
 The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). Do **not** re-register on a stamped “already Live” launch.
 
@@ -140,11 +141,12 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
 - Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
 - Ignoring `attachments[].path` on `owner_message` → miss screenshots/docs the owner sent with the command.
-- Fast-connect abort (auth / project / register / attach / poller) → launcher exits **before** `--resume` (no half-Live agent).
+- Fast-connect abort (auth / project / register / attach) → launcher exits **before** `--resume` (no half-Live agent). Missing owner-pid at pre-resume poller time is **not** fatal; poller starts after spawn (item f099fc6e).
+- Mechanical Connect `ensure-poller` before `--resume` on Windows → refuse owner-pid, launcher exits, connection idle_timeout (Restless Owl). Fixed in 0.5.2: defer poller until the CLI child tree exists.
 
 ## Key files
 
-- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect** → thin stamp → `--resume`)
+- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect (no poller)** → thin stamp → `--resume` → **ensure-poller** from child tree)
 - `hooks/scripts/fast-connect.mjs` (mechanical Connect orchestrator)
 - `scripts/pin-remote-plugin.mjs` (PLUGIN= + thin post-Live brief)
 - `hooks/scripts/devspec-remote-poll.mjs`
