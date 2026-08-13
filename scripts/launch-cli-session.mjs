@@ -17,6 +17,7 @@
 import fs from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   expandRemoteControlLaunchPrompt,
@@ -101,13 +102,74 @@ export function resolveStampedPromptPath(promptFile, chatId) {
 }
 
 /**
- * Short argv prompt that only points at the stamped file — no skill body,
- * no YAML `---`, safe under Windows CreateProcess / PowerShell forwarding.
- * @param {string} stampedPromptPath
+ * Plugin root when this launcher is running from the installed (or source) tree.
  * @returns {string}
  */
-export function buildShortArgvPrompt(stampedPromptPath) {
+export function pluginRootFromLauncher() {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+}
+
+/**
+ * Quote a filesystem path for an agent-facing Shell one-liner (not cmd.exe).
+ * @param {string} p
+ * @returns {string}
+ */
+export function quotePathForPrompt(p) {
+  const s = String(p ?? '')
+  if (!s) return '""'
+  return /[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s
+}
+
+/**
+ * Exact first Shell command for mechanical Connect (item 1586a9e4).
+ * One-shot wait + `--from-end` so queued owner mail is not skipped (1f177af4).
+ * @param {{ pluginRoot: string, connectionId: string, launchId?: string | null }} opts
+ * @returns {string}
+ */
+export function buildRemoteWaitCommand(opts) {
+  const waitScript = path.join(
+    path.resolve(String(opts.pluginRoot ?? '')),
+    'hooks',
+    'scripts',
+    'devspec-remote-wait.mjs',
+  )
+  const connectionId = String(opts.connectionId ?? '').trim()
+  const launchId =
+    typeof opts.launchId === 'string' && opts.launchId.trim() ? opts.launchId.trim() : ''
+  const parts = [
+    'node',
+    quotePathForPrompt(waitScript),
+    '--connection-id',
+    connectionId,
+    '--from-end',
+  ]
+  if (launchId) parts.push('--launch-id', launchId)
+  return parts.join(' ')
+}
+
+/**
+ * Short argv prompt — no skill body, no YAML `---`, safe under Windows
+ * CreateProcess / PowerShell forwarding (item e949305f).
+ *
+ * Non-Connect: pointer to the stamped file.
+ * Remote Connect after Live: imperative wait-first command; stamp stays on
+ * disk for recovery only (item 1586a9e4).
+ * @param {string} stampedPromptPath
+ * @param {{ waitFirst?: boolean, waitCommand?: string }} [opts]
+ * @returns {string}
+ */
+export function buildShortArgvPrompt(stampedPromptPath, opts = {}) {
   const p = path.resolve(String(stampedPromptPath ?? ''))
+  const waitCommand =
+    typeof opts.waitCommand === 'string' && opts.waitCommand.trim()
+      ? opts.waitCommand.trim()
+      : ''
+  if (opts.waitFirst === true && waitCommand) {
+    return (
+      `Arm wait FIRST with this exact Shell command. Do not read any file, skill, or script before it. ${waitCommand} ` +
+      `After it prints owner_message, act only on that. Stamp on disk for recovery only: ${p}`
+    )
+  }
   return `Read the file at ${p} and follow every instruction in it exactly, then begin.`
 }
 
@@ -467,7 +529,19 @@ async function main() {
     connectionId: connectResult?.connection_id || null,
     extra: { stamp_chars: stampedBody.length },
   })
-  const argvPrompt = buildShortArgvPrompt(stampedPath)
+  const argvPrompt = buildShortArgvPrompt(
+    stampedPath,
+    isRemoteConnect && connectResult?.connection_id
+      ? {
+          waitFirst: true,
+          waitCommand: buildRemoteWaitCommand({
+            pluginRoot: pluginRootFromLauncher(),
+            connectionId: connectResult.connection_id,
+            launchId: connectResult.launch_id || launchId,
+          }),
+        }
+      : {},
+  )
   console.log(`[devspec-cli] Stamped prompt → ${stampedPath} (${stampedBody.length} chars; argv ${argvPrompt.length} chars)`)
 
   const kind = inferCursorAgentRunKindFromPrompt(expandedBody)

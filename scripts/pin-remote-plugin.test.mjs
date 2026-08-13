@@ -219,6 +219,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
     assert.ok(expanded.includes('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'))
     assert.ok(expanded.includes('Brave Otter'))
     assert.ok(expanded.includes('--from-end'))
+    assert.ok(expanded.includes('argv already has the wait command'))
     assert.ok(expanded.includes('--pending --after-reply'))
     assert.ok(expanded.includes('Do **NOT** call `register_connection`'))
     assert.ok(expanded.length < 8_000, `thin brief too large: ${expanded.length}`)

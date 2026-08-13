@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4 - 2026-08-13
+
+> Maintainer note: `package.json` is in `protected_paths`, so this version bump is documented here only — bump `package.json` manually before publishing the new VSIX.
+
+### Improved
+
+- **Cold Connect first ping:** argv is now an imperative `devspec-remote-wait.mjs --from-end` command. The model must not read the stamp/skill before that Shell call. Full stamp stays on disk for recovery (item 1586a9e4). Keeps the e949305f argv-vs-stamp split (no YAML `---` on argv).
+
 ## 0.5.3 - 2026-08-13
 
 ### Fixed

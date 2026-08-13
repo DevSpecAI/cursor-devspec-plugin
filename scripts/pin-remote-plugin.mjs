@@ -220,6 +220,7 @@ export function buildPostLiveRemoteBrief(opts) {
     '',
     '## Your job (post-Live only)',
     '',
+    'The Connect argv already has the wait command. Run that Shell first — do not read this stamp or any skill/script before it.',
     '1. **Arm wait FIRST** with `--from-end` (quote PLUGIN; Windows paths often have spaces):',
     '```bash',
     `node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "${connectionId}" --owner-pid "$PPID" --from-end${launchFlag}`,

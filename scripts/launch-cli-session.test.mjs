@@ -11,10 +11,13 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   buildInteractiveCursorAgentFlags,
+  buildRemoteWaitCommand,
   buildShortArgvPrompt,
   buildStampedPromptBody,
   flattenPromptForArgv,
   inferCursorAgentRunKindFromPrompt,
+  pluginRootFromLauncher,
+  quotePathForPrompt,
   quoteWinCmdArg,
   resolveShellExecutable,
   resolveStampedPromptPath,
@@ -142,6 +145,33 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.equal(argv.includes('---'), false)
     assert.ok(argv.includes(path.resolve(stampedPath)))
     assert.match(argv, /Read the file at /)
+  })
+
+  it('Connect argv is wait-first and does not say read the stamp first (item 1586a9e4)', () => {
+    const stampedPath = path.join(os.tmpdir(), 'connect.stamped-waitfirst.txt')
+    const pluginRoot = path.join(os.tmpdir(), 'Users', 'Brandon Young', 'ext')
+    const waitCommand = buildRemoteWaitCommand({
+      pluginRoot,
+      connectionId: '4f088b52-0f2c-4a8a-abb6-758e96cf5061',
+      launchId: '61909d7c-f48f-47b9-b96d-4323de517aaf',
+    })
+    assert.match(waitCommand, /devspec-remote-wait\.mjs/)
+    assert.match(waitCommand, /--from-end/)
+    assert.match(waitCommand, /4f088b52-0f2c-4a8a-abb6-758e96cf5061/)
+    assert.match(waitCommand, /61909d7c-f48f-47b9-b96d-4323de517aaf/)
+    assert.ok(waitCommand.includes(quotePathForPrompt(path.join(pluginRoot, 'hooks', 'scripts', 'devspec-remote-wait.mjs'))))
+
+    const argv = buildShortArgvPrompt(stampedPath, { waitFirst: true, waitCommand })
+    assert.equal(argv.includes('---'), false)
+    assert.match(argv, /^Arm wait FIRST/)
+    assert.doesNotMatch(argv, /^Read the file at /)
+    assert.match(argv, /--from-end/)
+    assert.ok(argv.includes(path.resolve(stampedPath)))
+    assert.ok(argv.length < 1200, `argv too long: ${argv.length}`)
+    assert.ok(
+      fs.existsSync(path.join(pluginRootFromLauncher(), 'hooks', 'scripts', 'devspec-remote-wait.mjs')),
+      'launcher plugin root must resolve wait script',
+    )
   })
 
   it('short argv would not present --- as its own agent CLI option token', () => {
