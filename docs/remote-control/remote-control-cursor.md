@@ -18,6 +18,8 @@ On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no long
 
 The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). Do **not** re-register on a stamped “already Live” launch.
 
+**Launcher path (item 94b11df6):** `open-handler --install` / extension activate writes `~/.cursor/devspec/extension-root.json`. Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a VSIX update.
+
 **Invoke fast-connect manually:**
 
 ```bash

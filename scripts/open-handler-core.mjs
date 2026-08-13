@@ -2,6 +2,7 @@
  * Shared DevSpec "Open in Cursor" handoff logic.
  * Used by the devspec:// protocol handler and the macOS localhost bridge fallback.
  */
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
@@ -48,9 +49,92 @@ export const DEVSPEC_LOCAL_OPEN_PORT = 42731
 export const DEVSPEC_DIR = path.join(os.homedir(), '.cursor', 'devspec')
 export const MAP_PATH = path.join(DEVSPEC_DIR, 'repo-folder-map.json')
 export const HANDLER_LOG_PATH = path.join(DEVSPEC_DIR, 'handler.log')
+/** Written by open-handler --install / extension activate so CLI launches use the live extension. */
+export const EXTENSION_ROOT_MARKER = path.join(DEVSPEC_DIR, 'extension-root.json')
 
 export async function ensureDevspecDir() {
   await fs.mkdir(DEVSPEC_DIR, { recursive: true })
+}
+
+/**
+ * Record which Cursor extension package root last ran --install / activate.
+ * Protocol launches prefer scripts under this root over a stale ~/.cursor/devspec copy.
+ * @param {string} extensionRoot absolute path to the extension package root
+ */
+export async function writeExtensionRootMarker(extensionRoot) {
+  const root = path.resolve(String(extensionRoot ?? '').trim())
+  if (!root) {
+    throw new Error('writeExtensionRootMarker: extensionRoot required')
+  }
+  await ensureDevspecDir()
+  const payload = {
+    v: 1,
+    extensionRoot: root,
+    updatedAt: new Date().toISOString(),
+  }
+  await fs.writeFile(EXTENSION_ROOT_MARKER, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+}
+
+/**
+ * @returns {Promise<string | null>}
+ */
+export async function readExtensionRootMarker() {
+  try {
+    const raw = await fs.readFile(EXTENSION_ROOT_MARKER, 'utf8')
+    const parsed = JSON.parse(raw)
+    const root = typeof parsed?.extensionRoot === 'string' ? parsed.extensionRoot.trim() : ''
+    return root || null
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return null
+    return null
+  }
+}
+
+/**
+ * Prefer the active extension's scripts/ launcher over a stale ~/.cursor/devspec copy.
+ * Order: extension-root marker → installed DEVSPEC_DIR copy → sibling of this module.
+ *
+ * @param {string} scriptName e.g. 'launch-cli-session.mjs'
+ * @param {{
+ *   moduleDir: string,
+ *   extensionRoot?: string | null,
+ *   existsSync?: (p: string) => boolean,
+ * }} opts
+ * @returns {{ path: string, source: 'extension' | 'installed' | 'sibling' }}
+ */
+export function resolveCliLauncher(scriptName, opts) {
+  const name = String(scriptName ?? '').trim()
+  if (!name) {
+    throw new Error('resolveCliLauncher: scriptName required')
+  }
+  const exists = opts.existsSync ?? ((p) => fsSync.existsSync(p))
+  const moduleDir = path.resolve(String(opts.moduleDir ?? ''))
+  const extensionRoot =
+    typeof opts.extensionRoot === 'string' && opts.extensionRoot.trim()
+      ? path.resolve(opts.extensionRoot.trim())
+      : null
+
+  /** @type {{ path: string, source: 'extension' | 'installed' | 'sibling' }[]} */
+  const candidates = []
+  if (extensionRoot) {
+    candidates.push({
+      path: path.join(extensionRoot, 'scripts', name),
+      source: 'extension',
+    })
+  }
+  candidates.push({
+    path: path.join(DEVSPEC_DIR, name),
+    source: 'installed',
+  })
+  candidates.push({
+    path: path.join(moduleDir, name),
+    source: 'sibling',
+  })
+
+  for (const candidate of candidates) {
+    if (exists(candidate.path)) return candidate
+  }
+  return candidates[candidates.length - 1]
 }
 
 export async function appendHandlerLog(line) {
@@ -276,10 +360,16 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
   const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
   await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
 
-  // Prefer the installed copy under ~/.cursor/devspec; fall back to sibling of this module.
-  const installedLauncher = path.join(DEVSPEC_DIR, 'launch-cli-session.mjs')
-  const siblingLauncher = path.join(path.dirname(fileURLToPath(import.meta.url)), 'launch-cli-session.mjs')
-  const launcher = (await pathExists(installedLauncher)) ? installedLauncher : siblingLauncher
+  // Prefer the extension recorded at --install/activate; never let a stale
+  // ~/.cursor/devspec copy shadow mechanical fast-connect after a VSIX update.
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+  const extensionRoot = await readExtensionRootMarker()
+  const resolved = resolveCliLauncher('launch-cli-session.mjs', {
+    moduleDir,
+    extensionRoot,
+  })
+  const launcher = resolved.path
+  await appendHandlerLog(`cli launcher source=${resolved.source} path=${launcher}`)
 
   const nodeBin = process.execPath
   const launchArgs = [
@@ -384,13 +474,14 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
   const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
   await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
 
-  // Prefer the installed copy under ~/.cursor/devspec; fall back to sibling of this module.
-  const installedLauncher = path.join(DEVSPEC_DIR, 'launch-opencode-session.mjs')
-  const siblingLauncher = path.join(
-    path.dirname(fileURLToPath(import.meta.url)),
-    'launch-opencode-session.mjs',
-  )
-  const launcher = (await pathExists(installedLauncher)) ? installedLauncher : siblingLauncher
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+  const extensionRoot = await readExtensionRootMarker()
+  const resolved = resolveCliLauncher('launch-opencode-session.mjs', {
+    moduleDir,
+    extensionRoot,
+  })
+  const launcher = resolved.path
+  await appendHandlerLog(`opencode launcher source=${resolved.source} path=${launcher}`)
 
   const nodeBin = process.execPath
   const launchArgs = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--opencode', opencodeBin]

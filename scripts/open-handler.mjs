@@ -12,6 +12,7 @@ import {
   ensureDevspecDir,
   handleProtocolUrl,
   appendHandlerLog,
+  writeExtensionRootMarker,
 } from './open-handler-core.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -20,6 +21,11 @@ const INSTALLED_HANDLER = path.join(DEVSPEC_DIR, 'open-handler.mjs')
 
 async function copyInstalledArtifacts(sourceDir) {
   await ensureDevspecDir()
+  // sourceDir is …/extension/scripts — record the extension package root so
+  // protocol CLI launches prefer that tree over a stale DEVSPEC_DIR copy.
+  const extensionRoot = path.resolve(sourceDir, '..')
+  await writeExtensionRootMarker(extensionRoot)
+
   const files = [
     'open-handler.mjs',
     'open-handler-core.mjs',
@@ -55,6 +61,53 @@ async function copyInstalledArtifacts(sourceDir) {
     // exe built separately
   }
 
+  // Mirror hooks/scripts next to the installed launchers so the fallback
+  // `../hooks/scripts/*` imports from DEVSPEC_DIR resolve when the extension
+  // root is missing. Primary launches use the extension path from the marker.
+  const hooksSrcDir = path.join(extensionRoot, 'hooks', 'scripts')
+  const hooksScriptsDest = path.join(DEVSPEC_DIR, 'hooks', 'scripts')
+  await fs.mkdir(hooksScriptsDest, { recursive: true })
+  try {
+    const hookEntries = await fs.readdir(hooksSrcDir, { withFileTypes: true })
+    for (const entry of hookEntries) {
+      if (!entry.isFile()) continue
+      if (!entry.name.endsWith('.mjs') && !entry.name.endsWith('.js')) continue
+      // Skip unit tests in the install mirror.
+      if (entry.name.endsWith('.test.mjs') || entry.name.endsWith('.test.js')) continue
+      try {
+        await fs.copyFile(
+          path.join(hooksSrcDir, entry.name),
+          path.join(hooksScriptsDest, entry.name),
+        )
+      } catch {
+        // best-effort per file
+      }
+    }
+  } catch {
+    // hooks tree may be absent in a stripped package
+  }
+
+  // Also place a copy where `../hooks/scripts` from DEVSPEC_DIR resolves
+  // (`~/.cursor/hooks/scripts`) — launch-cli-session uses that relative import.
+  const cursorHooksScripts = path.join(path.dirname(DEVSPEC_DIR), 'hooks', 'scripts')
+  await fs.mkdir(cursorHooksScripts, { recursive: true })
+  try {
+    const hookEntries = await fs.readdir(hooksScriptsDest, { withFileTypes: true })
+    for (const entry of hookEntries) {
+      if (!entry.isFile()) continue
+      try {
+        await fs.copyFile(
+          path.join(hooksScriptsDest, entry.name),
+          path.join(cursorHooksScripts, entry.name),
+        )
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   // Stable mirror-turn launcher for ~/.cursor/hooks.json (item 2097651e / fe456bf9).
   // Prefer the sibling hooks/scripts copy in the plugin checkout; fall back to a
   // previously installed copy under DEVSPEC_DIR/hooks.
@@ -65,6 +118,7 @@ async function copyInstalledArtifacts(sourceDir) {
     path.join(sourceDir, '..', 'hooks', 'scripts', launcherName),
     path.join(sourceDir, 'hooks', launcherName),
     path.join(DEVSPEC_DIR, 'hooks', launcherName),
+    path.join(hooksScriptsDest, launcherName),
   ]
   for (const src of launcherCandidates) {
     try {

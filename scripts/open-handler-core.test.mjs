@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import path from 'node:path'
+import os from 'node:os'
 import {
   buildWindowsCliLaunchBat,
   buildWindowsCliStartCommand,
+  resolveCliLauncher,
+  DEVSPEC_DIR,
 } from './open-handler-core.mjs'
 
 describe('buildWindowsCliLaunchBat', () => {
@@ -47,5 +51,59 @@ describe('buildWindowsCliStartCommand', () => {
   it('strips quotes from the window title', () => {
     const cmd = buildWindowsCliStartCommand('node', ['script.mjs'], 'Title "x"')
     assert.match(cmd, /^start "Title x" cmd\.exe \/k /)
+  })
+})
+
+describe('resolveCliLauncher', () => {
+  const moduleDir = path.join(os.homedir(), 'fake-module-dir')
+  const extensionRoot = path.join(os.homedir(), 'fake-extension')
+  const scriptName = 'launch-cli-session.mjs'
+  const extensionLauncher = path.join(extensionRoot, 'scripts', scriptName)
+  const installedLauncher = path.join(DEVSPEC_DIR, scriptName)
+  const siblingLauncher = path.join(moduleDir, scriptName)
+
+  it('prefers the extension launcher when the marker root exists', () => {
+    const present = new Set([extensionLauncher, installedLauncher, siblingLauncher])
+    const resolved = resolveCliLauncher(scriptName, {
+      moduleDir,
+      extensionRoot,
+      existsSync: (p) => present.has(p),
+    })
+    assert.equal(resolved.source, 'extension')
+    assert.equal(resolved.path, extensionLauncher)
+  })
+
+  it('falls back to installed when extension root is missing on disk', () => {
+    const present = new Set([installedLauncher, siblingLauncher])
+    const resolved = resolveCliLauncher(scriptName, {
+      moduleDir,
+      extensionRoot,
+      existsSync: (p) => present.has(p),
+    })
+    assert.equal(resolved.source, 'installed')
+    assert.equal(resolved.path, installedLauncher)
+  })
+
+  it('falls back to sibling when neither extension nor installed exists', () => {
+    const present = new Set([siblingLauncher])
+    const resolved = resolveCliLauncher(scriptName, {
+      moduleDir,
+      extensionRoot: null,
+      existsSync: (p) => present.has(p),
+    })
+    assert.equal(resolved.source, 'sibling')
+    assert.equal(resolved.path, siblingLauncher)
+  })
+
+  it('does not prefer a stale installed copy over a present extension', () => {
+    // Installed exists and is "older" in spirit; extension still wins.
+    const present = new Set([extensionLauncher, installedLauncher])
+    const resolved = resolveCliLauncher(scriptName, {
+      moduleDir,
+      extensionRoot,
+      existsSync: (p) => present.has(p),
+    })
+    assert.equal(resolved.source, 'extension')
+    assert.notEqual(resolved.path, installedLauncher)
   })
 })
