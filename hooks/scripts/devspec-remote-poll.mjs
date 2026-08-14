@@ -96,8 +96,6 @@ const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 // Client-side ceiling on a held request. fetch() has NO default timeout, so a
 // silently-dropped TCP connection would wedge the poller forever with no heartbeat.
 const POLL_HTTP_GRACE_MS = 15_000
-// Hard idle-disconnect cap: a fully idle connection disconnects cleanly at 72h.
-const IDLE_DISCONNECT_MS = 72 * 60 * 60 * 1000
 const MAX_TURN_MS = 60 * 60 * 1000
 
 /**
@@ -278,8 +276,8 @@ function sleep(ms) {
 /**
  * Poll/heartbeat cadence from connection STATE. attended (15s) when attached to a
  * session OR a turn is active — someone may be watching and pickup latency
- * matters; idle (60s) otherwise. Elapsed idle time no longer changes the cadence;
- * it only feeds the 72h IDLE_DISCONNECT_MS cap.
+ * matters; idle (60s) otherwise. Elapsed idle time does not change the cadence
+ * and is not a lifetime cap — a quiet connection stays up while the host lives.
  */
 export function cadenceFor({ attached = false, turnActive = false } = {}) {
   return attached || turnActive ? ATTENDED_CADENCE : IDLE_CADENCE
@@ -825,7 +823,6 @@ async function main() {
   )
   let lastTier = null
   let lastBusySent = null
-  let idleStarted = Date.now()
   // Advisory carried forward since the last owner command (see the header note on
   // why forwarding only the same response's advisory would not fix the 1-2-3 case).
   let carryOwnerAmbient = []
@@ -990,7 +987,6 @@ async function main() {
       // deliverOwnerMessages stamps the message cursor + wake time into state itself.
       // Awaits trail seed so Working opens before the model wake.
       await deliverOwnerMessages(connectionId, commands, cursor, ownerUserId, sessionId, takeCarriedContext())
-      idleStarted = Date.now()
     } else if (advisoryCount > 0 || freshDispatches.length > 0) {
       logRemoteControlStory({
         phase: 'wake',
@@ -1060,21 +1056,6 @@ async function main() {
       return
     }
 
-    const idleMs = Date.now() - idleStarted
-    if (idleMs >= IDLE_DISCONNECT_MS) {
-      try {
-        await sendHeartbeat({ status: 'offline', endReason: 'idle_timeout' })
-      } catch (e) {
-        process.stderr.write(`devspec-remote-poll: idle offline heartbeat failed: ${e.message}\n`)
-      }
-      disableLocalState({ connectionId, reason: 'idle_timeout' })
-      process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'idle_timeout', connection_id: connectionId }) + '\n',
-      )
-      process.stderr.write('devspec-remote-poll: idle timeout — offline and exiting\n')
-      process.exit(1)
-    }
-
     // Agent-authoritative "working": re-assert busy while a fresh turn marker exists.
     const marker = readTurnMarker(connectionId)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
@@ -1091,7 +1072,6 @@ async function main() {
         data: { elapsed_ms: turnElapsed, max_turn_ms: MAX_TURN_MS },
       })
     }
-    if (turnActive) idleStarted = Date.now()
     let busyArg = null
     if (turnActive) busyArg = true
     else if (lastBusySent === true) busyArg = false

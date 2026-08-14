@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.5 - 2026-08-14
+
+### A quiet connection stays up while the host process is alive
+
+- **Removed the 72h idle-disconnect.** The poller no longer stamps `idle_timeout` and exits after three quiet days. A connection lives as long as its Cursor process, unless you End it or run the remote-stop command. Item `4a74d001`.
+
 ## 0.5.4 - 2026-08-13
 
 > Maintainer note: `package.json` is in `protected_paths`, so this version bump is documented here only — bump `package.json` manually before publishing the new VSIX.
