@@ -21,7 +21,7 @@ function loadPublicKey() {
 
 /**
  * @param {string} token  base64url(payload).base64url(signature)
- * @returns {{ ok: true, data: { repo: string, prompt?: string, title?: string, surface?: 'ide' | 'cli', tool?: 'cursor' | 'opencode', model?: string, exp: number } } | { ok: false, error: string }}
+ * @returns {{ ok: true, data: { repo: string, prompt?: string, title?: string, surface?: 'ide' | 'cli', tool?: 'cursor' | 'opencode' | 'pi', model?: string, thinking?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max', exp: number } } | { ok: false, error: string }}
  */
 export function verifyHandoffToken(token) {
   if (!token || typeof token !== 'string') return { ok: false, error: 'missing_token' }
@@ -65,12 +65,14 @@ export function verifyHandoffToken(token) {
   let surface
   if (data.surface === 'cli' || data.surface === 'ide') surface = data.surface
 
-  /** @type {'cursor' | 'opencode' | undefined} */
+  /** @type {'cursor' | 'opencode' | 'pi' | undefined} */
   let tool
-  if (data.tool === 'cursor' || data.tool === 'opencode') tool = data.tool
+  if (data.tool === 'cursor' || data.tool === 'opencode' || data.tool === 'pi') tool = data.tool
 
   const model =
     typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined
+  const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+  const thinking = thinkingLevels.has(data.thinking) ? data.thinking : undefined
 
   return {
     ok: true,
@@ -81,6 +83,7 @@ export function verifyHandoffToken(token) {
       surface,
       tool,
       model,
+      thinking,
       exp,
     },
   }

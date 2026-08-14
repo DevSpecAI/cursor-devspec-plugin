@@ -117,8 +117,12 @@ export async function startMacOsBridgeServer() {
     let displayTitle
     /** @type {'ide' | 'cli'} */
     let surface = 'ide'
+    /** @type {'cursor' | 'opencode' | 'pi'} */
+    let tool = 'cursor'
     /** @type {string | null} */
     let model = null
+    /** @type {'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null} */
+    let thinking = null
 
     if (token) {
       const verified = verifyHandoffToken(decodeURIComponent(token))
@@ -131,7 +135,11 @@ export async function startMacOsBridgeServer() {
       promptText = verified.data.prompt ?? null
       displayTitle = verified.data.title ?? null
       surface = verified.data.surface === 'cli' ? 'cli' : 'ide'
+      tool = verified.data.tool === 'opencode' || verified.data.tool === 'pi'
+        ? verified.data.tool
+        : 'cursor'
       model = verified.data.model ?? null
+      thinking = verified.data.thinking ?? null
     } else {
       slug = decodeURIComponent(repo)
       promptText = prompt ? decodeURIComponent(prompt) : null
@@ -150,7 +158,9 @@ export async function startMacOsBridgeServer() {
       promptText,
       itemTitle: displayTitle,
       surface,
+      tool,
       model,
+      thinking,
       requireSignedToken: false,
       unsigned: true,
     })

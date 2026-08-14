@@ -348,6 +348,47 @@ export async function resolveOpencodeExecutable() {
 }
 
 /**
+ * Resolve the Pi CLI binary (`pi`) from this user's machine only.
+ * Mirrors the established OpenCode resolver, including Windows npm shims.
+ * @returns {Promise<string | null>}
+ */
+export async function resolvePiExecutable() {
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which'
+  try {
+    const { stdout } = await execFileAsync(whichCmd, ['pi'], { timeout: 5000 })
+    const lines = String(stdout)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+    const preferred =
+      process.platform === 'win32'
+        ? lines.find((line) => /\.(cmd|exe|bat|ps1)$/i.test(line)) ?? lines[0]
+        : lines[0]
+    if (preferred && (await pathExists(preferred))) return preferred
+  } catch {
+    // fall through to known paths
+  }
+
+  const home = os.homedir()
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          path.join(process.env.APPDATA ?? '', 'npm', 'pi.cmd'),
+          path.join(home, 'AppData', 'Roaming', 'npm', 'pi.cmd'),
+        ]
+      : [
+          path.join(home, '.local', 'bin', 'pi'),
+          '/usr/local/bin/pi',
+          path.join(home, '.npm-global', 'bin', 'pi'),
+        ]
+
+  for (const candidate of candidates) {
+    if (candidate && (await pathExists(candidate))) return candidate
+  }
+  return null
+}
+
+/**
  * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
  * @param {{ folderPath: string, promptText: string | null, agentBin: string, model?: string | null }} opts
  */
@@ -550,6 +591,81 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
   }).unref()
 }
 
+/**
+ * Launch an interactive Pi TUI in a visible terminal. Model and thinking are
+ * optional signed overrides; omitting both preserves Pi's own current/default
+ * runtime configuration.
+ * @param {{ folderPath: string, promptText: string | null, piBin: string, model?: string | null, thinking?: string | null }} opts
+ */
+export async function openInPi({ folderPath, promptText, piBin, model, thinking }) {
+  await ensureDevspecDir()
+  const launchesDir = path.join(DEVSPEC_DIR, 'launches')
+  await fs.mkdir(launchesDir, { recursive: true })
+
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
+  await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
+
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+  const extensionRoot = await readExtensionRootMarker()
+  const resolved = resolveCliLauncher('launch-pi-session.mjs', {
+    moduleDir,
+    extensionRoot,
+  })
+  const launcher = resolved.path
+  await appendHandlerLog(`pi launcher source=${resolved.source} path=${launcher}`)
+
+  const nodeBin = process.execPath
+  const launchArgs = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--pi', piBin]
+  const modelId = typeof model === 'string' ? model.trim() : ''
+  if (modelId) launchArgs.push('--model', modelId)
+  const thinkingLevel = typeof thinking === 'string' ? thinking.trim() : ''
+  if (['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinkingLevel)) {
+    launchArgs.push('--thinking', thinkingLevel)
+  }
+
+  if (process.platform === 'win32') {
+    const batPath = path.join(launchesDir, `${stamp}.pi-launch.cmd`)
+    await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
+    spawn('cmd.exe', ['/c', 'start', 'DevSpec Pi', 'cmd.exe', '/k', batPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      cwd: folderPath,
+    }).unref()
+    return
+  }
+
+  if (process.platform === 'darwin') {
+    const cmd = `cd ${shellSingleQuote(folderPath)} && ${shellSingleQuote(nodeBin)} ${launchArgs
+      .map(shellSingleQuote)
+      .join(' ')}`
+    spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref()
+    return
+  }
+
+  const linuxCmd = `${shellSingleQuote(nodeBin)} ${launchArgs.map(shellSingleQuote).join(' ')}`
+  const terminals = [
+    ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
+    ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
+    ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
+    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
+  ]
+  for (const [bin, args] of terminals) {
+    try {
+      await execFileAsync('which', [bin], { timeout: 2000 })
+      spawn(bin, args, { detached: true, stdio: 'ignore', cwd: folderPath }).unref()
+      return
+    } catch {
+      // try next
+    }
+  }
+  throw new Error('No terminal emulator found to launch Pi')
+}
+
 const CURSOR_PROMPT_DEEPLINK_BASE = 'cursor://anysphere.cursor-deeplink/prompt'
 const CURSOR_PROMPT_DEEPLINK_MAX = 8000
 const PROMPT_DEEPLINK_DELAY_MS = 1500
@@ -679,8 +795,12 @@ export function parseHandoffUrl(raw) {
       promptText: verified.data.prompt ?? null,
       itemTitle: verified.data.title ?? null,
       surface: verified.data.surface === 'cli' ? 'cli' : 'ide',
-      tool: verified.data.tool === 'opencode' ? 'opencode' : 'cursor',
+      tool:
+        verified.data.tool === 'opencode' || verified.data.tool === 'pi'
+          ? verified.data.tool
+          : 'cursor',
       model: verified.data.model ?? null,
+      thinking: verified.data.thinking ?? null,
     }
   }
 
@@ -689,6 +809,7 @@ export function parseHandoffUrl(raw) {
   const surfaceRaw = url.searchParams.get('surface')
   const toolRaw = url.searchParams.get('tool')
   const modelRaw = url.searchParams.get('model')
+  const thinkingRaw = url.searchParams.get('thinking')
   return {
     slug: decodeURIComponent(repo),
     promptText: url.searchParams.get('prompt')
@@ -698,8 +819,11 @@ export function parseHandoffUrl(raw) {
       ? decodeURIComponent(url.searchParams.get('title'))
       : null,
     surface: surfaceRaw === 'cli' ? 'cli' : 'ide',
-    tool: toolRaw === 'opencode' ? 'opencode' : 'cursor',
+    tool: toolRaw === 'opencode' || toolRaw === 'pi' ? toolRaw : 'cursor',
     model: modelRaw ? decodeURIComponent(modelRaw) : null,
+    thinking: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinkingRaw)
+      ? thinkingRaw
+      : null,
     /** Unsigned localhost bridge requests (macOS fallback only). */
     unsigned: true,
   }
@@ -716,6 +840,7 @@ export async function executeHandoff({
   surface = 'ide',
   tool = 'cursor',
   model = null,
+  thinking = null,
   requireSignedToken = true,
   unsigned = false,
 }) {
@@ -729,6 +854,25 @@ export async function executeHandoff({
     await appendHandlerLog(`missing mapping for ${slug}`)
     openErrorPage(slug, 'missing_mapping')
     return { ok: false, error: 'missing_mapping', slug }
+  }
+
+  if (tool === 'pi') {
+    const piBin = await resolvePiExecutable()
+    if (!piBin) {
+      await appendHandlerLog(`pi missing for handoff ${slug}`)
+      openErrorPage(slug, 'pi_missing')
+      return { ok: false, error: 'pi_missing', slug }
+    }
+    try {
+      await openInPi({ folderPath, promptText, piBin, model, thinking })
+      await appendHandlerLog(`opened Pi ${slug} → ${folderPath} via ${piBin}`)
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await appendHandlerLog(`Pi open failed: ${message}`)
+      openErrorPage(slug, 'agent_launch_failed')
+      return { ok: false, error: 'agent_launch_failed', slug }
+    }
   }
 
   // OpenCode has no separate "ide" surface — it's always a terminal, so it
@@ -805,8 +949,9 @@ export async function handleProtocolUrl(raw, opts = {}) {
     promptText: parsed.promptText,
     itemTitle: parsed.itemTitle,
     surface: parsed.surface === 'cli' ? 'cli' : 'ide',
-    tool: parsed.tool === 'opencode' ? 'opencode' : 'cursor',
+    tool: parsed.tool === 'opencode' || parsed.tool === 'pi' ? parsed.tool : 'cursor',
     model: parsed.model ?? null,
+    thinking: parsed.thinking ?? null,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
