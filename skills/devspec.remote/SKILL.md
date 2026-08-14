@@ -68,7 +68,11 @@ Never rejoin/attach a session because it shared a repo/cwd or another agent stop
 
 ### 2. Resolve project
 
-Call `devspec__list_projects` with `git_remote` from `git remote get-url origin` (or omit if single-project context). Use `remote_match.resolved_project_id` as `project_id` when multi-project. If no match, stop with `✗ No DevSpec project tracks this repo`.
+Call `devspec__list_projects` with `git_remote` from `git remote get-url origin` (or omit if single-project context). Use `remote_match.resolved_project_id` as `project_id` when multi-project.
+
+**Folder pin — a project with no repo yet.** Whether or not there is a remote, read `.devspec/project.json` in the working folder if it exists; it holds `{ "project_id": "<uuid>" }`. That is how a folder whose code does not exist yet names its project. Pass it as **`pinned_project_id`** on `register_connection` (and any project-scoped call), NEVER as `project_id`: `project_id` is an explicit override that outranks a verified git remote, whereas the pin is only a local assertion the server deliberately ranks BELOW a remote it can verify — so sending it as `project_id` reverses that. Send whichever signals you have and let the server arbitrate. **Never decide precedence locally.**
+
+Only stop with `✗ No DevSpec project tracks this repo, and there is no .devspec/project.json pin` when there is neither a matching remote nor a pin.
 
 ### 3. Resolve local conversation id (bond key)
 
