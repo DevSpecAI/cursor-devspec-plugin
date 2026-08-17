@@ -53,7 +53,7 @@ describe('buildSkillPastePrompt', () => {
     assert.equal(prompt.includes('PLUGIN='), false)
     assert.equal(
       prompt,
-      `Run the \`devspec.work\` skill with this input: item-1\n\n---\n\n${body}`,
+      `Run the \`devspec.remote\` skill with this input: item-1\n\n---\n\n${body}`,
     )
   })
 })
