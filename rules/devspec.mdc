@@ -61,7 +61,7 @@ Read these fields — they override local assumptions about branches and whether
 
 ### Ship loop (do not stop at local changes)
 
-For claimed or staged action-item work, after tests pass:
+For action-item work you hold, after tests pass:
 
 1. **Commit** — stage only your changed files; message ends with `[devspec:<full-item-uuid>]`
 2. **Push** — if `execution.auto_push` or `execution.auto_merge` is true, push to that repo's resolved `target_branch` **without waiting for the user to ask**

@@ -26,7 +26,7 @@ You'll need:
   - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
   - It's **retrievable.** Reveal and copy it again any time at **You → Connections** (no more show-once).
   - You don't paste a project id — the project for a run is resolved from your repo's git remote.
-- **Node.js 18+** — only needed for **remote control** and working dispatched batches (check with `node --version`). Plain MCP tool access — working a task in chat, creating items, asking the docs — doesn't require it, but you'll want it installed for the full feature set.
+- **Node.js 18+** — only needed for **remote control** and working a batch of items (check with `node --version`). Plain MCP tool access — working a task in chat, creating items, asking the docs — doesn't require it, but you'll want it installed for the full feature set.
 
 ## Install
 
