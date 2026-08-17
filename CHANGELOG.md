@@ -1,5 +1,33 @@
 # Changelog
 
+
+## 0.8.0
+
+### Nine skills removed — remote and remote-stop remain
+
+`devspec.work`, `.create`, `.commit`, `.link`, `.help`, `.done`, `.brainstorm`,
+`.session-brainstorm` and `.verify-connection` are gone from the command palette
+and from `contributes.commands`.
+
+A command must be a script, not a restatement. Connecting runs a deterministic
+setup a model improvises badly; the other nine were a page of prose each,
+telling a model to call one DevSpec MCP tool it could already see.
+
+**Nothing was lost.** What those skills taught now lives in the MCP tool schemas
+server-side, written once and reaching every host the moment it changes, instead
+of copied into six repositories with no way to notice when one drifts.
+
+**What you do instead is say it** in the Agent chat: *"Work on DevSpec action
+item 4f2a"*, *"Work these in order: 4f2a, 9c1b, 2e7d"*, *"Log a DevSpec item for
+the login bug"*. DevSpec's copy buttons emit exactly those lines, so copying and
+typing produce the same thing — and a sentence works in any host with the MCP
+server, which a palette command never could.
+
+**`--plan` is gone with it.** `devspec.brainstorm` was the only route from
+DevSpec to Cursor's plan mode, so `inferCursorAgentRunKindFromPrompt` no longer
+returns a `brainstorm` kind; a stale prompt now reads as `work`. If plan mode is
+wanted it should return as a deliberate feature, not as a leftover.
+
 ## 0.7.0 - 2026-08-17
 
 ### An agent reserves its work — nothing is dispatched to it any more

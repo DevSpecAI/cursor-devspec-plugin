@@ -30,16 +30,19 @@ import {
 import { buildPostLiveRemoteBrief } from './pin-remote-plugin.mjs'
 
 describe('DevSpec Cursor CLI flag policy', () => {
-  it('infers brainstorm vs work from skill prompts', () => {
+  it('a stale brainstorm prompt now reads as work — there is no plan kind', () => {
+    // devspec.brainstorm was the only route to Cursor's --plan mode and it is
+    // deleted, so an old prompt pasted from somewhere must fall through to work
+    // rather than to a kind nothing can produce.
     assert.equal(
       inferCursorAgentRunKindFromPrompt(
         'Run the `devspec.brainstorm` skill with this input: abc',
       ),
-      'brainstorm',
+      'work',
     )
     assert.equal(
       inferCursorAgentRunKindFromPrompt(
-        'Run the `devspec.work` skill with this input: abc',
+        'Use the DevSpec MCP connection to work on action item abc',
       ),
       'work',
     )

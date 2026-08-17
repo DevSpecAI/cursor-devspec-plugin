@@ -9,7 +9,7 @@ Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, 
 ## What you can do with it
 
 - **Work a task in chat.** Point the agent at an action item and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
-- **Work a batch in one go.** Pass several task ids to `devspec.work` — it reserves them, then claims and works the members one at a time, in order.
+- **Work a batch in one go.** Tell the Agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time. DevSpec's web app has a copy button that writes that line for you.
 - **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
 - **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
 - **Small conveniences.** Create tasks, make tracked commits, link commits to tasks, and ask DevSpec's docs questions — all from the command palette.

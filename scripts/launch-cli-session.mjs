@@ -235,18 +235,16 @@ export function buildShortArgvPrompt(stampedPromptPath, opts = {}) {
 /**
  * Infer run kind from a DevSpec skill / MCP paste prompt (mirrors
  * DevSpecV2 `inferCursorAgentRunKindFromPrompt`).
+ *
+ * There is no `brainstorm` kind any more. It mapped to Cursor's --plan mode and
+ * was reachable only through the devspec.brainstorm skill, which is deleted, so
+ * a stale prompt from before that now reads as `work` — the honest fallback.
+ *
  * @param {string} prompt
- * @returns {'work' | 'brainstorm' | 'ask'}
+ * @returns {'work' | 'ask'}
  */
 export function inferCursorAgentRunKindFromPrompt(prompt) {
   const p = String(prompt ?? '').toLowerCase()
-  if (
-    p.includes('devspec.brainstorm') ||
-    p.includes('brainstorm action item') ||
-    p.includes('brainstorm the following action items')
-  ) {
-    return 'brainstorm'
-  }
   if (p.includes('devspec.verify') || /\b--mode\s+ask\b/.test(p)) {
     return 'ask'
   }

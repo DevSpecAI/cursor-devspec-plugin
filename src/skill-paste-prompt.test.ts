@@ -11,7 +11,7 @@ describe('skillNeedsPluginRoot', () => {
   it('is true for remote skills only', () => {
     assert.equal(skillNeedsPluginRoot('devspec.remote'), true)
     assert.equal(skillNeedsPluginRoot('devspec.remote-stop'), true)
-    assert.equal(skillNeedsPluginRoot('devspec.work'), false)
+    assert.equal(skillNeedsPluginRoot('devspec.remote'), false)
   })
 })
 
@@ -49,7 +49,7 @@ describe('buildSkillPastePrompt', () => {
   })
 
   it('does not inject PLUGIN= for unrelated skills', () => {
-    const prompt = buildSkillPastePrompt('devspec.work', body, 'item-1', '/ext')
+    const prompt = buildSkillPastePrompt('devspec.remote', body, 'item-1', '/ext')
     assert.equal(prompt.includes('PLUGIN='), false)
     assert.equal(
       prompt,

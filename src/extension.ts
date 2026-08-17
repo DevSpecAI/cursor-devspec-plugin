@@ -10,18 +10,13 @@ import { installProtocolHandler, registerProtocolHandlerCommands } from './proto
 import { registerRepoFolderFeatures } from './repo-folder-map'
 import { buildSkillPastePrompt } from './skill-paste-prompt'
 
-type SkillId =
-  | 'devspec.work'
-  | 'devspec.brainstorm'
-  | 'devspec.create'
-  | 'devspec.session-brainstorm'
-  | 'devspec.remote'
-  | 'devspec.remote-stop'
-  | 'devspec.verify-connection'
-  | 'devspec.done'
-  | 'devspec.help'
-  | 'devspec.link'
-  | 'devspec.commit'
+/*
+ * Two skills. The other nine were a page of prose each, telling a model to call
+ * one DevSpec MCP tool it could already see; what they taught now lives in the
+ * tool schemas server-side. These two survive because connecting runs a real
+ * setup a model improvises badly — that is what earns a command.
+ */
+type SkillId = 'devspec.remote' | 'devspec.remote-stop'
 
 interface SkillMeta {
   command: string
@@ -30,26 +25,6 @@ interface SkillMeta {
 }
 
 const SKILLS: Record<SkillId, SkillMeta> = {
-  'devspec.work': {
-    command: 'devspec.work',
-    promptLabel: 'Action item title or ID (optional)',
-    promptPlaceholder: 'e.g. "OAuth login bug", a UUID, or add --remote',
-  },
-  'devspec.brainstorm': {
-    command: 'devspec.brainstorm',
-    promptLabel: 'Action item title or ID',
-    promptPlaceholder: 'e.g. "OAuth login bug" or a UUID',
-  },
-  'devspec.create': {
-    command: 'devspec.create',
-    promptLabel: 'Title and optional fields',
-    promptPlaceholder: 'title: Fix login bug  type: bug  priority: high',
-  },
-  'devspec.session-brainstorm': {
-    command: 'devspec.session-brainstorm',
-    promptLabel: 'Session handoff arguments',
-    promptPlaceholder: 'mode=answer session_id=<uuid>  or  mode=brainstorm session_id=<uuid>',
-  },
   'devspec.remote': {
     command: 'devspec.remote',
     promptLabel: 'Optional title or note (leave empty to connect)',
@@ -58,31 +33,6 @@ const SKILLS: Record<SkillId, SkillMeta> = {
   'devspec.remote-stop': {
     command: 'devspec.remote-stop',
     promptLabel: '',
-  },
-  'devspec.verify-connection': {
-    command: 'devspec.verify-connection',
-    promptLabel: 'Verification UUID (leave empty for ping mode)',
-    promptPlaceholder: 'empty = ping mode  ·  or paste setup-wizard UUID for commit mode',
-  },
-  'devspec.done': {
-    command: 'devspec.done',
-    promptLabel: 'Optional description (auto-infers from git if empty)',
-    promptPlaceholder: 'leave empty to infer from recent commits',
-  },
-  'devspec.help': {
-    command: 'devspec.help',
-    promptLabel: 'Your question about using DevSpec',
-    promptPlaceholder: 'e.g. "How do I set up autopilot?"',
-  },
-  'devspec.link': {
-    command: 'devspec.link',
-    promptLabel: 'Commit SHA and action item ID',
-    promptPlaceholder: '<sha> <action_item_id>',
-  },
-  'devspec.commit': {
-    command: 'devspec.commit',
-    promptLabel: 'Action item ID and commit summary',
-    promptPlaceholder: '<action_item_id> <summary under 72 chars>',
   },
 }
 
