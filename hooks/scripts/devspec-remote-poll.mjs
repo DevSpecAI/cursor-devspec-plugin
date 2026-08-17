@@ -934,7 +934,7 @@ async function main() {
       content:
         d.kind === 'playbook_run'
           ? playbookRunCommandText(d)
-          : `📦 DevSpec assignment dispatched to this connection (assignment ${d.id}). Work it via the assignment protocol: get_assignment → acknowledge_assignment → claim_work_item per member (in position order) → implement → record_implementation → resolve_assignment. There is no batch mode: working a batch installs no rules a single item does not already carry. Ask only what is not yours to decide, never assume someone is waiting to answer, and never pause on a question nobody may read. A member that cannot be implemented safely is failed loudly with fail_work_item (precise error + partial_work_notes), then CONTINUE with the next member — a blocked member fails the member, not the batch. When the batch resolves you are ordinary available capacity again; nothing about the connection changed.`,
+          : `📦 DevSpec dispatched \`${d.id}\` to this connection, and this plugin does not recognise its kind. Work assignments are no longer dispatched to anyone (item 1e455001) — an agent reserves what it was asked to work with reserve_work_items — so do NOT try get_assignment / acknowledge_assignment / resolve_assignment: those tools are gone. Read it with get_connection_dispatch and report what you see.`,
       remote_control: { is_owner_instruction: true, is_advisory: false, role: 'owner_instruction' },
     }))
 
