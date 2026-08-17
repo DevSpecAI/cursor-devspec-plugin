@@ -6,7 +6,7 @@
 
 `devspec.work` took a flag that installed a mode for the whole session: never ask, never wait, auto-select the highest-priority match when a name was ambiguous. It read as a safety feature and was really a licence to guess.
 
-Deleted: the flag, the `Mode:` line in the item header, every "interactive mode / unattended mode" fork, and the two mode-specific contract resources — the served contract is now one document at `devspec://product/implementation-contract`. `devspec.remote`'s "batch mode overrides conversation mode" section goes too: working a batch never installed different rules, so resolving one clears nothing.
+Deleted: the flag, the `Mode:` line in the item header, every "interactive mode / unattended mode" fork, the batch-mode paragraph the poller injected into a dispatched assignment, and the two mode-specific contract resources — the served contract is now one document at `devspec://product/implementation-contract`. `devspec.remote`'s "batch mode overrides conversation mode" section goes too: working a batch never installed different rules, so resolving one clears nothing.
 
 Nothing takes its place — no timeout, no patience window, no ask-policy. **Ask only what is not yours to decide** (never a detail the item's intent and criteria already settle), and **do not assume someone is waiting to answer** (before a claim, say what you need and stop; after a claim, fail the item with a precise reason).
 
