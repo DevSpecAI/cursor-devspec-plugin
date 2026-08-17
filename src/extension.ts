@@ -33,7 +33,7 @@ const SKILLS: Record<SkillId, SkillMeta> = {
   'devspec.work': {
     command: 'devspec.work',
     promptLabel: 'Action item title or ID (optional)',
-    promptPlaceholder: 'e.g. "OAuth login bug", a UUID, or add --unattended',
+    promptPlaceholder: 'e.g. "OAuth login bug", a UUID, or add --remote',
   },
   'devspec.brainstorm': {
     command: 'devspec.brainstorm',

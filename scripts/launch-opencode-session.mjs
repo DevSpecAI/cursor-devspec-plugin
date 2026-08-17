@@ -336,7 +336,7 @@ export function buildOpencodeServeArgs(port) {
  * prompt body + optional model.
  *
  * Always includes `--auto` so permission prompts that would hang an
- * unattended remote session (notably `external_directory` for Temp paths)
+ * headless remote session (notably `external_directory` for Temp paths)
  * are auto-approved unless explicitly denied in config/env. Interactive
  * `opencode` TUI launches (not via this script) are unchanged.
  *
