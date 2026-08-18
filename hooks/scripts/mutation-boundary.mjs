@@ -28,7 +28,7 @@ export const TERMINAL_WORK_VERBS = new Set([
 ])
 
 export const CLAIM_WARNING =
-  'DevSpec mutation boundary: stop and successfully call claim_work_item before making changes. Follow the canonical implementation contract returned by claim_work_item.'
+  'DevSpec mutation boundary: claim the covering item and retry before making changes; read-only investigation remains available. Follow the canonical implementation contract returned by claim_work_item.'
 
 export const POST_EDIT_WARNING =
   `${CLAIM_WARNING} Cursor reported this edit only after it occurred; the hook did not prevent or revert the edit. Review the edit after claiming the work.`
@@ -210,25 +210,83 @@ function gitReadOnly(words) {
   return false
 }
 
-/** Strict, single-command read-only allowlist used only while the scope is unclaimed. */
-export function classifyShellCommand(command) {
-  const words = shellWords(command)
-  if (!words) return { allowed: false, reason: 'empty, compound, expanded, or unparsable shell command' }
-  const [program, ...args] = words
-  let allowed = false
-  if (program === 'pwd') allowed = args.length === 0 || (args.length === 1 && (args[0] === '-L' || args[0] === '-P'))
-  else if (program === 'ls') allowed = args.every((arg) => arg === '--' || !arg.startsWith('-') || LS_OPTIONS.test(arg))
-  else if (program === 'cat') allowed = argsArePaths(args.filter((arg) => !CAT_OPTIONS.has(arg)))
-  else if (program === 'head' || program === 'tail') {
-    allowed = args.every((arg) => arg === '--' || !arg.startsWith('-') || HEAD_TAIL_OPTIONS.test(arg))
-  } else if (program === 'GIT_OPTIONAL_LOCKS=0' && words[1] === 'git') {
-    allowed = gitReadOnly(words.slice(1))
+function compoundSegments(command) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 16384 || /`|\$\(|[<>]/.test(command)) return null
+  const segments = []
+  let current = ''
+  let quote = null
+  let escaped = false
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (escaped) { current += char; escaped = false; continue }
+    if (char === '\\' && quote !== "'") { escaped = true; continue }
+    if (quote) { if (char === quote) quote = null; else current += char; continue }
+    if (char === "'" || char === '"') { quote = char; continue }
+    if (char === '&' && command[index + 1] !== '&') return null
+    if ((char === '&' || char === '|') && command[index + 1] === char) {
+      if (!current.trim()) return null
+      segments.push(current.trim()); current = ''; index += 1; continue
+    }
+    if (char === ';' || char === '\n' || char === '|') {
+      if (current.trim()) segments.push(current.trim())
+      current = ''; continue
+    }
+    if (char === '(' || char === ')') return null
+    current += char
   }
+  if (quote || escaped) return null
+  if (current.trim()) segments.push(current.trim())
+  return segments.length ? segments : null
+}
+
+function compoundWords(segment) {
+  return segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((word) =>
+    word.length >= 2 && ((word[0] === '"' && word.at(-1) === '"') || (word[0] === "'" && word.at(-1) === "'"))
+      ? word.slice(1, -1) : word,
+  ) || []
+}
+
+function compoundGitReadOnly(args) {
+  let index = 0
+  if (args[index] === '-C') {
+    const target = args[index + 1]
+    if (!target || (target.includes('$') && !/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(target))) return false
+    index += 2
+  }
+  while (['--no-pager', '--no-optional-locks'].includes(args[index])) index += 1
+  const verb = args[index]
+  const rest = args.slice(index + 1)
+  if (!verb || rest.some((arg) => arg.includes('$') || ['--output', '--ext-diff', '--textconv'].includes(arg) || arg.startsWith('--output='))) return false
+  if (['status', 'diff', 'log', 'show', 'ls-files', 'ls-tree', 'rev-parse', 'grep', 'blame', 'describe', 'for-each-ref', 'cat-file', 'diff-tree', 'diff-index', 'diff-files', 'merge-base', 'shortlog'].includes(verb)) return true
+  if (verb === 'branch') return rest.length === 0 || rest.every((arg) => /^(?:-a|--all|-r|--remotes|--list|--show-current|--contains|--no-contains|--merged|--no-merged|--points-at|--format=|--sort=)/.test(arg))
+  if (verb === 'worktree') return rest[0] === 'list'
+  if (verb === 'remote') return rest.length === 0 || ['-v', 'show', 'get-url'].includes(rest[0])
+  return false
+}
+
+/** Every segment of a compound shell inspection must be conservatively read-only. */
+export function classifyShellCommand(command) {
+  const segments = compoundSegments(command)
+  const allowed = Boolean(segments?.every((segment) => {
+    const words = compoundWords(segment)
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
+      const assignment = words.shift()
+      const name = assignment.slice(0, assignment.indexOf('='))
+      const value = assignment.slice(assignment.indexOf('=') + 1)
+      if (/^(?:PATH|GIT_|LD_|DYLD_|NODE_OPTIONS|BASH_ENV|ENV|SHELL|IFS)/.test(name) || value.includes('$')) return false
+    }
+    const program = words.shift()
+    if (!program) return true
+    if (program === 'git') return compoundGitReadOnly(words)
+    if (words.some((arg) => arg.includes('$'))) return false
+    if (program === 'find') return !words.some((arg) => /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(arg))
+    if (program === 'rg') return !words.some((arg) => arg === '--pre' || arg.startsWith('--pre='))
+    if (program === 'printf' && words.includes('-v')) return false
+    return ['pwd', 'printf', 'echo', 'ls', 'cat', 'head', 'tail', 'grep', 'cut', 'wc', 'stat', 'file', 'readlink', 'realpath', 'basename', 'dirname', 'true', 'false', 'test', '[', 'cd', 'pushd', 'popd'].includes(program)
+  }))
   return {
     allowed,
-    reason: allowed
-      ? 'strict read-only allowlist'
-      : 'not on the strict read-only allowlist (git reads require GIT_OPTIONAL_LOCKS=0)',
+    reason: allowed ? 'conservative read-only compound' : 'contains an unknown or mutating shell segment',
   }
 }
 

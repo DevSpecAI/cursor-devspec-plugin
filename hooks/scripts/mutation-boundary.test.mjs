@@ -138,45 +138,38 @@ describe('conversation + repo scoped state', () => {
   })
 })
 
-describe('strict shell classifier', () => {
-  it('allows only small, single-command read-only forms', () => {
-    for (const command of [
-      'pwd',
-      'ls -la',
-      'cat -- README.md',
-      'head -20 README.md',
-      'GIT_OPTIONAL_LOCKS=0 git status --short',
-      'GIT_OPTIONAL_LOCKS=0 git diff --no-ext-diff --no-textconv --stat -- src/a.ts',
-      'GIT_OPTIONAL_LOCKS=0 git log --no-ext-diff --no-textconv --oneline -5',
-      'GIT_OPTIONAL_LOCKS=0 git show --no-ext-diff --no-textconv --stat HEAD',
-      'GIT_OPTIONAL_LOCKS=0 git rev-parse --show-toplevel',
-      'GIT_OPTIONAL_LOCKS=0 git branch --show-current',
-    ]) {
+describe('read-only compound shell classifier', () => {
+  it('allows ordinary and reported cross-repository inspection forms', () => {
+    const inspection = [
+      'WT=/other/repo',
+      "printf '%s\\n' status",
+      'git -C "$WT" status --short --branch',
+      'git -C "$WT" diff --stat',
+      'git -C "$WT" ls-files --others --exclude-standard',
+      'git -C "$WT" log --oneline --decorate -8',
+    ].join('\n')
+    for (const command of ['pwd', 'ls -la', 'cat -- README.md', 'head -20 README.md', 'git status --short', 'git diff --stat', inspection]) {
       assert.equal(classifyShellCommand(command).allowed, true, command)
     }
   })
 
-  it('denies mutation, unknown flags, composition, expansion, and redirection', () => {
+  it('denies mutation, expansion, hidden mutation, and redirection', () => {
     for (const command of [
-      'rm README.md',
-      'npm test',
-      'git checkout main',
-      'git status --short',
-      'GIT_OPTIONAL_LOCKS=1 git status --short',
-      'GIT_OPTIONAL_LOCKS=0 git status --unknown',
-      'GIT_OPTIONAL_LOCKS=0 git diff --stat',
-      'GIT_OPTIONAL_LOCKS=0 git diff --no-ext-diff --no-textconv --output=diff.txt',
-      'cat README.md > copy.md',
-      'pwd && touch x',
-      'ls $(touch x)',
-      'ls *.ts',
-      'cat file?.ts',
-      "cat '[abc].ts'",
-      'echo hello',
-      '',
-    ]) {
-      assert.equal(classifyShellCommand(command).allowed, false, command)
-    }
+      'rm README.md', 'npm test', 'git checkout main', 'git diff --output=diff.txt',
+      'cat README.md > copy.md', 'pwd && touch x', 'git status | tee out', 'ls $(touch x)',
+      'sort input -o owned', 'uniq input owned', 'find . -fprint0 owned', 'X=-delete; find . "$X"',
+      'PATH=.:$PATH git status', 'GIT_EXTERNAL_DIFF=rm git diff', 'git -c alias.status=touch status',
+      'git branch -D main', 'printf -v PATH .', '',
+    ]) assert.equal(classifyShellCommand(command).allowed, false, command)
+  })
+
+  it('keeps beforeShellExecution denials actionable and non-stopping', () => {
+    const output = handleHook('beforeShellExecution', { command: 'touch x' }, { scope: scope('chat-deny', '/repo/deny'), stateRoot: tempStateRoot() })
+    assert.equal(output?.permission, 'deny')
+    assert.equal(output?.stopReason, undefined)
+    assert.equal(output?.continue, undefined)
+    assert.match(output?.agent_message || '', /claim the covering item and retry/i)
+    assert.match(output?.agent_message || '', /read-only investigation remains available/i)
   })
 })
 
