@@ -1,5 +1,6 @@
 {
-  "description": "DevSpec remote-control turn mirroring + work-trail (UserPromptSubmit/Stop + mid-turn tool hooks). The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
+  "version": 1,
+  "description": "DevSpec claim-before-mutation boundary plus remote-control turn mirroring and work-trail hooks. The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
   "hooks": {
     "Stop": [
       {
@@ -61,6 +62,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" beforeShellExecution",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
             "timeout": 30
           }
@@ -70,6 +76,11 @@
     "afterMCPExecution": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" afterMCPExecution",
+            "timeout": 30
+          },
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterMCPExecution",
@@ -92,6 +103,11 @@
     "afterFileEdit": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" afterFileEdit",
+            "timeout": 30
+          },
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterFileEdit",

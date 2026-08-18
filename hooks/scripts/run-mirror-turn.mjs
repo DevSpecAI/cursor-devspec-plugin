@@ -21,6 +21,8 @@ import { fileURLToPath } from 'node:url'
 
 const EXT_PREFIX = 'devspecai.devspec-autopilot-'
 
+const BOUNDARY_MODE_PREFIX = 'mutation-'
+
 const TRAIL_MODES = new Set([
   'seed',
   'postToolUse',
@@ -98,11 +100,25 @@ export function stableMirrorTurnPath(home = os.homedir()) {
   return path.join(home, '.cursor', 'devspec', 'hooks', 'run-mirror-turn.mjs')
 }
 
-function main() {
-  const modeArg = String(process.argv[2] || 'stop')
+export function resolveHookInvocation(modeValue) {
+  const modeArg = String(modeValue || 'stop')
+  const boundaryMode = modeArg.startsWith(BOUNDARY_MODE_PREFIX)
+    ? modeArg.slice(BOUNDARY_MODE_PREFIX.length)
+    : null
+  const isBoundary = Boolean(boundaryMode && ['beforeShellExecution', 'afterMCPExecution', 'afterFileEdit'].includes(boundaryMode))
   const isTrail = TRAIL_MODES.has(modeArg)
-  const mode = isTrail ? modeArg : modeArg === 'user_prompt' ? 'user_prompt' : 'stop'
-  const scriptName = isTrail ? 'trail-turn.mjs' : 'mirror-turn.mjs'
+  return {
+    mode: isBoundary ? boundaryMode : isTrail ? modeArg : modeArg === 'user_prompt' ? 'user_prompt' : 'stop',
+    scriptName: isBoundary
+      ? 'mutation-boundary.mjs'
+      : isTrail
+        ? 'trail-turn.mjs'
+        : 'mirror-turn.mjs',
+  }
+}
+
+function main() {
+  const { mode, scriptName } = resolveHookInvocation(process.argv[2])
   const target = resolveInstalledHookScript(scriptName)
   if (!target) {
     process.stderr.write(
