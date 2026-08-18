@@ -12,7 +12,7 @@ Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, 
 - **Work a batch in one go.** Tell the Agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time. DevSpec's web app has a copy button that writes that line for you.
 - **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
 - **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
-- **Small conveniences.** Create tasks, make tracked commits, link commits to tasks, and ask DevSpec's docs questions — all from the command palette.
+- **Use DevSpec directly from Agent chat.** The MCP tools exposed in chat cover action items, tracked implementations, project memory, and product help.
 
 Everything runs against your own DevSpec account and repositories, using an API token you control.
 
@@ -26,7 +26,7 @@ You'll need:
   - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
   - It's **retrievable.** Reveal and copy it again any time at **You → Connections** (no more show-once).
   - You don't paste a project id — the project for a run is resolved from your repo's git remote.
-- **Node.js 18+** — only needed for **remote control** and working a batch of items (check with `node --version`). Plain MCP tool access — working a task in chat, creating items, asking the docs — doesn't require it, but you'll want it installed for the full feature set.
+- **Node.js 18+** — needed by the installed agent hooks and remote-control scripts (check with `node --version`). Plain MCP tool access is provided by Cursor itself.
 
 ## Install
 
@@ -39,8 +39,9 @@ The extension ships as a VSIX.
 On first activation the extension:
 
 - registers the DevSpec **MCP server** in your Cursor config,
-- installs project rules at `.cursor/rules/devspec.mdc` in git repos you open,
-- adds the **DevSpec: …** commands to the command palette.
+- installs project rules at `.cursor/rules/devspec.mdc` in git repos and worktrees you open,
+- installs Cursor agent hooks for remote-control telemetry and the claim-before-mutation guardrail,
+- adds the setup and remote-control **DevSpec: …** commands to the command palette.
 
 ## Connect your token
 
@@ -57,28 +58,26 @@ It points the server at the DevSpec MCP endpoint `https://devspec.ai/api/mcp` an
 
 ## Verify
 
-Open the command palette and run **DevSpec: Verify connection** (leave the verification ID blank for a quick ping). It copies a check prompt to your clipboard — paste it into Cursor's Agent chat (**Ctrl+L**) and send. You should see confirmation that you're connected as your DevSpec user.
-
-That clipboard-paste flow is how every DevSpec skill runs: a **DevSpec: …** palette command copies a ready-to-run prompt, and you paste it into Agent chat to kick it off.
+Open Cursor's Agent chat (**Ctrl+L** / **Cmd+L**) and ask it to call the DevSpec `verify_agent_connection` tool. You should see confirmation that the MCP server is reachable and connected as your DevSpec user.
 
 ### Commands
 
-Every command is under the **DevSpec:** prefix in the command palette.
+The extension currently contributes these command-palette commands:
 
 | Command | What it does |
 |---|---|
-| DevSpec: Work on action item | Pick up an action item, implement it, and record the work |
-| DevSpec: Brainstorm action item | Talk through scope and approach before writing code |
-| DevSpec: Create action item | Create a new action item from the editor |
-| DevSpec: Commit with tracking tag | Write a tracked commit message and commit |
-| DevSpec: Link commit to item | Link an existing commit to an action item |
-| DevSpec: Log completed work | Log work you already finished (commits, testing notes) |
-| DevSpec: Help | Ask a question and get an answer from DevSpec's docs |
-| DevSpec: Verify connection | Confirm the plugin is connected |
 | DevSpec: Connect remote control | Connect this session to DevSpec's Agents page |
 | DevSpec: Disconnect remote control | Disconnect this session from the Agents page |
+| DevSpec: Set MCP token | Store the account-wide MCP token |
+| DevSpec: Register MCP server in Cursor config | Write or refresh Cursor's MCP registration |
+| DevSpec: Install rules | Install or overwrite the managed project rule |
+| DevSpec: Install agent hooks | Install remote-control telemetry and mutation-boundary hooks |
+| DevSpec: Manage repo folder mappings | Manage local folders used by signed handoffs |
+| DevSpec: Install protocol handler | Register signed `devspec://` handoffs |
+| DevSpec: Install handoff handler | Install the local handoff bridge |
+| DevSpec: Start handoff handler | Start the local handoff bridge |
 
-Setup and utility commands are also in the palette: **DevSpec: Set MCP token**, **DevSpec: Register MCP server in Cursor config**, **DevSpec: Install rules**, **DevSpec: Install remote-control mirror hooks**, and **DevSpec: Manage repo folder mappings**.
+Action-item, memory, help, and implementation operations are MCP tools used from Agent chat; they are not separate command-palette commands.
 
 ## How it finds the right project
 
@@ -133,7 +132,7 @@ npm install
 npm run package   # → devspec-autopilot.vsix
 ```
 
-Skills are Markdown prompts synced from the Claude Code plugin via `npm run sync`. Release notes are in [CHANGELOG.md](./CHANGELOG.md).
+The two remote-control skills are packaged in this plugin. Release notes are in [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 

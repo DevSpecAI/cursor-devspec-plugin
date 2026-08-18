@@ -8,6 +8,7 @@ import {
   parseExtensionVersion,
   resolveInstalledHookScript,
   resolveInstalledMirrorTurn,
+  resolveHookInvocation,
   stableMirrorTurnPath,
 } from './run-mirror-turn.mjs'
 
@@ -68,6 +69,19 @@ describe('stableMirrorTurnPath', () => {
   it('is under ~/.cursor/devspec/hooks', () => {
     const p = stableMirrorTurnPath('/tmp/home')
     assert.equal(p, path.join('/tmp/home', '.cursor', 'devspec', 'hooks', 'run-mirror-turn.mjs'))
+  })
+})
+
+describe('resolveHookInvocation', () => {
+  it('routes installed mutation hooks to the boundary script and keeps trail routing separate', () => {
+    assert.deepEqual(resolveHookInvocation('mutation-beforeShellExecution'), {
+      mode: 'beforeShellExecution',
+      scriptName: 'mutation-boundary.mjs',
+    })
+    assert.deepEqual(resolveHookInvocation('afterMCPExecution'), {
+      mode: 'afterMCPExecution',
+      scriptName: 'trail-turn.mjs',
+    })
   })
 })
 

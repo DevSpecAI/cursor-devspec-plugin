@@ -1,6 +1,7 @@
 import * as vscode from 'vscode'
 import { promises as fs } from 'fs'
 import * as path from 'path'
+import { hasGitMetadata } from './project-rules-core.cjs'
 
 /** Matches `<!-- devspec-autopilot-rules:N -->` in bundled / installed rules files. */
 export const RULES_MARKER = /<!-- devspec-autopilot-rules:(\d+) -->/
@@ -28,13 +29,7 @@ export async function installProjectRules(
   opts: { overwrite?: boolean } = {},
 ): Promise<'installed' | 'skipped_exists' | 'skipped_no_git'> {
   const root = workspaceFolder.uri.fsPath
-  const gitDir = path.join(root, '.git')
-  try {
-    const stat = await fs.stat(gitDir)
-    if (!stat.isDirectory()) return 'skipped_no_git'
-  } catch {
-    return 'skipped_no_git'
-  }
+  if (!await hasGitMetadata(root)) return 'skipped_no_git'
 
   const targetPath = path.join(root, RULES_RELATIVE_PATH)
   const bundled = await readBundledRules(extensionPath)
