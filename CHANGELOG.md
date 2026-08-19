@@ -3,6 +3,15 @@
 
 ## 0.8.1
 
+### Healthy turn close no longer looks like the agent crashed
+
+The keep-alive poller called `report_complete` with no reason when the turn
+marker cleared after a real reply. Staging treats a missing reason as an
+old-poller stall and stamps the red "stopped before finishing this turn"
+notice onto the leftover Working bubble. Healthy complete now sends
+`reason: turn_end` (server skips abandon); a real max-turn stall still sends
+`max_turn_ms`. Reload/reinstall the plugin after this lands.
+
 ### MCP HTTP calls no longer hang forever
 
 Wait, mirror-turn, and `report_complete` used fetch with no timeout. A dead

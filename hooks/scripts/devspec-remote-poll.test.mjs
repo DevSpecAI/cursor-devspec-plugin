@@ -407,10 +407,22 @@ describe('verbForTurnTransition (direct activity-verb emission, item 71a8b201)',
   })
 })
 
-describe('extraActivityVerbArgs (stall complete, 0c2fb922)', () => {
-  it('adds reason=max_turn_ms only when stalling', () => {
-    assert.deepEqual(extraActivityVerbArgs({ stalling: true }), { reason: 'max_turn_ms' })
-    assert.deepEqual(extraActivityVerbArgs({ stalling: false }), {})
+describe('extraActivityVerbArgs (complete reasons, d8bf97c6)', () => {
+  it('healthy complete sends reason=turn_end so leftover trails are not abandoned', () => {
+    assert.deepEqual(extraActivityVerbArgs({ verb: 'complete', stalling: false }), {
+      reason: 'turn_end',
+    })
+  })
+
+  it('stall complete sends reason=max_turn_ms so leftover trails ARE abandoned', () => {
+    assert.deepEqual(extraActivityVerbArgs({ verb: 'complete', stalling: true }), {
+      reason: 'max_turn_ms',
+    })
+  })
+
+  it('pickup and keepalive never carry a complete reason', () => {
+    assert.deepEqual(extraActivityVerbArgs({ verb: 'pickup', stalling: false }), {})
+    assert.deepEqual(extraActivityVerbArgs({ verb: 'keepalive', stalling: true }), {})
     assert.deepEqual(extraActivityVerbArgs(), {})
   })
 })

@@ -462,9 +462,21 @@ export function verbForTurnTransition(prev, next) {
   return null
 }
 
-/** Extra MCP args for a turn-verb. Stall complete carries max_turn_ms so the server can finalize the streaming bubble. */
-export function extraActivityVerbArgs({ stalling } = {}) {
-  return stalling ? { reason: 'max_turn_ms' } : {}
+/**
+ * Extra MCP args for a turn-verb.
+ *
+ * Healthy complete MUST send reason=turn_end (item 628d83a8): the server skips
+ * leftover-trail abandon on that reason so Working dots clear without the red
+ * "stopped before finishing" notice. Omitting reason is treated as an old-poller
+ * stall and stamps WORK_TRAIL_ABANDONED_NOTICE onto the leftover bubble
+ * (Crimson Salmon, session b7a66c75).
+ *
+ * Stall complete still sends reason=max_turn_ms so the server CAN finalize a
+ * leftover streaming bubble (0c2fb922). Pickup/keepalive never carry a reason.
+ */
+export function extraActivityVerbArgs({ stalling, verb } = {}) {
+  if (verb !== 'complete') return {}
+  return { reason: stalling ? 'max_turn_ms' : 'turn_end' }
 }
 
 /** Activity verb → connection-native MCP tool name. */
@@ -1089,12 +1101,10 @@ async function main() {
     // syncActivityFromBusy translation as the safety net during rollout. One tick =
     // one keepalive (≈25s while a turn runs, well inside the 5-minute working lease).
     // Best-effort inside emitActivityVerb — a failed verb never breaks the loop.
-    // Stall complete (0c2fb922) includes reason=max_turn_ms so report_complete can
-    // finalize a leftover streaming bubble, not only the activity attempt.
-    await emitActivityVerb(
-      verbForTurnTransition(prevTurnActive, turnActive),
-      extraActivityVerbArgs({ stalling }),
-    )
+    // Complete always carries a reason: turn_end on a healthy marker clear
+    // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
+    const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
     prevTurnActive = turnActive
 
     // Cadence from connection STATE — with long-poll this picks the HOLD LENGTH,
