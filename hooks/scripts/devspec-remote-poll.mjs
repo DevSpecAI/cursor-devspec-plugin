@@ -462,6 +462,11 @@ export function verbForTurnTransition(prev, next) {
   return null
 }
 
+/** Extra MCP args for a turn-verb. Stall complete carries max_turn_ms so the server can finalize the streaming bubble. */
+export function extraActivityVerbArgs({ stalling } = {}) {
+  return stalling ? { reason: 'max_turn_ms' } : {}
+}
+
 /** Activity verb → connection-native MCP tool name. */
 const ACTIVITY_VERB_TOOL = {
   pickup: 'report_pickup',
@@ -776,7 +781,7 @@ async function main() {
   // break the poll loop — log to stderr and move on. attempt_id is omitted; the
   // server resolves this connection's current attempt (pickup opens one for a
   // locally-initiated turn; keepalive/complete refresh/close the working attempt).
-  async function emitActivityVerb(verb) {
+  async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return
     const name = ACTIVITY_VERB_TOOL[verb]
     if (!name) return
@@ -785,7 +790,7 @@ async function main() {
         mcpUrl,
         token,
         name,
-        arguments: { connection_id: connectionId },
+        arguments: { connection_id: connectionId, ...extraArgs },
         timeoutMs: 10_000,
       })
     } catch (e) {
@@ -1072,6 +1077,7 @@ async function main() {
         data: { elapsed_ms: turnElapsed, max_turn_ms: MAX_TURN_MS },
       })
     }
+    const stalling = !!(marker && turnElapsed >= MAX_TURN_MS && prevTurnActive)
     let busyArg = null
     if (turnActive) busyArg = true
     else if (lastBusySent === true) busyArg = false
@@ -1083,7 +1089,12 @@ async function main() {
     // syncActivityFromBusy translation as the safety net during rollout. One tick =
     // one keepalive (≈25s while a turn runs, well inside the 5-minute working lease).
     // Best-effort inside emitActivityVerb — a failed verb never breaks the loop.
-    await emitActivityVerb(verbForTurnTransition(prevTurnActive, turnActive))
+    // Stall complete (0c2fb922) includes reason=max_turn_ms so report_complete can
+    // finalize a leftover streaming bubble, not only the activity attempt.
+    await emitActivityVerb(
+      verbForTurnTransition(prevTurnActive, turnActive),
+      extraActivityVerbArgs({ stalling }),
+    )
     prevTurnActive = turnActive
 
     // Cadence from connection STATE — with long-poll this picks the HOLD LENGTH,

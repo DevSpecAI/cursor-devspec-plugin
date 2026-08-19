@@ -13,6 +13,7 @@ import {
   installStopSignalHandlers,
   resolveServerAttachment,
   verbForTurnTransition,
+  extraActivityVerbArgs,
   trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
@@ -403,6 +404,14 @@ describe('verbForTurnTransition (direct activity-verb emission, item 71a8b201)',
       verbs.push(verbForTurnTransition(ticks[i - 1], ticks[i]))
     }
     assert.deepEqual(verbs, ['pickup', 'keepalive', 'keepalive', 'complete', null])
+  })
+})
+
+describe('extraActivityVerbArgs (stall complete, 0c2fb922)', () => {
+  it('adds reason=max_turn_ms only when stalling', () => {
+    assert.deepEqual(extraActivityVerbArgs({ stalling: true }), { reason: 'max_turn_ms' })
+    assert.deepEqual(extraActivityVerbArgs({ stalling: false }), {})
+    assert.deepEqual(extraActivityVerbArgs(), {})
   })
 })
 

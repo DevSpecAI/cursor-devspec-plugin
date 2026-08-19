@@ -434,6 +434,8 @@ describe('notifyWorkingEnded (item cd989606 — immediate report_complete)', () 
     assert.equal(calls[1].name, 'report_complete')
     assert.equal(calls[1].arguments.connection_id, 'conn-1')
     assert.equal(calls[1].arguments.reason, 'turn_end')
+    assert.equal(calls[0].timeoutMs, 15_000)
+    assert.equal(calls[1].timeoutMs, 15_000)
   })
 
   it('returns no_token without calling MCP when auth is missing', async () => {

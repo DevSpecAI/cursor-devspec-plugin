@@ -361,6 +361,7 @@ async function main() {
           token,
           name: 'post_session_message',
           arguments: postArgs,
+          timeoutMs: 15_000,
         })
       }
     }
@@ -404,6 +405,7 @@ async function main() {
           status: 'live',
           busy: turnActive,
         },
+        timeoutMs: 15_000,
       })
       // End the activity attempt immediately on Stop. The poller also emits
       // report_complete when the marker disappears, but that waits for the next
@@ -417,6 +419,7 @@ async function main() {
             token,
             name: 'report_complete',
             arguments: { connection_id: connectionId, reason: 'turn_end' },
+            timeoutMs: 15_000,
           })
           logRemoteControlStory({
             phase: 'complete_turn',

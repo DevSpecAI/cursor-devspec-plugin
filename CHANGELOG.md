@@ -1,6 +1,22 @@
 # Changelog
 
 
+## 0.8.1
+
+### MCP HTTP calls no longer hang forever
+
+Wait, mirror-turn, and `report_complete` used fetch with no timeout. A dead
+gateway (HTTP 502 before `/api/mcp` logged) froze the poller and left DevSpec
+showing Working for the rest of the hour. Non-hold MCP calls now default to 30s;
+stall complete sends `reason: max_turn_ms` so the server can close the streaming
+bubble.
+
+Reload/reinstall the plugin after this lands. Source 0.8.0 already had the
+resume-first owner-pid fix; machines still on 0.5.3 need this install, not a
+reconnect of a hung session.
+
+> Maintainer note: `package.json` is in `protected_paths`, so this version bump is documented here only — bump `package.json` manually before publishing the new VSIX.
+
 ## 0.8.0
 
 ### Cursor CLI Connect stays Live when the wait script is named in the prompt

@@ -11,15 +11,22 @@
  *     poller whose owning agent process died tears down immediately instead of after
  *     the hold expires (the anti-zombie contract).
  * Both throw an Error carrying `code` ('timeout' | 'owner_gone') so callers can tell a
- * deliberate abort from a network failure. Omitting them keeps the original behaviour.
+ * deliberate abort from a network failure.
+ *
+ * Non-hold calls that omit timeoutMs use DEFAULT_MCP_CALL_TIMEOUT_MS (30s). A dead
+ * gateway used to freeze wait/mirror-turn/report_complete forever (0c2fb922). Long-poll
+ * must pass an explicit timeout above the server hold.
  */
+
+/** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
+export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
 
 export async function mcpToolsCall({
   mcpUrl,
   token,
   name,
   arguments: toolArgs,
-  timeoutMs = 0,
+  timeoutMs = DEFAULT_MCP_CALL_TIMEOUT_MS,
   isAlive = null,
   aliveCheckMs = 2_000,
 }) {

@@ -157,6 +157,7 @@ export async function notifyWorkingEnded({
         status: 'live',
         busy: false,
       },
+      timeoutMs: 15_000,
     })
   } catch {
     /* non-fatal — report_complete is the durable clear */
@@ -168,6 +169,7 @@ export async function notifyWorkingEnded({
       token,
       name: 'report_complete',
       arguments: { connection_id: connectionId, reason: 'turn_end' },
+      timeoutMs: 15_000,
     })
     return { ok: true }
   } catch (e) {
