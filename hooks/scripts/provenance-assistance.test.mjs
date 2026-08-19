@@ -2,14 +2,17 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
 import {
   AMBIGUOUS_REFERENCE_MESSAGE,
   MULTIPLE_CLAIMS_MESSAGE,
+  ONLINE_REFERENCE_TIMEOUT_MS,
   appendReference,
+  confirmReferenceOnline,
   findProjectPin,
+  gitMainWorktree,
   handleHook,
   inspectReferences,
   parseHookInput,
@@ -69,7 +72,16 @@ function pre(command, cwd, stateRoot, extra = {}) {
     tool_input: { command },
     tool_use_id: extra.tool_use_id || 'tool-1',
     cwd,
-  }, { stateRoot, nowMs: extra.nowMs, pinOptions: { home: extra.home, repoRoot: extra.repoRoot } })
+  }, {
+    stateRoot,
+    env: extra.env,
+    nowMs: extra.nowMs,
+    pinOptions: { home: extra.home, repoRoot: extra.repoRoot },
+    mainWorktree: extra.mainWorktree,
+    resolveAuth: extra.resolveAuth,
+    onlineCall: extra.onlineCall,
+    onlineTimeoutMs: extra.onlineTimeoutMs,
+  })
 }
 
 describe('readable Cursor commit shapes', () => {
@@ -86,6 +98,11 @@ describe('readable Cursor commit shapes', () => {
 
     const dashC = parseReadableCommit("git -C '../work tree' commit -m 'ship'", cwd)
     assert.equal(dashC?.targetCwd, '/workspace/work tree')
+
+    const cursorTrailer = parseReadableCommit(
+      `git commit --trailer "Co-authored-by: Cursor <cursoragent@cursor.com>" --allow-empty -m 'ship'`, cwd,
+    )
+    assert.equal(cursorTrailer?.message, 'ship')
   })
 
   it('fails open for opaque, compound, history-rewriting, and expansion forms', () => {
@@ -93,6 +110,8 @@ describe('readable Cursor commit shapes', () => {
       "cd repo && git commit -m 'x' && git push",
       "git -c user.name=x commit -m 'x'",
       "git commit --amend -m 'x'",
+      "git commit --no-verify -m 'x'",
+      "git commit -n -m 'x'",
       "git commit --am -m 'x'",
       "git commit -c HEAD -m 'x'",
       "git commit -C HEAD -m 'x'",
@@ -112,6 +131,23 @@ describe('readable Cursor commit shapes', () => {
       "git commit -m unquoted",
       "eval git commit -m 'x'",
       "git commit -F message.txt",
+      "git commit -Fmessage.txt -m 'x'",
+      "git commit --file=message.txt -m 'x'",
+      "git commit --fi=message.txt -m 'x'",
+      "git commit --template=template.txt -m 'x'",
+      "git commit --edit -m 'x'",
+      "git commit -e -m 'x'",
+      "git commit --signoff -m 'x'",
+      "git commit -s -m 'x'",
+      "git commit --trailer 'DevSpec: [devspec:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]' -m 'x'",
+      "git commit --trailer='Co-authored-by: Cursor <cursoragent@cursor.com>' -m 'x'",
+      "git commit --trailer 'Reviewed-by: Human <human@example.com>' -m 'x'",
+      "git commit --tr 'Reviewed-by: Human <human@example.com>' -m 'x'",
+      "git commit --message=first -m 'second'",
+      "git commit --mess=first -m 'second'",
+      "git commit -mfirst -m 'second'",
+      "git commit -m 'first' -m 'second'",
+      "git commit -m 'first'joined",
       "git commit -m 'x' | tee out",
       "git commit -m 'x'; echo done",
       "git commit -m 'x'\necho done",
@@ -156,6 +192,27 @@ describe('project jurisdiction', () => {
     })
   })
 
+  it('derives repository identity and the untracked pin from a real linked worktree', () => {
+    const root = tempRoot()
+    const home = path.join(root, 'home')
+    const main = path.join(root, 'main')
+    const linked = path.join(root, 'linked')
+    fs.mkdirSync(main)
+    execFileSync('git', ['-C', main, 'init', '-q', '-b', 'main'])
+    execFileSync('git', ['-C', main, 'config', 'user.name', 'Cursor Pin Test'])
+    execFileSync('git', ['-C', main, 'config', 'user.email', 'cursor-pin@example.invalid'])
+    execFileSync('git', ['-C', main, 'commit', '--allow-empty', '-q', '-m', 'initial'])
+    execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'linked', linked])
+    fs.mkdirSync(path.join(main, '.devspec'))
+    fs.writeFileSync(path.join(main, '.devspec', 'project.json'), JSON.stringify({ project_id: PROJECT }))
+
+    assert.equal(gitMainWorktree(linked), main)
+    assert.deepEqual(findProjectPin(linked, { home }), {
+      projectId: PROJECT,
+      path: path.join(main, '.devspec', 'project.json'),
+    })
+  })
+
   it('fails open on missing, malformed, and non-uuid pins without bypassing a local invalid pin', () => {
     const root = tempRoot()
     const home = path.join(root, 'home')
@@ -172,11 +229,159 @@ describe('project jurisdiction', () => {
   })
 })
 
+describe('online reference confirmation', () => {
+  function gitPinnedRepo() {
+    const result = pinnedRepo()
+    execFileSync('git', ['-C', result.repo, 'init', '-q', '-b', 'main'])
+    execFileSync('git', ['-C', result.repo, 'config', 'user.name', 'Cursor Online Test'])
+    execFileSync('git', ['-C', result.repo, 'config', 'user.email', 'cursor-online@example.invalid'])
+    execFileSync('git', ['-C', result.repo, 'commit', '--allow-empty', '-q', '-m', 'initial'])
+    execFileSync('git', ['-C', result.repo, 'remote', 'add', 'origin', 'git@github.com:DevSpecAI/cursor-online-test.git'])
+    return result
+  }
+
+  it('validates one existing reference with target project hints and a bounded timeout', async () => {
+    const { home, repo } = gitPinnedRepo()
+    const stateRoot = tempRoot()
+    const calls = []
+    const output = await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
+      home,
+      repoRoot: repo,
+      mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }),
+      onlineCall: async (request) => { calls.push(request); return { online: { status: 'valid' } } },
+    })
+    assert.equal(output, null)
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0], {
+      mcpUrl: 'https://mcp.example/test',
+      token: 'dvs_test',
+      name: 'validate_commit_reference',
+      arguments: {
+        commit_message: `ship [devspec:${ITEM_A}]`,
+        pinned_project_id: PROJECT,
+        git_remote: 'git@github.com:DevSpecAI/cursor-online-test.git',
+      },
+      timeoutMs: ONLINE_REFERENCE_TIMEOUT_MS,
+    })
+  })
+
+  it('inherits pin, remote, endpoint, and bearer from a real linked worktree', async () => {
+    const root = tempRoot()
+    const home = path.join(root, 'home')
+    const main = path.join(root, 'main')
+    const linked = path.join(root, 'linked')
+    fs.mkdirSync(main)
+    execFileSync('git', ['-C', main, 'init', '-q', '-b', 'main'])
+    execFileSync('git', ['-C', main, 'config', 'user.name', 'Cursor Online Worktree'])
+    execFileSync('git', ['-C', main, 'config', 'user.email', 'cursor-online-worktree@example.invalid'])
+    execFileSync('git', ['-C', main, 'commit', '--allow-empty', '-q', '-m', 'initial'])
+    execFileSync('git', ['-C', main, 'remote', 'add', 'origin', 'git@github.com:DevSpecAI/worktree-online.git'])
+    execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'linked', linked])
+    fs.mkdirSync(path.join(main, '.devspec'))
+    fs.writeFileSync(path.join(main, '.devspec', 'project.json'), JSON.stringify({ project_id: PROJECT }))
+    fs.mkdirSync(path.join(main, '.cursor'))
+    fs.writeFileSync(path.join(main, '.cursor', 'mcp.json'), JSON.stringify({
+      mcpServers: { devspec: { url: 'https://staging.example/mcp', headers: { Authorization: 'Bearer dvs_main_worktree' } } },
+    }))
+    let request = null
+    const output = await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, linked, tempRoot(), {
+      home,
+      env: { HOME: home },
+      onlineCall: async (value) => { request = value; return { online: { status: 'valid' } } },
+    })
+    assert.equal(output, null)
+    assert.equal(request?.token, 'dvs_main_worktree')
+    assert.equal(request?.mcpUrl, 'https://staging.example/mcp')
+    assert.equal(request?.arguments?.pinned_project_id, PROJECT)
+    assert.equal(request?.arguments?.git_remote, 'git@github.com:DevSpecAI/worktree-online.git')
+  })
+
+  it('denies only a definitive not_found with non-terminating recovery', async () => {
+    const { home, repo } = gitPinnedRepo()
+    const output = await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, tempRoot(), {
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }),
+      onlineCall: async () => ({ online: { status: 'not_found' } }),
+    })
+    assert.equal(output?.permission, 'deny')
+    assert.match(output?.agent_message || '', /UUID tail|another project/i)
+    assert.match(output?.agent_message || '', /retry/i)
+    assert.equal(output?.continue, undefined)
+    assert.equal(output?.stopReason, undefined)
+  })
+
+  it('allows every unavailable or indeterminate online outcome', async () => {
+    const { home, repo } = gitPinnedRepo()
+    const stateRoot = tempRoot()
+    const results = [
+      { online: { status: 'unavailable' } },
+      { online: { status: 'indeterminate' } },
+      { online: { status: 'unknown' } },
+      { online: { status: ' NOT_FOUND ' } },
+      { online: { status: 'Not_Found' } },
+      { online: {} },
+      {},
+      null,
+    ]
+    for (const result of results) {
+      assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
+        home, repoRoot: repo, mainWorktree: repo,
+        resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }),
+        onlineCall: async () => result,
+      }), null)
+    }
+    assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }),
+      onlineCall: async () => { throw new Error('offline') },
+    }), null)
+  })
+
+  it('makes no online call without credentials, without a reference, or while stamping', async () => {
+    const { home, repo } = gitPinnedRepo()
+    const stateRoot = tempRoot()
+    let calls = 0
+    const onlineCall = async () => { calls += 1; return { online: { status: 'valid' } } }
+    assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: repo, resolveAuth: () => ({ ok: false }), onlineCall,
+    }), null)
+    assert.equal(pre("git commit -m 'plain'", repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
+    }), null)
+    assert.equal(pre(`git commit --message=hidden -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
+    }), null)
+    observeClaim(stateRoot)
+    assert.match(pre("git commit -m 'stamp me'", repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
+    })?.updated_input?.command || '', new RegExp(ITEM_A))
+    assert.equal(calls, 0)
+  })
+
+  it('fails open against an unreachable endpoint within the explicit timeout', async () => {
+    const started = Date.now()
+    const outcome = await confirmReferenceOnline(`ship [devspec:${ITEM_A}]`, {
+      cwd: process.cwd(),
+      pin: { projectId: PROJECT },
+      timeoutMs: 150,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'http://127.0.0.1:9/mcp' }),
+    })
+    assert.equal(outcome, 'unavailable')
+    assert.ok(Date.now() - started < 2_000)
+  })
+})
+
 describe('claim observation and commit decisions', () => {
-  it('accepts a valid reference without any live claim and allows no-claim/offline work', () => {
+  it('accepts a valid reference without any live claim and allows no-claim/offline work', async () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
-    assert.equal(pre(`git commit -m 'ship [devspec:${ITEM_B}]'`, repo, stateRoot, { home, repoRoot: repo }), null)
+    assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_B}]'`, repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: null, resolveAuth: () => ({ ok: false }),
+    }), null)
     assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo }), null)
     assert.equal(pre("git commit -m 'broken [devspec:not-a-uuid]'", repo, stateRoot, { home, repoRoot: repo })?.permission, 'deny')
     assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_name: 'Write' }), null)
@@ -199,11 +404,13 @@ describe('claim observation and commit decisions', () => {
     assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'], undefined)
   })
 
-  it('never overwrites an existing different reference', () => {
+  it('never overwrites an existing different reference', async () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     observeClaim(stateRoot, ITEM_A)
-    assert.equal(pre(`git commit -m 'follow-up [devspec:${ITEM_B}]'`, repo, stateRoot, { home, repoRoot: repo }), null)
+    assert.equal(await pre(`git commit -m 'follow-up [devspec:${ITEM_B}]'`, repo, stateRoot, {
+      home, repoRoot: repo, mainWorktree: null, resolveAuth: () => ({ ok: false }),
+    }), null)
   })
 
   it('never stamps a claim observed for a different DevSpec project', () => {

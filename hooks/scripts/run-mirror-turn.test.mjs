@@ -9,11 +9,14 @@ import {
   compareSemverTuples,
   hookChildExitCode,
   parseExtensionVersion,
+  PROVENANCE_CHILD_TIMEOUT_MS,
+  provenanceChildTimeoutMs,
   resolveInstalledHookScript,
   resolveInstalledMirrorTurn,
   resolveHookInvocation,
   stableMirrorTurnPath,
 } from './run-mirror-turn.mjs'
+import { ONLINE_REFERENCE_TIMEOUT_MS } from './provenance-assistance.mjs'
 
 describe('parseExtensionVersion', () => {
   it('parses dotted versions', () => {
@@ -102,6 +105,15 @@ describe('hookChildExitCode', () => {
 })
 
 describe('stable provenance launcher output', () => {
+  it('keeps network, child, and outer hook budgets strictly ordered', () => {
+    const hooks = JSON.parse(fs.readFileSync(new URL('../hooks.json', import.meta.url), 'utf8'))
+    const outerSeconds = hooks.hooks.preToolUse[0].hooks[0].timeout
+    assert.ok(ONLINE_REFERENCE_TIMEOUT_MS < PROVENANCE_CHILD_TIMEOUT_MS)
+    assert.ok(PROVENANCE_CHILD_TIMEOUT_MS < outerSeconds * 1_000)
+    assert.equal(provenanceChildTimeoutMs({ DEVSPEC_CURSOR_PROVENANCE_CHILD_TIMEOUT_MS: '75' }), 75)
+    assert.equal(provenanceChildTimeoutMs({ DEVSPEC_CURSOR_PROVENANCE_CHILD_TIMEOUT_MS: '999999' }), PROVENANCE_CHILD_TIMEOUT_MS)
+  })
+
   it('forwards a decision only when the provenance child exits successfully', () => {
     const script = fileURLToPath(new URL('./run-mirror-turn.mjs', import.meta.url))
     for (const { exitCode, expected } of [{ exitCode: 0, expected: '{"permission":"allow"}\n' }, { exitCode: 1, expected: '' }]) {
@@ -120,6 +132,29 @@ describe('stable provenance launcher output', () => {
       } finally {
         fs.rmSync(home, { recursive: true, force: true })
       }
+    }
+  })
+
+  it('kills a hung child, discards its partial decision, and exits zero', () => {
+    const script = fileURLToPath(new URL('./run-mirror-turn.mjs', import.meta.url))
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-provenance-timeout-'))
+    try {
+      const childDir = path.join(home, '.cursor', 'extensions', 'devspecai.devspec-autopilot-9.9.9', 'hooks', 'scripts')
+      fs.mkdirSync(childDir, { recursive: true })
+      fs.writeFileSync(path.join(childDir, 'provenance-assistance.mjs'),
+        `if (process.platform !== 'win32') process.on('SIGTERM', () => {}); process.stdout.write('{"permission":"deny"}\\n'); setInterval(() => {}, 1000)\n`)
+      const started = Date.now()
+      const result = spawnSync(process.execPath, [script, 'provenance-preToolUse'], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, DEVSPEC_CURSOR_PROVENANCE_CHILD_TIMEOUT_MS: '75' },
+        input: '{}',
+      })
+      assert.equal(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /failed open/i)
+      assert.ok(Date.now() - started < 2_000)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
     }
   })
 })

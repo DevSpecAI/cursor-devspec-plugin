@@ -35,9 +35,9 @@ describe('managed Cursor rule upgrade', () => {
     }
   })
 
-  it('bumps the managed marker so existing v6 installs upgrade', () => {
-    assert.equal(rulesVersion(bundled), 7)
-    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:6 -->\nold', bundled), true)
+  it('bumps the managed marker so existing v7 installs upgrade', () => {
+    assert.equal(rulesVersion(bundled), 8)
+    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:7 -->\nold', bundled), true)
     assert.equal(shouldUpgrade(bundled, bundled), false)
     assert.equal(shouldUpgrade('# user-owned rules', bundled), false)
   })
@@ -48,6 +48,8 @@ describe('managed Cursor rule upgrade', () => {
     assert.match(bundled, /missing claim never blocks edits/i)
     assert.match(bundled, /after-the-fact, non-blocking edit reminder/i)
     assert.match(bundled, /afterFileEdit.*no supported output fields/i)
+    assert.match(bundled, /when DevSpec is reachable.*checked for existence/i)
+    assert.match(bundled, /unavailable or indeterminate result allows/i)
     assert.match(bundled, /Pushes are never blocked/i)
     assert.doesNotMatch(bundled, /GIT_OPTIONAL_LOCKS=0/)
   })

@@ -3,6 +3,23 @@
 
 ## 0.9.0
 
+### Present commit references are confirmed without breaking offline work
+
+A directly readable commit that already contains one well-formed DevSpec
+reference now uses the purpose-built `validate_commit_reference` MCP tool. Only
+a definitive `not_found` result refuses that commit; missing credentials,
+timeouts, transport/auth/server failures, malformed responses, and uncertain
+project resolution all allow. Unreferenced and newly auto-stamped commits make
+no network call.
+
+Linked worktrees now inherit untracked project `.cursor/mcp.json` and
+`.mcp.json` credentials from the repository's main checkout, preserving their
+paired endpoint and token ahead of home fallbacks. Alternate or multiple Git
+message sources remain unreadable and pass untouched. The stable provenance
+launcher also kills hung children after 10 seconds, discards partial output,
+and exits successfully so Cursor's 30-second outer hook never becomes a local
+work blocker.
+
 ### Commit provenance replaces mutation classification
 
 Cursor no longer denies edits, tests, builds, arbitrary shell, worktrees,

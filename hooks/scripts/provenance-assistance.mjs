@@ -14,6 +14,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { mcpToolsCall } from './mcp-call.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -24,13 +26,21 @@ const VALID_REFERENCE = new RegExp(`\\[devspec:(${FULL_UUID})\\]`, 'gi')
 const REFERENCE_START = /\[devspec\s*:/gi
 const EDIT_TOOLS = new Set(['write', 'edit', 'applypatch', 'apply_patch', 'delete'])
 const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000
-const HISTORY_OPTIONS = ['--amend', '--reuse-message', '--reedit-message', '--fixup', '--squash', '--no-edit', '--reset-author']
+export const ONLINE_REFERENCE_TIMEOUT_MS = 2_500
+const HISTORY_OPTIONS = ['--amend', '--reuse-message', '--reedit-message', '--fixup', '--squash', '--no-edit', '--reset-author', '--no-verify', '--edit', '--signoff']
+const MESSAGE_SOURCE_OPTIONS = ['--message', '--file', '--template']
+const CURSOR_COAUTHOR_TRAILER = 'Co-authored-by: Cursor <cursoragent@cursor.com>'
 
 export const AMBIGUOUS_REFERENCE_MESSAGE =
   'DevSpec commit provenance: this readable commit message has malformed or multiple DevSpec references. Keep exactly one full [devspec:<uuid>] reference and retry. Nothing else is blocked.'
 
 export const MULTIPLE_CLAIMS_MESSAGE =
   'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Keep exactly one correct [devspec:<uuid>] reference in the message and retry. Nothing else is blocked.'
+
+export function unresolvedReferenceMessage(reference) {
+  return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
+    'This usually means the UUID tail is wrong or the item belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
+}
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
@@ -165,15 +175,29 @@ function isInside(candidate, parent) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
-function gitMainWorktree(cwd) {
+export function gitMainWorktree(cwd) {
+  try {
+    const commonDir = execFileSync('git', ['-C', cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000,
+    }).trim()
+    if (path.basename(commonDir) === '.git') return path.dirname(path.resolve(commonDir))
+  } catch {}
   try {
     const output = execFileSync('git', ['-C', cwd, 'worktree', 'list', '--porcelain', '-z'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2_000,
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000,
     })
     const first = output.split('\0').find((field) => field.startsWith('worktree '))
     return first ? path.resolve(first.slice('worktree '.length)) : null
+  } catch {
+    return null
+  }
+}
+
+function gitRemoteOrigin(cwd) {
+  try {
+    return cleanString(execFileSync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000,
+    }))
   } catch {
     return null
   }
@@ -250,6 +274,7 @@ function lexCommand(command) {
       }
       if (command[index] !== quote) return null
       index += 1
+      if (index < command.length && !/\s/.test(command[index]) && !';&|<>`'.includes(command[index])) return null
       tokens.push({ value, raw: command.slice(start, index), start, end: index, quote })
       continue
     }
@@ -305,11 +330,31 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
 
   const rest = tokens.slice(index)
   if (!rest.length || rest.some((token) => token.value === '&&')) return null
+  let cursorTrailerCount = 0
+  for (let i = 0; i < rest.length; i += 1) {
+    const token = rest[i]
+    if (token.value === '--trailer') {
+      cursorTrailerCount += 1
+      if (cursorTrailerCount > 1 || rest[i + 1]?.value !== CURSOR_COAUTHOR_TRAILER) return null
+      i += 1
+      continue
+    }
+    if (token.value.startsWith('--')) {
+      const optionName = token.value.split('=', 1)[0]
+      if ('--trailer'.startsWith(optionName)) return null
+    }
+  }
   if (rest.some((token) => {
-    if (token.value === '-C' || token.value === '-c' || /^-[Cc].+/.test(token.value)) return true
+    if (token.value === '-C' || token.value === '-c' || /^-[Cc].+/.test(token.value) ||
+      token.value === '-n' || token.value === '-e' || /^-e.+/.test(token.value) ||
+      token.value === '-s' || /^-s.+/.test(token.value)) return true
+    if (token.value === '-F' || /^-F.+/.test(token.value) || token.value === '-t' || /^-t.+/.test(token.value)) return true
+    if (token.value.startsWith('-m') && token.value !== '-m') return true
     if (!token.value.startsWith('--')) return false
     const optionName = token.value.split('=', 1)[0]
-    return HISTORY_OPTIONS.some((option) => option.startsWith(optionName))
+    return HISTORY_OPTIONS.some((option) => option.startsWith(optionName)) ||
+      MESSAGE_SOURCE_OPTIONS.some((option) => option.startsWith(optionName) &&
+        !(option === '--message' && optionName === '--message' && token.value === '--message'))
   })) return null
 
   let messageToken = null
@@ -341,6 +386,49 @@ export function inspectReferences(message) {
 
 export function appendReference(parsed, actionItemId) {
   return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
+}
+
+export async function confirmReferenceOnline(commitMessage, options = {}) {
+  const {
+    cwd,
+    mainWorktree = null,
+    pin = null,
+    env = process.env,
+    timeoutMs = ONLINE_REFERENCE_TIMEOUT_MS,
+    call = mcpToolsCall,
+    resolveAuth = resolveDevspecMcpAuth,
+  } = options
+
+  let auth
+  try {
+    auth = resolveAuth(cwd, { env, mainWorktree })
+  } catch {
+    return 'unavailable'
+  }
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return 'unavailable'
+
+  const args = { commit_message: commitMessage }
+  if (pin?.projectId) args.pinned_project_id = pin.projectId
+  const gitRemote = gitRemoteOrigin(cwd)
+  if (gitRemote) args.git_remote = gitRemote
+
+  let result
+  try {
+    result = await call({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'validate_commit_reference',
+      arguments: args,
+      timeoutMs,
+    })
+  } catch {
+    return 'unavailable'
+  }
+
+  const status = result?.online?.status
+  if (status === 'not_found') return 'not_found'
+  if (status === 'valid') return 'valid'
+  return 'indeterminate'
 }
 
 function toolFields(data) {
@@ -499,7 +587,23 @@ export function handleHook(mode, data, options = {}) {
     const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === pin.projectId)
 
     const refs = inspectReferences(parsed.message)
-    if (refs.valid.length === 1 && !refs.malformedOrAmbiguous) return null
+    if (refs.valid.length === 1 && !refs.malformedOrAmbiguous) {
+      const reference = refs.valid[0]
+      const mainWorktree = options.mainWorktree === undefined ? gitMainWorktree(parsed.targetCwd) : options.mainWorktree
+      return confirmReferenceOnline(parsed.message, {
+        cwd: parsed.targetCwd,
+        mainWorktree,
+        pin,
+        env,
+        timeoutMs: options.onlineTimeoutMs,
+        call: options.onlineCall,
+        resolveAuth: options.resolveAuth,
+      }).then((outcome) => {
+        if (outcome !== 'not_found') return null
+        const message = unresolvedReferenceMessage(reference)
+        return { permission: 'deny', user_message: message, agent_message: message }
+      }).catch(() => null)
+    }
     if (refs.malformedOrAmbiguous) {
       return { permission: 'deny', user_message: AMBIGUOUS_REFERENCE_MESSAGE, agent_message: AMBIGUOUS_REFERENCE_MESSAGE }
     }
@@ -557,11 +661,11 @@ function readStdin() {
   }
 }
 
-function main() {
+async function main() {
   try {
     const mode = String(process.argv[2] || '')
     if (!HOOK_MODES.has(mode)) return
-    const output = handleHook(mode, parseHookInput(readStdin()))
+    const output = await handleHook(mode, parseHookInput(readStdin()))
     if (output) process.stdout.write(`${JSON.stringify(output)}\n`)
   } catch (error) {
     // Cursor's hook-failure default is host-dependent. Make provenance outages
@@ -571,4 +675,4 @@ function main() {
 }
 
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-if (isMain) main()
+if (isMain) void main()

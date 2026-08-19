@@ -22,6 +22,14 @@ import { fileURLToPath } from 'node:url'
 const EXT_PREFIX = 'devspecai.devspec-autopilot-'
 
 const PROVENANCE_MODE_PREFIX = 'provenance-'
+export const PROVENANCE_CHILD_TIMEOUT_MS = 10_000
+
+export function provenanceChildTimeoutMs(env = process.env) {
+  const requested = Number(env.DEVSPEC_CURSOR_PROVENANCE_CHILD_TIMEOUT_MS)
+  return Number.isFinite(requested) && requested >= 50
+    ? Math.min(requested, PROVENANCE_CHILD_TIMEOUT_MS)
+    : PROVENANCE_CHILD_TIMEOUT_MS
+}
 
 const TRAIL_MODES = new Set([
   'seed',
@@ -135,6 +143,8 @@ function main() {
   const result = spawnSync(process.execPath, [target, mode], {
     stdio: isProvenance ? ['inherit', 'pipe', 'pipe'] : 'inherit',
     encoding: isProvenance ? 'utf8' : undefined,
+    timeout: isProvenance ? provenanceChildTimeoutMs(process.env) : undefined,
+    killSignal: isProvenance ? 'SIGKILL' : undefined,
     windowsHide: true,
     env: process.env,
   })

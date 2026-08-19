@@ -3,7 +3,7 @@ description: DevSpec workflow — claim early, link commits, and follow the serv
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:7 -->
+<!-- devspec-autopilot-rules:8 -->
 
 ## Working with DevSpec
 
@@ -19,7 +19,7 @@ Search/reuse/create and claim the smallest covering item early because claims co
 
 Cursor's hooks provide capability-honest assistance only where the host exposes enough structure:
 
-- `preToolUse` may inspect a narrow, directly readable Shell `git commit -m` message. A valid full `[devspec:<uuid>]` reference passes without a live claim. Exactly one recent claim explicitly confirmed by a successful DevSpec result may be appended through Cursor's structured `updated_input`; multiple or stale claims are never guessed.
+- `preToolUse` may inspect a narrow, directly readable Shell `git commit -m` message. A valid full `[devspec:<uuid>]` reference does not require a live claim; when DevSpec is reachable it is checked for existence, but every unavailable or indeterminate result allows. Exactly one recent claim explicitly confirmed by a successful DevSpec result may be appended through Cursor's structured `updated_input`; multiple or stale claims are never guessed.
 - Readable isolated-worktree forms include `cd <single-path> && git commit …` and `git -C <path> commit …`. Aliases, further compounding, expansions, amend/history-producing forms, and every opaque command fail open.
 - `postToolUse` may add one after-the-fact, non-blocking edit reminder per conversation/project. Cursor's `afterFileEdit` event has no supported output fields, so it is telemetry only and never pretends to stop or undo an edit.
 - Pushes are never blocked because Cursor does not provide the certain outgoing commit set and safe recovery required by the contract.
