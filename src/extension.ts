@@ -44,7 +44,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerRepoFolderFeatures(context)
   registerProtocolHandlerCommands(context)
   installProtocolHandler(context.extensionPath)
-  // Wire remote-control telemetry and the claim-before-mutation boundary into Cursor hooks.
+  // Wire remote-control telemetry and commit-provenance assistance into Cursor hooks.
   void installRemoteControlHooks(context.extensionPath)
 
   for (const [skillId, meta] of Object.entries(SKILLS) as [SkillId, SkillMeta][]) {
@@ -90,7 +90,7 @@ async function installStableMirrorLauncher(extensionPath: string): Promise<strin
 
 /**
  * Merge DevSpec hooks into ~/.cursor/hooks.json so the stable launcher handles
- * remote-control telemetry plus claim-before-mutation checks. Idempotent:
+ * remote-control telemetry plus capability-honest commit provenance. Idempotent:
  * rewrites only DevSpec entries and leaves third-party hooks alone.
  */
 async function installRemoteControlHooks(
@@ -127,7 +127,7 @@ async function installRemoteControlHooks(
   await fs.writeFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf8')
   if (opts.forceNotify) {
     void vscode.window.showInformationMessage(
-      'DevSpec: remote-control mirror, work-trail, and mutation-boundary hooks installed (stable path under ~/.cursor/devspec/hooks/).',
+      'DevSpec: remote-control mirror, work-trail, and commit-provenance hooks installed (stable path under ~/.cursor/devspec/hooks/).',
     )
   }
 }

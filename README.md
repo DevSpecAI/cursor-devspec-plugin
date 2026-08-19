@@ -40,7 +40,7 @@ On first activation the extension:
 
 - registers the DevSpec **MCP server** in your Cursor config,
 - installs project rules at `.cursor/rules/devspec.mdc` in git repos and worktrees you open,
-- installs Cursor agent hooks for remote-control telemetry and the claim-before-mutation guardrail,
+- installs Cursor agent hooks for remote-control telemetry and commit-provenance assistance,
 - adds the setup and remote-control **DevSpec: …** commands to the command palette.
 
 ## Connect your token
@@ -71,7 +71,7 @@ The extension currently contributes these command-palette commands:
 | DevSpec: Set MCP token | Store the account-wide MCP token |
 | DevSpec: Register MCP server in Cursor config | Write or refresh Cursor's MCP registration |
 | DevSpec: Install rules | Install or overwrite the managed project rule |
-| DevSpec: Install agent hooks | Install remote-control telemetry and mutation-boundary hooks |
+| DevSpec: Install agent hooks | Install remote-control telemetry and commit-provenance hooks |
 | DevSpec: Manage repo folder mappings | Manage local folders used by signed handoffs |
 | DevSpec: Install protocol handler | Register signed `devspec://` handoffs |
 | DevSpec: Install handoff handler | Install the local handoff bridge |

@@ -1,6 +1,32 @@
 # Changelog
 
 
+## 0.9.0
+
+### Commit provenance replaces mutation classification
+
+Cursor no longer denies edits, tests, builds, arbitrary shell, worktrees,
+delegation, or follow-through because a conversation has no active DevSpec
+claim. The shell allowlist, repository-scoped mutation authority, and
+post-edit stop response are removed rather than retained behind exceptions.
+
+Cursor's structured `preToolUse` hook now assists only on directly readable,
+quoted `git commit -m` messages in explicitly pinned projects. A valid full
+DevSpec reference passes without a live claim; exactly one observed claim may
+be appended with `updated_input`; multiple claims are never guessed. The
+readable worktree shapes include both `cd <single-path> && git commit …` and
+`git -C <path> commit …`. Opaque/history-producing forms and pushes fail open
+to commit ingestion and analyzer recovery.
+
+`afterFileEdit` has no supported response fields, so the optional one-time edit
+reminder uses `postToolUse.additional_context` and says plainly that the edit
+already happened. Existing remote control, trail delivery, session fallback,
+permissions, and security controls are unchanged. Reload/reinstall the
+extension to replace stale user-level mutation hooks.
+
+> Maintainer note: `package.json` is protected and remains at 0.8.0 in source;
+> bump it to 0.9.0 only as part of the signed VSIX/Open VSX publish step.
+
 ## 0.8.1
 
 ### Healthy turn close no longer looks like the agent crashed

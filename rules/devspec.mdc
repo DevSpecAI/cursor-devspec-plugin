@@ -1,9 +1,9 @@
 ---
-description: DevSpec workflow — claim before mutation and follow the served contract
+description: DevSpec workflow — claim early, link commits, and follow the served contract
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:6 -->
+<!-- devspec-autopilot-rules:7 -->
 
 ## Working with DevSpec
 
@@ -13,22 +13,21 @@ This workspace is connected to the DevSpec MCP server. Cursor normally prefixes 
 
 `devspec__claim_work_item` mechanically returns the current product implementation contract, including project and personal agent rules. That served contract is authoritative for implementation, validation, commit, push, recording, and completion boundaries. Follow it rather than relying on lifecycle prose copied into plugin files. Use DevSpec memory/decision tools for the full body of recalled project conventions before relying on or contradicting them.
 
-### Mutation boundary
+### Commit provenance
 
-Before **any repository mutation**, successfully call `devspec__claim_work_item` for the action item that covers the work. Mutation includes native file edits and shell commands that can change files, git state, dependencies, generated output, or external systems. Read-only exploration may happen first.
+Search/reuse/create and claim the smallest covering item early because claims coordinate work and expose conflicts. A missing claim never blocks edits, shell execution, tests, builds, worktrees, delegation, or post-implementation follow-through. The current authority and fail-open behavior live in the served contract's `commit_provenance_contract`; do not replace it with a local mutation classifier.
 
-The Cursor hooks add a mechanical boundary where Cursor exposes one:
+Cursor's hooks provide capability-honest assistance only where the host exposes enough structure:
 
-- `beforeShellExecution` denies unknown or mutating shell commands until this conversation has successfully claimed work for this repository. Only a tiny strict read-only command allowlist passes while unclaimed. Allowed git reads must explicitly set `GIT_OPTIONAL_LOCKS=0`; diff/log/show reads must also disable external diff and text conversion.
-- `afterMCPExecution` arms that boundary only after a successful DevSpec `claim_work_item` result and clears it after a successful terminal work verb.
-- Cursor exposes only `afterFileEdit`, not a pre-edit hook. An unclaimed native edit is therefore detected **after it occurred**. The hook records the violation and tells the agent to stop and claim; it does not claim to have prevented or reverted the edit.
+- `preToolUse` may inspect a narrow, directly readable Shell `git commit -m` message. A valid full `[devspec:<uuid>]` reference passes without a live claim. Exactly one recent claim explicitly confirmed by a successful DevSpec result may be appended through Cursor's structured `updated_input`; multiple or stale claims are never guessed.
+- Readable isolated-worktree forms include `cd <single-path> && git commit …` and `git -C <path> commit …`. Aliases, further compounding, expansions, amend/history-producing forms, and every opaque command fail open.
+- `postToolUse` may add one after-the-fact, non-blocking edit reminder per conversation/project. Cursor's `afterFileEdit` event has no supported output fields, so it is telemetry only and never pretends to stop or undo an edit.
+- Pushes are never blocked because Cursor does not provide the certain outgoing commit set and safe recovery required by the contract.
 
-These hooks are guardrails, not a substitute for the contract returned by `claim_work_item`, and they do not provide full mechanical enforcement for native edits.
-
-If DevSpec MCP is unavailable, stop before mutation and tell the user. Do not invent a claim or silently proceed.
+A local plugin outage, absent/malformed pin, unavailable DevSpec service, or uncertain command always leaves local work available. Commit ingestion and the unlinked-commit analyzer provide universal recovery.
 
 ### Project and conversation identity
 
 Resolve the project from the repository remote with `devspec__list_projects`; use its exact resolved project id for project-scoped calls and never guess between ambiguous matches.
 
-When Cursor supplies a conversation id (`conversation_id` or `CURSOR_CONVERSATION_ID`), pass it as `local_session_id` where the served contract requests one. Never invent an id. Mutation-hook state is isolated by both conversation and repository so one chat or checkout cannot arm another.
+When Cursor supplies a conversation id (`conversation_id` or `CURSOR_CONVERSATION_ID`), pass it as `local_session_id` where the served contract requests one. Never invent an id. Provenance observations are conversation-scoped; local commit assistance activates only under the nearest valid `.devspec/project.json` pin and never consults `~/.devspec`.

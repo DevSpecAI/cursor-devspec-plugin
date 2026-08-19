@@ -35,19 +35,20 @@ describe('managed Cursor rule upgrade', () => {
     }
   })
 
-  it('bumps the managed marker so existing v5 installs upgrade', () => {
-    assert.equal(rulesVersion(bundled), 6)
-    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:5 -->\nold', bundled), true)
+  it('bumps the managed marker so existing v6 installs upgrade', () => {
+    assert.equal(rulesVersion(bundled), 7)
+    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:6 -->\nold', bundled), true)
     assert.equal(shouldUpgrade(bundled, bundled), false)
     assert.equal(shouldUpgrade('# user-owned rules', bundled), false)
   })
 
-  it('points to the served canonical contract and states the native-edit limit honestly', () => {
+  it('points to the served provenance contract and states Cursor limits honestly', () => {
     assert.match(bundled, /claim_work_item.*returns the current product implementation contract/i)
-    assert.match(bundled, /after it occurred/i)
-    assert.match(bundled, /does not claim to have prevented or reverted/i)
-    assert.match(bundled, /do not provide full mechanical enforcement for native edits/i)
-    assert.match(bundled, /GIT_OPTIONAL_LOCKS=0/)
-    assert.match(bundled, /disable external diff and text conversion/i)
+    assert.match(bundled, /commit_provenance_contract/)
+    assert.match(bundled, /missing claim never blocks edits/i)
+    assert.match(bundled, /after-the-fact, non-blocking edit reminder/i)
+    assert.match(bundled, /afterFileEdit.*no supported output fields/i)
+    assert.match(bundled, /Pushes are never blocked/i)
+    assert.doesNotMatch(bundled, /GIT_OPTIONAL_LOCKS=0/)
   })
 })

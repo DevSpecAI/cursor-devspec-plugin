@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "DevSpec claim-before-mutation boundary plus remote-control turn mirroring and work-trail hooks. The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
+  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
   "hooks": {
     "Stop": [
       {
@@ -24,9 +24,25 @@
         ]
       }
     ],
+    "preToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "postToolUse": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
+            "timeout": 30
+          },
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUse",
@@ -62,11 +78,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" beforeShellExecution",
-            "timeout": 30
-          },
-          {
-            "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
             "timeout": 30
           }
@@ -78,7 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" afterMCPExecution",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" afterMCPExecution",
             "timeout": 30
           },
           {
@@ -103,11 +114,6 @@
     "afterFileEdit": [
       {
         "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mutation-boundary.mjs\" afterFileEdit",
-            "timeout": 30
-          },
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterFileEdit",

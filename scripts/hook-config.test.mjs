@@ -42,20 +42,24 @@ describe('Cursor hook config merge', () => {
     assert.ok(commandsFor(once, 'Stop').includes('node /third-party/stop.mjs'))
 
     const beforeShell = commandsFor(once, 'beforeShellExecution')
-    assert.equal(beforeShell.filter((command) => command.includes('mutation-beforeShellExecution')).length, 1)
     assert.equal(beforeShell.filter((command) => / beforeShellExecution #/.test(command)).length, 1)
-    assert.equal(commandsFor(once, 'afterMCPExecution').filter((command) => command.includes('mutation-afterMCPExecution')).length, 1)
-    assert.equal(commandsFor(once, 'afterFileEdit').filter((command) => command.includes('mutation-afterFileEdit')).length, 1)
+    assert.equal(beforeShell.some((command) => command.includes('mutation-')), false)
+    assert.equal(commandsFor(once, 'preToolUse').filter((command) => command.includes('provenance-preToolUse')).length, 1)
+    assert.equal(commandsFor(once, 'postToolUse').filter((command) => command.includes('provenance-postToolUse')).length, 1)
+    assert.equal(commandsFor(once, 'afterMCPExecution').filter((command) => command.includes('provenance-afterMCPExecution')).length, 1)
+    assert.equal(commandsFor(once, 'afterFileEdit').some((command) => command.includes('provenance-')), false)
     assert.equal(JSON.stringify(once).includes('/old/run-mirror-turn.mjs'), false)
   })
 
-  it('keeps packaged mutation boundary hooks wired alongside trail hooks', () => {
+  it('keeps packaged provenance assistance wired without restoring mutation gates', () => {
     const packaged = JSON.parse(fs.readFileSync(new URL('../hooks/hooks.json', import.meta.url), 'utf8'))
     assert.equal(packaged.version, 1)
-    for (const event of ['beforeShellExecution', 'afterMCPExecution', 'afterFileEdit']) {
-      const commands = commandsFor(packaged, event)
-      assert.equal(commands.some((command) => command.includes('mutation-boundary.mjs')), true, event)
-      assert.equal(commands.some((command) => command.includes('trail-turn.mjs')), true, event)
+    for (const event of ['preToolUse', 'postToolUse', 'afterMCPExecution']) {
+      assert.equal(commandsFor(packaged, event).some((command) => command.includes('provenance-assistance.mjs')), true, event)
     }
+    for (const event of ['beforeShellExecution', 'postToolUse', 'afterMCPExecution', 'afterFileEdit']) {
+      assert.equal(commandsFor(packaged, event).some((command) => command.includes('trail-turn.mjs')), true, event)
+    }
+    assert.equal(JSON.stringify(packaged).includes('mutation-boundary.mjs'), false)
   })
 })

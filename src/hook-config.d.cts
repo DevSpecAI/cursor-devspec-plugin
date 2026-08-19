@@ -23,6 +23,6 @@ export function mergeCursorHookConfig(
   stableLauncher: string,
 ): CursorHookConfig
 
-export const BOUNDARY_EVENTS: readonly string[]
+export const PROVENANCE_EVENTS: readonly string[]
 export const MARKER: string
 export const TRAIL_EVENTS: readonly string[]

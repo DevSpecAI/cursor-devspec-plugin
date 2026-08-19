@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 
 const EXT_PREFIX = 'devspecai.devspec-autopilot-'
 
-const BOUNDARY_MODE_PREFIX = 'mutation-'
+const PROVENANCE_MODE_PREFIX = 'provenance-'
 
 const TRAIL_MODES = new Set([
   'seed',
@@ -102,19 +102,24 @@ export function stableMirrorTurnPath(home = os.homedir()) {
 
 export function resolveHookInvocation(modeValue) {
   const modeArg = String(modeValue || 'stop')
-  const boundaryMode = modeArg.startsWith(BOUNDARY_MODE_PREFIX)
-    ? modeArg.slice(BOUNDARY_MODE_PREFIX.length)
+  const provenanceMode = modeArg.startsWith(PROVENANCE_MODE_PREFIX)
+    ? modeArg.slice(PROVENANCE_MODE_PREFIX.length)
     : null
-  const isBoundary = Boolean(boundaryMode && ['beforeShellExecution', 'afterMCPExecution', 'afterFileEdit'].includes(boundaryMode))
+  const isProvenance = Boolean(provenanceMode && ['preToolUse', 'postToolUse', 'afterMCPExecution'].includes(provenanceMode))
   const isTrail = TRAIL_MODES.has(modeArg)
   return {
-    mode: isBoundary ? boundaryMode : isTrail ? modeArg : modeArg === 'user_prompt' ? 'user_prompt' : 'stop',
-    scriptName: isBoundary
-      ? 'mutation-boundary.mjs'
+    mode: isProvenance ? provenanceMode : isTrail ? modeArg : modeArg === 'user_prompt' ? 'user_prompt' : 'stop',
+    scriptName: isProvenance
+      ? 'provenance-assistance.mjs'
       : isTrail
         ? 'trail-turn.mjs'
         : 'mirror-turn.mjs',
   }
+}
+
+export function hookChildExitCode(scriptName, result) {
+  if (scriptName === 'provenance-assistance.mjs') return 0
+  return typeof result?.status === 'number' ? result.status : 1
 }
 
 function main() {
@@ -126,12 +131,22 @@ function main() {
     )
     process.exit(0)
   }
+  const isProvenance = scriptName === 'provenance-assistance.mjs'
   const result = spawnSync(process.execPath, [target, mode], {
-    stdio: 'inherit',
+    stdio: isProvenance ? ['inherit', 'pipe', 'pipe'] : 'inherit',
+    encoding: isProvenance ? 'utf8' : undefined,
     windowsHide: true,
     env: process.env,
   })
-  process.exit(typeof result.status === 'number' ? result.status : 1)
+  if (isProvenance) {
+    if (result.stderr) process.stderr.write(result.stderr)
+    if (!result.error && result.status === 0) {
+      if (result.stdout) process.stdout.write(result.stdout)
+    } else {
+      process.stderr.write(`[devspec-provenance] launcher failed open: ${result.error?.message || `child exited ${result.status ?? 'without status'}`}\n`)
+    }
+  }
+  process.exit(hookChildExitCode(scriptName, result))
 }
 
 const isMain =

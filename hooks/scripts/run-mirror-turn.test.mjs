@@ -2,9 +2,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import {
   compareSemverTuples,
+  hookChildExitCode,
   parseExtensionVersion,
   resolveInstalledHookScript,
   resolveInstalledMirrorTurn,
@@ -73,15 +76,51 @@ describe('stableMirrorTurnPath', () => {
 })
 
 describe('resolveHookInvocation', () => {
-  it('routes installed mutation hooks to the boundary script and keeps trail routing separate', () => {
-    assert.deepEqual(resolveHookInvocation('mutation-beforeShellExecution'), {
-      mode: 'beforeShellExecution',
-      scriptName: 'mutation-boundary.mjs',
+  it('routes installed provenance hooks separately from trail hooks', () => {
+    assert.deepEqual(resolveHookInvocation('provenance-preToolUse'), {
+      mode: 'preToolUse',
+      scriptName: 'provenance-assistance.mjs',
+    })
+    assert.deepEqual(resolveHookInvocation('provenance-afterMCPExecution'), {
+      mode: 'afterMCPExecution',
+      scriptName: 'provenance-assistance.mjs',
     })
     assert.deepEqual(resolveHookInvocation('afterMCPExecution'), {
       mode: 'afterMCPExecution',
       scriptName: 'trail-turn.mjs',
     })
+  })
+})
+
+describe('hookChildExitCode', () => {
+  it('fails provenance launch errors open without changing trail/remote behavior', () => {
+    assert.equal(hookChildExitCode('provenance-assistance.mjs', { status: 1 }), 0)
+    assert.equal(hookChildExitCode('provenance-assistance.mjs', { status: null, error: new Error('spawn') }), 0)
+    assert.equal(hookChildExitCode('trail-turn.mjs', { status: 1 }), 1)
+    assert.equal(hookChildExitCode('mirror-turn.mjs', { status: null }), 1)
+  })
+})
+
+describe('stable provenance launcher output', () => {
+  it('forwards a decision only when the provenance child exits successfully', () => {
+    const script = fileURLToPath(new URL('./run-mirror-turn.mjs', import.meta.url))
+    for (const { exitCode, expected } of [{ exitCode: 0, expected: '{"permission":"allow"}\n' }, { exitCode: 1, expected: '' }]) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-provenance-launch-'))
+      try {
+        const childDir = path.join(home, '.cursor', 'extensions', 'devspecai.devspec-autopilot-9.9.9', 'hooks', 'scripts')
+        fs.mkdirSync(childDir, { recursive: true })
+        fs.writeFileSync(path.join(childDir, 'provenance-assistance.mjs'),
+          `process.stdout.write('{"permission":"allow"}\\n'); process.exit(${exitCode})\n`)
+        const result = spawnSync(process.execPath, [script, 'provenance-preToolUse'], {
+          encoding: 'utf8', env: { ...process.env, HOME: home }, input: '{}',
+        })
+        assert.equal(result.status, 0)
+        assert.equal(result.stdout, expected)
+        if (exitCode) assert.match(result.stderr, /failed open/i)
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true })
+      }
+    }
   })
 })
 

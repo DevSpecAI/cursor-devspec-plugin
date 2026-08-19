@@ -11,16 +11,16 @@ const TRAIL_EVENTS = [
   'afterAgentThought',
 ]
 
-const BOUNDARY_EVENTS = [
-  'beforeShellExecution',
+const PROVENANCE_EVENTS = [
+  'preToolUse',
+  'postToolUse',
   'afterMCPExecution',
-  'afterFileEdit',
 ]
 
 function isOurs(command) {
   if (typeof command !== 'string') return false
   if (command.includes(MARKER)) return true
-  const knownScript = /(?:run-mirror-turn|mirror-turn|trail-turn|mutation-boundary)\.mjs/i.test(command)
+  const knownScript = /(?:run-mirror-turn|mirror-turn|trail-turn|mutation-boundary|provenance-assistance)\.mjs/i.test(command)
   const devspecPath = /devspecai\.devspec-autopilot|[\\/]\.cursor[\\/]devspec[\\/]hooks|\$\{CLAUDE_PLUGIN_ROOT\}/i.test(command)
   return knownScript && devspecPath
 }
@@ -58,6 +58,7 @@ function mergeCursorHookConfig(input, stableLauncher) {
     'stop',
     'Stop',
     ...TRAIL_EVENTS,
+    ...PROVENANCE_EVENTS,
   ]) {
     hooks[event] = stripOursFromGroups(hooks[event])
   }
@@ -79,19 +80,17 @@ function mergeCursorHookConfig(input, stableLauncher) {
   pushClaude('UserPromptSubmit', command('user_prompt'))
   pushClaude('Stop', command('stop'))
 
-  for (const event of TRAIL_EVENTS) {
-    if (BOUNDARY_EVENTS.includes(event)) {
-      pushCursor(event, command(`mutation-${event}`))
-    }
-    pushCursor(event, command(event))
+  for (const event of PROVENANCE_EVENTS) {
+    pushCursor(event, command(`provenance-${event}`))
   }
+  for (const event of TRAIL_EVENTS) pushCursor(event, command(event))
 
   file.hooks = hooks
   return file
 }
 
 module.exports = {
-  BOUNDARY_EVENTS,
+  PROVENANCE_EVENTS,
   MARKER,
   TRAIL_EVENTS,
   mergeCursorHookConfig,
