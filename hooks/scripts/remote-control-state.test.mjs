@@ -17,6 +17,7 @@ import {
   isWin32OwnerHostName,
   isWin32ShellName,
   isWin32CursorAgentNodeCommand,
+  isWin32CursorAgentResumeCommand,
   isWin32CursorAgentWorkerServerCommand,
   isWin32CursorAgentDurableNodeCommand,
   isWin32DurableOwnerProcess,
@@ -578,6 +579,25 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
     assert.equal(isWin32CursorAgentNodeCommand(launcher), false)
   })
 
+  it('keeps --resume durable when Agents Connect prompt names the wait script (item 36de7cb4)', () => {
+    const resumeWithWaitPrompt =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" --resume abc ' +
+      '--force --approve-mcps "Arm wait FIRST ... node C:\\\\ProgramData\\\\DevSpec\\\\cursor-plugin\\\\hooks\\\\scripts\\\\devspec-remote-wait.mjs --connection-id uuid --from-end"'
+    assert.equal(isWin32CursorAgentResumeCommand(resumeWithWaitPrompt), true)
+    assert.equal(isWin32CursorAgentNodeCommand(resumeWithWaitPrompt), true)
+    assert.equal(isWin32CursorAgentDurableNodeCommand(resumeWithWaitPrompt), true)
+    assert.equal(isWin32DurableOwnerProcess('node.exe', resumeWithWaitPrompt), true)
+    assert.equal(isWin32CliSpawnOwnerProcess('node.exe', resumeWithWaitPrompt), true)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', resumeWithWaitPrompt), false)
+
+    const waitScriptItself =
+      'C:\\nvm4w\\nodejs\\node.exe C:\\ProgramData\\DevSpec\\cursor-plugin\\hooks\\scripts\\devspec-remote-wait.mjs --connection-id uuid --from-end'
+    assert.equal(isWin32CursorAgentResumeCommand(waitScriptItself), false)
+    assert.equal(isWin32CursorAgentNodeCommand(waitScriptItself), false)
+    assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', waitScriptItself), true)
+  })
+
   it('rejects cursor-agent worker-server as a durable owner (item 5c884554)', () => {
     const resumeCmd =
       '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
@@ -743,7 +763,7 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -match '(?i)\\b--resume\\b' -and $_.CommandLine -notmatch '(?i)\\bworker-server\\b' -and $_.CommandLine -notmatch 'remote-control-state|launch-cli-session' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
+            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -match '(?i)--resume(\\s|$)' -and $_.CommandLine -notmatch '(?i)\\bworker-server\\b' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
           ],
           { encoding: 'utf8', timeout: 8000, windowsHide: true },
         ).trim()
@@ -828,6 +848,24 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
           return null
         },
         childrenOf: (pid) => (pid === 100 ? [201, 200] : []),
+      }),
+      200,
+    )
+  })
+
+  it('pins --resume even when prompt argv names the wait script (item 36de7cb4)', () => {
+    const resumeWithWait =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume abc ' +
+      '--approve-mcps "node C:\\\\x\\\\devspec-remote-wait.mjs --from-end"'
+    assert.equal(
+      walkChildTreeForDurableOwner(100, {
+        processInfoOf: (pid) => {
+          if (pid === 100) return { name: 'powershell.exe', commandLine: '' }
+          if (pid === 200) return { name: 'node.exe', commandLine: resumeWithWait }
+          return null
+        },
+        childrenOf: (pid) => (pid === 100 ? [200] : []),
       }),
       200,
     )

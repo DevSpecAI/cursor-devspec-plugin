@@ -716,4 +716,21 @@ describe('resolveOwnerPid (item 5c884554 — wait copy skips worker-server)', ()
       22808,
     )
   })
+
+  it('keeps --resume when Agents Connect prompt names the wait script (item 36de7cb4)', () => {
+    const resumeWithWaitPrompt =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\node.exe" ' +
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume abc ' +
+      '--approve-mcps "node C:\\\\x\\\\devspec-remote-wait.mjs --from-end"'
+    assert.equal(
+      resolveOwnerPid(22808, 999, {
+        processNameOf: () => 'node.exe',
+        processCommandLineOf: () => resumeWithWaitPrompt,
+        resolveAuto: () => {
+          throw new Error('auto should not run')
+        },
+      }),
+      22808,
+    )
+  })
 })

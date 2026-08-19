@@ -3,6 +3,15 @@
 
 ## 0.8.0
 
+### Cursor CLI Connect stays Live when the wait script is named in the prompt
+
+Agents Connect puts `devspec-remote-wait` in the `--approve-mcps` prompt of the
+durable `cursor-agent --resume` process. The Windows owner-pid walk treated any
+command line containing that name as a throwaway helper, so the keep-alive
+poller never started and DevSpec idle-timeout-disconnected the agent. `--resume`
+hosts are durable even when later argv mentions plugin scripts; plugin scripts
+and `worker-server` stay rejected.
+
 ### Nine skills removed — remote and remote-stop remain
 
 `devspec.work`, `.create`, `.commit`, `.link`, `.help`, `.done`, `.brainstorm`,

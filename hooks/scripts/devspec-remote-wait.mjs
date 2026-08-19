@@ -228,11 +228,20 @@ const WIN32_NODE_EPHEMERAL_CMD_RE =
 const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
 const WIN32_CURSOR_AGENT_WORKER_SERVER_RE = /\bworker-server\b/i
 
+function isWin32CursorAgentResumeCommand(commandLine) {
+  // `\b--resume\b` never matches: `-` is not a word character. Match argv separators
+  // instead, then treat `--resume` as durable even if later argv names plugin scripts
+  // (Running Wombat / item 36de7cb4). Keep in sync with remote-control-state.mjs.
+  return /(?:^|[\s"'])--resume(?:\s|$|"|')/i.test(String(commandLine || ''))
+}
+
 function isWin32CursorAgentNodeCommand(commandLine) {
   const cmd = String(commandLine || '')
   if (!cmd) return false
+  if (!WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)) return false
+  if (isWin32CursorAgentResumeCommand(cmd)) return true
   if (WIN32_NODE_EPHEMERAL_CMD_RE.test(cmd)) return false
-  return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
+  return true
 }
 
 function isWin32CursorAgentDurableNodeCommand(commandLine) {
@@ -288,7 +297,7 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
     '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
     '  if ($name -eq "node.exe") {',
     '    $cmd = [string]$proc.CommandLine',
-    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '    if ($cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and (($cmd -match "(?i)--resume(\\s|$)") -or ($cmd -notmatch $ephemeralNode))) { Write-Output $proc.ProcessId; break }',
     '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',

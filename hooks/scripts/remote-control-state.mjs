@@ -247,14 +247,30 @@ export function isWin32ShellName(name) {
 }
 
 /**
+ * Durable Cursor CLI session host: `index.js --resume`, not `worker-server`.
+ */
+export function isWin32CursorAgentResumeCommand(commandLine) {
+  // `\b--resume\b` never matches: `-` is not a word character, so there is no
+  // boundary before the flag. Match argv separators instead (item 36de7cb4).
+  return /(?:^|[\s"'])--resume(?:\s|$|"|')/i.test(String(commandLine || ''))
+}
+
+/**
  * True when CommandLine proves this node.exe is the Cursor CLI agent host
  * (AppData\\Local\\cursor-agent\\…\\index.js), not an ephemeral plugin script.
+ *
+ * Agents Connect puts wait-script paths in later argv (`--approve-mcps` prompt).
+ * Those strings must not classify a live `--resume` host as a throwaway helper
+ * (Running Wombat, item 36de7cb4). Ephemeral rejection still applies when the
+ * process is not a `--resume` host.
  */
 export function isWin32CursorAgentNodeCommand(commandLine) {
   const cmd = String(commandLine || '')
   if (!cmd) return false
+  if (!WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)) return false
+  if (isWin32CursorAgentResumeCommand(cmd)) return true
   if (WIN32_NODE_EPHEMERAL_CMD_RE.test(cmd)) return false
-  return WIN32_CURSOR_AGENT_NODE_CMD_RE.test(cmd)
+  return true
 }
 
 export function isWin32CursorAgentWorkerServerCommand(commandLine) {
@@ -359,7 +375,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     '      $name = $proc.Name.ToLowerInvariant()',
     '      $cmd = [string]$proc.CommandLine',
     '      if ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe") { Write-Output $proc.ProcessId; exit 0 }',
-    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; exit 0 }',
+    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and (($cmd -match "(?i)--resume(\\s|$)") -or ($cmd -notmatch $ephemeralNode))) { Write-Output $proc.ProcessId; exit 0 }',
     '    }',
     '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
     '  }',
@@ -568,7 +584,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
     '  if ($ownerHosts -contains $name) { Write-Output $proc.ProcessId; break }',
     '  if ($name -eq "node.exe") {',
     '    $cmd = [string]$proc.CommandLine',
-    '    if ($cmd -and ($cmd -notmatch $ephemeralNode) -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)")) { Write-Output $proc.ProcessId; break }',
+    '    if ($cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and (($cmd -match "(?i)--resume(\\s|$)") -or ($cmd -notmatch $ephemeralNode))) { Write-Output $proc.ProcessId; break }',
     '  }',
     '  if (-not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }',
     '  $p = $proc.ParentProcessId',
