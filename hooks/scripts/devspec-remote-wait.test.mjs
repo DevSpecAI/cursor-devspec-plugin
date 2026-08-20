@@ -28,6 +28,8 @@ import {
   armEndsTurn,
   clearTurnMarker,
   notifyWorkingEnded,
+  createInboxCursorEvidence,
+  inboxCursorEvidenceMatches,
   offsetAfterAdvisoryHistory,
   resolveFromEndOffset,
   resolveWatchOffset,
@@ -629,11 +631,11 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
   })
 
-  it('incomplete trailing owner_messages line (no newline) is not a wake', () => {
+  it('incomplete trailing owner_messages line is left before the offset until it completes', () => {
     const prefix = advisory()
     const incomplete = '{"type":"owner_messages","messages":[{"id":"x"}]}'
     const text = prefix + incomplete
-    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
+    assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(prefix, 'utf8'))
   })
 
   it('first arm keeps an explicit playbook dispatch queued before wait starts', () => {
@@ -668,7 +670,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     }
   })
 
-  it('--from-end never rewinds before a consumed canonical offset and keeps the unread turn after it', () => {
+  it('unchanged same-file evidence preserves the consumed offset and unread canonical turn', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-canonical-offset-'))
     const file = path.join(dir, 'inbox.jsonl')
     try {
@@ -677,8 +679,11 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       const unread = `${JSON.stringify(canonicalBatch(unreadMessage))}\n`
       fs.writeFileSync(file, consumed + unread)
       const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const evidence = createInboxCursorEvidence(file, savedOffset)
+      assert.equal(inboxCursorEvidenceMatches(file, savedOffset, evidence), true)
       const offset = resolveWatchOffset({
-        pending: false, fromEnd: true, inboxByteOffset: savedOffset, file,
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence, file,
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
@@ -707,14 +712,64 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       const unread = lineFor(unreadDispatch)
       fs.writeFileSync(file, consumed + unread)
       const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const evidence = createInboxCursorEvidence(file, savedOffset)
+      assert.equal(inboxCursorEvidenceMatches(file, savedOffset, evidence), true)
       const offset = resolveWatchOffset({
-        pending: false, fromEnd: true, inboxByteOffset: savedOffset, file,
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence, file,
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
         canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].run_id, unreadDispatch.run_id)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rename replacement with a larger file rejects stale identity and rescans safely', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-inbox-rename-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      const consumed = `${JSON.stringify(canonicalBatch())}\n`
+      fs.writeFileSync(file, consumed)
+      const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const evidence = createInboxCursorEvidence(file, savedOffset)
+      fs.renameSync(file, `${file}.rotated`)
+      let prefix = ''
+      while (Buffer.byteLength(prefix, 'utf8') <= savedOffset) prefix += advisory({ content: 'replacement padding' })
+      fs.writeFileSync(file, prefix + `${JSON.stringify(canonicalBatch())}\n`)
+      assert.ok(fs.statSync(file).size > savedOffset)
+      assert.equal(inboxCursorEvidenceMatches(file, savedOffset, evidence), false)
+      assert.equal(resolveWatchOffset({
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence, file,
+      }), Buffer.byteLength(prefix, 'utf8'))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('same-inode truncate/regrow with a changed prefix rejects the stale boundary hash', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-inbox-regrow-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      const consumed = `${JSON.stringify(canonicalBatch())}\n`
+      fs.writeFileSync(file, consumed)
+      const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const evidence = createInboxCursorEvidence(file, savedOffset)
+      const originalIno = fs.statSync(file).ino
+      let prefix = ''
+      while (Buffer.byteLength(prefix, 'utf8') <= savedOffset) prefix += advisory({ content: 'regrown padding' })
+      fs.writeFileSync(file, prefix + `${JSON.stringify(canonicalBatch())}\n`)
+      assert.equal(fs.statSync(file).ino, originalIno)
+      assert.ok(fs.statSync(file).size > savedOffset)
+      assert.equal(inboxCursorEvidenceMatches(file, savedOffset, evidence), false)
+      assert.equal(resolveWatchOffset({
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence, file,
+      }), Buffer.byteLength(prefix, 'utf8'))
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -737,29 +792,28 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     }
   })
 
-  it('--pending keeps the saved inbox_byte_offset even when unread owner_messages exist', () => {
+  it('--pending keeps a generation-bound saved offset when unread owner_messages exist', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pending-offset-'))
     const file = path.join(dir, 'inbox.jsonl')
     try {
-      fs.writeFileSync(file, advisory() + owner())
-      assert.equal(
-        resolveWatchOffset({
-          pending: true,
-          fromEnd: true,
-          inboxByteOffset: 42,
-          file,
-        }),
-        42,
-      )
-      assert.equal(
-        resolveWatchOffset({
-          pending: true,
-          fromEnd: false,
-          inboxByteOffset: 99,
-          file,
-        }),
-        99,
-      )
+      const consumed = advisory()
+      fs.writeFileSync(file, consumed + owner())
+      const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const evidence = createInboxCursorEvidence(file, savedOffset)
+      assert.equal(resolveWatchOffset({
+        pending: true,
+        fromEnd: true,
+        inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence,
+        file,
+      }), savedOffset)
+      assert.equal(resolveWatchOffset({
+        pending: true,
+        fromEnd: false,
+        inboxByteOffset: savedOffset,
+        inboxCursorEvidence: evidence,
+        file,
+      }), savedOffset)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -881,6 +935,10 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
           `unexpected exit ${code}\nstderr=${stderr}\nstdout=${stdout}`,
         )
       }
+      const persisted = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(persisted.inbox_byte_offset, Buffer.byteLength(line, 'utf8'))
+      assert.equal(persisted.inbox_cursor_evidence.offset, persisted.inbox_byte_offset)
+      assert.equal(inboxCursorEvidenceMatches(inbox, persisted.inbox_byte_offset, persisted.inbox_cursor_evidence), true)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

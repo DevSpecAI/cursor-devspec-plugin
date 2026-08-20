@@ -42,6 +42,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
@@ -431,6 +432,21 @@ function writeStatePatch(connectionId, patch) {
   }
 }
 
+function persistInboxCursor(connectionId, file, offset, readEvidence = null) {
+  const evidence = readEvidence
+    ? refreshInboxCursorEvidence(file, offset, readEvidence)
+    : createInboxCursorEvidence(file, offset)
+  if (!evidence) {
+    process.stderr.write('devspec-remote-wait: inbox cursor evidence failed; offset not persisted\n')
+    return null
+  }
+  writeStatePatch(connectionId, {
+    inbox_byte_offset: offset,
+    inbox_cursor_evidence: evidence,
+  })
+  return evidence
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
@@ -447,6 +463,89 @@ function fileSize(p) {
   } catch {
     return 0
   }
+}
+
+function identityFromStat(stat) {
+  return {
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    birthtime_ns: String(stat.birthtimeNs ?? BigInt(Math.trunc(Number(stat.birthtimeMs) * 1_000_000))),
+  }
+}
+
+function createInboxCursorEvidenceFromFd(fd, offset) {
+  if (!Number.isSafeInteger(offset) || offset < 0) return null
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true })
+    if (BigInt(offset) > stat.size) return null
+    const hash = createHash('sha256')
+    const chunk = Buffer.allocUnsafe(64 * 1024)
+    let position = 0
+    let boundaryByte = null
+    while (position < offset) {
+      const wanted = Math.min(chunk.length, offset - position)
+      const read = fs.readSync(fd, chunk, 0, wanted, position)
+      if (read <= 0) return null
+      hash.update(chunk.subarray(0, read))
+      boundaryByte = chunk[read - 1]
+      position += read
+    }
+    if (offset > 0 && boundaryByte !== 0x0a) return null
+    const after = fs.fstatSync(fd, { bigint: true })
+    if (after.dev !== stat.dev || after.ino !== stat.ino || after.birthtimeNs !== stat.birthtimeNs || after.size < BigInt(offset)) {
+      return null
+    }
+    return {
+      version: 1,
+      offset,
+      file_identity: identityFromStat(stat),
+      observed_size: String(stat.size),
+      observed_mtime_ns: String(stat.mtimeNs),
+      prefix_sha256: hash.digest('hex'),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Bind an offset to this exact file generation and every byte through its record boundary. */
+export function createInboxCursorEvidence(file, offset) {
+  let fd = null
+  try {
+    fd = fs.openSync(file, 'r')
+    return createInboxCursorEvidenceFromFd(fd, offset)
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+export function refreshInboxCursorEvidence(file, offset, evidence) {
+  if (!evidence || evidence.version !== 1 || evidence.offset !== offset ||
+      typeof evidence.prefix_sha256 !== 'string' || !evidence.file_identity) return null
+  try {
+    const stat = fs.statSync(file, { bigint: true })
+    if (stat.size < BigInt(offset) || !isDeepStrictEqual(identityFromStat(stat), evidence.file_identity)) {
+      return null
+    }
+    if (String(stat.size) === evidence.observed_size && String(stat.mtimeNs) === evidence.observed_mtime_ns) {
+      return evidence
+    }
+  } catch {
+    return null
+  }
+  const current = createInboxCursorEvidence(file, offset)
+  return current && current.prefix_sha256 === evidence.prefix_sha256 &&
+    isDeepStrictEqual(current.file_identity, evidence.file_identity)
+    ? current
+    : null
+}
+
+export function inboxCursorEvidenceMatches(file, offset, evidence) {
+  return Boolean(refreshInboxCursorEvidence(file, offset, evidence))
 }
 
 /**
@@ -485,7 +584,18 @@ export function offsetAfterAdvisoryHistory(text) {
     }
     searchFrom = nl + 1
   }
-  return Buffer.byteLength(src, 'utf8')
+  const lastNl = src.lastIndexOf('\n')
+  return lastNl === -1 ? 0 : Buffer.byteLength(src.slice(0, lastNl + 1), 'utf8')
+}
+
+export function resolveCompleteFileOffset(file) {
+  try {
+    const text = fs.readFileSync(file, 'utf8')
+    const lastNl = text.lastIndexOf('\n')
+    return lastNl === -1 ? 0 : Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8')
+  } catch {
+    return 0
+  }
 }
 
 /** @param {string} file */
@@ -500,19 +610,30 @@ export function resolveFromEndOffset(file) {
 /**
  * Inbox watch start. A valid saved offset is a durable consumed boundary and may
  * never be rewound by `--from-end`. First-arm scanning can only move forward from it.
- * @param {{ pending?: boolean, fromEnd?: boolean, inboxByteOffset?: number, file: string }} opts
+ * @param {{ pending?: boolean, fromEnd?: boolean, inboxByteOffset?: number, inboxCursorEvidence?: object|null, file: string }} opts
  */
-export function resolveWatchOffset({ pending, fromEnd, inboxByteOffset, file }) {
+export function resolveWatchOffset({
+  pending,
+  fromEnd,
+  inboxByteOffset,
+  inboxCursorEvidence = null,
+  file,
+}) {
   const size = fileSize(file)
-  const hasValidSavedOffset = Number.isSafeInteger(inboxByteOffset) &&
+  const hasSavedOffsetCandidate = Number.isSafeInteger(inboxByteOffset) &&
     inboxByteOffset >= 0 && inboxByteOffset <= size
+  const hasValidSavedOffset = hasSavedOffsetCandidate &&
+    inboxCursorEvidenceMatches(file, inboxByteOffset, inboxCursorEvidence)
   if (pending === true && hasValidSavedOffset) return inboxByteOffset
   if (fromEnd === true) {
     const firstUnreadWake = resolveFromEndOffset(file)
     return hasValidSavedOffset ? Math.max(inboxByteOffset, firstUnreadWake) : firstUnreadWake
   }
   if (hasValidSavedOffset) return inboxByteOffset
-  return size
+  // A stale/legacy saved offset is evidence that this is a resume, but it is not a
+  // safe boundary in this file generation. Re-scan rather than dropping unread work.
+  if (Number.isSafeInteger(inboxByteOffset)) return resolveFromEndOffset(file)
+  return resolveCompleteFileOffset(file)
 }
 
 /**
@@ -550,29 +671,64 @@ export function consumeInboxSlice(
   offset,
   { canonicalOnly = false, includePlaybooks = false, oneCommandTurn = false } = {},
 ) {
-  const { lines, newOffset: allOffset } = readNewLines(file, offset)
-  if (!oneCommandTurn || lines.length === 0) {
+  if (!oneCommandTurn) {
+    const { lines, newOffset } = readNewLines(file, offset)
     return {
       lines,
-      newOffset: allOffset,
+      newOffset,
       batches: lines.length > 0
         ? parseWakeBatches(lines, { canonicalOnly, includePlaybooks })
         : [],
+      evidence: createInboxCursorEvidence(file, newOffset),
     }
   }
-  const consumed = []
-  let bytes = 0
-  let batches = []
-  for (const line of lines) {
-    consumed.push(line)
-    bytes += Buffer.byteLength(line + '\n', 'utf8')
-    const found = parseWakeBatches([line], { canonicalOnly, includePlaybooks })
-    if (found.length > 0) {
-      batches = found
-      break
+
+  let fd = null
+  try {
+    fd = fs.openSync(file, 'r')
+    const stat = fs.fstatSync(fd, { bigint: true })
+    if (BigInt(offset) > stat.size) return { lines: [], newOffset: offset, batches: [], evidence: null }
+    const len = Number(stat.size - BigInt(offset))
+    if (len === 0) {
+      return { lines: [], newOffset: offset, batches: [], evidence: createInboxCursorEvidenceFromFd(fd, offset) }
+    }
+    const buf = Buffer.alloc(len)
+    fs.readSync(fd, buf, 0, len, offset)
+    const text = buf.toString('utf8')
+    const lastNl = text.lastIndexOf('\n')
+    if (lastNl === -1) {
+      return { lines: [], newOffset: offset, batches: [], evidence: createInboxCursorEvidenceFromFd(fd, offset) }
+    }
+    const completeText = text.slice(0, lastNl + 1)
+    const segments = completeText.match(/[^\n]*\n/g) ?? []
+    const lines = []
+    let consumedBytes = 0
+    let batches = []
+    for (const segment of segments) {
+      consumedBytes += Buffer.byteLength(segment, 'utf8')
+      const line = segment.slice(0, -1)
+      if (!line.trim()) continue
+      lines.push(line)
+      const found = parseWakeBatches([line], { canonicalOnly, includePlaybooks })
+      if (found.length > 0) {
+        batches = found
+        break
+      }
+    }
+    const newOffset = offset + consumedBytes
+    return {
+      lines,
+      newOffset,
+      batches,
+      evidence: createInboxCursorEvidenceFromFd(fd, newOffset),
+    }
+  } catch {
+    return { lines: [], newOffset: offset, batches: [], evidence: null }
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
     }
   }
-  return { lines: consumed, newOffset: offset + bytes, batches }
 }
 
 /**
@@ -878,11 +1034,10 @@ async function main() {
     pending: args.pending,
     fromEnd: args.fromEnd,
     inboxByteOffset: state?.inbox_byte_offset,
+    inboxCursorEvidence: state?.inbox_cursor_evidence,
     file,
   })
-  if (args.fromEnd && !args.pending) {
-    writeStatePatch(connectionId, { inbox_byte_offset: offset })
-  }
+  let offsetEvidence = persistInboxCursor(connectionId, file, offset)
 
   // First arm (--from-end) or reply-complete re-arm (--pending --after-reply)
   // ends Working; plain --pending keeps the turn marker (see armEndsTurn).
@@ -939,7 +1094,29 @@ async function main() {
       process.exit(1)
     }
 
-    const { lines, newOffset, batches } = consumeInboxSlice(file, offset, {
+    // Rotation or truncate/regrow may happen while this one-shot wait is armed.
+    // Rebind before reading so a stale byte count never starts inside a new record.
+    const refreshedEvidence = offsetEvidence
+      ? refreshInboxCursorEvidence(file, offset, offsetEvidence)
+      : null
+    if (refreshedEvidence) {
+      offsetEvidence = refreshedEvidence
+    } else {
+      offset = resolveWatchOffset({
+        pending: args.pending,
+        fromEnd: args.fromEnd,
+        inboxByteOffset: offset,
+        inboxCursorEvidence: offsetEvidence,
+        file,
+      })
+      offsetEvidence = persistInboxCursor(connectionId, file, offset)
+      if (!offsetEvidence) {
+        await sleep(pollMs)
+        continue
+      }
+    }
+
+    const { lines, newOffset, batches, evidence: readEvidence } = consumeInboxSlice(file, offset, {
       canonicalOnly: true,
       includePlaybooks: true,
       oneCommandTurn: true,
@@ -959,14 +1136,14 @@ async function main() {
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
         offset = newOffset
-        writeStatePatch(connectionId, { inbox_byte_offset: offset })
+        offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         process.stderr.write(
           `devspec-remote-wait: wake (${batch.messages.length} msg) — exit 0\n`,
         )
         return
       }
       offset = newOffset
-      writeStatePatch(connectionId, { inbox_byte_offset: offset })
+      offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
     }
 
     await sleep(pollMs)
