@@ -117,6 +117,7 @@ describe('canonical one-command-turn wake', () => {
     assert.equal(context.locally_omitted, 3)
     for (const bucket of Object.keys(typed)) assert.match(context.typed[bucket][0].actor_label, /:/)
     assert.equal(events.at(-1).turn_id, '77777777-7777-4777-8777-777777777777')
+    assert.equal(events.at(-1).envelope_id, FIXTURE_ID.envelope)
   })
 
   it('revalidates the full canonical envelope and exact message binding before execution', () => {
@@ -662,6 +663,75 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       assert.equal(resolveFromEndOffset(file), Buffer.byteLength(prefix, 'utf8'))
       fs.writeFileSync(file, prefix)
       assert.equal(resolveFromEndOffset(file), Buffer.byteLength(prefix, 'utf8'))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('--from-end never rewinds before a consumed canonical offset and keeps the unread turn after it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-canonical-offset-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      const consumed = `${JSON.stringify(canonicalBatch())}\n`
+      const unreadMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
+      const unread = `${JSON.stringify(canonicalBatch(unreadMessage))}\n`
+      fs.writeFileSync(file, consumed + unread)
+      const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const offset = resolveWatchOffset({
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset, file,
+      })
+      assert.equal(offset, savedOffset)
+      const slice = consumeInboxSlice(file, offset, {
+        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+      })
+      assert.equal(slice.batches[0].messages[0].message_id, unreadMessage.message_id)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('--from-end never rewinds before a consumed playbook offset and keeps the unread run after it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-playbook-offset-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    const lineFor = (dispatch) => `${JSON.stringify({
+      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION,
+      messages: [dispatch], acceptance_key: playbookAcceptanceKey(dispatch),
+    })}\n`
+    try {
+      const consumedDispatch = fixturePlaybookDispatch()
+      const unreadDispatch = fixturePlaybookDispatch({
+        id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      })
+      const consumed = lineFor(consumedDispatch)
+      const unread = lineFor(unreadDispatch)
+      fs.writeFileSync(file, consumed + unread)
+      const savedOffset = Buffer.byteLength(consumed, 'utf8')
+      const offset = resolveWatchOffset({
+        pending: false, fromEnd: true, inboxByteOffset: savedOffset, file,
+      })
+      assert.equal(offset, savedOffset)
+      const slice = consumeInboxSlice(file, offset, {
+        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+      })
+      assert.equal(slice.batches[0].messages[0].run_id, unreadDispatch.run_id)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('--from-end ignores an out-of-range saved offset and scans for the first unread wake', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-invalid-offset-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      const prefix = advisory()
+      fs.writeFileSync(file, prefix + `${JSON.stringify(canonicalBatch())}\n`)
+      assert.equal(resolveWatchOffset({
+        pending: false,
+        fromEnd: true,
+        inboxByteOffset: fs.statSync(file).size + 1,
+        file,
+      }), Buffer.byteLength(prefix, 'utf8'))
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

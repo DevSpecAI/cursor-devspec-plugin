@@ -498,21 +498,21 @@ export function resolveFromEndOffset(file) {
 }
 
 /**
- * Inbox watch start. `--pending` always wins (saved offset, including mid-turn
- * mail). `--from-end` skips advisory history but keeps unread owner_messages.
+ * Inbox watch start. A valid saved offset is a durable consumed boundary and may
+ * never be rewound by `--from-end`. First-arm scanning can only move forward from it.
  * @param {{ pending?: boolean, fromEnd?: boolean, inboxByteOffset?: number, file: string }} opts
  */
 export function resolveWatchOffset({ pending, fromEnd, inboxByteOffset, file }) {
-  if (pending === true && typeof inboxByteOffset === 'number') {
-    return inboxByteOffset
-  }
+  const size = fileSize(file)
+  const hasValidSavedOffset = Number.isSafeInteger(inboxByteOffset) &&
+    inboxByteOffset >= 0 && inboxByteOffset <= size
+  if (pending === true && hasValidSavedOffset) return inboxByteOffset
   if (fromEnd === true) {
-    return resolveFromEndOffset(file)
+    const firstUnreadWake = resolveFromEndOffset(file)
+    return hasValidSavedOffset ? Math.max(inboxByteOffset, firstUnreadWake) : firstUnreadWake
   }
-  if (typeof inboxByteOffset === 'number') {
-    return inboxByteOffset
-  }
-  return fileSize(file)
+  if (hasValidSavedOffset) return inboxByteOffset
+  return size
 }
 
 /**
@@ -836,7 +836,7 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
       : { owner_ambient: ownerAmbient.length, room_context: roomContext.length },
     cursor_v2: batch?.ingress?.canonical ? batch?.next_after_message_id ?? null : undefined,
     next_after_message_id: batch?.ingress?.canonical ? undefined : batch?.next_after_message_id ?? null,
-    envelope_id: batch?.ingress?.envelope_id ?? null,
+    envelope_id: batch?.ingress?.envelope?.envelope_id ?? null,
     turn_id: batch?.ingress?.canonical ? messages[0]?.delivery?.turn_id ?? null : null,
     inbox: inboxFile ?? null,
     continuous_poller: true,
