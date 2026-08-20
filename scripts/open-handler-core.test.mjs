@@ -44,13 +44,24 @@ describe('buildWindowsCliStartCommand', () => {
       'C:\\Users\\Brandon Young\\AppData\\Local\\cursor-agent\\agent.cmd',
     ])
 
-    assert.match(cmd, /^start "DevSpec Cursor CLI" cmd\.exe \/k /)
+    assert.match(cmd, /^start "DevSpec Cursor" cmd\.exe \/k /)
+    assert.doesNotMatch(cmd, /DevSpec Cursor CLI/)
+    assert.doesNotMatch(cmd, /wt\.exe/)
     assert.doesNotMatch(cmd, /\\"/)
   })
 
   it('strips quotes from the window title', () => {
     const cmd = buildWindowsCliStartCommand('node', ['script.mjs'], 'Title "x"')
     assert.match(cmd, /^start "Title x" cmd\.exe \/k /)
+  })
+
+  it('start title with a launch stamp is unique and not DevSpec Cursor CLI', () => {
+    const a = buildWindowsCliStartCommand('node', ['a.mjs'], 'DevSpec Cursor · stamp-a')
+    const b = buildWindowsCliStartCommand('node', ['b.mjs'], 'DevSpec Cursor · stamp-b')
+    assert.match(a, /^start "DevSpec Cursor · stamp-a"/)
+    assert.match(b, /^start "DevSpec Cursor · stamp-b"/)
+    assert.notEqual(a, b)
+    assert.doesNotMatch(a, /DevSpec Cursor CLI/)
   })
 })
 

@@ -18,7 +18,7 @@ import fs from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn, spawnSync, execFileSync } from 'node:child_process'
 import {
   expandRemoteControlLaunchPrompt,
   promptIsRemoteConnect,
@@ -289,6 +289,80 @@ export function quoteWinCmdArg(value) {
 }
 
 /**
+ * Windows console titles cannot carry quotes or cmd metacharacters (item 20900b80).
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function sanitizeWindowsConsoleTitle(raw) {
+  return String(raw ?? '')
+    .replace(/["\r\n]/g, '')
+    .replace(/[&|<>^]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Cursor CLI window title: server-minted codename after Live, unique launch stamp before.
+ * Never the hardcoded `DevSpec Cursor CLI` (item 20900b80).
+ * @param {{ codename?: string | null, stamp?: string | null }} [opts]
+ * @returns {string}
+ */
+export function composeWindowsCursorCliTitle(opts = {}) {
+  const name = sanitizeWindowsConsoleTitle(opts.codename)
+  if (name) return `DevSpec Cursor · ${name}`
+  const stamp = sanitizeWindowsConsoleTitle(opts.stamp)
+  if (stamp) return `DevSpec Cursor · ${stamp}`
+  return 'DevSpec Cursor'
+}
+
+/**
+ * argv for `cmd.exe` after the executable: titled cmd /k, never wt.exe.
+ * @param {string} batPath
+ * @param {string} title
+ * @returns {string[]}
+ */
+export function windowsCursorCliStartArgs(batPath, title) {
+  const safe = sanitizeWindowsConsoleTitle(title) || composeWindowsCursorCliTitle()
+  return ['/c', 'start', safe, 'cmd.exe', '/k', batPath]
+}
+
+/**
+ * Retitle this console after fast-connect so the cmd window shows the minted codename.
+ * @param {string} title
+ * @param {{
+ *   platform?: NodeJS.Platform,
+ *   setProcessTitle?: (t: string) => void,
+ *   execTitle?: (safe: string) => void,
+ * }} [io]
+ */
+export function applyWindowsConsoleTitle(title, io = {}) {
+  const safe = sanitizeWindowsConsoleTitle(title)
+  if (!safe) return { ok: false, title: '' }
+  const setTitle = io.setProcessTitle || ((t) => {
+    process.title = t
+  })
+  setTitle(safe)
+  const platform = io.platform ?? process.platform
+  if (platform === 'win32') {
+    const execTitle =
+      io.execTitle ||
+      ((t) => {
+        execFileSync('cmd.exe', ['/c', `title ${t}`], {
+          stdio: 'ignore',
+          windowsHide: true,
+          timeout: 2000,
+        })
+      })
+    try {
+      execTitle(safe)
+    } catch {
+      /* process.title still applied */
+    }
+  }
+  return { ok: true, title: safe }
+}
+
+/**
  * @deprecated Prefer resolveWindowsAgentInvocation + spawnAgent*.
  * @param {string} bin
  * @param {NodeJS.Platform} [platform]
@@ -524,6 +598,12 @@ async function main() {
     console.log(
       `[devspec-cli] Live as ${connectResult.codename || connectResult.connection_id.slice(0, 8)}…` +
         (connectResult.session_id ? ` (session ${connectResult.session_id.slice(0, 8)}…)` : ' (sessionless)'),
+    )
+    applyWindowsConsoleTitle(
+      composeWindowsCursorCliTitle({
+        codename: connectResult.codename,
+        stamp: connectResult.launch_id || launchId,
+      }),
     )
   }
 

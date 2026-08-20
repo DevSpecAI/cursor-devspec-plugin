@@ -10,7 +10,7 @@ import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
-import { quoteWinCmdArg } from './launch-cli-session.mjs'
+import { quoteWinCmdArg, composeWindowsCursorCliTitle, sanitizeWindowsConsoleTitle, windowsCursorCliStartArgs } from './launch-cli-session.mjs'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -36,8 +36,8 @@ export function buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath) {
  * @param {string} [title]
  * @returns {string}
  */
-export function buildWindowsCliStartCommand(nodeBin, launchArgs, title = 'DevSpec Cursor CLI') {
-  const safeTitle = String(title).replace(/"/g, '')
+export function buildWindowsCliStartCommand(nodeBin, launchArgs, title = composeWindowsCursorCliTitle()) {
+  const safeTitle = sanitizeWindowsConsoleTitle(title) || composeWindowsCursorCliTitle()
   const cmdline = [nodeBin, ...launchArgs].map(quoteWinCmdArg).join(' ')
   return `start "${safeTitle}" cmd.exe /k ${cmdline}`
 }
@@ -439,7 +439,8 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
     // `\"…\"`, and cmd fails with `'\"C:\…\node.exe\"' is not recognized`.
     const batPath = path.join(launchesDir, `${stamp}.launch.cmd`)
     await fs.writeFile(batPath, buildWindowsCliLaunchBat(nodeBin, launchArgs, folderPath), 'utf8')
-    spawn('cmd.exe', ['/c', 'start', 'DevSpec Cursor CLI', 'cmd.exe', '/k', batPath], {
+    const startTitle = composeWindowsCursorCliTitle({ stamp })
+    spawn('cmd.exe', windowsCursorCliStartArgs(batPath, startTitle), {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,

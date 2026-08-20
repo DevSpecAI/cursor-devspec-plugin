@@ -26,6 +26,10 @@ import {
   resolveWindowsAgentInvocation,
   spawnAgentSync,
   stampLine,
+  sanitizeWindowsConsoleTitle,
+  composeWindowsCursorCliTitle,
+  windowsCursorCliStartArgs,
+  applyWindowsConsoleTitle,
 } from './launch-cli-session.mjs'
 import { buildPostLiveRemoteBrief } from './pin-remote-plugin.mjs'
 
@@ -369,5 +373,54 @@ describe('spawnAgentSync (win32 create-chat)', () => {
       .filter(Boolean)
       .at(-1)
     assert.ok(chatId && chatId.length > 8, `expected chat id, got ${JSON.stringify(chatId)}`)
+  })
+})
+
+describe('Windows Cursor console title (item 20900b80)', () => {
+  it('strips quotes and cmd metacharacters', () => {
+    assert.equal(sanitizeWindowsConsoleTitle('Brave "Panda"'), 'Brave Panda')
+    assert.equal(sanitizeWindowsConsoleTitle('A & B | C'), 'A B C')
+  })
+
+  it('uses minted codename after Live and stamp before', () => {
+    assert.equal(composeWindowsCursorCliTitle({ codename: 'Brave Panda' }), 'DevSpec Cursor · Brave Panda')
+    assert.equal(
+      composeWindowsCursorCliTitle({ stamp: '1787229023147-4hmfqg' }),
+      'DevSpec Cursor · 1787229023147-4hmfqg',
+    )
+    assert.equal(composeWindowsCursorCliTitle({}), 'DevSpec Cursor')
+    assert.notEqual(composeWindowsCursorCliTitle({}), 'DevSpec Cursor CLI')
+  })
+
+  it('two concurrent Connects compose two different titles', () => {
+    const a = composeWindowsCursorCliTitle({ codename: 'Brave Panda' })
+    const b = composeWindowsCursorCliTitle({ codename: 'Lucky Caracal' })
+    assert.notEqual(a, b)
+    assert.match(a, /Brave Panda/)
+    assert.match(b, /Lucky Caracal/)
+    const stampA = composeWindowsCursorCliTitle({ stamp: 'stamp-aaa' })
+    const stampB = composeWindowsCursorCliTitle({ stamp: 'stamp-bbb' })
+    assert.notEqual(stampA, stampB)
+  })
+
+  it('start argv is titled cmd.exe, never wt.exe, never hardcoded DevSpec Cursor CLI', () => {
+    const title = composeWindowsCursorCliTitle({ stamp: 'stamp-1' })
+    const args = windowsCursorCliStartArgs('C:\\tmp\\x.cmd', title)
+    assert.deepEqual(args, ['/c', 'start', title, 'cmd.exe', '/k', 'C:\\tmp\\x.cmd'])
+    assert.ok(!args.some((a) => /wt\.exe/i.test(a)))
+    assert.ok(!args.includes('DevSpec Cursor CLI'))
+  })
+
+  it('applyWindowsConsoleTitle sets process.title and skips wt.exe', () => {
+    const titles = []
+    const execs = []
+    const r = applyWindowsConsoleTitle('DevSpec Cursor · Brave Panda', {
+      platform: 'win32',
+      setProcessTitle: (t) => titles.push(t),
+      execTitle: (t) => execs.push(t),
+    })
+    assert.equal(r.ok, true)
+    assert.deepEqual(titles, ['DevSpec Cursor · Brave Panda'])
+    assert.deepEqual(execs, ['DevSpec Cursor · Brave Panda'])
   })
 })
