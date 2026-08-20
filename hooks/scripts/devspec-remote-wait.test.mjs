@@ -1002,4 +1002,40 @@ describe('resolveOwnerPid (item 5c884554 — wait copy skips worker-server)', ()
       22808,
     )
   })
+
+  it('ignored powershell pid picks THIS spawn --resume, not a sibling (item 5b954281)', () => {
+    if (process.platform !== 'win32') {
+      assert.equal(
+        resolveOwnerPid(100, null, {
+          processNameOf: () => 'powershell.exe',
+          resolveAuto: () => 400,
+        }),
+        100,
+      )
+      return
+    }
+    const resumeA =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-a'
+    const resumeB =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-b'
+    const forest = {
+      100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [200] },
+      200: { name: 'node.exe', commandLine: resumeA, children: [] },
+      300: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [400] },
+      400: { name: 'node.exe', commandLine: resumeB, children: [] },
+    }
+    assert.equal(
+      resolveOwnerPid(100, null, {
+        processNameOf: () => 'powershell.exe',
+        processCommandLineOf: () => 'powershell -File agent.ps1',
+        processInfoOf: (pid) => {
+          const n = forest[pid]
+          return n ? { name: n.name, commandLine: n.commandLine || '' } : null
+        },
+        childrenOf: (pid) => forest[pid]?.children ?? [],
+        resolveAuto: () => 400,
+      }),
+      200,
+    )
+  })
 })

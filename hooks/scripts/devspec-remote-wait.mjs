@@ -273,6 +273,111 @@ function shouldIgnoreExplicitWin32Owner(name, commandLine = '') {
   return false
 }
 
+function isWin32CliSpawnOwnerProcess(name, commandLine = '') {
+  const n = String(name || '').toLowerCase()
+  if (n === 'agent.exe' || n === 'claude.exe' || n === 'cursor-agent.exe') return true
+  if (n === 'node.exe') return isWin32CursorAgentDurableNodeCommand(commandLine)
+  return false
+}
+
+function isWin32CliSpawnResumeOwner(name, commandLine = '') {
+  const n = String(name || '').toLowerCase()
+  if (n === 'agent.exe' || n === 'claude.exe' || n === 'cursor-agent.exe') return true
+  return n === 'node.exe' && isWin32CursorAgentResumeCommand(commandLine)
+}
+
+/** Keep in sync with remote-control-state.mjs walkChildTreeForDurableOwner (item 5b954281). */
+function walkChildTreeForDurableOwner(rootPid, opts = {}) {
+  const processInfoOf = opts.processInfoOf
+  const childrenOf = opts.childrenOf || (() => [])
+  const maxNodes = opts.maxNodes ?? 40
+  const queue = [{ pid: rootPid, depth: 0 }]
+  const seen = new Set()
+  /** @type {{ pid: number, depth: number, resume: boolean }[]} */
+  const hits = []
+  while (queue.length && seen.size < maxNodes) {
+    const item = queue.shift()
+    if (!item) continue
+    const p = item.pid
+    const depth = item.depth
+    if (!Number.isInteger(p) || p < 1 || seen.has(p)) continue
+    seen.add(p)
+    const info = processInfoOf ? processInfoOf(p) : null
+    if (info && isWin32CliSpawnOwnerProcess(info.name, info.commandLine)) {
+      hits.push({
+        pid: p,
+        depth,
+        resume: isWin32CliSpawnResumeOwner(info.name, info.commandLine),
+      })
+    }
+    const kids = childrenOf(p)
+    if (Array.isArray(kids)) {
+      for (const k of kids) {
+        const child = Number.parseInt(String(k), 10)
+        if (Number.isInteger(child) && child > 1) queue.push({ pid: child, depth: depth + 1 })
+      }
+    }
+  }
+  const resumeHits = hits.filter((h) => h.resume)
+  const pool = resumeHits.length ? resumeHits : hits
+  if (!pool.length) return null
+  const minDepth = Math.min(...pool.map((h) => h.depth))
+  const closest = pool.filter((h) => h.depth === minDepth)
+  if (closest.length !== 1) return null
+  const pick = closest[0]
+  return pick ? pick.pid : null
+}
+
+function resolveOwnerPidFromChildTreeWin32(startPid, { timeoutMs = 0, maxNodes = 40 } = {}) {
+  if (process.platform !== 'win32') return null
+  const pid = Number.parseInt(String(startPid), 10)
+  if (!Number.isInteger(pid) || pid < 1) return null
+  const timeout = Math.max(0, Number(timeoutMs) || 0)
+  const script = [
+    `$root = ${pid}`,
+    `$maxNodes = ${maxNodes}`,
+    `$deadline = (Get-Date).AddMilliseconds(${timeout})`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$workerServer = '(?i)\\bworker-server\\b'`,
+    'do {',
+    '  $fallback = $null',
+    '  $queue = New-Object System.Collections.Generic.Queue[int]',
+    '  $queue.Enqueue($root)',
+    '  $seen = @{}',
+    '  $n = 0',
+    '  while ($queue.Count -gt 0 -and $n -lt $maxNodes) {',
+    '    $p = $queue.Dequeue()',
+    '    if ($seen.ContainsKey($p)) { continue }',
+    '    $seen[$p] = $true',
+    '    $n++',
+    '    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue',
+    '    if ($proc) {',
+    '      $name = $proc.Name.ToLowerInvariant()',
+    '      $cmd = [string]$proc.CommandLine',
+    '      $isResumeHost = ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe" -or ($name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)--resume(\\s|$)")))',
+    '      if ($isResumeHost) { Write-Output $proc.ProcessId; exit 0 }',
+    '      if (-not $fallback -and $name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and ($cmd -notmatch $ephemeralNode)) { $fallback = $proc.ProcessId }',
+    '    }',
+    '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
+    '  }',
+    '  if ($fallback) { Write-Output $fallback; exit 0 }',
+    '  if ((Get-Date) -ge $deadline) { break }',
+    '  Start-Sleep -Milliseconds 50',
+    '} while ((Get-Date) -lt $deadline)',
+  ].join('\n')
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: Math.max(timeout + 4000, 5000),
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+    const found = Number.parseInt(out, 10)
+    return Number.isInteger(found) && found > 1 ? found : null
+  } catch {
+    return null
+  }
+}
+
 function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
   if (process.platform !== 'win32') return null
   const id = Number.parseInt(String(pid), 10)
@@ -350,7 +455,18 @@ export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
         commandLine = info?.commandLine ?? ''
       }
       if (name && shouldIgnoreExplicitWin32Owner(name, commandLine)) {
-        // Fall through — not a durable owner anchor (items f3a88333 / c57dc381 / 5c884554).
+        // Walk THIS pid's descendants for `--resume` before ancestor/auto
+        // (item 5b954281). Keep in sync with remote-control-state.mjs.
+        const hasTreeHooks = !!(opts.resolveFromChildTree || opts.processInfoOf || opts.childrenOf)
+        if (hasTreeHooks) {
+          const fromTree = opts.resolveFromChildTree
+            ? opts.resolveFromChildTree(explicit)
+            : walkChildTreeForDurableOwner(explicit, opts)
+          if (fromTree) return fromTree
+        } else if (!opts.processNameOf && !opts.processCommandLineOf) {
+          const fromTree = resolveOwnerPidFromChildTreeWin32(explicit, { timeoutMs: 0 })
+          if (fromTree) return fromTree
+        }
       } else {
         return explicit
       }

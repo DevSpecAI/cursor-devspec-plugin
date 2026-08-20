@@ -310,9 +310,19 @@ function defaultSleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
+function isWin32CliSpawnResumeOwner(name, commandLine = '') {
+  const n = String(name || '').toLowerCase()
+  if (WIN32_CLI_SPAWN_OWNER_NAMES.has(n)) return true
+  return n === 'node.exe' && isWin32CursorAgentResumeCommand(commandLine)
+}
+
 /**
  * BFS descendants of `rootPid` for a CLI-spawn durable owner.
- * Injectable `processInfoOf` / `childrenOf` keep unit tests off Win32_Process.
+ * Prefers THIS tree’s `--resume` / agent.exe host. Never machine-wide “first
+ * --resume”. If two `--resume` nodes sit at the same depth (shared parent such
+ * as Cursor.exe), fail closed rather than pinning both pollers to `-First 1`
+ * (item 5b954281). Injectable `processInfoOf` / `childrenOf` keep unit tests
+ * off Win32_Process.
  * @param {number} rootPid
  * @param {{
  *   processInfoOf?: (pid: number) => { name?: string, commandLine?: string } | null,
@@ -325,29 +335,49 @@ export function walkChildTreeForDurableOwner(rootPid, opts = {}) {
   const processInfoOf = opts.processInfoOf
   const childrenOf = opts.childrenOf || (() => [])
   const maxNodes = opts.maxNodes ?? 40
-  const queue = [rootPid]
+  const queue = [{ pid: rootPid, depth: 0 }]
   const seen = new Set()
+  /** @type {{ pid: number, depth: number, resume: boolean }[]} */
+  const hits = []
   while (queue.length && seen.size < maxNodes) {
-    const p = queue.shift()
+    const item = queue.shift()
+    if (!item) continue
+    const p = item.pid
+    const depth = item.depth
     if (!Number.isInteger(p) || p < 1 || seen.has(p)) continue
     seen.add(p)
     const info = processInfoOf ? processInfoOf(p) : null
-    if (info && isWin32CliSpawnOwnerProcess(info.name, info.commandLine)) return p
+    if (info && isWin32CliSpawnOwnerProcess(info.name, info.commandLine)) {
+      hits.push({
+        pid: p,
+        depth,
+        resume: isWin32CliSpawnResumeOwner(info.name, info.commandLine),
+      })
+    }
     const kids = childrenOf(p)
     if (Array.isArray(kids)) {
       for (const k of kids) {
         const child = Number.parseInt(String(k), 10)
-        if (Number.isInteger(child) && child > 1) queue.push(child)
+        if (Number.isInteger(child) && child > 1) queue.push({ pid: child, depth: depth + 1 })
       }
     }
   }
-  return null
+  const resumeHits = hits.filter((h) => h.resume)
+  const pool = resumeHits.length ? resumeHits : hits
+  if (!pool.length) return null
+  const minDepth = Math.min(...pool.map((h) => h.depth))
+  const closest = pool.filter((h) => h.depth === minDepth)
+  // Two `--resume` siblings under a shared parent: do not pick an arbitrary one.
+  if (closest.length !== 1) return null
+  const pick = closest[0]
+  return pick ? pick.pid : null
 }
 
 /**
- * Windows: one PowerShell invocation BFS-walks descendants of the spawned CLI
- * process until cursor-agent/agent.exe appears (or timeout). Does not walk
- * parents (that finds Cursor.exe the IDE, or nothing).
+ * Windows: one PowerShell invocation BFS-walks descendants of THIS spawn PID
+ * until `--resume` / agent.exe appears (or timeout). Queries are
+ * ProcessId=/ParentProcessId= only — never a machine-wide First 1 (item 5b954281).
+ * Does not walk parents (that finds Cursor.exe the IDE, or nothing).
  */
 export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, timeoutMs = CLI_SPAWN_OWNER_WALK_TIMEOUT_MS } = {}) {
   if (process.platform !== 'win32') return null
@@ -361,6 +391,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
     `$workerServer = '(?i)\\bworker-server\\b'`,
     'do {',
+    '  $fallback = $null',
     '  $queue = New-Object System.Collections.Generic.Queue[int]',
     '  $queue.Enqueue($root)',
     '  $seen = @{}',
@@ -374,11 +405,13 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     '    if ($proc) {',
     '      $name = $proc.Name.ToLowerInvariant()',
     '      $cmd = [string]$proc.CommandLine',
-    '      if ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe") { Write-Output $proc.ProcessId; exit 0 }',
-    '      if ($name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and (($cmd -match "(?i)--resume(\\s|$)") -or ($cmd -notmatch $ephemeralNode))) { Write-Output $proc.ProcessId; exit 0 }',
+    '      $isResumeHost = ($name -eq "agent.exe" -or $name -eq "claude.exe" -or $name -eq "cursor-agent.exe" -or ($name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and ($cmd -match "(?i)--resume(\\s|$)")))',
+    '      if ($isResumeHost) { Write-Output $proc.ProcessId; exit 0 }',
+    '      if (-not $fallback -and $name -eq "node.exe" -and $cmd -and ($cmd -match "(?i)(?:^|[\\\\/])cursor-agent(?:[\\\\/]|$)") -and ($cmd -notmatch $workerServer) -and ($cmd -notmatch $ephemeralNode)) { $fallback = $proc.ProcessId }',
     '    }',
     '    Get-CimInstance Win32_Process -Filter "ParentProcessId=$p" -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }',
     '  }',
+    '  if ($fallback) { Write-Output $fallback; exit 0 }',
     '  if ((Get-Date) -ge $deadline) { break }',
     '  Start-Sleep -Milliseconds 50',
     '} while ((Get-Date) -lt $deadline)',
@@ -615,7 +648,8 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
  * if none.
  *
  * `opts.processInfoOf` / `opts.processNameOf` / `opts.processCommandLineOf` /
- * `opts.resolveAuto` are test hooks only.
+ * `opts.childrenOf` / `opts.resolveFromChildTree` / `opts.resolveAuto` /
+ * `opts.childTreeOpts` are test hooks only.
  */
 export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
   const explicit = Number.parseInt(String(explicitArg ?? ''), 10)
@@ -633,7 +667,22 @@ export function resolveOwnerPid(explicitArg, prevValue, opts = {}) {
         commandLine = info?.commandLine ?? ''
       }
       if (name && shouldIgnoreExplicitWin32Owner(name, commandLine)) {
-        // Fall through — not a durable owner anchor.
+        // Shell / worker-server / ephemeral node: walk THIS pid's descendants
+        // for `--resume` before any ancestor/auto walk (item 5b954281). Auto
+        // from process.pid can land on Cursor.exe or a sibling `--resume`.
+        const hasTreeHooks = !!(opts.resolveFromChildTree || opts.processInfoOf || opts.childrenOf)
+        if (hasTreeHooks) {
+          const fromTree = opts.resolveFromChildTree
+            ? opts.resolveFromChildTree(explicit)
+            : walkChildTreeForDurableOwner(explicit, opts)
+          if (fromTree) return fromTree
+        } else if (!opts.processNameOf && !opts.processCommandLineOf) {
+          const fromTree = resolveOwnerPidFromChildTree(explicit, {
+            timeoutMs: 0,
+            ...opts.childTreeOpts,
+          })
+          if (fromTree) return fromTree
+        }
       } else {
         return explicit
       }

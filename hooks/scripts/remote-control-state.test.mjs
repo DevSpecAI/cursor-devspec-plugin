@@ -4,7 +4,6 @@
  * Run: node --test hooks/scripts/remote-control-state.test.mjs
  */
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 import {
   detectLocalId,
@@ -753,25 +752,9 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
     'resolveOwnerPidAutoWindows recognizes a live cursor-agent node.exe host (item c57dc381)',
     { skip: process.platform !== 'win32' },
     () => {
-      // Prefer a real cursor-agent process on this machine; skip when none are running
-      // (CI / bare runners) so the suite stays deterministic.
-      let startPid = null
-      try {
-        const out = execFileSync(
-          'powershell.exe',
-          [
-            '-NoProfile',
-            '-NonInteractive',
-            '-Command',
-            `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match '(?i)[\\\\/]cursor-agent[\\\\/]' -and $_.CommandLine -match '(?i)--resume(\\s|$)' -and $_.CommandLine -notmatch '(?i)\\bworker-server\\b' } | Select-Object -First 1 -ExpandProperty ProcessId; if ($p) { Write-Output $p }`,
-          ],
-          { encoding: 'utf8', timeout: 8000, windowsHide: true },
-        ).trim()
-        const n = Number.parseInt(out, 10)
-        if (Number.isInteger(n) && n > 1) startPid = n
-      } catch {
-        /* no host */
-      }
+      // Walk THIS process's ancestry — never machine-wide Get-CimInstance | Select -First 1
+      // (item 5b954281). Skip when this runner is not under a cursor-agent host.
+      const startPid = resolveOwnerPidAutoWindows(process.pid)
       if (startPid == null) return
       assert.equal(resolveOwnerPidAutoWindows(startPid), startPid)
     },
@@ -807,6 +790,82 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
       }),
     )
     assert.equal(found, 200)
+  })
+
+  it('pins each spawn tree to its own --resume when two exist (item 5b954281)', () => {
+    const resumeA =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-a'
+    const resumeB =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-b'
+    const forest = {
+      1: { name: 'Cursor.exe', commandLine: 'Cursor.exe', children: [10, 20] },
+      10: { name: 'cmd.exe', commandLine: 'cmd.exe /k', children: [100] },
+      20: { name: 'cmd.exe', commandLine: 'cmd.exe /k', children: [300] },
+      100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [101, 200] },
+      101: { name: 'node.exe', commandLine: workerServerCmd, children: [] },
+      200: { name: 'node.exe', commandLine: resumeA, children: [] },
+      300: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [400] },
+      400: { name: 'node.exe', commandLine: resumeB, children: [] },
+    }
+    const opts = treeOpts(forest)
+    assert.equal(resolveOwnerPidFromChildTree(100, opts), 200)
+    assert.equal(resolveOwnerPidFromChildTree(300, opts), 400)
+    assert.notEqual(resolveOwnerPidFromChildTree(100, opts), 400)
+    assert.notEqual(resolveOwnerPidFromChildTree(300, opts), 200)
+  })
+
+  it('does not pick machine-wide first --resume under a shared Cursor.exe parent (item 5b954281)', () => {
+    const resumeA =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-a'
+    const resumeB =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-b'
+    assert.equal(
+      resolveOwnerPidFromChildTree(
+        1,
+        treeOpts({
+          1: { name: 'Cursor.exe', children: [200, 400] },
+          200: { name: 'node.exe', commandLine: resumeA, children: [] },
+          400: { name: 'node.exe', commandLine: resumeB, children: [] },
+        }),
+      ),
+      null,
+    )
+  })
+
+  it('ignored powershell --owner-pid walks THIS spawn tree, not a sibling --resume (item 5b954281)', () => {
+    if (process.platform !== 'win32') {
+      assert.equal(
+        resolveOwnerPid(100, null, {
+          processNameOf: () => 'powershell.exe',
+          resolveAuto: () => 400,
+        }),
+        100,
+      )
+      return
+    }
+    const resumeA =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-a'
+    const resumeB =
+      '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\1\\index.js" --resume chat-b'
+    const forest = {
+      100: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [200] },
+      200: { name: 'node.exe', commandLine: resumeA, children: [] },
+      300: { name: 'powershell.exe', commandLine: 'powershell -File agent.ps1', children: [400] },
+      400: { name: 'node.exe', commandLine: resumeB, children: [] },
+    }
+    assert.equal(
+      resolveOwnerPid(100, null, {
+        processNameOf: () => 'powershell.exe',
+        processCommandLineOf: () => 'powershell -File agent.ps1',
+        processInfoOf: (pid) => {
+          const n = forest[pid]
+          return n ? { name: n.name, commandLine: n.commandLine || '' } : null
+        },
+        childrenOf: (pid) => forest[pid]?.children ?? [],
+        resolveAuto: () => 400,
+      }),
+      200,
+    )
   })
 
   it('prefers --resume over a worker-server sibling listed first (item 5c884554)', () => {
