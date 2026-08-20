@@ -49,7 +49,7 @@ describe('isDeliverableCommand (command gate)', () => {
   })
 
   it("HIJACK: rejects a command addressed to ANOTHER agent's connection", () => {
-    // The devspec:3e76a6cc case — two of the owner's agents in one room, one dispatch.
+    // The devspec:3e76a6cc case — two of the owner's agents in one room, one command.
     const forOther = command({ addressed_to: { connection_id: OTHER_CONN } })
     assert.equal(isDeliverableCommand(forOther, ME), false)
   })
@@ -59,8 +59,8 @@ describe('isDeliverableCommand (command gate)', () => {
   })
 
   it('rejects an unrecognised authority kind rather than assuming it is safe', () => {
-    // Delegated dispatch (c55865bb) must be enabled by a deliberate edit here, not by
-    // a new server value quietly switching itself on.
+    // Delegated command authority (c55865bb) must be enabled by a deliberate edit
+    // here, not by a new server value quietly switching itself on.
     // Decision A (DevSpec memory 61ba9948): `delegated` is now a RECOGNISED kind —
     // an authorized teammate, decided server-side. The property this test defends
     // is unchanged: a kind we have never heard of is still refused.

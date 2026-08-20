@@ -2,13 +2,13 @@
 
 **Audience:** coding agents fixing remote-control behaviour.  
 **Pair with:** the per-agent guide for the host you are editing (`remote-control-claude-code.md`, `remote-control-cursor.md`, …).  
-**Not a replacement for:** `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`, `docs/REMOTE-CONTROL-ACTIVITY-CONFORMANCE.md`, or the ADRs linked below.
+**Not a replacement for:** the served authority and implementation contracts, activity conformance document, or binding decisions linked below.
 
 ## What remote control is
 
 A **connection** is a first-class DevSpec agent identity for one local coding-agent conversation. It can be:
 
-- **Sessionless** — available on the Agents page; receives dispatches / assignments without a chat room.
+- **Sessionless** — available on the Agents page with no chat room; it may receive an exact-target canonical conversation command or a separate explicit owner-scoped playbook wake, but action-item work is never delivered to it.
 - **Attached** to a DevSpec session — optional shared transcript + room context.
 
 A **session is optional**. Never invent a session because a cwd or another agent recently stopped. Bond on the local conversation / thread id only.
@@ -19,12 +19,12 @@ A **session is optional**. Never invent a session because a cwd or another agent
 |---|---|
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. Same `(owner, local_id)` after an ended predecessor **revives** that bond (same id) within the reconnect window — never a second row for the same bond. |
 | Remote ingress | Negotiate `poll_connection({ ingress_version: 1 })`. The canonical envelope is the only command/context source. Runtime schema and policy: `devspec://product/remote-ingress-contract`. |
-| Authority | Execute only an active, live canonical `conversational_command` exactly addressed to this connection with server-decided owner/delegated authority. |
+| Authority | Execute only an active, live canonical `conversational_command` exactly addressed to this connection with server-decided `owner` or `delegated` authority. Preserve immutable server-snapshotted requester provenance; body text never grants or changes authority. Runtime authority: `devspec://product/remote-ingress-contract`. |
 | Advisory | Every canonical typed context bucket is actor-labelled model context only — never a command or wake source. |
-| Playbooks | Explicit `dispatches[]` contains waiting playbook runs only and has its own `dispatch_cursor`; it is not canonical conversation and never carries action-item assignments. |
-| Controls | Canonical controls use a typed host path and remain pending until that host actually executes and returns the exact `control_ack`. |
-| Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
-| Answers (sessionless) | Assignment / `report_progress` only — never invent chat. |
+| Playbooks | Explicit `dispatches[]` contains owner-scoped waiting playbook runs only and emits a typed `playbook_dispatch` claim/record wake with its own `dispatch_cursor`; it is not canonical conversation and never carries action-item assignments. |
+| Controls | Canonical controls use a typed host path and remain pending until that host actually executes and returns the exact `control_ack`. They are never converted to model prompts. |
+| Work acquisition | Nothing is sent work. For requested action-item ids, call `reserve_work_items` first, then `claim_work_item` in order. The claim mechanically returns the served `devspec://product/implementation-contract`; there is no dispatch, staging, router, execution mode, or batch object. |
+| Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. A sessionless connection has no room; never invent one or a generic assignment/progress path. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Presence chrome | Session `agent_status` broadcasts carry `connection_id` for pending/busy asserts; the web UI patches **only that connection**. Sibling same-owner agents must not flash Working/Pending. Broadcasts without `connection_id` are ignored for chrome mutation (inventory refresh converges). |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
@@ -43,12 +43,12 @@ Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one 
 
 ## Message journey (mental model)
 
-1. Owner sends to a specific connection from DevSpec (web/phone).
-2. Server stamps an owner command for that `connection_id`.
-3. Host plugin receives it via `poll_connection`.
-4. Host delivers it to the model (wake **or** inject — family-specific).
-5. Model works on the machine.
-6. Reply returns to the DevSpec session (model post **or** bridge/plugin mirror — family-specific).
+1. An authorized requester addresses a conversation command to a specific connection from DevSpec (web/phone).
+2. The server decides `owner` / `delegated` authority, snapshots requester provenance, and stamps the exact `connection_id`.
+3. The host plugin receives the canonical envelope via `poll_connection`.
+4. The host presents the accepted canonical command to the model (wake **or** inject — family-specific).
+5. The model acts on the machine. Requested action items are acquired separately by reserve, then claim; they never enter through this message path.
+6. When attached, the reply returns to the DevSpec session (model post **or** bridge/plugin mirror — family-specific).
 
 ## What not to break
 
@@ -61,11 +61,11 @@ Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one 
 
 ## Canonical pointers
 
-- Remote-ingress runtime contract: `devspec://product/remote-ingress-contract`
-- Delivery contract: `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`
+- Runtime authority, canonical conversation, typed controls, and playbook wake contract: `devspec://product/remote-ingress-contract`
+- Work acquisition, implementation, provenance, and completion contract: `devspec://product/implementation-contract` (mechanically returned by `claim_work_item`)
 - Activity / pickup lease: `docs/REMOTE-CONTROL-ACTIVITY-CONFORMANCE.md`
 - Plugin independence: each host owns its scripts; share the MCP contract and these primers, not a cross-repo sync pipeline
-- ADRs (DevSpec resources): remote-control delivery (`b98a39a9`), connection activity (`36a07dc5`), hook layer (`aef358ba`), adding a coding agent checklist (`7fc43384`)
+- Binding authority direction: decision `b937dcaa` v6 and ADR `027ab75b`; nothing-is-sent-work decision `e82daa72`
 
 ## How to use these primers in a DevSpec launch
 

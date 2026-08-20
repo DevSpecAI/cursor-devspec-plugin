@@ -222,6 +222,11 @@ describe('expandRemoteControlLaunchPrompt', () => {
     assert.ok(expanded.includes('argv already has the wait command'))
     assert.ok(expanded.includes('--pending --after-reply'))
     assert.ok(expanded.includes('Do **NOT** call `register_connection`'))
+    assert.match(expanded, /exactly addressed[\s\S]*`owner` \/ `delegated` authority/)
+    assert.match(expanded, /immutable requester provenance/)
+    assert.match(expanded, /Typed controls stay host-only/)
+    assert.match(expanded, /owner-scoped `playbook_dispatch`/)
+    assert.doesNotMatch(expanded, /Owner-only commands/)
     assert.ok(expanded.length < 8_000, `thin brief too large: ${expanded.length}`)
     assert.equal(expanded.includes('Call register_connection then attach_connection.'), false)
     const brief = buildPostLiveRemoteBrief({

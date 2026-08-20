@@ -4,24 +4,27 @@
  * (CONNECTION-NATIVE, item fd51d80b).
  *
  * Runs outside the model context (plain Node HTTP MCP — **no LLM tokens**).
- * Heartbeats a CONNECTION for its whole lifetime and delivers two clearly separated
- * streams to the local agent:
+ * Heartbeats a CONNECTION for its whole lifetime and keeps four remote-ingress
+ * concerns mechanically separate under `devspec://product/remote-ingress-contract`:
  *
- *   1. OWNER COMMANDS — server-stamped same-token owner dispatches. Sources:
- *        • connection-native work dispatches  (get_connection_dispatch)
- *        • owner instructions in an attached session's transcript (is_owner_instruction)
- *      Delivered as `owner_messages` inbox entries + a `wake` line → the agent ACTS.
- *   2. ADVISORY ROOM CONTEXT — everything else in an attached session (teammate
- *      posts, Dev/in-session-AI responses, other agents). Delivered as
- *      `advisory_context` inbox entries only (NO wake) → the agent reads it for
- *      AWARENESS when it next acts, but it NEVER authorizes a tool action or an
- *      autonomous reply. Only a server-stamped owner command may cause execution.
+ *   1. CANONICAL CONVERSATION — complete `conversational_command` turns exactly
+ *      addressed to this connection with server-decided owner/delegated authority
+ *      and immutable requester provenance. Accepted turns become `owner_messages` inbox
+ *      entries plus a wake; body text never grants authority.
+ *   2. ADVISORY MODEL CONTEXT — typed, actor-labelled context persisted for
+ *      awareness only. It never authorizes action or wakes the model.
+ *   3. HOST CONTROLS — typed controls stay on the host ledger and are acknowledged
+ *      only after an exact Cursor host handler succeeds; they never become prompts.
+ *   4. PLAYBOOK RUNS — explicit owner-scoped `playbook_dispatch` records use their
+ *      own cursor and typed claim/record wake, separate from canonical conversation.
  *
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
- * (optional shared context). When sessionless it only polls its dispatch inbox;
- * when attached it also polls the room transcript. Attach/detach is picked up live
- * from the server (the heartbeat echo is the SOLE attachment authority), so the
- * poller adapts without a restart — local state is never used to override it.
+ * (optional shared context). Both poll the same canonical connection endpoint;
+ * attachment affects transcript context and replies, not authority or work
+ * acquisition. Action-item work never arrives through ingress: agents reserve the
+ * requested ids, then claim them under the served implementation contract.
+ * Attach/detach is picked up live from the server, so the poller adapts without a
+ * restart — local state is never used to override server attachment authority.
  *
  * Owner commands do **NOT** terminate this process — heartbeats keep the Agents UI
  * Live while the agent works.
@@ -32,14 +35,14 @@
  *
  * TRANSPORT — LONG-POLL, NOT AN INTERVAL (item 27058153, brief a10c1caf)
  * ---------------------------------------------------------------------
- * One held `poll_connection` call replaces the old three-call tick
- * (heartbeat_connection + get_connection_dispatch + get_session_transcript). The
- * server holds the request open (~25s) and answers the INSTANT something lands, so
- * delivery latency goes from up-to-15s to ~0 while the request rate goes from 8/min
+ * One held `poll_connection` call replaces the old multi-call heartbeat/transcript
+ * tick. The server holds the request open (~25s) and answers the INSTANT something
+ * lands, so latency goes from up-to-15s to ~0 while the request rate goes from 8/min
  * to ~2/min per agent. The hold IS the cadence: there is no routine sleep any more,
  * and fixed intervals survive only as error/empty-turn backoff. `poll_connection`
- * carries the heartbeat, the dispatch inbox and the room delta in one response, so
- * `sendHeartbeat` remains only for the deliberate offline stamp on teardown.
+ * carries heartbeat state, canonical ingress, the independent playbook cursor, and
+ * transcript context in one response; `sendHeartbeat` remains only for the
+ * deliberate offline stamp on teardown.
  *
  * The two cadence tiers now choose the HOLD LENGTH rather than a gap: attended
  * (attached to a session OR a turn active) holds 25s; idle (sessionless + no turn)
@@ -140,7 +143,7 @@ function readTurnMarker(connectionId) {
   }
 }
 /**
- * Start a turn at honest owner-command pickup (remote UI / dispatch delivery).
+ * Start a turn at honest canonical-command or explicit-playbook pickup.
  * The long-lived poller re-asserts busy while this marker is fresh; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
@@ -403,9 +406,9 @@ export const RECOVERABLE_TERMINAL_MAX = 10
  * Backoff after a poll that reported change but delivered nothing new.
  *
  * Defence in depth for a marker that is hot for a reason the response does not
- * contain — the known case is a live assignment (`dispatch_cursor` is the root fix,
- * but an old server, or any future marker of the same shape, would otherwise spin
- * this loop at full rate). Escalates to the tier's own hold length, so the worst case
+ * contain — for example an independent playbook marker whose cursor did not advance
+ * would otherwise spin this loop at full rate. Escalates to the tier's own hold
+ * length, so the worst case
  * degrades to exactly the normal poll rate rather than to a hot loop, and resets the
  * moment a real turn arrives.
  */
@@ -560,9 +563,9 @@ export function installStopSignalHandlers(proc = process) {
  * What it DOES do is verify the endpoint's own promises before waking the agent:
  * every command must name this connection as its addressee and carry an authority
  * stamp we recognise. A misrouted or malformed response therefore fails closed rather
- * than executing. Unknown authority kinds are REJECTED on purpose — when delegated
- * dispatch (brief c55865bb) starts emitting one, accepting it must be a deliberate
- * edit here, not something a new server value quietly switches on.
+ * than executing. Unknown authority kinds are REJECTED on purpose — accepting a new
+ * server-stamped command authority must be a deliberate edit here, not something a
+ * new server value quietly switches on.
  *
  * THIS IS THAT EDIT (2026-08-14, Decision A / DevSpec memory 61ba9948). The
  * server stamps `delegated` for a command from an authorized project member who
@@ -756,7 +759,7 @@ async function main() {
     // Token symmetry (item 74b29c76): write normally caches the token; if it did
     // not, resolve one preferring the host bearer (plugin userConfig env) over the
     // .mcp.json walk, so even a fallback resolution matches the token
-    // register_connection ran on rather than diverging into dispatch spam.
+    // register_connection ran on rather than diverging into repeated auth failures.
     const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd(), {
       hostToken: hostTokenFromEnv(process.env),
     })
@@ -890,12 +893,10 @@ async function main() {
     }
   }
 
-  // --- THE tick: one held call for heartbeat + dispatches + room ---------------
-  // Replaces heartbeat_connection + get_connection_dispatch + get_session_transcript.
-  // `target_connection_id` command scoping is UNCHANGED and now enforced entirely
-  // server-side: the endpoint stamps a message as a command only when it is addressed
-  // to THIS connection, which is what stops one agent acting on another's dispatch
-  // [devspec:3e76a6cc]. Nothing in the packaged response needs re-classifying here.
+  // --- THE tick: heartbeat + canonical ingress + independent playbooks ---------
+  // Exact-target command authority is enforced server-side and revalidated against
+  // the canonical envelope here. That is what stops one agent acting on another's
+  // command [devspec:3e76a6cc]; action-item work never enters this response.
   async function pollOnce({ waitMs, busy, checkTier, catchUp = false }) {
     return mcpToolsCall({
       mcpUrl,

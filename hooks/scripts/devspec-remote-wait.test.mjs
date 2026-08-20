@@ -204,7 +204,7 @@ describe('buildOwnerMessageEvents (item b9fb49a9 — session id must not be drop
     assert.equal(wake.inbox, '/tmp/inbox.jsonl')
   })
 
-  it('emits session_id: null for a sessionless dispatch batch rather than throwing', () => {
+  it('emits session_id: null for a sessionless owner-message batch rather than throwing', () => {
     const batch = { messages: [{ id: 'msg-1' }] } // no session_id field at all
     const events = buildOwnerMessageEvents(batch, { inboxFile: '/tmp/inbox.jsonl' })
     assert.equal(events.find((e) => e.type === 'owner_message').session_id, null)

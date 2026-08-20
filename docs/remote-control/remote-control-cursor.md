@@ -39,10 +39,10 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 
 ## How a message reaches Cursor
 
-1. Owner dispatches to this connection in DevSpec.
-2. Detached `devspec-remote-poll.mjs` long-polls and writes the inbox.
-3. `devspec-remote-wait.mjs` runs **one-shot** (no `--stream` in the Cursor plugin copy).
-4. Wait exits on owner command; Cursor notifies the Agent chat on matching stdout.
+1. An authorized requester sends a canonical conversation command exactly to this connection in DevSpec.
+2. The server decides `owner` / `delegated` authority, snapshots immutable requester provenance, and returns the canonical envelope to detached `devspec-remote-poll.mjs`.
+3. The poller validates the exact target and complete envelope, then writes the accepted command turn to the inbox.
+4. `devspec-remote-wait.mjs` runs **one-shot** (no `--stream` in the Cursor plugin copy) and exits on the canonical command; Cursor notifies the Agent chat on matching stdout.
 5. Model acts; when attached, model `post_session_message({ connection_id, phase: "answer", complete_turn: true })` on the **final** answer (omit `complete_turn` on any rare mid-turn narrative posts — **trail is plugin-owned**).
 6. Model **must re-arm** wait with `--pending --after-reply` after the reply (never `--from-end` on re-arm) — backstop for Working clear + local turn marker.
 
@@ -56,11 +56,15 @@ Wait emits exactly one accepted unit per one-shot arm. Canonical conversation tu
 2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — complete command records with full bodies and delivery metadata.
 3. `{ "type": "wake", "reason": "canonical_conversational_command", "envelope_id": "…", "turn_id": "…" }` — the complete turn boundary.
 
-Explicit `dispatches[]` playbook runs use a separate `playbook_dispatch` + `wake(reason: "playbook_dispatch")` path; they are never canonical conversation or action-item assignment. Canonical controls use a separate typed host-control ledger. Cursor currently exposes no safe in-process lifecycle control API, so those verbs remain unacked rather than being converted to model prompts; `control_ack` is authorized only after a real host handler succeeds.
+Explicit `dispatches[]` playbook runs use a separate owner-scoped `playbook_dispatch` + `wake(reason: "playbook_dispatch")` path with their own requester snapshot and typed claim/record lifecycle; they are never canonical conversation or action-item assignment. Canonical controls use a separate typed host-control ledger. Cursor currently exposes no safe in-process lifecycle control API, so those verbs remain unacked rather than being converted to model prompts; `control_ack` is authorized only after a real host handler succeeds.
 
 The poller persists `cursor_v2` as the live forward cursor, `window.next_cursor` as `catch_up_cursor` for older pages, and `dispatch_cursor` as the playbook watermark. Older-page draining never rewinds the live cursor. Stable command-turn/playbook keys make inbox acceptance replay-idempotent, and wait validates the full canonical envelope again before emission.
 
 The wait byte cursor advances only after all events are flushed. A queued second unit remains for the next one-shot re-arm. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
+
+### Work acquisition is not ingress
+
+Nothing sends action-item work to Cursor. When an owner asks the agent to work item ids, the agent calls `reserve_work_items` for those ids first, then `claim_work_item` in order. Claim mechanically returns the served `devspec://product/implementation-contract`; it governs implementation and completion. There is no work dispatch, staging, router, execution mode, or batch object, and neither canonical conversation nor `playbook_dispatch` carries an action-item assignment.
 
 ### Owner attachments
 
@@ -131,7 +135,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Re-arm with `--after-reply` that only clears the local marker (no `report_complete`) → dots linger one long-poll (~30s) after the reply — fixed by `notifyWorkingEnded` in wait (cd989606).
 - Stale notifications from a previous wait process → check whether the command was already answered before redoing work.
 - Wrong local_id mint vs conversation id → duplicate connections / Resume empty.
-- Tool-shell `$PID` as `--owner-pid` on Windows → poller dies with `owner_gone` mid-session; reconnect without bond revival used to mint a new connection and orphan targeted dispatches.
+- Tool-shell `$PID` as `--owner-pid` on Windows → poller dies with `owner_gone` mid-session; reconnect without bond revival used to mint a new connection and orphan exact-target commands.
 - Version-pinned hook path → Stop never runs; Working and local-prompt mirroring go silent.
 - Lexicographic PLUGIN pin → Agents relaunch keeps an older VSIX (e.g. 0.4.9 over 0.4.14/0.4.15) even after install (item 0688ff96).
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
@@ -139,7 +143,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Ignoring canonical `attachments[].resource_id` on `owner_message` → miss a stable referenced resource that is part of the command.
 - Fast-connect abort (auth / project / register / attach) → launcher exits **before** `--resume` (no half-Live agent). Missing owner-pid at pre-resume poller time is **not** fatal; poller starts after spawn (item f099fc6e).
 - Mechanical Connect `ensure-poller` before `--resume` on Windows → refuse owner-pid, launcher exits, connection idle_timeout (Restless Owl). Fixed in 0.5.2: defer poller until the CLI child tree exists.
-- First dispatch after Connect skipped (Emerald Ocelot). Wait `--from-end` seeked to EOF past `owner_messages` the poller already queued. Fixed in 0.5.3: skip advisory history only (item 1f177af4).
+- First canonical command after Connect skipped (Emerald Ocelot). Wait `--from-end` seeked to EOF past `owner_messages` the poller already queued. Fixed in 0.5.3: skip advisory history only (item 1f177af4).
 - Poller `--owner-pid` pinned to cursor-agent `index.js worker-server` → `owner_gone` while `agent --resume` is still alive (Copper Sparrow / Azure Bison / Azure Raccoon). Fixed in 0.5.4: skip worker-server; pin to `--resume` (item 5c884554).
 
 ## Key files

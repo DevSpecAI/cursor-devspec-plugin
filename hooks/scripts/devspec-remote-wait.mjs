@@ -10,10 +10,13 @@
  *   - Claude Code: run_in_background → process exit wakes the model
  *   - Grok Build:  monitor tool on this process stdout → chat notification
  *
- * It wakes ONLY on `owner_messages` (server-stamped owner commands / dispatches).
- * `advisory_context` inbox entries (teammate / Dev / other-agent room context) are
+ * It wakes only on twice-validated canonical `owner_messages` turns and, on its
+ * separate typed path, explicit owner-scoped `playbook_dispatch` records. Canonical
+ * commands retain their exact addressee, server-decided owner/delegated authority,
+ * and immutable requester provenance. `advisory_context` inbox entries are
  * DELIBERATELY ignored as a WAKE TRIGGER — advisory must never force a model wake or
- * an autonomous response.
+ * an autonomous response. Typed controls remain on the host lane and never wake the
+ * model.
  *
  * It is NOT ignored as CONTENT. An `owner_messages` entry carries the room the
  * command arrived into on its `context` field (owner-ambient + everyone-else, carried
@@ -551,8 +554,8 @@ export function inboxCursorEvidenceMatches(file, offset, evidence) {
 /**
  * First-arm `--from-end` offset: skip `advisory_context` history, but do not skip
  * `owner_messages` the poller already wrote. Mechanical Connect starts the poller
- * before the model arms wait, so a first dispatch is often already in the inbox
- * (Emerald Ocelot / item 1f177af4). Incomplete trailing lines (no final `\n`) are
+ * before the model arms wait, so a first canonical command is often already in the
+ * inbox (Emerald Ocelot / item 1f177af4). Incomplete trailing lines (no final `\n`) are
  * ignored, matching `readNewLines`.
  *
  * @param {string} text inbox file contents (utf8)

@@ -10,9 +10,9 @@
  * detached poller and the turn-mirroring hooks run in a side channel that doesn't
  * share Cursor's config, so they must resolve THAT token — otherwise
  * register_connection ran on one token while the poller heartbeats another and the
- * server rejects with "connection belongs to a different token" (dispatch delivery
- * then spams). So Cursor's mcp.json is the source of truth and wins over a generic
- * project `.mcp.json`. (The Claude Code plugin's resolver reads
+ * server rejects with "connection belongs to a different token" (the poll loop then
+ * repeats the auth failure). So Cursor's mcp.json is the source of truth and wins
+ * over a generic project `.mcp.json`. (The Claude Code plugin's resolver reads
  * `CLAUDE_PLUGIN_OPTION_*` + `~/.claude.json`, which are meaningless for Cursor.)
  *
  * Lookup order:
