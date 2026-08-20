@@ -50,13 +50,17 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 
 Cursor negotiates canonical v1 ingress. The runtime schema, version, wake, authority, attachment, and bounded-window rules live at `devspec://product/remote-ingress-contract`; operational prose does not duplicate them.
 
-Wait emits exactly one canonical command turn in this order:
+Wait emits exactly one accepted unit per one-shot arm. Canonical conversation turns use this order:
 
 1. Optional `{ "type": "model_context", "advisory": true, "typed": { … }, "windows": […], "locally_omitted": N }` — all four actor-labelled context buckets, inert.
 2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — complete command records with full bodies and delivery metadata.
 3. `{ "type": "wake", "reason": "canonical_conversational_command", "envelope_id": "…", "turn_id": "…" }` — the complete turn boundary.
 
-The wait byte cursor advances only after all events are flushed. A queued second turn remains for the next one-shot re-arm. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
+Explicit `dispatches[]` playbook runs use a separate `playbook_dispatch` + `wake(reason: "playbook_dispatch")` path; they are never canonical conversation or action-item assignment. Canonical controls use a separate typed host-control ledger. Cursor currently exposes no safe in-process lifecycle control API, so those verbs remain unacked rather than being converted to model prompts; `control_ack` is authorized only after a real host handler succeeds.
+
+The poller persists `cursor_v2` as the live forward cursor, `window.next_cursor` as `catch_up_cursor` for older pages, and `dispatch_cursor` as the playbook watermark. Older-page draining never rewinds the live cursor. Stable command-turn/playbook keys make inbox acceptance replay-idempotent, and wait validates the full canonical envelope again before emission.
+
+The wait byte cursor advances only after all events are flushed. A queued second unit remains for the next one-shot re-arm. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
 
 ### Owner attachments
 

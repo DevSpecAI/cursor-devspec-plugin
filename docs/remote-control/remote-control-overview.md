@@ -21,6 +21,8 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Remote ingress | Negotiate `poll_connection({ ingress_version: 1 })`. The canonical envelope is the only command/context source. Runtime schema and policy: `devspec://product/remote-ingress-contract`. |
 | Authority | Execute only an active, live canonical `conversational_command` exactly addressed to this connection with server-decided owner/delegated authority. |
 | Advisory | Every canonical typed context bucket is actor-labelled model context only — never a command or wake source. |
+| Playbooks | Explicit `dispatches[]` contains waiting playbook runs only and has its own `dispatch_cursor`; it is not canonical conversation and never carries action-item assignments. |
+| Controls | Canonical controls use a typed host path and remain pending until that host actually executes and returns the exact `control_ack`. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
 | Answers (sessionless) | Assignment / `report_progress` only — never invent chat. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |

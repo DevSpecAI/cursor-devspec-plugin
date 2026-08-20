@@ -6,8 +6,9 @@ export const REMOTE_INGRESS_SCHEMA_VERSION = 1
 export const REMOTE_INGRESS_CONTRACT_VERSION = '1.1.0'
 export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.2'
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const DATETIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/
+const UUID = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/
+const DATE_SOURCE = '(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))'
+const DATETIME = new RegExp(`^${DATE_SOURCE}T(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)$`)
 const WAKE_KINDS = new Set(['conversational_command', 'control', 'advisory_update', 'history_reseed', 'idle'])
 const ACTOR_KINDS = new Set(['human', 'agent', 'ai', 'system'])
 const RELATIONSHIPS = new Set(['before_window', 'within_window', 'after_command'])
@@ -26,15 +27,14 @@ function exact(value, keys) {
 function uuid(value) { return typeof value === 'string' && UUID.test(value) }
 function text(value) { return typeof value === 'string' && value.length > 0 }
 function nullableText(value) { return value === null || text(value) }
-function datetime(value) { return typeof value === 'string' && DATETIME.test(value) && Number.isFinite(Date.parse(value)) }
-function integer(value, min = 0) { return Number.isInteger(value) && value >= min }
+function datetime(value) { return typeof value === 'string' && DATETIME.test(value) }
+function integer(value, min = 0) { return Number.isSafeInteger(value) && value >= min }
 function ordered(rows) { return rows.every((row, i) => i === 0 || rows[i - 1].order.sequence < row.order.sequence) }
 
 function validOrder(value) {
   return exact(value, ['sequence', 'created_at', 'message_id']) && integer(value.sequence, 1) &&
     datetime(value.created_at) && uuid(value.message_id)
 }
-function sameOrder(a, b) { return a.sequence === b.sequence && a.created_at === b.created_at && a.message_id === b.message_id }
 function validAddressee(value) {
   return exact(value, ['connection_id', 'agent_name', 'codename', 'label']) && uuid(value.connection_id) &&
     nullableText(value.agent_name) && nullableText(value.codename) && text(value.label)
@@ -187,29 +187,116 @@ export function emptyCanonicalContextCarry() {
     context: Object.fromEntries(REMOTE_INGRESS_CONTEXT_BUCKETS.map((bucket) => [bucket, []])),
     windows: [],
     locally_omitted: 0,
+    locally_omitted_by_bucket: Object.fromEntries(REMOTE_INGRESS_CONTEXT_BUCKETS.map((bucket) => [bucket, 0])),
+    windows_omitted: 0,
+    local_omission_reason: null,
   }
 }
 
-/** Preserve the existing newest-first bounded carry, independently per typed actor bucket. */
-export function mergeCanonicalContextCarry(carry, envelope, { maxCount = 20, maxChars = 12_000 } = {}) {
+/** Strictly bound the complete advisory rows and source-window ledger, newest first. */
+export function mergeCanonicalContextCarry(
+  carry,
+  envelope,
+  { maxCount = 20, maxChars = 12_000, maxWindows = 20 } = {},
+) {
   const next = emptyCanonicalContextCarry()
-  next.windows = [...(Array.isArray(carry?.windows) ? carry.windows : []), envelope.window]
+  const priorWindows = Array.isArray(carry?.windows) ? carry.windows : []
+  const windowKey = (window) => JSON.stringify([
+    window.policy_version,
+    window.source_window.start?.sequence ?? null,
+    window.source_window.start?.message_id ?? null,
+    window.source_window.end?.sequence ?? null,
+    window.source_window.end?.message_id ?? null,
+    window.fetch_id,
+    window.next_cursor,
+  ])
+  const uniqueWindows = new Map()
+  for (const window of [...priorWindows, envelope.window]) uniqueWindows.set(windowKey(window), window)
+  const allWindows = [...uniqueWindows.values()]
+  next.windows = allWindows.slice(-maxWindows)
+  next.windows_omitted = (integer(carry?.windows_omitted) ? carry.windows_omitted : 0) +
+    Math.max(0, allWindows.length - next.windows.length)
   next.locally_omitted = integer(carry?.locally_omitted) ? carry.locally_omitted : 0
   for (const bucket of REMOTE_INGRESS_CONTEXT_BUCKETS) {
-    const rows = [...(Array.isArray(carry?.context?.[bucket]) ? carry.context[bucket] : []), ...envelope.context[bucket]]
-    const kept = []
-    let chars = 0
-    for (let i = rows.length - 1; i >= 0 && kept.length < maxCount; i--) {
-      const size = rows[i].content.length
-      if (kept.length > 0 && chars + size > maxChars) break
-      chars += size
-      kept.push(rows[i])
+    next.locally_omitted_by_bucket[bucket] = integer(carry?.locally_omitted_by_bucket?.[bucket])
+      ? carry.locally_omitted_by_bucket[bucket]
+      : 0
+  }
+
+  const taggedById = new Map()
+  for (const bucket of REMOTE_INGRESS_CONTEXT_BUCKETS) {
+    const prior = Array.isArray(carry?.context?.[bucket]) ? carry.context[bucket] : []
+    for (const row of [...prior, ...envelope.context[bucket]]) taggedById.set(row.message_id, { bucket, row })
+  }
+  const tagged = [...taggedById.values()].sort((a, b) => a.row.order.sequence - b.row.order.sequence)
+  const kept = []
+  let chars = 0
+  for (let i = tagged.length - 1; i >= 0 && kept.length < maxCount; i--) {
+    const taggedRow = tagged[i]
+    const size = taggedRow.row.content.length
+    if (size > maxChars || chars + size > maxChars) continue
+    chars += size
+    kept.push(taggedRow)
+  }
+  kept.reverse()
+  const keptIds = new Set(kept.map(({ row }) => row.message_id))
+  for (const { bucket, row } of tagged) {
+    if (keptIds.has(row.message_id)) next.context[bucket].push(row)
+    else {
+      next.locally_omitted++
+      next.locally_omitted_by_bucket[bucket]++
     }
-    kept.reverse()
-    next.context[bucket] = kept
-    next.locally_omitted += rows.length - kept.length
+  }
+  if (next.locally_omitted > 0 || next.windows_omitted > 0) {
+    next.local_omission_reason = 'model_budget'
   }
   return next
+}
+
+export function validateCanonicalContextCarry(
+  carry,
+  { maxCount = 20, maxChars = 12_000, maxWindows = 20 } = {},
+) {
+  if (!exact(carry, [
+    'advisory', 'typed', 'windows', 'locally_omitted', 'locally_omitted_by_bucket',
+    'windows_omitted', 'local_omission_reason', 'note',
+  ]) || carry.advisory !== true || !validContext(carry.typed) || !Array.isArray(carry.windows) ||
+      carry.windows.length > maxWindows || !carry.windows.every(validWindow) ||
+      !integer(carry.locally_omitted) || !integer(carry.windows_omitted) ||
+      !exact(carry.locally_omitted_by_bucket, REMOTE_INGRESS_CONTEXT_BUCKETS) ||
+      REMOTE_INGRESS_CONTEXT_BUCKETS.some((bucket) => !integer(carry.locally_omitted_by_bucket[bucket])) ||
+      !(carry.local_omission_reason === null || carry.local_omission_reason === 'model_budget') ||
+      typeof carry.note !== 'string') return false
+  const rows = Object.values(carry.typed).flat()
+  const omittedByBucket = Object.values(carry.locally_omitted_by_bucket)
+    .reduce((sum, count) => sum + count, 0)
+  return omittedByBucket === carry.locally_omitted && rows.length <= maxCount &&
+    rows.reduce((sum, row) => sum + row.content.length, 0) <= maxChars &&
+    (carry.locally_omitted > 0 || carry.windows_omitted > 0
+      ? carry.local_omission_reason === 'model_budget'
+      : carry.local_omission_reason === null)
+}
+
+export function canonicalContextAcceptanceKey(envelope) {
+  const start = envelope.window.source_window.start
+  const end = envelope.window.source_window.end
+  return [
+    'context-window', envelope.delivery_state, envelope.wake.kind,
+    envelope.control?.id ?? 'no-control',
+    start ? `${start.sequence}:${start.message_id}` : 'empty',
+    end ? `${end.sequence}:${end.message_id}` : 'empty',
+    envelope.window.fetch_id ?? 'no-fetch',
+  ].join(':')
+}
+
+/** Stable across server replay (envelope_id is intentionally not used). */
+export function canonicalAcceptanceKey(envelope) {
+  if (envelope.wake.kind === 'conversational_command' && envelope.commands.length > 0) {
+    const first = envelope.commands[0]
+    return `command-turn:${first.delivery.turn_id}:${first.delivery.primary_provenance_ref}`
+  }
+  if (envelope.wake.kind === 'control' && envelope.control) return `control:${envelope.control.id}`
+  return canonicalContextAcceptanceKey(envelope)
 }
 
 export function canonicalAttachmentDescriptor(attachment) {

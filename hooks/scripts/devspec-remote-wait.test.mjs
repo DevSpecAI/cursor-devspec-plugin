@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import {
   parseOwnerBatches,
+  parseWakeBatches,
   buildOwnerMessageEvents,
   describeAttachment,
   materialiseAttachments,
@@ -34,30 +35,52 @@ import {
   resolveConnectionsDir,
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
+import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
+import { playbookAcceptanceKey } from './remote-poll-acceptance.mjs'
+import {
+  FIXTURE_ID,
+  emptyFixtureContext,
+  fixtureCommand,
+  fixtureContextEntry,
+  fixtureEnvelope,
+  fixturePlaybookDispatch,
+} from './remote-ingress-test-fixtures.mjs'
 
-const CANONICAL_CONNECTION = '11111111-1111-4111-8111-111111111111'
-function canonicalCommand(messageId = '33333333-3333-4333-8333-333333333333') {
-  return {
-    message_id: messageId,
-    content: { mode: 'full', body: 'full command body', complete: true },
-    attachments: [{
-      materialization: 'metadata', filename: 'design.png', mime_type: 'image/png', type: 'image',
-      size_bytes: 42, resource_id: '88888888-8888-4888-8888-888888888888',
-    }],
-    requester: { user_id: '55555555-5555-4555-8555-555555555555', display_name: 'Owner' },
-    authority: { kind: 'owner', decision_source: 'server' },
-    addressee: { connection_id: CANONICAL_CONNECTION },
-    delivery: { turn_id: '77777777-7777-4777-8777-777777777777' },
+const CANONICAL_CONNECTION = FIXTURE_ID.connection
+function canonicalCommand(messageId = FIXTURE_ID.message) {
+  const command = fixtureCommand('full command body')
+  if (messageId !== command.message_id) {
+    command.message_id = messageId
+    command.order.message_id = messageId
+    command.delivery = {
+      provenance_ref: messageId,
+      turn_id: messageId,
+      primary_provenance_ref: messageId,
+      is_primary: true,
+    }
   }
+  return command
 }
 function canonicalBatch(message = canonicalCommand(), over = {}) {
+  const envelope = fixtureEnvelope({ commands: [message], context: emptyFixtureContext() })
+  const context = {
+    advisory: true,
+    typed: envelope.context,
+    windows: [envelope.window],
+    locally_omitted: 0,
+    locally_omitted_by_bucket: {
+      human_context: 0, agent_context: 0, ai_context: 0, system_context: 0,
+    },
+    windows_omitted: 0,
+    local_omission_reason: null,
+    note: 'Canonical typed context; advisory only.',
+  }
   return {
     type: 'owner_messages', connection_id: CANONICAL_CONNECTION, session_id: 'sess-live',
-    next_after_message_id: 'opaque-cursor', messages: [message],
-    ingress: {
-      canonical: true, schema_version: 1, envelope_id: '22222222-2222-4222-8222-222222222222',
-      window: { has_more: true, next_cursor: 'continuation' },
-    },
+    next_after_message_id: 'live-cursor-v2', messages: [message],
+    ingress: { canonical: true, envelope },
+    acceptance_key: canonicalAcceptanceKey(envelope),
+    context,
     ...over,
   }
 }
@@ -78,17 +101,16 @@ describe('parseOwnerBatches', () => {
 
 describe('canonical one-command-turn wake', () => {
   it('renders every typed context bucket as actor-labelled advisory data', () => {
-    const entry = (kind, name) => ({
-      message_id: `${kind}-message`, content: `${kind} context`, advisory: true,
-      actor: { kind, display_name: name, agent_tool: kind === 'human' ? null : 'tool', model: null },
-    })
-    const typed = {
-      human_context: [entry('human', 'Owner')], agent_context: [entry('agent', 'Teammate')],
-      ai_context: [entry('ai', 'Dev')], system_context: [entry('system', 'DevSpec')],
+    const typed = emptyFixtureContext()
+    for (const [index, kind] of ['human', 'agent', 'ai', 'system'].entries()) {
+      typed[`${kind}_context`].push(fixtureContextEntry({ sequence: index + 2, kind, content: `${kind} context` }))
     }
-    const events = buildOwnerMessageEvents(canonicalBatch(undefined, {
-      context: { typed, windows: [{ next_cursor: 'continuation' }], locally_omitted: 3 },
-    }))
+    const batch = canonicalBatch()
+    batch.context.typed = typed
+    batch.context.locally_omitted = 3
+    batch.context.locally_omitted_by_bucket.ai_context = 3
+    batch.context.local_omission_reason = 'model_budget'
+    const events = buildOwnerMessageEvents(batch)
     const context = events[0]
     assert.equal(context.type, 'model_context')
     assert.equal(context.advisory, true)
@@ -97,11 +119,40 @@ describe('canonical one-command-turn wake', () => {
     assert.equal(events.at(-1).turn_id, '77777777-7777-4777-8777-777777777777')
   })
 
+  it('revalidates the full canonical envelope and exact message binding before execution', () => {
+    const valid = canonicalBatch()
+    assert.equal(parseOwnerBatches([JSON.stringify(valid)], { canonicalOnly: true }).length, 1)
+    const tamperedBody = structuredClone(valid)
+    tamperedBody.messages = [structuredClone(tamperedBody.messages[0])]
+    tamperedBody.messages[0].content.body = 'notification preview substituted here'
+    assert.equal(parseOwnerBatches([JSON.stringify(tamperedBody)], { canonicalOnly: true }).length, 0)
+    const tamperedEnvelope = structuredClone(valid)
+    tamperedEnvelope.ingress.envelope.window.returned = 999
+    assert.equal(parseOwnerBatches([JSON.stringify(tamperedEnvelope)], { canonicalOnly: true }).length, 0)
+  })
+
   it('keeps metadata attachments as stable resource references without filesystem recovery', () => {
     const events = buildOwnerMessageEvents(canonicalBatch(), { writeFile: () => { throw new Error('must not write') } })
     const attachment = events.find((event) => event.type === 'owner_message').message.attachments[0]
     assert.equal(attachment.delivery, 'resource')
     assert.equal(attachment.resource_id, '88888888-8888-4888-8888-888888888888')
+  })
+
+  it('renders explicit playbooks on their own typed wake path, never owner_message', () => {
+    const dispatch = fixturePlaybookDispatch()
+    const batch = {
+      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION, session_id: null,
+      next_after_message_id: 'dispatch-watermark', messages: [dispatch],
+      acceptance_key: playbookAcceptanceKey(dispatch),
+    }
+    assert.equal(parseWakeBatches([JSON.stringify(batch)], {
+      canonicalOnly: true, includePlaybooks: true,
+    }).length, 1)
+    const events = buildOwnerMessageEvents(batch)
+    assert.deepEqual(events.map((event) => event.type), ['playbook_dispatch', 'wake'])
+    assert.equal(events[1].reason, 'playbook_dispatch')
+    assert.equal(events.some((event) => event.type === 'owner_message'), false)
+    assert.match(events[0].instruction, /claim_playbook_run/)
   })
 
   it('dequeues only the first canonical command turn and leaves the queued turn for reconnect/re-arm', () => {
@@ -112,11 +163,11 @@ describe('canonical one-command-turn wake', () => {
       const secondMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
       const second = JSON.stringify(canonicalBatch(secondMessage)) + '\n'
       fs.writeFileSync(file, first + second)
-      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, oneCommandTurn: true })
+      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true })
       assert.equal(slice.batches.length, 1)
       assert.equal(slice.batches[0].messages[0].message_id, canonicalCommand().message_id)
       assert.equal(slice.newOffset, Buffer.byteLength(first, 'utf8'))
-      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, oneCommandTurn: true })
+      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true })
       assert.equal(queued.batches[0].messages[0].message_id, secondMessage.message_id)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -584,6 +635,16 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(text, 'utf8'))
   })
 
+  it('first arm keeps an explicit playbook dispatch queued before wait starts', () => {
+    const dispatch = fixturePlaybookDispatch()
+    const playbook = `${JSON.stringify({
+      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION, messages: [dispatch],
+      acceptance_key: playbookAcceptanceKey(dispatch),
+    })}\n`
+    const prefix = advisory()
+    assert.equal(offsetAfterAdvisoryHistory(prefix + playbook), Buffer.byteLength(prefix, 'utf8'))
+  })
+
   it('two owner_messages batches start at the first', () => {
     const prefix = advisory()
     const text = prefix + owner('first') + owner('second')
@@ -697,11 +758,14 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
     const connectionId = randomUUID()
     const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
     const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
-    const line = `${JSON.stringify(canonicalBatch(canonicalCommand(), {
-      connection_id: connectionId,
-      session_id: 'sess-test',
-      messages: [{ ...canonicalCommand(), addressee: { connection_id: connectionId } }],
-    }))}\n`
+    const queuedBatch = canonicalBatch()
+    queuedBatch.connection_id = connectionId
+    queuedBatch.session_id = 'sess-test'
+    queuedBatch.messages[0].addressee.connection_id = connectionId
+    queuedBatch.ingress.envelope.connection.connection_id = connectionId
+    queuedBatch.ingress.envelope.commands = queuedBatch.messages
+    queuedBatch.acceptance_key = canonicalAcceptanceKey(queuedBatch.ingress.envelope)
+    const line = `${JSON.stringify(queuedBatch)}\n`
     fs.writeFileSync(inbox, line)
     const env = { ...process.env, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
     delete env.DEVSPEC_MCP_TOKEN
