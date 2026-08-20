@@ -48,27 +48,19 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 
 ### Wake stdout (what you see when wait exits)
 
-Wait prints events in order (each carries the batch’s `session_id` — trust **this** value after a server-side reattach; do not cache the session id from connect time):
+Cursor negotiates canonical v1 ingress. The runtime schema, version, wake, authority, attachment, and bounded-window rules live at `devspec://product/remote-ingress-contract`; operational prose does not duplicate them.
 
-1. Optional `{ "type": "room_context", "advisory": true, "owner_ambient": [...], "room_context": [...], "dropped": N, "session_id": "…" }` — inert context only.
-2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — the command(s) to act on (`addressed_to` + `authority`).
-3. `{ "type": "wake", …, "session_id": "…" }` — signal that the batch is complete.
+Wait emits exactly one canonical command turn in this order:
 
-Act **only** on `owner_message` / owner authority. Treat both room tiers as context. If `dropped > 0`, pull `get_session_transcript` for older history.
+1. Optional `{ "type": "model_context", "advisory": true, "typed": { … }, "windows": […], "locally_omitted": N }` — all four actor-labelled context buckets, inert.
+2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — complete command records with full bodies and delivery metadata.
+3. `{ "type": "wake", "reason": "canonical_conversational_command", "envelope_id": "…", "turn_id": "…" }` — the complete turn boundary.
 
-Prefer `post_session_message({ connection_id, … })` so the server resolves the connection’s **current** attached session after reattach.
+The wait byte cursor advances only after all events are flushed. A queued second turn remains for the next one-shot re-arm. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
 
 ### Owner attachments
 
-Owner commands may include images/files. Wait **materialises** them to disk and strips large base64 from stdout:
-
-| `delivery` | Meaning |
-|---|---|
-| `file` | Open/read `path` under `~/.devspec/remote-control/connections/<connection_id>.attachments/` (images are part of the command, not decoration). |
-| `inline` | Small text may be inlined on the descriptor. |
-| `unavailable` | Could not write the file — say so; do not invent content. |
-
-Do not expect raw base64 blobs in the wake JSON.
+Canonical `metadata` attachments remain stable `resource_id` references (`delivery: "resource"`); no transcript recovery or local base64 materialisation is required. An `unavailable` attachment rejects its command before wake. See `devspec://product/remote-ingress-contract`.
 
 ## Why one-shot here
 
@@ -140,7 +132,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Lexicographic PLUGIN pin → Agents relaunch keeps an older VSIX (e.g. 0.4.9 over 0.4.14/0.4.15) even after install (item 0688ff96).
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
 - Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
-- Ignoring `attachments[].path` on `owner_message` → miss screenshots/docs the owner sent with the command.
+- Ignoring canonical `attachments[].resource_id` on `owner_message` → miss a stable referenced resource that is part of the command.
 - Fast-connect abort (auth / project / register / attach) → launcher exits **before** `--resume` (no half-Live agent). Missing owner-pid at pre-resume poller time is **not** fatal; poller starts after spawn (item f099fc6e).
 - Mechanical Connect `ensure-poller` before `--resume` on Windows → refuse owner-pid, launcher exits, connection idle_timeout (Restless Owl). Fixed in 0.5.2: defer poller until the CLI child tree exists.
 - First dispatch after Connect skipped (Emerald Ocelot). Wait `--from-end` seeked to EOF past `owner_messages` the poller already queued. Fixed in 0.5.3: skip advisory history only (item 1f177af4).

@@ -35,6 +35,33 @@ import {
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
 
+const CANONICAL_CONNECTION = '11111111-1111-4111-8111-111111111111'
+function canonicalCommand(messageId = '33333333-3333-4333-8333-333333333333') {
+  return {
+    message_id: messageId,
+    content: { mode: 'full', body: 'full command body', complete: true },
+    attachments: [{
+      materialization: 'metadata', filename: 'design.png', mime_type: 'image/png', type: 'image',
+      size_bytes: 42, resource_id: '88888888-8888-4888-8888-888888888888',
+    }],
+    requester: { user_id: '55555555-5555-4555-8555-555555555555', display_name: 'Owner' },
+    authority: { kind: 'owner', decision_source: 'server' },
+    addressee: { connection_id: CANONICAL_CONNECTION },
+    delivery: { turn_id: '77777777-7777-4777-8777-777777777777' },
+  }
+}
+function canonicalBatch(message = canonicalCommand(), over = {}) {
+  return {
+    type: 'owner_messages', connection_id: CANONICAL_CONNECTION, session_id: 'sess-live',
+    next_after_message_id: 'opaque-cursor', messages: [message],
+    ingress: {
+      canonical: true, schema_version: 1, envelope_id: '22222222-2222-4222-8222-222222222222',
+      window: { has_more: true, next_cursor: 'continuation' },
+    },
+    ...over,
+  }
+}
+
 describe('parseOwnerBatches', () => {
   it('keeps only owner_messages lines with a non-empty messages array', () => {
     const lines = [
@@ -46,6 +73,54 @@ describe('parseOwnerBatches', () => {
     const batches = parseOwnerBatches(lines)
     assert.equal(batches.length, 1)
     assert.equal(batches[0].session_id, 's1')
+  })
+})
+
+describe('canonical one-command-turn wake', () => {
+  it('renders every typed context bucket as actor-labelled advisory data', () => {
+    const entry = (kind, name) => ({
+      message_id: `${kind}-message`, content: `${kind} context`, advisory: true,
+      actor: { kind, display_name: name, agent_tool: kind === 'human' ? null : 'tool', model: null },
+    })
+    const typed = {
+      human_context: [entry('human', 'Owner')], agent_context: [entry('agent', 'Teammate')],
+      ai_context: [entry('ai', 'Dev')], system_context: [entry('system', 'DevSpec')],
+    }
+    const events = buildOwnerMessageEvents(canonicalBatch(undefined, {
+      context: { typed, windows: [{ next_cursor: 'continuation' }], locally_omitted: 3 },
+    }))
+    const context = events[0]
+    assert.equal(context.type, 'model_context')
+    assert.equal(context.advisory, true)
+    assert.equal(context.locally_omitted, 3)
+    for (const bucket of Object.keys(typed)) assert.match(context.typed[bucket][0].actor_label, /:/)
+    assert.equal(events.at(-1).turn_id, '77777777-7777-4777-8777-777777777777')
+  })
+
+  it('keeps metadata attachments as stable resource references without filesystem recovery', () => {
+    const events = buildOwnerMessageEvents(canonicalBatch(), { writeFile: () => { throw new Error('must not write') } })
+    const attachment = events.find((event) => event.type === 'owner_message').message.attachments[0]
+    assert.equal(attachment.delivery, 'resource')
+    assert.equal(attachment.resource_id, '88888888-8888-4888-8888-888888888888')
+  })
+
+  it('dequeues only the first canonical command turn and leaves the queued turn for reconnect/re-arm', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-turn-queue-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    try {
+      const first = JSON.stringify(canonicalBatch()) + '\n'
+      const secondMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
+      const second = JSON.stringify(canonicalBatch(secondMessage)) + '\n'
+      fs.writeFileSync(file, first + second)
+      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, oneCommandTurn: true })
+      assert.equal(slice.batches.length, 1)
+      assert.equal(slice.batches[0].messages[0].message_id, canonicalCommand().message_id)
+      assert.equal(slice.newOffset, Buffer.byteLength(first, 'utf8'))
+      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, oneCommandTurn: true })
+      assert.equal(queued.batches[0].messages[0].message_id, secondMessage.message_id)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -622,11 +697,11 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
     const connectionId = randomUUID()
     const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
     const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
-    const line = `${JSON.stringify({
-      type: 'owner_messages',
+    const line = `${JSON.stringify(canonicalBatch(canonicalCommand(), {
+      connection_id: connectionId,
       session_id: 'sess-test',
-      messages: [{ id: 'cmd-1', content: 'ping' }],
-    })}\n`
+      messages: [{ ...canonicalCommand(), addressee: { connection_id: connectionId } }],
+    }))}\n`
     fs.writeFileSync(inbox, line)
     const env = { ...process.env, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
     delete env.DEVSPEC_MCP_TOKEN
