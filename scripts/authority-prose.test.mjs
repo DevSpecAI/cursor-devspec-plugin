@@ -9,6 +9,7 @@ const operationalFiles = [
   'hooks/scripts/devspec-remote-poll.mjs',
   'hooks/scripts/devspec-remote-wait.mjs',
   'hooks/scripts/resolve-mcp-auth.mjs',
+  'scripts/pin-remote-plugin.mjs',
 ]
 
 const contents = new Map(
@@ -48,6 +49,12 @@ describe('current Cursor authority and work-acquisition prose', () => {
       /\bfirst dispatch after Connect\b/i,
       /\btargeted dispatches\b/i,
       /\bowner-only commands\b/i,
+      /fail loudly, never silently, never by chatting/i,
+      /fail a blocked item[^\n]*rather than stalling/i,
+      /never do is post a question[^\n]*wait/i,
+      /nobody may be there/i,
+      /batch stalls dead/i,
+      /server-delivered commands still win/i,
     ]
 
     for (const [file, content] of contents) {
@@ -75,6 +82,15 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /immutable[\s\S]{0,80}requester[^\n]*provenance/i, file)
       assert.match(content, /typed[^\n]{0,80}control|control[^\n]{0,80}typed/i, file)
       assert.match(content, /owner-scoped[^\n]{0,80}`?playbook_dispatch`?/i, file)
+    }
+  })
+
+  it('keeps interaction policy item-scoped on every work surface', () => {
+    for (const file of ['skills/devspec.remote/SKILL.md', 'scripts/pin-remote-plugin.mjs']) {
+      const content = contents.get(file)
+      assert.match(content, /multiple items do not change (?:that )?interaction policy/i, file)
+      assert.match(content, /each claimed item[^\n]*served[^\n]*implementation(?:-| )contract/i, file)
+      assert.match(content, /item(?:’s|'s)? intent[^\n]*(?:acceptance )?criteria/i, file)
     }
   })
 })
