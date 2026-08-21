@@ -93,7 +93,7 @@ export function fixtureEnvelope({
   const cmds = commands ?? (wakeKind === 'conversational_command' ? [fixtureCommand(body)] : [])
   const rows = [...cmds, ...Object.values(context).flat()]
   return {
-    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.0',
+    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.1',
     policy_version: '2026-08-19.2', envelope_id: envelopeId,
     connection: {
       connection_id: FIXTURE_ID.connection, agent_name: 'Cursor', codename: 'Calm Fox',

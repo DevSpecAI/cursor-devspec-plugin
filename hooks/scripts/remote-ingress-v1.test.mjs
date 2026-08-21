@@ -38,6 +38,35 @@ describe('canonical remote ingress v1', () => {
     const unknown = envelope()
     unknown.schema_version = 2
     assert.equal(normalizeRemoteIngressV1({ changed: true, ingress: unknown }, ID.connection).ok, false)
+    const previousPatch = envelope()
+    previousPatch.contract_version = '1.1.0'
+    assert.equal(normalizeRemoteIngressV1({ changed: true, ingress: previousPatch }, ID.connection).ok, true)
+    const futurePatch = envelope()
+    futurePatch.contract_version = '1.1.2'
+    assert.equal(normalizeRemoteIngressV1({ changed: true, ingress: futurePatch }, ID.connection).ok, false)
+  })
+
+  it('accepts a later cursor delta after the turn primary was already consumed', () => {
+    const secondary = structuredClone(command())
+    secondary.message_id = ID.control
+    secondary.order = {
+      sequence: 2,
+      created_at: '2026-08-19T12:00:02.000Z',
+      message_id: ID.control,
+    }
+    secondary.delivery = {
+      ...secondary.delivery,
+      provenance_ref: ID.resource,
+      primary_provenance_ref: ID.provenance,
+      is_primary: false,
+    }
+    const result = normalizeRemoteIngressV1(
+      { changed: true, ingress: envelope({ commands: [secondary] }) },
+      ID.connection,
+    )
+    assert.equal(result.ok, true)
+    assert.equal(result.wake, true)
+    assert.deepEqual(result.envelope.command_message_ids, [ID.control])
   })
 
   it('keeps typed AI context inert even when its body looks executable', () => {
@@ -84,6 +113,31 @@ describe('canonical remote ingress v1', () => {
     const mismatch = envelope()
     mismatch.commands[0].requester.user_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
     assert.match(validateRemoteIngressEnvelopeV1(mismatch, ID.connection), /commands/)
+
+    const falsePrimary = envelope()
+    falsePrimary.commands[0].delivery.is_primary = false
+    assert.match(validateRemoteIngressEnvelopeV1(falsePrimary, ID.connection), /turn binding/)
+
+    const duplicateProvenance = envelope()
+    const duplicate = structuredClone(duplicateProvenance.commands[0])
+    duplicate.message_id = ID.control
+    duplicate.order = { sequence: 2, created_at: '2026-08-19T12:00:02.000Z', message_id: ID.control }
+    duplicate.delivery = {
+      ...duplicate.delivery,
+      is_primary: false,
+      primary_provenance_ref: ID.resource,
+    }
+    duplicateProvenance.commands[0].delivery = {
+      ...duplicateProvenance.commands[0].delivery,
+      provenance_ref: ID.provenance,
+      primary_provenance_ref: ID.resource,
+      is_primary: false,
+    }
+    duplicate.delivery.provenance_ref = ID.provenance
+    duplicateProvenance.commands.push(duplicate)
+    duplicateProvenance.command_message_ids.push(duplicate.message_id)
+    duplicateProvenance.window = windowFor(duplicateProvenance.commands)
+    assert.match(validateRemoteIngressEnvelopeV1(duplicateProvenance, ID.connection), /turn binding/)
   })
 
   it('strictly bounds large typed context and honestly reports row/window omissions', () => {

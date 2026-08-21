@@ -6,15 +6,17 @@ import { describe, it } from 'node:test'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
 import {
   advancePollCursorState,
+  appendAcceptedCanonicalJsonl,
   appendAcceptedJsonl,
   buildPollCursorArgs,
   inspectPollResponseV1,
   playbookAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
-import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
+import { canonicalAcceptanceKey, validateRemoteIngressEnvelopeV1 } from './remote-ingress-v1.mjs'
 import {
   FIXTURE_ID,
   emptyFixtureContext,
+  fixtureCommand,
   fixtureContextEntry,
   fixtureControl,
   fixtureEnvelope,
@@ -116,6 +118,98 @@ describe('poll acceptance integration seam', () => {
       const replay = appendAcceptedJsonl(file, { type: 'owner_messages', messages: envelope.commands }, key)
       assert.deepEqual(replay, { ok: true, duplicate: true, error: null })
       assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('generic duplicate detection still fails closed on later malformed interior records', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-acceptance-'))
+    const file = path.join(dir, 'control.jsonl')
+    try {
+      fs.writeFileSync(file, [
+        JSON.stringify({ acceptance_key: 'control:1', type: 'host_control' }),
+        '{"malformed":}',
+        JSON.stringify({ acceptance_key: 'control:2', type: 'host_control' }),
+        '',
+      ].join('\n'))
+      const result = appendAcceptedJsonl(file, { type: 'host_control' }, 'control:1')
+      assert.equal(result.ok, false)
+      assert.equal(result.duplicate, false)
+      assert.match(result.error, /malformed complete interior/)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('durably filters an expanded retry window per command message', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-acceptance-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    const first = fixtureCommand('first')
+    const second = structuredClone(fixtureCommand('second'))
+    second.message_id = FIXTURE_ID.control
+    second.order = {
+      sequence: 2,
+      created_at: '2026-08-19T12:00:02.000Z',
+      message_id: FIXTURE_ID.control,
+    }
+    second.delivery = {
+      ...second.delivery,
+      provenance_ref: FIXTURE_ID.resource,
+      primary_provenance_ref: FIXTURE_ID.provenance,
+      is_primary: false,
+    }
+    const record = (envelope) => ({
+      type: 'owner_messages',
+      count: envelope.commands.length,
+      connection_id: FIXTURE_ID.connection,
+      messages: envelope.commands,
+      context: null,
+      ingress: { canonical: true, envelope },
+    })
+    try {
+      const initial = fixtureEnvelope({ commands: [first] })
+      assert.equal(appendAcceptedCanonicalJsonl(file, record(initial)).duplicate, false)
+      fs.appendFileSync(file, '{"newline_terminated_but_malformed":}\n')
+      const expanded = fixtureEnvelope({ commands: [first, second] })
+      const accepted = appendAcceptedCanonicalJsonl(file, record(expanded))
+      assert.equal(accepted.duplicate, false)
+      assert.deepEqual(accepted.record.messages.map((command) => command.message_id), [second.message_id])
+      assert.deepEqual(accepted.record.ingress.envelope.command_message_ids, [second.message_id])
+      assert.equal(validateRemoteIngressEnvelopeV1(accepted.record.ingress.envelope, FIXTURE_ID.connection), null)
+      assert.equal(appendAcceptedCanonicalJsonl(file, record(expanded)).duplicate, true)
+      const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
+      assert.deepEqual(lines.map((line) => line.messages.map((command) => command.message_id)), [
+        [first.message_id],
+        [second.message_id],
+      ])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed on a malformed complete interior acceptance record', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-acceptance-'))
+    const file = path.join(dir, 'inbox.jsonl')
+    const envelope = fixtureEnvelope()
+    const record = {
+      type: 'owner_messages',
+      count: envelope.commands.length,
+      connection_id: FIXTURE_ID.connection,
+      messages: envelope.commands,
+      context: null,
+      ingress: { canonical: true, envelope },
+    }
+    try {
+      fs.writeFileSync(file, [
+        JSON.stringify({ type: 'advisory_context', messages: [] }),
+        '{"malformed":}',
+        JSON.stringify({ type: 'advisory_context', messages: [] }),
+        '',
+      ].join('\n'))
+      const result = appendAcceptedCanonicalJsonl(file, record)
+      assert.equal(result.ok, false)
+      assert.match(result.error, /malformed complete interior/)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
