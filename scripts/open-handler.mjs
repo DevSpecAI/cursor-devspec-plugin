@@ -14,6 +14,7 @@ import {
   appendHandlerLog,
   writeExtensionRootMarker,
 } from './open-handler-core.mjs'
+import { ensureSpaceSafePluginPin } from './space-safe-plugin-root.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -25,11 +26,13 @@ async function copyInstalledArtifacts(sourceDir) {
   // protocol CLI launches prefer that tree over a stale DEVSPEC_DIR copy.
   const extensionRoot = path.resolve(sourceDir, '..')
   await writeExtensionRootMarker(extensionRoot)
+  ensureSpaceSafePluginPin(extensionRoot)
 
   const files = [
     'open-handler.mjs',
     'open-handler-core.mjs',
     'pin-remote-plugin.mjs',
+    'space-safe-plugin-root.mjs',
     'launch-cli-session.mjs',
     'launch-opencode-session.mjs',
     'launch-pi-session.mjs',

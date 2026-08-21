@@ -31,6 +31,12 @@ import {
 import { resolveDevspecMcpAuth } from '../hooks/scripts/resolve-mcp-auth.mjs'
 import { fastConnect } from '../hooks/scripts/fast-connect.mjs'
 import { ensurePollerAfterAgentSpawn } from '../hooks/scripts/remote-control-state.mjs'
+import {
+  pathHasWhitespace,
+  spaceSafePluginRoot,
+} from './space-safe-plugin-root.mjs'
+
+export { pathHasWhitespace, spaceSafePluginRoot, win32SpaceSafePluginPin } from './space-safe-plugin-root.mjs'
 
 function parseArgs(argv) {
   const out = {}
@@ -109,65 +115,6 @@ export function pluginRootFromLauncher() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 }
 
-export function pathHasWhitespace(p) {
-  return /[\s]/.test(String(p ?? ''))
-}
-
-/** Space-free Windows pin so Connect argv `node <script>` cannot wrap inside quotes (item dc3fb0f5). */
-export function win32SpaceSafePluginPin(programData = process.env.ProgramData) {
-  return path.join(String(programData || 'C:\\ProgramData'), 'DevSpec', 'cursor-plugin')
-}
-
-/**
- * When pluginRoot contains whitespace (e.g. `C:\Users\Brandon Young\...`), junction
- * it to a space-free pin so the wait-first argv path is one unquoted token.
- * Cursor TUI wrap splits quoted spaced paths and the model drops the quotes (Ibis).
- * Junction keeps relative imports. POSIX / space-free roots are returned unchanged.
- *
- * @param {string} pluginRoot
- * @param {{
- *   platform?: NodeJS.Platform,
- *   pinRoot?: string,
- *   mkdirSync?: (d: string) => void,
- *   existsSync?: (p: string) => boolean,
- *   lstatSync?: (p: string) => { isSymbolicLink?: () => boolean, isDirectory?: () => boolean },
- *   rmSync?: (p: string) => void,
- *   symlinkSync?: (target: string, dest: string) => void,
- *   readlinkSync?: (p: string) => string,
- * }} [opts]
- * @returns {string}
- */
-export function spaceSafePluginRoot(pluginRoot, opts = {}) {
-  const root = path.resolve(String(pluginRoot ?? ''))
-  if (!root || !pathHasWhitespace(root)) return root
-  const platform = opts.platform ?? process.platform
-  if (platform !== 'win32') return root
-  const pin = path.resolve(String(opts.pinRoot ?? win32SpaceSafePluginPin()))
-  const mkdir = opts.mkdirSync ?? ((d) => fs.mkdirSync(d, { recursive: true }))
-  const exists = opts.existsSync ?? ((p) => fs.existsSync(p))
-  const lstat = opts.lstatSync ?? ((p) => fs.lstatSync(p))
-  const rm = opts.rmSync ?? ((p) => fs.rmSync(p, { recursive: true, force: true }))
-  const symlink = opts.symlinkSync ?? ((target, dest) => fs.symlinkSync(target, dest, 'junction'))
-  const readlink = opts.readlinkSync ?? ((p) => fs.readlinkSync(p))
-  try {
-    mkdir(path.dirname(pin))
-    if (exists(pin)) {
-      let current = ''
-      try {
-        current = path.resolve(String(readlink(pin)))
-      } catch {
-        current = ''
-      }
-      if (current === root) return pin
-      rm(pin)
-    }
-    symlink(root, pin)
-    return pin
-  } catch {
-    return root
-  }
-}
-
 /**
  * Quote a filesystem path for an agent-facing Shell one-liner (not cmd.exe).
  * @param {string} p
@@ -192,6 +139,9 @@ export function buildRemoteWaitCommand(opts) {
     'scripts',
     'devspec-remote-wait.mjs',
   )
+  if (pathHasWhitespace(waitScript)) {
+    throw new Error(`buildRemoteWaitCommand: wait script path has whitespace: ${waitScript}`)
+  }
   const connectionId = String(opts.connectionId ?? '').trim()
   const launchId =
     typeof opts.launchId === 'string' && opts.launchId.trim() ? opts.launchId.trim() : ''

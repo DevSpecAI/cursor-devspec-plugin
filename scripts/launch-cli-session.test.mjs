@@ -246,6 +246,74 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.equal(spaceSafePluginRoot(root, { platform: 'linux' }), path.resolve(root))
   })
 
+  it('wait argv stays space-free when a leftover cursor-plugin junction points at an old VSIX (item 6de4b055)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pin-legacy-'))
+    try {
+      const programData = tmp
+      const legacyPin = path.join(programData, 'DevSpec', 'cursor-plugin')
+      const oldVsix = path.join(tmp, 'extensions', 'devspecai.devspec-autopilot-0.5.3')
+      const pluginRoot = path.join(tmp, 'Users', 'Brandon Young', 'ext')
+      fs.mkdirSync(oldVsix, { recursive: true })
+      fs.mkdirSync(pluginRoot, { recursive: true })
+      fs.mkdirSync(path.dirname(legacyPin), { recursive: true })
+      fs.symlinkSync(oldVsix, legacyPin, 'junction')
+
+      const waitCommand = buildRemoteWaitCommand({
+        pluginRoot,
+        connectionId: '70b341ea-401d-43d1-a126-9aa02c6725c6',
+        launchId: '58ad9f8c-f2f6-4663-b6a1-e9c7e2a590ea',
+        spaceSafe: { platform: 'win32', programData },
+      })
+      const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+      assert.ok(scriptToken, waitCommand)
+      assert.equal(pathHasWhitespace(scriptToken), false)
+      assert.equal(scriptToken.includes('Brandon Young'), false)
+      assert.match(scriptToken, /cursor-plugin-[0-9a-f]{12}/)
+      assert.equal(path.resolve(fs.readlinkSync(legacyPin)), path.resolve(oldVsix))
+
+      const stamp = buildPostLiveRemoteBrief({
+        pluginPath: pluginRoot,
+        connectionId: '70b341ea-401d-43d1-a126-9aa02c6725c6',
+        launchId: '58ad9f8c-f2f6-4663-b6a1-e9c7e2a590ea',
+      })
+      assert.ok(stamp.includes(`PLUGIN=${pluginRoot}`))
+      assert.ok(stamp.includes('Brandon Young'))
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('does not fail-open to a spaced plugin root when pin create fails (item 6de4b055)', () => {
+    const pluginRoot = path.join(os.tmpdir(), 'Users', 'Brandon Young', 'ext-fail')
+    assert.throws(
+      () =>
+        buildRemoteWaitCommand({
+          pluginRoot,
+          connectionId: '70b341ea-401d-43d1-a126-9aa02c6725c6',
+          spaceSafe: {
+            platform: 'win32',
+            pinRoot: path.join(os.tmpdir(), 'DevSpecPinFail', 'cursor-plugin'),
+            mkdirSync: () => {},
+            existsSync: () => false,
+            lstatSync: () => ({ isSymbolicLink: () => false, isDirectory: () => false }),
+            unlinkSync: () => {},
+            rmdirSync: () => {},
+            symlinkSync: () => {
+              throw new Error('EPERM')
+            },
+            readlinkSync: () => '',
+          },
+        }),
+      /cannot pin spaced plugin root|EPERM/,
+    )
+  })
+
+  it('open-handler --install ensures the space-free pin (item 6de4b055)', () => {
+    const src = fs.readFileSync(new URL('./open-handler.mjs', import.meta.url), 'utf8')
+    assert.match(src, /ensureSpaceSafePluginPin/)
+    assert.match(src, /space-safe-plugin-root\.mjs/)
+  })
+
   it('short argv would not present --- as its own agent CLI option token', () => {
     // Reconstruct the argv array launch-cli-session passes to agent.
     const stampedPath = path.join(os.tmpdir(), 'launch.stamped-test.txt')
