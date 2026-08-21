@@ -185,6 +185,10 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.ok(argv.includes(path.resolve(stampedPath)))
     assert.ok(argv.length < 1600, `argv too long: ${argv.length}`)
     assert.match(argv, /Do not pass --from-end/)
+    assert.match(argv, /post_session_message/)
+    assert.match(argv, /complete_turn true/)
+    assert.match(argv, /Do not only print the answer in this CLI/)
+    assert.doesNotMatch(argv, /act only on that/)
     assert.ok(
       fs.existsSync(path.join(pluginRootFromLauncher(), 'hooks', 'scripts', 'devspec-wake-tail.mjs')),
       'launcher plugin root must resolve wake-tail script',

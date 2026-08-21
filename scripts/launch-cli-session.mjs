@@ -186,7 +186,7 @@ export function buildShortArgvPrompt(stampedPromptPath, opts = {}) {
     return (
       `Arm wait FIRST as a background Shell with block_until_ms: 0 and notify_on_output pattern ${REMOTE_WAKE_NOTIFY_PATTERN}. ` +
       `Do not read any file, skill, or script before it. Do not pass --from-end. Host already follows the inbox. ${waitCommand} ` +
-      `When notify prints owner_message, act only on that. Leave the background Shell running. Stamp on disk for recovery only: ${p}`
+      `When notify prints owner_message, post_session_message the reply to that DevSpec session (connection_id from the wake, complete_turn true). Do not only print the answer in this CLI. Leave the background Shell running. Stamp on disk for recovery only: ${p}`
     )
   }
   return `Read the file at ${p} and follow every instruction in it exactly, then begin.`

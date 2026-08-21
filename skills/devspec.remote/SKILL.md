@@ -221,7 +221,7 @@ How to run wait so the model actually turns:
 
 | Host | How |
 |---|---|
-| **Cursor (Agents Connect)** | Background Shell on the argv **wake-tail** (`block_until_ms: 0`, `notify_on_output` pattern `owner_message\|session_ended\|playbook_dispatch`). Host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end`. **Do not** re-arm after `turn_ended`. |
+| **Cursor (Agents Connect)** | Background Shell on the argv **wake-tail** (`block_until_ms: 0`, `notify_on_output` pattern `owner_message\|session_ended\|playbook_dispatch`). Host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end`. **Do not** re-arm after `turn_ended`. When notify prints `owner_message`, `post_session_message` the reply to that DevSpec session (`connection_id` from the wake, `complete_turn: true`). Do not only print the answer in this CLI. |
 | **Cursor (manual `/devspec.remote`)** | One-shot wait with `notify_on_output` / `monitor` on stdout. When you see `type":"wake"`, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
 
 Wait contract:
