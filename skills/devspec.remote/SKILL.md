@@ -20,7 +20,7 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 | Situation | What to do |
 |---|---|
-| **Stamped “already Live” brief** (Agents launch / protocol handoff) | Mechanical Connect **already ran** in `launch-cli-session` (`fast-connect`). Bond IDs are in the prompt. **Do not** call `register_connection` / `attach_connection`. Arm wait with `--from-end`, handle owner commands, re-arm with `--pending --after-reply`. |
+| **Stamped “already Live” brief** (Agents launch / protocol handoff) | Mechanical Connect **already ran** in `launch-cli-session` (`fast-connect`). Bond IDs are in the prompt. **Do not** call `register_connection` / `attach_connection`. Arm the argv **background tail** (`block_until_ms: 0` + `notify_on_output`); host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end` and **do not** re-arm wait after `turn_ended`. |
 | **`resolve-local` → `already_live`** | Re-arm wait only (attach only if `--session` changed). |
 | **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers (Axiom `connect_phase`). Fall back to MCP only if helpers are missing. |
 
@@ -221,7 +221,8 @@ How to run wait so the model actually turns:
 
 | Host | How |
 |---|---|
-| **Cursor** | `monitor` tool on the wait command (each stdout line notifies the chat). When you see `type":"wake"`, act, post the reply, then **re-arm wait** with `monitor` using **`--pending --after-reply`**. Never re-arm with `--from-end`. |
+| **Cursor (Agents Connect)** | Background Shell on the argv **wake-tail** (`block_until_ms: 0`, `notify_on_output` pattern `owner_message\|session_ended\|playbook_dispatch`). Host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end`. **Do not** re-arm after `turn_ended`. |
+| **Cursor (manual `/devspec.remote`)** | One-shot wait with `notify_on_output` / `monitor` on stdout. When you see `type":"wake"`, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
 
 Wait contract:
 - Does **not** heartbeat (the poller does).

@@ -34,6 +34,10 @@
  *
  * Usage:
  *   node devspec-remote-wait.mjs --connection-id <uuid> [--from-end|--pending] [--after-reply] [--owner-pid <pid>]
+ *   node devspec-remote-wait.mjs --connection-id <uuid> --from-end --follow --wake-file <path>
+ *     Host-owned Connect follow (item 9d89a6d2): never exit 0 on a command; append
+ *     each accepted batch to the wake file so a background tail can notify after
+ *     Cursor turn_ended. Do not pass --after-reply on follow (would hide mid-turn work).
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
@@ -67,6 +71,7 @@ import {
   emitConnectPhase,
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
+import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -203,7 +208,7 @@ function parseArgs(argv) {
   // Live bug 2026-07-24: re-arm with --from-end after a wake permanently dropped
   // concurrent owner mail. Live bug 2026-08-13 (Emerald Ocelot / 1f177af4): first
   // arm seek-to-EOF skipped owner_messages the mechanical poller wrote before wait.
-  const out = { fromEnd: false, pending: false, afterReply: false }
+  const out = { fromEnd: false, pending: false, afterReply: false, follow: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
@@ -214,7 +219,9 @@ function parseArgs(argv) {
       out.fromEnd = false
     } else if (a === '--after-reply' || a === '--after_reply') {
       out.afterReply = true
-    } else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
+    } else if (a === '--follow') out.follow = true
+    else if (a === '--wake-file' || a === '--wake_file') out.wakeFile = argv[++i]
+    else if (a === '--poll-ms') out.pollMs = Number(argv[++i]) || POLL_MS
     else if (a === '--owner-pid') out.ownerPid = argv[++i]
     else if (a === '--launch-id' || a === '--launch_id') out.launchId = argv[++i]
   }
@@ -242,7 +249,7 @@ function parseArgs(argv) {
 const WIN32_OWNER_HOST_NAMES = new Set(['cursor.exe', 'agent.exe', 'claude.exe', 'cursor-agent.exe'])
 const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe', 'bash.exe'])
 const WIN32_NODE_EPHEMERAL_CMD_RE =
-  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
+  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session/i
 const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
 const WIN32_CURSOR_AGENT_WORKER_SERVER_RE = /\bworker-server\b/i
 
@@ -337,7 +344,7 @@ function resolveOwnerPidFromChildTreeWin32(startPid, { timeoutMs = 0, maxNodes =
     `$root = ${pid}`,
     `$maxNodes = ${maxNodes}`,
     `$deadline = (Get-Date).AddMilliseconds(${timeout})`,
-    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session'`,
     `$workerServer = '(?i)\\bworker-server\\b'`,
     'do {',
     '  $fallback = $null',
@@ -410,7 +417,7 @@ function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 12, time
   const hosts = [...WIN32_OWNER_HOST_NAMES].map((n) => `'${n.replace(/'/g, "''")}'`).join(', ')
   const script = [
     `$ownerHosts = @(${hosts})`,
-    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session'`,
     `$workerServer = '(?i)\\bworker-server\\b'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
@@ -574,6 +581,11 @@ function emitStdoutEvent(event) {
   return new Promise((resolve, reject) => {
     process.stdout.write(JSON.stringify(event) + '\n', (error) => error ? reject(error) : resolve())
   })
+}
+
+async function emitEnded(event, wakeFile) {
+  await emitStdoutEvent(event)
+  if (wakeFile) appendWakeEvents(wakeFile, [event])
 }
 
 function fileSize(p) {
@@ -1128,6 +1140,15 @@ async function main() {
     process.stderr.write('devspec-remote-wait: missing --connection-id\n')
     process.exit(2)
   }
+  if (args.follow) {
+    if (!args.wakeFile) {
+      process.stderr.write('devspec-remote-wait: --follow requires --wake-file\n')
+      process.exit(2)
+    }
+    // Follow must not clear Working on every wake (item 68f7b30c).
+    args.afterReply = false
+    ensureWakeFile(args.wakeFile)
+  }
 
   const state = readState(connectionId)
   if (state && state.enabled === false) {
@@ -1193,22 +1214,24 @@ async function main() {
     })
   }
 
-  while (Date.now() - started < MAX_WAIT_MS) {
+  while (args.follow || Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
-      process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'owner_gone', connection_id: connectionId }) + '\n',
+      await emitEnded(
+        { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
+        args.wakeFile,
       )
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
-      process.stdout.write(
-        JSON.stringify({ type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId }) + '\n',
+      await emitEnded(
+        { type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId },
+        args.wakeFile,
       )
       process.exit(1)
     }
@@ -1254,8 +1277,17 @@ async function main() {
         })
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
+        if (args.follow && args.wakeFile) appendWakeEvents(args.wakeFile, events)
         offset = newOffset
         offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+        if (args.follow) {
+          process.stderr.write(
+            `devspec-remote-wait: wake (${batch.messages.length} msg) — follow\n`,
+          )
+          args.fromEnd = false
+          args.pending = true
+          continue
+        }
         process.stderr.write(
           `devspec-remote-wait: wake (${batch.messages.length} msg) — exit 0\n`,
         )

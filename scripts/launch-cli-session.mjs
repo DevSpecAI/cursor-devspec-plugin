@@ -8,8 +8,9 @@
  *
  * For remote Connect prompts: runs mechanical fast-connect (register → optional
  * attach → write state, poller deferred) AFTER create-chat and BEFORE --resume,
- * stamps a thin post-Live brief, then starts the poller once `agent --resume`
- * has a durable owner PID in its process tree (item f099fc6e).
+ * stamps a thin post-Live brief, then starts the poller **and host-owned wait
+ * follow** once `agent --resume` has a durable owner PID in its process tree
+ * (item f099fc6e / 9d89a6d2).
  *
  * Invoked by open-handler-core when surface=cli:
  *   node launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>]
@@ -30,11 +31,18 @@ import {
 } from '../hooks/scripts/connect-phase-timing.mjs'
 import { resolveDevspecMcpAuth } from '../hooks/scripts/resolve-mcp-auth.mjs'
 import { fastConnect } from '../hooks/scripts/fast-connect.mjs'
-import { ensurePollerAfterAgentSpawn } from '../hooks/scripts/remote-control-state.mjs'
+import {
+  ensurePollerAfterAgentSpawn,
+  ensureWakeFollowAfterAgentSpawn,
+} from '../hooks/scripts/remote-control-state.mjs'
 import {
   pathHasWhitespace,
   spaceSafePluginRoot,
 } from './space-safe-plugin-root.mjs'
+import {
+  ensureWakeFile,
+  resolveSpaceFreeWakeFile,
+} from '../hooks/scripts/devspec-wake-file.mjs'
 
 export { pathHasWhitespace, spaceSafePluginRoot, win32SpaceSafePluginPin } from './space-safe-plugin-root.mjs'
 
@@ -127,34 +135,33 @@ export function quotePathForPrompt(p) {
 }
 
 /**
- * Exact first Shell command for mechanical Connect (item 1586a9e4).
- * One-shot wait + `--from-end` so queued owner mail is not skipped (1f177af4).
- * @param {{ pluginRoot: string, connectionId: string, launchId?: string | null, spaceSafe?: object }} opts
+ * Exact first Shell command for mechanical Connect (items 1586a9e4, 9d89a6d2).
+ * Host follow already consumes the inbox; the model tails a space-free wake file
+ * in the background so Cursor `turn_ended` cannot deafen the room.
+ * @param {{ pluginRoot: string, connectionId: string, launchId?: string | null, spaceSafe?: object, wakeFile?: string, wakeFileOpts?: object }} opts
  * @returns {string}
  */
 export function buildRemoteWaitCommand(opts) {
-  const waitScript = path.join(
+  const tailScript = path.join(
     spaceSafePluginRoot(opts.pluginRoot, opts.spaceSafe || {}),
     'hooks',
     'scripts',
-    'devspec-remote-wait.mjs',
+    'devspec-wake-tail.mjs',
   )
-  if (pathHasWhitespace(waitScript)) {
-    throw new Error(`buildRemoteWaitCommand: wait script path has whitespace: ${waitScript}`)
+  if (pathHasWhitespace(tailScript)) {
+    throw new Error(`buildRemoteWaitCommand: tail script path has whitespace: ${tailScript}`)
   }
-  const connectionId = String(opts.connectionId ?? '').trim()
-  const launchId =
-    typeof opts.launchId === 'string' && opts.launchId.trim() ? opts.launchId.trim() : ''
-  const parts = [
-    'node',
-    quotePathForPrompt(waitScript),
-    '--connection-id',
-    connectionId,
-    '--from-end',
-  ]
-  if (launchId) parts.push('--launch-id', launchId)
-  return parts.join(' ')
+  const wakeFile =
+    typeof opts.wakeFile === 'string' && opts.wakeFile.trim()
+      ? path.resolve(opts.wakeFile.trim())
+      : resolveSpaceFreeWakeFile(opts.connectionId, opts.wakeFileOpts || {})
+  if (pathHasWhitespace(wakeFile)) {
+    throw new Error(`buildRemoteWaitCommand: wake file path has whitespace: ${wakeFile}`)
+  }
+  return ['node', quotePathForPrompt(tailScript), '--file', quotePathForPrompt(wakeFile)].join(' ')
 }
+
+export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|session_ended|playbook_dispatch'
 
 /**
  * Short argv prompt — no skill body, no YAML `---`, safe under Windows
@@ -162,7 +169,9 @@ export function buildRemoteWaitCommand(opts) {
  *
  * Non-Connect: pointer to the stamped file.
  * Remote Connect after Live: imperative wait-first command; stamp stays on
- * disk for recovery only (item 1586a9e4).
+ * disk for recovery only (item 1586a9e4). The first Shell is a background tail
+ * of the host-owned wake file (item 9d89a6d2) — not a one-shot wait the model
+ * must re-arm after turn_ended.
  * @param {string} stampedPromptPath
  * @param {{ waitFirst?: boolean, waitCommand?: string }} [opts]
  * @returns {string}
@@ -175,8 +184,9 @@ export function buildShortArgvPrompt(stampedPromptPath, opts = {}) {
       : ''
   if (opts.waitFirst === true && waitCommand) {
     return (
-      `Arm wait FIRST with this exact Shell command. Do not read any file, skill, or script before it. ${waitCommand} ` +
-      `After it prints owner_message, act only on that. Stamp on disk for recovery only: ${p}`
+      `Arm wait FIRST as a background Shell with block_until_ms: 0 and notify_on_output pattern ${REMOTE_WAKE_NOTIFY_PATTERN}. ` +
+      `Do not read any file, skill, or script before it. Do not pass --from-end. Host already follows the inbox. ${waitCommand} ` +
+      `When notify prints owner_message, act only on that. Leave the background Shell running. Stamp on disk for recovery only: ${p}`
     )
   }
   return `Read the file at ${p} and follow every instruction in it exactly, then begin.`
@@ -616,15 +626,20 @@ async function main() {
     connectionId: connectResult?.connection_id || null,
     extra: { stamp_chars: stampedBody.length },
   })
+  let connectWakeFile = null
+  if (isRemoteConnect && connectResult?.connection_id) {
+    connectWakeFile = ensureWakeFile(resolveSpaceFreeWakeFile(connectResult.connection_id))
+  }
   const argvPrompt = buildShortArgvPrompt(
     stampedPath,
-    isRemoteConnect && connectResult?.connection_id
+    connectWakeFile
       ? {
           waitFirst: true,
           waitCommand: buildRemoteWaitCommand({
             pluginRoot: pluginRootFromLauncher(),
             connectionId: connectResult.connection_id,
             launchId: connectResult.launch_id || launchId,
+            wakeFile: connectWakeFile,
           }),
         }
       : {},
@@ -699,6 +714,38 @@ async function main() {
       console.log(
         `[devspec-cli] Poller pid ${poller.pid} anchored to owner ${poller.owner_pid}`,
       )
+    }
+    if (connectWakeFile) {
+      const followStarted = Date.now()
+      const follow = ensureWakeFollowAfterAgentSpawn(connectResult.connection_id, child.pid, {
+        cwd: args.folder,
+        ownerPid: poller.owner_pid || null,
+        launchId: connectResult.launch_id || launchId,
+        wakeFile: connectWakeFile,
+      })
+      await emitConnectPhase({
+        ...timingCtx,
+        phase: 'ensure_wake_follow',
+        outcome: follow.ok ? 'ok' : 'error',
+        duration_ms: durationMs(followStarted),
+        local_id: chatId,
+        connectionId: connectResult.connection_id,
+        sessionId: connectResult.session_id || null,
+        reason: follow.ok ? null : follow.error || 'ensure_wake_follow_failed',
+        extra: {
+          follow_pid: follow.pid || null,
+          owner_pid: follow.owner_pid || null,
+          wake_file: connectWakeFile,
+          spawn_pid: child.pid,
+        },
+      })
+      if (!follow.ok) {
+        console.error(`[devspec-cli] ensure-wake-follow after resume failed: ${follow.error}`)
+      } else {
+        console.log(
+          `[devspec-cli] Wake follow pid ${follow.pid} writing ${connectWakeFile}`,
+        )
+      }
     }
   }
 

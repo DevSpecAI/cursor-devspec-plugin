@@ -157,30 +157,37 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.match(argv, /Read the file at /)
   })
 
-  it('Connect argv is wait-first and does not say read the stamp first (item 1586a9e4)', () => {
+  it('Connect argv is wait-first background tail and does not say read the stamp first (items 1586a9e4, 9d89a6d2)', () => {
     const stampedPath = path.join(os.tmpdir(), 'connect.stamped-waitfirst.txt')
     const pluginRoot = path.join(os.tmpdir(), 'ext-root')
+    const connectionId = '4f088b52-0f2c-4a8a-abb6-758e96cf5061'
+    const wakeFile = path.join(os.tmpdir(), 'DevSpec', 'wakes', `${connectionId}.jsonl`)
     const waitCommand = buildRemoteWaitCommand({
       pluginRoot,
-      connectionId: '4f088b52-0f2c-4a8a-abb6-758e96cf5061',
+      connectionId,
       launchId: '61909d7c-f48f-47b9-b96d-4323de517aaf',
+      wakeFile,
     })
-    assert.match(waitCommand, /devspec-remote-wait\.mjs/)
-    assert.match(waitCommand, /--from-end/)
-    assert.match(waitCommand, /4f088b52-0f2c-4a8a-abb6-758e96cf5061/)
-    assert.match(waitCommand, /61909d7c-f48f-47b9-b96d-4323de517aaf/)
-    assert.ok(waitCommand.includes(quotePathForPrompt(path.join(pluginRoot, 'hooks', 'scripts', 'devspec-remote-wait.mjs'))))
+    assert.match(waitCommand, /devspec-wake-tail\.mjs/)
+    assert.match(waitCommand, /--file/)
+    assert.doesNotMatch(waitCommand, /--from-end/)
+    assert.ok(waitCommand.includes(quotePathForPrompt(path.join(pluginRoot, 'hooks', 'scripts', 'devspec-wake-tail.mjs'))))
+    assert.ok(waitCommand.includes(quotePathForPrompt(wakeFile)))
 
     const argv = buildShortArgvPrompt(stampedPath, { waitFirst: true, waitCommand })
     assert.equal(argv.includes('---'), false)
     assert.match(argv, /^Arm wait FIRST/)
     assert.doesNotMatch(argv, /^Read the file at /)
-    assert.match(argv, /--from-end/)
+    assert.match(argv, /block_until_ms: 0/)
+    assert.match(argv, /notify_on_output/)
+    assert.match(argv, /owner_message\|session_ended\|playbook_dispatch/)
+    assert.doesNotMatch(waitCommand, /--from-end/)
     assert.ok(argv.includes(path.resolve(stampedPath)))
-    assert.ok(argv.length < 1200, `argv too long: ${argv.length}`)
+    assert.ok(argv.length < 1600, `argv too long: ${argv.length}`)
+    assert.match(argv, /Do not pass --from-end/)
     assert.ok(
-      fs.existsSync(path.join(pluginRootFromLauncher(), 'hooks', 'scripts', 'devspec-remote-wait.mjs')),
-      'launcher plugin root must resolve wait script',
+      fs.existsSync(path.join(pluginRootFromLauncher(), 'hooks', 'scripts', 'devspec-wake-tail.mjs')),
+      'launcher plugin root must resolve wake-tail script',
     )
   })
 
@@ -189,10 +196,12 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.equal(pathHasWhitespace(pluginRoot), true)
     const pinRoot = path.join(os.tmpdir(), 'DevSpecPin', 'cursor-plugin')
     assert.equal(pathHasWhitespace(pinRoot), false)
+    const connectionId = '1ae93936-69bb-4a27-9cfe-9480e4a221ff'
+    const programData = path.join(os.tmpdir(), 'ProgramDataNoSpace')
     let linked = null
     const waitCommand = buildRemoteWaitCommand({
       pluginRoot,
-      connectionId: '1ae93936-69bb-4a27-9cfe-9480e4a221ff',
+      connectionId,
       launchId: 'bbddf870-8ae6-42dc-a244-666df32d00a0',
       spaceSafe: {
         platform: 'win32',
@@ -206,29 +215,32 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
         },
         readlinkSync: () => '',
       },
+      wakeFileOpts: { platform: 'win32', programData },
     })
     assert.equal(linked?.target, path.resolve(pluginRoot))
     assert.equal(linked?.dest, path.resolve(pinRoot))
-    const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+    const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-wake-tail.mjs'))
     assert.ok(scriptToken, waitCommand)
     assert.equal(pathHasWhitespace(scriptToken), false)
     assert.equal(scriptToken.includes('Brandon Young'), false)
-    assert.match(waitCommand, /--from-end/)
-    assert.match(waitCommand, /1ae93936-69bb-4a27-9cfe-9480e4a221ff/)
-    assert.match(waitCommand, /bbddf870-8ae6-42dc-a244-666df32d00a0/)
+    assert.doesNotMatch(waitCommand, /--from-end/)
+    assert.match(waitCommand, new RegExp(connectionId.replace(/-/g, '\\-')))
 
     const argv = buildShortArgvPrompt(path.join(os.tmpdir(), 'stamp.txt'), {
       waitFirst: true,
       waitCommand,
     })
     assert.match(argv, /^Arm wait FIRST/)
-    const nodeScript = argv.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+    const nodeScript = argv.split(' ').find((t) => t.endsWith('devspec-wake-tail.mjs'))
     assert.ok(nodeScript)
     assert.equal(pathHasWhitespace(nodeScript), false)
+    for (const token of waitCommand.split(' ')) {
+      assert.equal(pathHasWhitespace(token), false, token)
+    }
 
     const stamp = buildPostLiveRemoteBrief({
       pluginPath: pluginRoot,
-      connectionId: '1ae93936-69bb-4a27-9cfe-9480e4a221ff',
+      connectionId,
       launchId: 'bbddf870-8ae6-42dc-a244-666df32d00a0',
     })
     assert.match(stamp, /^PLUGIN=/)
@@ -263,12 +275,16 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
         connectionId: '70b341ea-401d-43d1-a126-9aa02c6725c6',
         launchId: '58ad9f8c-f2f6-4663-b6a1-e9c7e2a590ea',
         spaceSafe: { platform: 'win32', programData },
+        wakeFileOpts: { platform: 'win32', programData },
       })
-      const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-remote-wait.mjs'))
+      const scriptToken = waitCommand.split(' ').find((t) => t.endsWith('devspec-wake-tail.mjs'))
       assert.ok(scriptToken, waitCommand)
       assert.equal(pathHasWhitespace(scriptToken), false)
       assert.equal(scriptToken.includes('Brandon Young'), false)
       assert.match(scriptToken, /cursor-plugin-[0-9a-f]{12}/)
+      for (const token of waitCommand.split(' ')) {
+        assert.equal(pathHasWhitespace(token), false, token)
+      }
       assert.equal(path.resolve(fs.readlinkSync(legacyPin)), path.resolve(oldVsix))
 
       const stamp = buildPostLiveRemoteBrief({
@@ -312,6 +328,14 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     const src = fs.readFileSync(new URL('./open-handler.mjs', import.meta.url), 'utf8')
     assert.match(src, /ensureSpaceSafePluginPin/)
     assert.match(src, /space-safe-plugin-root\.mjs/)
+  })
+
+  it('Connect launcher starts host-owned wake follow after the poller (item 9d89a6d2)', () => {
+    const src = fs.readFileSync(new URL('./launch-cli-session.mjs', import.meta.url), 'utf8')
+    assert.match(src, /ensureWakeFollowAfterAgentSpawn/)
+    assert.match(src, /ensure_wake_follow/)
+    assert.match(src, /devspec-wake-tail\.mjs/)
+    assert.match(src, /block_until_ms: 0/)
   })
 
   it('short argv would not present --- as its own agent CLI option token', () => {

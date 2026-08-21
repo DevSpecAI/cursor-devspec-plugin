@@ -82,6 +82,7 @@ const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
 const CONNECTIONS_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'connections')
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url))
 const POLLER_SCRIPT = path.join(THIS_DIR, 'devspec-remote-poll.mjs')
+const WAIT_SCRIPT = path.join(THIS_DIR, 'devspec-remote-wait.mjs')
 
 function pollerPidPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.pid`)
@@ -89,6 +90,14 @@ function pollerPidPath(connectionId) {
 
 function pollerLogPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.poll.log`)
+}
+
+function wakeFollowPidPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.wake-follow.pid`)
+}
+
+function wakeFollowLogPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.wake-follow.log`)
 }
 const LOCAL_DIR = path.join(DEVSPEC_DIR, 'remote-control', 'local')
 
@@ -226,7 +235,7 @@ export const WIN32_SHELL_NAMES = new Set(['powershell.exe', 'pwsh.exe', 'cmd.exe
  * walk in resolveOwnerPidAutoWindows and the duplicate in devspec-remote-wait.mjs.
  */
 export const WIN32_NODE_EPHEMERAL_CMD_RE =
-  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session/i
+  /remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session/i
 
 /** Cursor CLI often runs as node.exe with cursor-agent in CommandLine (not agent.exe). */
 export const WIN32_CURSOR_AGENT_NODE_CMD_RE = /(?:^|[\\/])cursor-agent(?:[\\/]|$)/i
@@ -388,7 +397,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
     `$root = ${pid}`,
     `$maxNodes = ${maxNodes}`,
     `$deadline = (Get-Date).AddMilliseconds(${timeout})`,
-    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session'`,
     `$workerServer = '(?i)\\bworker-server\\b'`,
     'do {',
     '  $fallback = $null',
@@ -536,6 +545,160 @@ export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
 }
 
 /**
+ * Host-owned inbox follow for Cursor Connect (item 9d89a6d2). Same durable
+ * owner-pid as the poller. Writes accepted owner_message lines to a space-free
+ * wake file; the model's first Shell tails that file and does not re-arm wait.
+ *
+ * @param {string} connectionId
+ * @param {{
+ *   ownerPid?: string | number | null,
+ *   cwd?: string,
+ *   launchId?: string | null,
+ *   wakeFile: string,
+ *   resolveOwnerPid?: typeof resolveOwnerPid,
+ *   spawn?: typeof spawn,
+ * }} [opts]
+ */
+export function ensureWakeFollowForConnection(connectionId, opts = {}) {
+  if (!connectionId || connectionId.length < 8) {
+    return { ok: false, error: 'missing connection id' }
+  }
+  const wakeFile = typeof opts.wakeFile === 'string' ? opts.wakeFile.trim() : ''
+  if (!wakeFile) return { ok: false, error: 'missing wake file' }
+  if (!fs.existsSync(WAIT_SCRIPT)) {
+    return { ok: false, error: `wait script missing: ${WAIT_SCRIPT}` }
+  }
+  const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
+  const ownerPid = resolveOwnerPidFn(opts.ownerPid, null)
+  if (ownerPid === null) {
+    return {
+      ok: false,
+      error:
+        'refusing to spawn wake follow without a valid owner-pid (same zombie-Live rule as the poller)',
+    }
+  }
+
+  stopWakeFollowForConnection(connectionId)
+  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  fs.mkdirSync(path.dirname(wakeFile), { recursive: true })
+  if (!fs.existsSync(wakeFile)) fs.writeFileSync(wakeFile, '', { mode: 0o600 })
+
+  const logPath = wakeFollowLogPath(connectionId)
+  const pidPath = wakeFollowPidPath(connectionId)
+  const cwd = opts.cwd || process.cwd()
+  const launchId =
+    typeof opts.launchId === 'string' && opts.launchId.trim() ? opts.launchId.trim() : ''
+
+  let logFd
+  try {
+    logFd = fs.openSync(logPath, 'a')
+  } catch (e) {
+    return { ok: false, error: `could not open wake-follow log: ${e.message}` }
+  }
+
+  const waitArgs = [
+    WAIT_SCRIPT,
+    '--connection-id',
+    connectionId,
+    '--from-end',
+    '--follow',
+    '--wake-file',
+    wakeFile,
+    '--owner-pid',
+    String(ownerPid),
+  ]
+  if (launchId) waitArgs.push('--launch-id', launchId)
+
+  const spawnFn = opts.spawn || spawn
+  let child
+  try {
+    child = spawnFn(process.execPath, waitArgs, {
+      cwd,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      windowsHide: true,
+      env: process.env,
+    })
+  } catch (e) {
+    try {
+      fs.closeSync(logFd)
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: `spawn failed: ${e.message}` }
+  }
+  try {
+    fs.closeSync(logFd)
+  } catch {
+    /* ignore */
+  }
+  if (typeof child.unref === 'function') child.unref()
+
+  const pid = child.pid
+  if (!pid) return { ok: false, error: 'spawn returned no pid' }
+  try {
+    fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
+  } catch (e) {
+    return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath }
+  }
+
+  return {
+    ok: true,
+    connection_id: connectionId,
+    pid,
+    owner_pid: ownerPid,
+    pid_file: pidPath,
+    log: logPath,
+    wake_file: wakeFile,
+  }
+}
+
+/**
+ * After `agent --resume` is spawned, start host-owned inbox follow with the
+ * same durable owner as the poller.
+ *
+ * @param {string} connectionId
+ * @param {string | number | null | undefined} spawnPid
+ * @param {{
+ *   cwd?: string,
+ *   launchId?: string | null,
+ *   wakeFile: string,
+ *   ownerPid?: number | null,
+ *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
+ *   ensureFollow?: typeof ensureWakeFollowForConnection,
+ *   childTreeOpts?: object,
+ * }} [opts]
+ */
+export function ensureWakeFollowAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
+  if (!connectionId || connectionId.length < 8) {
+    return { ok: false, error: 'missing connection id', owner_pid: null }
+  }
+  const wakeFile = typeof opts.wakeFile === 'string' ? opts.wakeFile.trim() : ''
+  if (!wakeFile) return { ok: false, error: 'missing wake file', owner_pid: null }
+  let ownerPid = opts.ownerPid != null ? Number(opts.ownerPid) : null
+  if (!Number.isInteger(ownerPid) || ownerPid < 1) {
+    const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
+    ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
+  }
+  if (!ownerPid) {
+    return {
+      ok: false,
+      error:
+        'no durable owner-pid in spawned agent tree for wake follow (same --resume / agent.exe rule as the poller)',
+      owner_pid: null,
+    }
+  }
+  const ensure = opts.ensureFollow || ensureWakeFollowForConnection
+  const follow = ensure(connectionId, {
+    cwd: opts.cwd,
+    ownerPid,
+    launchId: opts.launchId || null,
+    wakeFile,
+  })
+  return { ...follow, owner_pid: ownerPid }
+}
+
+/**
  * Explicit --owner-pid values that must not be trusted on win32 — fall through to
  * ancestry walk instead (shells: f3a88333; plain/ephemeral node.exe: c57dc381).
  */
@@ -607,7 +770,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
   const script = [
     // Avoid `$hosts` — it is a PowerShell automatic variable.
     `$ownerHosts = @(${hosts})`,
-    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|launch-cli-session'`,
+    `$ephemeralNode = 'remote-control-state|ensure-poller|devspec-remote-poll|devspec-remote-wait|devspec-wake-tail|launch-cli-session'`,
     `$workerServer = '(?i)\\bworker-server\\b'`,
     `$p = ${pid}`,
     `for ($i = 0; $i -lt ${maxHops}; $i++) {`,
@@ -714,7 +877,51 @@ function stopPollerForConnection(connectionId) {
   } catch {
     /* ignore */
   }
-  return { connection_id: connectionId, pids_found: pids, pids_killed: killed }
+  const follow = stopWakeFollowForConnection(connectionId)
+  return {
+    connection_id: connectionId,
+    pids_found: pids,
+    pids_killed: killed,
+    wake_follow: follow,
+  }
+}
+
+function findWakeFollowPidForConnection(connectionId) {
+  if (!connectionId || connectionId.length < 8) return null
+  try {
+    const pidFile = wakeFollowPidPath(connectionId)
+    if (!fs.existsSync(pidFile)) return null
+    const n = Number(fs.readFileSync(pidFile, 'utf8').trim())
+    if (!Number.isFinite(n) || n <= 0) return null
+    try {
+      process.kill(n, 0)
+      return n
+    } catch {
+      return null
+    }
+  } catch {
+    return null
+  }
+}
+
+function stopWakeFollowForConnection(connectionId) {
+  const pid = findWakeFollowPidForConnection(connectionId)
+  const killed = []
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM')
+      killed.push(pid)
+    } catch {
+      /* already gone */
+    }
+  }
+  try {
+    const pidFile = wakeFollowPidPath(connectionId)
+    if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile)
+  } catch {
+    /* ignore */
+  }
+  return { connection_id: connectionId, pids_found: pid ? [pid] : [], pids_killed: killed }
 }
 
 /**

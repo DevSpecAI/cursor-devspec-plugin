@@ -943,6 +943,62 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('--follow writes owner_message to the wake file and does not exit 0 (item 9d89a6d2)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-follow-'))
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const wakeFile = path.join(dir, `${connectionId}.wake.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    const queuedBatch = canonicalBatch()
+    queuedBatch.connection_id = connectionId
+    queuedBatch.session_id = 'sess-test'
+    queuedBatch.messages[0].addressee.connection_id = connectionId
+    queuedBatch.ingress.envelope.connection.connection_id = connectionId
+    queuedBatch.ingress.envelope.commands = queuedBatch.messages
+    queuedBatch.acceptance_key = canonicalAcceptanceKey(queuedBatch.ingress.envelope)
+    fs.writeFileSync(inbox, `${JSON.stringify(queuedBatch)}\n`)
+    const env = { ...process.env, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    delete env.DEVSPEC_MCP_TOKEN
+    const child = spawn(
+      process.execPath,
+      [
+        script,
+        '--connection-id',
+        connectionId,
+        '--from-end',
+        '--follow',
+        '--wake-file',
+        wakeFile,
+        '--poll-ms',
+        '50',
+      ],
+      { env, cwd: dir, windowsHide: true },
+    )
+    let stderr = ''
+    child.stderr.on('data', (d) => {
+      stderr += d.toString()
+    })
+    const deadline = Date.now() + 15000
+    try {
+      while (Date.now() < deadline) {
+        if (fs.existsSync(wakeFile)) {
+          const text = fs.readFileSync(wakeFile, 'utf8')
+          if (text.includes('"type":"owner_message"')) break
+        }
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      const text = fs.existsSync(wakeFile) ? fs.readFileSync(wakeFile, 'utf8') : ''
+      assert.match(stderr, /wake \(1 msg\) — follow/)
+      assert.match(text, /"type":"owner_message"/)
+      assert.match(text, /"type":"wake"/)
+      assert.equal(child.exitCode, null)
+    } finally {
+      child.kill()
+      await new Promise((r) => child.once('close', r))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('resolveOwnerPid (item 5c884554 — wait copy skips worker-server)', () => {

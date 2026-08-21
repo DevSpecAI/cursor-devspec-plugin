@@ -14,10 +14,10 @@ On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no long
 3. `register_connection`
 4. `attach_connection` when the launch prompt has `--session <uuid>`
 5. Write connection state (**poller deferred** — no durable owner PID exists yet)
-6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + arm-wait / answer / re-arm) — **not** the full ~32k skill body
-7. Spawn `agent --resume`, then `ensure-poller` anchored to a durable host **in that child tree** (`cursor-agent` node.exe / `agent.exe`). Walking ancestors of `launch-cli-session` cannot see the CLI agent; pinning to `Cursor.exe` (the IDE) would not reap when the terminal closes (item f099fc6e).
+6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + background tail / answer) — **not** the full ~32k skill body
+7. Spawn `agent --resume`, then `ensure-poller` **and host-owned wait follow** anchored to a durable host **in that child tree** (`cursor-agent` node.exe / `agent.exe`). Walking ancestors of `launch-cli-session` cannot see the CLI agent; pinning to `Cursor.exe` (the IDE) would not reap when the terminal closes (item f099fc6e).
 
-The model’s job after resume: arm wait (`--from-end`), handle owner commands, post answers, re-arm (`--pending --after-reply`). `--from-end` skips advisory inbox history but **does not** skip `owner_messages` the poller already queued (item 1f177af4). Do **not** re-register on a stamped “already Live” launch.
+The model’s job after resume: arm the argv **background tail** (`block_until_ms: 0` + `notify_on_output`), handle owner commands, post answers. **Do not** run one-shot `devspec-remote-wait.mjs --from-end` on a Connect launch — the launcher already follows the inbox into a space-free wake file (item 9d89a6d2). `--from-end` on that host follow skips advisory inbox history but **does not** skip `owner_messages` the poller already queued (item 1f177af4). Do **not** re-register on a stamped “already Live” launch.
 
 **Launcher path (item 94b11df6):** `open-handler --install` / extension activate writes `~/.cursor/devspec/extension-root.json`. Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a VSIX update.
 
@@ -42,9 +42,9 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 1. An authorized requester sends a canonical conversation command exactly to this connection in DevSpec.
 2. The server decides `owner` / `delegated` authority, snapshots immutable requester provenance, and returns the canonical envelope to detached `devspec-remote-poll.mjs`.
 3. The poller validates the exact target and complete envelope, then writes the accepted command turn to the inbox.
-4. `devspec-remote-wait.mjs` runs **one-shot** (no `--stream` in the Cursor plugin copy) and exits on the canonical command; Cursor notifies the Agent chat on matching stdout.
+4. Host-owned `devspec-remote-wait.mjs --follow` (same durable owner-pid as the poller) appends each accepted command to a space-free wake file. Connect argv tails that file as a background Shell (`block_until_ms: 0`, `notify_on_output` matching `owner_message|session_ended|playbook_dispatch`). Cursor notifies the Agent chat on matching stdout. Manual `/devspec.remote` still uses one-shot wait.
 5. Model acts; when attached, model `post_session_message({ connection_id, phase: "answer", complete_turn: true })` on the **final** answer (omit `complete_turn` on any rare mid-turn narrative posts — **trail is plugin-owned**).
-6. Model **must re-arm** wait with `--pending --after-reply` after the reply (never `--from-end` on re-arm) — backstop for Working clear + local turn marker.
+6. Connect **must not** re-arm wait after `turn_ended` — host follow keeps writing the wake file. Manual Connect still re-arms with `--pending --after-reply` (never `--from-end` on re-arm) as the Working-clear backstop.
 
 ### Wake stdout (what you see when wait exits)
 
@@ -60,7 +60,7 @@ Explicit `dispatches[]` playbook runs use a separate owner-scoped `playbook_disp
 
 The poller persists `cursor_v2` as the live forward cursor, `window.next_cursor` as `catch_up_cursor` for older pages, and `dispatch_cursor` as the playbook watermark. Older-page draining never rewinds the live cursor. Stable command-turn/playbook keys make inbox acceptance replay-idempotent, and wait validates the full canonical envelope again before emission.
 
-The wait byte cursor advances only after all events are flushed. A queued second unit remains for the next one-shot re-arm. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
+The wait byte cursor advances only after all events are flushed. Host follow keeps watching; a queued second unit is the next wake line. Prefer `post_session_message({ connection_id, … })` so the server resolves the current attachment.
 
 ### Work acquisition is not ingress
 
@@ -70,9 +70,9 @@ Nothing sends action-item work to Cursor. When an owner asks the agent to work i
 
 Canonical `metadata` attachments remain stable `resource_id` references (`delivery: "resource"`); no transcript recovery or local base64 materialisation is required. An `unavailable` attachment rejects its command before wake. See `devspec://product/remote-ingress-contract`.
 
-## Why one-shot here
+## Why Connect wait is host-owned
 
-Cursor has no Claude-style persistent Monitor for session-scoped stdout wakes. Exit-to-notify is the working host pattern. That makes **re-arm mandatory**; forgetting it leaves the connection Live but deaf.
+Cursor has no Claude-style persistent Monitor. One-shot wait plus model re-arm left rooms Live but deaf after `turn_ended` (Nimble Octopus, item 9d89a6d2). Connect therefore uses a **host-owned follow** (session-scoped, owner-pid anchored like the poller) plus Cursor’s real wake primitive: Shell `notify_on_output` on a never-exiting tail. That is not a port of Claude `--stream`. Manual `/devspec.remote` still uses one-shot wait and must re-arm.
 
 ## Turn end / Working indicator
 
@@ -148,11 +148,13 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 
 ## Key files
 
-- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect (no poller)** → thin stamp → `--resume` → **ensure-poller** from child tree)
+- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect (no poller)** → thin stamp → `--resume` → **ensure-poller** + **host wait follow** from child tree)
 - `hooks/scripts/fast-connect.mjs` (mechanical Connect orchestrator)
 - `scripts/pin-remote-plugin.mjs` (PLUGIN= + thin post-Live brief)
 - `hooks/scripts/devspec-remote-poll.mjs`
-- `hooks/scripts/devspec-remote-wait.mjs` (one-shot; `--after-reply` turn-end; attachment materialisation)
+- `hooks/scripts/devspec-remote-wait.mjs` (one-shot for manual Connect; `--follow --wake-file` for host-owned Connect follow)
+- `hooks/scripts/devspec-wake-tail.mjs` (Connect argv background tail of the space-free wake file)
+- `hooks/scripts/devspec-wake-file.mjs` (ProgramData / `/var/tmp` wake path)
 - `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher — also dispatches trail modes)
 - `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — seeds trail; Stop clears turn + trail state + `report_complete` when hooks fire)
 - `hooks/scripts/seed-work-trail.mjs` (shared `phase=trail` Working… seed used by mirror + poller)

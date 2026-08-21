@@ -196,7 +196,6 @@ export function buildPostLiveRemoteBrief(opts) {
   const sessionLine = sessionId
     ? `session_id: ${sessionId}`
     : 'session_id: (none — sessionless / available)'
-  const launchFlag = launchId ? ` --launch-id "${launchId}"` : ''
   const header =
     typeof opts.headerLine === 'string' && opts.headerLine.trim()
       ? opts.headerLine.trim()
@@ -220,23 +219,16 @@ export function buildPostLiveRemoteBrief(opts) {
     '',
     '## Your job (post-Live only)',
     '',
-    'The Connect argv already has the wait command. Run that Shell first — do not read this stamp or any skill/script before it.',
-    '1. **Arm wait FIRST** with `--from-end` (quote PLUGIN; Windows paths often have spaces):',
-    '```bash',
-    `node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "${connectionId}" --owner-pid "$PPID" --from-end${launchFlag}`,
-    '```',
-    '   Prefer Cursor `monitor` on that wait so stdout wakes this chat.',
+    'The Connect argv already has the wake-tail command. Run that Shell first — do not read this stamp or any skill/script before it.',
+    '1. **Arm wait FIRST** as a **background** Shell (`block_until_ms: 0`) with `notify_on_output` pattern `owner_message|session_ended|playbook_dispatch`. Do **not** pass `--from-end`. Host already follows the inbox into a space-free wake file; the argv command tails that file.',
     '2. **Authority:** follow `devspec://product/remote-ingress-contract`. Act only on a complete canonical `owner_message` exactly addressed to this connection with server-stamped `owner` / `delegated` authority; preserve immutable requester provenance. Typed context is advisory, typed controls stay host-only, and explicit owner-scoped `playbook_dispatch` runs use their separate typed claim/record path.',
     '3. **Work acquisition:** nothing is sent work. For requested item ids, call `reserve_work_items` first, then `claim_work_item` in order. Each claimed item follows the served `devspec://product/implementation-contract`; multiple items do not change interaction policy, and whether to ask is judged from each item’s intent and acceptance criteria.',
     '4. When attached, post the **final** answer with `post_session_message({ connection_id, message, phase: "answer", complete_turn: true, agent_name: "Cursor" })`. Omit `complete_turn` on rare mid-turn posts. **Never** post status chrome / connect banners into the session.',
-    '5. **Re-arm** with `--pending --after-reply` (never `--from-end` on re-arm):',
-    '```bash',
-    `node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "${connectionId}" --owner-pid "$PPID" --pending --after-reply${launchFlag}`,
-    '```',
+    '5. **Do not re-arm wait.** Leave the background tail running. Host follow keeps writing the wake file after Cursor `turn_ended`. Never run `devspec-remote-wait.mjs --from-end` on a Connect launch.',
     '6. Stop with `devspec.remote-stop` when done.',
     '',
     'Canonical exact-target commands only. Trail / Working chrome is plugin-owned — you own the final answer.',
-    'If `resolve-local` later says `already_live`, only re-arm wait — do not re-register.',
+    'If `resolve-local` later says `already_live`, keep the background tail — do not re-register.',
   ].filter((l) => l !== null)
 
   const body = lines.join('\n')
