@@ -10,8 +10,8 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { ensureWakeFile } from './devspec-wake-file.mjs'
+import { isDirectRun } from './is-direct-run.mjs'
 
 const POLL_MS = 250
 
@@ -62,10 +62,7 @@ async function main() {
   setInterval(poll, POLL_MS)
 }
 
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-
-if (isMain) {
+if (isDirectRun(import.meta.url)) {
   void main().catch((e) => {
     process.stderr.write(`devspec-wake-tail: ${e.message}\n`)
     process.exit(1)

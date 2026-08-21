@@ -72,6 +72,7 @@ import {
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
 import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
+import { isDirectRun } from './is-direct-run.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1307,10 +1308,7 @@ async function main() {
 // Run the CLI only when executed directly (skipped when imported for tests —
 // this module used to call main() unconditionally on import, which killed any
 // test file that imported its exports with "missing --connection-id").
-const isMain =
-  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-
-if (isMain) {
+if (isDirectRun(import.meta.url)) {
   main().catch((e) => {
     process.stderr.write(`devspec-remote-wait: ${e.message}\n`)
     process.exit(1)
