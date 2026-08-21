@@ -3,9 +3,10 @@
 
 export const REMOTE_INGRESS_RESOURCE_URI = 'devspec://product/remote-ingress-contract'
 export const REMOTE_INGRESS_SCHEMA_VERSION = 1
-export const REMOTE_INGRESS_CONTRACT_VERSION = '1.1.1'
-const SUPPORTED_REMOTE_INGRESS_CONTRACT_VERSIONS = new Set(['1.1.0', REMOTE_INGRESS_CONTRACT_VERSION])
-export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.2'
+export const REMOTE_INGRESS_CONTRACT_VERSION = '1.2.0'
+export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.3'
+export const DELEGATED_PROJECT_SCOPE_KIND = 'devspec_project'
+export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
 
 const UUID = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/
 const DATE_SOURCE = '(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))'
@@ -61,14 +62,26 @@ function validAuthority(value) {
   const requesterIsOwner = value.requested_by_user_id === value.connection_owner_user_id
   return (value.kind === 'owner') === requesterIsOwner && !(value.mode === 'owner' && value.kind !== 'owner')
 }
+
+/** Strict authority/scope pair shared by canonical and scope-aware legacy commands. */
+export function validCommandProjectScope(authority, projectScope) {
+  if (!object(authority) || !AUTHORITY_KINDS.has(authority.kind)) return false
+  if (authority.kind === 'owner') return projectScope === null
+  return exact(projectScope, ['kind', 'policy_id', 'project_id', 'instruction']) &&
+    projectScope.kind === DELEGATED_PROJECT_SCOPE_KIND &&
+    projectScope.policy_id === DELEGATED_PROJECT_SCOPE_POLICY_ID &&
+    uuid(projectScope.project_id) && text(projectScope.instruction)
+}
+
 function validCommand(value) {
-  if (!exact(value, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'addressee', 'delivery']) ||
+  if (!exact(value, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'addressee', 'delivery', 'project_scope']) ||
       !uuid(value.message_id) || !validOrder(value.order) || value.message_id !== value.order.message_id ||
       !exact(value.content, ['mode', 'body', 'complete']) || value.content.mode !== 'full' ||
       typeof value.content.body !== 'string' || value.content.complete !== true ||
       !Array.isArray(value.attachments) || !value.attachments.every(validAttachment) ||
       !exact(value.requester, ['user_id', 'display_name']) || !uuid(value.requester.user_id) ||
       !nullableText(value.requester.display_name) || !validAuthority(value.authority) ||
+      !validCommandProjectScope(value.authority, value.project_scope) ||
       value.requester.user_id !== value.authority.requested_by_user_id || !validAddressee(value.addressee) ||
       !exact(value.delivery, ['provenance_ref', 'turn_id', 'primary_provenance_ref', 'is_primary']) ||
       !uuid(value.delivery.provenance_ref) || !uuid(value.delivery.turn_id) ||
@@ -134,7 +147,7 @@ function withinWindow(row, window) {
 export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
   if (!exact(envelope, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'])) return 'malformed canonical ingress envelope'
   if (envelope.kind !== 'devspec.remote_ingress' || envelope.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION ||
-      !SUPPORTED_REMOTE_INGRESS_CONTRACT_VERSIONS.has(envelope.contract_version) || envelope.policy_version !== REMOTE_INGRESS_POLICY_VERSION) return 'unknown canonical ingress contract version'
+      envelope.contract_version !== REMOTE_INGRESS_CONTRACT_VERSION || envelope.policy_version !== REMOTE_INGRESS_POLICY_VERSION) return 'unknown canonical ingress contract version'
   if (!uuid(envelope.envelope_id) || !validAddressee(envelope.connection) || envelope.connection.connection_id !== connectionId) return 'canonical ingress connection mismatch'
   if (!exact(envelope.wake, ['kind', 'active', 'reason_id']) || !WAKE_KINDS.has(envelope.wake.kind) ||
       typeof envelope.wake.active !== 'boolean' || !text(envelope.wake.reason_id)) return 'malformed canonical wake decision'

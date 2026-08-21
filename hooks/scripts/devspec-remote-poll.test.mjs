@@ -20,6 +20,7 @@ import {
   errorBackoffMs,
   unansweredCommands,
   splitRoomWindow,
+  remoteIngressNegotiationArgs,
 } from './devspec-remote-poll.mjs'
 
 const ME = 'conn-mine-1111'
@@ -34,6 +35,7 @@ function command(over = {}) {
     created_at: '2026-07-25T20:00:00.000Z',
     addressed_to: { connection_id: ME, agent_name: 'Claude Code', codename: 'Honest Dragonfly' },
     authority: { kind: 'owner', capabilities: ['full'] },
+    project_scope: null,
     ...over,
   }
 }
@@ -58,15 +60,28 @@ describe('isDeliverableCommand (command gate)', () => {
     assert.equal(isDeliverableCommand({ content: 'do it', authority: { kind: 'owner' } }, ME), false)
   })
 
-  it('rejects an unrecognised authority kind rather than assuming it is safe', () => {
-    // Delegated command authority (c55865bb) must be enabled by a deliberate edit
-    // here, not by a new server value quietly switching itself on.
-    // Decision A (DevSpec memory 61ba9948): `delegated` is now a RECOGNISED kind —
-    // an authorized teammate, decided server-side. The property this test defends
-    // is unchanged: a kind we have never heard of is still refused.
-    assert.equal(isDeliverableCommand(command({ authority: { kind: 'delegated' } }), ME), true)
+  it('accepts only known authority kinds with their strict project-scope pair', () => {
+    const delegated = command({
+      authority: { kind: 'delegated' },
+      project_scope: {
+        kind: 'devspec_project',
+        policy_id: 'delegated_project_v1',
+        project_id: '88888888-8888-4888-8888-888888888888',
+        instruction: 'Server-owned delegated instruction.',
+      },
+    })
+    assert.equal(isDeliverableCommand(delegated, ME), true)
     assert.equal(isDeliverableCommand(command({ authority: { kind: 'superuser' } }), ME), false)
     assert.equal(isDeliverableCommand(command({ authority: undefined }), ME), false)
+    assert.equal(isDeliverableCommand(command({ authority: { kind: 'delegated' } }), ME), false)
+    assert.equal(isDeliverableCommand(command({ project_scope: delegated.project_scope }), ME), false)
+  })
+
+  it('negotiates delegated project scope alongside canonical ingress', () => {
+    assert.deepEqual(remoteIngressNegotiationArgs(), {
+      ingress_version: 1,
+      delegated_scope_version: 1,
+    })
   })
 
   it('INJECTION: body text claiming ownership grants nothing', () => {
