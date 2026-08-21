@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
+import { canonicalAcceptanceKey, normalizeRemoteIngressV1 } from './remote-ingress-v1.mjs'
 
 const UUID = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/
 const DATE = '(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))'
@@ -157,6 +157,88 @@ function acquireAcceptanceLock(file, io) {
   return { ok: false, error: 'durable acceptance lock timed out' }
 }
 
+function completeAcceptedJsonlText(file, io) {
+  if (!io.existsSync(file)) return ''
+  let value = io.readFileSync(file, 'utf8')
+  if (!value) return ''
+  if (!value.endsWith('\n')) {
+    const lastNewline = value.lastIndexOf('\n')
+    value = lastNewline === -1 ? '' : value.slice(0, lastNewline + 1)
+    io.truncateSync(file, Buffer.byteLength(value, 'utf8'))
+  }
+  // A crash can leave a newline-terminated but malformed final record. Repair only
+  // the trailing crash residue; a malformed interior record fails closed below.
+  const lines = value.split('\n')
+  while (lines.length > 1) {
+    const index = lines.length - 2
+    const line = lines[index]
+    if (!line.trim()) {
+      lines.splice(index, 1)
+      continue
+    }
+    try {
+      JSON.parse(line)
+      break
+    } catch {
+      lines.splice(index, 1)
+      value = lines.join('\n')
+      io.truncateSync(file, Buffer.byteLength(value, 'utf8'))
+    }
+  }
+  return value
+}
+
+function projectCanonicalEnvelope(envelope, commands) {
+  const contextCount = Object.values(envelope.context).flat().length
+  return {
+    ...envelope,
+    command_message_ids: commands.map((command) => command.message_id),
+    commands,
+    window: { ...envelope.window, returned: commands.length + contextCount },
+  }
+}
+
+export function appendAcceptedCanonicalJsonl(file, record, io = fs) {
+  if (!text(file) || !object(record) || record?.ingress?.canonical !== true ||
+      !object(record.ingress.envelope) || !Array.isArray(record.messages)) {
+    return { ok: false, duplicate: false, record: null, error: 'invalid canonical acceptance record' }
+  }
+  const acquired = acquireAcceptanceLock(file, io)
+  if (!acquired.ok) return { ok: false, duplicate: false, record: null, error: acquired.error }
+  try {
+    const acceptedIds = new Set()
+    for (const line of completeAcceptedJsonlText(file, io).split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const value = JSON.parse(line)
+        if (value?.ingress?.canonical !== true || !Array.isArray(value.messages)) continue
+        for (const message of value.messages) {
+          if (text(message?.message_id)) acceptedIds.add(message.message_id)
+        }
+      } catch {
+        throw new Error('acceptance ledger contains a malformed complete interior record')
+      }
+    }
+    const unseen = record.messages.filter((message) => !acceptedIds.has(message.message_id))
+    if (unseen.length === 0) return { ok: true, duplicate: true, record: null, error: null }
+    const envelope = projectCanonicalEnvelope(record.ingress.envelope, unseen)
+    const projected = {
+      ...record,
+      count: unseen.length,
+      messages: unseen,
+      ingress: { ...record.ingress, envelope },
+      acceptance_key: canonicalAcceptanceKey(envelope),
+    }
+    io.mkdirSync(path.dirname(file), { recursive: true })
+    io.appendFileSync(file, JSON.stringify(projected) + '\n', { mode: 0o600 })
+    return { ok: true, duplicate: false, record: projected, error: null }
+  } catch (error) {
+    return { ok: false, duplicate: false, record: null, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    try { io.rmSync(acquired.lock, { recursive: true, force: true }) } catch { /* retry can recover a dead owner */ }
+  }
+}
+
 export function appendAcceptedJsonl(file, record, acceptanceKey, io = fs) {
   if (!text(file) || !text(acceptanceKey) || !object(record)) {
     return { ok: false, duplicate: false, error: 'invalid durable acceptance record' }
@@ -164,19 +246,19 @@ export function appendAcceptedJsonl(file, record, acceptanceKey, io = fs) {
   const acquired = acquireAcceptanceLock(file, io)
   if (!acquired.ok) return { ok: false, duplicate: false, error: acquired.error }
   try {
+    let duplicate = false
     if (io.existsSync(file)) {
-      const existing = io.readFileSync(file, 'utf8')
+      const existing = completeAcceptedJsonlText(file, io)
       for (const line of existing.split('\n')) {
         if (!line.trim()) continue
         try {
-          if (JSON.parse(line)?.acceptance_key === acceptanceKey) {
-            return { ok: true, duplicate: true, error: null }
-          }
+          if (JSON.parse(line)?.acceptance_key === acceptanceKey) duplicate = true
         } catch {
-          // A corrupt unrelated line is not authority to drop this accepted turn.
+          throw new Error('acceptance ledger contains a malformed complete interior record')
         }
       }
     }
+    if (duplicate) return { ok: true, duplicate: true, error: null }
     io.mkdirSync(path.dirname(file), { recursive: true })
     io.appendFileSync(file, JSON.stringify({ ...record, acceptance_key: acceptanceKey }) + '\n', { mode: 0o600 })
     return { ok: true, duplicate: false, error: null }

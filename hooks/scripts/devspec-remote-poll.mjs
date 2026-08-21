@@ -85,6 +85,7 @@ import {
 } from './remote-ingress-v1.mjs'
 import {
   advancePollCursorState,
+  appendAcceptedCanonicalJsonl,
   appendAcceptedJsonl,
   buildPollCursorArgs,
   inspectPollResponseV1,
@@ -262,7 +263,9 @@ function appendInbox(
     messages,
   }
   if (acceptanceKey) {
-    const accepted = appendAcceptedJsonl(inboxPathForConnection(connectionId), record, acceptanceKey)
+    const accepted = ingress?.canonical === true && type === 'owner_messages'
+      ? appendAcceptedCanonicalJsonl(inboxPathForConnection(connectionId), record)
+      : appendAcceptedJsonl(inboxPathForConnection(connectionId), record, acceptanceKey)
     if (!accepted.ok) process.stderr.write(`devspec-remote-poll: inbox write failed: ${accepted.error}\n`)
     return accepted
   }
@@ -613,6 +616,13 @@ async function deliverOwnerMessages(
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
+  const acceptedRecord = accepted.record ?? {
+    messages: ownerMsgs,
+    context,
+    ingress,
+  }
+  const acceptedMessages = acceptedRecord.messages
+  const acceptedContext = acceptedRecord.context
 
   // Open the Working trail only after first durable acceptance (attached only).
   if (sessionId) {
@@ -634,17 +644,17 @@ async function deliverOwnerMessages(
       )
     }
   }
-  if (context) {
-    process.stdout.write(JSON.stringify({ type: 'model_context', session_id: sessionId, ...context }) + '\n')
+  if (acceptedContext) {
+    process.stdout.write(JSON.stringify({ type: 'model_context', session_id: sessionId, ...acceptedContext }) + '\n')
   }
-  for (const m of ownerMsgs) {
+  for (const m of acceptedMessages) {
     process.stdout.write(JSON.stringify({ type: 'owner_message', message: m }) + '\n')
   }
   process.stdout.write(
     JSON.stringify({
       type: 'wake',
       reason: 'canonical_conversational_command',
-      count: ownerMsgs.length,
+      count: acceptedMessages.length,
       next_cursor: nextCursor,
       inbox: inboxPathForConnection(connectionId),
       continuous: true,

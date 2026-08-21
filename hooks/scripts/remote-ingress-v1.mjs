@@ -3,7 +3,8 @@
 
 export const REMOTE_INGRESS_RESOURCE_URI = 'devspec://product/remote-ingress-contract'
 export const REMOTE_INGRESS_SCHEMA_VERSION = 1
-export const REMOTE_INGRESS_CONTRACT_VERSION = '1.1.0'
+export const REMOTE_INGRESS_CONTRACT_VERSION = '1.1.1'
+const SUPPORTED_REMOTE_INGRESS_CONTRACT_VERSIONS = new Set(['1.1.0', REMOTE_INGRESS_CONTRACT_VERSION])
 export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.2'
 
 const UUID = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/
@@ -133,7 +134,7 @@ function withinWindow(row, window) {
 export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
   if (!exact(envelope, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'])) return 'malformed canonical ingress envelope'
   if (envelope.kind !== 'devspec.remote_ingress' || envelope.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION ||
-      envelope.contract_version !== REMOTE_INGRESS_CONTRACT_VERSION || envelope.policy_version !== REMOTE_INGRESS_POLICY_VERSION) return 'unknown canonical ingress contract version'
+      !SUPPORTED_REMOTE_INGRESS_CONTRACT_VERSIONS.has(envelope.contract_version) || envelope.policy_version !== REMOTE_INGRESS_POLICY_VERSION) return 'unknown canonical ingress contract version'
   if (!uuid(envelope.envelope_id) || !validAddressee(envelope.connection) || envelope.connection.connection_id !== connectionId) return 'canonical ingress connection mismatch'
   if (!exact(envelope.wake, ['kind', 'active', 'reason_id']) || !WAKE_KINDS.has(envelope.wake.kind) ||
       typeof envelope.wake.active !== 'boolean' || !text(envelope.wake.reason_id)) return 'malformed canonical wake decision'
@@ -157,10 +158,14 @@ export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
   if (new Set(allRows.map((row) => row.message_id)).size !== allRows.length || envelope.window.returned !== allRows.length ||
       (allRows.length > 0 && allRows.some((row) => !withinWindow(row, envelope.window)))) return 'canonical ingress window mismatch'
   if (envelope.commands.length > 0) {
-    const primary = envelope.commands.filter((command) => command.delivery.is_primary)
-    if (primary.length !== 1 || new Set(envelope.commands.map((c) => c.delivery.turn_id)).size !== 1 ||
+    const sharedPrimaryRef = envelope.commands[0].delivery.primary_provenance_ref
+    const provenanceRefs = envelope.commands.map((command) => command.delivery.provenance_ref)
+    const primaryFlagsMatch = envelope.commands.every((command) =>
+      command.delivery.is_primary === (command.delivery.provenance_ref === sharedPrimaryRef)
+    )
+    if (new Set(envelope.commands.map((c) => c.delivery.turn_id)).size !== 1 ||
         new Set(envelope.commands.map((c) => c.delivery.primary_provenance_ref)).size !== 1 ||
-        primary[0].delivery.provenance_ref !== primary[0].delivery.primary_provenance_ref) return 'canonical command turn binding mismatch'
+        new Set(provenanceRefs).size !== provenanceRefs.length || !primaryFlagsMatch) return 'canonical command turn binding mismatch'
   }
   return null
 }
@@ -293,7 +298,7 @@ export function canonicalContextAcceptanceKey(envelope) {
 export function canonicalAcceptanceKey(envelope) {
   if (envelope.wake.kind === 'conversational_command' && envelope.commands.length > 0) {
     const first = envelope.commands[0]
-    return `command-turn:${first.delivery.turn_id}:${first.delivery.primary_provenance_ref}`
+    return `command-messages:${first.delivery.turn_id}:${first.delivery.primary_provenance_ref}:${envelope.command_message_ids.join(',')}`
   }
   if (envelope.wake.kind === 'control' && envelope.control) return `control:${envelope.control.id}`
   return canonicalContextAcceptanceKey(envelope)
