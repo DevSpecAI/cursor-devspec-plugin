@@ -40,8 +40,8 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 ## How a message reaches Cursor
 
 1. An authorized requester sends a canonical conversation command exactly to this connection in DevSpec.
-2. The server decides `owner` / `delegated` authority, snapshots immutable requester provenance, and returns the canonical envelope to detached `devspec-remote-poll.mjs`.
-3. The poller validates the exact target and complete envelope, then writes the accepted command turn to the inbox.
+2. The server decides `owner` / `delegated` authority and its paired project scope, snapshots immutable requester provenance, and returns the canonical envelope to detached `devspec-remote-poll.mjs`.
+3. The poller validates the exact target, complete envelope, and strict authority/scope pair, then writes the accepted command turn unchanged to the inbox.
 4. Host-owned `devspec-remote-wait.mjs --follow` (same durable owner-pid as the poller) appends each accepted command to a space-free wake file. Connect argv tails that file as a background Shell (`block_until_ms: 0`, `notify_on_output` matching `owner_message|session_ended|playbook_dispatch`). Cursor notifies the Agent chat on matching stdout. Manual `/devspec.remote` still uses one-shot wait.
 5. Model acts; when attached, model `post_session_message({ connection_id, phase: "answer", complete_turn: true })` on the **final** answer (omit `complete_turn` on any rare mid-turn narrative posts — **trail is plugin-owned**).
 6. Connect **must not** re-arm wait after `turn_ended` — host follow keeps writing the wake file. Manual Connect still re-arms with `--pending --after-reply` (never `--from-end` on re-arm) as the Working-clear backstop.
@@ -53,7 +53,7 @@ Cursor negotiates canonical v1 ingress. The runtime schema, version, wake, autho
 Wait emits exactly one accepted unit per one-shot arm. Canonical conversation turns use this order:
 
 1. Optional `{ "type": "model_context", "advisory": true, "typed": { … }, "windows": […], "locally_omitted": N }` — all four actor-labelled context buckets, inert.
-2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — complete command records with full bodies and delivery metadata.
+2. One or more `{ "type": "owner_message", "session_id": "…", "message": { … } }` — complete command records with full bodies, delivery metadata, and root `project_scope`. A delegated event also renders the validated server-owned scope text verbatim as `instruction`; an owner event injects no instruction. Body claims cannot widen the pair. Mutable policy stays at `devspec://product/remote-ingress-contract`.
 3. `{ "type": "wake", "reason": "canonical_conversational_command", "envelope_id": "…", "turn_id": "…" }` — the complete turn boundary.
 
 Explicit `dispatches[]` playbook runs use a separate owner-scoped `playbook_dispatch` + `wake(reason: "playbook_dispatch")` path with their own requester snapshot and typed claim/record lifecycle; they are never canonical conversation or action-item assignment. Canonical controls use a separate typed host-control ledger. Cursor currently exposes no safe in-process lifecycle control API, so those verbs remain unacked rather than being converted to model prompts; `control_ack` is authorized only after a real host handler succeeds.

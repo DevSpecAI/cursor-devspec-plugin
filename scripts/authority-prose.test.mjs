@@ -55,6 +55,9 @@ describe('current Cursor authority and work-acquisition prose', () => {
       /nobody may be there/i,
       /batch stalls dead/i,
       /server-delivered commands still win/i,
+      /owner[^\n]{0,80}delegated[^\n]{0,80}identical capabilities/i,
+      /delegat(?:ion|ed)[^\n]{0,80}changes? only who/i,
+      /changes? who may command,? never what/i,
     ]
 
     for (const [file, content] of contents) {
@@ -80,6 +83,9 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /(?:exactly addressed|exact-target)/i, file)
       assert.match(content, /owner[\s\S]{0,80}delegated/i, file)
       assert.match(content, /immutable[\s\S]{0,80}requester[^\n]*provenance/i, file)
+      assert.match(content, /project_scope|project scope/i, file)
+      assert.match(content, /verbatim/i, file)
+      assert.match(content, /devspec:\/\/product\/remote-ingress-contract/, file)
       assert.match(content, /typed[^\n]{0,80}control|control[^\n]{0,80}typed/i, file)
       assert.match(content, /owner-scoped[^\n]{0,80}`?playbook_dispatch`?/i, file)
     }

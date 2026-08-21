@@ -1107,9 +1107,16 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   for (const m of messages) {
     // Attachments become on-disk files + descriptors. Emitting the server's base64
     // verbatim used to blow the turn up ~2.7x the source image (item 99165e12).
+    // Delegated scope instructions are server-owned runtime policy. Surface the
+    // accepted text verbatim beside the command; never synthesize equivalent prose.
+    const delegatedInstruction = m?.authority?.kind === 'delegated' &&
+      typeof m?.project_scope?.instruction === 'string'
+      ? m.project_scope.instruction
+      : null
     events.push({
       type: 'owner_message',
       session_id: sessionId,
+      ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
       message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
     })
   }

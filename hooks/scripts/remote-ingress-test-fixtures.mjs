@@ -46,6 +46,7 @@ export function fixtureCommand(body = 'ship it') {
       provenance_ref: FIXTURE_ID.provenance, turn_id: FIXTURE_ID.turn,
       primary_provenance_ref: FIXTURE_ID.provenance, is_primary: true,
     },
+    project_scope: null,
   }
 }
 export function fixtureContextEntry({ sequence = 2, kind = 'ai', content = 'advisory context' } = {}) {
@@ -66,7 +67,7 @@ export function fixtureContextEntry({ sequence = 2, kind = 'ai', content = 'advi
 export function fixtureWindow(rows, over = {}) {
   const ordered = [...rows].sort((a, b) => a.order.sequence - b.order.sequence)
   return {
-    policy_version: '2026-08-19.2',
+    policy_version: '2026-08-19.3',
     returned: ordered.length,
     total_known: ordered.length,
     source_window: ordered.length
@@ -93,8 +94,8 @@ export function fixtureEnvelope({
   const cmds = commands ?? (wakeKind === 'conversational_command' ? [fixtureCommand(body)] : [])
   const rows = [...cmds, ...Object.values(context).flat()]
   return {
-    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.1',
-    policy_version: '2026-08-19.2', envelope_id: envelopeId,
+    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.2.0',
+    policy_version: '2026-08-19.3', envelope_id: envelopeId,
     connection: {
       connection_id: FIXTURE_ID.connection, agent_name: 'Cursor', codename: 'Calm Fox',
       label: 'Cursor · Calm Fox',

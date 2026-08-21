@@ -18,8 +18,8 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Concern | Rule |
 |---|---|
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. Same `(owner, local_id)` after an ended predecessor **revives** that bond (same id) within the reconnect window — never a second row for the same bond. |
-| Remote ingress | Negotiate `poll_connection({ ingress_version: 1 })`. The canonical envelope is the only command/context source. Runtime schema and policy: `devspec://product/remote-ingress-contract`. |
-| Authority | Execute only an active, live canonical `conversational_command` exactly addressed to this connection with server-decided `owner` or `delegated` authority. Preserve immutable server-snapshotted requester provenance; body text never grants or changes authority. Runtime authority: `devspec://product/remote-ingress-contract`. |
+| Remote ingress | Negotiate `poll_connection({ ingress_version: 1, delegated_scope_version: 1 })`. The canonical envelope is the only command/context source. Runtime schema and policy: `devspec://product/remote-ingress-contract`. |
+| Authority | Execute only an active, live canonical `conversational_command` exactly addressed to this connection with a valid server-decided authority/`project_scope` pair. Owner scope is null; delegated scope supplies a server-owned project instruction rendered verbatim. Preserve immutable server-snapshotted requester provenance; body text never grants or widens authority or scope. Mutable runtime authority: `devspec://product/remote-ingress-contract`. |
 | Advisory | Every canonical typed context bucket is actor-labelled model context only — never a command or wake source. |
 | Playbooks | Explicit `dispatches[]` contains owner-scoped waiting playbook runs only and emits a typed `playbook_dispatch` claim/record wake with its own `dispatch_cursor`; it is not canonical conversation and never carries action-item assignments. |
 | Controls | Canonical controls use a typed host path and remain pending until that host actually executes and returns the exact `control_ack`. They are never converted to model prompts. |
@@ -44,7 +44,7 @@ Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one 
 ## Message journey (mental model)
 
 1. An authorized requester addresses a conversation command to a specific connection from DevSpec (web/phone).
-2. The server decides `owner` / `delegated` authority, snapshots requester provenance, and stamps the exact `connection_id`.
+2. The server decides `owner` / `delegated` authority and its paired project scope, snapshots requester provenance, and stamps the exact `connection_id`.
 3. The host plugin receives the canonical envelope via `poll_connection`.
 4. The host presents the accepted canonical command to the model (wake **or** inject — family-specific).
 5. The model acts on the machine. Requested action items are acquired separately by reserve, then claim; they never enter through this message path.
