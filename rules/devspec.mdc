@@ -3,7 +3,7 @@ description: DevSpec workflow — claim early, link commits, and follow the serv
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:8 -->
+<!-- devspec-autopilot-rules:9 -->
 
 ## Working with DevSpec
 
@@ -12,6 +12,14 @@ This workspace is connected to the DevSpec MCP server. Cursor normally prefixes 
 ### Canonical contract
 
 `devspec__claim_work_item` mechanically returns the current product implementation contract, including project and personal agent rules. That served contract is authoritative for implementation, validation, commit, push, recording, and completion boundaries. Follow it rather than relying on lifecycle prose copied into plugin files. Use DevSpec memory/decision tools for the full body of recalled project conventions before relying on or contradicting them.
+
+### Shared session plans
+
+The served `devspec://product/implementation-contract` → `work_entry_contract` is the only authority for deciding whether work warrants a shared session plan. The threshold is intentionally high: ordinary investigation and one-run work stay unplanned; do not use generic complexity, tool count, file count, or elapsed time as substitutes for the contract decision.
+
+When an attached remote session has an active plan, continue or explicitly close that plan before creating another. Use `advance` to complete the current milestone and start the next atomically. Every existing-plan mutation carries `expected_revision`; omit `plan_id` for the current connection's own active plan, and supply explicit `plan_id` plus `expected_revision` for intentional same-owner cross-plan work or orphan adoption. Plans owned by someone else are read awareness only, never mutation authority.
+
+Cursor's global MCP registration cannot safely carry a per-conversation capability. During remote control, use the connection-bound `manage-plan describe` / `manage-plan use` helper named in the remote brief. It derives identity from Cursor host state; without a native conversation id it requires exactly one live, attached minted bond in the current workspace and refuses ambiguous siblings. Its describe operation exposes the complete bounded schema on demand; never pass an id/capability or paste a giant static schema into chat.
 
 ### Commit provenance
 

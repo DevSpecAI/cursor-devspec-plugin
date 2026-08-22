@@ -16,6 +16,7 @@ import { canonicalAcceptanceKey, validateRemoteIngressEnvelopeV1 } from './remot
 import {
   FIXTURE_ID,
   emptyFixtureContext,
+  fixtureActivePlanEnvelope,
   fixtureCommand,
   fixtureContextEntry,
   fixtureControl,
@@ -26,6 +27,15 @@ import {
 } from './remote-ingress-test-fixtures.mjs'
 
 describe('poll acceptance integration seam', () => {
+  it('accepts the negotiated strict 1.3 active-plan projection as advisory envelope data', () => {
+    const envelope = fixtureActivePlanEnvelope()
+    const accepted = inspectPollResponseV1(fixturePollResponse({ envelope }), FIXTURE_ID.connection)
+    assert.equal(accepted.ok, true)
+    assert.equal(accepted.envelope.contract_version, '1.3.0')
+    assert.equal(accepted.envelope.active_session_plans.advisory, true)
+    assert.equal(accepted.canonicalWake, true)
+  })
+
   it('keeps explicit playbooks independent from canonical conversation commands', () => {
     const playbook = fixturePlaybookDispatch()
     const accepted = inspectPollResponseV1(

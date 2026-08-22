@@ -77,7 +77,17 @@ The extension currently contributes these command-palette commands:
 | DevSpec: Install handoff handler | Install the local handoff bridge |
 | DevSpec: Start handoff handler | Start the local handoff bridge |
 
-Action-item, memory, help, and implementation operations are MCP tools used from Agent chat; they are not separate command-palette commands.
+Action-item, memory, help, and implementation operations are MCP tools used from Agent chat; they are not separate command-palette commands. Cursor receives concise tool discovery rather than a giant static catalog; detailed schemas are resolved only when used.
+
+### Shared session plans during remote control
+
+The current `devspec://product/implementation-contract` decides whether work warrants a shared session plan. The threshold is deliberately high: routine investigation and one-run checks remain unplanned. When a qualifying attached-session plan exists, Cursor continues it across reconnects using its authoritative revision and advances meaningful milestones atomically.
+
+Plan awareness is all-room and advisory: Cursor can see every active plan in the attached session, but another owner's plan grants no mutation authority. Same-owner cross-plan work and orphan adoption require explicit plan id plus expected revision and remain server-authorized.
+
+Plan mutation uses a narrow connection-bound helper installed with the extension. It negotiates and stores a per-conversation capability without putting the secret in prompts or the global MCP config. The helper exposes the complete `manage_plan` schema only on demand (`manage-plan describe`) and accepts operations on stdin (`manage-plan use`). Native chats bind through Cursor's host conversation id; a manual chat without that id is accepted only when the host's minted-bond index has exactly one live, attached, capability-bound Cursor connection in the current workspace. Ambiguous sibling connections fail closed. Ordinary MCP tools keep using the normal Cursor registration in `~/.cursor/mcp.json`.
+
+Cursor's existing Resume behavior is unchanged: CLI launches still mint a native chat, run `agent --resume`, and stamp that chat id as `local_session_id`; classic IDE conversations continue using Cursor's supplied conversation id when available.
 
 ## How it finds the right project
 

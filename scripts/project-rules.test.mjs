@@ -35,9 +35,9 @@ describe('managed Cursor rule upgrade', () => {
     }
   })
 
-  it('bumps the managed marker so existing v7 installs upgrade', () => {
-    assert.equal(rulesVersion(bundled), 8)
-    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:7 -->\nold', bundled), true)
+  it('bumps the managed marker so existing v8 installs upgrade', () => {
+    assert.equal(rulesVersion(bundled), 9)
+    assert.equal(shouldUpgrade('<!-- devspec-autopilot-rules:8 -->\nold', bundled), true)
     assert.equal(shouldUpgrade(bundled, bundled), false)
     assert.equal(shouldUpgrade('# user-owned rules', bundled), false)
   })
@@ -52,5 +52,19 @@ describe('managed Cursor rule upgrade', () => {
     assert.match(bundled, /unavailable or indeterminate result allows/i)
     assert.match(bundled, /Pushes are never blocked/i)
     assert.doesNotMatch(bundled, /GIT_OPTIONAL_LOCKS=0/)
+  })
+
+  it('points plan timing to the served contract and keeps Cursor capability use bounded', () => {
+    assert.match(bundled, /implementation-contract.*work_entry_contract/i)
+    assert.match(bundled, /threshold is intentionally high/i)
+    assert.match(bundled, /advance.*atomically/i)
+    assert.match(bundled, /expected_revision/)
+    assert.match(bundled, /explicit `plan_id`/)
+    assert.match(bundled, /owned by someone else.*read awareness only/i)
+    assert.match(bundled, /manage-plan describe.*manage-plan use/i)
+    assert.match(bundled, /complete bounded schema on demand/i)
+    assert.match(bundled, /exactly one live, attached minted bond/i)
+    assert.match(bundled, /refuses ambiguous siblings/i)
+    assert.doesNotMatch(bundled, /several sub-agents|branching investigation/i)
   })
 })

@@ -58,6 +58,9 @@
  *       [--no-poller]
  *     → Mechanical register → optional attach → write (poller optional; Cursor
  *       launch defers it until after agent --resume)
+ *   node remote-control-state.mjs manage-plan describe
+ *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-plan use
+ *     → capability-bound manage_plan for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -71,6 +74,12 @@ import { fileURLToPath } from 'node:url'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import {
+  clearConnectionCapability,
+  describeManagePlanBridge,
+  persistConnectionCapability,
+  useManagePlanBridge,
+} from './manage-plan-bridge.mjs'
 import {
   durationMs,
   emitConnectPhase,
@@ -1085,6 +1094,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     }
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
+  const capability_cleared = clearConnectionCapability(connectionId)
   const killResult = stopPollerForConnection(connectionId)
   return {
     ok: true,
@@ -1093,6 +1103,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     path: perPath,
     poller: killResult,
     bonds_stopped: bonds.length,
+    capability_cleared,
   }
 }
 
@@ -1184,6 +1195,7 @@ export function reapDeadPollers({
 
     if (!provablyDead && !staleNoOwner) continue
     const killed = pids.filter((pid) => kill(pid))
+    clearConnectionCapability(s.connection_id)
     reaped.push({
       connection_id: s.connection_id,
       agent_name: s.agent_name || null,
@@ -1488,6 +1500,7 @@ export function resolveLocalAction({
  *   mcpCall?: typeof mcpToolsCall,
  *   resolveAuth?: typeof resolveDevspecMcpAuth,
  *   emitPhase?: typeof emitConnectPhase,
+ *   persistCapability?: typeof persistConnectionCapability,
  * }} opts
  */
 export async function registerConnection(opts) {
@@ -1500,6 +1513,7 @@ export async function registerConnection(opts) {
   const mcpCall = opts.mcpCall || mcpToolsCall
   const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
   const emitPhase = opts.emitPhase || emitConnectPhase
+  const persistCapability = opts.persistCapability || persistConnectionCapability
 
   const hostToken =
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
@@ -1535,14 +1549,29 @@ export async function registerConnection(opts) {
   }
 
   try {
-    const result = await mcpCall({
+    toolArgs.connection_capability_version = 1
+    const response = await mcpCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'register_connection',
       arguments: toolArgs,
       timeoutMs: 60_000,
+      includeMeta: true,
     })
+    const result = response?.data ?? response
+    const capabilityEnvelope = response?.meta?.devspec?.connection_capability
     const connectionId = result?.connection_id || result?.connectionId || null
+    if (connectionId) {
+      const persisted = persistCapability({
+        connectionId,
+        localId,
+        version: capabilityEnvelope?.version,
+        capability: capabilityEnvelope?.value,
+      })
+      if (!persisted.ok) {
+        throw new Error('register_connection did not return a valid hidden connection capability')
+      }
+    }
     await emitPhase({
       phase: 'register_connection',
       outcome: connectionId ? 'ok' : 'error',
@@ -1844,6 +1873,36 @@ async function runCli() {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
     await runFastConnectCli(args)
     return
+  }
+
+  if (cmd === 'manage-plan') {
+    const action = args._[1] || 'describe'
+    if (action === 'describe') {
+      process.stdout.write(JSON.stringify(describeManagePlanBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    if (action !== 'use') {
+      process.stderr.write('Usage: remote-control-state.mjs manage-plan describe|use\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write('manage-plan use requires one JSON object on stdin\n')
+      process.exit(2)
+    }
+    // Identity is host-derived only. In particular there is deliberately no
+    // --connection-id / --local-id / --capability escape hatch on this command.
+    const localId = detectLocalId({}, process.env).local_id
+    const result = await useManagePlanBridge(input, {
+      localId,
+      agent: AGENT_NAME,
+      hostToken: hostTokenFromEnv(process.env),
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
   }
 
   if (cmd === 'resolve-auth') {

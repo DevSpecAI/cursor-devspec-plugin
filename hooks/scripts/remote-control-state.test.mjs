@@ -29,6 +29,7 @@ import {
   ensurePollerAfterAgentSpawn,
   ensureWakeFollowAfterAgentSpawn,
   CLI_SPAWN_OWNER_WALK_TIMEOUT_MS,
+  registerConnection,
 } from './remote-control-state.mjs'
 
 describe('detectLocalId', () => {
@@ -72,6 +73,46 @@ describe('detectLocalId', () => {
   it('sanitizes unsafe characters', () => {
     const r = detectLocalId({ 'local-id': 'abc/../evil;rm' }, {})
     assert.equal(r.local_id, 'abc..evilrm')
+  })
+})
+
+describe('registerConnection capability negotiation', () => {
+  it('requests v1, captures hidden _meta, persists it, and never returns the raw secret', async () => {
+    let request
+    let persisted
+    const result = await registerConnection({
+      localId: 'cursor-chat-a',
+      projectId: '11111111-1111-4111-8111-111111111111',
+      cwd: process.cwd(),
+      resolveAuth: () => ({ ok: true, token: 'dvs_token', mcp_url: 'https://example.test/api/mcp' }),
+      emitPhase: async () => {},
+      mcpCall: async (value) => {
+        request = value
+        return {
+          data: { connection_id: '22222222-2222-4222-8222-222222222222', connection_capability_version: 1 },
+          meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_hidden-secret' } } },
+        }
+      },
+      persistCapability: (value) => { persisted = value; return { ok: true } },
+    })
+    assert.equal(request.arguments.connection_capability_version, 1)
+    assert.equal(request.includeMeta, true)
+    assert.equal(persisted.capability, 'dvsc_hidden-secret')
+    assert.equal(result.ok, true)
+    assert.doesNotMatch(JSON.stringify(result), /hidden-secret/)
+  })
+
+  it('fails closed when a negotiated register omits the hidden capability', async () => {
+    const result = await registerConnection({
+      localId: 'cursor-chat-a',
+      projectId: '11111111-1111-4111-8111-111111111111',
+      resolveAuth: () => ({ ok: true, token: 'dvs_token', mcp_url: 'https://example.test/api/mcp' }),
+      emitPhase: async () => {},
+      mcpCall: async () => ({ data: { connection_id: '22222222-2222-4222-8222-222222222222' }, meta: null }),
+      persistCapability: () => ({ ok: false }),
+    })
+    assert.equal(result.ok, false)
+    assert.match(result.error, /hidden connection capability/)
   })
 })
 

@@ -81,6 +81,7 @@ describe('isDeliverableCommand (command gate)', () => {
     assert.deepEqual(remoteIngressNegotiationArgs(), {
       ingress_version: 1,
       delegated_scope_version: 1,
+      active_plan_projection_version: 1,
     })
   })
 

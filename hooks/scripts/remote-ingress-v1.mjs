@@ -5,6 +5,11 @@ export const REMOTE_INGRESS_RESOURCE_URI = 'devspec://product/remote-ingress-con
 export const REMOTE_INGRESS_SCHEMA_VERSION = 1
 export const REMOTE_INGRESS_CONTRACT_VERSION = '1.2.0'
 export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.3'
+export const REMOTE_INGRESS_ACTIVE_PLAN_CONTRACT_VERSION = '1.3.0'
+export const REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION = '2026-08-21.1'
+export const ACTIVE_SESSION_PLAN_PROJECTION_VERSION = 1
+export const ACTIVE_SESSION_PLAN_AUTHORITY_NOTE =
+  'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.'
 export const DELEGATED_PROJECT_SCOPE_KIND = 'devspec_project'
 export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
 
@@ -106,9 +111,12 @@ function validContext(value) {
   }
   return true
 }
-function validWindow(value) {
+function validWindow(value, policyVersion = null) {
+  const supportedPolicy = policyVersion
+    ? value?.policy_version === policyVersion
+    : new Set([REMOTE_INGRESS_POLICY_VERSION, REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION]).has(value?.policy_version)
   if (!exact(value, ['policy_version', 'returned', 'total_known', 'source_window', 'truncated', 'has_more', 'next_cursor', 'fetch_id', 'omission_reason']) ||
-      value.policy_version !== REMOTE_INGRESS_POLICY_VERSION || !integer(value.returned) ||
+      !supportedPolicy || !integer(value.returned) ||
       !(value.total_known === null || integer(value.total_known)) ||
       !exact(value.source_window, ['start', 'end']) ||
       !(value.source_window.start === null || validOrder(value.source_window.start)) ||
@@ -135,6 +143,47 @@ function validControl(value) {
   if (value.verb === 'set_thinking' && !THINKING_LEVELS.has(value.args?.thinking)) return false
   return true
 }
+function validPlanAgentIdentity(value) {
+  if (!exact(value, ['kind', 'connection_id', 'agent_name', 'codename']) ||
+      !new Set(['dev', 'connection']).has(value.kind) || !text(value.agent_name) ||
+      value.agent_name.length > 300 || !(value.codename === null || (text(value.codename) && value.codename.length <= 300))) return false
+  return value.kind === 'dev' ? value.connection_id === null : uuid(value.connection_id)
+}
+function validPlanStep(value) {
+  if (!object(value)) return false
+  const failed = value.status === 'failed'
+  const keys = ['id', 'position', 'title', 'status', ...(failed && Object.hasOwn(value, 'failure_reason') ? ['failure_reason'] : []), ...(failed ? ['retryable'] : [])]
+  return exact(value, keys) && uuid(value.id) && Number.isSafeInteger(value.position) && text(value.title) &&
+    value.title.length <= 300 && new Set(['pending', 'in_progress', 'completed', 'failed', 'skipped']).has(value.status) &&
+    (!failed || ((value.failure_reason === undefined || (text(value.failure_reason) && value.failure_reason.length <= 4096)) && typeof value.retryable === 'boolean'))
+}
+function validActiveSessionPlan(value) {
+  if (!exact(value, ['id', 'title', 'revision', 'status', 'created_at', 'origin', 'steward', 'owner', 'orphaned', 'progress', 'steps']) ||
+      !uuid(value.id) || !text(value.title) || value.title.length > 300 || !integer(value.revision, 1) ||
+      value.status !== 'active' || !datetime(value.created_at) || !validPlanAgentIdentity(value.origin) ||
+      !validPlanAgentIdentity(value.steward) || !exact(value.owner, ['user_id', 'display_name']) ||
+      !uuid(value.owner.user_id) || !text(value.owner.display_name) || value.owner.display_name.length > 300 ||
+      typeof value.orphaned !== 'boolean' || !exact(value.progress, ['terminal', 'total', 'completed', 'skipped']) ||
+      !Object.values(value.progress).every((count) => integer(count)) || !Array.isArray(value.steps) ||
+      value.steps.length > 64 || !value.steps.every(validPlanStep)) return false
+  const completed = value.steps.filter((step) => step.status === 'completed').length
+  const skipped = value.steps.filter((step) => step.status === 'skipped').length
+  return value.progress.total === value.steps.length && value.progress.completed === completed &&
+    value.progress.skipped === skipped && value.progress.terminal === completed + skipped
+}
+function validActiveSessionPlans(value) {
+  if (!exact(value, ['version', 'advisory', 'authority_note', 'inventory', 'plans']) ||
+      value.version !== ACTIVE_SESSION_PLAN_PROJECTION_VERSION || value.advisory !== true ||
+      value.authority_note !== ACTIVE_SESSION_PLAN_AUTHORITY_NOTE ||
+      !exact(value.inventory, ['returned', 'total_known', 'truncated']) || value.inventory.truncated !== false ||
+      !Array.isArray(value.plans) || value.plans.length < 1 || value.plans.length > 64 ||
+      !value.plans.every(validActiveSessionPlan) || value.inventory.returned !== value.plans.length ||
+      value.inventory.total_known !== value.plans.length) return false
+  const totalText = value.plans.reduce((total, plan) => total + plan.title.length + plan.origin.agent_name.length +
+    (plan.origin.codename?.length ?? 0) + plan.steward.agent_name.length + (plan.steward.codename?.length ?? 0) +
+    plan.owner.display_name.length + plan.steps.reduce((sum, step) => sum + step.title.length + (step.failure_reason?.length ?? 0), 0), 0)
+  return totalText <= 131_072
+}
 function sameAddressee(a, b) {
   return a.connection_id === b.connection_id && a.agent_name === b.agent_name && a.codename === b.codename && a.label === b.label
 }
@@ -145,9 +194,16 @@ function withinWindow(row, window) {
 
 /** Validate the authoritative v1 envelope without mutating or projecting it. */
 export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
-  if (!exact(envelope, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'])) return 'malformed canonical ingress envelope'
+  const activePlanContract = envelope?.contract_version === REMOTE_INGRESS_ACTIVE_PLAN_CONTRACT_VERSION &&
+    envelope?.policy_version === REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION
+  const scopedContract = envelope?.contract_version === REMOTE_INGRESS_CONTRACT_VERSION &&
+    envelope?.policy_version === REMOTE_INGRESS_POLICY_VERSION
+  const keys = ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', ...(activePlanContract && Object.hasOwn(envelope, 'active_session_plans') ? ['active_session_plans'] : []), 'window']
+  if (!exact(envelope, keys)) return 'malformed canonical ingress envelope'
   if (envelope.kind !== 'devspec.remote_ingress' || envelope.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION ||
-      envelope.contract_version !== REMOTE_INGRESS_CONTRACT_VERSION || envelope.policy_version !== REMOTE_INGRESS_POLICY_VERSION) return 'unknown canonical ingress contract version'
+      (!activePlanContract && !scopedContract)) return 'unknown canonical ingress contract version'
+  if (activePlanContract && Object.hasOwn(envelope, 'active_session_plans') &&
+      !validActiveSessionPlans(envelope.active_session_plans)) return 'malformed active session plan projection'
   if (!uuid(envelope.envelope_id) || !validAddressee(envelope.connection) || envelope.connection.connection_id !== connectionId) return 'canonical ingress connection mismatch'
   if (!exact(envelope.wake, ['kind', 'active', 'reason_id']) || !WAKE_KINDS.has(envelope.wake.kind) ||
       typeof envelope.wake.active !== 'boolean' || !text(envelope.wake.reason_id)) return 'malformed canonical wake decision'
@@ -165,7 +221,7 @@ export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
   if (envelope.commands.some((command) => !sameAddressee(command.addressee, envelope.connection))) return 'canonical command addressee mismatch'
   if (envelope.commands.some((command) => command.attachments.some((a) => a.materialization === 'unavailable'))) return 'canonical command attachment unavailable'
   if ((envelope.wake.kind === 'control') !== (envelope.control !== null) || (envelope.control !== null && !validControl(envelope.control))) return 'malformed canonical control'
-  if (!validContext(envelope.context) || !validWindow(envelope.window)) return 'malformed canonical context/window'
+  if (!validContext(envelope.context) || !validWindow(envelope.window, envelope.policy_version)) return 'malformed canonical context/window'
   const contextRows = Object.values(envelope.context).flat()
   const allRows = [...envelope.commands, ...contextRows]
   if (new Set(allRows.map((row) => row.message_id)).size !== allRows.length || envelope.window.returned !== allRows.length ||
@@ -275,10 +331,16 @@ export function validateCanonicalContextCarry(
   carry,
   { maxCount = 20, maxChars = 12_000, maxWindows = 20 } = {},
 ) {
+  const hasPlans = Object.hasOwn(carry ?? {}, 'active_session_plans') ||
+    Object.hasOwn(carry ?? {}, 'active_session_plan_guidance')
   if (!exact(carry, [
     'advisory', 'typed', 'windows', 'locally_omitted', 'locally_omitted_by_bucket',
-    'windows_omitted', 'local_omission_reason', 'note',
+    'windows_omitted', 'local_omission_reason',
+    ...(hasPlans ? ['active_session_plans', 'active_session_plan_guidance'] : []),
+    'note',
   ]) || carry.advisory !== true || !validContext(carry.typed) || !Array.isArray(carry.windows) ||
+      (hasPlans && (!validActiveSessionPlans(carry.active_session_plans) ||
+        !text(carry.active_session_plan_guidance))) ||
       carry.windows.length > maxWindows || !carry.windows.every(validWindow) ||
       !integer(carry.locally_omitted) || !integer(carry.windows_omitted) ||
       !exact(carry.locally_omitted_by_bucket, REMOTE_INGRESS_CONTEXT_BUCKETS) ||

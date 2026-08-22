@@ -9,6 +9,9 @@ export const FIXTURE_ID = {
   control: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   playbookRun: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
   playbook: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  plan: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+  step: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+  siblingConnection: '99999999-9999-4999-8999-999999999999',
 }
 
 export function fixtureUuid(n) {
@@ -112,6 +115,36 @@ export function fixtureEnvelope({
     context,
     window: windowOverride ?? fixtureWindow(rows),
   }
+}
+export function fixtureActiveSessionPlans(over = {}) {
+  return {
+    version: 1,
+    advisory: true,
+    authority_note: 'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.',
+    inventory: { returned: 1, total_known: 1, truncated: false },
+    plans: [{
+      id: FIXTURE_ID.plan,
+      title: 'Ship the shared plan',
+      revision: 3,
+      status: 'active',
+      created_at: '2026-08-21T12:00:00.000Z',
+      origin: { kind: 'connection', connection_id: FIXTURE_ID.connection, agent_name: 'Cursor', codename: 'Calm Fox' },
+      steward: { kind: 'connection', connection_id: FIXTURE_ID.connection, agent_name: 'Cursor', codename: 'Calm Fox' },
+      owner: { user_id: FIXTURE_ID.requester, display_name: 'Owner' },
+      orphaned: false,
+      progress: { terminal: 0, total: 1, completed: 0, skipped: 0 },
+      steps: [{ id: FIXTURE_ID.step, position: 0, title: 'Implement', status: 'in_progress' }],
+    }],
+    ...over,
+  }
+}
+export function fixtureActivePlanEnvelope(opts = {}) {
+  const envelope = fixtureEnvelope(opts)
+  envelope.contract_version = '1.3.0'
+  envelope.policy_version = '2026-08-21.1'
+  envelope.window.policy_version = '2026-08-21.1'
+  envelope.active_session_plans = opts.activeSessionPlans ?? fixtureActiveSessionPlans()
+  return envelope
 }
 export function fixtureControl(verb = 'compact', args) {
   return {

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.0
+
+### Shared session plans stay connection-bound and survive Cursor reconnects
+
+Cursor's remote poller now negotiates canonical ingress, delegated project scope,
+and active-plan projection version 1 together. It strictly accepts the 1.3.0
+active-session-plan inventory while preserving older strict parser tiers. Every
+active plan in the attached room is available as advisory read awareness; the
+projection never grants mutation authority.
+
+Mechanical register negotiates a hidden per-connection capability. The trusted
+helper captures MCP result `_meta`, stores the capability in a mode-0600
+connection file, rotates it on reconnect, clears it on end, and sends it only in
+the capability header for `manage_plan`. The raw value is never printed or put in
+the global Cursor MCP configuration. `manage-plan describe` exposes the complete,
+bounded schema only on demand; `manage-plan use` accepts plan mechanics on stdin
+and derives identity from Cursor host state. Manual chats without a Cursor
+conversation id use the minted-bond index only when one live attached candidate in
+the current workspace is unambiguous; sibling candidates fail closed.
+
+Static Cursor guidance now points plan timing to
+`devspec://product/implementation-contract` instead of copying complexity-based
+tracking rules. Routine work remains no-plan; qualifying plans use atomic advance,
+authoritative revisions on reconnect, explicit plan id plus expected revision for
+same-owner cross-plan work/adoption, and read-only treatment for other owners.
+Cursor's native `agent --resume` and `local_session_id` behavior is unchanged.
+
+> Maintainer note: Cursor releases are versioned independently from sibling host
+> plugins. The Cursor plugin manifest is 0.10.0. `package.json` remains protected
+> at 0.8.0 in source; bump it to 0.10.0 only as part of the signed VSIX/Open VSX
+> publish step.
 
 ## 0.9.0
 

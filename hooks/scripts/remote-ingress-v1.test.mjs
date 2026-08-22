@@ -4,6 +4,7 @@ import {
   emptyCanonicalContextCarry,
   mergeCanonicalContextCarry,
   normalizeRemoteIngressV1,
+  validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
 } from './remote-ingress-v1.mjs'
 import {
@@ -11,6 +12,8 @@ import {
   emptyFixtureContext as emptyContext,
   fixtureCommand as command,
   fixtureContextEntry as contextEntry,
+  fixtureActivePlanEnvelope,
+  fixtureActiveSessionPlans,
   fixtureEnvelope,
   fixtureWindow as windowFor,
 } from './remote-ingress-test-fixtures.mjs'
@@ -44,6 +47,55 @@ describe('canonical remote ingress v1', () => {
     const futureContract = envelope()
     futureContract.contract_version = '1.2.1'
     assert.equal(normalizeRemoteIngressV1({ changed: true, ingress: futureContract }, ID.connection).ok, false)
+  })
+
+  it('accepts strict 1.3 active-session plans while preserving strict 1.2 compatibility', () => {
+    const active = fixtureActivePlanEnvelope()
+    const parsed = normalizeRemoteIngressV1({ changed: true, ingress: active }, ID.connection)
+    assert.equal(parsed.ok, true)
+    assert.deepEqual(parsed.envelope.active_session_plans, active.active_session_plans)
+    const carried = {
+      advisory: true,
+      typed: active.context,
+      windows: [active.window],
+      locally_omitted: 0,
+      locally_omitted_by_bucket: { human_context: 0, agent_context: 0, ai_context: 0, system_context: 0 },
+      windows_omitted: 0,
+      local_omission_reason: null,
+      note: 'advisory',
+    }
+    assert.equal(validateCanonicalContextCarry(carried), true)
+    assert.equal(validateCanonicalContextCarry({
+      ...carried,
+      active_session_plans: active.active_session_plans,
+      active_session_plan_guidance: 'Continue own plan with its displayed revision.',
+    }), true)
+
+    // The pre-projection scoped tier remains accepted and must not grow an optional
+    // field silently: strictness is per negotiated contract pair.
+    const activeWithoutPlans = fixtureActivePlanEnvelope()
+    delete activeWithoutPlans.active_session_plans
+    assert.equal(validateRemoteIngressEnvelopeV1(activeWithoutPlans, ID.connection), null)
+
+    const scoped = envelope()
+    assert.equal(validateRemoteIngressEnvelopeV1(scoped, ID.connection), null)
+    scoped.active_session_plans = fixtureActiveSessionPlans()
+    assert.match(validateRemoteIngressEnvelopeV1(scoped, ID.connection), /malformed canonical ingress/)
+  })
+
+  it('fails closed on malformed 1.3 plan schema and mismatched contract/policy negotiation', () => {
+    const malformed = fixtureActivePlanEnvelope()
+    malformed.active_session_plans.plans[0].progress.terminal = 1
+    assert.match(validateRemoteIngressEnvelopeV1(malformed, ID.connection), /active session plan projection/)
+
+    const extra = fixtureActivePlanEnvelope()
+    extra.active_session_plans.plans[0].steward.extra = true
+    assert.match(validateRemoteIngressEnvelopeV1(extra, ID.connection), /active session plan projection/)
+
+    const wrongPolicy = fixtureActivePlanEnvelope()
+    wrongPolicy.policy_version = '2026-08-19.3'
+    wrongPolicy.window.policy_version = '2026-08-19.3'
+    assert.match(validateRemoteIngressEnvelopeV1(wrongPolicy, ID.connection), /canonical ingress/)
   })
 
   it('strictly validates the authority/project-scope pair and delegated policy fields', () => {

@@ -21,6 +21,17 @@
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
 
+export function mcpRequestHeaders({ token, connectionCapability = null }) {
+  return {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+    ...(typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_')
+      ? { 'X-DevSpec-Connection-Capability': connectionCapability }
+      : {}),
+  }
+}
+
 export async function mcpToolsCall({
   mcpUrl,
   token,
@@ -29,6 +40,8 @@ export async function mcpToolsCall({
   timeoutMs = DEFAULT_MCP_CALL_TIMEOUT_MS,
   isAlive = null,
   aliveCheckMs = 2_000,
+  connectionCapability = null,
+  includeMeta = false,
 }) {
   const body = {
     jsonrpc: '2.0',
@@ -68,11 +81,7 @@ export async function mcpToolsCall({
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
-      },
+      headers: mcpRequestHeaders({ token, connectionCapability }),
       body: JSON.stringify(body),
       signal: controller.signal,
     })
@@ -129,11 +138,21 @@ export async function mcpToolsCall({
     if (payload.result?.isError) {
       throw new Error(joined || 'MCP tool error')
     }
+    let data
     try {
-      return JSON.parse(joined)
+      data = JSON.parse(joined)
     } catch {
-      return { raw: joined, result: payload.result }
+      const { _meta: _hiddenMeta, ...publicResult } = payload.result ?? {}
+      data = { raw: joined, result: publicResult }
     }
+    return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
   }
-  return payload.result ?? payload
+  const source = payload.result ?? payload
+  const hiddenMeta = source && typeof source === 'object' && !Array.isArray(source)
+    ? source._meta ?? null
+    : null
+  const data = hiddenMeta
+    ? Object.fromEntries(Object.entries(source).filter(([key]) => key !== '_meta'))
+    : source
+  return includeMeta ? { data, meta: hiddenMeta } : data
 }
