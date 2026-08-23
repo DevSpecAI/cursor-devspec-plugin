@@ -181,8 +181,22 @@ async function main() {
       await startMacOsBridgeServer()
       console.log('[devspec-open-handler] macOS: localhost bridge fallback active')
     } else {
-      await installProtocolHandler(path.join(DEVSPEC_DIR, 'devspec-handler.cmd'))
+      const result = await installProtocolHandler(path.join(DEVSPEC_DIR, 'devspec-handler.cmd'))
       console.log('[devspec-open-handler] devspec:// protocol registered')
+      // Linux returns what actually happened. Report it: a scheme owned by
+      // another app is the difference between "registered" and "will work".
+      if (result?.repaired?.length) {
+        console.log(
+          `[devspec-open-handler] cleared a conflicting devspec:// association in ${result.repaired.join(', ')}`,
+        )
+      }
+      if (result && result.ok === false) {
+        console.warn(
+          `[devspec-open-handler] WARNING: devspec:// is still owned by ${result.owner} — ` +
+            'run `xdg-mime default devspec-protocol.desktop x-scheme-handler/devspec`, ' +
+            'and clear any remembered choice in your desktop settings.',
+        )
+      }
     }
     console.log(`[devspec-open-handler] installed to ${INSTALLED_HANDLER}`)
     return
