@@ -41,6 +41,7 @@ async function copyInstalledArtifacts(sourceDir) {
     'handoff-public-key.pem',
     'devspec-handler.cmd',
     'devspec-handler.vbs',
+    'devspec-handler.sh',
     // Needed only for --install / reinstall from the installed copy; URL
     // handling does not import these (lazy-loaded below). Keep them so a
     // reinstall from ~/.cursor/devspec still works.
@@ -54,6 +55,16 @@ async function copyInstalledArtifacts(sourceDir) {
       await fs.copyFile(src, path.join(DEVSPEC_DIR, name))
     } catch {
       // optional files (e.g. exe) may be absent in dev
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    // A .desktop Exec target must be executable and packing does not reliably
+    // preserve the mode bit.
+    try {
+      await fs.chmod(path.join(DEVSPEC_DIR, 'devspec-handler.sh'), 0o755)
+    } catch {
+      // absent in dev / already correct
     }
   }
 
