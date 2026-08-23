@@ -35,9 +35,9 @@ export async function installProtocolHandler(handlerCmdPath) {
     return
   }
   if (process.platform === 'linux') {
-    await installLinux()
-    return
+    return installLinux()
   }
+  return null
 }
 
 async function installWindows(handlerCmdPath) {
@@ -126,6 +126,147 @@ async function resolveLinuxNodeBin() {
   return 'node'
 }
 
+export const DEVSPEC_SCHEME = 'x-scheme-handler/devspec'
+export const DEVSPEC_DESKTOP_FILE = 'devspec-protocol.desktop'
+
+/**
+ * Strip associations that would outrank us for a scheme, in one mimeapps.list.
+ *
+ * Why this is needed at all: the FIRST time a Linux user opens a devspec:// link
+ * the desktop asks "which program?" and offers whatever claims a nearby scheme.
+ * Picking the wrong app there pins it — reported live: a KDE dialog offering only
+ * "Cursor Agents" (not the Cursor CLI we needed), after which every devspec://
+ * launch opened that instead, and the real handler was never invoked.
+ *
+ * Registering our own default is not enough to recover from that, for two reasons:
+ *  - `[Default Applications]` may already name another app for the scheme, and
+ *  - `[Removed Associations]` can BLOCK our handler outright.
+ * So a repair pass has to remove the competing claims rather than just add ours.
+ *
+ * Pure text transform over the whole file (section-aware) so it is testable and
+ * so comments, ordering and unrelated keys survive untouched.
+ */
+export function stripConflictingSchemeAssociations(
+  contents,
+  { scheme = DEVSPEC_SCHEME, desktopFile = DEVSPEC_DESKTOP_FILE } = {},
+) {
+  const lines = String(contents).split('\n')
+  const out = []
+  let section = null
+  let changed = false
+
+  for (const line of lines) {
+    const sectionMatch = /^\s*\[(.+)\]\s*$/.exec(line)
+    if (sectionMatch) {
+      section = sectionMatch[1]
+      out.push(line)
+      continue
+    }
+
+    const eq = line.indexOf('=')
+    if (eq < 0 || line.trimStart().startsWith('#') || line.slice(0, eq).trim() !== scheme) {
+      out.push(line)
+      continue
+    }
+
+    // A "Removed" entry for our handler is a hard block — drop the whole line.
+    if (section === 'Removed Associations') {
+      const kept = line
+        .slice(eq + 1)
+        .split(';')
+        .map((v) => v.trim())
+        .filter((v) => v && v !== desktopFile)
+      changed = true
+      if (kept.length) out.push(`${scheme}=${kept.join(';')};`)
+      continue
+    }
+
+    // Default / Added: keep only our handler. An emptied list drops the line so
+    // the lookup falls through to the file where we DO register.
+    const values = line
+      .slice(eq + 1)
+      .split(';')
+      .map((v) => v.trim())
+      .filter(Boolean)
+    const kept = values.filter((v) => v === desktopFile)
+    if (kept.length === values.length) {
+      out.push(line)
+      continue
+    }
+    changed = true
+    if (kept.length) out.push(`${scheme}=${kept.join(';')};`)
+  }
+
+  return { contents: out.join('\n'), changed }
+}
+
+/**
+ * Every mimeapps.list that can decide this scheme, in XDG precedence order.
+ *
+ * The desktop-specific file (`kde-mimeapps.list`, `gnome-mimeapps.list`, …) is
+ * checked BEFORE plain mimeapps.list, so an entry there silently outranks
+ * anything `xdg-mime default` writes — which is exactly how one bad choice
+ * becomes permanent. $XDG_CURRENT_DESKTOP is colon-separated and may name
+ * several desktops.
+ */
+export function mimeappsCandidatePaths(
+  env = process.env,
+  homedir = os.homedir(),
+) {
+  const configHome = env.XDG_CONFIG_HOME || path.join(homedir, '.config')
+  const dataHome = env.XDG_DATA_HOME || path.join(homedir, '.local', 'share')
+  const desktops = String(env.XDG_CURRENT_DESKTOP || '')
+    .split(':')
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean)
+
+  return [
+    ...desktops.map((d) => path.join(configHome, `${d}-mimeapps.list`)),
+    path.join(configHome, 'mimeapps.list'),
+    ...desktops.map((d) => path.join(dataHome, 'applications', `${d}-mimeapps.list`)),
+    path.join(dataHome, 'applications', 'mimeapps.list'),
+  ]
+}
+
+/**
+ * Remove competing devspec:// claims wherever they are pinned. Best-effort per
+ * file: an unreadable or absent file is simply skipped.
+ */
+async function repairSchemeAssociations() {
+  const repaired = []
+  for (const file of mimeappsCandidatePaths()) {
+    let original
+    try {
+      original = await fs.readFile(file, 'utf8')
+    } catch {
+      continue
+    }
+    const { contents, changed } = stripConflictingSchemeAssociations(original)
+    if (!changed) continue
+    try {
+      await fs.writeFile(file, contents, 'utf8')
+      repaired.push(file)
+    } catch {
+      // read-only (e.g. a system file) — the default we write still applies
+    }
+  }
+  return repaired
+}
+
+/**
+ * Ask the OS who owns devspec:// now. Returns the winning .desktop name, or null
+ * when it cannot be determined. Registering without checking is how the original
+ * breakage stayed invisible: nothing ever asserted the claim actually took.
+ */
+export async function queryLinuxSchemeOwner() {
+  try {
+    const { stdout } = await execFileAsync('xdg-mime', ['query', 'default', DEVSPEC_SCHEME])
+    return stdout.trim() || null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Claim devspec:// on Linux.
  *
@@ -165,17 +306,40 @@ async function installLinux() {
   } catch {
     // optional on some distros
   }
+
+  // Clear any earlier "open with…" choice that would beat us — including one in
+  // a desktop-specific mimeapps.list, which outranks whatever xdg-mime writes.
+  const repaired = await repairSchemeAssociations()
+
   // update-desktop-database only refreshes mimeinfo.cache ("can handle").
   // Desktops that read mimeapps.list [Default Applications] need the default
   // set explicitly, which is what xdg-mime writes.
   try {
-    await execFileAsync('xdg-mime', [
-      'default',
-      'devspec-protocol.desktop',
-      'x-scheme-handler/devspec',
-    ])
+    await execFileAsync('xdg-mime', ['default', DEVSPEC_DESKTOP_FILE, DEVSPEC_SCHEME])
   } catch {
     // xdg-utils not installed — mimeinfo.cache still resolves on most DEs
+  }
+
+  // KDE answers from its own service cache (ksycoca), so a freshly written
+  // .desktop can stay invisible until that cache is rebuilt.
+  for (const bin of ['kbuildsycoca6', 'kbuildsycoca5']) {
+    try {
+      await execFileAsync(bin, ['--noincremental'], { timeout: 20000 })
+      break
+    } catch {
+      // not a KDE session, or not installed
+    }
+  }
+
+  // Verify rather than assume: the original bug survived precisely because
+  // nothing ever checked that the claim took.
+  const owner = await queryLinuxSchemeOwner()
+  return {
+    desktopPath,
+    execLine,
+    repaired,
+    owner,
+    ok: owner === null || owner === DEVSPEC_DESKTOP_FILE,
   }
 }
 

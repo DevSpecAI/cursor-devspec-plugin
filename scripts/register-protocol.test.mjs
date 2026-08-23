@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url'
 import {
   buildLinuxDesktopEntry,
   linuxDesktopExecLine,
+  mimeappsCandidatePaths,
   quoteDesktopExecArg,
+  stripConflictingSchemeAssociations,
 } from './register-protocol.mjs'
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url))
@@ -97,5 +99,77 @@ describe('devspec-handler.sh', () => {
   it('is copied by --install so the Exec target exists', () => {
     const installer = fs.readFileSync(path.join(SCRIPTS_DIR, 'open-handler.mjs'), 'utf8')
     assert.match(installer, /'devspec-handler\.sh',/)
+  })
+})
+
+/*
+ * Recovering from a wrong "open with…" choice. Reported live on Ubuntu/KDE: the
+ * first devspec:// link raised a KDE chooser that offered only "Cursor Agents",
+ * and once picked, every launch went there and the real handler was never
+ * invoked. Registering our own default does not undo that on its own — a
+ * desktop-specific mimeapps.list outranks it, and a Removed Associations entry
+ * blocks us outright.
+ */
+describe('scheme association repair', () => {
+  const OURS = 'devspec-protocol.desktop'
+
+  it('drops another app that holds the scheme as default', () => {
+    const { contents, changed } = stripConflictingSchemeAssociations(
+      '[Default Applications]\nx-scheme-handler/devspec=cursor-agents.desktop;\ntext/html=firefox.desktop;\n',
+    )
+    assert.equal(changed, true)
+    assert.doesNotMatch(contents, /cursor-agents/)
+    assert.match(contents, /text\/html=firefox\.desktop;/)
+  })
+
+  it('keeps our handler and removes only the competing ones', () => {
+    const { contents, changed } = stripConflictingSchemeAssociations(
+      `[Added Associations]\nx-scheme-handler/devspec=cursor-agents.desktop;${OURS};other.desktop;\n`,
+    )
+    assert.equal(changed, true)
+    assert.match(contents, new RegExp(`x-scheme-handler/devspec=${OURS.replace('.', '\\.')};`))
+    assert.doesNotMatch(contents, /cursor-agents|other\.desktop/)
+  })
+
+  it('unblocks a handler listed under Removed Associations', () => {
+    const { contents, changed } = stripConflictingSchemeAssociations(
+      `[Removed Associations]\nx-scheme-handler/devspec=${OURS};\n`,
+    )
+    assert.equal(changed, true)
+    assert.doesNotMatch(contents, /devspec-protocol\.desktop/)
+  })
+
+  it('leaves a file that already names only us untouched', () => {
+    const input = `[Default Applications]\nx-scheme-handler/devspec=${OURS};\n`
+    const { contents, changed } = stripConflictingSchemeAssociations(input)
+    assert.equal(changed, false)
+    assert.equal(contents, input)
+  })
+
+  it('never touches another scheme or a commented line', () => {
+    const input =
+      '[Default Applications]\n#x-scheme-handler/devspec=old.desktop;\nx-scheme-handler/cursor=cursor.desktop;\n'
+    const { contents, changed } = stripConflictingSchemeAssociations(input)
+    assert.equal(changed, false)
+    assert.equal(contents, input)
+  })
+
+  it('checks the desktop-specific mimeapps.list BEFORE the plain one', () => {
+    const paths = mimeappsCandidatePaths(
+      { XDG_CURRENT_DESKTOP: 'KDE', XDG_CONFIG_HOME: '/c', XDG_DATA_HOME: '/d' },
+      '/home/u',
+    )
+    assert.equal(paths[0], '/c/kde-mimeapps.list')
+    assert.equal(paths[1], '/c/mimeapps.list')
+    assert.ok(paths.includes('/d/applications/mimeapps.list'))
+  })
+
+  it('handles a multi-desktop XDG_CURRENT_DESKTOP', () => {
+    const paths = mimeappsCandidatePaths(
+      { XDG_CURRENT_DESKTOP: 'ubuntu:GNOME', XDG_CONFIG_HOME: '/c', XDG_DATA_HOME: '/d' },
+      '/home/u',
+    )
+    assert.equal(paths[0], '/c/ubuntu-mimeapps.list')
+    assert.equal(paths[1], '/c/gnome-mimeapps.list')
   })
 })
