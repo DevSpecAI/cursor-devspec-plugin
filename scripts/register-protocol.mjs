@@ -25,7 +25,9 @@ async function pathExists(p) {
 }
 
 /**
- * @param {string} handlerCmdPath  Path to devspec-handler.cmd (installed copy)
+ * @param {string} handlerCmdPath  Path to devspec-handler.cmd (installed copy).
+ *   WINDOWS ONLY — it is a cmd.exe batch file. Linux resolves its own POSIX
+ *   launcher; handing this path to installLinux is the bug fixed in this file.
  */
 export async function installProtocolHandler(handlerCmdPath) {
   if (process.platform === 'win32') {
@@ -33,7 +35,7 @@ export async function installProtocolHandler(handlerCmdPath) {
     return
   }
   if (process.platform === 'linux') {
-    await installLinux(handlerCmdPath)
+    await installLinux()
     return
   }
 }
@@ -63,28 +65,117 @@ async function installWindows(handlerCmdPath) {
   }
 }
 
-async function installLinux(handlerScript) {
-  const desktopDir = path.join(os.homedir(), '.local', 'share', 'applications')
-  await fs.mkdir(desktopDir, { recursive: true })
-  const desktopPath = path.join(desktopDir, 'devspec-protocol.desktop')
-  const nodeHandler = path.join(DEVSPEC_DIR, 'open-handler.mjs')
-  const execLine = (await pathExists(handlerScript))
-    ? handlerScript
-    : `node ${nodeHandler} %u`
+/**
+ * Escape one `Exec=` argument per the Desktop Entry spec: wrap in double quotes
+ * and backslash-escape the characters that stay special inside them. Field codes
+ * (`%u`) go OUTSIDE the quotes — a quoted "%u" is not expanded.
+ */
+export function quoteDesktopExecArg(value) {
+  return `"${String(value).replace(/(["`$\\])/g, '\\$1')}"`
+}
 
-  const desktop = `[Desktop Entry]
+/**
+ * Build the `Exec=` value. Prefers the POSIX launcher (devspec-handler.sh);
+ * falls back to invoking node + the handler directly for an older install tree
+ * that predates the launcher. Always ends in `%u` — without it the handler is
+ * invoked with no URL and exits.
+ */
+export function linuxDesktopExecLine({ launcherPath, nodeBin, handlerPath }) {
+  if (launcherPath) return `${quoteDesktopExecArg(launcherPath)} %u`
+  return `${quoteDesktopExecArg(nodeBin)} ${quoteDesktopExecArg(handlerPath)} %u`
+}
+
+/**
+ * The `.desktop` entry that claims devspec://.
+ *
+ * `Terminal=false` is deliberate and correct: the handler spawns its own
+ * terminal emulator for CLI launches (see the emulator ladder in
+ * open-handler-core.mjs), so asking the DE for one too would nest two windows.
+ * `NoDisplay=true` keeps a protocol handler out of application menus.
+ */
+export function buildLinuxDesktopEntry(execLine) {
+  return `[Desktop Entry]
 Name=DevSpec Protocol Handler
-Comment=Open DevSpec action items in Cursor
+Comment=Open DevSpec work in Cursor, OpenCode or Pi
 Exec=${execLine}
 Type=Application
 Terminal=false
+NoDisplay=true
 MimeType=x-scheme-handler/devspec;
 `
-  await fs.writeFile(desktopPath, desktop, 'utf8')
+}
+
+/**
+ * Absolute node path for the launcher-less fallback Exec line.
+ *
+ * Bare `node` is not safe in a `.desktop` Exec: the launch inherits the desktop
+ * *session* PATH, which never includes a version-manager node. `process.execPath`
+ * is only usable when this process really is node — inside the Cursor extension
+ * host it is the Cursor binary, which would open the editor instead of running
+ * the handler.
+ */
+async function resolveLinuxNodeBin() {
+  if (/^node(js)?$/i.test(path.basename(process.execPath))) return process.execPath
+  try {
+    const { stdout } = await execFileAsync('which', ['node'])
+    const found = stdout.trim()
+    if (found) return found
+  } catch {
+    // fall through to bare `node`
+  }
+  return 'node'
+}
+
+/**
+ * Claim devspec:// on Linux.
+ *
+ * Takes no argument on purpose. It used to receive devspec-handler.cmd and, when
+ * that file existed (always — it is installed on every platform), wrote it
+ * straight into `Exec=`. That pointed the desktop entry at a cmd.exe batch file
+ * (`sh: @echo: not found` … `Syntax error`) and carried no `%u`, so every Linux
+ * devspec:// launch died before the handler ever saw a URL. The only correct
+ * branch was the fallback, which could not be reached.
+ */
+async function installLinux() {
+  const desktopDir = path.join(os.homedir(), '.local', 'share', 'applications')
+  await fs.mkdir(desktopDir, { recursive: true })
+  const desktopPath = path.join(desktopDir, 'devspec-protocol.desktop')
+
+  const launcherPath = path.join(DEVSPEC_DIR, 'devspec-handler.sh')
+  const hasLauncher = await pathExists(launcherPath)
+  if (hasLauncher) {
+    // A .desktop Exec must be executable; npm/vsix packing does not always
+    // preserve the mode bit.
+    try {
+      await fs.chmod(launcherPath, 0o755)
+    } catch {
+      // best-effort
+    }
+  }
+
+  const execLine = linuxDesktopExecLine({
+    launcherPath: hasLauncher ? launcherPath : null,
+    nodeBin: hasLauncher ? null : await resolveLinuxNodeBin(),
+    handlerPath: path.join(DEVSPEC_DIR, 'open-handler.mjs'),
+  })
+
+  await fs.writeFile(desktopPath, buildLinuxDesktopEntry(execLine), 'utf8')
   try {
     await execFileAsync('update-desktop-database', [desktopDir])
   } catch {
     // optional on some distros
+  }
+  // update-desktop-database only refreshes mimeinfo.cache ("can handle").
+  // Desktops that read mimeapps.list [Default Applications] need the default
+  // set explicitly, which is what xdg-mime writes.
+  try {
+    await execFileAsync('xdg-mime', [
+      'default',
+      'devspec-protocol.desktop',
+      'x-scheme-handler/devspec',
+    ])
+  } catch {
+    // xdg-utils not installed — mimeinfo.cache still resolves on most DEs
   }
 }
 
