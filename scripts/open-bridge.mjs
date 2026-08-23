@@ -19,7 +19,7 @@ import {
 
 const PID_PATH = `${DEVSPEC_DIR}/open-bridge.pid`
 
-function isAllowedOrigin(origin) {
+export function isAllowedOrigin(origin) {
   if (!origin || typeof origin !== 'string') return false
   return (
     origin === 'https://devspec.ai' ||
@@ -30,7 +30,7 @@ function isAllowedOrigin(origin) {
   )
 }
 
-function applyCors(req, res) {
+export function applyCors(req, res) {
   const origin = req.headers.origin
   if (isAllowedOrigin(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin)
@@ -38,6 +38,15 @@ function applyCors(req, res) {
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  // Chrome's Private Network Access: a request from a public HTTPS page to a
+  // loopback address is preflighted, and the preflight must opt in explicitly
+  // or the fetch fails before it reaches us. Without this, /health cannot be
+  // used from the app to tell "launcher present" from "launcher missing" —
+  // which is the difference between a useful message and a silent no-op.
+  // Only offered to origins we already allow above.
+  if (isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true')
+  }
 }
 
 async function isProcessAlive(pid) {
