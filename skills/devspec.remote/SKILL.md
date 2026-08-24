@@ -206,26 +206,26 @@ A wake payload carries bounded, actor-labelled `model_context` first, complete c
 - **Exit 1** only for terminal stop (disabled / UI End / owner gone / connection stood down). **Exit 2** = bad args.
 - **Rides out a recoverable teardown by itself.** If the server says the connection is gone but will not attribute it to a person — the shape a server redeploy produces — the poller retries rather than exiting. Only `end_reason` of `ui` or `local_stop` is a deliberate human end and stops it dead. You will see `recoverable, not a UI end; retrying` in its log; that is the poller working, not failing.
 
-**Wait-for-owner (wakes the model — required):** after the poller is up, run:
+**Wait is host-owned.** The detached poller (and its wake-follow) arm wait and inject owner commands. Do **not** block a model Shell on `devspec-wake-tail.mjs` — a hung turn would deafen the connection. Model re-arm of wait with `--pending --after-reply` is a **backstop only**.
+
+**Wait-for-owner (backstop):** after the poller is up, the host follow is already watching. If you re-arm wait yourself:
 
 ```bash
 # FIRST arm only (just connected) — skip historical inbox:
 node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --from-end [--launch-id "<launch_id>"]
 
-# EVERY re-arm after finishing this wake's reply — MUST use --pending so owner
-# commands that arrived while you were mid-turn are not skipped, AND --after-reply
-# so Working/dots clear on Cursor CLI (Stop often never fires there). Live bug:
-# plain --pending left the turn marker forever; --from-end on re-arm jumps the
-# byte offset to EOF and permanently drops mail the poller already wrote.
+# BACKSTOP re-arm after finishing this wake's reply — `--pending` so owner
+# commands that arrived while you were mid-turn are not skipped, AND `--after-reply`
+# so Working/dots clear on Cursor CLI (Stop often never fires there).
 node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id "$CONNECTION_ID" --owner-pid "$PPID" --pending --after-reply
 ```
 
-How to run wait so the model actually turns:
+How wait actually lands:
 
 | Host | How |
 |---|---|
-| **Cursor (Agents Connect)** | Background Shell on the argv **wake-tail** (`block_until_ms: 0`, `notify_on_output` pattern `owner_message\|session_ended\|playbook_dispatch`). Host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end`. **Do not** re-arm after `turn_ended`. When notify prints `owner_message`, `post_session_message` the reply to that DevSpec session (`connection_id` from the wake, `complete_turn: true`). Do not only print the answer in this CLI. |
-| **Cursor (manual `/devspec.remote`)** | One-shot wait with `notify_on_output` / `monitor` on stdout. When you see `type":"wake"`, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
+| **Cursor (Agents Connect)** | Host poller + wake-follow own inject. Background tail is optional notify only. **Do not** block on `devspec-wake-tail.mjs`. When a wake prints `owner_message`, `post_session_message` the reply (`connection_id` from the wake, `complete_turn: true`). |
+| **Cursor (manual `/devspec.remote`)** | Host poller still injects. One-shot wait with `notify_on_output` is a **backstop**. When you see `type":"wake"`, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
 
 Wait contract:
 - Does **not** heartbeat (the poller does).

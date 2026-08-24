@@ -14,6 +14,9 @@ import {
   resolveServerAttachment,
   verbForTurnTransition,
   extraActivityVerbArgs,
+  TURN_SILENCE_MS,
+  isTurnMarkerStale,
+  shouldForceCompleteAndInject,
   trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
@@ -440,6 +443,44 @@ describe('extraActivityVerbArgs (complete reasons, d8bf97c6)', () => {
     assert.deepEqual(extraActivityVerbArgs({ verb: 'pickup', stalling: false }), {})
     assert.deepEqual(extraActivityVerbArgs({ verb: 'keepalive', stalling: true }), {})
     assert.deepEqual(extraActivityVerbArgs(), {})
+  })
+})
+
+describe('host-owned inject after a hung turn (Colorful Dolphin)', () => {
+  it('treats a turn marker older than TURN_SILENCE_MS as stale', () => {
+    const now = 1_000_000
+    assert.equal(isTurnMarkerStale({ startedAt: now - TURN_SILENCE_MS }, now), true)
+    assert.equal(isTurnMarkerStale({ startedAt: now - 1_000 }, now), false)
+    assert.equal(isTurnMarkerStale(null, now), false)
+  })
+
+  it('force-completes and injects when a new owner command arrives on a stale marker', () => {
+    const now = 1_000_000
+    const stale = { startedAt: now - TURN_SILENCE_MS }
+    assert.equal(
+      shouldForceCompleteAndInject({ hasNewOwnerCommands: true, marker: stale, nowMs: now }),
+      true,
+    )
+    assert.equal(
+      shouldForceCompleteAndInject({ hasNewOwnerCommands: true, marker: { startedAt: now - 1_000 }, nowMs: now }),
+      false,
+    )
+    assert.equal(
+      shouldForceCompleteAndInject({ hasNewOwnerCommands: false, marker: stale, nowMs: now }),
+      false,
+    )
+  })
+
+  it('does not require a hung wake-tail Shell — inject decision is marker + new command only', () => {
+    const now = TURN_SILENCE_MS
+    assert.equal(
+      shouldForceCompleteAndInject({
+        hasNewOwnerCommands: true,
+        marker: { startedAt: 0 },
+        nowMs: now,
+      }),
+      true,
+    )
   })
 })
 
