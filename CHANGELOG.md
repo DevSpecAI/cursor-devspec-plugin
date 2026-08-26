@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.1
+
+### Fix: the test suite wrote into the repo root and a developer's real ~/.devspec
+
+`ensureWakeFollowForConnection` had `spawn`, `findPid` and `resolveOwnerPid` injectable
+and the filesystem not, so two tests that only wanted to assert the argv for a Windows
+wake path also wrote a file literally named `C:\ProgramData\DevSpec\wakes\<id>.jsonl`
+into the repo root — `path.dirname` does not treat a backslash as a separator on POSIX,
+so the whole string became one filename in the working directory — and left a fake
+`.wake-follow.log` plus a `.wake-follow.pid` holding a stubbed pid in the real
+`~/.devspec/remote-control/connections/`. That pid file is not inert:
+`findWakeFollowPidForConnection` reads exactly those.
+
+The filesystem is now injectable through `io` (defaulting to `fs`) the same way
+`persistConnectionCapability` and `appendAcceptedJsonl` already do, so the Windows path
+is asserted end to end without touching disk, and a new test arms a follow for real
+under a temp root so the POSIX path is exercised rather than merely resolved. A full run
+now leaves the working tree clean and the real state directory untouched.
+
 ## 0.11.0
 
 ### Cursor can ask the person driving a session one question, and pick up their answer
