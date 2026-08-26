@@ -102,7 +102,6 @@ import {
 import {
   resolveSpaceFreeWakeFile,
   ensureWakeFile,
-  appendWakeEvents,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
 
@@ -1096,23 +1095,11 @@ async function main() {
       )
       if (!delivered.ok) return false
       newlyDelivered ||= !delivered.duplicate
-      if (delivered.ok && !delivered.duplicate) {
-        try {
-          const wakeFile = ensureWakeFile(resolveSpaceFreeWakeFile(connectionId))
-          appendWakeEvents(wakeFile, [
-            {
-              type: 'owner_message',
-              connection_id: connectionId,
-              received_at: new Date().toISOString(),
-              count: envelope.commands.length,
-            },
-          ])
-        } catch (e) {
-          process.stderr.write(
-            `devspec-remote-poll: wake event append failed: ${e instanceof Error ? e.message : String(e)}\n`,
-          )
-        }
-      }
+      // Do NOT append a thin `{ type: owner_message, count }` wake here (item 9ed0d42e).
+      // Host wake-follow (`devspec-remote-wait --follow --wake-file`) owns the wake file
+      // and writes `buildOwnerMessageEvents` — full command bodies. A count-only line
+      // would notify Cursor before the body exists; the model then polls the server and
+      // races delivery. Wait-follow is started via ensureHostWakeFollow.
       canonicalCarry = emptyCanonicalContextCarry()
     } else {
       const advisoryRows = [...rows, ...envelope.commands]

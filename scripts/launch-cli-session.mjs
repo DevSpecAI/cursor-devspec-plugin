@@ -186,7 +186,10 @@ export function buildShortArgvPrompt(stampedPromptPath, opts = {}) {
     return (
       `Arm wait FIRST as a background Shell with block_until_ms: 0 and notify_on_output pattern ${REMOTE_WAKE_NOTIFY_PATTERN}. ` +
       `Do not read any file, skill, or script before it. Do not pass --from-end. Host already follows the inbox. ${waitCommand} ` +
-      `When notify prints owner_message, post_session_message the reply to that DevSpec session (connection_id from the wake, complete_turn true). Do not only print the answer in this CLI. Leave the background Shell running. Stamp on disk for recovery only: ${p}`
+      `When notify matches owner_message, read the NEW lines from that Shell's terminal output (and/or the --file wake JSONL path in the argv command) — they contain the full owner_message with message body. Act on that body. ` +
+      `Do NOT call poll_connection to discover the command. Do NOT post connect/status/listening chrome into the DevSpec session. ` +
+      `If the wake has no command body, post nothing and leave the tail running. ` +
+      `When you have a command, post_session_message the reply (connection_id from the wake, complete_turn true). Do not only print the answer in this CLI. Leave the background Shell running. Stamp on disk for recovery only: ${p}`
     )
   }
   return `Read the file at ${p} and follow every instruction in it exactly, then begin.`

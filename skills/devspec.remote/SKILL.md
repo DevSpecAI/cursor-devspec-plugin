@@ -224,8 +224,8 @@ How wait actually lands:
 
 | Host | How |
 |---|---|
-| **Cursor (Agents Connect)** | Host poller + wake-follow own inject. Background tail is optional notify only. **Do not** block on `devspec-wake-tail.mjs`. When a wake prints `owner_message`, `post_session_message` the reply (`connection_id` from the wake, `complete_turn: true`). |
-| **Cursor (manual `/devspec.remote`)** | Host poller still injects. One-shot wait with `notify_on_output` is a **backstop**. When you see `type":"wake"`, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
+| **Cursor (Agents Connect)** | Host poller + wake-follow own inject. Background `devspec-wake-tail` is notify-only. **Do not** block on it. When notify matches `owner_message`, **read the new wake-tail / wake-file lines** — they carry the full `owner_message` with `message` body (host follow writes `buildOwnerMessageEvents`). Act on that body; `post_session_message` the reply (`connection_id` from the wake, `complete_turn: true`). **Do not** call `poll_connection` to discover the command. **Do not** post connect/status/listening chrome. No command body → post **nothing**. |
+| **Cursor (manual `/devspec.remote`)** | Host poller still injects. One-shot wait with `notify_on_output` is a **backstop**. When you see `type":"wake"` / full `owner_message` events on wait stdout, act, post the reply, then **re-arm wait** with **`--pending --after-reply`**. Never re-arm with `--from-end`. |
 
 Wait contract:
 - Does **not** heartbeat (the poller does).
