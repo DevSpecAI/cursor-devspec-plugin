@@ -24,6 +24,39 @@ describe('parseSessionIdFromPrompt', () => {
   it('returns null for non-remote prompts', () => {
     assert.equal(parseSessionIdFromPrompt('Run the `devspec.work` skill'), null)
   })
+
+  it('returns null for playbook cold-launch prompts (sessionless register + claim)', () => {
+    const projectId = '24c4abaa-2cb9-496a-8492-cf1f1aa1090b'
+    const playbookId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const runId = '11111111-2222-3333-4444-555555555555'
+    const prompt = [
+      'DevSpec playbook run waiting: "Smoke check"',
+      `project_id=${projectId}`,
+      `playbook_id=${playbookId}`,
+      `run_id=${runId}`,
+      '',
+      '1. Register a live connection FIRST. Call register_connection: agent_name="Cursor", cwd=this repo.',
+      `2. claim_playbook_run({ run_id: "${runId}", provider: "cursor" })`,
+    ].join('\n')
+    assert.equal(parseSessionIdFromPrompt(prompt), null)
+  })
+
+  it('parses session_id= and skips project_id= when scanning bare uuids', () => {
+    const projectId = '24c4abaa-2cb9-496a-8492-cf1f1aa1090b'
+    const sessionId = '696a051d-2c2f-45bc-968a-6058b1734193'
+    assert.equal(
+      parseSessionIdFromPrompt(
+        `register_connection then attach_connection({ connection_id: "x", session_id: "${sessionId}" })`,
+      ),
+      sessionId,
+    )
+    assert.equal(
+      parseSessionIdFromPrompt(
+        `project_id=${projectId}\nregister_connection for DevSpec.remote attach`,
+      ),
+      null,
+    )
+  })
 })
 
 describe('resolveProjectForConnect', () => {
@@ -207,6 +240,58 @@ describe('fastConnect', () => {
           connection_id: connectionId,
           session_id: null,
           session_codename: 'Swift Fox',
+          auth_ok: true,
+          poller: { ok: true, pid: 1 },
+        }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.session_id, null)
+    assert.deepEqual(calls, ['register', 'write'])
+  })
+
+  it('playbook cold-launch promptText: register → write, no attach', async () => {
+    const calls = []
+    const projectId = '24c4abaa-2cb9-496a-8492-cf1f1aa1090b'
+    const promptText = [
+      'DevSpec playbook run waiting: "Smoke check"',
+      `project_id=${projectId}`,
+      'playbook_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'run_id=11111111-2222-3333-4444-555555555555',
+      '',
+      '1. Register a live connection FIRST. Call register_connection: agent_name="Cursor".',
+      '2. claim_playbook_run({ run_id: "11111111-2222-3333-4444-555555555555", provider: "cursor" })',
+    ].join('\n')
+    const r = await fastConnect({
+      localId,
+      launchId,
+      projectId,
+      promptText,
+      resolveAuth: () => ({
+        ok: true,
+        token: 't',
+        mcp_url: 'https://example.test/api/mcp',
+      }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({ action: 'register', connection_id: null }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async () => {},
+      registerFn: async () => {
+        calls.push('register')
+        return { ok: true, connection_id: connectionId, codename: 'Ivory Llama' }
+      },
+      attachFn: async () => {
+        calls.push('attach')
+        return { ok: true }
+      },
+      writeFn: async (opts) => {
+        calls.push('write')
+        assert.equal(opts.sessionId, null)
+        return {
+          ok: true,
+          connection_id: connectionId,
+          session_id: null,
+          session_codename: 'Ivory Llama',
           auth_ok: true,
           poller: { ok: true, pid: 1 },
         }
