@@ -31,8 +31,9 @@ import {
   writeConnectionState,
 } from './remote-control-state.mjs'
 
-const UUID_RE =
-  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+/** UUID values for these keys are never session ids (playbook cold-launch, etc.). */
+const NON_SESSION_UUID_KEY =
+  /(?:project_id|playbook_id|run_id|connection_id|local_id|launch_id|playbook_run_id|action_item_id|item_id)\s*=\s*$/i
 
 /**
  * Pull `--session <uuid>` / `--session=<uuid>` from a Connect prompt.
@@ -41,18 +42,34 @@ const UUID_RE =
  */
 export function parseSessionIdFromPrompt(promptBody) {
   if (typeof promptBody !== 'string' || !promptBody.trim()) return null
-  const flagged = promptBody.match(/--session(?:\s+|=)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)
+
+  // Playbook cold launch is sessionless — register only, then claim_playbook_run.
+  if (/devspec playbook run waiting/i.test(promptBody)) return null
+
+  const flagged = promptBody.match(
+    /--session(?:\s+|=)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})\b/i,
+  )
   if (flagged?.[1]) return flagged[1]
-  // Web headers: "with this input: --session <uuid>" already covered; bare uuid only
-  // when the prompt is clearly a remote connect (avoid grabbing random uuids).
+
+  const explicit = promptBody.match(
+    /session_id(?:\s*[:=]\s*)["']?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})\b/i,
+  )
+  if (explicit?.[1]) return explicit[1]
+
+  // Bare uuid only when the prompt is clearly remote connect — skip project/playbook/run ids.
   const lower = promptBody.toLowerCase()
   if (
     lower.includes('devspec.remote') ||
     lower.includes('register_connection') ||
     lower.includes('attach_connection')
   ) {
-    const bare = promptBody.match(UUID_RE)
-    return bare?.[0] ?? null
+    const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+    let match
+    while ((match = re.exec(promptBody)) !== null) {
+      const prefix = promptBody.slice(Math.max(0, match.index - 32), match.index)
+      if (NON_SESSION_UUID_KEY.test(prefix)) continue
+      return match[0]
+    }
   }
   return null
 }
