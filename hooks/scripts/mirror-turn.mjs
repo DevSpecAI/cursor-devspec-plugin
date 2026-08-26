@@ -23,6 +23,14 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
 import { clearTrailState } from './work-trail.mjs'
+import { clearInteractionContinuation } from './remote-control-state.mjs'
+import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
+import {
+  activeContinuation,
+  continuationIdentity,
+  turnEndInteractionDecision,
+} from './interaction-events.mjs'
+import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
@@ -150,6 +158,18 @@ export function consumeExplicitReplyMarker(connectionId) {
     return existed
   } catch {
     return false
+  }
+}
+
+/**
+ * Byte length of the space-free wake file Cursor's tail notifies from, or 0. The
+ * follow appending past a recorded length is the proof an answer reached the chat.
+ */
+export function wakeFileBytesFor(connectionId) {
+  try {
+    return fs.statSync(resolveSpaceFreeWakeFile(connectionId)).size
+  } catch {
+    return 0
   }
 }
 
@@ -412,25 +432,53 @@ async function main() {
       // long-poll tick — so Working / dots linger for seconds after the answer has
       // already landed. Calling it here drops them as soon as the turn ends, and
       // means a healthy Stop no longer depends on the poller to finish the turn.
+      //
+      // An exact directed-question attempt is the ONE case the generic call must not
+      // touch: closing an attempt from outside its claim generation is how a Cursor
+      // turn was sealed empty while the model was still inside it. It gets its own
+      // exact completion, and only once its answer has actually reached the chat.
       if (!turnActive) {
-        try {
-          await mcpToolsCall({
-            mcpUrl,
-            token,
-            name: 'report_complete',
-            arguments: { connection_id: connectionId, reason: 'turn_end' },
-            timeoutMs: 15_000,
-          })
-          logRemoteControlStory({
-            phase: 'complete_turn',
-            outcome: 'completed',
+        const decision = turnEndInteractionDecision({
+          continuation: activeContinuation(state.interaction_continuation, {
             connectionId,
-            agent: agentName || AGENT_NAME,
-            tool: 'mirror-turn.stop',
-            reason: 'turn_end',
-          })
-        } catch {
-          /* non-fatal — the poller's marker-driven backstop still runs */
+            sessionId,
+          }),
+          wakeFileBytes: wakeFileBytesFor(connectionId),
+        })
+        // 'hold' completes nothing at all: the answer is still in flight, and closing
+        // the connection's current attempt now would close THAT one. The window is the
+        // follow's poll interval, and the turn the answer starts owns the completion.
+        if (decision.action !== 'hold') {
+          try {
+            await mcpToolsCall({
+              mcpUrl,
+              token,
+              ...(decision.action === 'complete'
+                ? { connectionCapability: readConnectionCapability(connectionId) }
+                : {}),
+              name: 'report_complete',
+              arguments: decision.action === 'complete'
+                ? {
+                    connection_id: connectionId,
+                    attempt_id: decision.continuation.attempt_id,
+                    reason: 'turn_end',
+                    ...continuationIdentity(decision.continuation),
+                  }
+                : { connection_id: connectionId, reason: 'turn_end' },
+              timeoutMs: 15_000,
+            })
+            if (decision.action === 'complete') clearInteractionContinuation(connectionId)
+            logRemoteControlStory({
+              phase: 'complete_turn',
+              outcome: 'completed',
+              connectionId,
+              agent: agentName || AGENT_NAME,
+              tool: 'mirror-turn.stop',
+              reason: decision.action === 'complete' ? 'exact_interaction_turn_end' : 'turn_end',
+            })
+          } catch {
+            /* non-fatal — the poller's marker-driven backstop still runs */
+          }
         }
       }
     }

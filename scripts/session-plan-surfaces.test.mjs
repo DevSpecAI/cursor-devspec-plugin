@@ -28,8 +28,8 @@ describe('Cursor shared-session-plan surfaces', () => {
   })
 
   it('documents the independent Cursor release and protected publish-time package bump', () => {
-    assert.equal(pluginJson.version, '0.10.0')
-    assert.match(changelog, /^# Changelog\s+## 0\.10\.0/m)
+    assert.equal(pluginJson.version, '0.11.0')
+    assert.match(changelog, /^# Changelog\s+## 0\.11\.0/m)
     assert.match(changelog, /Cursor releases are versioned independently/i)
     assert.match(changelog, /package\.json.*protected.*0\.8\.0/is)
     assert.match(readme, /Shared session plans during remote control/)

@@ -239,6 +239,31 @@ export function appendAcceptedCanonicalJsonl(file, record, io = fs) {
   }
 }
 
+/**
+ * Has this acceptance key already been durably accepted?
+ *
+ * A cheap read, deliberately NOT the authority: `appendAcceptedJsonl` re-checks under
+ * the lock, so a concurrent writer can still turn an append into a duplicate. Its value
+ * is avoiding an expensive or externally-visible side effect before the append — for a
+ * directed-question answer, opening a second exact attempt for a redelivery would be a
+ * duplicate host effect in its own right (item b9f2c77a).
+ */
+export function hasAcceptedKey(file, acceptanceKey, io = fs) {
+  if (!text(file) || !text(acceptanceKey)) return false
+  if (!io.existsSync(file)) return false
+  try {
+    for (const line of completeAcceptedJsonlText(file, io).split('\n')) {
+      if (!line.trim()) continue
+      if (JSON.parse(line)?.acceptance_key === acceptanceKey) return true
+    }
+  } catch {
+    // A malformed interior record is the locked append's problem to report, not a
+    // reason to claim this key is new.
+    return false
+  }
+  return false
+}
+
 export function appendAcceptedJsonl(file, record, acceptanceKey, io = fs) {
   if (!text(file) || !text(acceptanceKey) || !object(record)) {
     return { ok: false, duplicate: false, error: 'invalid durable acceptance record' }

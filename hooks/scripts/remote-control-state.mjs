@@ -60,6 +60,9 @@
  *       launch defers it until after agent --resume)
  *   node remote-control-state.mjs manage-plan describe
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-plan use
+ *   node remote-control-state.mjs manage-question describe|status
+ *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-question use
+ *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs manage-question respond
  *     → capability-bound manage_plan for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
@@ -80,6 +83,12 @@ import {
   persistConnectionCapability,
   useManagePlanBridge,
 } from './manage-plan-bridge.mjs'
+import {
+  describeManageQuestionBridge,
+  manageQuestionStatus,
+  respondToQuestion,
+  useManageQuestionBridge,
+} from './manage-question-bridge.mjs'
 import {
   durationMs,
   emitConnectPhase,
@@ -115,6 +124,19 @@ const DEFAULT_RECONNECT_MAX_AGE_MINUTES = 30
 
 function connectionPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+}
+
+/**
+ * Drop a resolved directed-question continuation without disturbing concurrently
+ * written fields. Called after the reply is stored and the exact attempt completed, so
+ * the turn hook does not then complete an attempt that is already done (item b9f2c77a).
+ */
+export function clearInteractionContinuation(connectionId) {
+  const file = connectionPath(connectionId)
+  const prev = readJson(file)
+  if (!prev) return false
+  writeJson(file, { ...prev, interaction_continuation: null, updated_at: new Date().toISOString() })
+  return true
 }
 
 function readJson(filePath) {
@@ -1937,6 +1959,48 @@ async function runCli() {
       agent: AGENT_NAME,
       hostToken: hostTokenFromEnv(process.env),
     })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
+  if (cmd === 'manage-question') {
+    const action = args._[1] || 'describe'
+    if (action === 'describe') {
+      process.stdout.write(JSON.stringify(describeManageQuestionBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    // Identity is host-derived only: there is deliberately no --connection-id /
+    // --local-id / --capability escape hatch here either.
+    const localId = detectLocalId({}, process.env).local_id
+    if (action === 'status') {
+      const status = manageQuestionStatus({ localId, agent: AGENT_NAME })
+      process.stdout.write(JSON.stringify(status, null, 2) + '\n')
+      process.exit(status.ok ? 0 : 1)
+    }
+    if (action !== 'use' && action !== 'respond') {
+      process.stderr.write('Usage: remote-control-state.mjs manage-question describe|use|status|respond\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write(`manage-question ${action} requires one JSON object on stdin\n`)
+      process.exit(2)
+    }
+    const result = action === 'respond'
+      ? await respondToQuestion(input, {
+        localId,
+        agent: AGENT_NAME,
+        hostToken: hostTokenFromEnv(process.env),
+        clearContinuation: clearInteractionContinuation,
+      })
+      : await useManageQuestionBridge(input, {
+        localId,
+        agent: AGENT_NAME,
+        hostToken: hostTokenFromEnv(process.env),
+      })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
   }

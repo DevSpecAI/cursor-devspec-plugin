@@ -17,6 +17,7 @@ import {
   flattenPromptForArgv,
   inferCursorAgentRunKindFromPrompt,
   pluginRootFromLauncher,
+  REMOTE_WAKE_NOTIFY_PATTERN,
   pathHasWhitespace,
   quotePathForPrompt,
   spaceSafePluginRoot,
@@ -180,7 +181,12 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
     assert.doesNotMatch(argv, /^Read the file at /)
     assert.match(argv, /block_until_ms: 0/)
     assert.match(argv, /notify_on_output/)
-    assert.match(argv, /owner_message\|session_ended\|playbook_dispatch/)
+    // Every wake type the host follow can append must be notifiable, or the room reads
+    // Live and is deaf. question_answer joined the list with item b9f2c77a.
+    for (const wakeType of ['owner_message', 'question_answer', 'session_ended', 'playbook_dispatch']) {
+      assert.ok(REMOTE_WAKE_NOTIFY_PATTERN.split('|').includes(wakeType), `${wakeType} must be notifiable`)
+    }
+    assert.match(argv, /owner_message(\|[a-z_]+)*\|session_ended\|playbook_dispatch/)
     assert.doesNotMatch(waitCommand, /--from-end/)
     assert.ok(argv.includes(path.resolve(stampedPath)))
     assert.match(argv, /Do not pass --from-end/)

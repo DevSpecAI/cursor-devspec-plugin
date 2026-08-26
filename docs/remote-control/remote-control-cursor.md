@@ -42,7 +42,7 @@ Manual `/devspec.remote` in an already-open chat still uses the skill; prefer `r
 1. An authorized requester sends a canonical conversation command exactly to this connection in DevSpec.
 2. The server decides `owner` / `delegated` authority and its paired project scope, snapshots immutable requester provenance, and returns the canonical envelope to detached `devspec-remote-poll.mjs`.
 3. The poller validates the exact target, complete envelope, and strict authority/scope pair, then writes the accepted command turn unchanged to the inbox.
-4. Host-owned `devspec-remote-wait.mjs --follow` (same durable owner-pid as the poller) appends each accepted command to a space-free wake file. Connect argv tails that file as a background Shell (`block_until_ms: 0`, `notify_on_output` matching `owner_message|session_ended|playbook_dispatch`). Cursor notifies the Agent chat on matching stdout. Manual `/devspec.remote` still uses one-shot wait.
+4. Host-owned `devspec-remote-wait.mjs --follow` (same durable owner-pid as the poller) appends each accepted command to a space-free wake file. Connect argv tails that file as a background Shell (`block_until_ms: 0`, `notify_on_output` matching `owner_message|question_answer|session_ended|playbook_dispatch`). Cursor notifies the Agent chat on matching stdout. Manual `/devspec.remote` still uses one-shot wait.
 5. Model acts; when attached, model `post_session_message({ connection_id, phase: "answer", complete_turn: true })` on the **final** answer (omit `complete_turn` on any rare mid-turn narrative posts — **trail is plugin-owned**).
 6. Connect **must not** re-arm wait after `turn_ended` — host follow keeps writing the wake file. Manual Connect still re-arms with `--pending --after-reply` (never `--from-end` on re-arm) as the Working-clear backstop.
 
@@ -215,3 +215,37 @@ Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **
 The stamped prompt and launcher log print `launch_id=…` so you can paste that UUID into the filter. Expect a dense chain: `create_chat` → `project_resolve` → `register_connection` → optional `attach_connection` → `write_state` → `ensure_poller` → `expand_stamp` → `write_stamp` → `agent_resume` (then model-side `wait_armed`).
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.
+
+## Directed-question answers (item `b9f2c77a`)
+
+An answer to a question this agent asked is its own lane, not a command. The poller
+negotiates `interaction_event_version: 1` only when this connection holds the
+capability the claim, the ACK and the continuation start all require, so a host that
+could not finish the loop never leases someone's answer.
+
+One answer, in order: the acceptance ledger is read first (opening an exact attempt for
+an already-durable answer is itself a duplicate host effect) → `report_pickup` with the
+event identity opens the exact source-less attempt → the `interaction_answer` record
+goes through the same lock-protected `appendAcceptedJsonl` ledger the canonical lane
+uses, keyed `interaction:<event_id>` so a redelivery with a fresh claim token collides →
+ACK on the next poll. An outcome that is not startable persists nothing and acknowledges
+nothing; a record that cannot be written releases the attempt.
+
+The event lane is read BEFORE `inspectPollResponseV1`, because an event-only response
+carries no canonical ingress by design and that gate would reject a valid delivery.
+
+`question_answer` is in `REMOTE_WAKE_NOTIFY_PATTERN`. It has to be: Cursor only notifies
+the chat on stdout matching that pattern, so a wake type missing from it is a room that
+reads Live and is deaf. Change one without the other and this feature silently stops
+existing.
+
+While an attempt is open only the exact writer may finish it: generic pickup/complete
+are suppressed and keepalive is translated to the exact form. The reply goes through
+`remote-control-state.mjs manage-question respond`, which stores it and completes the
+attempt in one request; the Stop path is the fallback and completes exactly — but only
+once the wake file has grown past the recorded boundary, proving Cursor could notify.
+
+Authority is the served `devspec://product/interaction-event-contract`. Sibling
+connections and fresh replacement rows fail closed; detach/reattach and same-row revival
+resume.
+
