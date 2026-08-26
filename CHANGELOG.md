@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.11.0
+
+### Cursor can ask the person driving a session one question, and pick up their answer
+
+When a decision is genuinely the driver's, Cursor can now put a question with choices in
+front of them instead of guessing or stalling. The card sits above their composer; their
+answer arrives on the wake tail already armed, and one call posts the reply and closes
+the turn that answer opened.
+
+The answer channel is its own lane and never a command: it cannot carry an instruction,
+widen scope, or reach the room command, chat, dispatch or control paths. Cursor
+advertises the channel only while it holds the capability the claim, the ACK and the
+continuation all require, so a connection that could not apply an answer never leases
+one. Each answer opens exactly one exact attempt — the acceptance ledger is read before
+the attempt is opened, because opening one for an already-durable answer is itself a
+duplicate effect — lands through the same lock-protected ledger the canonical lane uses,
+keyed on the event so a redelivery with a fresh claim token collides, and is acknowledged
+only after that. While the attempt is open only its own writer may finish it, and a reply
+is never completed before the wake file proves the answer could reach the chat: the two
+ways a Cursor turn previously ended up sealed empty or showing Working with nothing
+working.
+
+`question_answer` joins `REMOTE_WAKE_NOTIFY_PATTERN`, which is load-bearing rather than
+cosmetic — Cursor only notifies the chat on stdout matching that pattern, so a wake type
+missing from it is a room that reads Live and is deaf.
+
+Delivery, leasing and completion authority remain the served
+`devspec://product/interaction-event-contract`. Asking a question is not work evidence
+and never stands in for claiming or recording an action item. 536 tests pass.
+
+> Maintainer note: Cursor releases are versioned independently from sibling host
+> plugins. The Cursor plugin manifest is 0.11.0. `package.json` remains protected
+> at 0.8.0 in source and is bumped at publish time only.
+
 ## 0.10.0
 
 ### Fix: multi-window context must not reject canonical wakes

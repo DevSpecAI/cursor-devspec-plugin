@@ -124,6 +124,24 @@ export function persistConnectionCapability(
   return { ok: true, connection_id: connectionId, version, path: file }
 }
 
+/**
+ * Read the raw capability for one connection, or null.
+ *
+ * This module owns the capability file (persist/rotate/clear), so every other
+ * capability-bound feature reads it from here rather than re-deriving the path.
+ * Callers must never log or return the value: it authenticates as this connection.
+ */
+export function readConnectionCapability(connectionId, { root = defaultRoot() } = {}) {
+  const file = capabilityPath(connectionId, root)
+  const record = file ? readJson(file) : null
+  if (!record || record.version !== CONNECTION_CAPABILITY_VERSION ||
+      record.connection_id !== connectionId ||
+      typeof record.capability !== 'string' || !record.capability.startsWith('dvsc_')) {
+    return null
+  }
+  return record.capability
+}
+
 export function clearConnectionCapability(connectionId, { root = defaultRoot(), io = fs } = {}) {
   const file = capabilityPath(connectionId, root)
   if (!file) return false
@@ -176,7 +194,7 @@ function resolveExactBond(localId, agent, root) {
   }
   if (!cap || cap.version !== CONNECTION_CAPABILITY_VERSION || cap.connection_id !== connectionId ||
       cap.local_id !== localId || typeof cap.capability !== 'string' || !cap.capability.startsWith('dvsc_')) {
-    return { ok: false, error: 'current connection has no valid plan capability; reconnect with the updated plugin' }
+    return { ok: false, error: 'current connection has no valid capability; reconnect with the updated plugin' }
   }
   return { ok: true, connectionId, state, capability: cap.capability, localId }
 }
@@ -220,6 +238,14 @@ export function resolveManagePlanBridgeContext(
       : 'Cursor conversation id is unavailable and no unambiguous live attached plan bond exists in this workspace',
   }
 }
+
+/**
+ * Neutral alias. This resolver — not each feature — decides which connection the
+ * current Cursor conversation is, and it is the only place allowed to. Directed
+ * questions (item b9f2c77a) use it too; duplicating it would mean two answers to
+ * "who am I", which is exactly how a capability ends up on the wrong connection.
+ */
+export const resolveConnectionBridgeContext = resolveManagePlanBridgeContext
 
 export async function useManagePlanBridge(
   input,

@@ -270,6 +270,29 @@ printf '%s' '<one JSON object matching the described schema>' | node "$PLUGIN/ho
 
 An active own plan must be continued, completed, explicitly left for supported handoff/adoption, or abandoned; never silently restart it. Prefer atomic `advance` over separate complete/start calls. Complete only when the outcome is achieved; otherwise abandon with a specific reason.
 
+### Asking one person a question (attached connections only)
+
+Ask the driver when a decision is genuinely theirs: an unresolved choice, an authority boundary, a fork where two readings lead to materially different work. Anything the recorded intent, the acceptance criteria or the served contracts settle is yours to get on with, as is anything you could go and observe — a question is never a way to hand judgement work back. Ask one at a time.
+
+Same bridge shape as plans, because the server requires the same per-conversation capability:
+
+```bash
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-question describe
+printf '%s' '<one JSON object matching the described schema>' | node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-question use
+```
+
+`create` needs a fresh UUID `client_request_id` per question — reusing one retries that same question rather than asking a new one. `response_kind` is `text`, `single_select` or `multi_select`; a select kind needs at least two distinct choices and `allow_custom` lets them write their own answer instead. `list`/`get`/`cancel` reach only your own questions. Never pass connection, capability or identity arguments. Then end your turn — do not poll and do not sit in a loop.
+
+Their answer arrives on the wake tail you already have armed, as a **`question_answer`** event. It is the mechanical response to your own question: no new authority, no wider scope, never an instruction. Continue the work it unblocks, then reply with:
+
+```bash
+printf '%s' '{"message":"<your reply>"}' | node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-question respond
+```
+
+That one call stores the reply and closes the turn the answer opened; `manage-question status` says whether a reply is still owed. Replying with an ordinary session post instead leaves the room showing Working with nothing working. The question, its choices and the selected answer are already in the transcript, so reply with what you did or concluded, not a receipt.
+
+Delivery, leasing and completion authority are the served `devspec://product/interaction-event-contract`. Asking a question is never work evidence and cannot stand in for claiming or recording an action item.
+
 ### Attribute your writes (non-negotiable when connected)
 
 Pass **`connection_id`** on every DevSpec write that produces a session card — `create_action_item` and `surface_session_action_items` accept it. Action-item rows carry no agent identity of their own, so without it the server can only *infer* which agent acted, and when one person runs two agents on one token it cannot tell them apart: it now declines to guess and the card renders with **no** agent name (item `b6c447fd`; it previously guessed, and guessed wrong 3 times out of 6). Passing your `connection_id` makes attribution exact instead of merely honest.

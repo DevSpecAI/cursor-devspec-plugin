@@ -91,6 +91,7 @@ import {
   appendAcceptedCanonicalJsonl,
   appendAcceptedJsonl,
   buildPollCursorArgs,
+  hasAcceptedKey,
   inspectPollResponseV1,
   playbookAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
@@ -98,7 +99,21 @@ import { executeCursorHostControl } from './cursor-host-control.mjs'
 import {
   buildActiveSessionPlanGuidance,
   clearConnectionCapability,
+  readConnectionCapability,
 } from './manage-plan-bridge.mjs'
+import {
+  activeContinuation,
+  classifyContinuationStart,
+  continuationIdentity,
+  DELIVERED,
+  interactionAcceptanceKey,
+  interactionActivityPlan,
+  interactionAnswerRecord,
+  interactionNegotiationArgs,
+  INTERACTION_EVENT_CONTRACT_URI,
+  INTERACTION_EVENT_VERSION,
+  validateInteractionEvent,
+} from './interaction-events.mjs'
 import {
   resolveSpaceFreeWakeFile,
   ensureWakeFile,
@@ -111,6 +126,20 @@ const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'c
 function inboxPathForConnection(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.inbox.jsonl`)
 }
+/**
+ * Byte length of the space-free wake file, or 0 when it does not exist yet. Used as
+ * the delivery boundary for an open interaction continuation: Cursor is notified from
+ * this file's stdout tail, so the file growing past a recorded length is the proof
+ * that an answer actually reached the chat.
+ */
+function wakeFileSizeForConnection(connectionId) {
+  try {
+    return fs.statSync(resolveSpaceFreeWakeFile(connectionId)).size
+  } catch {
+    return 0
+  }
+}
+
 function controlInboxPathForConnection(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.controls.jsonl`)
 }
@@ -928,8 +957,20 @@ async function main() {
   // break the poll loop — log to stderr and move on. attempt_id is omitted; the
   // server resolves this connection's current attempt (pickup opens one for a
   // locally-initiated turn; keepalive/complete refresh/close the working attempt).
+  //
+  // While an exact directed-question attempt is open, the generic verbs are the wrong
+  // writer for it (interactionActivityPlan): pickup/complete would touch an attempt
+  // they do not own, and completing one from outside its claim generation is how a
+  // Cursor turn was sealed empty while the model was still inside it. Keepalive is
+  // translated to the exact form so Working stays truthful.
   async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return
+    const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
+    if (plan.kind === 'suppress') return
+    if (plan.kind === 'exact_keepalive') {
+      await keepaliveInteractionContinuation()
+      return
+    }
     const name = ACTIVITY_VERB_TOOL[verb]
     if (!name) return
     try {
@@ -942,6 +983,37 @@ async function main() {
       })
     } catch (e) {
       process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
+    }
+  }
+
+  /**
+   * Refresh the exact interaction attempt AND its event lease together. An identity or
+   * terminal rejection means the continuation is over on the server: holding it would
+   * repeat the same rejection every tick, so drop it and let the generic verbs resume.
+   * "No longer attached" is NOT that signal — a detached moment resumes on reattach.
+   */
+  async function keepaliveInteractionContinuation() {
+    const held = interactionContinuation
+    if (!held) return
+    try {
+      await mcpToolsCall({
+        mcpUrl,
+        token,
+        connectionCapability: readConnectionCapability(connectionId),
+        name: 'report_keepalive',
+        arguments: {
+          connection_id: connectionId,
+          attempt_id: held.attempt_id,
+          ...continuationIdentity(held),
+        },
+        timeoutMs: 10_000,
+      })
+    } catch (e) {
+      process.stderr.write(`devspec-remote-poll: exact interaction keepalive failed: ${e.message}\n`)
+      if (/identity|not working|denied|authority/i.test(e.message || '')) {
+        interactionContinuation = null
+        patchState({ interaction_continuation: null })
+      }
     }
   }
 
@@ -974,6 +1046,14 @@ async function main() {
   let lastBusySent = null
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
+  // Directed-question answer lane (item b9f2c77a). The open continuation lives in state
+  // too, so the question bridge and the turn hook find the same one. The ACK rides the
+  // NEXT poll, which happens immediately: delivery continues straight back into the loop.
+  let interactionContinuation = activeContinuation(state?.interaction_continuation, {
+    connectionId,
+    sessionId,
+  })
+  let pendingInteractionAck = null
 
   /** Persist a state patch without clobbering concurrent fields. Best-effort. */
   function patchState(patch) {
@@ -991,14 +1071,25 @@ async function main() {
   // the canonical envelope here. That is what stops one agent acting on another's
   // command [devspec:3e76a6cc]; action-item work never enters this response.
   async function pollOnce({ waitMs, busy, checkTier, catchUp = false }) {
-    return mcpToolsCall({
+    // Directed-question answers are an independent lane, negotiated only while this
+    // connection holds the capability the claim, the ACK and the continuation start
+    // all require — and the capability header must ride the same call. Neither, or
+    // both (item b9f2c77a).
+    const capability = readConnectionCapability(connectionId)
+    const interactionArgs = interactionNegotiationArgs({ capability, sessionId })
+    const negotiatesInteraction = Object.keys(interactionArgs).length > 0
+    const ack = negotiatesInteraction ? pendingInteractionAck : null
+    const response = await mcpToolsCall({
       mcpUrl,
       token,
+      ...(negotiatesInteraction ? { connectionCapability: capability } : {}),
       name: 'poll_connection',
       arguments: {
         connection_id: connectionId,
         agent_name: agentName,
         ...remoteIngressNegotiationArgs(),
+        ...interactionArgs,
+        ...(ack ? { interaction_event_ack: ack } : {}),
         wait_ms: waitMs,
         ...buildPollCursorArgs({
           liveCursorV2,
@@ -1019,6 +1110,203 @@ async function main() {
       // showing Live for the length of a hold after the terminal is gone.
       isAlive: () => !ownerAnchor || ownerAlive(ownerAnchor),
     })
+    // Only a poll that actually returned carried the ACK. A thrown poll leaves it
+    // queued, and a lost ACK is recovered by the ledger path on redelivery — the
+    // answer itself is never the thing that gets lost.
+    if (ack && pendingInteractionAck === ack) pendingInteractionAck = null
+    return response
+  }
+
+  /**
+   * Release an exact attempt this host opened but could NOT durably apply. Without it
+   * the owner's answer would sit behind an attempt that is Working with nothing working
+   * on it until the lease expired; `interaction_pre_persistence_failure` terminalizes
+   * only this attempt and releases only this unacknowledged claim, so the server can
+   * redeliver to a healthy generation immediately.
+   */
+  async function releaseUnappliedInteraction(event, attemptId) {
+    try {
+      await mcpToolsCall({
+        mcpUrl,
+        token,
+        connectionCapability: readConnectionCapability(connectionId),
+        name: 'report_complete',
+        arguments: {
+          connection_id: connectionId,
+          attempt_id: attemptId,
+          interaction_pre_persistence_failure: true,
+          ...continuationIdentity(event),
+        },
+        timeoutMs: 10_000,
+      })
+    } catch (e) {
+      process.stderr.write(
+        `devspec-remote-poll: could not release unapplied interaction claim: ${e.message}\n`,
+      )
+    }
+  }
+
+  /**
+   * Apply ONE validated answer event, in the contract's order: start the exact
+   * continuation, persist through the existing acceptance ledger (a duplicate
+   * acceptance key IS the crash-safe dedupe), then ACK. The ledger is checked by the
+   * append itself, so a redelivered event is acknowledged without a second attempt.
+   */
+  async function applyInteractionEvent(event) {
+    const acceptanceKey = interactionAcceptanceKey(event)
+    // Dedupe first. Opening an exact attempt for an answer that is already durable is
+    // itself a duplicate host effect, so the cheap ledger read comes BEFORE the start
+    // and a redelivery is acknowledged with its fresh claim token instead.
+    if (hasAcceptedKey(inboxPathForConnection(connectionId), acceptanceKey)) {
+      pendingInteractionAck = {
+        event_id: event.event_id,
+        response_id: event.response_id,
+        claim_token: event.claim_token,
+      }
+      process.stderr.write(
+        `devspec-remote-poll: interaction event ${event.event_id} already applied — acknowledging redelivery\n`,
+      )
+      return { delivered: false }
+    }
+
+    let start
+    try {
+      start = await mcpToolsCall({
+        mcpUrl,
+        token,
+        connectionCapability: readConnectionCapability(connectionId),
+        name: 'report_pickup',
+        arguments: {
+          connection_id: connectionId,
+          interaction_event_version: INTERACTION_EVENT_VERSION,
+          ...continuationIdentity(event),
+        },
+        timeoutMs: 15_000,
+      })
+    } catch (e) {
+      process.stderr.write(`devspec-remote-poll: interaction continuation start failed: ${e.message}\n`)
+      return { delivered: false }
+    }
+
+    const decision = classifyContinuationStart(start)
+    if (decision.action === 'wait') {
+      process.stderr.write(
+        `devspec-remote-poll: interaction continuation not startable (${decision.outcome ?? 'unknown'}` +
+          `${decision.error ? `: ${decision.error}` : ''}) — waiting for redelivery\n`,
+      )
+      return { delivered: false }
+    }
+
+    const record = interactionAnswerRecord({
+      connectionId,
+      sessionId: event.source_session_id,
+      event,
+      attemptId: decision.attemptId,
+      disposition: decision.action === 'apply' ? DELIVERED : decision.disposition,
+    })
+    const accepted = appendAcceptedJsonl(
+      inboxPathForConnection(connectionId),
+      record,
+      acceptanceKey,
+    )
+    if (!accepted.ok) {
+      process.stderr.write(`devspec-remote-poll: interaction inbox write failed: ${accepted.error}\n`)
+      if (decision.action === 'apply' && decision.attemptId) {
+        await releaseUnappliedInteraction(event, decision.attemptId)
+      }
+      return { delivered: false }
+    }
+
+    // The locked append is the authority: a duplicate here means a concurrent writer
+    // won the race between the read above and this append. Acknowledge with the fresh
+    // claim token; never apply it twice, and never keep the attempt this call opened.
+    if (accepted.duplicate) {
+      // This call opened an attempt it must not keep: release it so it does not sit
+      // Working with nothing working on it.
+      if (decision.action === 'apply' && decision.attemptId) {
+        await releaseUnappliedInteraction(event, decision.attemptId)
+      }
+      pendingInteractionAck = {
+        event_id: event.event_id,
+        response_id: event.response_id,
+        claim_token: event.claim_token,
+      }
+      process.stderr.write(
+        `devspec-remote-poll: interaction event ${event.event_id} accepted concurrently — acknowledging\n`,
+      )
+      return { delivered: false }
+    }
+
+    if (decision.action !== 'apply') {
+      process.stderr.write(
+        `devspec-remote-poll: interaction event ${event.event_id} settled (${decision.outcome})\n`,
+      )
+      return { delivered: false }
+    }
+
+    interactionContinuation = {
+      event_id: event.event_id,
+      response_id: event.response_id,
+      claim_token: event.claim_token,
+      question_id: event.question_id,
+      attempt_id: decision.attemptId,
+      connection_id: connectionId,
+      session_id: event.source_session_id,
+      started_at: new Date().toISOString(),
+      // Delivery proof for the turn hook: the wake file growing past this means the
+      // host follow appended the line Cursor notifies on (continuationDelivered).
+      wake_offset_after: wakeFileSizeForConnection(connectionId),
+    }
+    patchState({ interaction_continuation: interactionContinuation })
+    pendingInteractionAck = {
+      event_id: event.event_id,
+      response_id: event.response_id,
+      claim_token: event.claim_token,
+    }
+    // The busy signal the poll already carries keepalives THIS attempt rather than
+    // opening a second one, so marking the turn active keeps Working truthful between
+    // delivery and Cursor actually notifying the chat.
+    writeTurnMarker(connectionId)
+    logRemoteControlStory({
+      phase: 'interaction_answer',
+      outcome: 'delivered',
+      connectionId,
+      sessionId,
+      agent: agentName,
+      tool: 'devspec-remote-poll',
+      reason: 'exact_continuation_started',
+    })
+    return { delivered: true }
+  }
+
+  /**
+   * The independent event lane, read BEFORE the canonical acceptance gate: an
+   * event-only response carries no canonical ingress by design, so inspectPollResponseV1
+   * would reject a perfectly valid delivery as malformed.
+   */
+  async function consumeInteractionEvents(res) {
+    const offered = Array.isArray(res?.interaction_events) ? res.interaction_events : []
+    if (offered.length === 0) return { lane: false, delivered: false }
+    if (res.interaction_event_version !== INTERACTION_EVENT_VERSION) {
+      process.stderr.write(
+        `devspec-remote-poll: refused interaction events on an unsupported version; ` +
+          `see ${INTERACTION_EVENT_CONTRACT_URI}\n`,
+      )
+      return { lane: true, delivered: false }
+    }
+    let delivered = false
+    for (const candidate of offered) {
+      const validated = validateInteractionEvent(candidate, { connectionId, sessionId })
+      if (!validated.ok) {
+        // Fails closed: no attempt, no record, no ACK. A sibling connection's or a
+        // stale session's event expires rather than executing here.
+        process.stderr.write(`devspec-remote-poll: rejected interaction event (${validated.error})\n`)
+        continue
+      }
+      const result = await applyInteractionEvent(validated.event)
+      if (result.delivered) delivered = true
+    }
+    return { lane: true, delivered }
   }
 
   let lastIngressAccepted = false
@@ -1237,6 +1525,20 @@ async function main() {
     // Overriding the server from the local file made the two fight and ping-pong the
     // transcript cursor on a web-driven detach the local file never learned about
     // (item edea1a91).
+    //
+    // The question bridge or the turn hook may have resolved the open continuation
+    // since the last tick, so re-read rather than cache it.
+    interactionContinuation = activeContinuation(liveState?.interaction_continuation, {
+      connectionId,
+      sessionId,
+    })
+    // A reattach to a DIFFERENT session ends this continuation's authority for good;
+    // a plain detach does not, so a sessionless moment leaves it held and resumable.
+    if (!interactionContinuation && liveState?.interaction_continuation &&
+        sessionId && liveState.interaction_continuation.session_id !== sessionId) {
+      patchState({ interaction_continuation: null })
+      pendingInteractionAck = null
+    }
 
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
       process.stderr.write(`devspec-remote-poll: owner process ${ownerAnchor} gone — stopping\n`)
@@ -1425,6 +1727,21 @@ async function main() {
         ingress_context_carry: canonicalCarry,
         active_session_plans: null,
       })
+      continue
+    }
+
+    // Directed-question answers first: an event-only response deliberately carries no
+    // canonical ingress, so reading it as a room page would reject a valid delivery.
+    const interaction = await consumeInteractionEvents(res)
+    if (interaction.lane) {
+      if (interaction.delivered) {
+        consecutiveEmpty = 0
+        continue
+      }
+      // Deduped, settled, or waiting for a startable generation. Same backoff as any
+      // other changed-but-empty turn, so a marker that stays hot cannot spin the loop.
+      consecutiveEmpty++
+      await sleep(emptyTurnBackoffMs(consecutiveEmpty, tier.waitMs))
       continue
     }
 

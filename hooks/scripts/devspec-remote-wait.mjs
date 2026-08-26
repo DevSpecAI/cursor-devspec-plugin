@@ -72,6 +72,11 @@ import {
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
 import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
+import {
+  buildInteractionAnswerEvents,
+  INTERACTION_ANSWER_RECORD_TYPE,
+  validateInteractionAnswerRecord,
+} from './interaction-events.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
@@ -801,7 +806,7 @@ export function readNewLines(file, offset) {
 export function consumeInboxSlice(
   file,
   offset,
-  { canonicalOnly = false, includePlaybooks = false, oneCommandTurn = false } = {},
+  { canonicalOnly = false, includePlaybooks = false, oneCommandTurn = false, connectionId = null } = {},
 ) {
   if (!oneCommandTurn) {
     const { lines, newOffset } = readNewLines(file, offset)
@@ -809,7 +814,7 @@ export function consumeInboxSlice(
       lines,
       newOffset,
       batches: lines.length > 0
-        ? parseWakeBatches(lines, { canonicalOnly, includePlaybooks })
+        ? parseWakeBatches(lines, { canonicalOnly, includePlaybooks, connectionId })
         : [],
       evidence: createInboxCursorEvidence(file, newOffset),
     }
@@ -841,7 +846,7 @@ export function consumeInboxSlice(
       const line = segment.slice(0, -1)
       if (!line.trim()) continue
       lines.push(line)
-      const found = parseWakeBatches([line], { canonicalOnly, includePlaybooks })
+      const found = parseWakeBatches([line], { canonicalOnly, includePlaybooks, connectionId })
       if (found.length > 0) {
         batches = found
         break
@@ -886,11 +891,21 @@ function isPlaybookBatch(obj) {
     playbookAcceptanceKey(dispatch) === obj.acceptance_key
 }
 
-export function parseWakeBatches(lines, { canonicalOnly = false, includePlaybooks = false } = {}) {
+export function parseWakeBatches(
+  lines,
+  { canonicalOnly = false, includePlaybooks = false, connectionId = null } = {},
+) {
   const batches = []
   for (const line of lines) {
     try {
       const obj = JSON.parse(line)
+      // Revalidated here as well as at write time: this is the only channel whose
+      // payload came from a person answering a card, and a record that no longer
+      // targets this exact connection and its source session must not wake anyone.
+      if (obj?.type === INTERACTION_ANSWER_RECORD_TYPE) {
+        if (connectionId && validateInteractionAnswerRecord(obj, connectionId)) batches.push(obj)
+        continue
+      }
       if (isCanonicalOwnerBatch(obj) || (includePlaybooks && isPlaybookBatch(obj)) ||
           (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)) {
         batches.push(obj)
@@ -1270,19 +1285,27 @@ async function main() {
       canonicalOnly: true,
       includePlaybooks: true,
       oneCommandTurn: true,
+      connectionId,
     })
     if (lines.length > 0) {
       if (batches.length > 0) {
         const attachmentDir = path.join(CONNECTIONS_DIR, `${connectionId}.attachments`)
         const batch = batches[0]
-        const events = buildOwnerMessageEvents(batch, {
-          inboxFile: file,
-          attachmentDir,
-          writeFile: (target, buf) => {
-            fs.mkdirSync(path.dirname(target), { recursive: true })
-            fs.writeFileSync(target, buf, { mode: 0o600 })
-          },
-        })
+        // A directed-question answer is its own event type — it wakes, but it is never
+        // a command, so it never goes through the owner-message builder.
+        const events = batch.type === INTERACTION_ANSWER_RECORD_TYPE
+          ? buildInteractionAnswerEvents(batch, { inboxFile: file })
+          : buildOwnerMessageEvents(batch, {
+            inboxFile: file,
+            attachmentDir,
+            writeFile: (target, buf) => {
+              fs.mkdirSync(path.dirname(target), { recursive: true })
+              fs.writeFileSync(target, buf, { mode: 0o600 })
+            },
+          })
+        const wakeCount = batch.type === INTERACTION_ANSWER_RECORD_TYPE
+          ? 1
+          : batch.messages.length
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
         if (args.follow && args.wakeFile) appendWakeEvents(args.wakeFile, events)
@@ -1290,14 +1313,14 @@ async function main() {
         offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         if (args.follow) {
           process.stderr.write(
-            `devspec-remote-wait: wake (${batch.messages.length} msg) — follow\n`,
+            `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,
           )
           args.fromEnd = false
           args.pending = true
           continue
         }
         process.stderr.write(
-          `devspec-remote-wait: wake (${batch.messages.length} msg) — exit 0\n`,
+          `devspec-remote-wait: wake (${wakeCount} msg) — exit 0\n`,
         )
         return
       }
