@@ -8,6 +8,7 @@ import { describe, it } from 'node:test'
 import {
   detectLocalId,
   ensurePollerForConnection,
+  ensureWakeFollowForConnection,
   isRecoverableEndReason,
   mintLocalId,
   ownerAlive,
@@ -1136,6 +1137,7 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
         assert.equal(connectionId, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
         assert.equal(opts.ownerPid, 200)
         assert.equal(opts.launchId, 'launch-1')
+        assert.equal(opts.fromEnd, true)
         assert.match(opts.wakeFile, /aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\.jsonl/)
         return { ok: true, pid: 888 }
       },
@@ -1154,5 +1156,70 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
     })
     assert.equal(r.ok, false)
     assert.match(r.error, /wake file/)
+  })
+})
+
+describe('ensureWakeFollowForConnection (item 1badd088)', () => {
+  it('reuses a live follow without stop or spawn', () => {
+    let spawned = 0
+    const r = ensureWakeFollowForConnection('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', {
+      wakeFile: 'C:\\ProgramData\\DevSpec\\wakes\\bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl',
+      ownerPid: 42,
+      findPid: () => 777,
+      spawn: () => {
+        spawned += 1
+        throw new Error('must not spawn when live')
+      },
+      resolveOwnerPid: () => {
+        throw new Error('must not resolve owner when reused')
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.reused, true)
+    assert.equal(r.pid, 777)
+    assert.equal(spawned, 0)
+  })
+
+  it('cold first-arm spawns with --from-end --follow', () => {
+    let args = null
+    const r = ensureWakeFollowForConnection('cccccccc-cccc-cccc-cccc-cccccccccccc', {
+      wakeFile: 'C:\\ProgramData\\DevSpec\\wakes\\cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl',
+      ownerPid: 42,
+      fromEnd: true,
+      findPid: () => null,
+      resolveOwnerPid: (_explicit) => 42,
+      spawn: (_exe, waitArgs) => {
+        args = waitArgs
+        return { pid: 901, unref() {} }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.reused, false)
+    assert.equal(r.arm, '--from-end')
+    assert.ok(args)
+    assert.equal(args.includes('--from-end'), true)
+    assert.equal(args.includes('--pending'), false)
+    assert.equal(args.includes('--follow'), true)
+  })
+
+  it('recovery spawn uses --pending --follow, never --from-end', () => {
+    let args = null
+    const r = ensureWakeFollowForConnection('dddddddd-dddd-dddd-dddd-dddddddddddd', {
+      wakeFile: 'C:\\ProgramData\\DevSpec\\wakes\\dddddddd-dddd-dddd-dddd-dddddddddddd.jsonl',
+      ownerPid: 42,
+      findPid: () => null,
+      resolveOwnerPid: (_explicit) => 42,
+      spawn: (_exe, waitArgs) => {
+        args = waitArgs
+        return { pid: 902, unref() {} }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.reused, false)
+    assert.equal(r.arm, '--pending')
+    assert.ok(args)
+    assert.equal(args.includes('--pending'), true)
+    assert.equal(args.includes('--from-end'), false)
+    assert.equal(args.includes('--follow'), true)
   })
 })

@@ -192,15 +192,28 @@ function clearTurnMarker(connectionId) {
   }
 }
 
-function ensureHostWakeFollow(connectionId, ownerPid) {
+/**
+ * Arm or reuse host wake-follow into the space-free wake file.
+ * @param {string} connectionId
+ * @param {number | null} ownerPid
+ * @param {{ fromEnd?: boolean }} [opts] — `fromEnd: true` only for cold poller
+ *   startup. Inject / recovery ensures omit it so a dead follow respawns with
+ *   `--pending` (item 1badd088). Live follows are always reused.
+ */
+function ensureHostWakeFollow(connectionId, ownerPid, opts = {}) {
   try {
     const wakeFile = ensureWakeFile(resolveSpaceFreeWakeFile(connectionId))
     const follow = ensureWakeFollowForConnection(connectionId, {
       wakeFile,
       ownerPid: ownerPid ?? undefined,
+      ...(opts.fromEnd === true ? { fromEnd: true } : {}),
     })
     if (!follow.ok) {
       process.stderr.write(`devspec-remote-poll: host wake follow not armed: ${follow.error}\n`)
+    } else if (follow.reused) {
+      process.stderr.write(
+        `devspec-remote-poll: host wake follow reused pid=${follow.pid} connection=${connectionId}\n`,
+      )
     }
     return wakeFile
   } catch (e) {
@@ -880,7 +893,10 @@ async function main() {
   // TRANSITION (see verbForTurnTransition). Declared here so consumePollResult
   // can clear it after a stall complete without a second turn_end complete.
   let prevTurnActive = false
-  ensureHostWakeFollow(connectionId, ownerAnchor)
+  // Cold first-arm only — subsequent inject ensures reuse the live follow
+  // (or respawn with --pending if it died). Never re-pass --from-end on inject
+  // (item 1badd088 / Racing Turtle empty wake file).
+  ensureHostWakeFollow(connectionId, ownerAnchor, { fromEnd: true })
 
   // Heartbeat — TEARDOWN ONLY since the long-poll port. `poll_connection` carries the
   // live heartbeat (presence, busy, check_tier) server-side at the start of every
@@ -1099,7 +1115,8 @@ async function main() {
       // Host wake-follow (`devspec-remote-wait --follow --wake-file`) owns the wake file
       // and writes `buildOwnerMessageEvents` — full command bodies. A count-only line
       // would notify Cursor before the body exists; the model then polls the server and
-      // races delivery. Wait-follow is started via ensureHostWakeFollow.
+      // races delivery. ensureHostWakeFollow here reuses a live follow (item 1badd088);
+      // it must not kill→`--from-end` or pending inbox mail is skipped.
       canonicalCarry = emptyCanonicalContextCarry()
     } else {
       const advisoryRows = [...rows, ...envelope.commands]

@@ -2,6 +2,13 @@
 
 ## 0.10.0
 
+### Fix: host wake-follow must not restart with `--from-end` on inject
+
+`ensureWakeFollowForConnection` now reuses a live follow instead of
+kill→respawn. Cold first-arm still uses `--from-end --follow`; recovery uses
+`--pending --follow`. Stops Racing Turtle empty wake files when the poller
+ensured follow immediately before `deliverOwnerMessages` (item 1badd088).
+
 ### Shared session plans stay connection-bound and survive Cursor reconnects
 
 Cursor's remote poller now negotiates canonical ingress, delegated project scope,

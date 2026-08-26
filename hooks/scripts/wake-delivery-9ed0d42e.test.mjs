@@ -25,6 +25,19 @@ describe('item 9ed0d42e — wake delivery', () => {
     assert.match(pollerSrc, /ensureHostWakeFollow/)
   })
 
+  it('poller cold-arms wake-follow with fromEnd; inject ensure does not', () => {
+    // Item 1badd088 — ensureHostWakeFollow(..., { fromEnd: true }) only at startup.
+    assert.match(pollerSrc, /1badd088/)
+    assert.match(
+      pollerSrc,
+      /ensureHostWakeFollow\(connectionId,\s*ownerAnchor,\s*\{\s*fromEnd:\s*true\s*\}\)/,
+    )
+    const injectEnsure = pollerSrc.match(
+      /ensureHostWakeFollow\(connectionId,\s*ownerAnchor\)\s*\n\s*const delivered/,
+    )
+    assert.ok(injectEnsure, 'inject path must call ensureHostWakeFollow without fromEnd')
+  })
+
   it('buildOwnerMessageEvents puts the command body on type owner_message', () => {
     const events = buildOwnerMessageEvents({
       type: 'owner_messages',

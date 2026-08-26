@@ -558,13 +558,24 @@ export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
  * owner-pid as the poller. Writes accepted owner_message lines to a space-free
  * wake file; the model's first Shell tails that file and does not re-arm wait.
  *
+ * Reuses a live follow instead of kill→respawn (item 1badd088). The poller
+ * called ensure on every inject; the old always-`--from-end` restart raced the
+ * inbox write and left the wake file empty while inject still opened a turn.
+ *
+ * Cold first-arm (`opts.fromEnd === true`) still uses `--from-end` so advisory
+ * history is skipped while unread `owner_messages` are kept (item 1f177af4).
+ * Recovery when the follow is dead uses `--pending` so saved inbox mail is not
+ * skipped. The model wake-tail must never pass `--from-end` (decision 70b0d7d6).
+ *
  * @param {string} connectionId
  * @param {{
  *   ownerPid?: string | number | null,
  *   cwd?: string,
  *   launchId?: string | null,
  *   wakeFile: string,
+ *   fromEnd?: boolean,
  *   resolveOwnerPid?: typeof resolveOwnerPid,
+ *   findPid?: typeof findWakeFollowPidForConnection,
  *   spawn?: typeof spawn,
  * }} [opts]
  */
@@ -577,6 +588,22 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   if (!fs.existsSync(WAIT_SCRIPT)) {
     return { ok: false, error: `wait script missing: ${WAIT_SCRIPT}` }
   }
+
+  const findPid = opts.findPid || findWakeFollowPidForConnection
+  const running = findPid(connectionId)
+  if (running) {
+    return {
+      ok: true,
+      reused: true,
+      connection_id: connectionId,
+      pid: running,
+      owner_pid: null,
+      pid_file: wakeFollowPidPath(connectionId),
+      log: wakeFollowLogPath(connectionId),
+      wake_file: wakeFile,
+    }
+  }
+
   const resolveOwnerPidFn = opts.resolveOwnerPid || resolveOwnerPid
   const ownerPid = resolveOwnerPidFn(opts.ownerPid, null)
   if (ownerPid === null) {
@@ -587,6 +614,7 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
     }
   }
 
+  // No live follow — clear a stale pid file if any, then spawn.
   stopWakeFollowForConnection(connectionId)
   fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
   fs.mkdirSync(path.dirname(wakeFile), { recursive: true })
@@ -597,6 +625,9 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   const cwd = opts.cwd || process.cwd()
   const launchId =
     typeof opts.launchId === 'string' && opts.launchId.trim() ? opts.launchId.trim() : ''
+  // Cold first-arm only. Recovery / inject ensure must resume with --pending
+  // (never --from-end) so concurrent owner commands are not lost (1badd088).
+  const armFlag = opts.fromEnd === true ? '--from-end' : '--pending'
 
   let logFd
   try {
@@ -609,7 +640,7 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
     WAIT_SCRIPT,
     '--connection-id',
     connectionId,
-    '--from-end',
+    armFlag,
     '--follow',
     '--wake-file',
     wakeFile,
@@ -653,12 +684,14 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
 
   return {
     ok: true,
+    reused: false,
     connection_id: connectionId,
     pid,
     owner_pid: ownerPid,
     pid_file: pidPath,
     log: logPath,
     wake_file: wakeFile,
+    arm: armFlag,
   }
 }
 
@@ -703,6 +736,9 @@ export function ensureWakeFollowAfterAgentSpawn(connectionId, spawnPid, opts = {
     ownerPid,
     launchId: opts.launchId || null,
     wakeFile,
+    // Cold first-arm after Connect / --resume (host follow only — model wake-tail
+    // still must not pass --from-end; decision 70b0d7d6).
+    fromEnd: true,
   })
   return { ...follow, owner_pid: ownerPid }
 }
