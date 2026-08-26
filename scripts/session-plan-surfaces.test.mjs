@@ -28,8 +28,8 @@ describe('Cursor shared-session-plan surfaces', () => {
   })
 
   it('documents the independent Cursor release and protected publish-time package bump', () => {
-    assert.equal(pluginJson.version, '0.11.1')
-    assert.match(changelog, /^# Changelog\s+## 0\.11\.1/m)
+    assert.equal(pluginJson.version, '0.11.2')
+    assert.match(changelog, /^# Changelog\s+## 0\.11\.2/m)
     assert.match(changelog, /Cursor releases are versioned independently/i)
     assert.match(changelog, /package\.json.*protected.*0\.8\.0/is)
     assert.match(readme, /Shared session plans during remote control/)
@@ -57,6 +57,27 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.match(brief, /manage-plan describe/)
     assert.doesNotMatch(brief, /"current_step_id"|"next_step_id"|"retryable"/)
     assert.match(remoteSkill, /complete schema.*on demand|bounded on-demand discovery/i)
+  })
+
+  it('every capability-bound bridge is discoverable from the brief a Connect launch loads', () => {
+    // A Connect launch reads this brief, NOT the 44KB SKILL.md. Directed questions
+    // shipped with their guidance only in the skill, so a Cursor agent could be woken
+    // by an answer but had no way to learn it could ask (item b9f2c77a, round 2). Any
+    // future connection-bound bridge has the same requirement: name it here or it does
+    // not exist as far as a Connect agent is concerned. Schemas stay on demand.
+    const brief = buildPostLiveRemoteBrief({
+      pluginPath: '/cursor/devspec-autopilot',
+      connectionId: '11111111-1111-4111-8111-111111111111',
+      sessionId: '22222222-2222-4222-8222-222222222222',
+      codename: 'Calm Fox',
+      localId: 'cursor-chat-a',
+    })
+    for (const bridge of ['manage-plan describe', 'manage-question describe', 'manage-question respond']) {
+      assert.match(brief, new RegExp(bridge.replace(' ', '\\s')), `${bridge} must be reachable from the brief`)
+    }
+    // Discovery, not the schema: the brief names the command and nothing more.
+    assert.doesNotMatch(brief, /"client_request_id"|"response_kind"|"allow_custom"/)
+    assert.ok(Buffer.byteLength(brief) < 8_000, `thin post-Live brief ${Buffer.byteLength(brief)} bytes`)
   })
 
   it('preserves Cursor-native resume and local-session documentation', () => {
