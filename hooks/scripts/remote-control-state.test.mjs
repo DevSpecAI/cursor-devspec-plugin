@@ -5,6 +5,10 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   detectLocalId,
   ensurePollerForConnection,
@@ -32,6 +36,28 @@ import {
   CLI_SPAWN_OWNER_WALK_TIMEOUT_MS,
   registerConnection,
 } from './remote-control-state.mjs'
+
+/**
+ * Recording stand-in for `fs`, so a wake-follow arm can be asserted on a WINDOWS path
+ * while the suite runs on Linux. Before this existed the same assertions wrote a file
+ * literally named `C:\\ProgramData\\...` into the repo root and left a fake log and pid
+ * file in the developer's real `~/.devspec` (item 76e1affb).
+ */
+function recordingIo({ waitScriptExists = true } = {}) {
+  const writes = []
+  const dirs = []
+  return {
+    writes,
+    dirs,
+    existsSync: (target) => (String(target).endsWith('.mjs') ? waitScriptExists : false),
+    mkdirSync: (target) => { dirs.push(String(target)) },
+    writeFileSync: (target, data) => { writes.push({ target: String(target), data: String(data) }) },
+    openSync: () => 7,
+    closeSync: () => {},
+    unlinkSync: (target) => { writes.push({ target: String(target), unlinked: true }) },
+    readFileSync: () => '',
+  }
+}
 
 describe('detectLocalId', () => {
   it('prefers explicit --local-id over env', () => {
@@ -1180,14 +1206,17 @@ describe('ensureWakeFollowForConnection (item 1badd088)', () => {
     assert.equal(spawned, 0)
   })
 
-  it('cold first-arm spawns with --from-end --follow', () => {
+  it('cold first-arm spawns with --from-end --follow, on a Windows wake path', () => {
     let args = null
+    const io = recordingIo()
+    const wakeFile = 'C:\\ProgramData\\DevSpec\\wakes\\cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl'
     const r = ensureWakeFollowForConnection('cccccccc-cccc-cccc-cccc-cccccccccccc', {
-      wakeFile: 'C:\\ProgramData\\DevSpec\\wakes\\cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl',
+      wakeFile,
       ownerPid: 42,
       fromEnd: true,
       findPid: () => null,
       resolveOwnerPid: (_explicit) => 42,
+      io,
       spawn: (_exe, waitArgs) => {
         args = waitArgs
         return { pid: 901, unref() {} }
@@ -1200,6 +1229,64 @@ describe('ensureWakeFollowForConnection (item 1badd088)', () => {
     assert.equal(args.includes('--from-end'), true)
     assert.equal(args.includes('--pending'), false)
     assert.equal(args.includes('--follow'), true)
+    // The Windows shape travels through unmangled: the tail is handed exactly that path,
+    // the wake file is created at exactly that path, and it stays whitespace-free (the
+    // whole reason ProgramData was chosen over a spaced home directory).
+    assert.equal(args[args.indexOf('--wake-file') + 1], wakeFile)
+    assert.ok(io.writes.some((write) => write.target === wakeFile && write.data === ''))
+    assert.doesNotMatch(wakeFile, /\s/)
+    // Its parent is ensured as the running platform computes it. On POSIX that is '.',
+    // because `path.dirname` does not treat a backslash as a separator — which is
+    // precisely how the un-injected version dropped this file into the repo root.
+    assert.ok(io.dirs.includes(path.dirname(wakeFile)))
+  })
+
+  it('arms for real on this platform: the wake file and its directory are created', () => {
+    // The counterpart to the injected-io tests above. Those prove the Windows path is
+    // carried through without touching disk; this one proves the real filesystem path
+    // works on the platform the suite actually runs on, including the POSIX wake
+    // location, by writing under a temp root and reading it back.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wake-follow-'))
+    const wakeFile = path.join(root, 'wakes', 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee.jsonl')
+    let args = null
+    try {
+      const r = ensureWakeFollowForConnection('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', {
+        wakeFile,
+        ownerPid: 42,
+        findPid: () => null,
+        resolveOwnerPid: (_explicit) => 42,
+        // Only the log and pid file are redirected, so this test cannot write into the
+        // developer's real ~/.devspec; every wake-file effect is the real fs.
+        io: {
+          ...fs,
+          openSync: (target, flags) =>
+            fs.openSync(String(target).includes(root) ? target : path.join(root, 'follow.log'), flags),
+          writeFileSync: (target, data, options) =>
+            fs.writeFileSync(
+              String(target).endsWith('.wake-follow.pid') ? path.join(root, 'follow.pid') : target,
+              data,
+              options,
+            ),
+        },
+        spawn: (_exe, waitArgs) => {
+          args = waitArgs
+          return { pid: 903, unref() {} }
+        },
+      })
+      assert.equal(r.ok, true)
+      assert.equal(r.wake_file, wakeFile)
+      assert.equal(fs.existsSync(path.dirname(wakeFile)), true, 'the wake directory is created')
+      assert.equal(fs.readFileSync(wakeFile, 'utf8'), '', 'the wake file is created empty')
+      assert.equal(args[args.indexOf('--wake-file') + 1], wakeFile)
+      // And the POSIX default location this platform would resolve is itself usable.
+      const posixDefault = resolveSpaceFreeWakeFile('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', {
+        platform: 'linux',
+      })
+      assert.equal(posixDefault, path.join('/var/tmp/devspec-wakes', 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee.jsonl'))
+      assert.doesNotMatch(posixDefault, /\s/)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('recovery spawn uses --pending --follow, never --from-end', () => {
@@ -1209,6 +1296,7 @@ describe('ensureWakeFollowForConnection (item 1badd088)', () => {
       ownerPid: 42,
       findPid: () => null,
       resolveOwnerPid: (_explicit) => 42,
+      io: recordingIo(),
       spawn: (_exe, waitArgs) => {
         args = waitArgs
         return { pid: 902, unref() {} }

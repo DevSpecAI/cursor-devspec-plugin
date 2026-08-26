@@ -599,15 +599,25 @@ export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
  *   resolveOwnerPid?: typeof resolveOwnerPid,
  *   findPid?: typeof findWakeFollowPidForConnection,
  *   spawn?: typeof spawn,
+ *   io?: Pick<typeof fs, 'existsSync' | 'mkdirSync' | 'writeFileSync' | 'openSync' | 'closeSync' | 'unlinkSync' | 'readFileSync'>,
  * }} [opts]
+ *
+ * `io` defaults to `fs` and carries EVERY filesystem effect this makes, matching the
+ * convention already used by `persistConnectionCapability` and `appendAcceptedJsonl`.
+ * It exists because `spawn`, `findPid` and `resolveOwnerPid` were injectable and the
+ * filesystem was not, so a unit test asserting the argv for a Windows wake path wrote a
+ * file literally named `C:\ProgramData\...` into the repo root on Linux AND left a
+ * fake log and pid file in the developer's real `~/.devspec` — where a stray pid file
+ * is not inert, since `findWakeFollowPidForConnection` reads exactly those (76e1affb).
  */
 export function ensureWakeFollowForConnection(connectionId, opts = {}) {
+  const io = opts.io || fs
   if (!connectionId || connectionId.length < 8) {
     return { ok: false, error: 'missing connection id' }
   }
   const wakeFile = typeof opts.wakeFile === 'string' ? opts.wakeFile.trim() : ''
   if (!wakeFile) return { ok: false, error: 'missing wake file' }
-  if (!fs.existsSync(WAIT_SCRIPT)) {
+  if (!io.existsSync(WAIT_SCRIPT)) {
     return { ok: false, error: `wait script missing: ${WAIT_SCRIPT}` }
   }
 
@@ -637,10 +647,10 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   }
 
   // No live follow — clear a stale pid file if any, then spawn.
-  stopWakeFollowForConnection(connectionId)
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-  fs.mkdirSync(path.dirname(wakeFile), { recursive: true })
-  if (!fs.existsSync(wakeFile)) fs.writeFileSync(wakeFile, '', { mode: 0o600 })
+  stopWakeFollowForConnection(connectionId, { io })
+  io.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  io.mkdirSync(path.dirname(wakeFile), { recursive: true })
+  if (!io.existsSync(wakeFile)) io.writeFileSync(wakeFile, '', { mode: 0o600 })
 
   const logPath = wakeFollowLogPath(connectionId)
   const pidPath = wakeFollowPidPath(connectionId)
@@ -653,7 +663,7 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
 
   let logFd
   try {
-    logFd = fs.openSync(logPath, 'a')
+    logFd = io.openSync(logPath, 'a')
   } catch (e) {
     return { ok: false, error: `could not open wake-follow log: ${e.message}` }
   }
@@ -683,14 +693,14 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
     })
   } catch (e) {
     try {
-      fs.closeSync(logFd)
+      io.closeSync(logFd)
     } catch {
       /* ignore */
     }
     return { ok: false, error: `spawn failed: ${e.message}` }
   }
   try {
-    fs.closeSync(logFd)
+    io.closeSync(logFd)
   } catch {
     /* ignore */
   }
@@ -699,7 +709,7 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   const pid = child.pid
   if (!pid) return { ok: false, error: 'spawn returned no pid' }
   try {
-    fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
+    io.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
   } catch (e) {
     return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath }
   }
@@ -953,12 +963,12 @@ function stopPollerForConnection(connectionId) {
   }
 }
 
-function findWakeFollowPidForConnection(connectionId) {
+function findWakeFollowPidForConnection(connectionId, { io = fs } = {}) {
   if (!connectionId || connectionId.length < 8) return null
   try {
     const pidFile = wakeFollowPidPath(connectionId)
-    if (!fs.existsSync(pidFile)) return null
-    const n = Number(fs.readFileSync(pidFile, 'utf8').trim())
+    if (!io.existsSync(pidFile)) return null
+    const n = Number(io.readFileSync(pidFile, 'utf8').trim())
     if (!Number.isFinite(n) || n <= 0) return null
     try {
       process.kill(n, 0)
@@ -971,8 +981,8 @@ function findWakeFollowPidForConnection(connectionId) {
   }
 }
 
-function stopWakeFollowForConnection(connectionId) {
-  const pid = findWakeFollowPidForConnection(connectionId)
+function stopWakeFollowForConnection(connectionId, { io = fs } = {}) {
+  const pid = findWakeFollowPidForConnection(connectionId, { io })
   const killed = []
   if (pid) {
     try {
@@ -984,7 +994,7 @@ function stopWakeFollowForConnection(connectionId) {
   }
   try {
     const pidFile = wakeFollowPidPath(connectionId)
-    if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile)
+    if (io.existsSync(pidFile)) io.unlinkSync(pidFile)
   } catch {
     /* ignore */
   }

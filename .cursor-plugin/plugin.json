@@ -1,7 +1,7 @@
 {
   "name": "devspec-autopilot",
   "displayName": "DevSpec Autopilot",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Connect Cursor's AI agent to DevSpec — work action items, use shared session plans, and drive remote sessions without leaving the editor.",
   "author": {
     "name": "DevSpecAI",
