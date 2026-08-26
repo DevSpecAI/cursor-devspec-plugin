@@ -15,6 +15,7 @@ import {
   fixtureActivePlanEnvelope,
   fixtureActiveSessionPlans,
   fixtureEnvelope,
+  fixtureUuid,
   fixtureWindow as windowFor,
 } from './remote-ingress-test-fixtures.mjs'
 
@@ -70,6 +71,26 @@ describe('canonical remote ingress v1', () => {
       active_session_plans: active.active_session_plans,
       active_session_plan_guidance: 'Continue own plan with its displayed revision.',
     }), true)
+
+    // Item 81c46c1e — Array.every(validWindow) passed the window index as
+    // policyVersion, so the 2nd+ window required policy_version === 1 and every
+    // multi-window carry failed isCanonicalOwnerBatch (empty wake file).
+    const secondWindow = {
+      ...active.window,
+      source_window: {
+        start: { sequence: 10, created_at: '2026-08-26T00:00:10.000Z', message_id: fixtureUuid(10) },
+        end: { sequence: 11, created_at: '2026-08-26T00:00:11.000Z', message_id: fixtureUuid(11) },
+      },
+      returned: 2,
+      total_known: 2,
+    }
+    assert.equal(
+      validateCanonicalContextCarry({
+        ...carried,
+        windows: [active.window, secondWindow],
+      }),
+      true,
+    )
 
     // The pre-projection scoped tier remains accepted and must not grow an optional
     // field silently: strictness is per negotiated contract pair.

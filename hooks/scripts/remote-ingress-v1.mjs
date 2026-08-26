@@ -341,7 +341,7 @@ export function validateCanonicalContextCarry(
   ]) || carry.advisory !== true || !validContext(carry.typed) || !Array.isArray(carry.windows) ||
       (hasPlans && (!validActiveSessionPlans(carry.active_session_plans) ||
         !text(carry.active_session_plan_guidance))) ||
-      carry.windows.length > maxWindows || !carry.windows.every(validWindow) ||
+      carry.windows.length > maxWindows || !carry.windows.every((window) => validWindow(window)) ||
       !integer(carry.locally_omitted) || !integer(carry.windows_omitted) ||
       !exact(carry.locally_omitted_by_bucket, REMOTE_INGRESS_CONTEXT_BUCKETS) ||
       REMOTE_INGRESS_CONTEXT_BUCKETS.some((bucket) => !integer(carry.locally_omitted_by_bucket[bucket])) ||

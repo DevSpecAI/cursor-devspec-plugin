@@ -2,6 +2,13 @@
 
 ## 0.10.0
 
+### Fix: multi-window context must not reject canonical wakes
+
+`validateCanonicalContextCarry` used `windows.every(validWindow)`, so
+`Array.every` passed the window index as `policyVersion` and rejected the
+second window. Wait then advanced past `owner_messages` without writing the
+wake file (Dashing Beaver / empty terminal — item 81c46c1e).
+
 ### Fix: host wake-follow must not restart with `--from-end` on inject
 
 `ensureWakeFollowForConnection` now reuses a live follow instead of
