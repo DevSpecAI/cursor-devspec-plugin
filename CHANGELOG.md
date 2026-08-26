@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.2
+
+### Fix: a Connect agent could be answered but could not learn to ask
+
+Directed-question guidance landed in `SKILL.md`, which a Connect launch never reads —
+it loads the thin post-Live brief instead. That brief named `manage-plan` and not
+`manage-question`, so an agent woken by an answer could still reply (the wake event
+carries its own reply instruction) but had no way to discover it could ask a question at
+all. The brief now names the bridge in one step, the same shape as the plan step, and a
+test asserts every capability-bound bridge is reachable from it while the schemas stay
+on demand.
+
 ## 0.11.1
 
 ### Fix: the test suite wrote into the repo root and a developer's real ~/.devspec
