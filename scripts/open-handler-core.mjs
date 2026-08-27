@@ -188,6 +188,73 @@ async function gitRemoteSlug(folderPath) {
   }
 }
 
+/**
+ * Tool-neutral connection state, written by EVERY DevSpec plugin's connect flow.
+ * Deliberately `~/.devspec`, not `~/.cursor` — the folder facts below belong to the
+ * machine, not to whichever plugin happens to be installed (memory `279bcc74`).
+ */
+const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+
+/**
+ * Resolve a repo folder from the working directories DevSpec plugins have already recorded.
+ *
+ * Every connect flow stamps `cwd` into ~/.devspec/remote-control/connections/<id>.json, so the
+ * machine already KNOWS which folder holds which repo. discoverRepoFolder() below only knows a
+ * fixed list of conventional layouts (~/repos, ~/Projects, ~/Developer, …) and silently misses
+ * anything else — which is exactly how a Pi launch failed with `missing_mapping` on a machine
+ * that had been running agents from the right folder for weeks (461 state files all naming it).
+ * Recorded fact beats guessed convention, so this runs first.
+ *
+ * Cheap and bounded on purpose: one flat readdir, no filesystem walk, no symlink following.
+ * Distinct cwds are deduped BEFORE any git call, and each resolves to its repo TOPLEVEL so a
+ * connection opened in a subdirectory (…/apps/web) still maps the repo root rather than the
+ * subfolder. Fails soft — any error just falls through to discoverRepoFolder().
+ */
+async function learnRepoFolderFromConnections(slug) {
+  let entries
+  try {
+    entries = await fs.readdir(CONNECTIONS_DIR)
+  } catch {
+    return null
+  }
+
+  const cwds = new Set()
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue
+    try {
+      const parsed = JSON.parse(await fs.readFile(path.join(CONNECTIONS_DIR, entry), 'utf8'))
+      if (parsed && typeof parsed.cwd === 'string' && parsed.cwd) cwds.add(parsed.cwd)
+    } catch {
+      // A truncated or half-written state file is not a reason to abandon the rest.
+    }
+  }
+  if (cwds.size === 0) return null
+
+  const roots = new Set()
+  for (const cwd of cwds) {
+    if (!(await pathExists(cwd))) continue
+    roots.add((await gitToplevel(cwd)) ?? cwd)
+  }
+
+  for (const root of roots) {
+    if ((await gitRemoteSlug(root)) === slug) return root
+  }
+  return null
+}
+
+/** Repo root for a directory, so a cwd inside a subfolder still maps the whole repo. */
+async function gitToplevel(folderPath) {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', folderPath, 'rev-parse', '--show-toplevel'], {
+      timeout: 5000,
+    })
+    const root = stdout.trim()
+    return root || null
+  } catch {
+    return null
+  }
+}
+
 async function discoverRepoFolder(slug) {
   const [owner, name] = slug.split('/')
   if (!owner || !name) return null
@@ -701,9 +768,14 @@ function openExternalUrl(url) {
   spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref()
 }
 
-function openErrorPage(slug, reason) {
+/**
+ * `tool` is passed so the page can name the agent the person actually launched. Without it the
+ * page defaults to Cursor and tells a Pi user to go and fix something in an editor they may not
+ * have installed — the same wrong-default class already fixed on the interstitial.
+ */
+function openErrorPage(slug, reason, tool = 'cursor') {
   const base = process.env.DEVSPEC_API_URL?.replace(/\/+$/, '') || 'https://devspec.ai'
-  const params = new URLSearchParams({ repo: slug, reason })
+  const params = new URLSearchParams({ repo: slug, reason, tool })
   openExternalUrl(`${base}/cursor-handoff/error?${params}`)
 }
 
@@ -732,7 +804,7 @@ export async function resolveRepoFolder(slug) {
   const stored = map[slug]
   if (stored && (await pathExists(stored))) return stored
 
-  const discovered = await discoverRepoFolder(slug)
+  const discovered = (await learnRepoFolderFromConnections(slug)) ?? (await discoverRepoFolder(slug))
   if (discovered) {
     map[slug] = discovered
     await writeMap(map)
@@ -853,7 +925,7 @@ export async function executeHandoff({
   const folderPath = await resolveRepoFolder(slug)
   if (!folderPath) {
     await appendHandlerLog(`missing mapping for ${slug}`)
-    openErrorPage(slug, 'missing_mapping')
+    openErrorPage(slug, 'missing_mapping', tool)
     return { ok: false, error: 'missing_mapping', slug }
   }
 
@@ -861,7 +933,7 @@ export async function executeHandoff({
     const piBin = await resolvePiExecutable()
     if (!piBin) {
       await appendHandlerLog(`pi missing for handoff ${slug}`)
-      openErrorPage(slug, 'pi_missing')
+      openErrorPage(slug, 'pi_missing', tool)
       return { ok: false, error: 'pi_missing', slug }
     }
     try {
@@ -871,7 +943,7 @@ export async function executeHandoff({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       await appendHandlerLog(`Pi open failed: ${message}`)
-      openErrorPage(slug, 'agent_launch_failed')
+      openErrorPage(slug, 'agent_launch_failed', tool)
       return { ok: false, error: 'agent_launch_failed', slug }
     }
   }
@@ -883,7 +955,7 @@ export async function executeHandoff({
     const opencodeBin = await resolveOpencodeExecutable()
     if (!opencodeBin) {
       await appendHandlerLog(`opencode missing for handoff ${slug}`)
-      openErrorPage(slug, 'opencode_missing')
+      openErrorPage(slug, 'opencode_missing', tool)
       return { ok: false, error: 'opencode_missing', slug }
     }
     try {
@@ -893,7 +965,7 @@ export async function executeHandoff({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       await appendHandlerLog(`OpenCode open failed: ${message}`)
-      openErrorPage(slug, 'agent_launch_failed')
+      openErrorPage(slug, 'agent_launch_failed', tool)
       return { ok: false, error: 'agent_launch_failed', slug }
     }
   }
@@ -907,7 +979,7 @@ export async function executeHandoff({
     const agentBin = await resolveAgentExecutable()
     if (!agentBin) {
       await appendHandlerLog(`agent missing for CLI handoff ${slug}`)
-      openErrorPage(slug, 'agent_missing')
+      openErrorPage(slug, 'agent_missing', tool)
       return { ok: false, error: 'agent_missing', slug }
     }
     try {
@@ -917,7 +989,7 @@ export async function executeHandoff({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       await appendHandlerLog(`CLI open failed: ${message}`)
-      openErrorPage(slug, 'agent_launch_failed')
+      openErrorPage(slug, 'agent_launch_failed', tool)
       return { ok: false, error: 'agent_launch_failed', slug }
     }
   }
@@ -930,7 +1002,7 @@ export async function executeHandoff({
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     await appendHandlerLog(`open failed: ${message}`)
-    openErrorPage(slug, 'open_failed')
+    openErrorPage(slug, 'open_failed', tool)
     return { ok: false, error: 'open_failed', slug }
   }
 }
