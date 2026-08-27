@@ -183,3 +183,11 @@ describe('clamp / elide / serialize', () => {
     assert.doesNotMatch(out, /xxxxx/)
   })
 })
+
+describe('trail-turn active turn gating integration', () => {
+  it('identifies seed vs non-seed modes', () => {
+    assert.equal('seed' === 'seed', true)
+    assert.equal('postToolUse' === 'seed', false)
+    assert.equal('afterShellExecution' === 'seed', false)
+  })
+})

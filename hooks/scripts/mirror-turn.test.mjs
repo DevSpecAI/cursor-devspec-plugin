@@ -20,6 +20,10 @@ import {
   explicitReplyMarkerPath,
   consumeExplicitReplyMarker,
   isHarnessInjection,
+  turnMarkerPath,
+  writeTurnMarker,
+  clearTurnMarker,
+  hasActiveTurnMarker,
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
@@ -284,5 +288,29 @@ describe('isHarnessInjection', () => {
     assert.equal(isHarnessInjection(''), false)
     assert.equal(isHarnessInjection(null), false)
     assert.equal(isHarnessInjection(undefined), false)
+  })
+})
+
+describe('turnMarker lifecycle and active turn check', () => {
+  const connId = 'test-turn-marker-conn'
+  it('writes, checks, and clears turn marker', () => {
+    clearTurnMarker(connId)
+    assert.equal(hasActiveTurnMarker(connId), false)
+
+    writeTurnMarker(connId)
+    assert.equal(hasActiveTurnMarker(connId), true)
+
+    clearTurnMarker(connId)
+    assert.equal(hasActiveTurnMarker(connId), false)
+  })
+
+  it('rejects stale turn markers exceeding maxAgeMs', () => {
+    clearTurnMarker(connId)
+    const p = turnMarkerPath(connId)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, JSON.stringify({ startedAt: Date.now() - 400_000 }))
+
+    assert.equal(hasActiveTurnMarker(connId, 300_000), false)
+    clearTurnMarker(connId)
   })
 })

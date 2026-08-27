@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
-import { loadState, resolveHookConversationId } from './mirror-turn.mjs'
+import { hasActiveTurnMarker, loadState, resolveHookConversationId } from './mirror-turn.mjs'
 import {
   TRAIL_SEED_TEXT,
   advanceTrailState,
@@ -71,6 +71,13 @@ async function main() {
   const bondId = conversationId || fromHook
   const state = loadState(bondId)
   if (!state?.enabled || !state.connection_id || !state.session_id) {
+    process.exit(0)
+  }
+
+  // Mid-turn trail hooks (postToolUse, shell, MCP, etc.) must only emit trail updates
+  // while a turn is actively marked running. Background IDE tool executions outside an
+  // active turn must not assert busy state or open transient streaming bubbles.
+  if (mode !== 'seed' && !hasActiveTurnMarker(state.connection_id)) {
     process.exit(0)
   }
 
