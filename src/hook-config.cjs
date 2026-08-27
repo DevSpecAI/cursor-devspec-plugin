@@ -20,7 +20,7 @@ const PROVENANCE_EVENTS = [
 function isOurs(command) {
   if (typeof command !== 'string') return false
   if (command.includes(MARKER)) return true
-  const knownScript = /(?:run-mirror-turn|mirror-turn|trail-turn|mutation-boundary|provenance-assistance)\.mjs/i.test(command)
+  const knownScript = /(?:run-mirror-turn|mirror-turn|trail-turn|mutation-boundary|provenance-assistance|mark-explicit-reply)\.mjs/i.test(command)
   const devspecPath = /devspecai\.devspec-autopilot|[\\/]\.cursor[\\/]devspec[\\/]hooks|\$\{CLAUDE_PLUGIN_ROOT\}/i.test(command)
   return knownScript && devspecPath
 }

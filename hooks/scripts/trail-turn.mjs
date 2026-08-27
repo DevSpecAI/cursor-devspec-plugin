@@ -18,6 +18,7 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { hasActiveTurnMarker, loadState, resolveHookConversationId } from './mirror-turn.mjs'
+import { handleExplicitReply } from './mark-explicit-reply.mjs'
 import {
   TRAIL_SEED_TEXT,
   advanceTrailState,
@@ -60,8 +61,15 @@ async function main() {
     data = {}
   }
 
-  // Don't recurse when our own trail/answer MCP post fires mid-turn hooks.
-  if (isDevspecPostSessionTool(data)) process.exit(0)
+  // Don't recurse when our own trail/answer MCP post fires mid-turn hooks; latch reply and clear turn marker if complete_turn.
+  if (isDevspecPostSessionTool(data)) {
+    try {
+      await handleExplicitReply(raw, process.env)
+    } catch {
+      /* non-fatal */
+    }
+    process.exit(0)
+  }
 
   const conversationId = resolveHookConversationId(raw, process.env)
   const fromHook =

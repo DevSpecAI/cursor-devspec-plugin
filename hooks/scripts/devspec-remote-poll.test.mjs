@@ -24,6 +24,7 @@ import {
   unansweredCommands,
   splitRoomWindow,
   remoteIngressNegotiationArgs,
+  handleKeepaliveRejection,
 } from './devspec-remote-poll.mjs'
 
 const ME = 'conn-mine-1111'
@@ -576,3 +577,42 @@ describe('installStopSignalHandlers (item b9e02835)', () => {
     assert.equal(typeof proc.handlers.SIGINT, 'function')
   })
 })
+
+describe('handleKeepaliveRejection', () => {
+  it('clears turn marker when keepalive fails with no working attempt', () => {
+    let removedPath = null
+    const io = {
+      rmSync: (p) => {
+        removedPath = p
+      },
+    }
+    const res = handleKeepaliveRejection('No working attempt to keep alive for this connection.', 'conn-test-abc', io)
+    assert.equal(res.cleared, true)
+    assert.match(removedPath, /conn-test-abc\.turn/)
+  })
+
+  it('clears turn marker when keepalive fails with not working', () => {
+    let removedPath = null
+    const io = {
+      rmSync: (p) => {
+        removedPath = p
+      },
+    }
+    const res = handleKeepaliveRejection('Attempt not working or expired', 'conn-test-xyz', io)
+    assert.equal(res.cleared, true)
+    assert.match(removedPath, /conn-test-xyz\.turn/)
+  })
+
+  it('leaves turn marker intact for transient/network errors', () => {
+    let removedPath = null
+    const io = {
+      rmSync: (p) => {
+        removedPath = p
+      },
+    }
+    const res = handleKeepaliveRejection('fetch failed: network timeout', 'conn-test-abc', io)
+    assert.equal(res.cleared, false)
+    assert.equal(removedPath, null)
+  })
+})
+

@@ -203,6 +203,19 @@ function writeTurnMarker(connectionId) {
   }
 }
 
+export function handleKeepaliveRejection(errorMessage, connectionId, io = {}) {
+  const rmSync = io.rmSync || fs.rmSync
+  if (/no working attempt|not working/i.test(errorMessage || '')) {
+    try {
+      rmSync(turnMarkerPath(connectionId), { force: true })
+    } catch {
+      /* ignore */
+    }
+    return { cleared: true }
+  }
+  return { cleared: false }
+}
+
 export function isTurnMarkerStale(marker, nowMs = Date.now(), windowMs = TURN_SILENCE_MS) {
   if (!marker || typeof marker.startedAt !== 'number') return false
   return nowMs - marker.startedAt >= windowMs
@@ -964,15 +977,15 @@ async function main() {
   // Cursor turn was sealed empty while the model was still inside it. Keepalive is
   // translated to the exact form so Working stays truthful.
   async function emitActivityVerb(verb, extraArgs = {}) {
-    if (!verb) return
+    if (!verb) return { ok: true }
     const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
-    if (plan.kind === 'suppress') return
+    if (plan.kind === 'suppress') return { ok: true }
     if (plan.kind === 'exact_keepalive') {
-      await keepaliveInteractionContinuation()
-      return
+      const exactRes = await keepaliveInteractionContinuation()
+      return exactRes ?? { ok: true }
     }
     const name = ACTIVITY_VERB_TOOL[verb]
-    if (!name) return
+    if (!name) return { ok: true }
     try {
       await mcpToolsCall({
         mcpUrl,
@@ -981,8 +994,19 @@ async function main() {
         arguments: { connection_id: connectionId, ...extraArgs },
         timeoutMs: 10_000,
       })
+      return { ok: true }
     } catch (e) {
       process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
+      if (verb === 'keepalive') {
+        const rejection = handleKeepaliveRejection(e.message, connectionId)
+        if (rejection.cleared) {
+          process.stderr.write(
+            `devspec-remote-poll: cleared turn marker on keepalive rejection connection=${connectionId}\n`,
+          )
+          return { ok: false, turnStale: true }
+        }
+      }
+      return { ok: false }
     }
   }
 
@@ -994,7 +1018,7 @@ async function main() {
    */
   async function keepaliveInteractionContinuation() {
     const held = interactionContinuation
-    if (!held) return
+    if (!held) return { ok: true }
     try {
       await mcpToolsCall({
         mcpUrl,
@@ -1008,12 +1032,21 @@ async function main() {
         },
         timeoutMs: 10_000,
       })
+      return { ok: true }
     } catch (e) {
       process.stderr.write(`devspec-remote-poll: exact interaction keepalive failed: ${e.message}\n`)
-      if (/identity|not working|denied|authority/i.test(e.message || '')) {
+      if (/identity|not working|no working attempt|denied|authority/i.test(e.message || '')) {
         interactionContinuation = null
         patchState({ interaction_continuation: null })
+        const rejection = handleKeepaliveRejection(e.message, connectionId)
+        if (rejection.cleared) {
+          process.stderr.write(
+            `devspec-remote-poll: cleared turn marker on exact keepalive rejection connection=${connectionId}\n`,
+          )
+          return { ok: false, turnStale: true }
+        }
       }
+      return { ok: false }
     }
   }
 
@@ -1552,7 +1585,7 @@ async function main() {
     // Agent-authoritative "working": re-assert busy while a fresh turn marker exists.
     const marker = readTurnMarker(connectionId)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
-    const turnActive = !!marker && turnElapsed < MAX_TURN_MS
+    let turnActive = !!marker && turnElapsed < MAX_TURN_MS
     if (marker && turnElapsed >= MAX_TURN_MS && prevTurnActive) {
       logRemoteControlStory({
         phase: 'stall',
@@ -1566,9 +1599,6 @@ async function main() {
       })
     }
     const stalling = !!(marker && turnElapsed >= MAX_TURN_MS && prevTurnActive)
-    let busyArg = null
-    if (turnActive) busyArg = true
-    else if (lastBusySent === true) busyArg = false
 
     // ADDITIVE (item 71a8b201): emit the connection activity verb DIRECTLY off the
     // turn-active transition (pickup / keepalive / complete). This is ON TOP of the
@@ -1580,8 +1610,15 @@ async function main() {
     // Complete always carries a reason: turn_end on a healthy marker clear
     // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
     const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
-    await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
+    const verbResult = await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
+    if (verbResult?.turnStale) {
+      turnActive = false
+    }
     prevTurnActive = turnActive
+
+    let busyArg = null
+    if (turnActive) busyArg = true
+    else if (lastBusySent === true) busyArg = false
 
     // Cadence from connection STATE — with long-poll this picks the HOLD LENGTH,
     // not a gap. Both tiers deliver instantly; check_tier is 'responsive' either way

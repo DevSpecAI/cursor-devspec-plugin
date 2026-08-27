@@ -60,6 +60,9 @@ describe('Cursor hook config merge', () => {
     for (const event of ['beforeShellExecution', 'postToolUse', 'afterMCPExecution', 'afterFileEdit']) {
       assert.equal(commandsFor(packaged, event).some((command) => command.includes('trail-turn.mjs')), true, event)
     }
+    for (const event of ['postToolUse', 'afterMCPExecution']) {
+      assert.equal(commandsFor(packaged, event).some((command) => command.includes('mark-explicit-reply.mjs')), true, event)
+    }
     assert.equal(JSON.stringify(packaged).includes('mutation-boundary.mjs'), false)
   })
 })
