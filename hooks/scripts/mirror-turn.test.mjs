@@ -19,6 +19,7 @@ import {
   prepareAgentMirrorText,
   explicitReplyMarkerPath,
   consumeExplicitReplyMarker,
+  isHarnessInjection,
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
@@ -254,5 +255,34 @@ describe('explicit-reply marker (double-post guard, item b9fb49a9)', () => {
     const p = explicitReplyMarkerPath(testConnectionId)
     assert.equal(path.basename(p), `${testConnectionId}.explicit-reply`)
     assert.equal(path.dirname(p), path.join(os.homedir(), '.devspec', 'remote-control', 'connections'))
+  })
+})
+
+describe('isHarnessInjection', () => {
+  it('detects task notifications and automated background task events', () => {
+    assert.equal(isHarnessInjection('<task-notification task="123" />'), true)
+    assert.equal(isHarnessInjection('[SYSTEM NOTIFICATION - NOT USER INPUT] foo'), true)
+    assert.equal(isHarnessInjection('This is an automated background-task event for shell 1'), true)
+  })
+
+  it('detects system reminders and system notifications', () => {
+    assert.equal(isHarnessInjection('<system-reminder>reminder</system-reminder>'), true)
+    assert.equal(isHarnessInjection('<system_reminder>reminder</system_reminder>'), true)
+    assert.equal(isHarnessInjection('<system-notification>notice</system-notification>'), true)
+    assert.equal(isHarnessInjection('<system_notification>notice</system_notification>'), true)
+  })
+
+  it('detects remote control wake tail arming prompts', () => {
+    assert.equal(isHarnessInjection('Arm wait FIRST as a background Shell with block_until_ms: 0'), true)
+    assert.equal(isHarnessInjection('node C:\\ProgramData\\DevSpec\\cursor-plugin-43fb3fa325fb\\hooks\\scripts\\devspec-wake-tail.mjs'), true)
+    assert.equal(isHarnessInjection('devspec-remote-wait'), true)
+  })
+
+  it('does not flag genuine user prompts', () => {
+    assert.equal(isHarnessInjection('Please fix the button styling on the dashboard'), false)
+    assert.equal(isHarnessInjection('How does authentication work in this repo?'), false)
+    assert.equal(isHarnessInjection(''), false)
+    assert.equal(isHarnessInjection(null), false)
+    assert.equal(isHarnessInjection(undefined), false)
   })
 })

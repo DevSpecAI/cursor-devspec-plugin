@@ -249,18 +249,24 @@ function extractLastText(hookInput, which) {
 }
 
 /**
- * Claude Code re-invokes the model after a background task by injecting a synthetic
- * user prompt (a <task-notification> block, a [SYSTEM NOTIFICATION …] banner, or a
- * <system-reminder>). Those are harness plumbing, never owner-typed input, and must
- * not be mirrored as local_prompt bubbles.
+ * Claude Code and Cursor re-invoke the model after a background task or during harness setup
+ * by injecting a synthetic user prompt (a <task-notification> block, a [SYSTEM NOTIFICATION …] banner,
+ * a <system-reminder>, wait-tail instructions, etc.). Those are harness plumbing, never owner-typed
+ * input, and must not assert busy or be mirrored as local_prompt bubbles.
  */
-function isHarnessInjection(text) {
-  const t = String(text)
+export function isHarnessInjection(text) {
+  const t = String(text ?? '')
   return (
     t.includes('<task-notification') ||
     t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
     t.includes('This is an automated background-task event') ||
-    t.includes('<system-reminder>')
+    t.includes('<system-reminder>') ||
+    t.includes('<system_reminder>') ||
+    t.includes('<system-notification>') ||
+    t.includes('<system_notification>') ||
+    t.includes('Arm wait FIRST as a background Shell') ||
+    t.includes('devspec-wake-tail.mjs') ||
+    t.includes('devspec-remote-wait')
   )
 }
 
@@ -347,13 +353,19 @@ async function main() {
   const localId = state.local_id || null
 
   const text = extractLastText(raw, mode)
-  const skipMirror = mode === 'user_prompt' && !!text && isHarnessInjection(text)
+  const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || isHarnessInjection(text))
 
   // Consume any explicit-reply marker so it cannot bleed into a later turn.
   // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
   // assistant text as a primary path — dual writers caused wrong-voice dupes
   // and silent misses when bonding failed.
   if (mode === 'stop') consumeExplicitReplyMarker(connectionId)
+
+  // Skip turn marker, work trail seed, local prompt mirroring, and busy assertion
+  // when user_prompt has no genuine user text or is harness injection (prevents transient dot flicker).
+  if (mode === 'user_prompt' && skipMirror) {
+    process.exit(0)
+  }
 
   try {
     // LOCAL PROMPT only: mirror owner text typed in the terminal into the room
@@ -363,8 +375,7 @@ async function main() {
       mode === 'user_prompt' &&
       sessionId &&
       text &&
-      String(text).trim() &&
-      !skipMirror
+      String(text).trim()
     ) {
       const cleaned = String(text).trim().slice(0, 12000)
       if (cleaned) {
@@ -389,7 +400,7 @@ async function main() {
     // Seed the live work-trail bubble when attached (OpenCode parity). Mid-turn
     // hooks grow it; the model's phase=answer + complete_turn collapses it.
     // Shared with the poller's remote-wake seed (phone/web never hits user_prompt).
-    if (mode === 'user_prompt' && sessionId && connectionId && !skipMirror) {
+    if (mode === 'user_prompt' && sessionId && connectionId) {
       try {
         await seedWorkTrailForConnection({
           connectionId,
