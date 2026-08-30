@@ -27,6 +27,7 @@ import {
   resolveWindowsAgentInvocation,
   spawnAgentSync,
   stampLine,
+  parseArgs,
   sanitizeWindowsConsoleTitle,
   composeWindowsCursorCliTitle,
   windowsCursorCliStartArgs,
@@ -528,5 +529,20 @@ describe('Windows Cursor console title (item 20900b80)', () => {
     assert.equal(r.ok, true)
     assert.deepEqual(titles, ['DevSpec Cursor · Brave Panda'])
     assert.deepEqual(execs, ['DevSpec Cursor · Brave Panda'])
+  })
+})
+
+describe('resume-chat-id argv', () => {
+  it('parses an existing chat id so launch can skip create-chat', () => {
+    const parsed = parseArgs([
+      '--folder',
+      '/repo',
+      '--prompt-file',
+      '/tmp/p.txt',
+      '--resume-chat-id',
+      '11111111-1111-4111-8111-111111111111',
+    ])
+    assert.equal(parsed.resumeChatId, '11111111-1111-4111-8111-111111111111')
+    assert.equal(parsed.folder, '/repo')
   })
 })

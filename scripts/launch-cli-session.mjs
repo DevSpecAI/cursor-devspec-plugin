@@ -46,7 +46,7 @@ import {
 
 export { pathHasWhitespace, spaceSafePluginRoot, win32SpaceSafePluginPin } from './space-safe-plugin-root.mjs'
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = {}
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -54,6 +54,7 @@ function parseArgs(argv) {
     else if (a === '--prompt-file' && argv[i + 1]) out.promptFile = argv[++i]
     else if (a === '--agent' && argv[i + 1]) out.agent = argv[++i]
     else if (a === '--model' && argv[i + 1]) out.model = argv[++i]
+    else if (a === '--resume-chat-id' && argv[i + 1]) out.resumeChatId = argv[++i]
   }
   return out
 }
@@ -471,7 +472,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (!args.folder || !args.promptFile) {
     console.error(
-      'Usage: launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>] [--model <id>]',
+      'Usage: launch-cli-session.mjs --folder <path> --prompt-file <path> [--agent <path>] [--model <id>] [--resume-chat-id <id>]',
     )
     process.exitCode = 1
     return
@@ -495,8 +496,25 @@ async function main() {
     return
   }
 
-  console.log(`[devspec-cli] Creating Cursor CLI chat… (launch_id=${launchId})`)
+  const resumeChatId =
+    typeof args.resumeChatId === 'string' ? args.resumeChatId.trim() : ''
+  let chatId
   const createStarted = Date.now()
+  if (resumeChatId) {
+    console.log(
+      `[devspec-cli] Resuming Cursor CLI chat ${resumeChatId}… (launch_id=${launchId})`,
+    )
+    chatId = resumeChatId
+    await emitConnectPhase({
+      ...timingCtx,
+      phase: 'create_chat',
+      outcome: 'ok',
+      duration_ms: durationMs(createStarted),
+      reason: 'resume_existing',
+      local_id: chatId,
+    })
+  } else {
+  console.log(`[devspec-cli] Creating Cursor CLI chat… (launch_id=${launchId})`)
   const created = spawnAgentSync(agentBin, ['create-chat'], {
     cwd: args.folder,
     encoding: 'utf8',
@@ -516,7 +534,7 @@ async function main() {
     return
   }
 
-  const chatId = String(created.stdout || '')
+  chatId = String(created.stdout || '')
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -526,6 +544,7 @@ async function main() {
     console.error('[devspec-cli] agent create-chat returned no chat id')
     process.exitCode = 1
     return
+  }
   }
 
   /** @type {{ connection_id: string, session_id?: string | null, codename?: string | null, local_id?: string | null, launch_id?: string | null } | null} */

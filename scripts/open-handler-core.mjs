@@ -459,7 +459,7 @@ export async function resolvePiExecutable() {
  * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
  * @param {{ folderPath: string, promptText: string | null, agentBin: string, model?: string | null }} opts
  */
-export async function openInAgentCli({ folderPath, promptText, agentBin, model }) {
+export async function openInAgentCli({ folderPath, promptText, agentBin, model, resumeChatId }) {
   await ensureDevspecDir()
   const launchesDir = path.join(DEVSPEC_DIR, 'launches')
   await fs.mkdir(launchesDir, { recursive: true })
@@ -492,6 +492,10 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model }
   const modelId = typeof model === 'string' ? model.trim() : ''
   if (modelId) {
     launchArgs.push('--model', modelId)
+  }
+  const existingChatId = typeof resumeChatId === 'string' ? resumeChatId.trim() : ''
+  if (existingChatId) {
+    launchArgs.push('--resume-chat-id', existingChatId)
   }
 
   if (process.platform === 'win32') {
@@ -874,6 +878,10 @@ export function parseHandoffUrl(raw) {
           : 'cursor',
       model: verified.data.model ?? null,
       thinking: verified.data.thinking ?? null,
+      resumeChatId:
+        typeof verified.data.resumeChatId === 'string' && verified.data.resumeChatId.trim()
+          ? verified.data.resumeChatId.trim()
+          : null,
     }
   }
 
@@ -883,6 +891,7 @@ export function parseHandoffUrl(raw) {
   const toolRaw = url.searchParams.get('tool')
   const modelRaw = url.searchParams.get('model')
   const thinkingRaw = url.searchParams.get('thinking')
+  const resumeChatRaw = url.searchParams.get('resumeChatId')
   return {
     slug: decodeURIComponent(repo),
     promptText: url.searchParams.get('prompt')
@@ -897,6 +906,10 @@ export function parseHandoffUrl(raw) {
     thinking: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinkingRaw)
       ? thinkingRaw
       : null,
+    resumeChatId:
+      typeof resumeChatRaw === 'string' && resumeChatRaw.trim()
+        ? decodeURIComponent(resumeChatRaw).trim()
+        : null,
     /** Unsigned localhost bridge requests (macOS fallback only). */
     unsigned: true,
   }
@@ -914,6 +927,7 @@ export async function executeHandoff({
   tool = 'cursor',
   model = null,
   thinking = null,
+  resumeChatId = null,
   requireSignedToken = true,
   unsigned = false,
 }) {
@@ -983,7 +997,7 @@ export async function executeHandoff({
       return { ok: false, error: 'agent_missing', slug }
     }
     try {
-      await openInAgentCli({ folderPath, promptText: pinnedPrompt, agentBin, model })
+      await openInAgentCli({ folderPath, promptText: pinnedPrompt, agentBin, model, resumeChatId })
       await appendHandlerLog(`opened CLI ${slug} → ${folderPath} via ${agentBin}`)
       return { ok: true }
     } catch (err) {
@@ -1025,6 +1039,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     tool: parsed.tool === 'opencode' || parsed.tool === 'pi' ? parsed.tool : 'cursor',
     model: parsed.model ?? null,
     thinking: parsed.thinking ?? null,
+    resumeChatId: parsed.resumeChatId ?? null,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
