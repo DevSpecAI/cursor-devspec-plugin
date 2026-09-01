@@ -33,12 +33,78 @@ import { execFileSync } from 'node:child_process'
 
 const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 
-function readJson(file) {
+// Captured at load so tests that overwrite HOME/USERPROFILE cannot make a
+// project walk climb into the real ~/.cursor/mcp.json.
+let processHomeAtLoad = null
+try {
+  processHomeAtLoad = fs.realpathSync.native(os.homedir())
+} catch {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'))
+    processHomeAtLoad = path.resolve(os.homedir())
   } catch {
+    processHomeAtLoad = null
+  }
+}
+
+/** Windows editors (and PowerShell Set-Content -Encoding utf8) prefix UTF-8 with BOM. Cursor's MCP client tolerates it; Node JSON.parse does not. */
+function stripUtf8Bom(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+}
+
+function createSearchLog() {
+  return { entries: [] }
+}
+
+/**
+ * Read and parse an MCP JSON file. Missing vs unreadable are distinct in `log`
+ * so a BOM/corrupt home file is never reported as "no DevSpec entry".
+ * `noteMissing: false` skips logging ancestor misses while walking parents.
+ */
+function readJson(file, log, { noteMissing = true } = {}) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8')
+    try {
+      const value = JSON.parse(stripUtf8Bom(raw))
+      log?.entries.push({ path: file, status: 'ok' })
+      return value
+    } catch {
+      log?.entries.push({ path: file, status: 'unreadable' })
+      return null
+    }
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      if (noteMissing) log?.entries.push({ path: file, status: 'missing' })
+      return null
+    }
+    log?.entries.push({ path: file, status: 'unreadable' })
     return null
   }
+}
+
+function formatLookedIn(log) {
+  if (!log?.entries?.length) return ''
+  const seen = new Set()
+  const parts = []
+  for (const entry of log.entries) {
+    if (seen.has(entry.path)) continue
+    seen.add(entry.path)
+    parts.push(`${entry.path} (${entry.status})`)
+  }
+  return parts.join('; ')
+}
+
+function tokenNotFoundError(log, { urlOnly = false } = {}) {
+  const looked = formatLookedIn(log)
+  const unreadable = [...new Set((log?.entries || []).filter((e) => e.status === 'unreadable').map((e) => e.path))]
+  const hint =
+    'Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.'
+  if (unreadable.length) {
+    return `Found a DevSpec MCP config but could not parse it: ${unreadable.join(', ')}.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
+  }
+  if (urlOnly) {
+    return `Found a DevSpec MCP URL but no Bearer token.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
+  }
+  return `No DevSpec MCP token found.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
 }
 
 function extractBearer(headers) {
@@ -67,6 +133,35 @@ function uniqueRoots(values) {
   return [...new Set(values.filter(Boolean).map((value) => path.resolve(value)))]
 }
 
+function canonicalDir(dir) {
+  try {
+    return fs.realpathSync.native(dir)
+  } catch {
+    try {
+      return fs.realpathSync(dir)
+    } catch {
+      return path.resolve(dir)
+    }
+  }
+}
+
+function sameDir(a, b) {
+  if (!a || !b) return false
+  return canonicalDir(a).toLowerCase() === canonicalDir(b).toLowerCase()
+}
+
+function resolvedHomeDir(home) {
+  const dirs = []
+  if (home) dirs.push(path.resolve(home))
+  if (processHomeAtLoad) dirs.push(processHomeAtLoad)
+  try {
+    dirs.push(path.resolve(os.homedir()))
+  } catch {
+    // os.homedir() can throw if HOME/USERPROFILE is unset in a stripped env.
+  }
+  return dirs
+}
+
 function gitTopLevel(startDir) {
   try {
     return path.resolve(execFileSync('git', ['-C', startDir, 'rev-parse', '--show-toplevel'], {
@@ -77,23 +172,25 @@ function gitTopLevel(startDir) {
   }
 }
 
-function walkForConfig(startDir, relativeNames, home) {
+function walkForConfig(startDir, relativeNames, home, log) {
   if (!startDir) return null
   let dir = path.resolve(startDir)
-  const homePath = home ? path.resolve(home) : null
-  const projectBoundary = homePath ? null : (gitTopLevel(dir) || dir)
+  const homeDirs = resolvedHomeDir(home)
+  const gitBoundary = gitTopLevel(dir)
   let urlOnly = null
   for (let i = 0; i < 24; i++) {
     // Home-level Cursor config has its own explicit precedence below project
-    // config. Never accidentally consume it during a project walk.
-    if (homePath && dir === homePath) break
+    // config. Never accidentally consume the real or test home during a walk —
+    // temp directories on Windows live under the user profile, so climbing
+    // would otherwise treat ~/.cursor/mcp.json as a project file.
+    if (homeDirs.some((homeDir) => sameDir(dir, homeDir))) break
     for (const relativeName of relativeNames) {
       const file = path.join(dir, relativeName)
-      const got = fromServerEntry(devspecEntry(readJson(file)))
+      const got = fromServerEntry(devspecEntry(readJson(file, log, { noteMissing: i === 0 })))
       if (got?.token) return { ...got, source: file }
       if (got?.mcp_url && !urlOnly) urlOnly = { ...got, source: file }
     }
-    if (projectBoundary && dir === projectBoundary) break
+    if (gitBoundary && sameDir(dir, gitBoundary)) break
     const parent = path.dirname(dir)
     if (parent === dir) break
     dir = parent
@@ -101,29 +198,29 @@ function walkForConfig(startDir, relativeNames, home) {
   return urlOnly
 }
 
-function firstConfigured(roots, relativeNames, home) {
+function firstConfigured(roots, relativeNames, home, log) {
   let urlOnly = null
   for (const root of uniqueRoots(roots)) {
-    const got = walkForConfig(root, relativeNames, home)
+    const got = walkForConfig(root, relativeNames, home, log)
     if (got?.token) return got
     if (got?.mcp_url && !urlOnly) urlOnly = got
   }
   return urlOnly
 }
 
-function cursorConfigAuth(cwd, { mainWorktree = null, home = null } = {}) {
-  const project = firstConfigured([cwd, mainWorktree], [path.join('.cursor', 'mcp.json')], home)
+function cursorConfigAuth(cwd, { mainWorktree = null, home = null, log = null } = {}) {
+  const project = firstConfigured([cwd, mainWorktree], [path.join('.cursor', 'mcp.json')], home, log)
   if (project?.token) return project
 
   const homeFile = home ? path.join(path.resolve(home), '.cursor', 'mcp.json') : null
-  const fromHome = homeFile ? fromServerEntry(devspecEntry(readJson(homeFile))) : null
+  const fromHome = homeFile ? fromServerEntry(devspecEntry(readJson(homeFile, log))) : null
   if (fromHome?.token) return { ...fromHome, source: homeFile }
   if (project?.mcp_url) return project
   return fromHome?.mcp_url ? { ...fromHome, source: homeFile } : null
 }
 
-function projectMcpAuth(cwd, { mainWorktree = null, home = null } = {}) {
-  return firstConfigured([cwd, mainWorktree], ['.mcp.json', 'mcp.json'], home)
+function projectMcpAuth(cwd, { mainWorktree = null, home = null, log = null } = {}) {
+  return firstConfigured([cwd, mainWorktree], ['.mcp.json', 'mcp.json'], home, log)
 }
 
 /**
@@ -147,12 +244,14 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
   const mainWorktree = opts.mainWorktree || null
   const envToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
   const envUrl = env.DEVSPEC_MCP_URL || null
+  const log = createSearchLog()
+  log.entries.push({ path: 'env DEVSPEC_MCP_TOKEN', status: envToken ? 'ok' : 'missing' })
   if (envToken) {
     return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
   }
 
-  const cursor = cursorConfigAuth(cwd, { mainWorktree, home })
-  const fromProject = projectMcpAuth(cwd, { mainWorktree, home })
+  const cursor = cursorConfigAuth(cwd, { mainWorktree, home, log })
+  const fromProject = projectMcpAuth(cwd, { mainWorktree, home, log })
 
   const hostToken =
     typeof opts.hostToken === 'string' && opts.hostToken.trim() ? opts.hostToken.trim() : null
@@ -190,16 +289,14 @@ export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
       ok: false,
       mcp_url: envUrl || urlOnly.mcp_url,
       source: urlOnly.source,
-      error:
-        'Found a DevSpec MCP URL but no Bearer token. Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.',
+      error: tokenNotFoundError(log, { urlOnly: true }),
     }
   }
 
   return {
     ok: false,
     mcp_url: envUrl || DEFAULT_PROD_URL,
-    error:
-      'No DevSpec MCP token found. Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.',
+    error: tokenNotFoundError(log),
   }
 }
 

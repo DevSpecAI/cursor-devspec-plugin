@@ -189,4 +189,57 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     assert.equal(auth.ok, false)
     assert.match(auth.error, /DevSpec: Set MCP token/)
   })
+
+  it('reads a UTF-8 BOM-prefixed ~/.cursor/mcp.json instead of treating it as missing', () => {
+    const d = proj('bomhome')
+    const cursorDir = path.join(fakeHome, '.cursor')
+    fs.mkdirSync(cursorDir, { recursive: true })
+    const body = JSON.stringify({
+      mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_home' } } },
+    })
+    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), `\uFEFF${body}`)
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_bom_home')
+    assert.match(auth.source, /\.cursor[\\/]mcp\.json$/)
+  })
+
+  it('reads a UTF-8 BOM-prefixed project .cursor/mcp.json', () => {
+    const d = proj('bomproj')
+    const cursorDir = path.join(d, '.cursor')
+    fs.mkdirSync(cursorDir, { recursive: true })
+    const body = JSON.stringify({
+      mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_proj' } } },
+    })
+    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body)]))
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, true)
+    assert.equal(auth.token, 'dvs_bom_proj')
+  })
+
+  it('distinguishes an unreadable mcp.json from a missing file', () => {
+    const d = proj('corrupt')
+    const cursorDir = path.join(d, '.cursor')
+    fs.mkdirSync(cursorDir, { recursive: true })
+    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), '{ this is not json')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, false)
+    assert.match(auth.error, /could not parse/i)
+    assert.match(auth.error, /\.cursor[\\/]mcp\.json/)
+    assert.doesNotMatch(auth.error, /this is not json/)
+    assert.doesNotMatch(auth.error, /Bearer /)
+  })
+
+  it('names the files searched when no token is found', () => {
+    const d = proj('emptysearch')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.ok, false)
+    assert.match(auth.error, /No DevSpec MCP token found/)
+    assert.match(auth.error, /Searched:/)
+    assert.match(auth.error, /env DEVSPEC_MCP_TOKEN/)
+    assert.match(auth.error, /\.cursor[\\/]mcp\.json/)
+    assert.match(auth.error, /missing/)
+    assert.doesNotMatch(auth.error, /dvs_/)
+    assert.doesNotMatch(auth.error, /Bearer /)
+  })
 })
