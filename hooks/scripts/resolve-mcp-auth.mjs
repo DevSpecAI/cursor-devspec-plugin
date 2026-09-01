@@ -29,9 +29,16 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 
 const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
+const WRONG_TOKEN_RE = /belongs to a different token/i
+
+export const DEFAULT_MCP_URL = DEFAULT_PROD_URL
+
+export const TOKENS_WARNING_FIX =
+  'Open You → Connections, reveal the key you want, and make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
 
 // Captured at load so tests that overwrite HOME/USERPROFILE cannot make a
 // project walk climb into the real ~/.cursor/mcp.json.
@@ -237,57 +244,165 @@ export function hostTokenFromEnv(env = process.env) {
   return typeof envTok === 'string' && envTok.trim() ? envTok.trim() : null
 }
 
-export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
+function trimToken(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function pairIdentity(pair) {
+  return `${pair.token}\0${pair.mcp_url}`
+}
+
+export function fingerprintToken(token) {
+  if (typeof token !== 'string' || !token) return 'unknown'
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 8)
+}
+
+/**
+ * Every reachable credential as a { token, mcp_url } pair from ONE source.
+ * Never mix a Cursor MCP token with a project `.mcp.json` URL (item 8bb707fd).
+ */
+export function enumerateCredentialPairs(cwd = process.cwd(), opts = {}) {
   const hasInjectedEnv = Object.hasOwn(opts, 'env')
   const env = hasInjectedEnv ? (opts.env || {}) : process.env
   const home = opts.home || env.USERPROFILE || env.HOME || (hasInjectedEnv ? null : os.homedir())
   const mainWorktree = opts.mainWorktree || null
-  const envToken = env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || null
-  const envUrl = env.DEVSPEC_MCP_URL || null
-  const log = createSearchLog()
+  const log = opts.log || createSearchLog()
+  const envToken = trimToken(env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN)
+  const envUrl = trimToken(env.DEVSPEC_MCP_URL) || DEFAULT_PROD_URL
+  const hostToken = trimToken(opts.hostToken)
+
   log.entries.push({ path: 'env DEVSPEC_MCP_TOKEN', status: envToken ? 'ok' : 'missing' })
-  if (envToken) {
-    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
-  }
 
   const cursor = cursorConfigAuth(cwd, { mainWorktree, home, log })
   const fromProject = projectMcpAuth(cwd, { mainWorktree, home, log })
 
-  const hostToken =
-    typeof opts.hostToken === 'string' && opts.hostToken.trim() ? opts.hostToken.trim() : null
-  if (hostToken) {
-    return {
-      ok: true,
-      token: hostToken,
-      mcp_url: envUrl || cursor?.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
-      source: 'host',
-    }
+  const pairs = []
+  const seen = new Set()
+  const push = (pair) => {
+    if (!pair?.token) return
+    const id = pairIdentity(pair)
+    if (seen.has(id)) return
+    seen.add(id)
+    pairs.push(pair)
   }
 
-  // Cursor's own config — the token register_connection ran on. Wins over .mcp.json.
-  if (cursor?.token) {
-    return {
-      ok: true,
-      token: cursor.token,
-      mcp_url: envUrl || cursor.mcp_url || fromProject?.mcp_url || DEFAULT_PROD_URL,
-      source: cursor.source,
+  if (envToken) {
+    push({
+      source: 'env',
+      sourceLabel: 'DEVSPEC_MCP_TOKEN',
+      token: envToken,
+      mcp_url: envUrl,
+    })
+  }
+
+  if (hostToken) {
+    let mcp_url = DEFAULT_PROD_URL
+    let sourceLabel = 'host MCP client'
+    if (hostToken === envToken) {
+      mcp_url = envUrl
+      sourceLabel = 'DEVSPEC_MCP_TOKEN'
+    } else if (cursor?.token && hostToken === cursor.token) {
+      mcp_url = cursor.mcp_url || DEFAULT_PROD_URL
+      sourceLabel = 'Cursor MCP config'
+    } else if (fromProject?.token && hostToken === fromProject.token) {
+      mcp_url = fromProject.mcp_url || DEFAULT_PROD_URL
+      sourceLabel = 'project .mcp.json'
     }
+    push({
+      source: 'host',
+      sourceLabel,
+      token: hostToken,
+      mcp_url,
+    })
+  }
+
+  if (cursor?.token) {
+    push({
+      source: cursor.source,
+      sourceLabel: 'Cursor MCP config',
+      token: cursor.token,
+      mcp_url: cursor.mcp_url || DEFAULT_PROD_URL,
+    })
   }
 
   if (fromProject?.token) {
-    return {
-      ok: true,
-      token: fromProject.token,
-      mcp_url: envUrl || fromProject.mcp_url || cursor?.mcp_url || DEFAULT_PROD_URL,
+    push({
       source: fromProject.source,
+      sourceLabel: 'project .mcp.json',
+      token: fromProject.token,
+      mcp_url: fromProject.mcp_url || DEFAULT_PROD_URL,
+    })
+  }
+
+  return { pairs, cursor, fromProject, log }
+}
+
+export function distinctTokenPairs(pairs) {
+  const seen = new Set()
+  const out = []
+  for (const pair of pairs || []) {
+    if (!pair?.token || seen.has(pair.token)) continue
+    seen.add(pair.token)
+    out.push(pair)
+  }
+  return out
+}
+
+export function buildTokensWarning(pairs) {
+  const tokens = distinctTokenPairs(pairs)
+  if (tokens.length < 2) return null
+  const named = tokens
+    .map((pair) => `${pair.sourceLabel} (${fingerprintToken(pair.token)})`)
+    .join(', ')
+  return (
+    `This machine has more than one DevSpec key: ${named}. ` +
+    `Connect will use the key that owns this connection. ${TOKENS_WARNING_FIX}`
+  )
+}
+
+export function isWrongTokenError(err) {
+  const msg = err?.message || String(err || '')
+  return WRONG_TOKEN_RE.test(msg)
+}
+
+export async function proveCredentialPair(pairs, { connectionId, probe } = {}) {
+  const warning = buildTokensWarning(pairs)
+  const tokens = distinctTokenPairs(pairs)
+  if (tokens.length === 0) {
+    return { pair: null, probed: false, warning: null, error: 'no_token' }
+  }
+  if (tokens.length === 1) {
+    return { pair: tokens[0], probed: false, warning: null, error: null }
+  }
+  if (typeof probe !== 'function') {
+    return { pair: null, probed: false, warning, error: 'unproven' }
+  }
+  for (const pair of tokens) {
+    try {
+      await probe(pair, connectionId)
+      return { pair, probed: true, warning, error: null }
+    } catch {
+      continue
     }
+  }
+  return { pair: null, probed: true, warning, error: 'no_proven_pair' }
+}
+
+export function resolveDevspecMcpAuth(cwd = process.cwd(), opts = {}) {
+  const hasInjectedEnv = Object.hasOwn(opts, 'env')
+  const env = hasInjectedEnv ? (opts.env || {}) : process.env
+  const envUrl = trimToken(env.DEVSPEC_MCP_URL)
+  const { pairs, cursor, fromProject, log } = enumerateCredentialPairs(cwd, opts)
+  const first = pairs.find((p) => p.token)
+  if (first) {
+    return { ok: true, token: first.token, mcp_url: first.mcp_url, source: first.source }
   }
 
   const urlOnly = cursor?.mcp_url ? cursor : fromProject
   if (urlOnly?.mcp_url) {
     return {
       ok: false,
-      mcp_url: envUrl || urlOnly.mcp_url,
+      mcp_url: urlOnly.mcp_url,
       source: urlOnly.source,
       error: tokenNotFoundError(log, { urlOnly: true }),
     }

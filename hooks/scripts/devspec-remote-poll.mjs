@@ -74,7 +74,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { distinctTokenPairs, enumerateCredentialPairs, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
@@ -881,15 +881,18 @@ async function main() {
   let token = state?.token || null
   let mcpUrl = state?.mcp_url || null
   if (!token) {
-    // Token symmetry (item 74b29c76): write normally caches the token; if it did
-    // not, resolve one preferring the host bearer (plugin userConfig env) over the
-    // .mcp.json walk, so even a fallback resolution matches the token
-    // register_connection ran on rather than diverging into repeated auth failures.
-    const auth = resolveDevspecMcpAuth(state?.cwd || process.cwd(), {
+    const { pairs } = enumerateCredentialPairs(state?.cwd || process.cwd(), {
       hostToken: hostTokenFromEnv(process.env),
     })
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
+    const only = distinctTokenPairs(pairs)
+    if (only.length !== 1) {
+      process.stderr.write(
+        'devspec-remote-poll: no proven token in state. Re-run connect / write — the poller will not guess among multiple DevSpec keys.\n',
+      )
+      process.exit(1)
+    }
+    token = only[0].token
+    mcpUrl = only[0].mcp_url
   }
   if (!token) {
     process.stderr.write(

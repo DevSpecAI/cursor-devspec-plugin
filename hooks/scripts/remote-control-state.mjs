@@ -74,7 +74,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import {
+  enumerateCredentialPairs,
+  hostTokenFromEnv,
+  proveCredentialPair,
+  resolveDevspecMcpAuth,
+} from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
@@ -1788,6 +1793,16 @@ export async function attachConnection(opts) {
  *   emitPhase?: typeof emitConnectPhase,
  * }} opts
  */
+async function heartbeatOwnsConnection(pair, connectionId) {
+  await mcpToolsCall({
+    mcpUrl: pair.mcp_url,
+    token: pair.token,
+    name: 'heartbeat_connection',
+    arguments: { connection_id: connectionId, status: 'live' },
+    timeoutMs: 15_000,
+  })
+}
+
 export async function writeConnectionState(opts) {
   const writeStarted = Date.now()
   const connectionId = opts.connectionId
@@ -1800,7 +1815,40 @@ export async function writeConnectionState(opts) {
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
       : null) || hostTokenFromEnv(process.env)
-  const auth = resolveAuth(cwd, { hostToken })
+  let auth
+  let warning_tokens = null
+  if (resolveAuth !== resolveDevspecMcpAuth) {
+    auth = resolveAuth(cwd, { hostToken })
+  } else {
+    const { pairs } = enumerateCredentialPairs(cwd, { hostToken })
+    const proven = await proveCredentialPair(pairs, {
+      connectionId,
+      probe: opts.probe || heartbeatOwnsConnection,
+    })
+    warning_tokens = proven.warning
+    if (proven.pair) {
+      auth = {
+        ok: true,
+        token: proven.pair.token,
+        mcp_url: proven.pair.mcp_url,
+        source: proven.pair.source,
+      }
+    } else {
+      const fallback = resolveAuth(cwd, { hostToken })
+      auth = {
+        ok: false,
+        token: null,
+        mcp_url: fallback.mcp_url,
+        source: fallback.source || fallback.error || null,
+        error:
+          proven.error === 'no_proven_pair'
+            ? 'No reachable DevSpec key owns this connection. Open You → Connections and make the Cursor MCP key and the project .mcp.json key the same.'
+            : proven.error === 'unproven'
+              ? 'This machine has more than one DevSpec key; the poller will not start until one is proven to own this connection.'
+              : fallback.error,
+      }
+    }
+  }
   const prev = readJson(connectionPath(connectionId)) || {}
   const agentName = opts.agent || prev.agent_name || AGENT_NAME
   const localId =
@@ -1820,10 +1868,13 @@ export async function writeConnectionState(opts) {
     agent_name: agentName,
     local_id: localId ?? prev.local_id ?? null,
     owner_pid: ownerPid,
-    mcp_url: opts.url || auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp',
-    token: auth.token || prev.token || undefined,
+    mcp_url: auth.ok
+      ? auth.mcp_url
+      : (auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp'),
+    token: auth.ok ? auth.token : undefined,
     auth_source: auth.source || auth.error || prev.auth_source || null,
-    auth_ok: !!auth.ok || !!prev.auth_ok,
+    auth_ok: !!auth.ok,
+    auth_proven: !!auth.ok,
     cwd,
     session_codename: opts.codename || prev.session_codename || prev.codename || null,
     title: opts.title || prev.title || null,
@@ -1868,6 +1919,7 @@ export async function writeConnectionState(opts) {
     result.warning = auth.error
     result.error = auth.error || 'auth_failed'
   }
+  if (warning_tokens) result.warning_tokens = warning_tokens
   if (!localId) {
     result.warning_local =
       'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
@@ -2400,6 +2452,9 @@ async function runCli() {
     })
     if (result.warning_poller) {
       process.stderr.write(`remote-control-state: ensure-poller failed — ${result.warning_poller}\n`)
+    }
+    if (result.warning_tokens) {
+      process.stderr.write(`remote-control-state: ${result.warning_tokens}\n`)
     }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)

@@ -14,7 +14,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth, hostTokenFromEnv, enumerateCredentialPairs, fingerprintToken, buildTokensWarning, proveCredentialPair } from './resolve-mcp-auth.mjs'
 
 let root
 let fakeHome
@@ -121,6 +121,7 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     const auth = resolveDevspecMcpAuth(d, { hostToken: 'dvs_explicit_host' })
     assert.equal(auth.token, 'dvs_explicit_host')
     assert.equal(auth.source, 'host')
+    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp', 'host token must not inherit the Cursor MCP URL')
   })
 
   it('walks upward to repository-root .cursor/mcp.json from a nested target', () => {
@@ -241,5 +242,65 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     assert.match(auth.error, /missing/)
     assert.doesNotMatch(auth.error, /dvs_/)
     assert.doesNotMatch(auth.error, /Bearer /)
+  })
+})
+
+describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', () => {
+  it('enumerates Cursor MCP config and project .mcp.json as separate pairs', () => {
+    const d = proj('pairs')
+    cursorJson(d, 'dvs_cursor_prod', 'https://devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
+    const cursor = pairs.find((p) => p.sourceLabel === 'Cursor MCP config')
+    const project = pairs.find((p) => p.sourceLabel === 'project .mcp.json')
+    assert.equal(cursor.token, 'dvs_cursor_prod')
+    assert.equal(cursor.mcp_url, 'https://devspec.ai/api/mcp')
+    assert.equal(project.token, 'dvs_project_staging')
+    assert.equal(project.mcp_url, 'https://staging.devspec.ai/api/mcp')
+  })
+
+  it('Cursor token does not inherit the .mcp.json URL', () => {
+    const d = proj('nomix')
+    cursorJson(d, 'dvs_cursor_prod', 'https://devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    const auth = resolveDevspecMcpAuth(d)
+    assert.equal(auth.token, 'dvs_cursor_prod')
+    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
+  })
+
+  it('warning names both sources with fingerprints and never the raw tokens', () => {
+    const d = proj('warn')
+    cursorJson(d, 'dvs_cursor_prod')
+    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
+    const warning = buildTokensWarning(pairs)
+    assert.match(warning, /Cursor MCP config/)
+    assert.match(warning, /project \.mcp\.json/)
+    assert.match(warning, /You → Connections/)
+    assert.ok(warning.includes(fingerprintToken('dvs_cursor_prod')))
+    assert.ok(warning.includes(fingerprintToken('dvs_project_staging')))
+    assert.doesNotMatch(warning, /dvs_cursor_prod|dvs_project_staging/)
+  })
+
+  it('falls through a "belongs to a different token" probe to the next pair', async () => {
+    const d = proj('probe')
+    cursorJson(d, 'dvs_cursor_prod')
+    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
+    const seen = []
+    const proven = await proveCredentialPair(pairs, {
+      connectionId: 'conn-1',
+      probe: async (pair) => {
+        seen.push(pair.token)
+        if (pair.token === 'dvs_cursor_prod') {
+          throw new Error('This connection belongs to a different token')
+        }
+      },
+    })
+    assert.deepEqual(seen, ['dvs_cursor_prod', 'dvs_project_staging'])
+    assert.equal(proven.pair.token, 'dvs_project_staging')
+    assert.equal(proven.pair.mcp_url, 'https://staging.devspec.ai/api/mcp')
+    assert.equal(proven.probed, true)
+    assert.doesNotMatch(proven.warning, /dvs_cursor_prod|dvs_project_staging/)
   })
 })

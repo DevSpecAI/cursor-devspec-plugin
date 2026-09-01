@@ -168,7 +168,7 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
 
 This resolves the MCP token (env `DEVSPEC_MCP_TOKEN` → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → project `.mcp.json`; on HTTP 401/403 it auth-falls-back to the next source), writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
 
-If `auth_ok: false`, print the `warning` and tell the user to fix MCP auth. If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
+If `auth_ok: false`, print the `warning` and tell the user to fix MCP auth. If the write JSON includes `warning_tokens`, print that text **verbatim** to the user (fingerprints only — never a raw token). If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
 
 Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 

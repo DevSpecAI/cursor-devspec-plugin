@@ -540,6 +540,7 @@ export async function fastConnect(opts = {}) {
     launch_id: launchId,
     action: localAction.action,
     poller,
+    warning_tokens: written.warning_tokens || null,
   }
 }
 
