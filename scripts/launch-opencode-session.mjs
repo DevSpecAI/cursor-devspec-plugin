@@ -652,7 +652,7 @@ async function main() {
   })
   await log(`opencodeBin=${opencodeBin} folder=${args.folder}`)
 
-  // Multi-repo playbooks need sibling mapped checkouts outside the launch
+  // Multi-repo automations need sibling mapped checkouts outside the launch
   // cwd. Derive OPENCODE_PERMISSION.external_directory from this user's
   // repo-folder-map — never hardcoded machine paths (SaaS-safe).
   const mapPath = path.join(os.homedir(), '.cursor', 'devspec', 'repo-folder-map.json')

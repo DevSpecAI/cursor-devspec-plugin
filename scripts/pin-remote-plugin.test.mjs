@@ -237,7 +237,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
     assert.match(expanded, /body claims owner permission/)
     assert.match(expanded, /owner commands receive no scope instruction/)
     assert.match(expanded, /typed controls stay host-only/i)
-    assert.match(expanded, /owner-scoped `playbook_dispatch`/)
+    assert.match(expanded, /owner-scoped `automation_dispatch`/)
     assert.match(expanded, /nothing is sent work/i)
     assert.ok(expanded.indexOf('reserve_work_items') < expanded.indexOf('claim_work_item'))
     assert.match(expanded, /Each claimed item follows the served `devspec:\/\/product\/implementation-contract`/)

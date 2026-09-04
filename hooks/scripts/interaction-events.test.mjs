@@ -192,7 +192,7 @@ describe('exact targeting and non-authority', () => {
     assert.match(answer.note, /not a command/)
     assert.match(answer.note, /manage-question respond/)
     const encoded = JSON.stringify(buildInteractionAnswerEvents(record()))
-    assert.doesNotMatch(encoded, /owner_message|playbook|project_scope|command_turn/)
+    assert.doesNotMatch(encoded, /owner_message|automation|project_scope|command_turn/)
   })
 
   it('keeps the answer event inside the pattern Cursor is told to notify on', async () => {

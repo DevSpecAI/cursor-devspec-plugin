@@ -38,14 +38,14 @@ import {
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
-import { playbookAcceptanceKey } from './remote-poll-acceptance.mjs'
+import { automationAcceptanceKey } from './remote-poll-acceptance.mjs'
 import {
   FIXTURE_ID,
   emptyFixtureContext,
   fixtureCommand,
   fixtureContextEntry,
   fixtureEnvelope,
-  fixturePlaybookDispatch,
+  fixtureAutomationDispatch,
 } from './remote-ingress-test-fixtures.mjs'
 
 const CANONICAL_CONNECTION = FIXTURE_ID.connection
@@ -184,10 +184,10 @@ describe('canonical one-command-turn wake', () => {
       const line = JSON.stringify(canonicalBatch(delegated)) + '\n'
       fs.writeFileSync(file, line)
       const first = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
       })
       const retry = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
       })
       assert.deepEqual(retry.batches[0].messages[0].project_scope, first.batches[0].messages[0].project_scope)
       assert.equal(retry.newOffset, Buffer.byteLength(line, 'utf8'))
@@ -203,21 +203,21 @@ describe('canonical one-command-turn wake', () => {
     assert.equal(attachment.resource_id, '88888888-8888-4888-8888-888888888888')
   })
 
-  it('renders explicit playbooks on their own typed wake path, never owner_message', () => {
-    const dispatch = fixturePlaybookDispatch()
+  it('renders explicit automations on their own typed wake path, never owner_message', () => {
+    const dispatch = fixtureAutomationDispatch()
     const batch = {
-      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION, session_id: null,
+      type: 'automation_dispatches', connection_id: CANONICAL_CONNECTION, session_id: null,
       next_after_message_id: 'dispatch-watermark', messages: [dispatch],
-      acceptance_key: playbookAcceptanceKey(dispatch),
+      acceptance_key: automationAcceptanceKey(dispatch),
     }
     assert.equal(parseWakeBatches([JSON.stringify(batch)], {
-      canonicalOnly: true, includePlaybooks: true,
+      canonicalOnly: true, includeAutomations: true,
     }).length, 1)
     const events = buildOwnerMessageEvents(batch)
-    assert.deepEqual(events.map((event) => event.type), ['playbook_dispatch', 'wake'])
-    assert.equal(events[1].reason, 'playbook_dispatch')
+    assert.deepEqual(events.map((event) => event.type), ['automation_dispatch', 'wake'])
+    assert.equal(events[1].reason, 'automation_dispatch')
     assert.equal(events.some((event) => event.type === 'owner_message'), false)
-    assert.match(events[0].instruction, /claim_playbook_run/)
+    assert.match(events[0].instruction, /claim_automation_run/)
   })
 
   it('dequeues only the first canonical command turn and leaves the queued turn for reconnect/re-arm', () => {
@@ -228,11 +228,11 @@ describe('canonical one-command-turn wake', () => {
       const secondMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
       const second = JSON.stringify(canonicalBatch(secondMessage)) + '\n'
       fs.writeFileSync(file, first + second)
-      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true })
+      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
       assert.equal(slice.batches.length, 1)
       assert.equal(slice.batches[0].messages[0].message_id, canonicalCommand().message_id)
       assert.equal(slice.newOffset, Buffer.byteLength(first, 'utf8'))
-      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true })
+      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
       assert.equal(queued.batches[0].messages[0].message_id, secondMessage.message_id)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -700,14 +700,14 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     assert.equal(offsetAfterAdvisoryHistory(text), Buffer.byteLength(prefix, 'utf8'))
   })
 
-  it('first arm keeps an explicit playbook dispatch queued before wait starts', () => {
-    const dispatch = fixturePlaybookDispatch()
-    const playbook = `${JSON.stringify({
-      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION, messages: [dispatch],
-      acceptance_key: playbookAcceptanceKey(dispatch),
+  it('first arm keeps an explicit automation dispatch queued before wait starts', () => {
+    const dispatch = fixtureAutomationDispatch()
+    const automation = `${JSON.stringify({
+      type: 'automation_dispatches', connection_id: CANONICAL_CONNECTION, messages: [dispatch],
+      acceptance_key: automationAcceptanceKey(dispatch),
     })}\n`
     const prefix = advisory()
-    assert.equal(offsetAfterAdvisoryHistory(prefix + playbook), Buffer.byteLength(prefix, 'utf8'))
+    assert.equal(offsetAfterAdvisoryHistory(prefix + automation), Buffer.byteLength(prefix, 'utf8'))
   })
 
   it('two owner_messages batches start at the first', () => {
@@ -749,7 +749,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].message_id, unreadMessage.message_id)
     } finally {
@@ -757,16 +757,16 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
     }
   })
 
-  it('--from-end never rewinds before a consumed playbook offset and keeps the unread run after it', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-playbook-offset-'))
+  it('--from-end never rewinds before a consumed automation offset and keeps the unread run after it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-from-end-automation-offset-'))
     const file = path.join(dir, 'inbox.jsonl')
     const lineFor = (dispatch) => `${JSON.stringify({
-      type: 'playbook_dispatches', connection_id: CANONICAL_CONNECTION,
-      messages: [dispatch], acceptance_key: playbookAcceptanceKey(dispatch),
+      type: 'automation_dispatches', connection_id: CANONICAL_CONNECTION,
+      messages: [dispatch], acceptance_key: automationAcceptanceKey(dispatch),
     })}\n`
     try {
-      const consumedDispatch = fixturePlaybookDispatch()
-      const unreadDispatch = fixturePlaybookDispatch({
+      const consumedDispatch = fixtureAutomationDispatch()
+      const unreadDispatch = fixtureAutomationDispatch({
         id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
         run_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
       })
@@ -782,7 +782,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includePlaybooks: true, oneCommandTurn: true,
+        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].run_id, unreadDispatch.run_id)
     } finally {

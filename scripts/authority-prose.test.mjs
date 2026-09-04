@@ -77,7 +77,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
     }
   })
 
-  it('keeps canonical authority, controls, and playbooks distinct', () => {
+  it('keeps canonical authority, controls, and automations distinct', () => {
     for (const file of primers) {
       const content = contents.get(file)
       assert.match(content, /(?:exactly addressed|exact-target)/i, file)
@@ -87,7 +87,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /verbatim/i, file)
       assert.match(content, /devspec:\/\/product\/remote-ingress-contract/, file)
       assert.match(content, /typed[^\n]{0,80}control|control[^\n]{0,80}typed/i, file)
-      assert.match(content, /owner-scoped[^\n]{0,80}`?playbook_dispatch`?/i, file)
+      assert.match(content, /owner-scoped[^\n]{0,80}`?automation_dispatch`?/i, file)
     }
   })
 

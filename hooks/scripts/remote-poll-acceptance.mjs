@@ -16,28 +16,28 @@ function datetime(value) { return typeof value === 'string' && DATETIME.test(val
 function nullableCursor(value) { return value === null || value === undefined || text(value) }
 
 /** Strictly accept the one independent non-conversation dispatch type the server emits. */
-export function validatePlaybookDispatch(dispatch, connectionId) {
+export function validateAutomationDispatch(dispatch, connectionId) {
   if (!exact(dispatch, [
-    'id', 'kind', 'run_id', 'playbook_id', 'playbook_name', 'instruction', 'permission',
+    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'instruction', 'permission',
     'requester', 'original_target_connection_id', 'delivery_connection_id', 'queued_at', 'state',
-  ])) return 'malformed playbook dispatch'
-  if (dispatch.kind !== 'playbook_run' || !uuid(dispatch.id) || dispatch.run_id !== dispatch.id ||
-      !uuid(dispatch.playbook_id) || !text(dispatch.playbook_name) || typeof dispatch.instruction !== 'string' ||
+  ])) return 'malformed automation dispatch'
+  if (dispatch.kind !== 'automation_run' || !uuid(dispatch.id) || dispatch.run_id !== dispatch.id ||
+      !uuid(dispatch.automation_id) || !text(dispatch.automation_name) || typeof dispatch.instruction !== 'string' ||
       !['look_only', 'can_commit', 'can_push'].includes(dispatch.permission) ||
       !exact(dispatch.requester, ['user_id']) || !uuid(dispatch.requester.user_id) ||
       !(dispatch.original_target_connection_id === null || uuid(dispatch.original_target_connection_id)) ||
       dispatch.delivery_connection_id !== connectionId || !datetime(dispatch.queued_at) ||
-      !['queued', 'waiting_for_agent'].includes(dispatch.state)) return 'invalid playbook dispatch'
+      !['queued', 'waiting_for_agent'].includes(dispatch.state)) return 'invalid automation dispatch'
   return null
 }
 
-export function normalizePlaybookDispatches(input, connectionId) {
-  if (!Array.isArray(input)) return { ok: false, error: 'missing playbook dispatch list' }
+export function normalizeAutomationDispatches(input, connectionId) {
+  if (!Array.isArray(input)) return { ok: false, error: 'missing automation dispatch list' }
   const seen = new Set()
   for (const dispatch of input) {
-    const error = validatePlaybookDispatch(dispatch, connectionId)
+    const error = validateAutomationDispatch(dispatch, connectionId)
     if (error) return { ok: false, error }
-    if (seen.has(dispatch.id)) return { ok: false, error: 'duplicate playbook dispatch id' }
+    if (seen.has(dispatch.id)) return { ok: false, error: 'duplicate automation dispatch id' }
     seen.add(dispatch.id)
   }
   return { ok: true, dispatches: input }
@@ -45,7 +45,7 @@ export function normalizePlaybookDispatches(input, connectionId) {
 
 /**
  * Execute the negotiated response acceptance seam, without performing I/O.
- * Canonical conversation/context and explicit playbooks remain separate outputs.
+ * Canonical conversation/context and explicit automations remain separate outputs.
  */
 export function inspectPollResponseV1(response, connectionId) {
   if (!object(response)) return { ok: false, error: 'malformed poll response' }
@@ -57,7 +57,7 @@ export function inspectPollResponseV1(response, connectionId) {
       changed: false,
       envelope: null,
       canonicalWake: false,
-      playbooks: [],
+      automations: [],
       liveCursorV2: response.cursor_v2 ?? null,
       legacyCursor: response.cursor ?? null,
       dispatchCursor: response.dispatch_cursor ?? null,
@@ -67,15 +67,15 @@ export function inspectPollResponseV1(response, connectionId) {
   }
   const canonical = normalizeRemoteIngressV1(response, connectionId)
   if (!canonical.ok) return canonical
-  const playbooks = normalizePlaybookDispatches(response.dispatches, connectionId)
-  if (!playbooks.ok) return playbooks
+  const automations = normalizeAutomationDispatches(response.dispatches, connectionId)
+  if (!automations.ok) return automations
   const envelope = canonical.envelope
   return {
     ok: true,
     changed: true,
     envelope,
     canonicalWake: canonical.wake,
-    playbooks: playbooks.dispatches,
+    automations: automations.dispatches,
     liveCursorV2: response.cursor_v2 ?? null,
     legacyCursor: response.cursor ?? null,
     dispatchCursor: response.dispatch_cursor ?? null,
@@ -294,24 +294,24 @@ export function appendAcceptedJsonl(file, record, acceptanceKey, io = fs) {
   }
 }
 
-export function playbookAcceptanceKey(dispatch) {
-  return `playbook:${dispatch.run_id}`
+export function automationAcceptanceKey(dispatch) {
+  return `automation:${dispatch.run_id}`
 }
 
-export function playbookRunInstruction(dispatch) {
+export function automationRunInstruction(dispatch) {
   const permission =
     dispatch.permission === 'can_push'
       ? 'You MAY edit, commit and push.'
       : dispatch.permission === 'can_commit'
         ? 'You MAY edit and commit locally, but MUST NOT push.'
-        : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+        : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
   return [
-    `▶️ Playbook run dispatched to this connection: "${dispatch.playbook_name}" (run ${dispatch.run_id}).`,
+    `▶️ Automation run dispatched to this connection: "${dispatch.automation_name}" (run ${dispatch.run_id}).`,
     '',
     'What to do:',
-    `1. claim_playbook_run({ run_id: "${dispatch.run_id}", provider: "cursor" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${dispatch.run_id}", provider: "cursor" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Do the work described below, in this repo.',
-    '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
     '',

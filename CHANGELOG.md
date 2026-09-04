@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0
+
+### Playbooks are now Automations
+
+DevSpec has renamed Playbooks to Automations. This plugin now uses the renamed tools
+(`claim_automation_run`, `record_automation_run`, `get_automations` and the rest) and reads
+the renamed fields in what the server sends it. It needs a DevSpec server that carries the
+same rename; against an older server, automation runs are not picked up.
+
 ## 0.11.2
 
 ### Fix: a Connect agent could be answered but could not learn to ask

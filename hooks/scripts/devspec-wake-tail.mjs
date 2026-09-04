@@ -3,7 +3,7 @@
  * Cursor Connect wake tail — never-exiting stdout follow of the host-owned
  * wake file. The launcher's argv starts this as a background Shell with
  * block_until_ms: 0 and notify_on_output matching owner_message / session_ended
- * / playbook_dispatch. Host follow (wait --follow) writes the file; this
+ * / automation_dispatch. Host follow (wait --follow) writes the file; this
  * process only prints new bytes so Cursor can notify the chat after turn_ended.
  *
  * Does not consume the inbox. Do not pass --from-end.

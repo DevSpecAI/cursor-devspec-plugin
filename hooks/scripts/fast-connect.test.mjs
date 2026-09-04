@@ -25,18 +25,18 @@ describe('parseSessionIdFromPrompt', () => {
     assert.equal(parseSessionIdFromPrompt('Run the `devspec.work` skill'), null)
   })
 
-  it('returns null for playbook cold-launch prompts (sessionless register + claim)', () => {
+  it('returns null for automation cold-launch prompts (sessionless register + claim)', () => {
     const projectId = '24c4abaa-2cb9-496a-8492-cf1f1aa1090b'
-    const playbookId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const automationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     const runId = '11111111-2222-3333-4444-555555555555'
     const prompt = [
-      'DevSpec playbook run waiting: "Smoke check"',
+      'DevSpec automation run waiting: "Smoke check"',
       `project_id=${projectId}`,
-      `playbook_id=${playbookId}`,
+      `automation_id=${automationId}`,
       `run_id=${runId}`,
       '',
       '1. Register a live connection FIRST. Call register_connection: agent_name="Cursor", cwd=this repo.',
-      `2. claim_playbook_run({ run_id: "${runId}", provider: "cursor" })`,
+      `2. claim_automation_run({ run_id: "${runId}", provider: "cursor" })`,
     ].join('\n')
     assert.equal(parseSessionIdFromPrompt(prompt), null)
   })
@@ -250,17 +250,17 @@ describe('fastConnect', () => {
     assert.deepEqual(calls, ['register', 'write'])
   })
 
-  it('playbook cold-launch promptText: register → write, no attach', async () => {
+  it('automation cold-launch promptText: register → write, no attach', async () => {
     const calls = []
     const projectId = '24c4abaa-2cb9-496a-8492-cf1f1aa1090b'
     const promptText = [
-      'DevSpec playbook run waiting: "Smoke check"',
+      'DevSpec automation run waiting: "Smoke check"',
       `project_id=${projectId}`,
-      'playbook_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'automation_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       'run_id=11111111-2222-3333-4444-555555555555',
       '',
       '1. Register a live connection FIRST. Call register_connection: agent_name="Cursor".',
-      '2. claim_playbook_run({ run_id: "11111111-2222-3333-4444-555555555555", provider: "cursor" })',
+      '2. claim_automation_run({ run_id: "11111111-2222-3333-4444-555555555555", provider: "cursor" })',
     ].join('\n')
     const r = await fastConnect({
       localId,

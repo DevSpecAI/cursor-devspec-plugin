@@ -1,6 +1,6 @@
 /**
  * Derive OpenCode `external_directory` allow rules from the user's
- * DevSpec repo-folder-map so multi-repo playbooks can touch sibling
+ * DevSpec repo-folder-map so multi-repo automations can touch sibling
  * checkouts without laptop-specific opencode.json hardcodes.
  *
  * Scope rules (deliberately narrow for SaaS):

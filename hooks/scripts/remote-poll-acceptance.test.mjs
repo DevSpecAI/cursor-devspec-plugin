@@ -10,7 +10,7 @@ import {
   appendAcceptedJsonl,
   buildPollCursorArgs,
   inspectPollResponseV1,
-  playbookAcceptanceKey,
+  automationAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
 import { canonicalAcceptanceKey, validateRemoteIngressEnvelopeV1 } from './remote-ingress-v1.mjs'
 import {
@@ -21,7 +21,7 @@ import {
   fixtureContextEntry,
   fixtureControl,
   fixtureEnvelope,
-  fixturePlaybookDispatch,
+  fixtureAutomationDispatch,
   fixturePollResponse,
   fixtureWindow,
 } from './remote-ingress-test-fixtures.mjs'
@@ -36,27 +36,27 @@ describe('poll acceptance integration seam', () => {
     assert.equal(accepted.canonicalWake, true)
   })
 
-  it('keeps explicit playbooks independent from canonical conversation commands', () => {
-    const playbook = fixturePlaybookDispatch()
+  it('keeps explicit automations independent from canonical conversation commands', () => {
+    const automation = fixtureAutomationDispatch()
     const accepted = inspectPollResponseV1(
-      fixturePollResponse({ dispatches: [playbook] }),
+      fixturePollResponse({ dispatches: [automation] }),
       FIXTURE_ID.connection,
     )
     assert.equal(accepted.ok, true)
     assert.equal(accepted.canonicalWake, true)
-    assert.deepEqual(accepted.playbooks, [playbook])
-    assert.equal(accepted.envelope.commands.some((command) => command.message_id === playbook.id), false)
-    assert.equal(playbookAcceptanceKey(playbook), `playbook:${playbook.run_id}`)
+    assert.deepEqual(accepted.automations, [automation])
+    assert.equal(accepted.envelope.commands.some((command) => command.message_id === automation.id), false)
+    assert.equal(automationAcceptanceKey(automation), `automation:${automation.run_id}`)
   })
 
   it('rejects action-item/unknown dispatches rather than reviving assignment delivery', () => {
-    const actionAssignment = { ...fixturePlaybookDispatch(), kind: 'action_item_assignment' }
+    const actionAssignment = { ...fixtureAutomationDispatch(), kind: 'action_item_assignment' }
     const accepted = inspectPollResponseV1(
       fixturePollResponse({ dispatches: [actionAssignment] }),
       FIXTURE_ID.connection,
     )
     assert.equal(accepted.ok, false)
-    assert.match(accepted.error, /playbook dispatch/)
+    assert.match(accepted.error, /automation dispatch/)
   })
 
   it('separates live cursor_v2, older catch_up_cursor, legacy cursor and dispatch cursor', () => {

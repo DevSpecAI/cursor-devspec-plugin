@@ -15,7 +15,7 @@
  *      awareness only. It never authorizes action or wakes the model.
  *   3. HOST CONTROLS — typed controls stay on the host ledger and are acknowledged
  *      only after an exact Cursor host handler succeeds; they never become prompts.
- *   4. PLAYBOOK RUNS — explicit owner-scoped `playbook_dispatch` records use their
+ *   4. AUTOMATION RUNS — explicit owner-scoped `automation_dispatch` records use their
  *      own cursor and typed claim/record wake, separate from canonical conversation.
  *   5. ACTIVE SESSION PLANS — strict 1.3 all-room inventory carried as advisory
  *      read awareness; it never grants execution or mutation authority.
@@ -42,7 +42,7 @@
  * lands, so latency goes from up-to-15s to ~0 while the request rate goes from 8/min
  * to ~2/min per agent. The hold IS the cadence: there is no routine sleep any more,
  * and fixed intervals survive only as error/empty-turn backoff. `poll_connection`
- * carries heartbeat state, canonical ingress, the independent playbook cursor, and
+ * carries heartbeat state, canonical ingress, the independent automation cursor, and
  * transcript context in one response; `sendHeartbeat` remains only for the
  * deliberate offline stamp on teardown.
  *
@@ -93,7 +93,7 @@ import {
   buildPollCursorArgs,
   hasAcceptedKey,
   inspectPollResponseV1,
-  playbookAcceptanceKey,
+  automationAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
 import {
@@ -187,7 +187,7 @@ function readTurnMarker(connectionId) {
   }
 }
 /**
- * Start a turn at honest canonical-command or explicit-playbook pickup.
+ * Start a turn at honest canonical-command or explicit-automation pickup.
  * The long-lived poller re-asserts busy while this marker is fresh; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
@@ -516,7 +516,7 @@ export const RECOVERABLE_TERMINAL_MAX = 10
  * Backoff after a poll that reported change but delivered nothing new.
  *
  * Defence in depth for a marker that is hot for a reason the response does not
- * contain — for example an independent playbook marker whose cursor did not advance
+ * contain — for example an independent automation marker whose cursor did not advance
  * would otherwise spin this loop at full rate. Escalates to the tier's own hold
  * length, so the worst case
  * degrades to exactly the normal poll rate rather than to a hot loop, and resets the
@@ -807,19 +807,19 @@ async function deliverOwnerMessages(
   return { ok: true, duplicate: false }
 }
 
-async function deliverPlaybookDispatches(connectionId, dispatches, nextDispatchCursor, sessionId) {
+async function deliverAutomationDispatches(connectionId, dispatches, nextDispatchCursor, sessionId) {
   let acceptedCount = 0
   for (const dispatch of dispatches) {
     const accepted = appendInbox(connectionId, [dispatch], {
-      type: 'playbook_dispatches',
+      type: 'automation_dispatches',
       nextCursor: nextDispatchCursor,
       sessionId,
-      acceptanceKey: playbookAcceptanceKey(dispatch),
+      acceptanceKey: automationAcceptanceKey(dispatch),
     })
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
       acceptedCount++
-      process.stdout.write(JSON.stringify({ type: 'playbook_dispatch', dispatch }) + '\n')
+      process.stdout.write(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
     }
   }
   if (acceptedCount === 0) return { ok: true, acceptedCount: 0 }
@@ -833,7 +833,7 @@ async function deliverPlaybookDispatches(connectionId, dispatches, nextDispatchC
         await seedWorkTrailForConnection({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
       }
     } catch (error) {
-      process.stderr.write(`devspec-remote-poll: playbook trail seed failed: ${error instanceof Error ? error.message : String(error)}\n`)
+      process.stderr.write(`devspec-remote-poll: automation trail seed failed: ${error instanceof Error ? error.message : String(error)}\n`)
     }
   }
   writeTurnMarker(connectionId)
@@ -1102,7 +1102,7 @@ async function main() {
     }
   }
 
-  // --- THE tick: heartbeat + canonical ingress + independent playbooks ---------
+  // --- THE tick: heartbeat + canonical ingress + independent automations ---------
   // Exact-target command authority is enforced server-side and revalidated against
   // the canonical envelope here. That is what stops one agent acting on another's
   // command [devspec:3e76a6cc]; action-item work never enters this response.
@@ -1347,7 +1347,7 @@ async function main() {
 
   let lastIngressAccepted = false
 
-  /** Accept one server response atomically across canonical, playbook, control and cursor lanes. */
+  /** Accept one server response atomically across canonical, automation, control and cursor lanes. */
   async function consumePollResult(res, { drainingCatchUp = false } = {}) {
     lastIngressAccepted = false
     const accepted = inspectPollResponseV1(res, connectionId)
@@ -1488,14 +1488,14 @@ async function main() {
       }
     }
 
-    const playbooks = await deliverPlaybookDispatches(
+    const automations = await deliverAutomationDispatches(
       connectionId,
-      accepted.playbooks,
+      accepted.automations,
       accepted.dispatchCursor,
       sessionId,
     )
-    if (!playbooks.ok) return false
-    newlyDelivered ||= playbooks.acceptedCount > 0
+    if (!automations.ok) return false
+    newlyDelivered ||= automations.acceptedCount > 0
 
     // Commit all independent clocks only after their complete durable acceptance.
     liveCursorV2 = advancedCursors.liveCursorV2
@@ -1522,12 +1522,12 @@ async function main() {
       },
     })
     logRemoteControlStory({
-      phase: accepted.canonicalWake || playbooks.acceptedCount > 0 ? 'inject' : 'wake',
+      phase: accepted.canonicalWake || automations.acceptedCount > 0 ? 'inject' : 'wake',
       outcome: newlyDelivered ? 'delivered' : 'deduped',
       connectionId, sessionId, agent: AGENT_NAME, tool: 'poll_connection',
       reason: accepted.control ? 'control' : accepted.canonicalWake ? 'canonical_conversational_command' :
-        playbooks.acceptedCount > 0 ? 'playbook_dispatch' : envelope.wake.kind,
-      data: { commands: envelope.commands.length, context: rows.length, playbooks: accepted.playbooks.length },
+        automations.acceptedCount > 0 ? 'automation_dispatch' : envelope.wake.kind,
+      data: { commands: envelope.commands.length, context: rows.length, automations: accepted.automations.length },
     })
     lastIngressAccepted = true
     return newlyDelivered || Boolean(transportProgress)

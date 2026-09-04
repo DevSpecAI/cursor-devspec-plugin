@@ -31,9 +31,9 @@ import {
   writeConnectionState,
 } from './remote-control-state.mjs'
 
-/** UUID values for these keys are never session ids (playbook cold-launch, etc.). */
+/** UUID values for these keys are never session ids (automation cold-launch, etc.). */
 const NON_SESSION_UUID_KEY =
-  /(?:project_id|playbook_id|run_id|connection_id|local_id|launch_id|playbook_run_id|action_item_id|item_id)\s*=\s*$/i
+  /(?:project_id|automation_id|run_id|connection_id|local_id|launch_id|automation_run_id|action_item_id|item_id)\s*=\s*$/i
 
 /**
  * Pull `--session <uuid>` / `--session=<uuid>` from a Connect prompt.
@@ -43,8 +43,8 @@ const NON_SESSION_UUID_KEY =
 export function parseSessionIdFromPrompt(promptBody) {
   if (typeof promptBody !== 'string' || !promptBody.trim()) return null
 
-  // Playbook cold launch is sessionless — register only, then claim_playbook_run.
-  if (/devspec playbook run waiting/i.test(promptBody)) return null
+  // Automation cold launch is sessionless — register only, then claim_automation_run.
+  if (/devspec automation run waiting/i.test(promptBody)) return null
 
   const flagged = promptBody.match(
     /--session(?:\s+|=)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})\b/i,
@@ -56,7 +56,7 @@ export function parseSessionIdFromPrompt(promptBody) {
   )
   if (explicit?.[1]) return explicit[1]
 
-  // Bare uuid only when the prompt is clearly remote connect — skip project/playbook/run ids.
+  // Bare uuid only when the prompt is clearly remote connect — skip project/automation/run ids.
   const lower = promptBody.toLowerCase()
   if (
     lower.includes('devspec.remote') ||

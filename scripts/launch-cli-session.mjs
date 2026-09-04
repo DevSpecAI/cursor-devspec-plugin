@@ -166,7 +166,7 @@ export function buildRemoteWaitCommand(opts) {
 // the chat on stdout matching this pattern, so a type missing from it is a room that
 // reads Live and is deaf — the 9d89a6d2 failure in a new costume. `question_answer`
 // is a directed-question answer (item b9f2c77a): it wakes, but it is never authority.
-export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|question_answer|session_ended|playbook_dispatch'
+export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|question_answer|session_ended|automation_dispatch'
 
 /**
  * Short argv prompt — no skill body, no YAML `---`, safe under Windows
