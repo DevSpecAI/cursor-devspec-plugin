@@ -360,12 +360,13 @@ Remote control has **no in-session Dev** offering memories each turn. **You** ar
 
 When the conversation produces a durable decision, convention, architecture choice, accepted risk, or short plan/ADR-worthy write-up:
 
-1. **Memories (primary)** — interactive, human-in-the-loop (do **not** pass `runner_session_id`; absence = interactive authority):
+1. **Memories (primary)** — human-in-the-loop: do **not** pass `runner_session_id` (that stamp marks an unattended run). Whether a write commits, is queued as a proposal, or is refused is the served contract's decision (`devspec://product/implementation-contract` → `authority_contract`), judged from the verb, the person's project role and whether the run is unattended — never predict it, read the `outcome`:
    - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then call `devspec__record_memory` (or `devspec__supersede_memory` if updating).
    - If the owner already clearly decided, propose the memory text in your mirrored reply and record after a clear yes (or record immediately when they said "please capture that").
    - Always `devspec__search_memories` first; never duplicate — `devspec__supersede_memory` the closest match. `devspec__search_memories` returns a CARD (title, one-line summary, id) — `devspec__get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight` as appropriate.
-2. **Artifacts (when durable docs are needed)** — short plans/ADRs/runbooks via `devspec__create_resource` / `devspec__update_resource` / `devspec__supersede_resource` (interactive, no runner stamp).
+   - **Read the `outcome` and report what it says.** `committed` = recorded now. `queued_for_review` = **not in effect**: relay the `proposal_id` and the reason the server gave, and say a maintainer has to accept it on the project's Review tab before it applies. Never tell the owner a change landed when it was only proposed.
+2. **Artifacts (when durable docs are needed)** — short plans/ADRs/runbooks via `devspec__create_resource` / `devspec__update_resource` / `devspec__supersede_resource` (no runner stamp; same `outcome` rule as memories).
 3. **Do not** rely on post-session pending-memory extraction for this channel.
 4. Mirror the offer and the capture confirmation into `devspec__post_session_message` (when attached) as a **short reply-only** line so the phone transcript shows knowledge landing — never paste status chrome or thinking.
 
