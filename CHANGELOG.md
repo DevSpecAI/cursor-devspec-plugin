@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.13.1
+
+### A conflict ruling can come back contested, and the skill now says so
+
+The remote skill told agents that ruling `related` or `not_a_conflict` on a flagged pair
+closes nothing and reverses nothing. That stopped being true when DevSpec added contested
+rulings: setting aside the detector against work someone else has already shipped is judged
+differently, and such a ruling comes back queued for a maintainer with the pair marked
+contested rather than resolved. The skill now points at the served contract for that
+decision instead of asserting one, tells the agent to read the ruling's `outcome` and to
+describe a contested pair as contested, and mentions `preview_conflict_resolution` for
+seeing the outcome before making the ruling. Settling plain conflicts yourself, and the
+three cases that still call for asking first, are unchanged.
+
+### Fix: the release test pinned a version literal and went red on every release
+
+`scripts/session-plan-surfaces.test.mjs` asserted the manifest version equalled `0.11.2`
+and that the changelog's newest heading was that number. It had been failing since 0.11.2
+shipped. It now asserts the relationship those literals were standing in for: the manifest
+ships the same version as the package, and the changelog's newest heading is that version.
+
 ## 0.13.0
 
 ### Authority is the served contract's, not this plugin's

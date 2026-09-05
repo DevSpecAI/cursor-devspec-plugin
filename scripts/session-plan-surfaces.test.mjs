@@ -28,8 +28,12 @@ describe('Cursor shared-session-plan surfaces', () => {
   })
 
   it('documents the independent Cursor release and protected publish-time package bump', () => {
-    assert.equal(pluginJson.version, '0.11.2')
-    assert.match(changelog, /^# Changelog\s+## 0\.11\.2/m)
+    // Assert the RELATIONSHIP, not the number of the day: the manifest ships the
+    // same version as the package (the 0.13.0 release made that true), and the
+    // changelog's newest heading is that version. Pinning a literal here made the
+    // suite go red on every release instead of on a real mistake, and it did.
+    assert.equal(pluginJson.version, packageJson.version)
+    assert.match(changelog, new RegExp(`^# Changelog\\s+## ${packageJson.version.replace(/\./g, '\\.')}\\b`, 'm'))
     assert.match(changelog, /Cursor releases are versioned independently/i)
     assert.match(changelog, /package\.json.*protected.*0\.8\.0/is)
     assert.match(readme, /Shared session plans during remote control/)
