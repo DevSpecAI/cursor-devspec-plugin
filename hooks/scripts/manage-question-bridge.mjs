@@ -76,7 +76,7 @@ export const MANAGE_QUESTION_INPUT_SCHEMA = {
     },
     allow_custom: {
       type: 'boolean',
-      description: 'Let a select answer be written in instead of chosen. Select kinds only.',
+      description: 'Let a select answer be written in instead of chosen. On by default; pass false only when the choices must be strictly constrained. Select kinds only.',
     },
     provenance_ref: {
       type: 'string',
