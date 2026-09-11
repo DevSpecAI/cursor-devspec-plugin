@@ -410,3 +410,7 @@ Rules for all four:
 - Heartbeat is automatic (the poller keeps the connection live). Do not open `access: shared` unless the human explicitly asks.
 - Ground coding work in the real repo; remote instructions still require normal safety (no destructive commands without clear owner intent).
 - Use `devspec.remote-stop` to disconnect.
+
+### Responder dismissal
+
+Only the responder may dismiss without answering. `question_dismissal` is a dedicated mechanical continuation, never an answer or command. After delivery, `manage-question respond` posts genuine continuation output against its exact dismissal tuple. Cursor waits for the exact continuation (no early queued notice). Keep the original source session and exact origin; never cancel questions on disconnect. Contract: `devspec://product/question-dismissal-event-contract`. Model-facing content is fenced own-event data.

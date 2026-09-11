@@ -1157,3 +1157,103 @@ describe('resolveOwnerPid (item 5c884554 — wait copy skips worker-server)', ()
     )
   })
 })
+
+import { interactionAnswerRecord, dismissalDeliveryDecision } from './interaction-events.mjs'
+const ROOM_A = 'a0000000-0000-4000-8000-000000000001'
+const ROOM_B = 'b0000000-0000-4000-8000-000000000002'
+function cursorDismissal(disposition = 'delivered') {
+  return interactionAnswerRecord({ connectionId: CANONICAL_CONNECTION, sessionId: ROOM_A, attemptId: disposition === 'queued' ? null : FIXTURE_ID.message, disposition, event: {
+    kind: 'devspec.question_dismissal_event', version: 1, event_id: FIXTURE_ID.message, question_id: FIXTURE_ID.envelope,
+    origin_connection_id: CANONICAL_CONNECTION, source_session_id: ROOM_A, response_kind: 'text', prompt: 'Original room A',
+    dismissed_by_user_id: CANONICAL_CONNECTION, dismissed_at: '2026-09-11T12:00:00Z', claim_token: FIXTURE_ID.message, lease_expires_at: '2026-09-11T12:05:00Z',
+  } })
+}
+function cursorDismissalHeld(record) {
+  return { kind: record.event.kind, connection_id: CANONICAL_CONNECTION, session_id: record.session_id, event_id: record.event.event_id,
+    question_id: record.event.question_id, claim_token: record.event.claim_token, attempt_id: record.attempt_id, wake_offset_after: null }
+}
+async function awaitCursorReader(predicate) {
+  const deadline = Date.now() + 4000
+  while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.ok(predicate(), 'reader did not reach expected boundary')
+}
+async function runCursorDismissalReader(record, patch, next = null, unavailable = null) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-dismissal-reader-'))
+  const dir = path.join(home, 'connections')
+  fs.mkdirSync(dir, { recursive: true })
+  const stateFile = path.join(dir, `${CANONICAL_CONNECTION}.json`), inbox = path.join(dir, `${CANONICAL_CONNECTION}.inbox.jsonl`)
+  const wakeFile = path.join(home, 'wake.jsonl')
+  const state = { enabled: true, connection_id: CANONICAL_CONNECTION, session_id: ROOM_A, inbox_byte_offset: 0, interaction_continuation: cursorDismissalHeld(record), ...patch }
+  fs.writeFileSync(stateFile, JSON.stringify({ ...state, session_id: ROOM_A, interaction_continuation: record.disposition === 'queued' ? null : cursorDismissalHeld(record) }))
+  fs.writeFileSync(inbox, [record, ...(next ? [next] : [])].map(JSON.stringify).join('\n') + '\n')
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+  if (unavailable) {
+    fs.mkdirSync(path.join(home, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.devspec', 'remote-control.json'), JSON.stringify({ ...state, session_id: ROOM_A, interaction_continuation: cursorDismissalHeld(record) }))
+    if (unavailable === 'missing') fs.unlinkSync(stateFile)
+    else fs.writeFileSync(stateFile, '{unreadable')
+  }
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url)), '--connection-id', CANONICAL_CONNECTION, '--pending', '--follow', '--wake-file', wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'], { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir } })
+  let stdout = '', stderr = ''
+  child.stdout.on('data', chunk => { stdout += chunk }); child.stderr.on('data', chunk => { stderr += chunk })
+  const closed = new Promise(resolve => child.once('close', resolve))
+  return { stateFile, inbox, wakeFile, state, stdout: () => stdout, stderr: () => stderr,
+    async cleanup() {
+      const timer = setTimeout(() => child.kill('SIGKILL'), 500)
+      child.kill('SIGTERM'); await closed; clearTimeout(timer)
+      fs.rmSync(home, { recursive: true, force: true })
+    } }
+}
+describe('Cursor dismissal reader source gate before stdout and wake-file', () => {
+  for (const disposition of ['delivered', 'queued']) it(`drops obsolete A ${disposition} while following the newer B command`, async () => {
+    const next = canonicalBatch(fixtureCommand('newer B command'), { session_id: ROOM_B })
+    const run = await runCursorDismissalReader(cursorDismissal(disposition), { session_id: ROOM_B, interaction_continuation: null }, next)
+    try {
+      await awaitCursorReader(() => fs.existsSync(run.wakeFile) && fs.readFileSync(run.wakeFile, 'utf8').includes('newer B command'))
+      assert.doesNotMatch(run.stdout(), /question_dismissal|Original room A/)
+      assert.doesNotMatch(fs.readFileSync(run.wakeFile, 'utf8'), /question_dismissal|Original room A/)
+      await awaitCursorReader(() => JSON.parse(fs.readFileSync(run.stateFile)).inbox_byte_offset === fs.statSync(run.inbox).size)
+      assert.equal(JSON.parse(fs.readFileSync(run.stateFile)).interaction_continuation, null)
+      assert.match(fs.readFileSync(run.inbox, 'utf8'), /Original room A/)
+    } finally { await run.cleanup() }
+  })
+  it('current-source delivery produces exact completion proof only after publication', async () => {
+    const run = await runCursorDismissalReader(cursorDismissal(), {})
+    try {
+      await awaitCursorReader(() => JSON.parse(fs.readFileSync(run.stateFile)).interaction_continuation.wake_offset_after > 0)
+      assert.match(run.stdout(), /question_dismissal/)
+      assert.match(fs.readFileSync(run.wakeFile, 'utf8'), /question_dismissal/)
+      assert.equal(JSON.parse(fs.readFileSync(run.stateFile)).interaction_continuation.wake_offset_after, fs.statSync(run.wakeFile).size)
+    } finally { await run.cleanup() }
+  })
+  it('does not grant queued records any delivery or completion authority in Cursor', async () => {
+    const next = canonicalBatch(fixtureCommand('newer command'), { session_id: ROOM_A })
+    const run = await runCursorDismissalReader(cursorDismissal('queued'), { interaction_continuation: null }, next)
+    try {
+      await awaitCursorReader(() => run.stdout().includes('newer command'))
+      assert.doesNotMatch(run.stdout(), /question_dismissal/)
+      assert.equal(JSON.parse(fs.readFileSync(run.stateFile)).interaction_continuation, null)
+    } finally { await run.cleanup() }
+  })
+  for (const unavailable of ['missing', 'unreadable']) it(`defers ${unavailable} own state without recreating legacy authority`, async () => {
+    const next = canonicalBatch(fixtureCommand('newer B command'), { session_id: ROOM_B })
+    const run = await runCursorDismissalReader(cursorDismissal(), {}, next, unavailable)
+    try {
+      await awaitCursorReader(() => run.stderr().includes('watching'))
+      await new Promise(resolve => setTimeout(resolve, 100))
+      assert.equal(run.stdout(), '')
+      assert.equal(fs.readFileSync(run.wakeFile, 'utf8'), '')
+      if (unavailable === 'missing') assert.equal(JSON.parse(fs.readFileSync(run.stateFile)).session_id, undefined)
+      else assert.equal(fs.readFileSync(run.stateFile, 'utf8'), '{unreadable')
+      fs.writeFileSync(run.stateFile, JSON.stringify({ ...run.state, session_id: ROOM_B, interaction_continuation: null }))
+      await awaitCursorReader(() => fs.readFileSync(run.wakeFile, 'utf8').includes('newer B command'))
+      assert.doesNotMatch(run.stdout(), /question_dismissal|Original room A/)
+      assert.doesNotMatch(fs.readFileSync(run.wakeFile, 'utf8'), /question_dismissal|Original room A/)
+    } finally { await run.cleanup() }
+  })
+  it('rejects each delivered tuple mismatch against held firing authority', () => {
+    const record = cursorDismissal(), state = { enabled: true, connection_id: CANONICAL_CONNECTION, session_id: ROOM_A, interaction_continuation: cursorDismissalHeld(cursorDismissal()) }
+    assert.equal(dismissalDeliveryDecision(record, state, CANONICAL_CONNECTION), 'deliver')
+    for (const key of ['event_id', 'question_id', 'claim_token', 'attempt_id', 'connection_id', 'session_id']) assert.equal(dismissalDeliveryDecision(record, { ...state, interaction_continuation: { ...state.interaction_continuation, [key]: ROOM_B } }, CANONICAL_CONNECTION), 'obsolete', key)
+  })
+})
