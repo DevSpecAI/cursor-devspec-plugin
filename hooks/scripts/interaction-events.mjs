@@ -24,6 +24,10 @@
  * command, chat, dispatch or control channels.
  */
 
+export const QUESTION_DISMISSAL_KIND = 'devspec.question_dismissal_event'
+export const QUESTION_DISMISSAL_RECORD_TYPE = 'question_dismissal'
+export const QUESTION_DISMISSAL_CONTRACT_URI = 'devspec://product/question-dismissal-event-contract'
+
 export const INTERACTION_EVENT_VERSION = 1
 export const INTERACTION_EVENT_KIND = 'devspec.interaction_event'
 export const INTERACTION_EVENT_CONTRACT_URI = 'devspec://product/interaction-event-contract'
@@ -83,7 +87,7 @@ export function interactionNegotiationArgs({ capability, enabled = true, session
   const ready = enabled !== false &&
     typeof capability === 'string' && capability.startsWith('dvsc_') &&
     uuid(sessionId)
-  return ready ? { interaction_event_version: INTERACTION_EVENT_VERSION } : {}
+  return ready ? { interaction_event_version: INTERACTION_EVENT_VERSION, question_dismissal_event_version: 1 } : {}
 }
 
 /** True when this connection is currently advertising the answer lane. */
@@ -105,6 +109,7 @@ export function validateInteractionEvent(event, { connectionId, sessionId } = {}
   if (!event || typeof event !== 'object' || Array.isArray(event)) {
     return { ok: false, error: 'event is not an object' }
   }
+  if (event.kind === QUESTION_DISMISSAL_KIND) return validateQuestionDismissalEvent(event, { connectionId, sessionId })
   const keys = Object.keys(event)
   if (keys.length !== EVENT_KEYS.length || EVENT_KEYS.some((key) => !Object.hasOwn(event, key))) {
     return { ok: false, error: 'event does not exactly match interaction event v1' }
@@ -151,6 +156,11 @@ export function validateInteractionEvent(event, { connectionId, sessionId } = {}
 
 /** The exact identity every continuation operation is bound to. */
 export function continuationIdentity(source) {
+  if (source.kind === QUESTION_DISMISSAL_KIND) return {
+    question_dismissal_event_id: source.event_id,
+    question_dismissal_question_id: source.question_id,
+    question_dismissal_claim_token: source.claim_token,
+  }
   return {
     interaction_event_id: source.event_id,
     interaction_response_id: source.response_id,
@@ -164,7 +174,7 @@ export function continuationIdentity(source) {
  * as already applied (criterion 7ad8dc8f).
  */
 export function interactionAcceptanceKey(event) {
-  return `interaction:${event.event_id}`
+  return `${event.kind === QUESTION_DISMISSAL_KIND ? "dismissal" : "interaction"}:${event.event_id}`
 }
 
 /**
@@ -175,12 +185,12 @@ export function interactionAcceptanceKey(event) {
  */
 export function interactionAnswerRecord({ connectionId, sessionId, event, attemptId, disposition }) {
   return {
-    type: INTERACTION_ANSWER_RECORD_TYPE,
+    type: event.kind === QUESTION_DISMISSAL_KIND ? QUESTION_DISMISSAL_RECORD_TYPE : INTERACTION_ANSWER_RECORD_TYPE,
     connection_id: connectionId,
     session_id: sessionId,
     received_at: new Date().toISOString(),
-    authoritative_source: INTERACTION_EVENT_CONTRACT_URI,
-    interaction_event_version: INTERACTION_EVENT_VERSION,
+    authoritative_source: event.kind === QUESTION_DISMISSAL_KIND ? QUESTION_DISMISSAL_CONTRACT_URI : INTERACTION_EVENT_CONTRACT_URI,
+    ...(event.kind === QUESTION_DISMISSAL_KIND ? { question_dismissal_event_version: 1 } : { interaction_event_version: INTERACTION_EVENT_VERSION }),
     disposition,
     attempt_id: attemptId ?? null,
     event,
@@ -227,7 +237,9 @@ export function classifyContinuationStart(result) {
 /** The continuation this host is holding, or null. Validated, never trusted raw. */
 export function activeContinuation(raw, { connectionId, sessionId } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const required = ['event_id', 'response_id', 'claim_token', 'attempt_id', 'question_id',
+  if (raw.kind && raw.kind !== QUESTION_DISMISSAL_KIND && raw.kind !== INTERACTION_EVENT_KIND) return null
+  if (raw.kind === QUESTION_DISMISSAL_KIND && Object.hasOwn(raw, 'response_id')) return null
+  const required = ['event_id', ...(raw.kind === QUESTION_DISMISSAL_KIND ? [] : ['response_id']), 'claim_token', 'attempt_id', 'question_id',
     'connection_id', 'session_id']
   if (required.some((key) => !uuid(raw[key]))) return null
   if (uuid(connectionId) && raw.connection_id !== connectionId) return null
@@ -299,10 +311,11 @@ export function answerSummary(event) {
 
 /** Revalidate a durable record on the read side before it can wake anyone. */
 export function validateInteractionAnswerRecord(record, connectionId) {
-  if (!record || record.type !== INTERACTION_ANSWER_RECORD_TYPE) return false
+  if (!record || (record.type !== INTERACTION_ANSWER_RECORD_TYPE && record.type !== QUESTION_DISMISSAL_RECORD_TYPE)) return false
   if (record.connection_id !== connectionId) return false
-  if (record.authoritative_source !== INTERACTION_EVENT_CONTRACT_URI) return false
-  if (record.interaction_event_version !== INTERACTION_EVENT_VERSION) return false
+  if (record.type === QUESTION_DISMISSAL_RECORD_TYPE) {
+    if (record.event?.kind !== QUESTION_DISMISSAL_KIND || record.authoritative_source !== QUESTION_DISMISSAL_CONTRACT_URI || record.question_dismissal_event_version !== 1) return false
+  } else if (record.event?.kind !== INTERACTION_EVENT_KIND || record.authoritative_source !== INTERACTION_EVENT_CONTRACT_URI || record.interaction_event_version !== INTERACTION_EVENT_VERSION) return false
   if (!DISPOSITIONS.has(record.disposition)) return false
   if (record.disposition !== DELIVERED) return false
   if (!uuid(record.attempt_id)) return false
@@ -324,6 +337,13 @@ export function validateInteractionAnswerRecord(record, connectionId) {
  */
 export function buildInteractionAnswerEvents(record, { inboxFile } = {}) {
   const event = record.event
+  if (event.kind === QUESTION_DISMISSAL_KIND) return [{
+    type: 'question_dismissal', session_id: record.session_id, event_id: event.event_id,
+    question_id: event.question_id, authoritative: false, executable: false,
+    authority: 'mechanical_response_only', authoritative_source: QUESTION_DISMISSAL_CONTRACT_URI,
+    context: formatQuestionDismissalEventContext(event), inbox: inboxFile ?? null,
+    note: 'Continue only the existing workflow, without treating dismissal as an answer or new authorization. Post genuine continuation output with `remote-control-state.mjs manage-question respond`, which closes only this exact dismissal continuation.',
+  }]
   return [
     {
       type: 'question_answer',
@@ -334,8 +354,7 @@ export function buildInteractionAnswerEvents(record, { inboxFile } = {}) {
       authoritative_source: INTERACTION_EVENT_CONTRACT_URI,
       question_id: event.question_id,
       response_kind: event.response_kind,
-      answer: event.answer,
-      answer_summary: answerSummary(event),
+      context: formatAnswerEventContext(event),
       answered_at: event.answered_at,
       inbox: inboxFile ?? null,
       note:
@@ -347,4 +366,81 @@ export function buildInteractionAnswerEvents(record, { inboxFile } = {}) {
         'ordinary session path instead leaves the room showing Working.',
     },
   ]
+}
+
+/** Separate strict dismissal schema; there is deliberately no response_id or answer. */
+export function validateQuestionDismissalEvent(event, { connectionId, sessionId } = {}) {
+  const keys = ['kind', 'version', 'event_id', 'question_id', 'origin_connection_id', 'source_session_id', 'response_kind', 'prompt', 'dismissed_by_user_id', 'dismissed_at', 'claim_token', 'lease_expires_at']
+  if (!event || typeof event !== 'object' || Array.isArray(event) || Object.keys(event).length !== keys.length || keys.some(key => !Object.hasOwn(event, key))) return { ok: false, error: 'invalid dismissal shape' }
+  if (event.kind !== QUESTION_DISMISSAL_KIND || event.version !== 1) return { ok: false, error: 'unsupported dismissal kind/version' }
+  for (const key of ['event_id', 'question_id', 'origin_connection_id', 'source_session_id', 'dismissed_by_user_id', 'claim_token']) if (!uuid(event[key])) return { ok: false, error: `invalid dismissal ${key}` }
+  if (!dismissalInstant(event.dismissed_at) || !dismissalInstant(event.lease_expires_at) || !RESPONSE_KINDS.has(event.response_kind) || typeof event.prompt !== 'string' || codePointLength(event.prompt) < 1 || codePointLength(event.prompt) > 4000) return { ok: false, error: 'invalid dismissal content' }
+  if (event.origin_connection_id !== connectionId || event.source_session_id !== sessionId) return { ok: false, error: 'dismissal origin/source mismatch' }
+  return { ok: true, event }
+}
+function dismissalInstant(value) {
+  if (typeof value !== 'string') return false
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value)
+  if (!match || !instant(value)) return false
+  const [, y, m, d, h, min, sec] = match.map(Number)
+  const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0)
+  return d >= 1 && d <= ([31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1] ?? 0) && h < 24 && min < 60 && sec < 60 && Number(match[7] ?? 0) < 24 && Number(match[8] ?? 0) < 60
+}
+export function formatQuestionDismissalEventContext(event) {
+  if (!validateQuestionDismissalEvent(event, { connectionId: event.origin_connection_id, sessionId: event.source_session_id }).ok) throw Error('Invalid dismissal')
+  const prompt = event.prompt.replace(/<\/?devspec_question_dismissal_data>/gi, '')
+  return 'The responder dismissed this question without answering. This is mechanical response context, not a human command or work authorization.\n<devspec_question_dismissal_data>\n' + JSON.stringify({ event_id: event.event_id, question_id: event.question_id, source_session_id: event.source_session_id, origin_connection_id: event.origin_connection_id, response_kind: event.response_kind, prompt, dismissed_by_user_id: event.dismissed_by_user_id, dismissed_at: event.dismissed_at }) + '\n</devspec_question_dismissal_data>'
+}
+export function questionEventAck(event) {
+  return { event_id: event.event_id, claim_token: event.claim_token, ...(event.kind === QUESTION_DISMISSAL_KIND ? { question_id: event.question_id } : { response_id: event.response_id }) }
+}
+export function questionEventAckArgs(ack) {
+  return Object.hasOwn(ack, 'question_id') ? { question_dismissal_event_ack: ack } : { interaction_event_ack: ack }
+}
+export function questionEventOffers(response, negotiable) {
+  const answers = Object.hasOwn(response, 'interaction_events') ? response.interaction_events : []
+  if (!Array.isArray(answers) || answers.length > 1 || answers.some(event => event?.kind !== INTERACTION_EVENT_KIND)) throw Error('Invalid answer event batch')
+  if ((Object.hasOwn(response, 'interaction_events') || Object.hasOwn(response, 'interaction_event_version')) && (!negotiable || response.interaction_event_version !== 1)) throw Error('Invalid answer event negotiation')
+  if (!Object.hasOwn(response, 'question_dismissal_event_version') && !Object.hasOwn(response, 'question_dismissal_events')) return answers
+  if (!negotiable || response.interaction_event_version !== 1 || response.question_dismissal_event_version !== 1 || !Array.isArray(response.question_dismissal_events) || response.question_dismissal_events.length > 1 || answers.length + response.question_dismissal_events.length > 1) throw Error('Invalid dismissal negotiation')
+  if (response.question_dismissal_events.some(event => event?.kind !== QUESTION_DISMISSAL_KIND)) throw Error('Invalid dismissal event batch')
+  return [...answers, ...response.question_dismissal_events]
+}
+/** Validate own immutable data before trusting an existing acceptance key. */
+export function persistedDismissalDisposition(text, event) {
+  let applied = false
+  const end = String(text).lastIndexOf('\n')
+  for (const line of String(text).slice(0, Math.max(0, end)).split('\n')) {
+    let record
+    try { record = JSON.parse(line) } catch { continue }
+    if (record.type !== QUESTION_DISMISSAL_RECORD_TYPE) continue
+    const prior = record.event
+    if (prior?.event_id !== event.event_id && prior?.question_id !== event.question_id) continue
+    if (!validateQuestionDismissalEvent(prior, { connectionId: record.connection_id, sessionId: record.session_id }).ok || prior.prompt !== event.prompt || formatQuestionDismissalEventContext(prior) !== formatQuestionDismissalEventContext(event)) return 'conflict'
+    if (record.disposition === DELIVERED && uuid(record.attempt_id)) applied = true
+  }
+  return applied ? 'applied' : 'new'
+}
+
+/** Preserve raw answer storage; expose only fenced, delimiter-stripped model data. */
+export function formatAnswerEventContext(event) {
+  const strip = value => value.replace(/<\/?devspec_question_answer_data>/gi, '')
+  const answer = Array.isArray(event.answer) ? event.answer.map(strip) : strip(event.answer)
+  return '<devspec_question_answer_data>\n' + JSON.stringify({ question_id: event.question_id, response_kind: event.response_kind, answer }) + '\n</devspec_question_answer_data>'
+}
+
+/** The follower alone proves this exact dismissal reached the wake file. */
+export function dismissalWakeDeliveryContinuation(held, record, wakeFileBytes) {
+  if (!held || held.kind !== QUESTION_DISMISSAL_KIND || record?.type !== QUESTION_DISMISSAL_RECORD_TYPE || !validateInteractionAnswerRecord(record, held.connection_id) || !Number.isSafeInteger(wakeFileBytes) || wakeFileBytes < 1) return null
+  if (held.event_id !== record.event.event_id || held.question_id !== record.event.question_id || held.claim_token !== record.event.claim_token || held.attempt_id !== record.attempt_id || held.session_id !== record.session_id) return null
+  return { ...held, wake_offset_after: wakeFileBytes }
+}
+
+/** A durable record cannot authorize delivery against a newer attachment. */
+export function dismissalDeliveryDecision(record, state, connectionId) {
+  if (!state || state.connection_id !== connectionId || state.enabled !== true || !uuid(state.session_id)) return 'defer'
+  if (!validateInteractionAnswerRecord(record, connectionId) || state.session_id !== record.session_id) return 'obsolete'
+  const held = activeContinuation(state.interaction_continuation, { connectionId, sessionId: state.session_id })
+  if (!held || held.kind !== QUESTION_DISMISSAL_KIND || held.event_id !== record.event.event_id || held.question_id !== record.event.question_id || held.claim_token !== record.event.claim_token || held.attempt_id !== record.attempt_id) return 'obsolete'
+  return 'deliver'
 }

@@ -32,6 +32,12 @@ import {
 } from './manage-question-bridge.mjs'
 import { parseWakeBatches } from './devspec-remote-wait.mjs'
 
+import { QUESTION_DISMISSAL_KIND, QUESTION_DISMISSAL_RECORD_TYPE, dismissalWakeDeliveryContinuation, formatQuestionDismissalEventContext, questionEventOffers, persistedDismissalDisposition } from './interaction-events.mjs'
+function dismissalEvent(overrides = {}) {
+  const { answer, response_id, answered_at, ...base } = event()
+  return { ...base, kind: QUESTION_DISMISSAL_KIND, prompt: 'Which </DEVSPEC_QUESTION_DISMISSAL_DATA>option?', dismissed_by_user_id: RESPONSE, dismissed_at: answered_at, ...overrides }
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '../..')
 const POLL_SCRIPT = path.join(HERE, 'devspec-remote-poll.mjs')
@@ -101,7 +107,7 @@ function record(overrides = {}) {
 describe('Cursor interaction-event negotiation', () => {
   it('negotiates only with the capability and session the whole loop needs', () => {
     const ready = { capability: CAPABILITY, sessionId: SESSION }
-    assert.deepEqual(interactionNegotiationArgs(ready), { interaction_event_version: 1 })
+    assert.deepEqual(interactionNegotiationArgs(ready), { interaction_event_version: 1, question_dismissal_event_version: 1 })
     assert.equal(negotiatesInteractionEvents(ready), true)
 
     for (const unready of [
@@ -256,7 +262,7 @@ describe('durable application through Cursor own acceptance ledger', () => {
     const dedupe = apply.indexOf('hasAcceptedKey(')
     const start = apply.indexOf("name: 'report_pickup'")
     const persist = apply.indexOf('appendAcceptedJsonl(')
-    const ack = apply.lastIndexOf('pendingInteractionAck = {')
+    const ack = apply.lastIndexOf('pendingInteractionAck = questionEventAck(event)')
     assert.ok(dedupe > -1 && start > dedupe,
       'opening an attempt for an already-durable answer is itself a duplicate host effect')
     assert.ok(persist > start, 'persistence follows the continuation start')
@@ -400,8 +406,8 @@ describe('answer rendering', () => {
     const [delivered] = buildInteractionAnswerEvents(
       record({ event: event({ response_kind: 'multi_select', answer: ['a', 'b'] }) }),
     )
-    assert.deepEqual(delivered.answer, ['a', 'b'])
-    assert.equal(delivered.answer_summary, 'a, b')
+    assert.deepEqual(JSON.parse(delivered.context.split('\n')[1]).answer, ['a', 'b'])
+    assert.equal(Object.hasOwn(delivered, 'answer_summary'), false)
   })
 })
 
@@ -446,7 +452,7 @@ describe('poller round trip', () => {
     return {
       url: `http://127.0.0.1:${server.address().port}/mcp`,
       requests,
-      close: () => new Promise((resolve) => server.close(resolve)),
+      close: () => new Promise((resolve) => { server.close(resolve); server.closeAllConnections() }),
     }
   }
 
@@ -462,14 +468,16 @@ describe('poller round trip', () => {
       POLL_SCRIPT, '--connection-id', CONNECTION, '--owner-pid', String(process.pid),
     ], { env: { ...process.env, HOME: home } })
     child.stdout.resume()
-    child.stderr.resume()
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += chunk })
     return {
       stub,
       dir,
+      stderr: () => stderr,
       async waitForAck(timeoutMs = 15_000) {
         const deadline = Date.now() + timeoutMs
         const acks = () => stub.requests.filter(
-          (entry) => entry.parsed.params?.arguments?.interaction_event_ack,
+          (entry) => entry.parsed.params?.arguments?.interaction_event_ack || entry.parsed.params?.arguments?.question_dismissal_event_ack,
         )
         while (acks().length === 0 && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 50))
@@ -477,7 +485,13 @@ describe('poller round trip', () => {
         return acks()
       },
       async cleanup() {
-        child.kill('SIGKILL')
+        child.kill('SIGTERM')
+        if (child.exitCode === null && child.signalCode === null) {
+          await new Promise(resolve => {
+            const timer = setTimeout(() => { child.kill('SIGKILL'); resolve() }, 500)
+            child.once('exit', () => { clearTimeout(timer); resolve() })
+          })
+        }
         await stub.close()
         fs.rmSync(home, { recursive: true, force: true })
         try {
@@ -555,6 +569,124 @@ describe('poller round trip', () => {
     }
   })
 
+  it('dismissal: persists exact lifecycle and inbox before exact ACK', async () => {
+    const event = dismissalEvent
+    let polls = 0
+    const run = await drive(async (parsed) => {
+      const call = parsed.params ?? {}
+      if (call.name === 'poll_connection') {
+        polls++
+        const first = polls === 1
+        if (!first) await new Promise((resolve) => setTimeout(resolve, 150))
+        return pollResponse(first
+          ? {
+              connection_id: CONNECTION,
+              session_id: SESSION,
+              changed: true,
+              interaction_event_version: 1,
+              interaction_events: [], question_dismissal_event_version: 1, question_dismissal_events: [event()],
+              commands: [],
+              dispatches: [],
+            }
+          : {
+              connection_id: CONNECTION,
+              session_id: SESSION,
+              changed: false,
+              interaction_event_version: 1,
+              interaction_events: [],
+            })
+      }
+      if (call.name === 'report_pickup') {
+        return pollResponse({ outcome: 'started', attempt_id: ATTEMPT, phase: 'working', source_session_id: SESSION, idempotent: false })
+      }
+      return pollResponse({})
+    })
+    try {
+      const acked = await run.waitForAck()
+      const polled = run.stub.requests.filter((e) => e.parsed.params?.name === 'poll_connection')
+      const pickups = run.stub.requests.filter((e) => e.parsed.params?.name === 'report_pickup')
+
+      assert.equal(polled[0].parsed.params.arguments.interaction_event_version, 1)
+      assert.equal(polled[0].capability, CAPABILITY, 'the claim needs the capability header')
+      assert.equal(pickups.length, 1, 'exactly one attempt per answer')
+      assert.equal(pickups[0].capability, CAPABILITY)
+      assert.deepEqual(pickups[0].parsed.params.arguments, {
+        connection_id: CONNECTION,
+        question_dismissal_event_version: 1,
+        question_dismissal_event_id: EVENT,
+        question_dismissal_question_id: QUESTION,
+        question_dismissal_claim_token: CLAIM,
+      })
+      assert.ok(acked.length >= 1)
+      assert.deepEqual(acked[0].parsed.params.arguments.question_dismissal_event_ack, {
+        event_id: EVENT,
+        question_id: QUESTION,
+        claim_token: CLAIM,
+      })
+
+      const inbox = fs.readFileSync(path.join(run.dir, `${CONNECTION}.inbox.jsonl`), 'utf8')
+      const written = inbox.trim().split('\n').map((line) => JSON.parse(line))
+      assert.deepEqual(written.map((r) => r.type), [QUESTION_DISMISSAL_RECORD_TYPE])
+      assert.equal(written[0].disposition, DELIVERED)
+      assert.equal(written[0].attempt_id, ATTEMPT)
+      assert.equal(written[0].acceptance_key, `dismissal:${EVENT}`)
+      const state = JSON.parse(fs.readFileSync(path.join(run.dir, `${CONNECTION}.json`), 'utf8'))
+      assert.equal(state.interaction_continuation.attempt_id, ATTEMPT)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('dismissal lifecycle persistence failure releases its claim without publishing or ACKing', async () => {
+    const run = await drive(async parsed => {
+      const call = parsed.params ?? {}
+      if (call.name === 'poll_connection') {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        return pollResponse({ connection_id: CONNECTION, session_id: SESSION, changed: true, interaction_event_version: 1, interaction_events: [], question_dismissal_event_version: 1, question_dismissal_events: [dismissalEvent()] })
+      }
+      if (call.name === 'report_pickup') {
+        const file = path.join(run.dir, `${CONNECTION}.json`)
+        fs.rmSync(file, { recursive: true, force: true }); fs.mkdirSync(file)
+        return pollResponse({ outcome: 'started', attempt_id: ATTEMPT, source_session_id: SESSION, phase: 'working', idempotent: false })
+      }
+      return pollResponse({})
+    })
+    try {
+      const until = Date.now() + 5000
+      while (!run.stub.requests.some(r => r.parsed.params?.arguments?.interaction_pre_persistence_failure === true) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 25))
+      const complete = run.stub.requests.find(r => r.parsed.params?.arguments?.interaction_pre_persistence_failure === true)?.parsed.params.arguments
+      assert.equal(complete?.interaction_pre_persistence_failure, true)
+      assert.equal(complete?.question_dismissal_event_id, EVENT)
+      assert.equal(run.stub.requests.some(r => r.parsed.params?.arguments?.question_dismissal_event_ack), false)
+      const inbox = path.join(run.dir, `${CONNECTION}.inbox.jsonl`)
+      assert.equal(fs.existsSync(inbox) ? fs.readFileSync(inbox, 'utf8').includes('question_dismissal') : false, false)
+    } finally { await run.cleanup() }
+  })
+
+  it('Cursor poller rejects swapped negotiated arrays before any pickup or ACK', async () => {
+    for (const swapped of ['answer-array', 'dismissal-array']) {
+      const payload = swapped === 'answer-array'
+        ? { interaction_event_version: 1, interaction_events: [dismissalEvent()] }
+        : { interaction_event_version: 1, interaction_events: [], question_dismissal_event_version: 1, question_dismissal_events: [event()] }
+      const run = await drive(async parsed => {
+        if (parsed.params?.name === 'poll_connection') {
+          await new Promise(resolve => setTimeout(resolve, 50))
+          return pollResponse({ connection_id: CONNECTION, session_id: SESSION, changed: true, ...payload })
+        }
+        return pollResponse({})
+      })
+      try {
+        const deadline = Date.now() + 4000
+        while (!run.stderr().includes('event batch') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+        assert.match(run.stderr(), /Invalid (answer|dismissal) event batch/)
+        assert.equal(run.stub.requests.some(r => r.parsed.params?.name === 'report_pickup'), false)
+        assert.equal(run.stub.requests.some(r => r.parsed.params?.arguments?.question_dismissal_event_ack || r.parsed.params?.arguments?.interaction_event_ack), false)
+        const inbox = path.join(run.dir, `${CONNECTION}.inbox.jsonl`)
+        assert.equal(fs.existsSync(inbox) ? fs.readFileSync(inbox, 'utf8').includes('question_dismissal') : false, false)
+      } finally { await run.cleanup() }
+    }
+  })
+
   it('acknowledges a redelivery after a crash without opening a second attempt', async () => {
     // The crash window: the ledger entry is durable, the ACK never went out. The server
     // redelivers with a FRESH claim token and the host must settle it, not re-run it.
@@ -605,4 +737,66 @@ describe('Cursor directed-question policy surfaces', () => {
     assert.match(doc, /question_answer/)
     assert.match(doc, /devspec:\/\/product\/interaction-event-contract/)
   })
+})
+
+describe('Cursor dismissal boundaries', () => {
+  it('validates the separate no-answer event and immutable fenced projection', () => {
+    const event = dismissalEvent()
+    assert.equal(validateInteractionEvent(event, { connectionId: CONNECTION, sessionId: SESSION }).ok, true)
+    for (const bad of [{ ...event, answer: '' }, { ...event, response_id: RESPONSE }, { ...event, dismissed_at: '2026-02-30T00:00:00Z' }, { ...event, origin_connection_id: SIBLING }, { ...event, source_session_id: OTHER_SESSION }]) assert.equal(validateInteractionEvent(bad, { connectionId: CONNECTION, sessionId: SESSION }).ok, false)
+    const context = formatQuestionDismissalEventContext(event)
+    assert.equal((context.match(/<\/?devspec_question_dismissal_data>/gi) ?? []).length, 2)
+    assert.equal(formatQuestionDismissalEventContext({ ...event, claim_token: ATTEMPT }), context)
+    assert.throws(() => questionEventOffers({ interaction_event_version: 1, interaction_events: [], question_dismissal_event_version: 1, question_dismissal_events: [event] }, false))
+    const record = interactionAnswerRecord({ connectionId: CONNECTION, sessionId: SESSION, event, attemptId: ATTEMPT, disposition: DELIVERED })
+    assert.equal(persistedDismissalDisposition(JSON.stringify(record) + '\n', { ...event, claim_token: ATTEMPT }), 'applied')
+    assert.equal(persistedDismissalDisposition(JSON.stringify(record) + '\n', { ...event, prompt: 'changed' }), 'conflict')
+    assert.equal(persistedDismissalDisposition(JSON.stringify(record), event), 'new')
+    const parsed = parseWakeBatches([JSON.stringify(record)], { canonicalOnly: true, connectionId: CONNECTION })
+    assert.equal(parsed.length, 1)
+    const [wake] = buildInteractionAnswerEvents(parsed[0])
+    assert.equal(wake.type, 'question_dismissal')
+    assert.equal(wake.context, context)
+    for (const key of ['answer', 'response_id', 'prompt', 'answer_summary']) assert.equal(Object.hasOwn(wake, key), false)
+    assert.equal(wake.authoritative, false)
+    assert.deepEqual(parseWakeBatches([JSON.stringify({ ...record, disposition: 'queued', attempt_id: null })], { connectionId: CONNECTION }), [])
+    const held = { ...continuation(), kind: QUESTION_DISMISSAL_KIND }; delete held.response_id
+    assert.ok(activeContinuation(held, { connectionId: CONNECTION, sessionId: SESSION }))
+    assert.equal(activeContinuation(held, { connectionId: CONNECTION, sessionId: OTHER_SESSION }), null)
+    const args = respondArguments({ connectionId: CONNECTION, continuation: held, message: 'Continue existing work.' })
+    assert.equal(args.question_dismissal_question_id, QUESTION)
+    assert.equal(Object.hasOwn(args, 'interaction_response_id'), false)
+    assert.equal(turnEndInteractionDecision({ continuation: { ...held, wake_offset_after: null }, wakeFileBytes: 999 }).action, 'hold')
+  })
+  it('launcher and pinned wake filters include the distinct dismissal event', async () => {
+    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('../../scripts/launch-cli-session.mjs')
+    assert.match('question_dismissal', new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
+    assert.match(source('scripts/pin-remote-plugin.mjs'), /owner_message\|question_answer\|question_dismissal\|session_ended/)
+    assert.match(source('hooks/scripts/devspec-remote-wait.mjs'), /appendWakeEvents\(args.wakeFile, events\)[^]*dismissalWakeDeliveryContinuation\(held, batch, fs.statSync\(args.wakeFile\).size\)/)
+  })
+})
+
+it('Cursor dismissal wake proof names the exact event/question/claim/attempt before allowing Stop', () => {
+  const event = dismissalEvent()
+  const record = interactionAnswerRecord({ connectionId: CONNECTION, sessionId: SESSION, event, attemptId: ATTEMPT, disposition: DELIVERED })
+  const held = { ...continuation(), kind: QUESTION_DISMISSAL_KIND, wake_offset_after: null }; delete held.response_id
+  const delivered = dismissalWakeDeliveryContinuation(held, record, 500)
+  assert.equal(turnEndInteractionDecision({ continuation: delivered, wakeFileBytes: 500 }).action, 'complete')
+  for (const key of ['event_id', 'question_id', 'claim_token', 'attempt_id', 'session_id', 'connection_id']) assert.equal(dismissalWakeDeliveryContinuation({ ...held, [key]: SIBLING }, record, 500), null, key)
+})
+
+it('questionEventOffers preserves negotiated array kinds before union validation', () => {
+  const answer = event(), dismissal = dismissalEvent(), base = { interaction_event_version: 1, interaction_events: [] }
+  for (const payload of [
+    { ...base, interaction_events: [dismissal] },
+    { ...base, interaction_events: [dismissal], question_dismissal_event_version: 1, question_dismissal_events: [] },
+    { ...base, question_dismissal_event_version: 1, question_dismissal_events: [answer] },
+    { ...base, interaction_events: [{ ...answer, kind: 'unknown' }] },
+    { ...base, question_dismissal_event_version: 1, question_dismissal_events: [{ ...dismissal, kind: 'unknown' }] },
+    { ...base, interaction_events: [answer], question_dismissal_event_version: 1, question_dismissal_events: [dismissal] },
+    { ...base, question_dismissal_events: [dismissal] },
+  ]) assert.throws(() => questionEventOffers(payload, true))
+  assert.throws(() => questionEventOffers({ ...base, interaction_events: [answer] }, false))
+  assert.deepEqual(questionEventOffers({ ...base, interaction_events: [answer] }, true), [answer])
+  assert.deepEqual(questionEventOffers({ ...base, question_dismissal_event_version: 1, question_dismissal_events: [dismissal] }, true), [dismissal])
 })

@@ -75,6 +75,9 @@ import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
 import {
   buildInteractionAnswerEvents,
   INTERACTION_ANSWER_RECORD_TYPE,
+  QUESTION_DISMISSAL_RECORD_TYPE,
+  dismissalWakeDeliveryContinuation,
+  dismissalDeliveryDecision,
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
@@ -513,6 +516,11 @@ function inboxPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.inbox.jsonl`)
 }
 
+// Fail closed instead of using a stale legacy attachment for dismissal admission.
+function readDismissalState(connectionId) {
+  try { return JSON.parse(fs.readFileSync(statePath(connectionId), 'utf8')) } catch { return null }
+}
+
 function readState(connectionId) {
   const paths = [statePath(connectionId), LEGACY_STATE_PATH]
   for (const p of paths) {
@@ -531,7 +539,9 @@ function readState(connectionId) {
 
 function writeStatePatch(connectionId, patch) {
   try {
-    const prev = readState(connectionId) || { connection_id: connectionId }
+    // Cursor/receipt writes must not resurrect a legacy attachment when own state is absent.
+    const ownPath = statePath(connectionId)
+    const prev = fs.existsSync(ownPath) ? JSON.parse(fs.readFileSync(ownPath, 'utf8')) : { connection_id: connectionId }
     const next = {
       ...prev,
       ...patch,
@@ -559,8 +569,10 @@ function writeStatePatch(connectionId, patch) {
     } catch {
       /* ignore legacy */
     }
+    return true
   } catch (e) {
     process.stderr.write(`devspec-remote-wait: state write failed: ${e.message}\n`)
+    return false
   }
 }
 
@@ -708,6 +720,9 @@ export function offsetAfterAdvisoryHistory(text) {
     } catch {
       parsed = null
     }
+    // This scan chooses a read boundary, not execution authority. Keep dismissal
+    // rows for the live-source gate even when no connection/continuation is loaded.
+    if (parsed?.type === QUESTION_DISMISSAL_RECORD_TYPE) return Buffer.byteLength(src.slice(0, searchFrom), 'utf8')
     const canonicalWake = parseWakeBatches([line], {
       canonicalOnly: true,
       includeAutomations: true,
@@ -761,7 +776,7 @@ export function resolveWatchOffset({
     inboxByteOffset >= 0 && inboxByteOffset <= size
   const hasValidSavedOffset = hasSavedOffsetCandidate &&
     inboxCursorEvidenceMatches(file, inboxByteOffset, inboxCursorEvidence)
-  if (pending === true && hasValidSavedOffset) return inboxByteOffset
+  if (pending === true) return hasValidSavedOffset ? inboxByteOffset : resolveFromEndOffset(file)
   if (fromEnd === true) {
     const firstUnreadWake = resolveFromEndOffset(file)
     return hasValidSavedOffset ? Math.max(inboxByteOffset, firstUnreadWake) : firstUnreadWake
@@ -902,7 +917,7 @@ export function parseWakeBatches(
       // Revalidated here as well as at write time: this is the only channel whose
       // payload came from a person answering a card, and a record that no longer
       // targets this exact connection and its source session must not wake anyone.
-      if (obj?.type === INTERACTION_ANSWER_RECORD_TYPE) {
+      if ((obj?.type === INTERACTION_ANSWER_RECORD_TYPE || obj?.type === QUESTION_DISMISSAL_RECORD_TYPE)) {
         if (connectionId && validateInteractionAnswerRecord(obj, connectionId)) batches.push(obj)
         continue
       }
@@ -1291,9 +1306,19 @@ async function main() {
       if (batches.length > 0) {
         const attachmentDir = path.join(CONNECTIONS_DIR, `${connectionId}.attachments`)
         const batch = batches[0]
+        if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
+          const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
+          if (decision === 'defer') { await sleep(pollMs); continue }
+          if (decision === 'obsolete') {
+            // Preserve the record, tombstone its unread position, then inspect newer mail.
+            offset = newOffset
+            offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            continue
+          }
+        }
         // A directed-question answer is its own event type — it wakes, but it is never
         // a command, so it never goes through the owner-message builder.
-        const events = batch.type === INTERACTION_ANSWER_RECORD_TYPE
+        const events = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
           ? buildInteractionAnswerEvents(batch, { inboxFile: file })
           : buildOwnerMessageEvents(batch, {
             inboxFile: file,
@@ -1303,12 +1328,31 @@ async function main() {
               fs.writeFileSync(target, buf, { mode: 0o600 })
             },
           })
-        const wakeCount = batch.type === INTERACTION_ANSWER_RECORD_TYPE
+        const wakeCount = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
           ? 1
           : batch.messages.length
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
-        if (args.follow && args.wakeFile) appendWakeEvents(args.wakeFile, events)
+        if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
+          const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
+          if (decision === 'defer') { await sleep(pollMs); continue }
+          if (decision === 'obsolete') {
+            offset = newOffset
+            offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            continue
+          }
+        }
+        if (args.follow && args.wakeFile) {
+          appendWakeEvents(args.wakeFile, events)
+          if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
+            const current = readDismissalState(connectionId)
+            const held = current?.interaction_continuation
+            const delivered = dismissalWakeDeliveryContinuation(held, batch, fs.statSync(args.wakeFile).size)
+            if (delivered && current?.session_id === batch.session_id) {
+              if (!writeStatePatch(connectionId, { interaction_continuation: delivered })) throw Error('dismissal delivery proof not persisted')
+            }
+          }
+        }
         offset = newOffset
         offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         if (args.follow) {
