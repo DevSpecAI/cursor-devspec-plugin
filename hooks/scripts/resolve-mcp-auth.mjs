@@ -32,7 +32,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 
-const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
+const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 const WRONG_TOKEN_RE = /belongs to a different token/i
 
 export const DEFAULT_MCP_URL = DEFAULT_PROD_URL

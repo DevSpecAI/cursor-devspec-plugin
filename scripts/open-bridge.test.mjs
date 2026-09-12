@@ -12,6 +12,8 @@ function fakeRes() {
 describe('loopback bridge CORS', () => {
   it('allows the app origins and rejects everything else', () => {
     for (const ok of [
+      'https://app.devspec.ai',
+      'https://app.devspecstaging.com',
       'https://devspec.ai',
       'https://staging.devspec.ai',
       'http://localhost:3000',
@@ -19,9 +21,25 @@ describe('loopback bridge CORS', () => {
     ]) {
       assert.equal(isAllowedOrigin(ok), true, ok)
     }
-    for (const bad of ['https://evil.example', '', null, undefined]) {
+    for (const bad of [
+      'https://evil.example',
+      // A different TLD is not covered by the .devspec.ai suffix rule — only the
+      // named staging app host is.
+      'https://api.devspecstaging.com',
+      'https://evil.devspecstaging.com',
+      '',
+      null,
+      undefined,
+    ]) {
       assert.equal(isAllowedOrigin(bad), false, String(bad))
     }
+  })
+
+  it('serves CORS and Private Network Access to the staging app host', () => {
+    const res = fakeRes()
+    applyCors({ headers: { origin: 'https://app.devspecstaging.com' } }, res)
+    assert.equal(res.headers['Access-Control-Allow-Origin'], 'https://app.devspecstaging.com')
+    assert.equal(res.headers['Access-Control-Allow-Private-Network'], 'true')
   })
 
   /*

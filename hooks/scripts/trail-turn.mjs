@@ -97,7 +97,7 @@ async function main() {
     mcpUrl = mcpUrl || auth.mcp_url
   }
   if (!token) process.exit(0)
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
 
   const part = mode === 'seed' ? TRAIL_SEED_TEXT : renderHookTrailPart(mode, data)
   let transcriptText = null

@@ -174,7 +174,7 @@ export async function notifyWorkingEnded({
     }
   }
   if (!token) return { ok: false, reason: 'no_token' }
-  mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
 
   try {
     await call({

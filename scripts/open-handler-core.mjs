@@ -778,7 +778,13 @@ function openExternalUrl(url) {
  * have installed — the same wrong-default class already fixed on the interstitial.
  */
 function openErrorPage(slug, reason, tool = 'cursor') {
-  const base = process.env.DEVSPEC_API_URL?.replace(/\/+$/, '') || 'https://devspec.ai'
+  // The error page is a human page, so it lives on the app host (app.*), not the
+  // API host (api.*) that serves MCP. The two are separate settings — DEVSPEC_APP_URL
+  // / devspec.appUrl — rather than one derived from the other by rewriting a
+  // hostname, because nothing guarantees the pair share a shape (staging is
+  // app.devspecstaging.com beside api.devspecstaging.com today, and either could
+  // move alone).
+  const base = process.env.DEVSPEC_APP_URL?.replace(/\/+$/, '') || 'https://app.devspec.ai'
   const params = new URLSearchParams({ repo: slug, reason, tool })
   openExternalUrl(`${base}/cursor-handoff/error?${params}`)
 }

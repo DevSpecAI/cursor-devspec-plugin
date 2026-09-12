@@ -45,14 +45,14 @@ On first activation the extension:
 
 ## Connect your token
 
-Open the command palette and run **DevSpec: Set MCP token**. Paste your `dvs_…` token. The first time you connect it also asks for your DevSpec **API URL** — enter `https://devspec.ai`.
+Open the command palette and run **DevSpec: Set MCP token**. Paste your `dvs_…` token. It connects to the DevSpec API at `https://api.devspec.ai` by default; set the `devspec.apiUrl` setting to `https://api.devspecstaging.com` to use staging. If you clear that setting, the next connect asks for the URL instead.
 
 The extension writes the connection into your Cursor MCP config file:
 
 - **macOS / Linux:** `~/.cursor/mcp.json`
 - **Windows:** `%USERPROFILE%\.cursor\mcp.json`
 
-It points the server at the DevSpec MCP endpoint `https://devspec.ai/api/mcp` and sends your token as a Bearer header. **Restart Cursor** afterwards so it picks up the new server.
+It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart Cursor** afterwards so it picks up the new server.
 
 > **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Connections**.
 

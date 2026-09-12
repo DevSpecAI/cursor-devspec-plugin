@@ -1870,7 +1870,7 @@ export async function writeConnectionState(opts) {
     owner_pid: ownerPid,
     mcp_url: auth.ok
       ? auth.mcp_url
-      : (auth.mcp_url || prev.mcp_url || 'https://devspec.ai/api/mcp'),
+      : (auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp'),
     token: auth.ok ? auth.token : undefined,
     auth_source: auth.source || auth.error || prev.auth_source || null,
     auth_ok: !!auth.ok,

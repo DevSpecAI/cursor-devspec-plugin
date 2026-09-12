@@ -205,9 +205,9 @@ async function registerMcpServer({
 
   if (!apiUrl) {
     const entered = await vscode.window.showInputBox({
-      prompt: 'DevSpec API URL',
-      placeHolder: 'e.g. https://staging.devspec.ai',
-      value: 'https://staging.devspec.ai',
+      prompt: 'DevSpec API URL (https://api.devspecstaging.com for staging)',
+      placeHolder: 'https://api.devspec.ai',
+      value: 'https://api.devspec.ai',
       ignoreFocusOut: true,
       validateInput: (v) => /^https?:\/\/[^\s]+$/.test(v) ? null : 'Must be a valid http(s) URL',
     })

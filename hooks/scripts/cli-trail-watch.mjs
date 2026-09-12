@@ -204,7 +204,7 @@ async function main() {
       token = auth.token
       mcpUrl = mcpUrl || auth.mcp_url
     }
-    mcpUrl = mcpUrl || 'https://devspec.ai/api/mcp'
+    mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
     if (!token) {
       await sleep(args.pollMs)
       continue

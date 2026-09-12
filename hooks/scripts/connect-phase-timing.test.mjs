@@ -59,14 +59,14 @@ describe('resolveLaunchId / newLaunchId', () => {
 describe('deriveLogIngestUrl', () => {
   it('maps /api/mcp to /api/log', () => {
     assert.equal(
-      deriveLogIngestUrl('https://staging.devspec.ai/api/mcp'),
-      'https://staging.devspec.ai/api/log',
+      deriveLogIngestUrl('https://api.devspecstaging.com/api/mcp'),
+      'https://api.devspecstaging.com/api/log',
     )
     assert.equal(
-      deriveLogIngestUrl('https://devspec.ai/api/mcp/'),
-      'https://devspec.ai/api/log',
+      deriveLogIngestUrl('https://api.devspec.ai/api/mcp/'),
+      'https://api.devspec.ai/api/log',
     )
-    assert.equal(deriveLogIngestUrl('https://staging.devspec.ai'), 'https://staging.devspec.ai/api/log')
+    assert.equal(deriveLogIngestUrl('https://api.devspecstaging.com'), 'https://api.devspecstaging.com/api/log')
     assert.equal(deriveLogIngestUrl('not a url'), null)
   })
 })
@@ -100,12 +100,12 @@ describe('shipConnectPhaseToAxiom', () => {
     /** @type {RequestInit | undefined} */
     let init
     const fetchImpl = async (url, opts) => {
-      assert.equal(url, 'https://staging.devspec.ai/api/log')
+      assert.equal(url, 'https://api.devspecstaging.com/api/log')
       init = opts
       return { ok: true, status: 200 }
     }
     const result = await shipConnectPhaseToAxiom(
-      'https://staging.devspec.ai/api/log',
+      'https://api.devspecstaging.com/api/log',
       buildConnectPhasePayload({ phase: 'write_stamp', duration_ms: 5, launch_id: 'L' }),
       { fetchImpl },
     )
@@ -143,7 +143,7 @@ describe('emitConnectPhase', () => {
         duration_ms: 3,
         launch_id: 'L2',
         local_id: 'loc',
-        mcpUrl: 'https://staging.devspec.ai/api/mcp',
+        mcpUrl: 'https://api.devspecstaging.com/api/mcp',
         fetchImpl,
       })
       assert.equal(out.local, true)

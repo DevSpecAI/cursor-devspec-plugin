@@ -45,7 +45,7 @@ function proj(name) {
   fs.mkdirSync(d, { recursive: true })
   return d
 }
-function cursorJson(dir, token, url = 'https://devspec.ai/api/mcp') {
+function cursorJson(dir, token, url = 'https://api.devspec.ai/api/mcp') {
   const c = path.join(dir, '.cursor')
   fs.mkdirSync(c, { recursive: true })
   fs.writeFileSync(
@@ -53,7 +53,7 @@ function cursorJson(dir, token, url = 'https://devspec.ai/api/mcp') {
     JSON.stringify({ mcpServers: { devspec: { url, headers: { Authorization: `Bearer ${token}` } } } }),
   )
 }
-function mcpJson(dir, token, url = 'https://devspec.ai/api/mcp') {
+function mcpJson(dir, token, url = 'https://api.devspec.ai/api/mcp') {
   fs.writeFileSync(
     path.join(dir, '.mcp.json'),
     JSON.stringify({ mcpServers: { devspec: { url, headers: { Authorization: `Bearer ${token}` } } } }),
@@ -121,7 +121,7 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     const auth = resolveDevspecMcpAuth(d, { hostToken: 'dvs_explicit_host' })
     assert.equal(auth.token, 'dvs_explicit_host')
     assert.equal(auth.source, 'host')
-    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp', 'host token must not inherit the Cursor MCP URL')
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp', 'host token must not inherit the Cursor MCP URL')
   })
 
   it('walks upward to repository-root .cursor/mcp.json from a nested target', () => {
@@ -177,14 +177,14 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     fs.mkdirSync(c, { recursive: true })
     fs.writeFileSync(
       path.join(c, 'mcp.json'),
-      JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+      JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
     )
     // Stop walkMcpJson from climbing into a real ancestor ~/.mcp.json that has a
     // token (common on developer machines) — project .mcp.json with URL-only wins
     // the walk without a bearer.
     fs.writeFileSync(
       path.join(d, '.mcp.json'),
-      JSON.stringify({ mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp' } } }),
+      JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
     )
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, false)
@@ -196,7 +196,7 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     const cursorDir = path.join(fakeHome, '.cursor')
     fs.mkdirSync(cursorDir, { recursive: true })
     const body = JSON.stringify({
-      mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_home' } } },
+      mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_home' } } },
     })
     fs.writeFileSync(path.join(cursorDir, 'mcp.json'), `\uFEFF${body}`)
     const auth = resolveDevspecMcpAuth(d)
@@ -210,7 +210,7 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     const cursorDir = path.join(d, '.cursor')
     fs.mkdirSync(cursorDir, { recursive: true })
     const body = JSON.stringify({
-      mcpServers: { devspec: { url: 'https://devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_proj' } } },
+      mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_proj' } } },
     })
     fs.writeFileSync(path.join(cursorDir, 'mcp.json'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body)]))
     const auth = resolveDevspecMcpAuth(d)
@@ -248,30 +248,30 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
 describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', () => {
   it('enumerates Cursor MCP config and project .mcp.json as separate pairs', () => {
     const d = proj('pairs')
-    cursorJson(d, 'dvs_cursor_prod', 'https://devspec.ai/api/mcp')
-    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    cursorJson(d, 'dvs_cursor_prod', 'https://api.devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
     const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
     const cursor = pairs.find((p) => p.sourceLabel === 'Cursor MCP config')
     const project = pairs.find((p) => p.sourceLabel === 'project .mcp.json')
     assert.equal(cursor.token, 'dvs_cursor_prod')
-    assert.equal(cursor.mcp_url, 'https://devspec.ai/api/mcp')
+    assert.equal(cursor.mcp_url, 'https://api.devspec.ai/api/mcp')
     assert.equal(project.token, 'dvs_project_staging')
-    assert.equal(project.mcp_url, 'https://staging.devspec.ai/api/mcp')
+    assert.equal(project.mcp_url, 'https://api.devspecstaging.com/api/mcp')
   })
 
   it('Cursor token does not inherit the .mcp.json URL', () => {
     const d = proj('nomix')
-    cursorJson(d, 'dvs_cursor_prod', 'https://devspec.ai/api/mcp')
-    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    cursorJson(d, 'dvs_cursor_prod', 'https://api.devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.token, 'dvs_cursor_prod')
-    assert.equal(auth.mcp_url, 'https://devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
   })
 
   it('warning names both sources with fingerprints and never the raw tokens', () => {
     const d = proj('warn')
     cursorJson(d, 'dvs_cursor_prod')
-    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
     const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
     const warning = buildTokensWarning(pairs)
     assert.match(warning, /Cursor MCP config/)
@@ -285,7 +285,7 @@ describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', 
   it('falls through a "belongs to a different token" probe to the next pair', async () => {
     const d = proj('probe')
     cursorJson(d, 'dvs_cursor_prod')
-    mcpJson(d, 'dvs_project_staging', 'https://staging.devspec.ai/api/mcp')
+    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
     const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
     const seen = []
     const proven = await proveCredentialPair(pairs, {
@@ -299,7 +299,7 @@ describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', 
     })
     assert.deepEqual(seen, ['dvs_cursor_prod', 'dvs_project_staging'])
     assert.equal(proven.pair.token, 'dvs_project_staging')
-    assert.equal(proven.pair.mcp_url, 'https://staging.devspec.ai/api/mcp')
+    assert.equal(proven.pair.mcp_url, 'https://api.devspecstaging.com/api/mcp')
     assert.equal(proven.probed, true)
     assert.doesNotMatch(proven.warning, /dvs_cursor_prod|dvs_project_staging/)
   })

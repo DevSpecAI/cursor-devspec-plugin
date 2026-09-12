@@ -22,6 +22,10 @@ const PID_PATH = `${DEVSPEC_DIR}/open-bridge.pid`
 export function isAllowedOrigin(origin) {
   if (!origin || typeof origin !== 'string') return false
   return (
+    // The web app, where "Open in Cursor" is clicked.
+    origin === 'https://app.devspec.ai' ||
+    origin === 'https://app.devspecstaging.com' ||
+    // Legacy hosts, kept until they are retired.
     origin === 'https://devspec.ai' ||
     origin === 'https://staging.devspec.ai' ||
     origin.endsWith('.devspec.ai') ||

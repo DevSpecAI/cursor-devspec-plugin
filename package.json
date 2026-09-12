@@ -93,8 +93,13 @@
       "properties": {
         "devspec.apiUrl": {
           "type": "string",
-          "default": "",
-          "description": "Base URL of the DevSpec API. Set during onboarding (e.g. https://staging.devspec.ai). Leave empty to be prompted on first connect."
+          "default": "https://api.devspec.ai",
+          "description": "Base URL of the DevSpec API (MCP is served at <base>/api/mcp). Production is https://api.devspec.ai; use https://api.devspecstaging.com for staging. Clear it to be prompted on the next connect."
+        },
+        "devspec.appUrl": {
+          "type": "string",
+          "default": "https://app.devspec.ai",
+          "description": "Base URL of the DevSpec web app, where human-facing pages such as the handoff error page live. Production is https://app.devspec.ai; use https://app.devspecstaging.com for staging. The handoff scripts read the same value from the DEVSPEC_APP_URL environment variable."
         },
         "devspec.mcpToken": {
           "type": "string",

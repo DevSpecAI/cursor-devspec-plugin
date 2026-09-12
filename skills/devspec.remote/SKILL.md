@@ -404,7 +404,7 @@ Rules for all four:
 ## Rules
 
 - Full `connection_id` / `session_id` UUIDs always — never truncate when calling tools.
-- Never hardcode `https://devspec.ai` — the state write resolved the host.
+- Never hardcode `https://api.devspec.ai` (or any other DevSpec host) — the state write resolved the host.
 - Canonical exact-target commands with server-stamped `owner` / `delegated` authority only; preserve requester provenance and the strict authority/`project_scope` pair. Render delegated scope instructions verbatim; never recreate mutable policy wording locally. Advisory context is never a command.
 - **Action items belong to the session** when attached. Every `create_action_item` / `update_action_item` during attached remote control MUST pass `session_id` (see section above). Never dump a markdown inventory of items the transcript cards already show.
 - Heartbeat is automatic (the poller keeps the connection live). Do not open `access: shared` unless the human explicitly asks.

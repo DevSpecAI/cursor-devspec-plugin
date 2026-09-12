@@ -422,7 +422,7 @@ async function resolveMcpAuthForFolder(folder) {
     return {
       ok: true,
       token: envToken,
-      mcp_url: (envUrl || 'https://devspec.ai/api/mcp').replace(/\/+$/, ''),
+      mcp_url: (envUrl || 'https://api.devspec.ai/api/mcp').replace(/\/+$/, ''),
       source: 'env',
     }
   }
