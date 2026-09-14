@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { mcpToolsCall } from './mcp-call.mjs'
+import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import {
@@ -115,7 +115,7 @@ export async function resolveProjectForConnect(opts) {
     auth,
     launchId = null,
     agent = AGENT_NAME,
-    mcpCall = mcpToolsCall,
+    mcpCall = mcpToolsCallWithRetry,
     emitPhase = emitConnectPhase,
   } = opts
   const started = Date.now()
@@ -256,7 +256,7 @@ export async function fastConnect(opts = {}) {
   const launchId = resolveLaunchId(opts.launchId)
   const agent = opts.agent || AGENT_NAME
   const emitPhase = opts.emitPhase || emitConnectPhase
-  const mcpCall = opts.mcpCall || mcpToolsCall
+  const mcpCall = opts.mcpCall || mcpToolsCallWithRetry
   const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
   const resolveGitRemoteFn = opts.resolveGitRemoteFn || resolveGitRemote
   const registerFn = opts.registerFn || registerConnection

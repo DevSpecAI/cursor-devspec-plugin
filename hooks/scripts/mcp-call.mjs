@@ -32,6 +32,96 @@ export function mcpRequestHeaders({ token, connectionCapability = null }) {
   }
 }
 
+/** HTTP statuses that describe a transient condition, not a verdict on the request. */
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 502, 503, 504])
+
+/** Three attempts over ~1.5s: covers a container swap without making a down server feel hung. */
+const CONNECT_ATTEMPTS = 3
+const CONNECT_BACKOFF_MS = [300, 1_200]
+
+/**
+ * Read the server's typed failure contract off a non-OK response body (DevSpec
+ * item 798e2375). A validation outage answers 503 with
+ * `{code:'auth_validation_unavailable', retryable:true, credential_type}`; a
+ * genuinely rejected credential answers 401 with
+ * `{code:'invalid_api_token'|'invalid_connection_capability', retryable:false}`.
+ *
+ * Without this the status and the machine code exist only inside the error's
+ * message string, so every caller has to regex them back out — the pattern that
+ * turned transient 503s into "your token is revoked, go log in" elsewhere.
+ *
+ * The server's word is `serverCode`, deliberately NOT `code`: in this module
+ * `err.code` already means the ABORT reason ('timeout' | 'owner_gone') and callers
+ * switch on it. Exported for tests.
+ */
+export function readServerFailure(status, bodyText) {
+  const out = {
+    status: Number.isInteger(status) ? status : null,
+    serverCode: null,
+    retryable: null,
+    credentialType: null,
+  }
+  const text = typeof bodyText === 'string' ? bodyText : ''
+  const start = text.indexOf('{')
+  // A proxy's body-less "Bad Gateway" has no JSON; the status alone must carry it.
+  if (start < 0) return out
+  let body = null
+  try {
+    body = JSON.parse(text.slice(start))
+  } catch {
+    body = null
+  }
+  if (!body || typeof body !== 'object') return out
+  if (typeof body.code === 'string') out.serverCode = body.code
+  if (typeof body.retryable === 'boolean') out.retryable = body.retryable
+  if (body.credential_type === 'api_token' || body.credential_type === 'connection_capability') {
+    out.credentialType = body.credential_type
+  }
+  return out
+}
+
+/**
+ * Should this failure be tried again? The server's explicit word wins over the
+ * status, so a credential it has actually rejected is never retried however the
+ * transport dressed it up. A body-less 502/503 from a proxy mid-redeploy has no
+ * word to offer, hence the status fallback. A deliberate abort is never retried.
+ * Exported for tests.
+ */
+export function isRetryableHttpFailure(err) {
+  if (!err || typeof err !== 'object') return false
+  if (err.code === 'owner_gone' || err.code === 'timeout') return false
+  if (err.retryable === false) return false
+  if (err.retryable === true) return true
+  return RETRYABLE_HTTP_STATUSES.has(err.status)
+}
+
+/**
+ * `mcpToolsCall` with a bounded retry, for ONE-SHOT paths like connect where a
+ * transient failure is the whole command failing. Long-running pollers must keep
+ * using the bare call — they have their own tuned recoverable-end handling and a
+ * second layer would change it.
+ *
+ * `sleepFn` and `call` are injected so tests do not pay the backoff. Exported for tests.
+ */
+export async function mcpToolsCallWithRetry(args = {}, retryOptions = {}) {
+  const {
+    attempts = CONNECT_ATTEMPTS,
+    backoff = CONNECT_BACKOFF_MS,
+    onRetry = null,
+    sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    call = mcpToolsCall,
+  } = retryOptions
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call(args)
+    } catch (e) {
+      if (attempt >= attempts - 1 || !isRetryableHttpFailure(e)) throw e
+      if (onRetry) onRetry(e, attempt)
+      await sleepFn(backoff[attempt] ?? backoff[backoff.length - 1] ?? 1_200)
+    }
+  }
+}
+
 export async function mcpToolsCall({
   mcpUrl,
   token,
@@ -99,7 +189,10 @@ export async function mcpToolsCall({
 
   const text = await res.text()
   if (!res.ok) {
-    throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
+    // Message text is deliberately unchanged — logs and existing matching read it.
+    const err = new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
+    Object.assign(err, readServerFailure(res.status, text))
+    throw err
   }
 
   // Parse JSON or SSE-ish responses
