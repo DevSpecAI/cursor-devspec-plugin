@@ -18,16 +18,21 @@ function nullableCursor(value) { return value === null || value === undefined ||
 /** Strictly accept the one independent non-conversation dispatch type the server emits. */
 export function validateAutomationDispatch(dispatch, connectionId) {
   if (!exact(dispatch, [
-    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'instruction', 'permission',
-    'requester', 'original_target_connection_id', 'delivery_connection_id', 'queued_at', 'state',
+    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
+    'permission', 'queued_at', 'delivery_connection_id', 'requester',
   ])) return 'malformed automation dispatch'
+  const pressed = dispatch.trigger_kind === 'pressed'
+  const requesterOk = pressed
+    ? exact(dispatch.requester, ['user_id']) && uuid(dispatch.requester.user_id)
+    : dispatch.requester === null
   if (dispatch.kind !== 'automation_run' || !uuid(dispatch.id) || dispatch.run_id !== dispatch.id ||
-      !uuid(dispatch.automation_id) || !text(dispatch.automation_name) || typeof dispatch.instruction !== 'string' ||
+      !uuid(dispatch.automation_id) || !text(dispatch.automation_name) ||
+      !['scheduled', 'event', 'pressed'].includes(dispatch.trigger_kind) ||
+      !exact(dispatch.owner, ['user_id', 'display_name']) || !uuid(dispatch.owner.user_id) ||
+      !text(dispatch.owner.display_name) ||
       !['look_only', 'can_commit', 'can_push'].includes(dispatch.permission) ||
-      !exact(dispatch.requester, ['user_id']) || !uuid(dispatch.requester.user_id) ||
-      !(dispatch.original_target_connection_id === null || uuid(dispatch.original_target_connection_id)) ||
       dispatch.delivery_connection_id !== connectionId || !datetime(dispatch.queued_at) ||
-      !['queued', 'waiting_for_agent'].includes(dispatch.state)) return 'invalid automation dispatch'
+      !requesterOk) return 'invalid automation dispatch'
   return null
 }
 
@@ -305,17 +310,23 @@ export function automationRunInstruction(dispatch) {
       : dispatch.permission === 'can_commit'
         ? 'You MAY edit and commit locally, but MUST NOT push.'
         : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+  const started =
+    dispatch.trigger_kind === 'pressed'
+      ? 'Someone pressed Run.'
+      : dispatch.trigger_kind === 'scheduled'
+        ? 'This run started on a schedule.'
+        : 'This run started because of an event.'
+  const ownerName = dispatch.owner?.display_name || 'the owner'
   return [
     `▶️ Automation run dispatched to this connection: "${dispatch.automation_name}" (run ${dispatch.run_id}).`,
+    started,
+    `Owner: ${ownerName}`,
     '',
     'What to do:',
     `1. claim_automation_run({ run_id: "${dispatch.run_id}", provider: "cursor" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
-    '2. Do the work described below, in this repo.',
+    '2. Follow the instruction returned by that claim, in this repo.',
     '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
-    '',
-    'The instruction:',
-    dispatch.instruction || '(claim the run to read it)',
   ].join('\n')
 }
