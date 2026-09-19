@@ -107,7 +107,9 @@ describe('hookChildExitCode', () => {
 describe('stable provenance launcher output', () => {
   it('keeps network, child, and outer hook budgets strictly ordered', () => {
     const hooks = JSON.parse(fs.readFileSync(new URL('../hooks.json', import.meta.url), 'utf8'))
-    const outerSeconds = hooks.hooks.preToolUse[0].hooks[0].timeout
+    // Cursor's flat entry shape: [{ command, timeout }] — not Claude Code's
+    // nested { hooks: [...] } wrapper, which Cursor refuses to load (1b021c9e).
+    const outerSeconds = hooks.hooks.preToolUse[0].timeout
     assert.ok(ONLINE_REFERENCE_TIMEOUT_MS < PROVENANCE_CHILD_TIMEOUT_MS)
     assert.ok(PROVENANCE_CHILD_TIMEOUT_MS < outerSeconds * 1_000)
     assert.equal(provenanceChildTimeoutMs({ DEVSPEC_CURSOR_PROVENANCE_CHILD_TIMEOUT_MS: '75' }), 75)

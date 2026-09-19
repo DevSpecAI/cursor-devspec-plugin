@@ -66,3 +66,78 @@ describe('Cursor hook config merge', () => {
     assert.equal(JSON.stringify(packaged).includes('mutation-boundary.mjs'), false)
   })
 })
+
+// Every hook event Cursor documents. An event name outside this set does not
+// simply get ignored: Cursor validates the whole hooks.json and loads NONE of
+// it, so one wrong key silently disables every other hook in the file. That is
+// how the packaged config shipped with `Stop` / `UserPromptSubmit` (Claude Code
+// names) and every Cursor hook we ship was dead (item 1b021c9e).
+const CURSOR_HOOK_EVENTS = new Set([
+  'sessionStart', 'sessionEnd',
+  'preToolUse', 'postToolUse', 'postToolUseFailure',
+  'subagentStart', 'subagentStop',
+  'beforeShellExecution', 'afterShellExecution',
+  'beforeMCPExecution', 'afterMCPExecution',
+  'beforeReadFile', 'afterFileEdit',
+  'beforeSubmitPrompt', 'preCompact', 'stop',
+  'afterAgentResponse', 'afterAgentThought',
+  'beforeTabFileRead', 'afterTabFileEdit',
+  'workspaceOpen',
+])
+
+describe('Cursor hooks.json stays loadable by Cursor', () => {
+  const packaged = JSON.parse(fs.readFileSync(new URL('../hooks/hooks.json', import.meta.url), 'utf8'))
+
+  it('the packaged config uses only event names Cursor knows', () => {
+    for (const event of Object.keys(packaged.hooks)) {
+      assert.ok(
+        CURSOR_HOOK_EVENTS.has(event),
+        `"${event}" is not a Cursor hook event. Cursor rejects the entire hooks.json on an unknown key, so this disables EVERY hook in the file, not just this one.`,
+      )
+    }
+  })
+
+  it('the packaged config uses Cursor\'s flat entry shape, not Claude Code\'s nested one', () => {
+    for (const [event, entries] of Object.entries(packaged.hooks)) {
+      assert.ok(Array.isArray(entries), `${event} must be an array`)
+      for (const entry of entries) {
+        assert.equal(
+          Array.isArray(entry.hooks),
+          false,
+          `${event} uses Claude Code's nested { hooks: [...] } wrapper. Cursor expects a flat [{ command }] entry and fires nothing for the nested form — verified against cursor-agent 2026.08.11.`,
+        )
+        assert.equal(typeof entry.command, 'string', `${event} entry needs a command`)
+      }
+    }
+  })
+
+  it('the merged ~/.cursor/hooks.json never gains an event name Cursor does not know', () => {
+    const merged = mergeCursorHookConfig({}, '/stable/run-mirror-turn.mjs')
+    for (const event of Object.keys(merged.hooks)) {
+      assert.ok(CURSOR_HOOK_EVENTS.has(event), `merge emitted unknown Cursor event "${event}"`)
+    }
+  })
+
+  it('removes a legacy Claude-named key it had previously written, rather than leaving it empty', () => {
+    // An install from before the fix: our own entries under Claude Code names.
+    const poisoned = {
+      version: 1,
+      hooks: {
+        Stop: [{ hooks: [{ type: 'command', command: 'node /old/run-mirror-turn.mjs stop # devspec-remote-mirror' }] }],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node /old/run-mirror-turn.mjs user_prompt # devspec-remote-mirror' }] }],
+      },
+    }
+    const merged = mergeCursorHookConfig(poisoned, '/stable/run-mirror-turn.mjs')
+    assert.equal('Stop' in merged.hooks, false, 'an emptied "Stop" key still breaks the whole file')
+    assert.equal('UserPromptSubmit' in merged.hooks, false)
+    // The work those keys were doing has moved to the Cursor-named events.
+    assert.equal(commandsFor(merged, 'stop').some((c) => / stop # devspec-remote-mirror$/.test(c)), true)
+    assert.equal(commandsFor(merged, 'beforeSubmitPrompt').some((c) => / user_prompt # devspec-remote-mirror$/.test(c)), true)
+  })
+
+  it('leaves a third party\'s entries under a legacy key alone', () => {
+    const theirs = { hooks: [{ type: 'command', command: 'node /third-party/stop.mjs' }] }
+    const merged = mergeCursorHookConfig({ version: 1, hooks: { Stop: [theirs] } }, '/stable/run-mirror-turn.mjs')
+    assert.deepEqual(merged.hooks.Stop, [theirs], 'deleting someone else\'s hooks is not ours to do')
+  })
+})

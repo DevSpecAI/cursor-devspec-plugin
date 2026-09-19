@@ -17,6 +17,11 @@ const PROVENANCE_EVENTS = [
   'afterMCPExecution',
 ]
 
+// Claude Code event names we used to write into ~/.cursor/hooks.json. Cursor
+// does not know them, and one unknown key invalidates the entire file — so we
+// no longer emit them, and we clean them out of files that already have them.
+const LEGACY_CLAUDE_EVENTS = ['UserPromptSubmit', 'Stop']
+
 function isOurs(command) {
   if (typeof command !== 'string') return false
   if (command.includes(MARKER)) return true
@@ -54,13 +59,21 @@ function mergeCursorHookConfig(input, stableLauncher) {
 
   for (const event of [
     'beforeSubmitPrompt',
-    'UserPromptSubmit',
+    ...LEGACY_CLAUDE_EVENTS,
     'stop',
-    'Stop',
     ...TRAIL_EVENTS,
     ...PROVENANCE_EVENTS,
   ]) {
     hooks[event] = stripOursFromGroups(hooks[event])
+  }
+
+  // Cursor rejects the WHOLE hooks.json when it contains an event name it does
+  // not know, so a leftover `"Stop": []` is just as fatal as a populated one —
+  // it silently disables every other hook in the file (item 1b021c9e). Drop any
+  // key we emptied. A key still holding someone else's entries is left alone:
+  // deleting a third party's hooks is not ours to do.
+  for (const event of LEGACY_CLAUDE_EVENTS) {
+    if (Array.isArray(hooks[event]) && hooks[event].length === 0) delete hooks[event]
   }
 
   const command = (mode) => `node "${stableLauncher}" ${mode} # ${MARKER}`
@@ -69,16 +82,14 @@ function mergeCursorHookConfig(input, stableLauncher) {
     list.push({ command: value })
     hooks[event] = list
   }
-  const pushClaude = (event, value) => {
-    const list = Array.isArray(hooks[event]) ? hooks[event] : []
-    list.push({ hooks: [{ type: 'command', command: value, timeout: 30 }] })
-    hooks[event] = list
-  }
 
+  // Cursor event names only. We used to ALSO write Claude Code's `Stop` /
+  // `UserPromptSubmit` as a compatibility belt-and-braces; that is what broke
+  // the file, because Cursor validates the whole config and bails on an
+  // unrecognised key. Claude-format hooks are read from Claude's own
+  // settings.json, never from a key inside ~/.cursor/hooks.json.
   pushCursor('beforeSubmitPrompt', command('user_prompt'))
   pushCursor('stop', command('stop'))
-  pushClaude('UserPromptSubmit', command('user_prompt'))
-  pushClaude('Stop', command('stop'))
 
   for (const event of PROVENANCE_EVENTS) {
     pushCursor(event, command(`provenance-${event}`))

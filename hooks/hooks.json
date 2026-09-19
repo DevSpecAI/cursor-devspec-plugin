@@ -1,146 +1,102 @@
 {
   "version": 1,
-  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. The extension also merges a fragment into ~/.cursor/hooks.json on activate.",
+  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. Cursor's own hook schema: flat per-event arrays and Cursor event names. The extension merges this fragment into ~/.cursor/hooks.json on activate.",
   "hooks": {
-    "Stop": [
+    "stop": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" stop",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" stop",
+        "timeout": 30
       }
     ],
-    "UserPromptSubmit": [
+    "beforeSubmitPrompt": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" user_prompt",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" user_prompt",
+        "timeout": 30
       }
     ],
     "preToolUse": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
+        "timeout": 30
       }
     ],
     "postToolUse": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
-            "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUse",
-            "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
-            "timeout": 15
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
+        "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUse",
+        "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
+        "timeout": 15
       }
     ],
     "postToolUseFailure": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUseFailure",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUseFailure",
+        "timeout": 30
       }
     ],
     "afterShellExecution": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterShellExecution",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterShellExecution",
+        "timeout": 30
       }
     ],
     "beforeShellExecution": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
+        "timeout": 30
       }
     ],
     "afterMCPExecution": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" afterMCPExecution",
-            "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterMCPExecution",
-            "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
-            "timeout": 15
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" afterMCPExecution",
+        "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterMCPExecution",
+        "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
+        "timeout": 15
       }
     ],
     "beforeMCPExecution": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeMCPExecution",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeMCPExecution",
+        "timeout": 30
       }
     ],
     "afterFileEdit": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterFileEdit",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterFileEdit",
+        "timeout": 30
       }
     ],
     "afterAgentThought": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterAgentThought",
-            "timeout": 30
-          }
-        ]
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterAgentThought",
+        "timeout": 30
       }
     ]
   }
