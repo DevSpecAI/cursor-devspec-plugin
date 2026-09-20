@@ -28,12 +28,17 @@ Cold **Agents** Connect does **not** need the LLM to walk register/attach — th
 
 ## Plugin root (non-negotiable)
 
-All poller / state scripts come from the **installed Cursor DevSpec extension** — never from Claude Code or marketplace caches.
+All poller / state scripts come from the **installed Cursor DevSpec plugin** — never from Claude Code or another agent's plugin cache.
 
-1. **If your prompt already includes** a line `PLUGIN=<absolute-path>` (injected by **DevSpec: Connect remote control**), use that path exactly.
-2. **Otherwise** set `PLUGIN` to the newest directory matching:
-   - Windows: `%USERPROFILE%\.cursor\extensions\devspecai.devspec-autopilot-*`
-   - macOS / Linux: `~/.cursor/extensions/devspecai.devspec-autopilot-*`
+1. **If your prompt already includes** a line `PLUGIN=<absolute-path>` (injected by the launcher), use that path exactly.
+2. **Otherwise** find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). A marketplace install lives at `plugins/marketplaces/<host>/<owner>/<repo>/<commit-sha>/`, a local one at `plugins/local/<name>/`:
+
+   ```bash
+   HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
+   PLUGIN=${HIT%/hooks/scripts/remote-control-state.mjs}
+   ```
+
+   If more than one matches, take the most recently modified: a marketplace install is keyed by commit, so older commits stay on disk beside the current one.
 3. Confirm `PLUGIN/hooks/scripts/remote-control-state.mjs` exists before running anything.
 4. **Never** use scripts under `~/.claude/plugins/**`, `**/devspec-autopilot-marketplace/**`, or any other agent's plugin cache — those lack Cursor's auth-smoke + `ensure-poller` path and cause slow/broken attaches.
 5. Always **quote** `"$PLUGIN"` in shell commands (Windows usernames often contain spaces).

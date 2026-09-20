@@ -2,7 +2,7 @@
 
 **Family:** local-poller.  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
-**Plugin repo:** `cursor-devspec-plugin` (VSIX; hooks under `hooks/scripts/`).  
+**Plugin repo:** `cursor-devspec-plugin` (a cursor-agent CLI plugin; hooks under `hooks/scripts/`). There is no VSIX and no IDE extension — both were deleted in item 19956e89.  
 **Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md` (manual Connect + post-Live; Agents launches use mechanical Connect + thin brief).
 
 ## Cold Connect is mechanical (plugin-owned)
@@ -19,7 +19,7 @@ On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no long
 
 The model’s job after resume: arm the argv **background tail** (`block_until_ms: 0` + `notify_on_output`), handle owner commands, post answers. **Do not** run one-shot `devspec-remote-wait.mjs --from-end` on a Connect launch — the launcher already follows the inbox into a space-free wake file (item 9d89a6d2). `--from-end` on that host follow skips advisory inbox history but **does not** skip `owner_messages` the poller already queued (item 1f177af4). Do **not** re-register on a stamped “already Live” launch.
 
-**Launcher path (item 94b11df6):** `open-handler --install` / extension activate writes `~/.cursor/devspec/extension-root.json`. Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a VSIX update.
+**Launcher path (item 94b11df6):** `open-handler --install` writes `~/.cursor/devspec/extension-root.json` (extension activate used to as well, before the IDE half was deleted). Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a plugin update.
 
 **Invoke fast-connect manually:**
 
@@ -113,9 +113,9 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 | Token | Plugin-owned `resolve-mcp-auth.mjs` — lookup order: env → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → walk `.mcp.json` (not Claude plugin env) |
 | Agent name | `AGENT_NAME = 'Cursor'` |
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe` / `claude.exe`, or `node.exe` hosting cursor-agent `--resume` (Cursor CLI often has no `agent.exe` — item c57dc381). **Never** pin to `index.js worker-server` — that child exits while `--resume` lives and fires `owner_gone` (item 5c884554). **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
-| Mirror / trail hooks | `~/.cursor/hooks.json` points at **stable** `~/.cursor/devspec/hooks/run-mirror-turn.mjs`, which resolves the newest installed VSIX each run (never pin a versioned extension path). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
+| Mirror / trail hooks | The plugin's own `hooks/hooks.json`, which Cursor loads from the installed plugin and whose commands name the target scripts directly via `${CLAUDE_PLUGIN_ROOT}`. There is no `~/.cursor/hooks.json` and no `run-mirror-turn.mjs` launcher — both existed to survive VSIX version bumps and went with the VSIX (item 19956e89). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
 | CLI trail feed | Cursor Agents CLI (`agent --resume`) often **does not** invoke mid-turn hooks. On attached owner-command pickup the poller starts `cli-trail-watch.mjs`, which tails `~/.cursor/projects/*/agent-transcripts/<local_id>/<local_id>.jsonl` and posts throttled `phase=trail` until the turn marker clears. Hook path stays for IDE; transcript watcher is the CLI-safe path (item 63f3db87). |
-| PLUGIN pin (Agents launch) | Cold Agents launches stamp `PLUGIN=<extension-root>` via `scripts/pin-remote-plugin.mjs` (also copied to stable `~/.cursor/devspec/pin-remote-plugin.mjs`). Resolution uses **semver** (`parseExtensionVersion` / `compareSemverTuples`) — never lexicographic folder sort (`0.4.9` wrongly beat `0.4.14` before item `0688ff96`). Connect stamps a **thin post-Live brief**, not the full skill. |
+| PLUGIN pin (Agents launch) | Cold Agents launches stamp `PLUGIN=<plugin-root>` via `scripts/pin-remote-plugin.mjs` (also copied to stable `~/.cursor/devspec/pin-remote-plugin.mjs`), resolved from the running scripts tree. The old second route — scan `~/.cursor/extensions` for the newest `devspecai.devspec-autopilot-<version>` and sort by semver — is gone with the VSIX; it returned null once that directory stopped existing. Connect stamps a **thin post-Live brief**, not the full skill. |
 
 ## What not to change lightly
 
@@ -124,7 +124,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Using `--from-end` after the first arm (drops pending inbox mail). First-arm `--from-end` itself must not seek past unread `owner_messages` the poller already wrote (item 1f177af4).
 - Re-arming with plain `--pending` after a finished reply (leaves Live-but-Working forever on CLI).
 - Hand-writing connection JSON with a hardcoded prod MCP URL.
-- Pointing hooks.json at `…/extensions/devspecai.devspec-autopilot-<version>/…` (dies on every VSIX bump).
+- Reintroducing a global `~/.cursor/hooks.json` or a launcher indirection. The plugin serves its own hooks; both of those existed only because a VSIX path changed on every version bump.
 - Sorting installed extensions by folder-name string order when picking PLUGIN (pins stale patch versions).
 - Assuming CLI mid-turn hooks fire because IDE hooks do — always keep the transcript watcher for Agents attaches.
 - Re-introducing LLM-walked register/attach on cold Agents Connect (mechanical fast-connect owns that).
@@ -139,7 +139,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - Wrong local_id mint vs conversation id → duplicate connections / Resume empty.
 - Tool-shell `$PID` as `--owner-pid` on Windows → poller dies with `owner_gone` mid-session; reconnect without bond revival used to mint a new connection and orphan exact-target commands.
 - Version-pinned hook path → Stop never runs; Working and local-prompt mirroring go silent.
-- Lexicographic PLUGIN pin → Agents relaunch keeps an older VSIX (e.g. 0.4.9 over 0.4.14/0.4.15) even after install (item 0688ff96).
+- (Historical, VSIX-era) Lexicographic PLUGIN pin kept an older VSIX (0.4.9 over 0.4.14) even after install — item 0688ff96. The scan it applied to no longer exists.
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
 - Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
 - Ignoring canonical `attachments[].resource_id` on `owner_message` → miss a stable referenced resource that is part of the command.
@@ -157,7 +157,6 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/devspec-remote-wait.mjs` (one-shot for manual Connect; `--follow --wake-file` for host-owned Connect follow)
 - `hooks/scripts/devspec-wake-tail.mjs` (Connect argv background tail of the space-free wake file)
 - `hooks/scripts/devspec-wake-file.mjs` (ProgramData / `/var/tmp` wake path)
-- `hooks/scripts/run-mirror-turn.mjs` (stable hook launcher — also dispatches trail modes)
 - `hooks/scripts/mirror-turn.mjs` (Stop / user_prompt — seeds trail; Stop clears turn + trail state + `report_complete` when hooks fire)
 - `hooks/scripts/seed-work-trail.mjs` (shared `phase=trail` Working… seed used by mirror + poller)
 - `hooks/scripts/trail-turn.mjs` (mid-turn `phase=trail` posts)

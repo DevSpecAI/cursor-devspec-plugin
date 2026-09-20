@@ -17,7 +17,6 @@ import {
   promptAlreadyHasPostLiveBrief,
   promptAlreadyHasSkillBody,
   promptNeedsRemotePluginPin,
-  resolveCursorDevspecExtensionPath,
 } from './pin-remote-plugin.mjs'
 
 describe('promptNeedsRemotePluginPin', () => {
@@ -53,12 +52,8 @@ describe('pinRemotePluginInPrompt', () => {
 
   before(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pin-'))
-    extensionPath = path.join(
-      tmpHome,
-      '.cursor',
-      'extensions',
-      'devspecai.devspec-autopilot-0.4.6',
-    )
+    // Plugin-shaped, as a marketplace install lands: plugins/<…>/<commit>/…
+    extensionPath = path.join(tmpHome, '.cursor', 'plugins', 'local', 'devspec-autopilot')
     fs.mkdirSync(path.join(extensionPath, 'hooks', 'scripts'), { recursive: true })
     fs.writeFileSync(
       path.join(extensionPath, 'hooks', 'scripts', 'remote-control-state.mjs'),
@@ -70,24 +65,9 @@ describe('pinRemotePluginInPrompt', () => {
     fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
-  it('resolves the newest installed extension', () => {
-    const older = path.join(
-      tmpHome,
-      '.cursor',
-      'extensions',
-      'devspecai.devspec-autopilot-0.4.0',
-    )
-    fs.mkdirSync(path.join(older, 'hooks', 'scripts'), { recursive: true })
-    fs.writeFileSync(
-      path.join(older, 'hooks', 'scripts', 'remote-control-state.mjs'),
-      '// stub\n',
-    )
-    assert.equal(resolveCursorDevspecExtensionPath(tmpHome), extensionPath)
-  })
-
   it('prepends PLUGIN= for remote prompts when missing', () => {
     const prompt = 'Run the `devspec.remote` skill with this input: --session abc'
-    const pinned = pinRemotePluginInPrompt(prompt, { homeDir: tmpHome })
+    const pinned = pinRemotePluginInPrompt(prompt, { extensionPath })
     assert.ok(pinned.startsWith(`PLUGIN=${extensionPath}`))
     assert.ok(pinned.includes('Do NOT search ~/.claude/plugins'))
     assert.ok(pinned.endsWith(prompt))
@@ -95,49 +75,12 @@ describe('pinRemotePluginInPrompt', () => {
 
   it('is a no-op when PLUGIN= is already present', () => {
     const prompt = `${buildPluginPinBlock(extensionPath)}\n\nRun the \`devspec.remote\` skill`
-    assert.equal(pinRemotePluginInPrompt(prompt, { homeDir: tmpHome }), prompt)
+    assert.equal(pinRemotePluginInPrompt(prompt, { extensionPath }), prompt)
   })
 
   it('is a no-op for non-remote prompts', () => {
     const prompt = 'Run the `devspec.work` skill with this input: abc'
-    assert.equal(pinRemotePluginInPrompt(prompt, { homeDir: tmpHome }), prompt)
-  })
-})
-
-describe('resolveCursorDevspecExtensionPath semver', () => {
-  /** @type {string} */
-  let tmpHome
-
-  before(() => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-pin-semver-'))
-  })
-
-  after(() => {
-    fs.rmSync(tmpHome, { recursive: true, force: true })
-  })
-
-  it('picks 0.4.14 over 0.4.9 (lexicographic trap)', () => {
-    // Lex sort ranks "…-0.4.9" after "…-0.4.14" because '9' > '1'. Semver must not.
-    const v49 = path.join(
-      tmpHome,
-      '.cursor',
-      'extensions',
-      'devspecai.devspec-autopilot-0.4.9',
-    )
-    const v414 = path.join(
-      tmpHome,
-      '.cursor',
-      'extensions',
-      'devspecai.devspec-autopilot-0.4.14',
-    )
-    for (const dir of [v49, v414]) {
-      fs.mkdirSync(path.join(dir, 'hooks', 'scripts'), { recursive: true })
-      fs.writeFileSync(
-        path.join(dir, 'hooks', 'scripts', 'remote-control-state.mjs'),
-        '// stub\n',
-      )
-    }
-    assert.equal(resolveCursorDevspecExtensionPath(tmpHome), v414)
+    assert.equal(pinRemotePluginInPrompt(prompt, { extensionPath }), prompt)
   })
 })
 
@@ -149,12 +92,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
 
   before(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-expand-'))
-    extensionPath = path.join(
-      tmpHome,
-      '.cursor',
-      'extensions',
-      'devspecai.devspec-autopilot-0.4.7',
-    )
+    extensionPath = path.join(tmpHome, '.cursor', 'plugins', 'local', 'devspec-autopilot')
     fs.mkdirSync(path.join(extensionPath, 'hooks', 'scripts'), { recursive: true })
     fs.writeFileSync(
       path.join(extensionPath, 'hooks', 'scripts', 'remote-control-state.mjs'),
@@ -193,7 +131,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
 
   it('embeds PLUGIN= but NOT the full Connect skill body (thin path)', () => {
     const prompt = 'Run the `devspec.remote` skill with this input: --session abc'
-    const expanded = expandRemoteControlLaunchPrompt(prompt, { homeDir: tmpHome })
+    const expanded = expandRemoteControlLaunchPrompt(prompt, { extensionPath })
     assert.ok(expanded.startsWith(`PLUGIN=${extensionPath}`))
     assert.ok(expanded.includes('Do NOT glob for the skill') || expanded.includes('mechanical Connect'))
     // Fat skill must NOT be embedded on cold expand — launch stamps post-Live after fast-connect.
@@ -205,7 +143,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
     const prompt =
       'Run the `devspec.remote` skill with this input: --session 7e3afc79-abf4-48e4-ae33-aed27b00944d'
     const expanded = expandRemoteControlLaunchPrompt(prompt, {
-      homeDir: tmpHome,
+      extensionPath,
       connect: {
         connectionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         sessionId: '7e3afc79-abf4-48e4-ae33-aed27b00944d',
@@ -283,7 +221,7 @@ describe('expandRemoteControlLaunchPrompt', () => {
       ].join('\n'),
     )
     const expanded = expandRemoteControlLaunchPrompt('Run the `devspec.remote-stop` skill.', {
-      homeDir: tmpHome,
+      extensionPath,
     })
     assert.ok(expanded.includes('# DevSpec Remote Control — Stop'))
     assert.ok(expanded.includes('end_reason'))
@@ -293,9 +231,9 @@ describe('expandRemoteControlLaunchPrompt', () => {
     // Connect path is pin-only so re-expand is idempotent.
     const once = expandRemoteControlLaunchPrompt(
       'Run the `devspec.remote` skill with this input: --session abc',
-      { homeDir: tmpHome },
+      { extensionPath },
     )
-    const twice = expandRemoteControlLaunchPrompt(once, { homeDir: tmpHome })
+    const twice = expandRemoteControlLaunchPrompt(once, { extensionPath })
     assert.equal(twice, once)
   })
 })

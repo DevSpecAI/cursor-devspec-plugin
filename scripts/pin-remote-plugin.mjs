@@ -15,15 +15,8 @@
  * this module is the equivalent for protocol-handler / CLI / IDE deeplink launches.
  */
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import {
-  compareSemverTuples,
-  parseExtensionVersion,
-} from '../hooks/scripts/run-mirror-turn.mjs'
-
-const EXTENSION_DIR_PREFIX = 'devspecai.devspec-autopilot-'
 
 const REMOTE_SKILL_IDS = /** @type {const} */ (['devspec.remote', 'devspec.remote-stop'])
 
@@ -95,8 +88,8 @@ export function promptAlreadyHasPostLiveBrief(prompt) {
 }
 
 /**
- * Extension root when this module is running from an installed VSIX tree
- * (`…/extensions/devspecai.devspec-autopilot-x.y.z/scripts/pin-remote-plugin.mjs`).
+ * Plugin root when this module is running from an installed plugin tree
+ * (`…/<plugin root>/scripts/pin-remote-plugin.mjs`).
  * @param {string} [moduleUrl] `import.meta.url` of a script under `scripts/`
  * @returns {string | null}
  */
@@ -113,49 +106,21 @@ export function resolveExtensionPathFromScriptsDir(moduleUrl = import.meta.url) 
 }
 
 /**
- * Newest installed Cursor DevSpec extension under ~/.cursor/extensions.
- * @param {string} [homeDir]
- * @returns {string | null}
- */
-export function resolveCursorDevspecExtensionPath(homeDir = os.homedir()) {
-  const extensionsRoot = path.join(homeDir, '.cursor', 'extensions')
-  let entries
-  try {
-    entries = fs.readdirSync(extensionsRoot, { withFileTypes: true })
-  } catch {
-    return null
-  }
-  // Semver order — NOT lexicographic `.sort()`. Lex puts 0.4.9 above 0.4.14
-  // (string '9' > '1'), which pinned every Agents launch to the stale VSIX.
-  const candidates = entries
-    .filter((e) => e.isDirectory() && e.name.startsWith(EXTENSION_DIR_PREFIX))
-    .map((e) => ({
-      name: e.name,
-      version: parseExtensionVersion(e.name),
-      full: path.join(extensionsRoot, e.name),
-    }))
-    .filter((c) =>
-      fs.existsSync(path.join(c.full, 'hooks', 'scripts', 'remote-control-state.mjs')),
-    )
-    .sort((a, b) => compareSemverTuples(b.version, a.version))
-  return candidates[0]?.full ?? null
-}
-
-/**
- * Prefer the running extension tree; fall back to newest under ~/.cursor/extensions.
- * @param {{ homeDir?: string, extensionPath?: string | null, moduleUrl?: string }} [opts]
+ * Resolve the plugin root from the running scripts tree.
+ *
+ * There used to be a second route: scan `~/.cursor/extensions` for the newest
+ * `devspecai.devspec-autopilot-<version>` VSIX. That directory cannot exist now the
+ * IDE extension is gone (item 19956e89), and the scan returned null whenever it was
+ * absent, so removing it changes nothing at runtime — it only stops us carrying a
+ * lookup for a thing that was deleted.
+ *
+ * `opts.extensionPath` remains the seam for tests and alternate profiles.
+ * @param {{ extensionPath?: string | null, moduleUrl?: string }} [opts]
  * @returns {string | null}
  */
 export function resolveRemotePluginExtensionPath(opts = {}) {
   if (opts.extensionPath !== undefined) return opts.extensionPath
-  // Explicit homeDir (tests / alternate profiles) wins over the running scripts tree.
-  if (opts.homeDir !== undefined) {
-    return resolveCursorDevspecExtensionPath(opts.homeDir)
-  }
-  return (
-    resolveExtensionPathFromScriptsDir(opts.moduleUrl) ??
-    resolveCursorDevspecExtensionPath()
-  )
+  return resolveExtensionPathFromScriptsDir(opts.moduleUrl)
 }
 
 /**

@@ -9,10 +9,15 @@ Cleanly disconnect **this** conversation's connection so the **Agents page** dro
 
 ## Plugin root (non-negotiable)
 
-Use the **installed Cursor DevSpec extension** scripts only.
+Use the **installed Cursor DevSpec plugin** scripts only.
 
-1. Prefer a prompt line `PLUGIN=<absolute-path>` when present (extension injects it).
-2. Otherwise: newest `~/.cursor/extensions/devspecai.devspec-autopilot-*` (Windows: `%USERPROFILE%\.cursor\extensions\…`).
+1. Prefer a prompt line `PLUGIN=<absolute-path>` when present (the launcher injects it).
+2. Otherwise find it under `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`), taking the most recently modified match:
+
+   ```bash
+   HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
+   PLUGIN=${HIT%/hooks/scripts/remote-control-state.mjs}
+   ```
 3. **Never** call `remote-control-state.mjs` from `~/.claude/plugins/**` or marketplace caches.
 4. Quote `"$PLUGIN"` in every shell command.
 

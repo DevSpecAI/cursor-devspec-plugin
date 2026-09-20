@@ -123,26 +123,9 @@ async function copyInstalledArtifacts(sourceDir) {
     // ignore
   }
 
-  // Stable mirror-turn launcher for ~/.cursor/hooks.json (item 2097651e / fe456bf9).
-  // Prefer the sibling hooks/scripts copy in the plugin checkout; fall back to a
-  // previously installed copy under DEVSPEC_DIR/hooks.
-  const hooksDestDir = path.join(DEVSPEC_DIR, 'hooks')
-  await fs.mkdir(hooksDestDir, { recursive: true })
-  const launcherName = 'run-mirror-turn.mjs'
-  const launcherCandidates = [
-    path.join(sourceDir, '..', 'hooks', 'scripts', launcherName),
-    path.join(sourceDir, 'hooks', launcherName),
-    path.join(DEVSPEC_DIR, 'hooks', launcherName),
-    path.join(hooksScriptsDest, launcherName),
-  ]
-  for (const src of launcherCandidates) {
-    try {
-      await fs.copyFile(src, path.join(hooksDestDir, launcherName))
-      break
-    } catch {
-      // try next
-    }
-  }
+  // The stable mirror-turn launcher used to be copied here for ~/.cursor/hooks.json.
+  // Both are gone (item 19956e89): a Cursor plugin serves its own hooks/hooks.json, so
+  // there is no global hooks file to point anywhere and no launcher to point it with.
 }
 
 async function runFromUrlArg(urlArg) {
