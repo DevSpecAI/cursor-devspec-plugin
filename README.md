@@ -45,12 +45,21 @@ looking for a hook.
 
 ### Updating
 
-Remove and re-add. Do not use `marketplace update`:
+Three steps — remove the marketplace, re-add it, then reinstall the plugin. Do not use
+`marketplace update`:
 
 ```bash
 cursor-agent plugin marketplace remove devspec-autopilot
 cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
 ```
+
+Then run `cursor-agent`, `/plugins`, and install **devspec-autopilot** again.
+
+**All three are needed.** Re-adding the marketplace moves the index but leaves the installed
+plugin where it was, and removing the marketplace does not uninstall the plugin — so after the
+first two steps you are running one commit while the marketplace advertises another, with
+nothing to tell you. Reinstalling without re-adding first is equally useless: the install copies
+from the index, so it reproduces the commit you already had.
 
 `cursor-agent plugin marketplace update` prints `✓ Updated marketplace` and fetches nothing
 new. Cursor resolves whatever ref you gave it to a commit SHA when you add the marketplace and

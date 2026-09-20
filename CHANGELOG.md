@@ -28,7 +28,14 @@ Adding a marketplace resolves the ref with `git ls-remote` and stores the **reso
 SHA**; the branch name is discarded, so a marketplace added from `main` retains no idea that
 it came from `main`. There is nothing for `update` to re-resolve, and it re-fetches the same
 commit. This bites customers, not just us — whoever installs is frozen on whatever commit was
-current that second. Updating is remove-and-re-add, which resolves the branch afresh.
+current that second.
+
+Updating takes **three** steps: remove the marketplace, re-add it, then reinstall the plugin.
+Proven on 2026-09-20 by doing each half separately. Reinstalling the plugin alone reproduces
+the commit you already had, because the install copies from the marketplace index. Re-adding
+the marketplace alone moves the index but leaves the installed copy behind — and removing a
+marketplace does not uninstall its plugin, so in between you are running one commit while the
+marketplace advertises another, with nothing anywhere reporting the difference.
 
 The README now says so, `--git-ref` is described as pinning rather than tracking, and a test
 asserts `marketplace update` never appears inside a copyable code block again. Measured
