@@ -6,6 +6,7 @@ import { buildPostLiveRemoteBrief } from './pin-remote-plugin.mjs'
 const read = (relative) => fs.readFileSync(new URL(`../${relative}`, import.meta.url), 'utf8')
 const packageJson = JSON.parse(read('package.json'))
 const pluginJson = JSON.parse(read('.cursor-plugin/plugin.json'))
+const marketplaceJson = JSON.parse(read('.cursor-plugin/marketplace.json'))
 const mcp = JSON.parse(read('mcp.json'))
 const readme = read('README.md')
 const changelog = read('CHANGELOG.md')
@@ -33,6 +34,12 @@ describe('Cursor shared-session-plan surfaces', () => {
     // changelog's newest heading is that version. Pinning a literal here made the
     // suite go red on every release instead of on a real mistake, and it did.
     assert.equal(pluginJson.version, packageJson.version)
+    // The marketplace manifest is what makes the plugin installable at all, and it
+    // carries its own copy of the version. A third place to drift is a third place
+    // to ship a stale one, so it is asserted here rather than trusted.
+    assert.equal(marketplaceJson.plugins.length, 1)
+    assert.equal(marketplaceJson.plugins[0].version, packageJson.version)
+    assert.equal(marketplaceJson.plugins[0].name, pluginJson.name)
     assert.match(changelog, new RegExp(`^# Changelog\\s+## ${packageJson.version.replace(/\./g, '\\.')}\\b`, 'm'))
     assert.match(changelog, /Cursor releases are versioned independently/i)
     assert.match(changelog, /package\.json.*protected.*0\.8\.0/is)

@@ -1,0 +1,23 @@
+{
+  "name": "devspec-autopilot",
+  "owner": {
+    "name": "DevSpecAI",
+    "email": "hello@devspec.ai"
+  },
+  "description": "DevSpec plugin for Cursor \u2014 action items implemented for you, interactive workflows, and Agents-page remote control.",
+  "plugins": [
+    {
+      "name": "devspec-autopilot",
+      "source": "./",
+      "description": "Connect Cursor's agent to DevSpec: pull a batch of action items and work them, and drive sessions from the Agents page.",
+      "version": "0.13.2",
+      "keywords": [
+        "devspec",
+        "agent",
+        "remote-control",
+        "action-items",
+        "planning"
+      ]
+    }
+  ]
+}

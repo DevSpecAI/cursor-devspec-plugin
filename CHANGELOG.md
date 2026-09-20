@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.2
+
+### The plugin was never installable from its own repo — a marketplace manifest was missing
+
+`cursor-agent plugin marketplace add <gitUrl>` reported success and indexed the repo, and
+the plugin still never loaded. Measured 2026-09-20: with `~/.cursor/plugins/local/` cleared,
+a full `cursor-agent` run fired **no** DevSpec hooks at all, while the same run with a local
+copy present fired them. Adding a marketplace is not installing a plugin, and nothing said so.
+
+The cause is that Cursor discovers plugins in a marketplace repo through
+`.cursor-plugin/marketplace.json` (it also accepts `.claude-plugin/marketplace.json`), and
+this repo only ever had `.cursor-plugin/plugin.json`. A plugin manifest describes the plugin;
+a marketplace manifest is what lists it as installable. Without the second file the repo is a
+marketplace containing nothing, which is indistinguishable from a working install right up
+until you look for a hook.
+
+The version now lives in three files, so the release test checks all three rather than two.
+
 ## 0.13.1
 
 ### A conflict ruling can come back contested, and the skill now says so
