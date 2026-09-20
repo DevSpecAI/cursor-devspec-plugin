@@ -469,7 +469,7 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model, 
   await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', 'utf8')
 
   // Prefer the extension recorded at --install/activate; never let a stale
-  // ~/.cursor/devspec copy shadow mechanical fast-connect after a VSIX update.
+  // ~/.cursor/devspec copy shadow mechanical fast-connect after a plugin update.
   const moduleDir = path.dirname(fileURLToPath(import.meta.url))
   const extensionRoot = await readExtensionRootMarker()
   const resolved = resolveCliLauncher('launch-cli-session.mjs', {

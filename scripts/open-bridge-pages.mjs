@@ -163,11 +163,13 @@ export function renderMissingMapping(slug) {
     <div class="repo">${safeSlug}</div>
     <p>We could not find a local folder for this repo yet.</p>
     <ol>
-      <li>Open Cursor</li>
-      <li>Command Palette → <strong>DevSpec: Manage repo folder mappings</strong></li>
-      <li>Or open the repo once so DevSpec Autopilot can learn it</li>
+      <li>Clone the repo locally if you have not already</li>
+      <li>Open it once with <code>cursor-agent</code> so DevSpec learns where it lives</li>
       <li>Click the rocket button again</li>
     </ol>
+    <p>To set it by hand, add the folder to
+    <code>~/.cursor/devspec/repo-folder-map.json</code> as
+    <code>{"${safeSlug}": "/absolute/path/to/repo"}</code>.</p>
   `
   return layout({
     title: 'Map repository',
