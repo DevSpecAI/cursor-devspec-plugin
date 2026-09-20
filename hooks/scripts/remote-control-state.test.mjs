@@ -69,10 +69,12 @@ describe('detectLocalId', () => {
     assert.equal(r.source, 'arg')
   })
 
-  it('prefers CODEX_THREAD_ID over other conversation env', () => {
+  it('ignores every other host\'s conversation env', () => {
+    // REVERSED from "prefers CODEX_THREAD_ID over other conversation env"
+    // (memory f90e2ff9, superseded 2026-09-20). This is the Cursor plugin.
     const r = detectLocalId({}, { CODEX_THREAD_ID: 'thread-1', GROK_SESSION_ID: 'grok-1' })
-    assert.equal(r.local_id, 'thread-1')
-    assert.equal(r.source, 'env:CODEX_THREAD_ID')
+    assert.equal(r.local_id, null)
+    assert.equal(r.source, null)
   })
 
   it('does NOT bond on SHELL_SESSION_ID / TERM_SESSION_ID (terminal, not conversation)', () => {
@@ -85,10 +87,12 @@ describe('detectLocalId', () => {
     assert.equal(r.source, null)
   })
 
-  it('uses CLAUDE_CODE_SESSION_ID even when a shell id is also present', () => {
-    const r = detectLocalId({}, { CLAUDE_CODE_SESSION_ID: 'claude-conv', SHELL_SESSION_ID: 'shell' })
-    assert.equal(r.local_id, 'claude-conv')
-    assert.equal(r.source, 'env:CLAUDE_CODE_SESSION_ID')
+  it('uses CURSOR_CONVERSATION_ID even when a shell id is also present', () => {
+    // Was CLAUDE_CODE_SESSION_ID — mis-ported. The point of the test (a shell
+    // id must not shadow the real conversation id) is unchanged.
+    const r = detectLocalId({}, { CURSOR_CONVERSATION_ID: 'cursor-conv', SHELL_SESSION_ID: 'shell' })
+    assert.equal(r.local_id, 'cursor-conv')
+    assert.equal(r.source, 'env:CURSOR_CONVERSATION_ID')
   })
 
   it('does not invent an id from cwd or empty env', () => {

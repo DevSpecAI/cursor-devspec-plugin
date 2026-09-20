@@ -80,7 +80,11 @@ import {
   proveCredentialPair,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
-import { AGENT_NAME } from './agent-identity.mjs'
+import {
+  AGENT_NAME,
+  CONVERSATION_ID_ENV_VARS,
+  LOCAL_ID_OVERRIDE_ENV_VAR,
+} from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
   clearConnectionCapability,
@@ -1329,14 +1333,11 @@ export function detectLocalId(args = {}, env = process.env) {
   const fromArg = sanitizeLocalId(args['local-id'] || args.localId || args.local_id)
   if (fromArg) return { local_id: fromArg, source: 'arg' }
 
+  // Own host only — see CONVERSATION_ID_ENV_VARS for why this is not the list
+  // of every host's variable it used to be (item 75f65461).
   const envPairs = [
-    ['DEVSPEC_REMOTE_LOCAL_ID', env.DEVSPEC_REMOTE_LOCAL_ID],
-    ['CURSOR_CONVERSATION_ID', env.CURSOR_CONVERSATION_ID],
-    ['CODEX_THREAD_ID', env.CODEX_THREAD_ID],
-    ['CLAUDE_CODE_SESSION_ID', env.CLAUDE_CODE_SESSION_ID],
-    ['CLAUDE_SESSION_ID', env.CLAUDE_SESSION_ID],
-    ['GROK_SESSION_ID', env.GROK_SESSION_ID],
-    ['GROK_CONVERSATION_ID', env.GROK_CONVERSATION_ID],
+    [LOCAL_ID_OVERRIDE_ENV_VAR, env[LOCAL_ID_OVERRIDE_ENV_VAR]],
+    ...CONVERSATION_ID_ENV_VARS.map((name) => [name, env[name]]),
   ]
   for (const [name, val] of envPairs) {
     const id = sanitizeLocalId(val)

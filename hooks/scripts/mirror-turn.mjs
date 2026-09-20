@@ -132,8 +132,19 @@ export function selectBoundState(candidates, conversationId, agentName = null) {
     .filter(Boolean)
     .filter(({ raw }) => raw?.enabled === true && raw?.connection_id)
 
+  const isMine = ({ raw }) =>
+    !agentName ||
+    String(raw.agent_name || '').toLowerCase() === String(agentName).toLowerCase()
+
   if (conversationId) {
+    // The agent check matters as much as the id. A conversation id is unique to
+    // its host, not across hosts, so matching on the id ALONE means a plugin
+    // that somehow resolved a foreign id would be handed that host's live
+    // connection — and then post, claim and disable as them (item 75f65461).
+    // detectLocalId no longer returns foreign ids, so this is belt and braces;
+    // it is also the half that keeps holding if an id arrives by another route.
     const bound = enabled
+      .filter(isMine)
       .filter(({ raw }) => raw.local_id === conversationId)
       .sort((a, b) => b.mtime - a.mtime)[0]?.raw
     if (bound) return bound

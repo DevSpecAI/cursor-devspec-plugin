@@ -27,10 +27,13 @@ import {
 } from './mirror-turn.mjs'
 
 describe('resolveHookConversationId', () => {
-  it('prefers CLAUDE_CODE_SESSION_ID env (the value write stamps)', () => {
+  it('prefers CURSOR_CONVERSATION_ID env (the value write stamps)', () => {
+    // Was CLAUDE_CODE_SESSION_ID — a Claude-shaped test mis-ported into the
+    // Cursor repo, asserting that Cursor answers as a Claude conversation
+    // (item 75f65461).
     assert.equal(
       resolveHookConversationId('{"session_id":"stdin-conv"}', {
-        CLAUDE_CODE_SESSION_ID: 'env-conv',
+        CURSOR_CONVERSATION_ID: 'env-conv',
       }),
       'env-conv',
     )
@@ -45,13 +48,25 @@ describe('resolveHookConversationId', () => {
     )
   })
 
-  it('falls back to CLAUDE_SESSION_ID', () => {
-    assert.equal(resolveHookConversationId('{}', { CLAUDE_SESSION_ID: 'alt-conv' }), 'alt-conv')
+  it('does NOT resolve another host\'s env id', () => {
+    // REVERSED from "resolves a non-Claude tool env id via the shared
+    // detectLocalId" and "falls back to CLAUDE_SESSION_ID" (memory f90e2ff9,
+    // superseded 2026-09-20 by Ali). Both asserted that the CURSOR plugin
+    // answers as a Claude, Grok or Codex conversation. A foreign id in the
+    // environment belongs to whoever launched us (item 75f65461).
+    assert.equal(resolveHookConversationId('{}', { CLAUDE_SESSION_ID: 'alt-conv' }), null)
+    assert.equal(resolveHookConversationId('{}', { CLAUDE_CODE_SESSION_ID: 'c-conv' }), null)
+    assert.equal(resolveHookConversationId('{}', { GROK_SESSION_ID: 'grok-conv' }), null)
+    assert.equal(resolveHookConversationId('{}', { CODEX_THREAD_ID: 'codex-conv' }), null)
   })
 
-  it('resolves a non-Claude tool env id via the shared detectLocalId', () => {
-    assert.equal(resolveHookConversationId('{}', { GROK_SESSION_ID: 'grok-conv' }), 'grok-conv')
-    assert.equal(resolveHookConversationId('{}', { CODEX_THREAD_ID: 'codex-conv' }), 'codex-conv')
+  it('still reaches the hook payload id when only a foreign env id is present', () => {
+    assert.equal(
+      resolveHookConversationId('{"conversation_id":"hook-conv"}', {
+        CLAUDE_CODE_SESSION_ID: 'env-conv',
+      }),
+      'hook-conv',
+    )
   })
 
   it('falls back to hook stdin session_id when no env id', () => {

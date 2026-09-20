@@ -108,7 +108,8 @@ describe('manual Cursor manage-plan CLI lifecycle', () => {
       DEVSPEC_MCP_URL: url,
     }
     for (const key of [
-      'DEVSPEC_REMOTE_LOCAL_ID', 'CURSOR_CONVERSATION_ID', 'CODEX_THREAD_ID',
+      'DEVSPEC_REMOTE_LOCAL_ID', 'DEVSPEC_REMOTE_LOCAL_ID_CURSOR',
+      'CURSOR_CONVERSATION_ID', 'CODEX_THREAD_ID',
       'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'GROK_SESSION_ID',
       'GROK_CONVERSATION_ID',
     ]) delete env[key]
