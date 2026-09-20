@@ -14,12 +14,34 @@ const remoteSkill = read('skills/devspec.remote/SKILL.md')
 
 describe('Cursor shared-session-plan surfaces', () => {
   it('keeps the command surface Cursor-operational and does not revive a prose work command', () => {
-    const commandIds = packageJson.contributes.commands.map((command) => command.command)
-    assert.deepEqual(commandIds.filter((id) => /^devspec\.(remote|remote-stop)$/.test(id)), [
-      'devspec.remote', 'devspec.remote-stop',
-    ])
-    assert.equal(commandIds.includes('devspec.work'), false)
-    assert.equal(commandIds.includes('devspec.managePlan'), false)
+    // This used to read `contributes.commands` from the VS Code manifest. The IDE
+    // extension is gone, so the surface a user actually reaches is the plugin's
+    // skills directory — the assertion is the same one, against where it now lives.
+    const skills = fs.readdirSync(new URL('../skills', import.meta.url)).sort()
+    assert.deepEqual(skills, ['devspec.remote', 'devspec.remote-stop'])
+    assert.equal(skills.includes('devspec.work'), false)
+    assert.equal(skills.includes('devspec.managePlan'), false)
+  })
+
+  it('ships no VS Code extension surface — Cursor is CLI-only', () => {
+    // The VSIX is not "unused", it is gone: a manifest that still declares an
+    // activation point is an install path someone will follow (item 19956e89).
+    for (const field of ['main', 'contributes', 'activationEvents', 'engines', 'publisher']) {
+      assert.equal(field in packageJson, false, `package.json still declares ${field}`)
+    }
+    assert.equal(fs.existsSync(new URL('../src/extension.ts', import.meta.url)), false)
+    assert.equal(fs.existsSync(new URL('../tsconfig.json', import.meta.url)), false)
+    assert.doesNotMatch(JSON.stringify(packageJson.scripts), /vsce|esbuild/)
+  })
+
+  it('documents the marketplace install and never the VSIX one', () => {
+    // The README is the install path for anyone who did not read the code, so a
+    // stale instruction here is not cosmetic — it is a route people follow.
+    assert.match(readme, /cursor-agent plugin marketplace add/)
+    assert.match(readme, /Adding a marketplace does not install the plugin/)
+    assert.doesNotMatch(readme, /Install from VSIX/i)
+    assert.doesNotMatch(readme, /command palette/i)
+    assert.doesNotMatch(readme, /DevSpec: (Set MCP token|Install rules|Install agent hooks)/)
   })
 
   it('keeps global MCP config generic: no per-conversation secret or giant static schema', () => {

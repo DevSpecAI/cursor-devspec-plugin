@@ -5,7 +5,7 @@
  * WHY THIS IS CURSOR-SPECIFIC (this repo owns every script in it — the plugins are
  * independent implementations and nothing is synced between them). The Cursor
  * extension stores the DevSpec token in Cursor's OWN MCP config —
- * `~/.cursor/mcp.json` (written by the "DevSpec: Set MCP token" command) or a
+ * `~/.cursor/mcp.json` (written by `node scripts/setup-cursor.mjs`) or a
  * project `.cursor/mcp.json` — NOT in a `CLAUDE_PLUGIN_OPTION_*` env var. The
  * detached poller and the turn-mirroring hooks run in a side channel that doesn't
  * share Cursor's config, so they must resolve THAT token — otherwise
@@ -104,7 +104,7 @@ function tokenNotFoundError(log, { urlOnly = false } = {}) {
   const looked = formatLookedIn(log)
   const unreadable = [...new Set((log?.entries || []).filter((e) => e.status === 'unreadable').map((e) => e.path))]
   const hint =
-    'Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.'
+    'Run: node scripts/setup-cursor.mjs --token <your DevSpec token> (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.'
   if (unreadable.length) {
     return `Found a DevSpec MCP config but could not parse it: ${unreadable.join(', ')}.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
   }

@@ -1,9 +1,7 @@
 {
   "name": "devspec-autopilot",
-  "displayName": "DevSpec Autopilot",
-  "description": "Connect Cursor's AI agent to DevSpec \u2014 pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the editor.",
+  "description": "Connect Cursor's agent to DevSpec — pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the terminal.",
   "version": "0.13.2",
-  "publisher": "devspecai",
   "license": "MIT",
   "author": {
     "name": "DevSpecAI",
@@ -14,13 +12,6 @@
     "type": "git",
     "url": "https://github.com/DevSpecAI/cursor-devspec-plugin"
   },
-  "engines": {
-    "vscode": "^1.90.0"
-  },
-  "categories": [
-    "AI",
-    "Other"
-  ],
   "keywords": [
     "devspec",
     "autopilot",
@@ -29,119 +20,12 @@
     "agent",
     "project-management"
   ],
-  "main": "./dist/extension.js",
-  "activationEvents": [
-    "onUri",
-    "onStartupFinished",
-    "onCommand:devspec.installProjectRules"
-  ],
-  "contributes": {
-    "commands": [
-      {
-        "command": "devspec.remote",
-        "title": "DevSpec: Connect remote control",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.remote-stop",
-        "title": "DevSpec: Disconnect remote control",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.setToken",
-        "title": "DevSpec: Set MCP token",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.registerMcpServer",
-        "title": "DevSpec: Register MCP server in Cursor config",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.installProjectRules",
-        "title": "DevSpec: Install rules",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.installRemoteControlHooks",
-        "title": "DevSpec: Install agent hooks",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.forgetRepoFolder",
-        "title": "DevSpec: Manage repo folder mappings",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.installProtocolHandler",
-        "title": "DevSpec: Install protocol handler",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.installOpenBridge",
-        "title": "DevSpec: Install handoff handler",
-        "category": "DevSpec"
-      },
-      {
-        "command": "devspec.startOpenBridge",
-        "title": "DevSpec: Start handoff handler",
-        "category": "DevSpec"
-      }
-    ],
-    "configuration": {
-      "title": "DevSpec",
-      "properties": {
-        "devspec.apiUrl": {
-          "type": "string",
-          "default": "https://api.devspec.ai",
-          "description": "Base URL of the DevSpec API (MCP is served at <base>/api/mcp). Production is https://api.devspec.ai; use https://api.devspecstaging.com for staging. Clear it to be prompted on the next connect."
-        },
-        "devspec.appUrl": {
-          "type": "string",
-          "default": "https://app.devspec.ai",
-          "description": "Base URL of the DevSpec web app, where human-facing pages such as the handoff error page live. Production is https://app.devspec.ai; use https://app.devspecstaging.com for staging. The handoff scripts read the same value from the DEVSPEC_APP_URL environment variable."
-        },
-        "devspec.mcpToken": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "DevSpec MCP token (starts with `dvs_`). Generate one at **You \u2192 Connections** in the DevSpec UI. Stored per-machine."
-        },
-        "devspec.autoInstallRules": {
-          "type": "string",
-          "enum": [
-            "prompt",
-            "always",
-            "never"
-          ],
-          "default": "always",
-          "enumDescriptions": [
-            "Ask once per workspace when MCP is configured",
-            "Install `.cursor/rules/devspec.mdc` automatically in git repos",
-            "Never offer or install project rules"
-          ],
-          "description": "How the extension installs DevSpec agent rules into the workspace."
-        }
-      }
-    }
-  },
   "scripts": {
-    "build": "esbuild src/extension.ts --bundle --platform=node --target=node18 --external:vscode --outfile=dist/extension.js",
-    "watch": "npm run build -- --watch",
-    "typecheck": "tsc --noEmit",
+    "setup": "node scripts/setup-cursor.mjs",
     "test": "node --test hooks/scripts/*.test.mjs scripts/*.test.mjs",
-    "package": "npm run build && node scripts/build-handler-exe.mjs && vsce package --out devspec-autopilot.vsix",
     "open-bridge": "node scripts/open-bridge.mjs",
     "open-handler:install": "node scripts/open-handler.mjs --install",
     "open-bridge:install": "node scripts/open-handler.mjs --install",
-    "handler:build-exe": "node scripts/build-handler-exe.mjs",
-    "publish": "npm run build && vsce publish"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "@types/vscode": "^1.90.0",
-    "@vscode/vsce": "^3.0.0",
-    "esbuild": "^0.21.0",
-    "typescript": "^5.4.0"
+    "handler:build-exe": "node scripts/build-handler-exe.mjs"
   }
 }

@@ -188,7 +188,10 @@ describe('resolveDevspecMcpAuth (Cursor)', () => {
     )
     const auth = resolveDevspecMcpAuth(d)
     assert.equal(auth.ok, false)
-    assert.match(auth.error, /DevSpec: Set MCP token/)
+    // The hint must name something that exists. It used to name the VS Code
+    // command "DevSpec: Set MCP token", which was deleted with the IDE half.
+    assert.match(auth.error, /setup-cursor\.mjs/)
+    assert.match(auth.error, /DEVSPEC_MCP_TOKEN/)
   })
 
   it('reads a UTF-8 BOM-prefixed ~/.cursor/mcp.json instead of treating it as missing', () => {
