@@ -29,8 +29,8 @@ console.log('')
 
 const check = spawnSync('node', [join(repo, 'scripts', 'check-currency.mjs')], { cwd: repo, stdio: 'inherit' })
 if ((check.status ?? 1) !== 0) {
-  console.log('Next step (manual): remove the marketplace, re-add it, then install:')
-  console.log('  cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin --git-ref staging')
-  console.log('  then run /plugins in the Cursor TUI and install the plugin. Do NOT use update — it re-indexes the same pinned commit.')
+  console.log('Next step (manual): launch the Cursor agent against this local clone — the development path, not the marketplace:')
+  console.log(`  cursor-agent --plugin-dir "${repo}"`)
+  console.log('The marketplace route is the customer path only. Do NOT use `marketplace update` — it re-indexes the same pinned commit.')
 }
 process.exit(check.status ?? 1)
