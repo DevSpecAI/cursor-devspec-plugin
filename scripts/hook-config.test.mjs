@@ -141,3 +141,29 @@ describe('Cursor hooks.json stays loadable by Cursor', () => {
     assert.deepEqual(merged.hooks.Stop, [theirs], 'deleting someone else\'s hooks is not ours to do')
   })
 })
+
+describe('the repo is installable as a Cursor plugin', () => {
+  // Without this manifest Cursor does not recognise the directory as a plugin
+  // at all: `~/.cursor/plugins/local` skips it, and a marketplace cannot index
+  // it. The repo carried a VS Code extension package.json instead, which is the
+  // VSIX legacy (item 19956e89). `hooks/hooks.json` is discovered automatically
+  // from here, so this manifest is the whole difference between "a directory"
+  // and "a plugin".
+  const manifest = JSON.parse(
+    fs.readFileSync(new URL('../.cursor-plugin/plugin.json', import.meta.url), 'utf8'),
+  )
+
+  it('has the one field Cursor requires, in the shape it requires', () => {
+    assert.equal(typeof manifest.name, 'string')
+    assert.match(
+      manifest.name,
+      /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/,
+      'name must be lowercase kebab-case and start/end alphanumeric',
+    )
+  })
+
+  it('keeps its version in step with package.json', () => {
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    assert.equal(manifest.version, pkg.version, 'two manifests, one version — or neither is trustworthy')
+  })
+})
