@@ -18,6 +18,22 @@ until you look for a hook.
 
 The version now lives in three files, so the release test checks all three rather than two.
 
+### `marketplace update` does not update, and the README said it did
+
+The install instructions shipped earlier the same day told people to run
+`cursor-agent plugin marketplace update` to get a newer version. It doesn't work, and it
+doesn't fail either: it prints `✓ Updated marketplace` and fetches nothing.
+
+Adding a marketplace resolves the ref with `git ls-remote` and stores the **resolved commit
+SHA**; the branch name is discarded, so a marketplace added from `main` retains no idea that
+it came from `main`. There is nothing for `update` to re-resolve, and it re-fetches the same
+commit. This bites customers, not just us — whoever installs is frozen on whatever commit was
+current that second. Updating is remove-and-re-add, which resolves the branch afresh.
+
+The README now says so, `--git-ref` is described as pinning rather than tracking, and a test
+asserts `marketplace update` never appears inside a copyable code block again. Measured
+against cursor-agent 2026.09.18-9a7762b.
+
 ## 0.13.1
 
 ### A conflict ruling can come back contested, and the skill now says so

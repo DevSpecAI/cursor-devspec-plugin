@@ -44,6 +44,20 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.doesNotMatch(readme, /DevSpec: (Set MCP token|Install rules|Install agent hooks)/)
   })
 
+  it('never hands the reader `marketplace update` as the way to update', () => {
+    // `cursor-agent plugin marketplace update` reports success and fetches nothing:
+    // add resolves the ref to a SHA and discards the branch name, so there is
+    // nothing to re-resolve (item 9d44f370). This README shipped that instruction
+    // for a few hours. The guard is placement, not mention — the command may be
+    // NAMED in the explanation of why not to use it, but must never appear inside
+    // a fenced block, which is where a reader copies from.
+    const fenced = [...readme.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1])
+    for (const block of fenced) {
+      assert.doesNotMatch(block, /marketplace update/, `a copyable block tells the reader to run marketplace update:\n${block}`)
+    }
+    assert.match(readme, /marketplace remove/)
+  })
+
   it('keeps global MCP config generic: no per-conversation secret or giant static schema', () => {
     const serialized = JSON.stringify(mcp)
     assert.match(serialized, /DEVSPEC_MCP_TOKEN/)

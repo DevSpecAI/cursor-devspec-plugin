@@ -41,13 +41,23 @@ marketplace you just added. **Adding a marketplace does not install the plugin**
 step is what makes it load, and skipping it looks exactly like a working install until you go
 looking for a hook.
 
-To track a pre-release branch instead of the default, add `--git-ref <branch>`.
+`--git-ref <branch>` **pins** to a branch rather than tracking it — see updating, below.
 
-Updating is the same command with `update`:
+### Updating
+
+Remove and re-add. Do not use `marketplace update`:
 
 ```bash
-cursor-agent plugin marketplace update devspec-autopilot
+cursor-agent plugin marketplace remove devspec-autopilot
+cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
 ```
+
+`cursor-agent plugin marketplace update` prints `✓ Updated marketplace` and fetches nothing
+new. Cursor resolves whatever ref you gave it to a commit SHA when you add the marketplace and
+stores only that SHA — the branch name is not kept — so there is nothing left for `update` to
+re-resolve and it re-fetches the same commit. Removing and re-adding resolves the branch afresh.
+Measured against cursor-agent 2026.09.18; if a later version keeps the branch name, this section
+should go.
 
 Once it is enabled, the plugin provides:
 
