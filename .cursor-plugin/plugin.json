@@ -1,12 +1,29 @@
 {
   "name": "devspec-autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "author": {
     "name": "DevSpec"
   },
   "homepage": "https://devspec.ai",
   "repository": "https://github.com/DevSpecAI/cursor-devspec-plugin",
   "license": "MIT",
-  "keywords": ["devspec", "agent", "remote-control", "action-items", "planning"]
+  "keywords": ["devspec", "agent", "remote-control", "action-items", "planning"],
+  "variables": {
+    "type": "object",
+    "properties": {
+      "DEVSPEC_MCP_TOKEN": {
+        "type": "string",
+        "title": "DevSpec token",
+        "description": "Your DevSpec connection key. Create or reveal one in DevSpec under Settings → Connections."
+      },
+      "DEVSPEC_API_URL": {
+        "type": "string",
+        "title": "DevSpec API URL (advanced)",
+        "description": "Overrides which DevSpec environment the plugin connects to. Only set this if DevSpec support asks you to.",
+        "default": "https://api.devspec.ai"
+      }
+    },
+    "required": ["DEVSPEC_MCP_TOKEN"]
+  }
 }

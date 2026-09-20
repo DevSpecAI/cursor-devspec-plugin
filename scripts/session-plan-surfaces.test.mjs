@@ -84,6 +84,35 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.match(readme, /Ambiguous sibling connections fail closed/i)
   })
 
+  it('declares in the manifest every variable mcp.json references', () => {
+    // Cursor's marketplace submission checklist rejects a plugin whose mcp.json uses a
+    // ${VAR} the manifest's variables schema does not declare — and the declaration is
+    // also the customer experience: declared variables are prompted at install and
+    // editable under Plugins → Configure, instead of a hand-edited file (item f67ff2e9).
+    const variables = pluginJson.variables
+    assert.ok(variables, 'plugin.json declares no variables schema')
+    assert.equal(variables.type, 'object')
+    assert.ok(variables.properties && typeof variables.properties === 'object')
+    const referenced = [...JSON.stringify(mcp).matchAll(/\$\{([A-Z0-9_]+)\}/g)].map((m) => m[1])
+    assert.ok(referenced.length > 0, 'mcp.json references no variables — is the placeholder gone?')
+    for (const name of referenced) {
+      assert.ok(name in variables.properties, `mcp.json references \${${name}} but the manifest does not declare it`)
+    }
+    // Only Cursor's accepted schema subset — anything else fails their parser, not ours.
+    const allowed = new Set(['type', 'title', 'description', 'default', 'enum', 'const', 'items', 'required', 'properties',
+      'minLength', 'maxLength', 'pattern', 'minimum', 'maximum'])
+    for (const [name, schema] of Object.entries(variables.properties)) {
+      for (const key of Object.keys(schema)) {
+        assert.ok(allowed.has(key), `variables.${name} uses unsupported schema keyword "${key}"`)
+      }
+    }
+    // The token is the one the customer must supply; the API URL is our staging override
+    // and must stay optional with the production default — never required, never staging.
+    assert.ok(variables.required.includes('DEVSPEC_MCP_TOKEN'))
+    assert.ok(!variables.required.includes('DEVSPEC_API_URL'))
+    assert.equal(variables.properties.DEVSPEC_API_URL.default, 'https://api.devspec.ai')
+  })
+
   it('keeps plan schema on demand and bounds prompt bytes before/after plan guidance', () => {
     const brief = buildPostLiveRemoteBrief({
       pluginPath: '/cursor/devspec-autopilot',

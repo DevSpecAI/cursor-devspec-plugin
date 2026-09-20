@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.13.3
+
+### The manifest now declares the variables `mcp.json` needs
+
+`mcp.json` references `${DEVSPEC_MCP_TOKEN}` and `${DEVSPEC_API_URL}`, and the manifest
+declared neither — a guaranteed failure on Cursor's marketplace submission checklist
+("declare every `${VAR}` from `mcp.json` in the manifest schema"), and a worse install than
+the one Cursor built: declared variables are prompted for at install time and editable later
+under Plugins → Configure, so the token becomes a form field instead of a hand-edited file.
+`DEVSPEC_MCP_TOKEN` is required; `DEVSPEC_API_URL` is optional and defaults to production —
+the staging override stays ours, never the shipped default. The surface test that already
+pins the three-version agreement now also fails if any `${VAR}` in `mcp.json` is undeclared,
+and if a schema keyword outside Cursor's accepted subset sneaks in.
+
 ## 0.13.2
 
 ### The plugin was never installable from its own repo — a marketplace manifest was missing
