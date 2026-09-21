@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. Cursor's own hook schema: flat per-event arrays and Cursor event names. The extension merges this fragment into ~/.cursor/hooks.json on activate.",
+  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. Cursor CLI loads this file from the installed plugin (CLAUDE_PLUGIN_ROOT); there is no IDE extension activate() merge into ~/.cursor/hooks.json.",
   "hooks": {
     "stop": [
       {
