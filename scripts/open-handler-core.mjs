@@ -464,7 +464,14 @@ export async function resolvePiExecutable() {
  * Open an OS terminal that runs launch-cli-session.mjs (interactive agent).
  * @param {{ folderPath: string, promptText: string | null, agentBin: string, model?: string | null }} opts
  */
-export async function openInAgentCli({ folderPath, promptText, agentBin, model, resumeChatId }) {
+export async function openInAgentCli({
+  folderPath,
+  promptText,
+  agentBin,
+  model,
+  resumeChatId,
+  settle = false,
+}) {
   await ensureDevspecDir()
   const launchesDir = path.join(DEVSPEC_DIR, 'launches')
   await fs.mkdir(launchesDir, { recursive: true })
@@ -482,7 +489,9 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model, 
     extensionRoot,
   })
   const launcher = resolved.path
-  await appendHandlerLog(`cli launcher source=${resolved.source} path=${launcher}`)
+  await appendHandlerLog(
+    `cli launcher source=${resolved.source} path=${launcher} settle=${settle}`,
+  )
 
   const nodeBin = process.execPath
   const launchArgs = [
@@ -501,6 +510,19 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model, 
   const existingChatId = typeof resumeChatId === 'string' ? resumeChatId.trim() : ''
   if (existingChatId) {
     launchArgs.push('--resume-chat-id', existingChatId)
+  }
+
+  if (settle) {
+    const settled = await runNodeLaunchSettled({
+      nodeBin,
+      launchArgs,
+      cwd: folderPath,
+      label: `cursor-cli settle ${stamp}`,
+    })
+    if (!settled.ok) {
+      throw new Error(`Cursor CLI settle failed: ${settled.error}`)
+    }
+    return
   }
 
   if (process.platform === 'win32') {
@@ -566,24 +588,102 @@ export async function openInAgentCli({ folderPath, promptText, agentBin, model, 
  * `false` → production headless: hidden spawn, no console flash. DevSpec's live
  * work trail (and needs-your-input) is the visibility surface for remote turns.
  * `true`  → TEMP DEBUG: open a real console and pass `--headed` so serve/client
- *           windows are visible. Flip back to `false` when finished debugging.
+ *           windows are visible.
  *
  * Escape hatch: pass `--headed` to launch-opencode-session.mjs directly.
  *
- * TEMP (item 3dd5467c, owner request 2026-08-10): headed again while live-testing
- * the Working trail / remote-control path. Production default remains headless —
- * set this back to `false` when that testing is done.
+ * Fleet fan-out always uses the settled (awaited) headless path regardless of
+ * this flag — fire-and-forget headed starts were racing OpenCode's SQLite DB
+ * (item 8a288219).
  */
-export const OPENCODE_LAUNCH_HEADED = true
+export const OPENCODE_LAUNCH_HEADED = false
+
+/** Default wait for a settled CLI launch script to exit (connect done or failed). */
+export const FLEET_SETTLE_TIMEOUT_MS = 180_000
+
+/**
+ * Run `node <launchArgs…>` in-process and wait until it exits.
+ * Used by fleet fan-out so spawn N+1 never starts while spawn N is still
+ * cold-starting (OpenCode DB lock, shared CLI binary races).
+ *
+ * @param {{ nodeBin: string, launchArgs: string[], cwd: string, label: string, timeoutMs?: number }} opts
+ * @returns {Promise<{ ok: true, code: number } | { ok: false, error: string, code?: number | null }>}
+ */
+export function runNodeLaunchSettled({
+  nodeBin,
+  launchArgs,
+  cwd,
+  label,
+  timeoutMs = FLEET_SETTLE_TIMEOUT_MS,
+}) {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+
+    const child = spawn(nodeBin, launchArgs, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        DEVSPEC_FLEET_SETTLE: '1',
+      },
+      // Not detached: we need the exit event for the ready-gate.
+    })
+
+    let tail = ''
+    const appendTail = (chunk) => {
+      tail = `${tail}${chunk}`.slice(-4000)
+    }
+    child.stdout?.on('data', (buf) => appendTail(String(buf)))
+    child.stderr?.on('data', (buf) => appendTail(String(buf)))
+
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        // ignore
+      }
+      void appendHandlerLog(
+        `${label} settle timeout after ${timeoutMs}ms` +
+          (tail ? ` tail=${JSON.stringify(tail.slice(-500))}` : ''),
+      )
+      finish({ ok: false, error: 'settle_timeout', code: null })
+    }, timeoutMs)
+
+    child.on('error', (err) => {
+      void appendHandlerLog(`${label} settle spawn error: ${err?.message || err}`)
+      finish({ ok: false, error: 'settle_spawn_failed', code: null })
+    })
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        finish({ ok: true, code: 0 })
+        return
+      }
+      void appendHandlerLog(
+        `${label} settle exited code=${code}` +
+          (tail ? ` tail=${JSON.stringify(tail.slice(-500))}` : ''),
+      )
+      finish({ ok: false, error: 'settle_failed', code })
+    })
+  })
+}
 
 /**
  * Launch OpenCode via launch-opencode-session.mjs.
  *
- * When `OPENCODE_LAUNCH_HEADED` is true, opens a visible terminal (TEMP DEBUG).
- * Flip the flag back to false for normal remote use.
- * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null }} opts
+ * When `settle` is true (fleet fan-out), always run headless and await the
+ * launch script exit — that is the ready-gate. Otherwise honour
+ * OPENCODE_LAUNCH_HEADED for single interactive launches.
+ * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null, settle?: boolean }} opts
  */
-export async function openInOpenCode({ folderPath, promptText, opencodeBin, model }) {
+export async function openInOpenCode({ folderPath, promptText, opencodeBin, model, settle = false }) {
   await ensureDevspecDir()
   const launchesDir = path.join(DEVSPEC_DIR, 'launches')
   await fs.mkdir(launchesDir, { recursive: true })
@@ -599,7 +699,7 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
     extensionRoot,
   })
   const launcher = resolved.path
-  await appendHandlerLog(`opencode launcher source=${resolved.source} path=${launcher}`)
+  await appendHandlerLog(`opencode launcher source=${resolved.source} path=${launcher} settle=${settle}`)
 
   const nodeBin = process.execPath
   const launchArgs = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--opencode', opencodeBin]
@@ -607,6 +707,21 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
   if (modelId) {
     launchArgs.push('--model', modelId)
   }
+
+  // Fleet ready-gate: await connect/server-up (or failure). Never fire-and-forget.
+  if (settle) {
+    const settled = await runNodeLaunchSettled({
+      nodeBin,
+      launchArgs,
+      cwd: folderPath,
+      label: `opencode settle ${stamp}`,
+    })
+    if (!settled.ok) {
+      throw new Error(`OpenCode settle failed: ${settled.error}`)
+    }
+    return
+  }
+
   if (OPENCODE_LAUNCH_HEADED) {
     launchArgs.push('--headed')
   }
@@ -672,9 +787,19 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
  * Launch an interactive Pi TUI in a visible terminal. Model and thinking are
  * optional signed overrides; omitting both preserves Pi's own current/default
  * runtime configuration.
- * @param {{ folderPath: string, promptText: string | null, piBin: string, model?: string | null, thinking?: string | null }} opts
+ *
+ * When `settle` is true (fleet), await the launch script instead of opening a
+ * fire-and-forget terminal window.
+ * @param {{ folderPath: string, promptText: string | null, piBin: string, model?: string | null, thinking?: string | null, settle?: boolean }} opts
  */
-export async function openInPi({ folderPath, promptText, piBin, model, thinking }) {
+export async function openInPi({
+  folderPath,
+  promptText,
+  piBin,
+  model,
+  thinking,
+  settle = false,
+}) {
   await ensureDevspecDir()
   const launchesDir = path.join(DEVSPEC_DIR, 'launches')
   await fs.mkdir(launchesDir, { recursive: true })
@@ -690,7 +815,7 @@ export async function openInPi({ folderPath, promptText, piBin, model, thinking 
     extensionRoot,
   })
   const launcher = resolved.path
-  await appendHandlerLog(`pi launcher source=${resolved.source} path=${launcher}`)
+  await appendHandlerLog(`pi launcher source=${resolved.source} path=${launcher} settle=${settle}`)
 
   const nodeBin = process.execPath
   const launchArgs = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--pi', piBin]
@@ -699,6 +824,19 @@ export async function openInPi({ folderPath, promptText, piBin, model, thinking 
   const thinkingLevel = typeof thinking === 'string' ? thinking.trim() : ''
   if (['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinkingLevel)) {
     launchArgs.push('--thinking', thinkingLevel)
+  }
+
+  if (settle) {
+    const settled = await runNodeLaunchSettled({
+      nodeBin,
+      launchArgs,
+      cwd: folderPath,
+      label: `pi settle ${stamp}`,
+    })
+    if (!settled.ok) {
+      throw new Error(`Pi settle failed: ${settled.error}`)
+    }
+    return
   }
 
   if (process.platform === 'win32') {
@@ -929,6 +1067,7 @@ export function parseHandoffUrl(raw) {
 
 /**
  * Execute a single-agent handoff (one IDE open or one CLI spawn).
+ * @param {{ settle?: boolean }} [opts] — when true (fleet), await each CLI launch script exit before returning.
  * @returns {Promise<{ ok: true } | { ok: false, error: string, slug?: string }>}
  */
 export async function executeSingleHandoff({
@@ -942,6 +1081,7 @@ export async function executeSingleHandoff({
   resumeChatId = null,
   requireSignedToken = true,
   unsigned = false,
+  settle = false,
 }) {
   if (requireSignedToken && unsigned) {
     await appendHandlerLog('rejected unsigned handoff')
@@ -963,7 +1103,7 @@ export async function executeSingleHandoff({
       return { ok: false, error: 'pi_missing', slug }
     }
     try {
-      await openInPi({ folderPath, promptText, piBin, model, thinking })
+      await openInPi({ folderPath, promptText, piBin, model, thinking, settle })
       await appendHandlerLog(`opened Pi ${slug} → ${folderPath} via ${piBin}`)
       return { ok: true }
     } catch (err) {
@@ -985,7 +1125,7 @@ export async function executeSingleHandoff({
       return { ok: false, error: 'opencode_missing', slug }
     }
     try {
-      await openInOpenCode({ folderPath, promptText, opencodeBin, model })
+      await openInOpenCode({ folderPath, promptText, opencodeBin, model, settle })
       await appendHandlerLog(`opened OpenCode ${slug} → ${folderPath} via ${opencodeBin}`)
       return { ok: true }
     } catch (err) {
@@ -1009,7 +1149,14 @@ export async function executeSingleHandoff({
       return { ok: false, error: 'agent_missing', slug }
     }
     try {
-      await openInAgentCli({ folderPath, promptText: pinnedPrompt, agentBin, model, resumeChatId })
+      await openInAgentCli({
+        folderPath,
+        promptText: pinnedPrompt,
+        agentBin,
+        model,
+        resumeChatId,
+        settle,
+      })
       await appendHandlerLog(`opened CLI ${slug} → ${folderPath} via ${agentBin}`)
       return { ok: true }
     } catch (err) {
@@ -1033,8 +1180,11 @@ export async function executeSingleHandoff({
   }
 }
 
-/** Pause between fleet spawns so hosts do not race on the same CLI binary. */
-const FLEET_SPAWN_GAP_MS = 750
+/**
+ * Small pause after a settled spawn. The ready-gate is the awaited launch
+ * script; this gap only softens residual CLI binary contention.
+ */
+const FLEET_SPAWN_GAP_MS = 250
 
 /**
  * Execute the handoff: open Cursor IDE (default) or spawn interactive Cursor CLI.
@@ -1092,6 +1242,7 @@ export async function executeHandoff({
         resumeChatId: null,
         requireSignedToken,
         unsigned,
+        settle: true,
       })
       if (result.ok) {
         spawned += 1

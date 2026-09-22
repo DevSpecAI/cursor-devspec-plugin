@@ -6,6 +6,8 @@ import {
   buildWindowsCliLaunchBat,
   buildWindowsCliStartCommand,
   resolveCliLauncher,
+  runNodeLaunchSettled,
+  OPENCODE_LAUNCH_HEADED,
   DEVSPEC_DIR,
 } from './open-handler-core.mjs'
 
@@ -116,5 +118,36 @@ describe('resolveCliLauncher', () => {
     })
     assert.equal(resolved.source, 'extension')
     assert.notEqual(resolved.path, installedLauncher)
+  })
+})
+
+describe('fleet settle ready-gate', () => {
+  it('keeps OpenCode production launches headless', () => {
+    assert.equal(OPENCODE_LAUNCH_HEADED, false)
+  })
+
+  it('runNodeLaunchSettled resolves ok when the child exits 0', async () => {
+    const result = await runNodeLaunchSettled({
+      nodeBin: process.execPath,
+      launchArgs: ['-e', 'process.exit(0)'],
+      cwd: process.cwd(),
+      label: 'test-settle-ok',
+      timeoutMs: 10_000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.code, 0)
+  })
+
+  it('runNodeLaunchSettled resolves failed when the child exits non-zero', async () => {
+    const result = await runNodeLaunchSettled({
+      nodeBin: process.execPath,
+      launchArgs: ['-e', 'process.exit(7)'],
+      cwd: process.cwd(),
+      label: 'test-settle-fail',
+      timeoutMs: 10_000,
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'settle_failed')
+    assert.equal(result.code, 7)
   })
 })
