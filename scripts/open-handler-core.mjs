@@ -1271,6 +1271,9 @@ export async function executeHandoff({
       // skips mechanical Connect when the prompt is not remote-connect
       // (item f053c2ed). Prefer a handoff prompt when present; else bare remote.
       const spawnPrompt = resolveFleetSpawnPrompt(promptText)
+      // Only OpenCode needs the settled ready-gate (SQLite DB race — item
+      // 8a288219). Pi / Cursor CLI use the fire-and-forget visible terminal
+      // path so Launch agents matches session-launch UX (item 6649667f).
       const result = await executeSingleHandoff({
         slug,
         promptText: spawnPrompt,
@@ -1282,7 +1285,7 @@ export async function executeHandoff({
         resumeChatId: null,
         requireSignedToken,
         unsigned,
-        settle: true,
+        settle: spawnTool === 'opencode',
       })
       if (result.ok) {
         spawned += 1

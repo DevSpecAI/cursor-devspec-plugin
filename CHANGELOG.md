@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.11
+
+### Launch agents Pi opens a visible terminal
+
+Fleet fan-out was settling every tool through `runNodeLaunchSettled`, and Pi's
+settle path spawned with `windowsHide:true` — so Launch agents reported ok with
+no window. Only OpenCode still settles (SQLite ready-gate); Pi uses the same
+visible `cmd start /k` path as session launch, and the settle script opens a
+visible terminal if settle is still requested. OpenCode stays headless.
+
 ## 0.13.7
 
 ### Start local agents fleet no longer launches empty prompts

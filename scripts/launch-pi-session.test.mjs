@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   buildPiLaunchArgs,
+  buildWindowsVisiblePiStartArgs,
   parsePiLaunchArgs,
   PI_THINKING_LEVELS,
 } from './launch-pi-session.mjs'
@@ -60,5 +61,18 @@ describe('parsePiLaunchArgs', () => {
         thinking: 'xhigh',
       },
     )
+  })
+})
+
+describe('buildWindowsVisiblePiStartArgs', () => {
+  it('opens a titled cmd /k window (not a hidden Pi process)', () => {
+    assert.deepEqual(buildWindowsVisiblePiStartArgs('C:\\Tools\\pi.cmd', ['hello world']), [
+      '/c',
+      'start',
+      'DevSpec Pi',
+      'cmd.exe',
+      '/k',
+      'C:\\Tools\\pi.cmd "hello world"',
+    ])
   })
 })
