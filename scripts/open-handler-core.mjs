@@ -10,6 +10,7 @@ import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
+import { recipeFromHandoffPayload } from './fleet-recipe.mjs'
 import { quoteWinCmdArg, composeWindowsCursorCliTitle, sanitizeWindowsConsoleTitle, windowsCursorCliStartArgs } from './launch-cli-session.mjs'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
@@ -888,6 +889,7 @@ export function parseHandoffUrl(raw) {
         typeof verified.data.resumeChatId === 'string' && verified.data.resumeChatId.trim()
           ? verified.data.resumeChatId.trim()
           : null,
+      recipe: recipeFromHandoffPayload(verified.data),
     }
   }
 

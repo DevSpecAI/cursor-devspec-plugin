@@ -31,6 +31,7 @@ async function copyInstalledArtifacts(sourceDir) {
   const files = [
     'open-handler.mjs',
     'open-handler-core.mjs',
+    'fleet-recipe.mjs',
     'pin-remote-plugin.mjs',
     'space-safe-plugin-root.mjs',
     'launch-cli-session.mjs',
