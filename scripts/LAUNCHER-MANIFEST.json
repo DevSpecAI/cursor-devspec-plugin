@@ -1,8 +1,8 @@
 {
-  "version": "0.2.3",
+  "version": "0.2.4",
   "files": {
     "open-handler.mjs": "sha256:6cae7cab45ee76bf58a477e3620f8cf596bf9ccd712d2144c06ff0f774505787",
-    "open-handler-core.mjs": "sha256:7aaec392cdc726a177fbba7a4686f789f1289c3bff76714822a3eeb1d6471ad9",
+    "open-handler-core.mjs": "sha256:0da96a5942bf8edf1e6af8f28a6d77ccedab33ebe873b20bff910de07ddca9df",
     "fleet-recipe.mjs": "sha256:b1eee565c64e92c12fa46ae43c4e8a11dd968da355ebf2898a1148ae0bb558a5",
     "pin-remote-plugin.mjs": "sha256:0c3d6120e0ebb78f965c76043ecbdec581d6f86acf64d930b66f32445b491092",
     "space-safe-plugin-root.mjs": "sha256:c0154401d9aeb6fa4a413c7dce36c6966f01fd9c5e000eb812a0229bab1f6d55",

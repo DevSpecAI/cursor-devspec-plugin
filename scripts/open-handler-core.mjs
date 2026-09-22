@@ -583,20 +583,19 @@ export async function openInAgentCli({
 }
 
 /**
- * OpenCode session launches — production intent is headless (item 63662a98).
+ * OpenCode session launches — production default is headed (item a08a1885).
  *
- * `false` → production headless: hidden spawn, no console flash. DevSpec's live
- * work trail (and needs-your-input) is the visibility surface for remote turns.
- * `true`  → TEMP DEBUG: open a real console and pass `--headed` so serve/client
- *           windows are visible.
+ * `true`  → visible serve/client consoles (same class of UX as Pi / Cursor CLI).
+ * `false` → hidden spawn; DevSpec's live work trail is then the only surface.
  *
- * Escape hatch: pass `--headed` to launch-opencode-session.mjs directly.
+ * Headless was the prior remote default (item 63662a98) when the trail was the
+ * intended visibility surface. Launch agents made that inconsistent with every
+ * other tool's visible terminal, so headed is the product default again.
  *
- * Fleet fan-out always uses the settled (awaited) headless path regardless of
- * this flag — fire-and-forget headed starts were racing OpenCode's SQLite DB
- * (item 8a288219).
+ * Fleet fan-out still awaits the settle ready-gate (item 8a288219) — headed
+ * does not mean fire-and-forget; `--headed` is passed into the settled script.
  */
-export const OPENCODE_LAUNCH_HEADED = false
+export const OPENCODE_LAUNCH_HEADED = true
 
 /**
  * Default wait for a settled CLI launch script to exit.
@@ -684,11 +683,11 @@ export function runNodeLaunchSettled({
 /**
  * Launch OpenCode via launch-opencode-session.mjs.
  *
- * When `settle` is true (fleet fan-out), always run headless and await the
- * launch script exit — that is the ready-gate. The script exits once the
- * local OpenCode server is healthy (DEVSPEC_FLEET_SETTLE), not when the
- * connect client finishes its remote turn. Otherwise honour
- * OPENCODE_LAUNCH_HEADED for single interactive launches.
+ * When `settle` is true (fleet fan-out), await the launch script exit — that is
+ * the SQLite ready-gate. The script exits once the local OpenCode server is
+ * healthy (DEVSPEC_FLEET_SETTLE), not when the connect client finishes its
+ * remote turn. `OPENCODE_LAUNCH_HEADED` still applies: settle + headed passes
+ * `--headed` into the awaited script so consoles are visible.
  * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null, settle?: boolean }} opts
  */
 export async function openInOpenCode({ folderPath, promptText, opencodeBin, model, settle = false }) {
@@ -715,6 +714,9 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
   if (modelId) {
     launchArgs.push('--model', modelId)
   }
+  if (OPENCODE_LAUNCH_HEADED) {
+    launchArgs.push('--headed')
+  }
 
   // Fleet ready-gate: await connect/server-up (or failure). Never fire-and-forget.
   if (settle) {
@@ -728,10 +730,6 @@ export async function openInOpenCode({ folderPath, promptText, opencodeBin, mode
       throw new Error(`OpenCode settle failed: ${settled.error}`)
     }
     return
-  }
-
-  if (OPENCODE_LAUNCH_HEADED) {
-    launchArgs.push('--headed')
   }
 
   // Headed: reuse Cursor CLI's visible-terminal path so the user can watch the

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.12
+
+### OpenCode launches headed by default
+
+OpenCode was headless so the DevSpec work trail could be the visibility
+surface. Launch agents made that inconsistent with Pi and Cursor CLI, which
+open real terminals. Default is headed again; fleet still settles on server
+health before the next recipe child.
+
 ## 0.13.11
 
 ### Launch agents Pi opens a visible terminal

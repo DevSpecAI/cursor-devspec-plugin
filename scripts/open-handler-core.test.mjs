@@ -123,8 +123,8 @@ describe('resolveCliLauncher', () => {
 })
 
 describe('fleet settle ready-gate', () => {
-  it('keeps OpenCode production launches headless', () => {
-    assert.equal(OPENCODE_LAUNCH_HEADED, false)
+  it('defaults OpenCode production launches to headed', () => {
+    assert.equal(OPENCODE_LAUNCH_HEADED, true)
   })
 
   it('runNodeLaunchSettled resolves ok when the child exits 0', async () => {
