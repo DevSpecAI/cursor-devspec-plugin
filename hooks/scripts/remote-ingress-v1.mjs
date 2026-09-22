@@ -7,6 +7,17 @@ export const REMOTE_INGRESS_CONTRACT_VERSION = '1.2.0'
 export const REMOTE_INGRESS_POLICY_VERSION = '2026-08-19.3'
 export const REMOTE_INGRESS_ACTIVE_PLAN_CONTRACT_VERSION = '1.3.0'
 export const REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION = '2026-08-21.1'
+export const REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION = '1.4.0'
+export const REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION = '2026-08-22.1'
+export const REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION = '1.5.0'
+export const REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION = '2026-09-18.1'
+
+/** Contract versions whose `active_session_plans` absence is authoritative (1.3+). */
+export const ACTIVE_PLAN_ASSERTION_CONTRACT_VERSIONS = new Set([
+  REMOTE_INGRESS_ACTIVE_PLAN_CONTRACT_VERSION,
+  REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION,
+  REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION,
+])
 export const ACTIVE_SESSION_PLAN_PROJECTION_VERSION = 1
 export const ACTIVE_SESSION_PLAN_AUTHORITY_NOTE =
   'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.'
@@ -16,7 +27,7 @@ export const DELEGATED_PROJECT_SCOPE_POLICY_ID = 'delegated_project_v1'
 const UUID = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/
 const DATE_SOURCE = '(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))'
 const DATETIME = new RegExp(`^${DATE_SOURCE}T(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)$`)
-const WAKE_KINDS = new Set(['conversational_command', 'control', 'advisory_update', 'history_reseed', 'idle'])
+const WAKE_KINDS = new Set(['conversational_command', 'control', 'system_notice', 'advisory_update', 'history_reseed', 'idle'])
 const ACTOR_KINDS = new Set(['human', 'agent', 'ai', 'system'])
 const RELATIONSHIPS = new Set(['before_window', 'within_window', 'after_command'])
 const AUTHORITY_KINDS = new Set(['owner', 'delegated'])
@@ -114,7 +125,12 @@ function validContext(value) {
 function validWindow(value, policyVersion = null) {
   const supportedPolicy = policyVersion
     ? value?.policy_version === policyVersion
-    : new Set([REMOTE_INGRESS_POLICY_VERSION, REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION]).has(value?.policy_version)
+    : new Set([
+        REMOTE_INGRESS_POLICY_VERSION,
+        REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION,
+        REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION,
+        REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION,
+      ]).has(value?.policy_version)
   if (!exact(value, ['policy_version', 'returned', 'total_known', 'source_window', 'truncated', 'has_more', 'next_cursor', 'fetch_id', 'omission_reason']) ||
       !supportedPolicy || !integer(value.returned) ||
       !(value.total_known === null || integer(value.total_known)) ||
@@ -192,22 +208,53 @@ function withinWindow(row, window) {
   return !!start && !!end && row.order.sequence >= start.sequence && row.order.sequence <= end.sequence
 }
 
+/** Sender response style for one delivered command (item 7c421a20). Read verbatim, never recomputed. */
+export function isSenderResponseStyleV1(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (!exact(value, ['message_id', 'notes'])) return false
+  if (!uuid(value.message_id)) return false
+  if (!Array.isArray(value.notes) || value.notes.length === 0 || value.notes.length > 8) return false
+  return value.notes.every((note) => typeof note === 'string' && note.length > 0)
+}
+
 /** Validate the authoritative v1 envelope without mutating or projecting it. */
 export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
+  const senderStyleContract = envelope?.contract_version === REMOTE_INGRESS_SENDER_STYLE_CONTRACT_VERSION &&
+    envelope?.policy_version === REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION
+  const noticeContract = senderStyleContract ||
+    (envelope?.contract_version === REMOTE_INGRESS_SYSTEM_NOTICE_CONTRACT_VERSION &&
+      envelope?.policy_version === REMOTE_INGRESS_SYSTEM_NOTICE_POLICY_VERSION)
   const activePlanContract = envelope?.contract_version === REMOTE_INGRESS_ACTIVE_PLAN_CONTRACT_VERSION &&
     envelope?.policy_version === REMOTE_INGRESS_ACTIVE_PLAN_POLICY_VERSION
   const scopedContract = envelope?.contract_version === REMOTE_INGRESS_CONTRACT_VERSION &&
     envelope?.policy_version === REMOTE_INGRESS_POLICY_VERSION
-  const keys = ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', ...(activePlanContract && Object.hasOwn(envelope, 'active_session_plans') ? ['active_session_plans'] : []), 'window']
+  // active_session_plans is optional across every tier that carries it (1.3+);
+  // system_notices is required on 1.4+; sender_response_styles is optional and
+  // present only when a sender expressed a preference (item 7c421a20).
+  const activePlanAware = activePlanContract || noticeContract
+  const keys = ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', ...(activePlanAware && Object.hasOwn(envelope, 'active_session_plans') ? ['active_session_plans'] : []), ...(noticeContract ? ['system_notices'] : []), ...(senderStyleContract && Object.hasOwn(envelope, 'sender_response_styles') ? ['sender_response_styles'] : []), 'window']
   if (!exact(envelope, keys)) return 'malformed canonical ingress envelope'
   if (envelope.kind !== 'devspec.remote_ingress' || envelope.schema_version !== REMOTE_INGRESS_SCHEMA_VERSION ||
-      (!activePlanContract && !scopedContract)) return 'unknown canonical ingress contract version'
-  if (activePlanContract && Object.hasOwn(envelope, 'active_session_plans') &&
+      (!activePlanContract && !scopedContract && !noticeContract)) return 'unknown canonical ingress contract version'
+  if (activePlanAware && Object.hasOwn(envelope, 'active_session_plans') &&
       !validActiveSessionPlans(envelope.active_session_plans)) return 'malformed active session plan projection'
+  if (noticeContract) {
+    if (!Array.isArray(envelope.system_notices) || envelope.system_notices.length > 25) return 'malformed system notices'
+    const hasNotices = envelope.system_notices.length > 0
+    if (hasNotices !== (envelope.wake.kind === 'system_notice')) return 'system notices must be nonempty iff wake kind is system_notice'
+    if (hasNotices && (envelope.commands.length > 0 || envelope.control !== null)) return 'system notices cannot accompany commands or control'
+  }
+  if (senderStyleContract && Object.hasOwn(envelope, 'sender_response_styles')) {
+    const styles = envelope.sender_response_styles
+    if (!Array.isArray(styles) || !styles.every(isSenderResponseStyleV1)) return 'invalid sender response styles'
+    const delivered = new Set(envelope.command_message_ids)
+    const ids = styles.map((style) => style.message_id)
+    if (ids.some((id) => !delivered.has(id)) || new Set(ids).size !== ids.length) return 'sender response style must name a delivered command exactly once'
+  }
   if (!uuid(envelope.envelope_id) || !validAddressee(envelope.connection) || envelope.connection.connection_id !== connectionId) return 'canonical ingress connection mismatch'
   if (!exact(envelope.wake, ['kind', 'active', 'reason_id']) || !WAKE_KINDS.has(envelope.wake.kind) ||
       typeof envelope.wake.active !== 'boolean' || !text(envelope.wake.reason_id)) return 'malformed canonical wake decision'
-  const activeKind = envelope.wake.kind === 'conversational_command' || envelope.wake.kind === 'control'
+  const activeKind = envelope.wake.kind === 'conversational_command' || envelope.wake.kind === 'control' || envelope.wake.kind === 'system_notice'
   if (envelope.wake.active !== activeKind || !new Set(['live', 'replay', 'reseed']).has(envelope.delivery_state)) return 'contradictory canonical wake decision'
   if (envelope.delivery_state !== 'live' && (envelope.wake.kind !== 'history_reseed' || envelope.wake.active)) return 'non-live ingress cannot wake'
   if (envelope.wake.kind === 'history_reseed' && envelope.delivery_state === 'live') return 'history ingress cannot be live'

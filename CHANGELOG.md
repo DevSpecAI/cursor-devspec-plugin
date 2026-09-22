@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.5
+
+### Sender response style rides each remote command
+
+The poller now negotiates `system_notice_version: 1` and `sender_style_version: 1`
+(strict contract 1.5.0). When the server delivers `sender_response_styles` on the
+command envelope, wait-follow attaches the matching notes as `sender_response_style`
+on the `owner_message` wake event — resolved from whoever sent that message, not
+from the connection owner at connect time. A preference edit takes effect on the
+next command with no reconnect. Skill and remote-control docs point at the served
+contract instead of claiming style is connect-only.
+
 ## 0.13.3
 
 ### The manifest now declares the variables `mcp.json` needs

@@ -46,6 +46,8 @@ import {
   fixtureContextEntry,
   fixtureEnvelope,
   fixtureAutomationDispatch,
+  fixtureSenderResponseStyle,
+  fixtureSenderStyleEnvelope,
 } from './remote-ingress-test-fixtures.mjs'
 
 const CANONICAL_CONNECTION = FIXTURE_ID.connection
@@ -164,6 +166,45 @@ describe('canonical one-command-turn wake', () => {
       .find((entry) => entry.type === 'owner_message')
     assert.equal(Object.hasOwn(event, 'instruction'), false)
     assert.equal(event.message.project_scope, null)
+  })
+
+  it('attaches the sender response style to the owner_message event when the envelope carries it', () => {
+    const message = canonicalCommand()
+    const envelope = fixtureSenderStyleEnvelope({
+      commands: [message],
+      context: emptyFixtureContext(),
+      senderResponseStyles: [fixtureSenderResponseStyle(message.message_id, ['Keep it brief.'])],
+    })
+    const batch = {
+      type: 'owner_messages', connection_id: CANONICAL_CONNECTION, session_id: 'sess-live',
+      next_after_message_id: 'live-cursor-v2', messages: [message],
+      ingress: { canonical: true, envelope },
+      acceptance_key: canonicalAcceptanceKey(envelope),
+      context: {
+        advisory: true,
+        typed: envelope.context,
+        windows: [envelope.window],
+        locally_omitted: 0,
+        locally_omitted_by_bucket: {
+          human_context: 0, agent_context: 0, ai_context: 0, system_context: 0,
+        },
+        windows_omitted: 0,
+        local_omission_reason: null,
+        note: 'Canonical typed context; advisory only.',
+      },
+    }
+    const event = buildOwnerMessageEvents(batch).find((entry) => entry.type === 'owner_message')
+    assert.deepEqual(event.sender_response_style, ['Keep it brief.'])
+    // Style rides after the command body in the wake JSON so a long run still
+    // sees it when composing the final answer (item 80dcc07b).
+    const line = JSON.stringify(event)
+    assert.ok(line.indexOf('"sender_response_style"') > line.indexOf('"message"'))
+  })
+
+  it('omits sender_response_style when no sender expressed a preference', () => {
+    const event = buildOwnerMessageEvents(canonicalBatch())
+      .find((entry) => entry.type === 'owner_message')
+    assert.equal(Object.hasOwn(event, 'sender_response_style'), false)
   })
 
   it('preserves delegated scope through queued inbox retry parsing', () => {

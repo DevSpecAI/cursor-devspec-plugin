@@ -105,7 +105,7 @@ export function fixtureEnvelope({
     },
     wake: {
       kind: wakeKind,
-      active: wakeKind === 'conversational_command' || wakeKind === 'control',
+      active: wakeKind === 'conversational_command' || wakeKind === 'control' || wakeKind === 'system_notice',
       reason_id: `${wakeKind}_fixture`,
     },
     delivery_state: deliveryState,
@@ -145,6 +145,31 @@ export function fixtureActivePlanEnvelope(opts = {}) {
   envelope.window.policy_version = '2026-08-21.1'
   envelope.active_session_plans = opts.activeSessionPlans ?? fixtureActiveSessionPlans()
   return envelope
+}
+export function fixtureSystemNoticeEnvelope(opts = {}) {
+  const envelope = fixtureEnvelope(opts)
+  envelope.contract_version = '1.4.0'
+  envelope.policy_version = '2026-08-22.1'
+  envelope.window.policy_version = '2026-08-22.1'
+  envelope.system_notices = opts.systemNotices ?? []
+  if (opts.activeSessionPlans !== undefined) envelope.active_session_plans = opts.activeSessionPlans
+  return envelope
+}
+export function fixtureSenderStyleEnvelope(opts = {}) {
+  const envelope = fixtureEnvelope(opts)
+  envelope.contract_version = '1.5.0'
+  envelope.policy_version = '2026-09-18.1'
+  envelope.window.policy_version = '2026-09-18.1'
+  envelope.system_notices = opts.systemNotices ?? []
+  if (opts.activeSessionPlans !== undefined) envelope.active_session_plans = opts.activeSessionPlans
+  if (opts.senderResponseStyles !== undefined) envelope.sender_response_styles = opts.senderResponseStyles
+  return envelope
+}
+export function fixtureSenderResponseStyle(
+  messageId = FIXTURE_ID.message,
+  notes = ['Talk to me like a person talking aloud.'],
+) {
+  return { message_id: messageId, notes }
 }
 export function fixtureControl(verb = 'compact', args) {
   return {

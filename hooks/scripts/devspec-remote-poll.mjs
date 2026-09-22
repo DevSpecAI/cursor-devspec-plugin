@@ -80,6 +80,7 @@ import { logRemoteControlStory } from './remote-control-story.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 import {
+  ACTIVE_PLAN_ASSERTION_CONTRACT_VERSIONS,
   canonicalAcceptanceKey,
   canonicalContextAcceptanceKey,
   emptyCanonicalContextCarry,
@@ -699,12 +700,23 @@ export function isDeliverableCommand(msg, connectionId) {
     validCommandProjectScope(msg.authority, msg.project_scope)
 }
 
-/** Feature negotiation required for scope-aware canonical and legacy commands. */
+/** The nested ingress ladder. Each tier requires the one below it (item 7c421a20). */
+export const SYSTEM_NOTICE_VERSION = 1
+export const SENDER_STYLE_VERSION = 1
+
+/**
+ * Feature negotiation for canonical ingress. `sender_style_version` makes the
+ * person who SENT a command decide how they get answered, rather than whoever
+ * owns this connection; the server refuses it without `system_notice_version`,
+ * so notices come along for the ride and are treated as advisory.
+ */
 export function remoteIngressNegotiationArgs() {
   return {
     ingress_version: 1,
     delegated_scope_version: 1,
     active_plan_projection_version: 1,
+    system_notice_version: SYSTEM_NOTICE_VERSION,
+    sender_style_version: SENDER_STYLE_VERSION,
   }
 }
 
@@ -1401,10 +1413,10 @@ async function main() {
     }
 
     const envelope = accepted.envelope
-    if (envelope.contract_version === '1.3.0') {
-      // Under negotiated 1.3 absence authoritatively means the attached room has no
-      // active plans. Older accepted tiers do not carry that assertion, so they do
-      // not erase a previously observed projection.
+    if (ACTIVE_PLAN_ASSERTION_CONTRACT_VERSIONS.has(envelope.contract_version)) {
+      // Under negotiated 1.3+ absence authoritatively means the attached room has
+      // no active plans. Older accepted tiers do not carry that assertion, so they
+      // do not erase a previously observed projection.
       activeSessionPlans = envelope.active_session_plans ?? null
     }
     const transportProgress =

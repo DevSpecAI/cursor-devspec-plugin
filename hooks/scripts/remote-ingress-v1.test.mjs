@@ -15,6 +15,9 @@ import {
   fixtureActivePlanEnvelope,
   fixtureActiveSessionPlans,
   fixtureEnvelope,
+  fixtureSenderResponseStyle,
+  fixtureSenderStyleEnvelope,
+  fixtureSystemNoticeEnvelope,
   fixtureUuid,
   fixtureWindow as windowFor,
 } from './remote-ingress-test-fixtures.mjs'
@@ -285,5 +288,100 @@ describe('canonical remote ingress v1', () => {
     const replayed = mergeCanonicalContextCarry(carry, first, { maxCount: 20, maxChars: 12_000 })
     assert.equal(replayed.context.ai_context.length, 1)
     assert.equal(replayed.windows.length, 1)
+  })
+
+  it('accepts strict 1.5 sender-response style and preserves the notes verbatim', () => {
+    const styled = fixtureSenderStyleEnvelope({
+      senderResponseStyles: [fixtureSenderResponseStyle(ID.message)],
+    })
+    const parsed = normalizeRemoteIngressV1({ changed: true, ingress: styled }, ID.connection)
+    assert.equal(parsed.ok, true)
+    assert.equal(parsed.wake, true)
+    assert.deepEqual(parsed.envelope.sender_response_styles, styled.sender_response_styles)
+    assert.equal(validateRemoteIngressEnvelopeV1(styled, ID.connection), null)
+  })
+
+  it('accepts a 1.5 conversational command with no sender preference and empty notices', () => {
+    const plain = fixtureSenderStyleEnvelope()
+    assert.equal(validateRemoteIngressEnvelopeV1(plain, ID.connection), null)
+    assert.equal(Object.hasOwn(plain, 'sender_response_styles'), false)
+  })
+
+  it('rejects sender response style that does not name a delivered command exactly once', () => {
+    const undelivered = fixtureSenderStyleEnvelope({
+      senderResponseStyles: [fixtureSenderResponseStyle('99999999-9999-4999-8999-999999999999')],
+    })
+    assert.match(validateRemoteIngressEnvelopeV1(undelivered, ID.connection), /delivered command/)
+
+    const duplicated = fixtureSenderStyleEnvelope({
+      senderResponseStyles: [
+        fixtureSenderResponseStyle(ID.message),
+        fixtureSenderResponseStyle(ID.message),
+      ],
+    })
+    assert.match(validateRemoteIngressEnvelopeV1(duplicated, ID.connection), /delivered command/)
+  })
+
+  it('rejects malformed sender response style notes', () => {
+    const emptyNotes = fixtureSenderStyleEnvelope({
+      senderResponseStyles: [{ message_id: ID.message, notes: [] }],
+    })
+    assert.match(validateRemoteIngressEnvelopeV1(emptyNotes, ID.connection), /sender response styles/)
+
+    const blankNote = fixtureSenderStyleEnvelope({
+      senderResponseStyles: [{ message_id: ID.message, notes: [''] }],
+    })
+    assert.match(validateRemoteIngressEnvelopeV1(blankNote, ID.connection), /sender response styles/)
+  })
+
+  it('requires system_notices on 1.4+ and rejects notices alongside commands', () => {
+    const missingNotices = fixtureSystemNoticeEnvelope()
+    delete missingNotices.system_notices
+    assert.match(validateRemoteIngressEnvelopeV1(missingNotices, ID.connection), /malformed canonical ingress/)
+
+    // Notices on a conversational wake fail the nonempty↔kind pairing first
+    // (same order as the Claude host validator); the accompany rule is the
+    // second gate when the wake kind already says system_notice.
+    const noticesWithCommands = fixtureSystemNoticeEnvelope({
+      systemNotices: [{ id: ID.control }],
+    })
+    assert.match(
+      validateRemoteIngressEnvelopeV1(noticesWithCommands, ID.connection),
+      /nonempty iff wake kind is system_notice/,
+    )
+  })
+
+  it('accepts a system-notice wake with no commands and rejects a notice wake alongside a command', () => {
+    const noticeWake = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [],
+      systemNotices: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }],
+    })
+    assert.equal(validateRemoteIngressEnvelopeV1(noticeWake, ID.connection), null)
+
+    // fixtureEnvelope only auto-fills commands for conversational_command;
+    // pass an explicit command so the accompany gate is what fires.
+    const noticeWithCommand = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [command('ship it')],
+      systemNotices: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }],
+    })
+    assert.match(
+      validateRemoteIngressEnvelopeV1(noticeWithCommand, ID.connection),
+      /system notices cannot accompany/,
+    )
+  })
+
+  it('accepts active_session_plans on the 1.5 tier without regressing 1.2 strictness', () => {
+    const styledWithPlans = fixtureSenderStyleEnvelope({
+      activeSessionPlans: fixtureActiveSessionPlans(),
+      senderResponseStyles: [fixtureSenderResponseStyle(ID.message)],
+    })
+    assert.equal(validateRemoteIngressEnvelopeV1(styledWithPlans, ID.connection), null)
+
+    const scoped = envelope()
+    assert.equal(validateRemoteIngressEnvelopeV1(scoped, ID.connection), null)
+    scoped.system_notices = []
+    assert.match(validateRemoteIngressEnvelopeV1(scoped, ID.connection), /malformed canonical ingress/)
   })
 })

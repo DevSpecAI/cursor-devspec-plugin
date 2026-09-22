@@ -1134,6 +1134,9 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     })
   }
 
+  const senderStyles = Array.isArray(batch?.ingress?.envelope?.sender_response_styles)
+    ? batch.ingress.envelope.sender_response_styles
+    : []
   for (const m of messages) {
     // Attachments become on-disk files + descriptors. Emitting the server's base64
     // verbatim used to blow the turn up ~2.7x the source image (item 99165e12).
@@ -1143,11 +1146,17 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
       typeof m?.project_scope?.instruction === 'string'
       ? m.project_scope.instruction
       : null
+    // How the person who SENT this command likes to be answered, resolved from
+    // them when they sent it and delivered with the command (item 7c421a20).
+    // Never work, authority or scope; never overrides project rules or the
+    // owner's machine rules.
+    const senderResponseStyle = senderStyles.find((style) => style.message_id === m.message_id)?.notes ?? null
     events.push({
       type: 'owner_message',
       session_id: sessionId,
       ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
       message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
+      ...(senderResponseStyle ? { sender_response_style: senderResponseStyle } : {}),
     })
   }
 
