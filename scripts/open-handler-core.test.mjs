@@ -6,6 +6,7 @@ import {
   buildWindowsCliLaunchBat,
   buildWindowsCliStartCommand,
   resolveCliLauncher,
+  resolveAppBaseUrl,
   runNodeLaunchSettled,
   OPENCODE_LAUNCH_HEADED,
   DEVSPEC_DIR,
@@ -149,5 +150,47 @@ describe('fleet settle ready-gate', () => {
     assert.equal(result.ok, false)
     assert.equal(result.error, 'settle_failed')
     assert.equal(result.code, 7)
+  })
+})
+
+describe('resolveAppBaseUrl', () => {
+  it('prefers DEVSPEC_APP_URL when set', () => {
+    const base = resolveAppBaseUrl({
+      env: { DEVSPEC_APP_URL: 'https://app.devspecstaging.com/' },
+      readFileSync: () => {
+        throw new Error('should not read remote-control when env is set')
+      },
+    })
+    assert.equal(base, 'https://app.devspecstaging.com')
+  })
+
+  it('mirrors staging MCP host when env is unset', () => {
+    const base = resolveAppBaseUrl({
+      env: {},
+      remoteControlPath: '/tmp/fake-rc.json',
+      readFileSync: () =>
+        JSON.stringify({ mcp_url: 'https://api.devspecstaging.com/api/mcp' }),
+    })
+    assert.equal(base, 'https://app.devspecstaging.com')
+  })
+
+  it('mirrors production MCP host when env is unset', () => {
+    const base = resolveAppBaseUrl({
+      env: {},
+      remoteControlPath: '/tmp/fake-rc.json',
+      readFileSync: () => JSON.stringify({ mcp_url: 'https://api.devspec.ai/api/mcp' }),
+    })
+    assert.equal(base, 'https://app.devspec.ai')
+  })
+
+  it('falls back to production app host when nothing is configured', () => {
+    const base = resolveAppBaseUrl({
+      env: {},
+      remoteControlPath: '/tmp/missing-rc.json',
+      readFileSync: () => {
+        throw new Error('ENOENT')
+      },
+    })
+    assert.equal(base, 'https://app.devspec.ai')
   })
 })

@@ -598,7 +598,13 @@ export async function openInAgentCli({
  */
 export const OPENCODE_LAUNCH_HEADED = false
 
-/** Default wait for a settled CLI launch script to exit (connect done or failed). */
+/**
+ * Default wait for a settled CLI launch script to exit.
+ * OpenCode's fleet settle exits once the local server is healthy (see
+ * DEVSPEC_FLEET_SETTLE in launch-opencode-session.mjs); Cursor CLI / Pi exit
+ * after their launch script finishes spawning. Keep this generous for slow
+ * cold starts, not for a whole agent turn.
+ */
 export const FLEET_SETTLE_TIMEOUT_MS = 180_000
 
 /**
@@ -679,7 +685,9 @@ export function runNodeLaunchSettled({
  * Launch OpenCode via launch-opencode-session.mjs.
  *
  * When `settle` is true (fleet fan-out), always run headless and await the
- * launch script exit — that is the ready-gate. Otherwise honour
+ * launch script exit — that is the ready-gate. The script exits once the
+ * local OpenCode server is healthy (DEVSPEC_FLEET_SETTLE), not when the
+ * connect client finishes its remote turn. Otherwise honour
  * OPENCODE_LAUNCH_HEADED for single interactive launches.
  * @param {{ folderPath: string, promptText: string | null, opencodeBin: string, model?: string | null, settle?: boolean }} opts
  */
@@ -916,18 +924,50 @@ function openExternalUrl(url) {
 }
 
 /**
+ * App origin for human pages (error interstitial, etc.).
+ *
+ * Order: explicit DEVSPEC_APP_URL → known MCP host pairs from the live
+ * remote-control state → production app.devspec.ai.
+ *
+ * Staging dogfood machines often have MCP on api.devspecstaging.com without
+ * setting DEVSPEC_APP_URL; falling through to app.devspec.ai then opens a
+ * DNS-dead host ("site can't be reached"). Only the two settled host pairs
+ * are rewritten — never invent a hostname from an arbitrary API URL.
+ *
+ * @param {{ env?: NodeJS.ProcessEnv, remoteControlPath?: string, readFileSync?: (path: string, encoding: string) => string }} [opts]
+ * @returns {string}
+ */
+export function resolveAppBaseUrl(opts = {}) {
+  const env = opts.env ?? process.env
+  const fromEnv = typeof env.DEVSPEC_APP_URL === 'string' ? env.DEVSPEC_APP_URL.replace(/\/+$/, '') : ''
+  if (fromEnv) return fromEnv
+
+  const rcPath =
+    opts.remoteControlPath ?? path.join(os.homedir(), '.devspec', 'remote-control.json')
+  const readFile = opts.readFileSync ?? fsSync.readFileSync
+  try {
+    const raw = readFile(rcPath, 'utf8')
+    const mcpUrl = JSON.parse(raw)?.mcp_url
+    if (typeof mcpUrl === 'string') {
+      if (mcpUrl.includes('api.devspecstaging.com')) return 'https://app.devspecstaging.com'
+      if (mcpUrl.includes('api.devspec.ai')) return 'https://app.devspec.ai'
+    }
+  } catch {
+    // missing/unreadable config — fall through to production default
+  }
+  return 'https://app.devspec.ai'
+}
+
+/**
  * `tool` is passed so the page can name the agent the person actually launched. Without it the
  * page defaults to Cursor and tells a Pi user to go and fix something in an editor they may not
  * have installed — the same wrong-default class already fixed on the interstitial.
  */
 function openErrorPage(slug, reason, tool = 'cursor') {
-  // The error page is a human page, so it lives on the app host (app.*), not the
-  // API host (api.*) that serves MCP. The two are separate settings — DEVSPEC_APP_URL
-  // / devspec.appUrl — rather than one derived from the other by rewriting a
-  // hostname, because nothing guarantees the pair share a shape (staging is
-  // app.devspecstaging.com beside api.devspecstaging.com today, and either could
-  // move alone).
-  const base = process.env.DEVSPEC_APP_URL?.replace(/\/+$/, '') || 'https://app.devspec.ai'
+  // Human pages live on the app host (app.*), not the API host (api.*). Prefer
+  // DEVSPEC_APP_URL; otherwise resolveAppBaseUrl mirrors the machine's MCP
+  // staging/prod pair (item 2ed52078 / af6a1d20).
+  const base = resolveAppBaseUrl()
   const params = new URLSearchParams({ repo: slug, reason, tool })
   openExternalUrl(`${base}/cursor-handoff/error?${params}`)
 }

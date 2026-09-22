@@ -769,6 +769,24 @@ async function main() {
   attachStreamLogging(client.stdout, 'stdout', stdoutCapture, headed)
   attachStreamLogging(client.stderr, 'stderr', stderrCapture, headed)
 
+  // Fleet ready-gate (item 2ed52078): settle means "server healthy", not
+  // "connect client finished its whole remote turn". `opencode run --attach`
+  // with a remote-connect prompt can run for minutes; awaiting it made fleet
+  // Launch agents time out at 180s, kill the client, and open an error page
+  // while Pi never got a chance to start. DEVSPEC_FLEET_SETTLE=1 is set by
+  // open-handler-core's runNodeLaunchSettled.
+  if (process.env.DEVSPEC_FLEET_SETTLE === '1') {
+    client.unref()
+    console.log(
+      `[devspec-opencode] Fleet settle: server healthy on ${attachUrl}; connect client detached`,
+    )
+    await log(
+      `fleet settle: server healthy port=${port} client_pid=${client.pid ?? 'unknown'} (not awaiting connect exit)`,
+    )
+    process.exitCode = 0
+    return
+  }
+
   const exit = await waitForChildExit(client)
   if (exit.error) {
     console.error(`[devspec-opencode] failed to run connect command: ${exit.error}`)
