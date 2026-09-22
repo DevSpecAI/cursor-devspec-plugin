@@ -6,7 +6,7 @@
  * lets Pi use the user's own current/default configuration.
  */
 import fs from 'node:fs/promises'
-import { spawnAgentSync } from './launch-cli-session.mjs'
+import { spawnAgent, spawnAgentSync } from './launch-cli-session.mjs'
 
 export const PI_THINKING_LEVELS = Object.freeze([
   'off',
@@ -68,6 +68,36 @@ async function main() {
     model: args.model,
     thinking: args.thinking,
   })
+
+  // Fleet ready-gate: start Pi detached and exit once the process is alive so
+  // the next recipe child can launch. Interactive (non-fleet) waits on Pi.
+  if (process.env.DEVSPEC_FLEET_SETTLE === '1') {
+    const child = spawnAgent(piBin, piArgs, {
+      cwd: args.folder,
+      stdio: 'ignore',
+      detached: true,
+      windowsHide: true,
+      encoding: 'utf8',
+    })
+    child.on('error', (err) => {
+      console.error(`[devspec-pi] failed to start Pi: ${err.message}`)
+      process.exitCode = 1
+    })
+    if (!child.pid) {
+      console.error('[devspec-pi] Pi spawn returned no pid')
+      process.exitCode = 1
+      return
+    }
+    try {
+      child.unref()
+    } catch {
+      // ignore
+    }
+    console.log(`[devspec-pi] Fleet settle: Pi started pid=${child.pid}`)
+    process.exitCode = 0
+    return
+  }
+
   const result = spawnAgentSync(piBin, piArgs, {
     cwd: args.folder,
     stdio: 'inherit',

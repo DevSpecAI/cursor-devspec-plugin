@@ -154,6 +154,35 @@ async function main() {
 
   if (args.includes('--install')) {
     await copyInstalledArtifacts(__dirname)
+    // Also refresh the machine-level shared launcher (~/.devspec/launcher) when
+    // this plugin's copy is newer (Ali/Brandon fleet path — item 8a288219).
+    try {
+      const { ensureLauncherInstalled } = await import('./ensure.mjs')
+      const fsSync = await import('node:fs')
+      const manifestPath = path.join(__dirname, 'LAUNCHER-MANIFEST.json')
+      let launcherVersion = '0.2.0'
+      try {
+        const manifest = JSON.parse(fsSync.readFileSync(manifestPath, 'utf8'))
+        if (manifest?.version) launcherVersion = String(manifest.version)
+      } catch {
+        // default version above
+      }
+      const ensured = ensureLauncherInstalled({
+        sourceDir: __dirname,
+        version: launcherVersion,
+      })
+      await appendHandlerLog(
+        `shared launcher ensure outcome=${ensured.outcome} version=${ensured.version || launcherVersion}`,
+      )
+      console.log(
+        `[devspec-open-handler] shared launcher: ${ensured.outcome}` +
+          (ensured.version ? ` (${ensured.version})` : ''),
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await appendHandlerLog(`shared launcher ensure failed: ${message}`)
+      console.warn(`[devspec-open-handler] shared launcher ensure skipped: ${message}`)
+    }
     // Lazy-load so URL-only invocations (OS protocol launches) do not require
     // register-protocol.mjs to be present — that was the Windows crash.
     const { installProtocolHandler, uninstallLegacyBridge } = await import(
@@ -165,8 +194,19 @@ async function main() {
       await startMacOsBridgeServer()
       console.log('[devspec-open-handler] macOS: localhost bridge fallback active')
     } else {
-      const result = await installProtocolHandler(path.join(DEVSPEC_DIR, 'devspec-handler.cmd'))
-      console.log('[devspec-open-handler] devspec:// protocol registered')
+      // Prefer the shared launcher home when present so fleet/OS launches do not
+      // stay pinned to ~/.cursor/devspec after a Cursor-only install.
+      const os = await import('node:os')
+      const sharedCmd = path.join(os.homedir(), '.devspec', 'launcher', 'devspec-handler.cmd')
+      let handlerCmd = path.join(DEVSPEC_DIR, 'devspec-handler.cmd')
+      try {
+        await fs.access(sharedCmd)
+        handlerCmd = sharedCmd
+      } catch {
+        // fall back to Cursor install tree
+      }
+      const result = await installProtocolHandler(handlerCmd)
+      console.log(`[devspec-open-handler] devspec:// protocol registered → ${handlerCmd}`)
       // Linux returns what actually happened. Report it: a scheme owned by
       // another app is the difference between "registered" and "will work".
       if (result?.repaired?.length) {

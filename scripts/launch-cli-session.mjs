@@ -679,8 +679,9 @@ async function main() {
   })
 
   const inv = resolveWindowsAgentInvocation(agentBin)
+  const fleetSettle = process.env.DEVSPEC_FLEET_SETTLE === '1'
   console.log(
-    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} model=${args.model || 'auto'} invoke=${inv.mode})`,
+    `[devspec-cli] Resuming chat ${chatId} in ${args.folder} (kind=${kind} model=${args.model || 'auto'} invoke=${inv.mode}${fleetSettle ? ' fleet_settle' : ''})`,
   )
   const spawnStarted = Date.now()
   const child = spawnAgent(
@@ -688,7 +689,9 @@ async function main() {
     ['--resume', chatId, '--workspace', args.folder, ...policyFlags, argvPrompt],
     {
       cwd: args.folder,
-      stdio: 'inherit',
+      stdio: fleetSettle ? 'ignore' : 'inherit',
+      detached: fleetSettle,
+      windowsHide: fleetSettle ? true : undefined,
       env: {
         ...process.env,
         DEVSPEC_LAUNCH_ID: launchId,
@@ -774,6 +777,19 @@ async function main() {
         )
       }
     }
+  }
+
+  // Fleet ready-gate: agent is up and poller anchored — exit so the next
+  // recipe child can start. Keep the agent process alive (detached + unref).
+  if (fleetSettle) {
+    try {
+      child.unref()
+    } catch {
+      // ignore
+    }
+    console.log('[devspec-cli] Fleet settle complete; leaving agent running')
+    process.exitCode = 0
+    return
   }
 
   child.on('exit', (code, signal) => {
