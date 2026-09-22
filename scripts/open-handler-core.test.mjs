@@ -151,6 +151,26 @@ describe('fleet settle ready-gate', () => {
     assert.equal(result.error, 'settle_failed')
     assert.equal(result.code, 7)
   })
+
+  it('runNodeLaunchSettled resolves on exit even if a grandchild holds the pipe', async () => {
+    // Mimics headed OpenCode inherit: child exits 0 while a grandchild still
+    // holds the inherited stdout pipe briefly. Listening on 'close' would hang
+    // until the grandchild exits; 'exit' must resolve immediately.
+    const started = Date.now()
+    const result = await runNodeLaunchSettled({
+      nodeBin: process.execPath,
+      launchArgs: [
+        '-e',
+        "const {spawn}=require('child_process'); const g=spawn(process.execPath,['-e','setTimeout(()=>{}, 4000)'],{stdio:'inherit',detached:true,windowsHide:true}); g.unref(); process.exit(0)",
+      ],
+      cwd: process.cwd(),
+      label: 'test-settle-exit-vs-close',
+      timeoutMs: 10_000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.code, 0)
+    assert.ok(Date.now() - started < 2000, 'settle must resolve on exit, not wait for pipe close')
+  })
 })
 
 describe('resolveAppBaseUrl', () => {

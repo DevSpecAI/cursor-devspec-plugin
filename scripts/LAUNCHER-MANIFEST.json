@@ -1,13 +1,13 @@
 {
-  "version": "0.2.4",
+  "version": "0.2.5",
   "files": {
     "open-handler.mjs": "sha256:6cae7cab45ee76bf58a477e3620f8cf596bf9ccd712d2144c06ff0f774505787",
-    "open-handler-core.mjs": "sha256:0da96a5942bf8edf1e6af8f28a6d77ccedab33ebe873b20bff910de07ddca9df",
+    "open-handler-core.mjs": "sha256:aa592b51a7337988bc56d0e0db33c57d04e9c461c9dc981212d9c2781be0c0b3",
     "fleet-recipe.mjs": "sha256:b1eee565c64e92c12fa46ae43c4e8a11dd968da355ebf2898a1148ae0bb558a5",
     "pin-remote-plugin.mjs": "sha256:0c3d6120e0ebb78f965c76043ecbdec581d6f86acf64d930b66f32445b491092",
     "space-safe-plugin-root.mjs": "sha256:c0154401d9aeb6fa4a413c7dce36c6966f01fd9c5e000eb812a0229bab1f6d55",
     "launch-cli-session.mjs": "sha256:498189cbb83d2a967ca2e89858ace1cd8050179dc87db7c02acc541666e97792",
-    "launch-opencode-session.mjs": "sha256:4c1f654052f02f4b1c45ccc0394944289e0fd9061ea87ea8e8a1aa7c248ac1d3",
+    "launch-opencode-session.mjs": "sha256:d7a1f0897a9543f8f2e9c561923036c036646eb2ceeff85f5b185d38e315b0ca",
     "launch-pi-session.mjs": "sha256:6760465ee7c828ae7ce7cf6e9ef8156bb7170a7bc0285f8d7406e5954e5a1cc9",
     "opencode-mapped-permissions.mjs": "sha256:ce16256b45c7005794270f40378ff1691d829cb7487f051eb135c4671dd24a9e",
     "handoff-verify.mjs": "sha256:48a4697e98907a09a0968c85673cbcb257976c9e0b27c87fabb2be9f35787516",

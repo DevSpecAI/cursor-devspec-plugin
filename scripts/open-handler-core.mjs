@@ -666,7 +666,10 @@ export function runNodeLaunchSettled({
       finish({ ok: false, error: 'settle_spawn_failed', code: null })
     })
 
-    child.on('close', (code) => {
+    // Prefer 'exit' over 'close': headed grandchildren can inherit the settle
+    // child's piped stdio and keep 'close' from firing after process.exit
+    // (item 914889b5). Drain pipes above so we still capture a failure tail.
+    child.on('exit', (code) => {
       if (code === 0) {
         finish({ ok: true, code: 0 })
         return

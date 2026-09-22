@@ -697,14 +697,18 @@ async function main() {
   // via the devspec:// protocol handler does not create). `windowsHide` +
   // `stdio: 'ignore'` alone is sufficient for both invisibility and survival.
   //
-  // TEMP DEBUG (`--headed`): show the serve console. Restore headless by
-  // omitting `--headed` (set OPENCODE_LAUNCH_HEADED=false in open-handler-core).
+  // TEMP DEBUG / product headed: show the serve console when not under
+  // fleet settle. Under DEVSPEC_FLEET_SETTLE never inherit — the settle
+  // parent pipes stdout/stderr, and inherit keeps those pipes open in the
+  // OpenCode child so runNodeLaunchSettled's 'close' never fires (item
+  // 914889b5). windowsHide:!headed still shows a console when headed.
   const headed = args.headed === true
+  const fleetSettleEarly = process.env.DEVSPEC_FLEET_SETTLE === '1'
   const serveArgs = buildOpencodeServeArgs(port)
   const server = spawnAgent(opencodeBin, serveArgs, {
     cwd: args.folder,
     env: launchEnv,
-    stdio: headed ? 'inherit' : 'ignore',
+    stdio: fleetSettleEarly || !headed ? 'ignore' : 'inherit',
     windowsHide: !headed,
   })
   await log(`serve argv=${JSON.stringify(serveArgs)}`)

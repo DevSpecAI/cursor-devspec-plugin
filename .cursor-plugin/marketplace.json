@@ -10,7 +10,7 @@
       "name": "devspec-autopilot",
       "source": "./",
       "description": "Connect Cursor's agent to DevSpec: pull a batch of action items and work them, and drive sessions from the Agents page.",
-      "version": "0.13.12",
+      "version": "0.13.13",
       "keywords": [
         "devspec",
         "agent",

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.13
+
+### Headed OpenCode fleet settle no longer hangs
+
+Turning OpenCode headed by default made fleet Launch agents hang on the first
+spawn: serve inherited the settle script's piped stdio, so `close` never fired
+after `process.exit(0)` and Pi never started. Fleet settle never inherits now;
+`runNodeLaunchSettled` resolves on `exit`.
+
 ## 0.13.12
 
 ### OpenCode launches headed by default
