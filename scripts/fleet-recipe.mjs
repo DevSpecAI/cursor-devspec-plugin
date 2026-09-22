@@ -9,6 +9,30 @@ export const FLEET_RECIPE_MAX_PER_TOOL = 8
 export const FLEET_RECIPE_MAX_TOTAL = 24
 
 /**
+ * Default prompt for Start local agents / Warm fleet spawns when the signed
+ * handoff carries no prompt (prompt_chars=0). Bare sessionless Connect — each
+ * host mechanical-registers as available capacity without attaching to a room.
+ *
+ * Without this, OpenCode exits with "You must provide a message or a command"
+ * and Cursor skips mechanical Connect (empty body is not remote-connect), so
+ * only some fleet tools come up Live (item f053c2ed).
+ */
+export const FLEET_DEFAULT_REMOTE_PROMPT = 'Run the `devspec.remote` skill.'
+
+/**
+ * Resolve the prompt written into each fleet spawn's launch prompt file.
+ * Prefer a non-empty handoff prompt (e.g. attach-to-session); otherwise the
+ * bare remote-connect default so every tool has a message / Connect trigger.
+ *
+ * @param {string | null | undefined} promptText
+ * @returns {string}
+ */
+export function resolveFleetSpawnPrompt(promptText) {
+  const trimmed = typeof promptText === 'string' ? promptText.trim() : ''
+  return trimmed || FLEET_DEFAULT_REMOTE_PROMPT
+}
+
+/**
  * @param {unknown} input
  * @returns {{ ok: true, recipe: Record<string, number>, total: number } | { ok: false, error: string, detail?: string }}
  */

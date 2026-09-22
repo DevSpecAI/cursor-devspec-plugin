@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.7
+
+### Start local agents fleet no longer launches empty prompts
+
+Fleet fan-out was hard-coding `promptText: null` for every spawn. Start local
+agents handoffs also arrive with `prompt_chars=0`, so OpenCode exited with
+"You must provide a message or a command" and Cursor skipped mechanical Connect
+(empty body is not remote-connect), leaving stamp-only IDs. Spawns now resolve
+a non-empty handoff prompt when present, otherwise the bare
+`Run the \`devspec.remote\` skill.` default so each tool registers as sessionless
+available capacity.
+
 ## 0.13.5
 
 ### Sender response style rides each remote command

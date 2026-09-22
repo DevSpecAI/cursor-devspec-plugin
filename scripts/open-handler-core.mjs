@@ -10,7 +10,11 @@ import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
-import { expandFleetRecipe, recipeFromHandoffPayload } from './fleet-recipe.mjs'
+import {
+  expandFleetRecipe,
+  recipeFromHandoffPayload,
+  resolveFleetSpawnPrompt,
+} from './fleet-recipe.mjs'
 import { quoteWinCmdArg, composeWindowsCursorCliTitle, sanitizeWindowsConsoleTitle, windowsCursorCliStartArgs } from './launch-cli-session.mjs'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
@@ -1073,9 +1077,13 @@ export async function executeHandoff({
       await appendHandlerLog(
         `fleet spawn ${i + 1}/${tools.length} starting tool=${spawnTool}`,
       )
+      // Never pass null/empty — OpenCode rejects empty messages and Cursor
+      // skips mechanical Connect when the prompt is not remote-connect
+      // (item f053c2ed). Prefer a handoff prompt when present; else bare remote.
+      const spawnPrompt = resolveFleetSpawnPrompt(promptText)
       const result = await executeSingleHandoff({
         slug,
-        promptText: null,
+        promptText: spawnPrompt,
         itemTitle: null,
         surface: 'cli',
         tool: spawnTool,
