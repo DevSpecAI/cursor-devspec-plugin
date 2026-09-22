@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.14
+
+### Fleet OpenCode no longer kills its sibling
+
+Launch agents with 2+ OpenCodes in one folder shared a sessionless server pid
+file, so the second spawn taskkilled the first. Fleet settle now keys pid/state
+by the unique prompt-file stamp.
+
 ## 0.13.13
 
 ### Headed OpenCode fleet settle no longer hangs

@@ -195,22 +195,44 @@ async function findListeningPid(port) {
  * truncated raw encoding) is required so every input byte — including ones
  * past position ~24 — affects every output character.
  */
-function directoryKey(folder, sessionId) {
+/**
+ * Stable key for OpenCode server pid/state files.
+ * @param {string} folder
+ * @param {string | null | undefined} sessionId
+ * @param {string | null | undefined} [instanceId] fleet/sessionless disambiguator
+ */
+export function directoryKey(folder, sessionId, instanceId) {
   const base = path.resolve(folder)
-  const raw = sessionId ? `${base}:${sessionId}` : base
+  let raw = sessionId ? `${base}:${sessionId}` : base
+  const instance = typeof instanceId === 'string' ? instanceId.trim() : ''
+  if (instance) raw = `${raw}:instance:${instance}`
   return crypto.createHash('sha256').update(raw).digest('base64url').slice(0, 32)
+}
+
+/**
+ * Fleet Launch agents mint a unique prompt-file stamp per spawn. Use that as
+ * the sessionless instance id so two bare OpenCodes in one folder do not share
+ * a pid file and kill each other (item 9d213c07).
+ * @param {string | null | undefined} promptFile
+ * @returns {string | null}
+ */
+export function fleetInstanceIdFromPromptFile(promptFile) {
+  if (process.env.DEVSPEC_FLEET_SETTLE !== '1') return null
+  if (typeof promptFile !== 'string' || !promptFile.trim()) return null
+  const stamp = path.basename(promptFile).replace(/\.prompt\.txt$/i, '').trim()
+  return stamp || null
 }
 
 function remoteControlDir() {
   return path.join(os.homedir(), '.devspec', 'opencode-remote-control')
 }
 
-function serverPidFile(folder, sessionId) {
-  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId)}.server.pid`)
+function serverPidFile(folder, sessionId, instanceId) {
+  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId, instanceId)}.server.pid`)
 }
 
-function remoteControlStateFile(folder, sessionId) {
-  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId)}.json`)
+function remoteControlStateFile(folder, sessionId, instanceId) {
+  return path.join(remoteControlDir(), `${directoryKey(folder, sessionId, instanceId)}.json`)
 }
 
 /** True if a process with this pid currently exists (no signal actually sent on any platform). */
@@ -248,11 +270,12 @@ function isPidAlive(pid) {
  * way), rather than trusting the exit status.
  *
  * @param {string} folder
- * @param {{ incomingSessionId?: string | null, incomingModel?: string | null }} [ctx]
+ * @param {{ incomingSessionId?: string | null, incomingModel?: string | null, instanceId?: string | null }} [ctx]
  */
 async function killExistingServer(folder, ctx = {}) {
   const sessionId = ctx.incomingSessionId || null
-  const pidFile = serverPidFile(folder, sessionId)
+  const instanceId = ctx.instanceId || null
+  const pidFile = serverPidFile(folder, sessionId, instanceId)
   let pid
   try {
     pid = Number((await fsPromises.readFile(pidFile, 'utf8')).trim())
@@ -297,7 +320,7 @@ async function killExistingServer(folder, ctx = {}) {
   }
 
   try {
-    await fsPromises.unlink(remoteControlStateFile(folder, sessionId))
+    await fsPromises.unlink(remoteControlStateFile(folder, sessionId, instanceId))
   } catch {
     // already gone
   }
@@ -639,16 +662,20 @@ async function main() {
   }
 
   const sessionId = extractSessionIdFromPrompt(promptBody)
+  const instanceId = fleetInstanceIdFromPromptFile(args.promptFile)
   await log(
-    `prompt sessionId=${sessionId || 'none'} model=${args.model || 'auto'} promptBytes=${promptBody.length}`,
+    `prompt sessionId=${sessionId || 'none'} instanceId=${instanceId || 'none'} model=${args.model || 'auto'} promptBytes=${promptBody.length}`,
   )
 
   // Must happen before spawning the new server — see "round 4" note above.
   // A second live server for the same directory means two processes racing
   // to write the same state file, not two independent connections.
+  // Fleet instance ids (item 9d213c07) keep each Launch-agents OpenCode on its
+  // own pid file so siblings are not treated as replacements.
   await killExistingServer(args.folder, {
     incomingSessionId: sessionId,
     incomingModel: args.model || null,
+    instanceId,
   })
   await log(`opencodeBin=${opencodeBin} folder=${args.folder}`)
 
@@ -737,7 +764,11 @@ async function main() {
   await log(`recording server pid=${realPid ?? 'unknown'} (spawn returned ${server.pid ?? 'unknown'})`)
   if (realPid) {
     await fsPromises.mkdir(remoteControlDir(), { recursive: true })
-    await fsPromises.writeFile(serverPidFile(args.folder, sessionId), String(realPid), 'utf8')
+    await fsPromises.writeFile(
+      serverPidFile(args.folder, sessionId, instanceId),
+      String(realPid),
+      'utf8',
+    )
   }
 
   const attachUrl = `http://127.0.0.1:${port}`

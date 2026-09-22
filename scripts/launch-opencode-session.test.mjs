@@ -4,11 +4,44 @@ import {
   basicAuthHeaderValue,
   buildOpencodeRunArgs,
   buildOpencodeServeArgs,
+  directoryKey,
   extractSessionIdFromPrompt,
+  fleetInstanceIdFromPromptFile,
   redactArgsForLog,
   resolveServeAuth,
   withServeAuthEnv,
 } from './launch-opencode-session.mjs'
+
+describe('directoryKey / fleet instance', () => {
+  it('distinguishes two sessionless fleet launches in the same folder', () => {
+    const folder = 'C:\\Users\\Brandon Young\\Repositories\\Combined\\DevSpecV2'
+    const a = directoryKey(folder, null, '1790109140882-dma4fd')
+    const b = directoryKey(folder, null, '1790109144550-xsror7')
+    const bare = directoryKey(folder, null)
+    assert.notEqual(a, b)
+    assert.notEqual(a, bare)
+    assert.notEqual(b, bare)
+  })
+
+  it('fleetInstanceIdFromPromptFile only applies under DEVSPEC_FLEET_SETTLE', () => {
+    const prev = process.env.DEVSPEC_FLEET_SETTLE
+    try {
+      delete process.env.DEVSPEC_FLEET_SETTLE
+      assert.equal(
+        fleetInstanceIdFromPromptFile('C:\\tmp\\1790109140882-dma4fd.prompt.txt'),
+        null,
+      )
+      process.env.DEVSPEC_FLEET_SETTLE = '1'
+      assert.equal(
+        fleetInstanceIdFromPromptFile('C:\\tmp\\1790109140882-dma4fd.prompt.txt'),
+        '1790109140882-dma4fd',
+      )
+    } finally {
+      if (prev === undefined) delete process.env.DEVSPEC_FLEET_SETTLE
+      else process.env.DEVSPEC_FLEET_SETTLE = prev
+    }
+  })
+})
 
 describe('buildOpencodeServeArgs', () => {
   it('passes --port only — serve rejects --auto (OpenCode 1.18+)', () => {
