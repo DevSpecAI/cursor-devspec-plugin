@@ -10,6 +10,7 @@ import http from 'node:http'
 import fs from 'node:fs/promises'
 import { renderOpenSuccess, renderMissingMapping } from './open-bridge-pages.mjs'
 import { verifyHandoffToken } from './handoff-verify.mjs'
+import { recipeFromHandoffPayload } from './fleet-recipe.mjs'
 import {
   DEVSPEC_LOCAL_OPEN_PORT,
   DEVSPEC_DIR,
@@ -136,6 +137,8 @@ export async function startMacOsBridgeServer() {
     let model = null
     /** @type {'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null} */
     let thinking = null
+    /** @type {Record<string, number> | null} */
+    let recipe = null
 
     if (token) {
       const verified = verifyHandoffToken(decodeURIComponent(token))
@@ -153,6 +156,7 @@ export async function startMacOsBridgeServer() {
         : 'cursor'
       model = verified.data.model ?? null
       thinking = verified.data.thinking ?? null
+      recipe = recipeFromHandoffPayload(verified.data)
     } else {
       slug = decodeURIComponent(repo)
       promptText = prompt ? decodeURIComponent(prompt) : null
@@ -174,6 +178,7 @@ export async function startMacOsBridgeServer() {
       tool,
       model,
       thinking,
+      recipe,
       requireSignedToken: false,
       unsigned: true,
     })

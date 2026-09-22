@@ -10,7 +10,7 @@ import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { verifyHandoffToken } from './handoff-verify.mjs'
-import { recipeFromHandoffPayload } from './fleet-recipe.mjs'
+import { expandFleetRecipe, recipeFromHandoffPayload } from './fleet-recipe.mjs'
 import { quoteWinCmdArg, composeWindowsCursorCliTitle, sanitizeWindowsConsoleTitle, windowsCursorCliStartArgs } from './launch-cli-session.mjs'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
 
@@ -924,10 +924,10 @@ export function parseHandoffUrl(raw) {
 }
 
 /**
- * Execute the handoff: open Cursor IDE (default) or spawn interactive Cursor CLI.
- * @returns {{ ok: true } | { ok: false, error: string, slug?: string }}
+ * Execute a single-agent handoff (one IDE open or one CLI spawn).
+ * @returns {Promise<{ ok: true } | { ok: false, error: string, slug?: string }>}
  */
-export async function executeHandoff({
+export async function executeSingleHandoff({
   slug,
   promptText,
   itemTitle,
@@ -1029,6 +1029,97 @@ export async function executeHandoff({
   }
 }
 
+/** Pause between fleet spawns so hosts do not race on the same CLI binary. */
+const FLEET_SPAWN_GAP_MS = 750
+
+/**
+ * Execute the handoff: open Cursor IDE (default) or spawn interactive Cursor CLI.
+ * When `recipe` is set, fans out to N independent CLI sessions (brief ba6bd58e).
+ * @returns {{ ok: true, spawned?: number, failures?: Array<{ index: number, tool: string, error: string }> } | { ok: false, error: string, slug?: string, failures?: Array<{ index: number, tool: string, error: string }> }}
+ */
+export async function executeHandoff({
+  slug,
+  promptText,
+  itemTitle,
+  surface = 'ide',
+  tool = 'cursor',
+  model = null,
+  thinking = null,
+  resumeChatId = null,
+  recipe = null,
+  requireSignedToken = true,
+  unsigned = false,
+}) {
+  if (recipe && typeof recipe === 'object') {
+    const tools = expandFleetRecipe(recipe)
+    if (tools.length === 0) {
+      await appendHandlerLog(`fleet recipe empty for ${slug}`)
+      return { ok: false, error: 'empty_recipe', slug }
+    }
+
+    await appendHandlerLog(
+      `fleet fan-out ${slug}: ${tools.length} spawn(s) [${tools.join(', ')}]`,
+    )
+
+    /** @type {Array<{ index: number, tool: string, error: string }>} */
+    const failures = []
+    let spawned = 0
+
+    for (let i = 0; i < tools.length; i++) {
+      const spawnTool = tools[i]
+      const result = await executeSingleHandoff({
+        slug,
+        promptText: null,
+        itemTitle: null,
+        surface: 'cli',
+        tool: spawnTool,
+        model: null,
+        thinking: null,
+        resumeChatId: null,
+        requireSignedToken,
+        unsigned,
+      })
+      if (result.ok) {
+        spawned += 1
+      } else {
+        failures.push({
+          index: i,
+          tool: spawnTool,
+          error: result.error ?? 'unknown',
+        })
+        await appendHandlerLog(
+          `fleet spawn ${i + 1}/${tools.length} (${spawnTool}) failed: ${result.error}`,
+        )
+      }
+      if (i < tools.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, FLEET_SPAWN_GAP_MS))
+      }
+    }
+
+    if (spawned === 0) {
+      return { ok: false, error: 'fleet_all_failed', slug, failures }
+    }
+    await appendHandlerLog(
+      `fleet fan-out done ${slug}: ${spawned}/${tools.length} ok` +
+        (failures.length ? `, ${failures.length} failed` : ''),
+    )
+    return { ok: true, spawned, failures: failures.length ? failures : undefined }
+  }
+
+  return executeSingleHandoff({
+    slug,
+    promptText,
+    itemTitle,
+    surface,
+    tool,
+    model,
+    thinking,
+    resumeChatId,
+    requireSignedToken,
+    unsigned,
+  })
+}
+
 export async function handleProtocolUrl(raw, opts = {}) {
   const parsed = parseHandoffUrl(raw)
   if (!parsed) {
@@ -1048,6 +1139,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     model: parsed.model ?? null,
     thinking: parsed.thinking ?? null,
     resumeChatId: parsed.resumeChatId ?? null,
+    recipe: parsed.recipe ?? null,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
