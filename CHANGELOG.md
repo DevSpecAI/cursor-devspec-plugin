@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.15
+
+### Fleet headed OpenCode opens a visible connect-client console
+
+`--headed` under `DEVSPEC_FLEET_SETTLE` still exited after server health with a
+stdio-ignored, windowsHide client — so Brandon saw Pi terminals and zero OpenCode
+consoles even when handler.log said 2/2 ok. Fleet headed now opens a titled
+`cmd /k` "DevSpec OpenCode" window for the connect client (same class as Pi);
+settle still exits immediately after spawn.
+
 ## 0.13.14
 
 ### Fleet OpenCode no longer kills its sibling

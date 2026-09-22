@@ -4,6 +4,7 @@ import {
   basicAuthHeaderValue,
   buildOpencodeRunArgs,
   buildOpencodeServeArgs,
+  buildWindowsVisibleOpenCodeStartArgs,
   directoryKey,
   extractSessionIdFromPrompt,
   fleetInstanceIdFromPromptFile,
@@ -11,6 +12,28 @@ import {
   resolveServeAuth,
   withServeAuthEnv,
 } from './launch-opencode-session.mjs'
+
+describe('buildWindowsVisibleOpenCodeStartArgs', () => {
+  it('opens a titled cmd /k window (not a hidden OpenCode process)', () => {
+    const args = buildWindowsVisibleOpenCodeStartArgs('C:\\tools\\opencode.exe', [
+      'run',
+      '--auto',
+      '--attach',
+      'http://127.0.0.1:4096',
+      'hello',
+    ])
+    assert.deepEqual(args.slice(0, 5), [
+      '/c',
+      'start',
+      'DevSpec OpenCode',
+      'cmd.exe',
+      '/k',
+    ])
+    assert.match(args[5], /opencode\.exe/)
+    assert.match(args[5], /--attach/)
+    assert.match(args[5], /127\.0\.0\.1:4096/)
+  })
+})
 
 describe('directoryKey / fleet instance', () => {
   it('distinguishes two sessionless fleet launches in the same folder', () => {

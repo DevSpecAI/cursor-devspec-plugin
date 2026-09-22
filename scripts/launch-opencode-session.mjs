@@ -71,17 +71,94 @@
  * in open-handler-core.mjs) now that DevSpec streams the live work trail — set
  * that constant to true only while diagnosing launch, then flip it back.
  */
-import { execFile, spawnSync } from 'node:child_process'
+import { execFile, spawn, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fsPromises from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
-import { spawnAgent } from './launch-cli-session.mjs'
+import { quoteWinCmdArg, spawnAgent } from './launch-cli-session.mjs'
 import { buildOpenCodeLaunchEnv } from './opencode-mapped-permissions.mjs'
 
 const execFileAsync = promisify(execFile)
+
+/** @param {unknown} value */
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Windows `cmd /c start … /k` argv for a visible OpenCode connect client
+ * (fleet headed — item ea464dc2). Same class as Pi's DevSpec Pi console.
+ * @param {string} opencodeBin
+ * @param {string[]} runArgs
+ */
+export function buildWindowsVisibleOpenCodeStartArgs(opencodeBin, runArgs) {
+  const cmdline = [quoteWinCmdArg(opencodeBin), ...runArgs.map(quoteWinCmdArg)].join(' ')
+  return ['/c', 'start', 'DevSpec OpenCode', 'cmd.exe', '/k', cmdline]
+}
+
+/**
+ * Open a visible console for the OpenCode connect client under fleet settle
+ * when headed. Settle still exits immediately after spawn — the /k window
+ * outlives this process.
+ * @param {{ opencodeBin: string, runArgs: string[], folder: string, env?: NodeJS.ProcessEnv }} opts
+ */
+export function spawnVisibleOpenCodeClient({ opencodeBin, runArgs, folder, env }) {
+  if (process.platform === 'win32') {
+    return spawn('cmd.exe', buildWindowsVisibleOpenCodeStartArgs(opencodeBin, runArgs), {
+      cwd: folder,
+      env,
+      detached: true,
+      stdio: 'ignore',
+      // Hide the ephemeral `start` helper — not the /k console it opens.
+      windowsHide: true,
+    })
+  }
+
+  if (process.platform === 'darwin') {
+    const cmd = `cd ${shellSingleQuote(folder)} && ${shellSingleQuote(opencodeBin)} ${runArgs
+      .map(shellSingleQuote)
+      .join(' ')}`
+    return spawn('osascript', ['-e', `tell application "Terminal" to do script ${shellSingleQuote(cmd)}`], {
+      env,
+      detached: true,
+      stdio: 'ignore',
+    })
+  }
+
+  const linuxCmd = `cd ${shellSingleQuote(folder)} && ${shellSingleQuote(opencodeBin)} ${runArgs
+    .map(shellSingleQuote)
+    .join(' ')}`
+  const terminals = [
+    ['x-terminal-emulator', ['-e', 'bash', '-lc', linuxCmd]],
+    ['gnome-terminal', ['--', 'bash', '-lc', linuxCmd]],
+    ['konsole', ['-e', 'bash', '-lc', linuxCmd]],
+    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(linuxCmd)}`]],
+  ]
+  for (const [bin, termArgs] of terminals) {
+    try {
+      const child = spawn(bin, termArgs, {
+        cwd: folder,
+        env,
+        detached: true,
+        stdio: 'ignore',
+      })
+      if (child.pid) return child
+    } catch {
+      // try next emulator
+    }
+  }
+  return spawnAgent(opencodeBin, runArgs, {
+    cwd: folder,
+    env,
+    stdio: 'ignore',
+    detached: true,
+    windowsHide: false,
+    encoding: 'utf8',
+  })
+}
 
 /** Default OpenCode serve basic-auth username (OpenCode docs). */
 export const OPENCODE_SERVER_USERNAME_DEFAULT = 'opencode'
@@ -787,12 +864,32 @@ async function main() {
   // problem applies to any npm-installed .cmd binary, not just Cursor's.
   //
   // Fleet ready-gate (items 2ed52078 / 9ed47884): settle means "server
-  // healthy", not "connect client finished its whole remote turn". Spawn the
-  // connect client with stdio ignored and exit this process immediately —
-  // piping stdout/stderr + return kept Node alive on open pipes, so
-  // runNodeLaunchSettled never saw spawn N ok and Pi never started.
+  // healthy", not "connect client finished its whole remote turn". Exit this
+  // process immediately after starting the client — piping stdout/stderr +
+  // return kept Node alive on open pipes, so runNodeLaunchSettled never saw
+  // spawn N ok and Pi never started.
+  //
+  // Headed fleet (item ea464dc2): open a visible cmd /k console for the
+  // connect client (same class as Pi). Headless fleet keeps stdio-ignore
+  // + windowsHide so settle stays silent.
   const fleetSettle = process.env.DEVSPEC_FLEET_SETTLE === '1'
   if (fleetSettle) {
+    if (headed) {
+      const client = spawnVisibleOpenCodeClient({
+        opencodeBin,
+        runArgs,
+        folder: args.folder,
+        env: launchEnv,
+      })
+      client.unref()
+      console.log(
+        `[devspec-opencode] Fleet settle: server healthy on ${attachUrl}; visible connect client started`,
+      )
+      await log(
+        `fleet settle: visible client console started port=${port} client_pid=${client.pid ?? 'unknown'}`,
+      )
+      process.exit(0)
+    }
     const client = spawnAgent(opencodeBin, runArgs, {
       cwd: args.folder,
       env: launchEnv,
