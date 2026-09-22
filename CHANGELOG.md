@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.16
+
+### Fleet Launch agents uses the same remote prompt as a single launch
+
+Empty fleet prompts no longer fall back to a vague `Run the skill` line that
+lets the model wander. Each spawn gets the same `/devspec.remote` (or Cursor
+skill) shape as a single coding-agent launch, and when the handoff carries a
+`sessionId` it attaches with `--session` like an in-session OpenCode launch.
 ## 0.13.15
 
 ### Fleet headed OpenCode opens a visible connect-client console

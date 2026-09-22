@@ -10,7 +10,7 @@ import http from 'node:http'
 import fs from 'node:fs/promises'
 import { renderOpenSuccess, renderMissingMapping } from './open-bridge-pages.mjs'
 import { verifyHandoffToken } from './handoff-verify.mjs'
-import { recipeFromHandoffPayload } from './fleet-recipe.mjs'
+import { recipeFromHandoffPayload, sessionIdFromHandoffPayload } from './fleet-recipe.mjs'
 import {
   DEVSPEC_LOCAL_OPEN_PORT,
   DEVSPEC_DIR,
@@ -140,6 +140,8 @@ export async function startMacOsBridgeServer() {
     let thinking = null
     /** @type {Record<string, number> | null} */
     let recipe = null
+    /** @type {string | null} */
+    let sessionId = null
 
     if (token) {
       const verified = verifyHandoffToken(decodeURIComponent(token))
@@ -158,11 +160,13 @@ export async function startMacOsBridgeServer() {
       model = verified.data.model ?? null
       thinking = verified.data.thinking ?? null
       recipe = recipeFromHandoffPayload(verified.data)
+      sessionId = sessionIdFromHandoffPayload(verified.data)
       void appendHandlerLog(
         `bridge handoff slug=${slug} tool=${tool} surface=${surface} ` +
           `recipe=${recipe ? JSON.stringify(recipe) : 'none'} ` +
           `raw_recipe=${verified.data.recipe ? JSON.stringify(verified.data.recipe) : 'none'} ` +
-          `prompt_chars=${typeof promptText === 'string' ? promptText.length : 0}`,
+          `prompt_chars=${typeof promptText === 'string' ? promptText.length : 0}` +
+          (sessionId ? ` session=${sessionId}` : ''),
       )
     } else {
       slug = decodeURIComponent(repo)
@@ -186,6 +190,7 @@ export async function startMacOsBridgeServer() {
       model,
       thinking,
       recipe,
+      sessionId,
       requireSignedToken: false,
       unsigned: true,
     })

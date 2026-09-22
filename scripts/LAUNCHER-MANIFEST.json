@@ -1,9 +1,9 @@
 {
-  "version": "0.2.7",
+  "version": "0.2.8",
   "files": {
     "open-handler.mjs": "sha256:6cae7cab45ee76bf58a477e3620f8cf596bf9ccd712d2144c06ff0f774505787",
-    "open-handler-core.mjs": "sha256:aa592b51a7337988bc56d0e0db33c57d04e9c461c9dc981212d9c2781be0c0b3",
-    "fleet-recipe.mjs": "sha256:b1eee565c64e92c12fa46ae43c4e8a11dd968da355ebf2898a1148ae0bb558a5",
+    "open-handler-core.mjs": "sha256:1518a7a53135084272b9bd6ae9ed1924675f36ee6e50d258e5f5a056e8007571",
+    "fleet-recipe.mjs": "sha256:032381bcff80a3f37a4ab316d715f010b6aeebd8dd5ca64d556c35b0bf00a2f3",
     "pin-remote-plugin.mjs": "sha256:0c3d6120e0ebb78f965c76043ecbdec581d6f86acf64d930b66f32445b491092",
     "space-safe-plugin-root.mjs": "sha256:c0154401d9aeb6fa4a413c7dce36c6966f01fd9c5e000eb812a0229bab1f6d55",
     "launch-cli-session.mjs": "sha256:498189cbb83d2a967ca2e89858ace1cd8050179dc87db7c02acc541666e97792",
@@ -16,7 +16,7 @@
     "devspec-handler.vbs": "sha256:73b3e0888cf0d08ea0971b454928f34a4b7a6fd79bab9264cabf5bcd061c5deb",
     "devspec-handler.sh": "sha256:16b3915c1dc12467605a3bce81037f43a3fa6e082d962d8b5a23dd9096dfa598",
     "register-protocol.mjs": "sha256:28076642da279264c25f16a255710da9d366902aeb6b0d4b4e33f7082bd00544",
-    "open-bridge.mjs": "sha256:d45d707167b1c580255e0efda60b24df2eb2457fd1c26187e0fd40cf642045cd",
+    "open-bridge.mjs": "sha256:f2159407801ee6e8d3ff49c020cbf45da6d4de3d48f0fc23cf21b67cda65181c",
     "open-bridge-pages.mjs": "sha256:01f1b4dd17ccc32c8ac144630ecaec6ebfe424ab90d2ddd110853d5fe2b2b026",
     "ensure.mjs": "sha256:cb6e783bf1c873c5001390e2d065f70df09a20562064281db9a7d343339a6775"
   }
