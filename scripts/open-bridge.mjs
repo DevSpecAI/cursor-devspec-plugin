@@ -16,6 +16,7 @@ import {
   DEVSPEC_DIR,
   ensureDevspecDir,
   executeHandoff,
+  appendHandlerLog,
 } from './open-handler-core.mjs'
 
 const PID_PATH = `${DEVSPEC_DIR}/open-bridge.pid`
@@ -157,6 +158,12 @@ export async function startMacOsBridgeServer() {
       model = verified.data.model ?? null
       thinking = verified.data.thinking ?? null
       recipe = recipeFromHandoffPayload(verified.data)
+      void appendHandlerLog(
+        `bridge handoff slug=${slug} tool=${tool} surface=${surface} ` +
+          `recipe=${recipe ? JSON.stringify(recipe) : 'none'} ` +
+          `raw_recipe=${verified.data.recipe ? JSON.stringify(verified.data.recipe) : 'none'} ` +
+          `prompt_chars=${typeof promptText === 'string' ? promptText.length : 0}`,
+      )
     } else {
       slug = decodeURIComponent(repo)
       promptText = prompt ? decodeURIComponent(prompt) : null

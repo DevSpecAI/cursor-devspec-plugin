@@ -1053,12 +1053,15 @@ export async function executeHandoff({
   if (recipe && typeof recipe === 'object') {
     const tools = expandFleetRecipe(recipe)
     if (tools.length === 0) {
-      await appendHandlerLog(`fleet recipe empty for ${slug}`)
+      await appendHandlerLog(
+        `fleet recipe empty for ${slug} recipe=${JSON.stringify(recipe)}`,
+      )
       return { ok: false, error: 'empty_recipe', slug }
     }
 
     await appendHandlerLog(
-      `fleet fan-out ${slug}: ${tools.length} spawn(s) [${tools.join(', ')}]`,
+      `fleet fan-out ${slug}: ${tools.length} spawn(s) [${tools.join(', ')}] ` +
+        `recipe=${JSON.stringify(recipe)} title=${JSON.stringify(itemTitle ?? null)}`,
     )
 
     /** @type {Array<{ index: number, tool: string, error: string }>} */
@@ -1067,6 +1070,9 @@ export async function executeHandoff({
 
     for (let i = 0; i < tools.length; i++) {
       const spawnTool = tools[i]
+      await appendHandlerLog(
+        `fleet spawn ${i + 1}/${tools.length} starting tool=${spawnTool}`,
+      )
       const result = await executeSingleHandoff({
         slug,
         promptText: null,
@@ -1081,6 +1087,9 @@ export async function executeHandoff({
       })
       if (result.ok) {
         spawned += 1
+        await appendHandlerLog(
+          `fleet spawn ${i + 1}/${tools.length} (${spawnTool}) ok`,
+        )
       } else {
         failures.push({
           index: i,
@@ -1097,6 +1106,9 @@ export async function executeHandoff({
     }
 
     if (spawned === 0) {
+      await appendHandlerLog(
+        `fleet fan-out done ${slug}: 0/${tools.length} ok (all failed)`,
+      )
       return { ok: false, error: 'fleet_all_failed', slug, failures }
     }
     await appendHandlerLog(
@@ -1105,6 +1117,12 @@ export async function executeHandoff({
     )
     return { ok: true, spawned, failures: failures.length ? failures : undefined }
   }
+
+  await appendHandlerLog(
+    `single handoff ${slug} tool=${tool} surface=${surface} ` +
+      `prompt_chars=${typeof promptText === 'string' ? promptText.length : 0} ` +
+      `title=${JSON.stringify(itemTitle ?? null)} (no fleet recipe)`,
+  )
 
   return executeSingleHandoff({
     slug,
@@ -1130,6 +1148,15 @@ export async function handleProtocolUrl(raw, opts = {}) {
   if ('error' in parsed && !parsed.slug) return { ok: false, error: parsed.error }
   if (parsed.error && !parsed.slug) return { ok: false, error: parsed.error }
 
+  const recipe = parsed.recipe ?? null
+  await appendHandlerLog(
+    `handoff parsed slug=${parsed.slug} tool=${parsed.tool ?? 'cursor'} ` +
+      `surface=${parsed.surface ?? 'ide'} ` +
+      `recipe=${recipe ? JSON.stringify(recipe) : 'none'} ` +
+      `prompt_chars=${typeof parsed.promptText === 'string' ? parsed.promptText.length : 0} ` +
+      `title=${JSON.stringify(parsed.itemTitle ?? null)}`,
+  )
+
   return executeHandoff({
     slug: parsed.slug,
     promptText: parsed.promptText,
@@ -1139,7 +1166,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     model: parsed.model ?? null,
     thinking: parsed.thinking ?? null,
     resumeChatId: parsed.resumeChatId ?? null,
-    recipe: parsed.recipe ?? null,
+    recipe,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })
