@@ -10,26 +10,70 @@ export const FLEET_RECIPE_MAX_TOTAL = 24
 
 /**
  * Default prompt for Start local agents / Warm fleet spawns when the signed
- * handoff carries no prompt (prompt_chars=0). Bare sessionless Connect — each
- * host mechanical-registers as available capacity without attaching to a room.
+ * handoff carries no prompt (prompt_chars=0) and no per-tool session attach.
+ * Bare sessionless Connect — Cursor skill form (item f053c2ed).
  *
- * Without this, OpenCode exits with "You must provide a message or a command"
- * and Cursor skips mechanical Connect (empty body is not remote-connect), so
- * only some fleet tools come up Live (item f053c2ed).
+ * Prefer {@link fleetRemotePromptForTool} so OpenCode/Pi get the same slash
+ * shape as a single coding-agent launch (item f2fe858e).
  */
 export const FLEET_DEFAULT_REMOTE_PROMPT = 'Run the `devspec.remote` skill.'
 
 /**
- * Resolve the prompt written into each fleet spawn's launch prompt file.
- * Prefer a non-empty handoff prompt (e.g. attach-to-session); otherwise the
- * bare remote-connect default so every tool has a message / Connect trigger.
- *
- * @param {string | null | undefined} promptText
+ * Short session code for OpenCode/Pi attach (matches web shortSessionId).
+ * @param {unknown} sessionId
  * @returns {string}
  */
-export function resolveFleetSpawnPrompt(promptText) {
+export function shortSessionId(sessionId) {
+  const id = String(sessionId ?? '').trim()
+  if (!id) return ''
+  return id.split('-')[0] || id
+}
+
+/**
+ * Same remote prompt a single coding-agent launch would use for this tool.
+ * Session present → attach (`--session`). Else → sessionless Connect.
+ *
+ * @param {string | null | undefined} tool
+ * @param {string | null | undefined} sessionId
+ * @returns {string}
+ */
+export function fleetRemotePromptForTool(tool, sessionId) {
+  const short = shortSessionId(sessionId)
+  const t = String(tool ?? '').trim()
+
+  if (short) {
+    // Mirror apps/web formatDevspecRemoteAttachCommand for fleet's one-prompt fan-out.
+    if (t === 'cursor') {
+      return (
+        `Run the \`devspec.remote\` skill with this input: --session ${short} — ` +
+        `attach to existing DevSpec session ${short} (do NOT create_session). ` +
+        `Let the installed skill run register_connection/attach_connection and launch ` +
+        `its persistent poll_connection listener; it owns command delivery, activity, and replies.`
+      )
+    }
+    // OpenCode + Pi (and any future slash-skill tool): same as single OpenCode session launch.
+    return `/devspec.remote --session ${short}`
+  }
+
+  if (t === 'opencode' || t === 'pi') {
+    return '/devspec.remote'
+  }
+  return FLEET_DEFAULT_REMOTE_PROMPT
+}
+
+/**
+ * Resolve the prompt written into each fleet spawn's launch prompt file.
+ * Prefer a non-empty handoff prompt (e.g. web already signed attach); otherwise
+ * the per-tool single-launch shape (session attach when sessionId is set).
+ *
+ * @param {string | null | undefined} promptText
+ * @param {{ tool?: string | null, sessionId?: string | null }} [opts]
+ * @returns {string}
+ */
+export function resolveFleetSpawnPrompt(promptText, opts = {}) {
   const trimmed = typeof promptText === 'string' ? promptText.trim() : ''
-  return trimmed || FLEET_DEFAULT_REMOTE_PROMPT
+  if (trimmed) return trimmed
+  return fleetRemotePromptForTool(opts.tool, opts.sessionId)
 }
 
 /**
@@ -94,4 +138,16 @@ export function recipeFromHandoffPayload(data) {
   if (!data || data.recipe == null) return null
   const validated = validateFleetRecipe(data.recipe)
   return validated.ok ? validated.recipe : null
+}
+
+/**
+ * Optional DevSpec session id on the handoff (fleet attach parity — item f2fe858e).
+ * @param {Record<string, unknown> | null | undefined} data
+ * @returns {string | null}
+ */
+export function sessionIdFromHandoffPayload(data) {
+  if (!data) return null
+  const raw = data.sessionId ?? data.session_id
+  const id = typeof raw === 'string' ? raw.trim() : ''
+  return id || null
 }

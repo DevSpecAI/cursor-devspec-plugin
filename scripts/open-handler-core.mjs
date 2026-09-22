@@ -14,6 +14,7 @@ import {
   expandFleetRecipe,
   recipeFromHandoffPayload,
   resolveFleetSpawnPrompt,
+  sessionIdFromHandoffPayload,
 } from './fleet-recipe.mjs'
 import { quoteWinCmdArg, composeWindowsCursorCliTitle, sanitizeWindowsConsoleTitle, windowsCursorCliStartArgs } from './launch-cli-session.mjs'
 import { expandRemoteControlLaunchPrompt } from './pin-remote-plugin.mjs'
@@ -1073,6 +1074,7 @@ export function parseHandoffUrl(raw) {
           ? verified.data.resumeChatId.trim()
           : null,
       recipe: recipeFromHandoffPayload(verified.data),
+      sessionId: sessionIdFromHandoffPayload(verified.data),
     }
   }
 
@@ -1242,6 +1244,7 @@ export async function executeHandoff({
   thinking = null,
   resumeChatId = null,
   recipe = null,
+  sessionId = null,
   requireSignedToken = true,
   unsigned = false,
 }) {
@@ -1256,7 +1259,8 @@ export async function executeHandoff({
 
     await appendHandlerLog(
       `fleet fan-out ${slug}: ${tools.length} spawn(s) [${tools.join(', ')}] ` +
-        `recipe=${JSON.stringify(recipe)} title=${JSON.stringify(itemTitle ?? null)}`,
+        `recipe=${JSON.stringify(recipe)} title=${JSON.stringify(itemTitle ?? null)}` +
+        (sessionId ? ` session=${sessionId}` : ''),
     )
 
     /** @type {Array<{ index: number, tool: string, error: string }>} */
@@ -1270,8 +1274,12 @@ export async function executeHandoff({
       )
       // Never pass null/empty — OpenCode rejects empty messages and Cursor
       // skips mechanical Connect when the prompt is not remote-connect
-      // (item f053c2ed). Prefer a handoff prompt when present; else bare remote.
-      const spawnPrompt = resolveFleetSpawnPrompt(promptText)
+      // (item f053c2ed). Prefer a handoff prompt when present; else the same
+      // per-tool remote shape as a single coding-agent launch (item f2fe858e).
+      const spawnPrompt = resolveFleetSpawnPrompt(promptText, {
+        tool: spawnTool,
+        sessionId,
+      })
       // Only OpenCode needs the settled ready-gate (SQLite DB race — item
       // 8a288219). Pi / Cursor CLI use the fire-and-forget visible terminal
       // path so Launch agents matches session-launch UX (item 6649667f).
@@ -1291,7 +1299,8 @@ export async function executeHandoff({
       if (result.ok) {
         spawned += 1
         await appendHandlerLog(
-          `fleet spawn ${i + 1}/${tools.length} (${spawnTool}) ok`,
+          `fleet spawn ${i + 1}/${tools.length} (${spawnTool}) ok` +
+            ` prompt_chars=${spawnPrompt.length}`,
         )
       } else {
         failures.push({
@@ -1352,12 +1361,14 @@ export async function handleProtocolUrl(raw, opts = {}) {
   if (parsed.error && !parsed.slug) return { ok: false, error: parsed.error }
 
   const recipe = parsed.recipe ?? null
+  const sessionId = parsed.sessionId ?? null
   await appendHandlerLog(
     `handoff parsed slug=${parsed.slug} tool=${parsed.tool ?? 'cursor'} ` +
       `surface=${parsed.surface ?? 'ide'} ` +
       `recipe=${recipe ? JSON.stringify(recipe) : 'none'} ` +
       `prompt_chars=${typeof parsed.promptText === 'string' ? parsed.promptText.length : 0} ` +
-      `title=${JSON.stringify(parsed.itemTitle ?? null)}`,
+      `title=${JSON.stringify(parsed.itemTitle ?? null)}` +
+      (sessionId ? ` session=${sessionId}` : ''),
   )
 
   return executeHandoff({
@@ -1370,6 +1381,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     thinking: parsed.thinking ?? null,
     resumeChatId: parsed.resumeChatId ?? null,
     recipe,
+    sessionId,
     unsigned: parsed.unsigned,
     requireSignedToken: opts.requireSignedToken ?? process.platform !== 'darwin',
   })

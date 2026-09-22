@@ -1,7 +1,7 @@
 {
   "name": "devspec-autopilot",
   "description": "Connect Cursor's agent to DevSpec — pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the terminal.",
-  "version": "0.13.15",
+  "version": "0.13.16",
   "license": "MIT",
   "author": {
     "name": "DevSpecAI",
