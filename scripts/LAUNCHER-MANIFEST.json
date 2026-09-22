@@ -1,5 +1,5 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.2",
   "files": {
     "open-handler.mjs": "sha256:6cae7cab45ee76bf58a477e3620f8cf596bf9ccd712d2144c06ff0f774505787",
     "open-handler-core.mjs": "sha256:db7467a3095257e266928332ff9062b891d31b6298b9fe530064864996c570ca",

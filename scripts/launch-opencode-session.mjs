@@ -751,6 +751,29 @@ async function main() {
   // real console TTY and flash-closes the window) — the same shim-resolution
   // problem applies to any npm-installed .cmd binary, not just Cursor's.
   //
+  // Fleet ready-gate (items 2ed52078 / 9ed47884): settle means "server
+  // healthy", not "connect client finished its whole remote turn". Spawn the
+  // connect client with stdio ignored and exit this process immediately —
+  // piping stdout/stderr + return kept Node alive on open pipes, so
+  // runNodeLaunchSettled never saw spawn N ok and Pi never started.
+  const fleetSettle = process.env.DEVSPEC_FLEET_SETTLE === '1'
+  if (fleetSettle) {
+    const client = spawnAgent(opencodeBin, runArgs, {
+      cwd: args.folder,
+      env: launchEnv,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    client.unref()
+    console.log(
+      `[devspec-opencode] Fleet settle: server healthy on ${attachUrl}; connect client detached`,
+    )
+    await log(
+      `fleet settle: server healthy port=${port} client_pid=${client.pid ?? 'unknown'} (stdio ignore; exiting)`,
+    )
+    process.exit(0)
+  }
+
   // Round 8: pipe stdout/stderr into launcher.log so MiniMax/model failures
   // are not lost when the invisible client exits code 1 in a few seconds.
   // TEMP DEBUG (`--headed`): still pipe (so failure capture keeps working),
@@ -768,24 +791,6 @@ async function main() {
   const stderrCapture = { chunks: [], bytes: 0 }
   attachStreamLogging(client.stdout, 'stdout', stdoutCapture, headed)
   attachStreamLogging(client.stderr, 'stderr', stderrCapture, headed)
-
-  // Fleet ready-gate (item 2ed52078): settle means "server healthy", not
-  // "connect client finished its whole remote turn". `opencode run --attach`
-  // with a remote-connect prompt can run for minutes; awaiting it made fleet
-  // Launch agents time out at 180s, kill the client, and open an error page
-  // while Pi never got a chance to start. DEVSPEC_FLEET_SETTLE=1 is set by
-  // open-handler-core's runNodeLaunchSettled.
-  if (process.env.DEVSPEC_FLEET_SETTLE === '1') {
-    client.unref()
-    console.log(
-      `[devspec-opencode] Fleet settle: server healthy on ${attachUrl}; connect client detached`,
-    )
-    await log(
-      `fleet settle: server healthy port=${port} client_pid=${client.pid ?? 'unknown'} (not awaiting connect exit)`,
-    )
-    process.exitCode = 0
-    return
-  }
 
   const exit = await waitForChildExit(client)
   if (exit.error) {
