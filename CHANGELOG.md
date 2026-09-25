@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.19
+
+### A long answer typed in your own words reaches the agent
+
+An answer you type yourself to the agent's multiple-choice question now arrives when it is longer than 200 characters. DevSpec accepts up to 1000, but the plugin kept its own, older copy of that limit and turned longer answers away. The plugin now leaves answer limits to DevSpec, so a future change to them needs no plugin update.
+
 ## 0.13.18
 
 ### Knowledge: the closest match is read, not automatically replaced; open questions are on Review
