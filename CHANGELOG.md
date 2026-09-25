@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.17
+
+### A proposed change is accepted on the Review page
+
+When a write comes back `queued_for_review`, the skill now says a maintainer accepts it on the project's Review page, under Proposed changes. It used to send people to a "Review tab", which no longer exists.
+
 ## 0.13.16
 
 ### Fleet Launch agents uses the same remote prompt as a single launch
