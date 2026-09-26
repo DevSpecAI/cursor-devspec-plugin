@@ -74,7 +74,7 @@ export function resolveInputs({ args, env }) {
   if (!token) {
     throw new Error(
       'No token. Pass --token dvs_… or set DEVSPEC_MCP_TOKEN.\n' +
-        'Create one in DevSpec under You → Connections → Connect a tool (Read & write).',
+        'Create one in DevSpec under You → Coding agents → Create your token (Read & write).',
     )
   }
   if (!/^https?:\/\//.test(base)) {

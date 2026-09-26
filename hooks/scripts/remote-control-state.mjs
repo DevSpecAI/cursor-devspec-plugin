@@ -1843,7 +1843,7 @@ export async function writeConnectionState(opts) {
         source: fallback.source || fallback.error || null,
         error:
           proven.error === 'no_proven_pair'
-            ? 'No reachable DevSpec key owns this connection. Open You → Connections and make the Cursor MCP key and the project .mcp.json key the same.'
+            ? 'No reachable DevSpec key owns this connection. Open You → Coding agents and make the Cursor MCP key and the project .mcp.json key the same.'
             : proven.error === 'unproven'
               ? 'This machine has more than one DevSpec key; the poller will not start until one is proven to own this connection.'
               : fallback.error,

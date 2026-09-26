@@ -393,12 +393,12 @@ When the owner asks you to create, update, or refine a brief/action item during 
 When you attach to a session or create one (the `get_session_transcript` seed / `create_session` response), read the instruction fields from the response when present and non-null, and hold them for the **entire remote-control run**. There are two tiers:
 
 **Style + principles — how you talk, and what good work looks like:**
-- **`owner_custom_instructions`** — the owner's Account → Chat Response Style (their saved profile instructions). This connect-time copy is a snapshot of the OWNER only; it does not tell you how a non-owner sender likes to be answered, and it goes stale if they edit it mid-run. The live, per-command copy arrives as `sender_response_style` on each `owner_message` (see below).
+- **`owner_custom_instructions`** — the owner's own words on how they like to be answered, saved with their response style in DevSpec. This connect-time copy is a snapshot of the OWNER only; it does not tell you how a non-owner sender likes to be answered, and it goes stale if they edit it mid-run. The live, per-command copy arrives as `sender_response_style` on each `owner_message` (see below).
 - **`project_custom_instructions`** — the team's Project Principles (engineering philosophy, quality bar, provider preferences). Apply to how you plan, recommend, and evaluate work.
 
 **Agent execution rules — how you actually run work on this machine (you ARE a coding agent, so these apply to you and NOT to the in-session Dev):**
 - **`project_agent_rules`** — the team's Agent Execution Rules: e.g. run typecheck/build before pushing, never `git stash`, commit only your own files, target branch. Treat as mandatory execution mechanics.
-- **`owner_agent_rules`** — the owner's Personal Agent Rules: their machine/tooling context (installed tools, local ports, personal workflow). Apply to how you run work locally.
+- **`owner_agent_rules`** — the owner's personal agent rules: their machine/tooling context (installed tools, local ports, personal workflow). Apply to how you run work locally.
 - **Precedence:** your personal/machine rules govern local working-style; the shared-repo-safety rules (branch protection, commit-only-your-own-files, don't break staging, don't leak secrets) always hold.
 
 Rules for all four:
@@ -407,7 +407,7 @@ Rules for all four:
 - Re-read on reconnect via the initial transcript seed if you restart without a fresh create_session.
 - Never request or use another user's instructions — the owner-scoped fields are only returned to the session owner token.
 
-**Response style rides each command, not just connect.** The owner's Account → Chat Response Style, plus their conversational/concise toggle, is delivered again with every canonical command as `sender_response_style` on the `owner_message` event — resolved from whoever SENT that message, so a non-owner sender is answered in their own voice and a mid-run preference edit takes effect on the next command with no reconnect. Apply it to the prose of your reply (see section 8). It is never work, authority or scope, and it never overrides the project's rules or your owner's machine rules. Which tier is delivered where is the served contract's decision — read `devspec://product/remote-ingress-contract` rather than trusting this file if the two disagree.
+**Response style rides each command, not just connect.** A person's response style as saved in DevSpec (their conversational-replies choice, plus anything else they wrote about how they want to be answered) is delivered again with every canonical command as `sender_response_style` on the `owner_message` event — resolved from whoever SENT that message, so a non-owner sender is answered in their own voice and a mid-run preference edit takes effect on the next command with no reconnect. Apply it to the prose of your reply (see section 8). It is never work, authority or scope, and it never overrides the project's rules or your owner's machine rules. Which tier is delivered where is the served contract's decision — read `devspec://product/remote-ingress-contract` rather than trusting this file if the two disagree.
 
 ## Rules
 

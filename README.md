@@ -22,9 +22,9 @@ You'll need:
 
 - **Cursor's CLI agent** (`cursor-agent`). This is a CLI plugin: it is installed with `cursor-agent plugin`, and its hooks run in `cursor-agent` sessions. There is no VS Code extension and no VSIX.
 - A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repo(s).
-- A **DevSpec API token**. Create one in DevSpec under **You → Connections → Connect a tool** (pick **Read & write**); it starts with `dvs_`.
+- A **DevSpec API token**. Create one in DevSpec under **You → Coding agents** → **Create your token** (pick **Read & write**); it starts with `dvs_`.
   - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
-  - It's **retrievable.** Reveal and copy it again any time at **You → Connections** (no more show-once).
+  - It's **retrievable.** Reveal and copy it again any time at **You → Coding agents** (no more show-once).
   - You don't paste a project id — the project for a run is resolved from your repo's git remote.
 - **Node.js 18+** — needed by the installed agent hooks and remote-control scripts (check with `node --version`). Plain MCP tool access is provided by Cursor itself.
 
@@ -110,7 +110,7 @@ The config file lives at:
 
 It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart `cursor-agent`** afterwards so it picks up the new server.
 
-> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Connections**.
+> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Coding agents**.
 
 ## Verify
 

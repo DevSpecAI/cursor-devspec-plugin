@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.21
+
+### The plugin names DevSpec's renamed settings pages
+
+DevSpec's You → Connections page is now **You → Coding agents**, so the setup steps, the token prompt, `npm run setup` and the key-mismatch warnings now send you there to create or reveal your token. The remote-control skill no longer places your response style on the Account page, which has been split into Profile and Sign-in & security; it describes it as what you saved in DevSpec, and names personal agent rules the way the Coding agents page does. Nothing about how the plugin behaves has changed.
+
 ## 0.13.20
 
 ### A test catches a DevSpec tool name the server no longer has

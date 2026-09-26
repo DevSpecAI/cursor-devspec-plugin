@@ -38,7 +38,7 @@ const WRONG_TOKEN_RE = /belongs to a different token/i
 export const DEFAULT_MCP_URL = DEFAULT_PROD_URL
 
 export const TOKENS_WARNING_FIX =
-  'Open You → Connections, reveal the key you want, and make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
+  'Open You → Coding agents, reveal the key you want, and make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
 
 // Captured at load so tests that overwrite HOME/USERPROFILE cannot make a
 // project walk climb into the real ~/.cursor/mcp.json.
