@@ -1,8 +1,10 @@
 # DevSpec for Cursor
 
-Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the terminal.
+**Build on your team’s best thinking.**
 
-[DevSpec](https://devspec.ai) tracks your team's tasks, bugs, and features — called **action items** — against your git repositories, along with the context, decisions, and history around them. This plugin connects Cursor's agent to your DevSpec account over MCP so it can pull that work into the chat, do it, and record what it did — all tracked in DevSpec.
+[DevSpec](https://devspec.ai) helps your team and AI agents turn ideas and experience into better software.
+
+Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the terminal. This plugin connects Cursor's agent to your DevSpec account over MCP so it can pull that work into the chat, do it, and record what it did — all tracked in DevSpec.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
