@@ -18,6 +18,8 @@
  * must pass an explicit timeout above the server hold.
  */
 
+import { versionedConnectionArguments } from './connection-version.mjs'
+
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
 
@@ -137,7 +139,7 @@ export async function mcpToolsCall({
     jsonrpc: '2.0',
     id: Date.now(),
     method: 'tools/call',
-    params: { name, arguments: toolArgs || {} },
+    params: { name, arguments: versionedConnectionArguments(name, toolArgs || {}) },
   }
 
   const controller = new AbortController()

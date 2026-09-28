@@ -296,7 +296,9 @@ export function directoryKey(folder, sessionId, instanceId) {
 export function fleetInstanceIdFromPromptFile(promptFile) {
   if (process.env.DEVSPEC_FLEET_SETTLE !== '1') return null
   if (typeof promptFile !== 'string' || !promptFile.trim()) return null
-  const stamp = path.basename(promptFile).replace(/\.prompt\.txt$/i, '').trim()
+  // Prompt-file paths may have been serialized on Windows; win32.basename
+  // understands both separators regardless of the inspecting host's platform.
+  const stamp = path.win32.basename(promptFile).replace(/\.prompt\.txt$/i, '').trim()
   return stamp || null
 }
 

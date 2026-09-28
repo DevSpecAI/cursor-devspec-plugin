@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.23
+
+Registration and attachment now carry the executing DevSpec plugin version. Native MCP calls use Cursor's own `preToolUse.updated_input` field without making a permission decision; host version comes only from Cursor's documented `cursor_version`/`CURSOR_VERSION` values when available. Installed cache copies still require their normal update/restart, and a marketplace index alone is not evidence that a new plugin is running.
+
 ## 0.13.22
 
 ### Delivery evidence stays on action items, out of project memory

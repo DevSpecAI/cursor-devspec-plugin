@@ -1087,7 +1087,9 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
       while (Date.now() < deadline) {
         if (fs.existsSync(wakeFile)) {
           const text = fs.readFileSync(wakeFile, 'utf8')
-          if (text.includes('"type":"owner_message"')) break
+          // File writes and stderr pipe delivery are separate observations.
+          // Wait for both instead of racing the child's diagnostic stream.
+          if (text.includes('"type":"owner_message"') && /wake \(1 msg\) — follow/.test(stderr)) break
         }
         await new Promise((r) => setTimeout(r, 50))
       }
