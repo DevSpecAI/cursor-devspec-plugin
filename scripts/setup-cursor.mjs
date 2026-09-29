@@ -35,6 +35,7 @@ export function parseArgs(argv) {
     if (flag === '--token') out.token = inline ?? argv[++i]
     else if (flag === '--api-url') out.apiUrl = inline ?? argv[++i]
     else if (flag === '--home') out.home = inline ?? argv[++i]
+    else if (flag === '--refresh') out.refresh = true
   }
   return out
 }
@@ -80,12 +81,11 @@ export function resolveInputs({ args, env }) {
   if (!/^https?:\/\//.test(base)) {
     throw new Error(`--api-url must be an http(s) URL, got: ${base}`)
   }
-  return { token, url: `${base}/api/mcp` }
+  return { token, url: `${base}/api/mcp?tool_namespace=devspec` }
 }
 
 async function main(argv, env, homedir) {
   const args = parseArgs(argv)
-  const { token, url } = resolveInputs({ args, env })
   const home = args.home ?? homedir
   const file = path.join(home, '.cursor', 'mcp.json')
 
@@ -100,14 +100,27 @@ async function main(argv, env, homedir) {
     }
   }
 
-  const { config, changed } = mergeMcpConfig(existing, { url, token })
+  let token, url, config, changed
+  if (args.refresh) {
+    const entry = existing?.mcpServers?.[SERVER_KEY]
+    if (!entry || typeof entry.url !== 'string') throw new Error('No existing DevSpec HTTP server to refresh. Run normal setup first.')
+    const updated = new URL(entry.url)
+    updated.searchParams.set('tool_namespace', 'devspec')
+    url = updated.toString()
+    config = structuredClone(existing)
+    changed = config.mcpServers[SERVER_KEY].url !== url
+    config.mcpServers[SERVER_KEY].url = url
+  } else {
+    ({ token, url } = resolveInputs({ args, env }))
+    ;({ config, changed } = mergeMcpConfig(existing, { url, token }))
+  }
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(file, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
 
   const others = Object.keys(config.mcpServers).filter((k) => k !== SERVER_KEY)
   console.log(`${changed ? 'Registered' : 'Already registered'} DevSpec MCP in ${file}`)
   console.log(`  url:   ${url}`)
-  console.log(`  token: ${fingerprint(token)}`)
+  console.log(args.refresh ? '  credentials: preserved unchanged' : `  token: ${fingerprint(token)}`)
   if (others.length) console.log(`  left alone: ${others.join(', ')}`)
   console.log('\nRestart cursor-agent so it picks up the server.')
 }

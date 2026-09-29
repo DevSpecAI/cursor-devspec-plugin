@@ -86,6 +86,8 @@ import {
   LOCAL_ID_OVERRIDE_ENV_VAR,
 } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { findProjectPin } from './provenance-assistance.mjs'
+import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
@@ -162,11 +164,15 @@ function writeJson(filePath, state) {
   fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = { _: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--session' || a === '--session_id') out.session = argv[++i]
+    const projectEquals = /^--project(?:-id|_id)?=(.*)$/.exec(a)
+    if (projectEquals) {
+      if (out['project-id'] || !projectEquals[1].trim()) throw new Error('Pass one non-empty project name or full ID.')
+      out['project-id'] = projectEquals[1]
+    } else if (a === '--session' || a === '--session_id') out.session = argv[++i]
     else if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
       out['connection-id'] = argv[++i]
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
@@ -190,7 +196,8 @@ function parseArgs(argv) {
       out.forceNew = true
     } else if (a === '--launch-id' || a === '--launch_id') {
       out['launch-id'] = argv[++i]
-    } else if (a === '--project-id' || a === '--project_id') {
+    } else if (a === '--project' || a === '--project-id' || a === '--project_id') {
+      if (out['project-id'] || !argv[i + 1]?.trim() || argv[i + 1].startsWith('--')) throw new Error('Pass one project name or full ID after --project.')
       out['project-id'] = argv[++i]
     } else if (a === '--git-remote' || a === '--git_remote') {
       out['git-remote'] = argv[++i]
@@ -1581,7 +1588,8 @@ export async function registerConnection(opts) {
   const started = Date.now()
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd()
   const localId = opts.localId
-  const projectId = opts.projectId
+  let projectId = typeof opts.projectId === 'string' ? opts.projectId.trim().toLowerCase() : null
+  if (projectId && !UUID.test(projectId)) return { ok: false, error: 'register requires a full project ID. Use fast-connect --project for a project name.' }
   const launchId = resolveLaunchId(opts.launchId)
   const agent = opts.agent || AGENT_NAME
   const mcpCall = opts.mcpCall || mcpToolsCall
@@ -1608,9 +1616,20 @@ export async function registerConnection(opts) {
     return { ok: false, error: auth.error || 'auth_failed' }
   }
 
+  try {
+    const previous = readProjectContext(localId, auth.mcp_url, opts.projectHome)
+    if (previous?.status === 'blocked' && previous.requires_explicit && !projectId) return { ok: false, error: previous.message }
+    if (previous?.status === 'selected') {
+      if (projectId && projectId !== previous.project.id) return { ok: false, error: 'This Cursor conversation uses another project. Start a fresh chat to switch.' }
+      projectId = previous.project.id
+    }
+  } catch (error) { return { ok: false, error: error.message } }
+  const pin = findProjectPin(cwd)
   const toolArgs = {
     local_id: localId,
-    project_id: projectId,
+    ...(projectId ? { project_id: projectId } : {}),
+    ...(pin ? { pinned_project_id: pin.projectId } : {}),
+    project_selection_version: 1,
     agent_name: agent,
     cwd,
     machine_hostname: opts.hostname || os.hostname(),
@@ -1636,6 +1655,9 @@ export async function registerConnection(opts) {
     const capabilityEnvelope = response?.meta?.devspec?.connection_capability
     const connectionId = result?.connection_id || result?.connectionId || null
     if (connectionId) {
+      const project = candidate(result.project_selection?.project) ?? candidate({ id: result.project_id, name: result.project_id })
+      if (!project || (projectId && projectId !== project.id)) throw new Error('DevSpec did not confirm the requested project. No local scope was adopted.')
+      selectProjectContext(localId, auth.mcp_url, project, result.project_selection?.source ?? 'conversation', opts.projectHome)
       const persisted = persistCapability({
         connectionId,
         localId,
@@ -1682,7 +1704,11 @@ export async function registerConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    const choice = choiceFromFailure(err)
+    if (choice || projectId) {
+      try { blockProjectContext(localId, auth.mcp_url, 'Choose a project explicitly with fast-connect --project <name-or-id>.', opts.projectHome, Boolean(projectId)) } catch {}
+    }
+    return { ok: false, error: err instanceof Error ? err.message : String(err), ...(choice ? { code: 'project_choice_required', project_selection: choice } : {}) }
   }
 }
 

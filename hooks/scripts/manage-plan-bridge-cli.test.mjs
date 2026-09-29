@@ -62,6 +62,7 @@ describe('manual Cursor manage-plan CLI lifecycle', () => {
         const capability = `dvsc_${connectionId === CONNECTION_A ? 'a' : 'b'}_rotation_${ordinal}`
         res.end(resultPayload(rpc.id, {
           connection_id: connectionId,
+          project_id: PROJECT,
           created: ordinal === 1,
           connection_capability_version: 1,
         }, {

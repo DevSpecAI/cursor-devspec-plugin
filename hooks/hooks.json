@@ -19,8 +19,9 @@
     "preToolUse": [
       {
         "type": "command",
-        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/connection-version.mjs\"",
-        "matcher": "^(mcp__(plugin_devspec_)?devspec__|devspec__|devspec\\.)?(register_connection|attach_connection)$",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" pre",
+        "matcher": "^(MCP:devspec__.+|devspec__.+|(mcp__(plugin_devspec_)?devspec__|devspec\\.)?(register_connection|attach_connection))$",
+        "failClosed": true,
         "timeout": 5
       },
       {
@@ -70,6 +71,11 @@
     "afterMCPExecution": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" after",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" afterMCPExecution",
         "timeout": 30
       },
@@ -85,6 +91,11 @@
       }
     ],
     "beforeMCPExecution": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" before",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeMCPExecution",

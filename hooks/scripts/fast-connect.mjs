@@ -16,6 +16,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import {
   durationMs,
@@ -24,7 +25,6 @@ import {
 } from './connect-phase-timing.mjs'
 import {
   detectLocalId,
-  mintLocalId,
   resolveLocalAction,
   registerConnection,
   attachConnection,
@@ -55,6 +55,9 @@ export function parseSessionIdFromPrompt(promptBody) {
     /session_id(?:\s*[:=]\s*)["']?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})\b/i,
   )
   if (explicit?.[1]) return explicit[1]
+
+  // A project selector is not a room. Combined usage must name --session explicitly.
+  if (/--project(?:-id|_id)?(?:\s|=)/i.test(promptBody)) return null
 
   // Bare uuid only when the prompt is clearly remote connect — skip project/automation/run ids.
   const lower = promptBody.toLowerCase()
@@ -95,7 +98,8 @@ export function resolveGitRemote(cwd, { execFileSyncImpl = execFileSync } = {}) 
 }
 
 /**
- * Resolve DevSpec project_id via list_projects + git_remote.
+ * Resolve only an explicit project name/ID. Automatic remote/pin ranking belongs
+ * to the server at registration, so an ordinary connect makes no discovery call.
  * @param {{
  *   cwd: string,
  *   gitRemote?: string | null,
@@ -120,7 +124,8 @@ export async function resolveProjectForConnect(opts) {
   } = opts
   const started = Date.now()
 
-  if (typeof projectId === 'string' && projectId.trim().length >= 8) {
+  if (!projectId) return { ok: true, project_id: null, git_remote: gitRemote, source: 'server' }
+  if (typeof projectId === 'string' && UUID.test(projectId.trim())) {
     await emitPhase({
       phase: 'project_resolve',
       outcome: 'ok',
@@ -130,7 +135,7 @@ export async function resolveProjectForConnect(opts) {
       mcpUrl: auth.mcp_url || null,
       extra: { source: 'explicit', project_id: projectId.trim() },
     })
-    return { ok: true, project_id: projectId.trim(), git_remote: gitRemote, source: 'explicit' }
+    return { ok: true, project_id: projectId.trim().toLowerCase(), git_remote: gitRemote, source: 'explicit' }
   }
 
   if (!auth?.ok || !auth.token || !auth.mcp_url) {
@@ -151,25 +156,16 @@ export async function resolveProjectForConnect(opts) {
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'list_projects',
-      arguments: gitRemote ? { git_remote: gitRemote } : {},
+      arguments: {},
       timeoutMs: 60_000,
     })
-    const resolved =
-      result?.remote_match?.resolved_project_id ||
-      (typeof result?.remote_match?.resolved_project_id === 'string'
-        ? result.remote_match.resolved_project_id
-        : null)
-    const candidates = Array.isArray(result?.remote_match?.candidate_project_ids)
-      ? result.remote_match.candidate_project_ids
-      : []
-    const projects = Array.isArray(result?.projects) ? result.projects : []
-
-    let project_id = resolved || null
-    let source = 'remote_match'
-    if (!project_id && projects.length === 1 && projects[0]?.id) {
-      project_id = projects[0].id
-      source = 'single_project'
-    }
+    if (!Array.isArray(result?.projects)) throw new Error('DevSpec did not return accessible project choices.')
+    const projects = result.projects.map(candidate)
+    if (projects.some(project => !project)) throw new Error('DevSpec returned invalid project choices.')
+    const matches = selectNamedProject(projects, projectId)
+    const candidates = matches.length ? matches : projects
+    const project_id = matches.length === 1 ? matches[0].id : null
+    const source = 'explicit_name'
 
     if (!project_id) {
       const reason = candidates.length
@@ -189,12 +185,12 @@ export async function resolveProjectForConnect(opts) {
       })
       return {
         ok: false,
-        error: candidates.length
-          ? `Repo tracked by multiple DevSpec projects — pass --project-id`
-          : `No DevSpec project tracks this repo (${gitRemote || 'no git remote'})`,
+        error: matches.length ? 'Several accessible projects have that name. Choose a project and organisation.' : 'No accessible project has that exact name. Choose from the returned projects or use a full ID.',
+        code: 'project_choice_required',
+        project_selection: { version: 1, status: 'choice_required', reason: matches.length ? 'ambiguous_name' : 'unknown_name', candidates },
         project_id: null,
         git_remote: gitRemote,
-        candidates,
+        candidates: candidates.map(project => project.id),
       }
     }
 
@@ -248,7 +244,6 @@ export async function resolveProjectForConnect(opts) {
  *   writeFn?: typeof writeConnectionState,
  *   resolveLocalFn?: typeof resolveLocalAction,
  *   detectLocalIdFn?: typeof detectLocalId,
- *   mintLocalIdFn?: typeof mintLocalId,
  * }} [opts]
  */
 export async function fastConnect(opts = {}) {
@@ -264,7 +259,6 @@ export async function fastConnect(opts = {}) {
   const writeFn = opts.writeFn || writeConnectionState
   const resolveLocalFn = opts.resolveLocalFn || resolveLocalAction
   const detectLocalIdFn = opts.detectLocalIdFn || detectLocalId
-  const mintLocalIdFn = opts.mintLocalIdFn || mintLocalId
 
   const hostToken =
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
@@ -289,9 +283,7 @@ export async function fastConnect(opts = {}) {
   let localIdSource = detected.source
   let minted = false
   if (!localId) {
-    localId = mintLocalIdFn()
-    localIdSource = 'minted'
-    minted = true
+    return { ok: false, error: 'Cursor did not provide its conversation ID. Run this from Cursor or use a native create-chat ID; never substitute a folder or another host’s ID.', connection_id: null, local_id: null }
   }
   await emitPhase({
     phase: 'resolve_local_id',
@@ -313,6 +305,20 @@ export async function fastConnect(opts = {}) {
     session_id: sessionId,
     codename: null,
   })
+
+  let previousProject
+  try { previousProject = readProjectContext(localId, auth.mcp_url || null, opts.projectHome) }
+  catch (error) { return { ok: false, error: error.message, local_id: localId, connection_id: null } }
+  const gitRemote = resolveGitRemoteFn(cwd)
+  const prepared = await resolveProjectForConnect({ cwd, gitRemote, projectId: opts.projectId, auth, launchId, agent, mcpCall, emitPhase })
+  if (!prepared.ok) {
+    try { blockProjectContext(localId, auth.mcp_url, prepared.error, opts.projectHome, true) } catch {}
+    return { ...prepared, local_id: localId, connection_id: null, session_id: sessionId, launch_id: launchId }
+  }
+  if (previousProject?.status === 'selected' && prepared.project_id && prepared.project_id !== previousProject.project.id) {
+    return { ok: false, error: 'This Cursor conversation is already connected to another project. Start a fresh chat to switch.', local_id: localId, connection_id: null }
+  }
+  let projectContext = previousProject?.status === 'selected' ? previousProject : null
 
   // --- resolve_local (already_live / reconnect / register) ---
   const localStarted = Date.now()
@@ -341,7 +347,7 @@ export async function fastConnect(opts = {}) {
   /** @type {string | null} */
   let attachedSessionId = sessionId
 
-  if (localAction.action === 'already_live' && localAction.connection_id) {
+  if (localAction.action === 'already_live' && localAction.connection_id && projectContext) {
     connectionId = localAction.connection_id
     codename = localAction.session_codename || null
     // Attach only when the launch asked for a (possibly new) session.
@@ -389,38 +395,16 @@ export async function fastConnect(opts = {}) {
       return authFailed()
     }
 
-    const gitRemote = resolveGitRemoteFn(cwd)
-    const project = await resolveProjectForConnect({
-      cwd,
-      gitRemote,
-      projectId: opts.projectId,
-      auth,
-      launchId,
-      agent,
-      mcpCall,
-      emitPhase,
-    })
-    if (!project.ok || !project.project_id) {
-      return {
-        ok: false,
-        error: project.error || 'project_resolve_failed',
-        local_id: localId,
-        launch_id: launchId,
-        connection_id: null,
-        session_id: sessionId,
-        codename: null,
-      }
-    }
-
     const registered = await registerFn({
       localId,
-      projectId: project.project_id,
+      projectId: projectContext?.project.id ?? prepared.project_id,
+      projectHome: opts.projectHome,
       cwd,
       launchId,
       agent,
       hostToken,
       codename: opts.codename,
-      gitRemote: project.git_remote || gitRemote,
+      gitRemote,
       mcpCall,
       resolveAuth,
       emitPhase,
@@ -429,6 +413,7 @@ export async function fastConnect(opts = {}) {
       return {
         ok: false,
         error: registered.error || 'register_failed',
+        ...(registered.project_selection ? { code: 'project_choice_required', project_selection: registered.project_selection } : {}),
         local_id: localId,
         launch_id: launchId,
         connection_id: null,
@@ -436,6 +421,12 @@ export async function fastConnect(opts = {}) {
         codename: null,
       }
     }
+    const project = candidate(registered.project_selection?.project) ?? candidate({ id: registered.project_id, name: registered.project_id })
+    if (!project) return { ok: false, error: 'The registration did not confirm its project.', local_id: localId, connection_id: null }
+    try {
+      if (prepared.project_id && prepared.project_id !== project.id) throw new Error('DevSpec confirmed a different project than requested.')
+      projectContext = selectProjectContext(localId, auth.mcp_url, project, registered.project_selection?.source ?? 'conversation', opts.projectHome)
+    } catch (error) { return { ok: false, error: error.message, local_id: localId, connection_id: null } }
     connectionId = registered.connection_id
     codename = registered.codename || registered.session_codename || null
 
@@ -464,7 +455,9 @@ export async function fastConnect(opts = {}) {
       }
       attachedSessionId = attached.session_id || sessionId
     } else {
-      attachedSessionId = null
+      // Registration also refreshes existing native conversations. Its attachment
+      // snapshot is authoritative; hydration must not erase a live room bond.
+      attachedSessionId = registered.session_id || null
     }
   }
 
@@ -539,6 +532,8 @@ export async function fastConnect(opts = {}) {
     local_id: localId,
     launch_id: launchId,
     action: localAction.action,
+    project_id: projectContext?.project.id,
+    project_selection: projectContext,
     poller,
     warning_tokens: written.warning_tokens || null,
   }

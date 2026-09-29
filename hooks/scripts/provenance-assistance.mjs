@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { readProjectContext, isDevspecServer } from './project-context.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -205,9 +206,8 @@ function gitRemoteOrigin(cwd) {
 
 function walkForPin(start, repoRoot, home) {
   let current = path.resolve(start)
-  const boundedByHome = isInside(current, home)
   while (true) {
-    if (boundedByHome && current === home) return { pin: null, invalid: false }
+    if (isInside(home, current)) return { pin: null, invalid: false }
     const pinPath = path.join(current, '.devspec', 'project.json')
     try {
       const parsed = JSON.parse(fs.readFileSync(pinPath, 'utf8'))
@@ -229,7 +229,7 @@ function walkForPin(start, repoRoot, home) {
 export function findProjectPin(start, options = {}) {
   const home = path.resolve(options.home || os.homedir())
   const initial = path.resolve(start || process.cwd())
-  const repoRoot = path.resolve(options.repoRoot || gitTopLevel(nearestExistingDirectory(initial)) || initial)
+  const repoRoot = path.resolve(options.repoRoot || gitTopLevel(nearestExistingDirectory(initial)) || path.parse(initial).root)
   const local = walkForPin(initial, repoRoot, home)
   if (local.pin || local.invalid) return local.pin
 
@@ -395,6 +395,8 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
     pin = null,
     env = process.env,
     timeoutMs = ONLINE_REFERENCE_TIMEOUT_MS,
+    conversationId = null,
+    projectHome = os.homedir(),
     call = mcpToolsCall,
     resolveAuth = resolveDevspecMcpAuth,
   } = options
@@ -408,6 +410,11 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
   if (!auth?.ok || !auth.token || !auth.mcp_url) return 'unavailable'
 
   const args = { commit_message: commitMessage }
+  try {
+    const selected = readProjectContext(conversationId, auth.mcp_url, projectHome)
+    if (selected?.status === 'blocked') return 'indeterminate'
+    if (selected?.status === 'selected') args.project_id = selected.project.id
+  } catch { return 'indeterminate' }
   if (pin?.projectId) args.pinned_project_id = pin.projectId
   const gitRemote = gitRemoteOrigin(cwd)
   if (gitRemote) args.git_remote = gitRemote
@@ -432,7 +439,8 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
 }
 
 function toolFields(data) {
-  const lowerName = (cleanString(data?.tool_name) || cleanString(data?.toolName) || '').toLowerCase()
+  if (data?.mcp_server_name && !isDevspecServer(data.mcp_server_name)) return { verb: '', isDevspec: false }
+  const lowerName = (cleanString(data?.tool_name) || cleanString(data?.toolName) || '').toLowerCase().replace(/^mcp:(?=devspec__)/, '')
   const known = ['claim_work_item', ...TERMINAL_WORK_VERBS]
   const verb = known.find((candidate) => lowerName === candidate || lowerName === `devspec__${candidate}` || lowerName === `devspec.${candidate}`) || ''
   return { verb, isDevspec: Boolean(verb) }
@@ -505,14 +513,17 @@ export function parseMcpExecution(data) {
   const { verb, isDevspec } = toolFields(data)
   const args = parseJsonObject(data?.tool_input ?? data?.toolInput) || {}
   const resultPresent = Object.hasOwn(data || {}, 'result_json') || Object.hasOwn(data || {}, 'resultJson')
-  const result = parseJsonObject(data?.result_json ?? data?.resultJson)
+  const envelope = parseJsonObject(data?.result_json ?? data?.resultJson)
+  const result = Array.isArray(envelope?.content)
+    ? parseJsonObject(envelope.content.filter(block => block.type === 'text').map(block => block.text).join('\n'))
+    : envelope
   const requestedId = claimedItemId(args)
-  if (!isDevspec || !resultPresent || hasOuterFailure(result)) return { verb, args, successful: false, actionItemId: requestedId, projectId: null }
+  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) return { verb, args, successful: false, actionItemId: requestedId, projectId: null }
   const rawProjects = resultProjectValues(result)
   const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
   const projectId = rawProjects.length === returnedProjects.length && returnedProjects.length &&
     returnedProjects.every((id) => id === returnedProjects[0]) ? returnedProjects[0] : null
-  const requestedProjectValue = cleanString(args?.project_id) || cleanString(args?.pinned_project_id)
+  const requestedProjectValue = cleanString(args?.project_id) // a folder pin is a hint, not an explicit scope
   const requestedProject = cleanUuid(requestedProjectValue)
   const projectAgrees = !requestedProjectValue || Boolean(requestedProject && requestedProject === projectId)
   if (verb === 'claim_work_item') {
@@ -583,8 +594,12 @@ export function handleHook(mode, data, options = {}) {
     if (!commandKey) return null
     const parsed = parseReadableCommit(toolInput[commandKey], candidateCwd(data))
     const pin = parsed ? findProjectPin(parsed.targetCwd, options.pinOptions) : null
-    if (!parsed || !pin) return null
-    const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === pin.projectId)
+    let selected
+    try { selected = readProjectContext(conversationId, null, options.projectHome) } catch { return null }
+    if (selected?.status === 'blocked') return null
+    const projectId = selected?.project?.id ?? pin?.projectId
+    if (!parsed || !projectId) return null
+    const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === projectId)
 
     const refs = inspectReferences(parsed.message)
     if (refs.valid.length === 1 && !refs.malformedOrAmbiguous) {
@@ -593,6 +608,8 @@ export function handleHook(mode, data, options = {}) {
       return confirmReferenceOnline(parsed.message, {
         cwd: parsed.targetCwd,
         mainWorktree,
+        conversationId,
+        projectHome: options.projectHome,
         pin,
         env,
         timeoutMs: options.onlineTimeoutMs,
@@ -640,12 +657,16 @@ export function handleHook(mode, data, options = {}) {
     const targetDirectory = editTargetDirectory(data)
     if (!targetDirectory) return null
     const pin = findProjectPin(targetDirectory, options.pinOptions)
-    if (!pin || state.active_claims.some((claim) => claim.project_id === pin.projectId) || state.nudged_projects.includes(pin.projectId)) return null
-    state.nudged_projects.push(pin.projectId)
+    let selected
+    try { selected = readProjectContext(conversationId, null, options.projectHome) } catch { return null }
+    if (selected?.status === 'blocked') return null
+    const projectId = selected?.project?.id ?? pin?.projectId
+    if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
+    state.nudged_projects.push(projectId)
     writeConversationState(conversationId, state, stateRoot)
     return {
       additional_context:
-        `DevSpec provenance note: this edit already completed in project ${pin.projectId}, and this Cursor conversation has no observed active claim. ` +
+        `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
         'Continue working—do not stop or retry. When practical, search/reuse/create and claim the smallest covering item; commit linkage and server reconciliation remain authoritative.',
     }
   }

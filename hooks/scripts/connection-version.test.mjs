@@ -35,7 +35,7 @@ test('internal MCP register/attach requests report the artifact without changing
 })
 test('Cursor native updates use updated_input, observed host facts, and no permission override', () => {
   const config = JSON.parse(readFileSync(join(root, 'hooks/hooks.json'), 'utf8'))
-  const hook = config.hooks.preToolUse.find(entry => entry.command.includes('connection-version.mjs'))
+  const hook = config.hooks.preToolUse.find(entry => entry.command.includes('project-input.mjs'))
   assert.ok(hook)
   for (const prefix of ['', 'devspec__', 'devspec.', 'mcp__devspec__', 'mcp__plugin_devspec_devspec__']) {
     for (const verb of ['register_connection', 'attach_connection']) {

@@ -72,7 +72,7 @@ should go.
 
 Once it is enabled, the plugin provides:
 
-- the two remote-control **skills** (`devspec.remote`, `devspec.remote-stop`),
+- the remote-control and project **skills** (`devspec.remote`, `devspec.remote-stop`, `devspec.project`),
 - the agent **hooks** for remote-control telemetry and commit-provenance assistance,
 - the managed **project rule** (`rules/devspec.mdc`), which Cursor picks up from the plugin.
 
@@ -122,12 +122,13 @@ To check the plugin itself loaded — a separate thing from MCP working — run 
 
 ### Skills
 
-The plugin contributes two skills, invoked from a `cursor-agent` session:
+The plugin contributes these skills, invoked from a `cursor-agent` session:
 
 | Skill | What it does |
 |---|---|
 | `devspec.remote` | Connect this session to DevSpec's Agents page |
 | `devspec.remote-stop` | Disconnect this session from the Agents page |
+| `devspec.project` | Inspect project scope, manage folder defaults, or prepare a fresh chat for another project |
 
 Action-item, memory, help, and implementation operations are MCP tools used from the agent
 session; they are not separate skills. Cursor receives concise tool discovery rather than a
@@ -145,7 +146,13 @@ Cursor's existing Resume behavior is unchanged: CLI launches mint a native chat,
 
 ## How it finds the right project
 
-You don't pass a project id in most cases. The plugin matches the git remote of the repo you're in to the DevSpec project that tracks it. If a single repo is tracked by more than one project, pass `--project-id=<id>` in the command's input.
+Bare `/devspec.remote` stays automatic when a remote identifies one accessible project, or a greenfield folder has a valid `.devspec/project.json` pin. A unique remote beats a stale pin; a pin naming one of several matching projects breaks that tie.
+
+For an explicit choice, use `/devspec.remote --project "Project name"` or a full ID (`--project-id` remains supported). Ambiguity produces project **and organisation** choices; the agent asks rather than picking one. The selection belongs to this Cursor conversation and its resume, including ordinary DevSpec tools. It does not change a folder default or another conversation in the same directory.
+
+Use `/devspec.project` for details. Remember and forget show the effective file and require separate confirmation; existing conversations stay on their project. Switching projects requires a fresh native Cursor chat, not the old chat's history. The helper returns a verified bare-Cursor command to run in a new terminal and the first project-selection message to send there. It does not launch the chat or change the old one. If your Cursor executable is not discoverable, supply its real path with `--cursor-bin`; never substitute another host's generic `agent` command.
+
+**After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the supported namespaced view, preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
 
 ## Open in Cursor from DevSpec
 

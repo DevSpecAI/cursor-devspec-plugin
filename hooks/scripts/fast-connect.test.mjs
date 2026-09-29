@@ -4,12 +4,20 @@
  * Run: node --test hooks/scripts/fast-connect.test.mjs
  */
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import { describe, it, beforeEach, afterEach } from 'node:test'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { selectProjectContext } from './project-context.mjs'
+let projectHome
+beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
+afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
 import {
-  fastConnect,
+  fastConnect as connectImpl,
   parseSessionIdFromPrompt,
   resolveProjectForConnect,
 } from './fast-connect.mjs'
+const fastConnect = opts => connectImpl({ ...opts, projectHome })
 
 describe('parseSessionIdFromPrompt', () => {
   it('parses --session <uuid> and --session=<uuid>', () => {
@@ -80,16 +88,17 @@ describe('resolveProjectForConnect', () => {
     assert.equal(phases[0].launch_id, 'launch-1')
   })
 
-  it('resolves via list_projects remote_match', async () => {
+  it('resolves an explicit exact name without deciding remote precedence', async () => {
     const r = await resolveProjectForConnect({
       cwd: '/tmp',
       gitRemote: 'https://github.com/DevSpecAI/cursor-devspec-plugin.git',
       auth: { ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' },
       launchId: 'launch-2',
+      projectId: 'DevSpec',
       emitPhase: async () => {},
       mcpCall: async ({ name, arguments: args }) => {
         assert.equal(name, 'list_projects')
-        assert.equal(args.git_remote, 'https://github.com/DevSpecAI/cursor-devspec-plugin.git')
+        assert.deepEqual(args, {})
         return {
           projects: [{ id: '24c4abaa-2cb9-496a-8492-cf1f1aa1090b', name: 'DevSpec' }],
           remote_match: { resolved_project_id: '24c4abaa-2cb9-496a-8492-cf1f1aa1090b' },
@@ -100,10 +109,11 @@ describe('resolveProjectForConnect', () => {
     assert.equal(r.project_id, '24c4abaa-2cb9-496a-8492-cf1f1aa1090b')
   })
 
-  it('fails when no project matches', async () => {
+  it('fails when no accessible project has the explicit name', async () => {
     const r = await resolveProjectForConnect({
       cwd: '/tmp',
       gitRemote: 'https://github.com/example/none.git',
+      projectId: 'Missing project',
       auth: { ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' },
       emitPhase: async () => {},
       mcpCall: async () => ({
@@ -112,7 +122,11 @@ describe('resolveProjectForConnect', () => {
       }),
     })
     assert.equal(r.ok, false)
-    assert.match(r.error, /No DevSpec project/)
+    assert.match(r.error, /No accessible project/)
+  })
+  it('defers automatic remote and pin resolution to registration without a discovery call', async () => {
+    const result = await resolveProjectForConnect({ cwd: '/tmp', gitRemote: 'repo', auth: { ok: true }, mcpCall: async () => { throw new Error('must not discover') } })
+    assert.equal(result.ok, true); assert.equal(result.project_id, null); assert.equal(result.source, 'server')
   })
 })
 
@@ -162,6 +176,7 @@ describe('fastConnect', () => {
           ok: true,
           connection_id: connectionId,
           codename: 'Brave Otter',
+          project_id: projectId,
           created: true,
         }
       },
@@ -226,7 +241,7 @@ describe('fastConnect', () => {
       emitPhase: async () => {},
       registerFn: async () => {
         calls.push('register')
-        return { ok: true, connection_id: connectionId, codename: 'Swift Fox' }
+        return { ok: true, connection_id: connectionId, project_id: projectId, codename: 'Swift Fox' }
       },
       attachFn: async () => {
         calls.push('attach')
@@ -278,7 +293,7 @@ describe('fastConnect', () => {
       emitPhase: async () => {},
       registerFn: async () => {
         calls.push('register')
-        return { ok: true, connection_id: connectionId, codename: 'Ivory Llama' }
+        return { ok: true, connection_id: connectionId, project_id: projectId, codename: 'Ivory Llama' }
       },
       attachFn: async () => {
         calls.push('attach')
@@ -344,7 +359,7 @@ describe('fastConnect', () => {
     const r = await fastConnect({
       localId,
       launchId,
-      // no projectId — force list_projects
+      projectId: 'Missing project', // only an explicit name needs discovery
       resolveAuth: () => ({
         ok: true,
         token: 't',
@@ -362,10 +377,29 @@ describe('fastConnect', () => {
       writeFn: async () => ({ ok: true }),
     })
     assert.equal(r.ok, false)
-    assert.match(r.error, /No DevSpec project/)
+    assert.match(r.error, /No accessible project/)
   })
 
-  it('already_live skips register when no new session', async () => {
+  it('hydrates a legacy live connection without erasing the server attachment', async () => {
+    const result = await fastConnect({
+      localId, cwd: process.cwd(), launchId,
+      resolveAuth: () => ({ ok: true, token: 'fixture', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({ action: 'already_live', connection_id: connectionId, session_id: sessionId }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'native' }), emitPhase: async () => {},
+      registerFn: async () => ({ ok: true, connection_id: connectionId, session_id: sessionId, project_id: projectId, codename: 'Existing' }),
+      writeFn: async opts => {
+        assert.equal(opts.sessionId, sessionId)
+        return { ok: true, session_codename: 'Existing', poller: { ok: true, reused: true } }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.session_id, sessionId)
+    assert.equal(result.project_id, projectId)
+  })
+
+  it('already_live with saved scope skips register when no new session', async () => {
+    selectProjectContext(localId, 'https://example.test/api/mcp', { id: projectId, name: 'Project' }, 'explicit', projectHome)
     const calls = []
     const r = await fastConnect({
       localId,
@@ -434,6 +468,7 @@ describe('fastConnect', () => {
         ok: true,
         connection_id: connectionId,
         codename: 'Restless Owl',
+        project_id: projectId,
       }),
       attachFn: async () => ({ ok: true, connection_id: connectionId, session_id: sessionId }),
       writeFn: async (opts) => {
@@ -475,6 +510,7 @@ describe('fastConnect', () => {
         ok: true,
         connection_id: connectionId,
         codename: 'Restless Owl',
+        project_id: projectId,
       }),
       attachFn: async () => ({ ok: true, session_id: sessionId }),
       writeFn: async () => ({

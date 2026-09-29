@@ -124,6 +124,10 @@ export async function mcpToolsCallWithRetry(args = {}, retryOptions = {}) {
   }
 }
 
+export class CursorMcpRefusal extends Error {
+  constructor(text, details) { super(text); this.name = 'CursorMcpRefusal'; this.details = details }
+}
+
 export async function mcpToolsCall({
   mcpUrl,
   token,
@@ -231,7 +235,9 @@ export async function mcpToolsCall({
       .map((c) => c.text)
     const joined = textParts.join('\n')
     if (payload.result?.isError) {
-      throw new Error(joined || 'MCP tool error')
+      let details = payload.result.structuredContent
+      if (!details) { try { details = JSON.parse(joined) } catch {} }
+      throw new CursorMcpRefusal(joined || 'MCP tool error', details)
     }
     let data
     try {

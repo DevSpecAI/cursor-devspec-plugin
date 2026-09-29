@@ -108,19 +108,22 @@ describe('detectLocalId', () => {
 })
 
 describe('registerConnection capability negotiation', () => {
-  it('requests v1, captures hidden _meta, persists it, and never returns the raw secret', async () => {
+  it('requests v1, captures hidden _meta, persists it, and never returns the raw secret', async (t) => {
+    const projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-register-scope-'))
+    t.after(() => fs.rmSync(projectHome, { recursive: true, force: true }))
     let request
     let persisted
     const result = await registerConnection({
       localId: 'cursor-chat-a',
       projectId: '11111111-1111-4111-8111-111111111111',
+      projectHome,
       cwd: process.cwd(),
       resolveAuth: () => ({ ok: true, token: 'dvs_token', mcp_url: 'https://example.test/api/mcp' }),
       emitPhase: async () => {},
       mcpCall: async (value) => {
         request = value
         return {
-          data: { connection_id: '22222222-2222-4222-8222-222222222222', connection_capability_version: 1 },
+          data: { connection_id: '22222222-2222-4222-8222-222222222222', project_id: '11111111-1111-4111-8111-111111111111', connection_capability_version: 1 },
           meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_hidden-secret' } } },
         }
       },
@@ -133,13 +136,16 @@ describe('registerConnection capability negotiation', () => {
     assert.doesNotMatch(JSON.stringify(result), /hidden-secret/)
   })
 
-  it('fails closed when a negotiated register omits the hidden capability', async () => {
+  it('fails closed when a negotiated register omits the hidden capability', async (t) => {
+    const projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-register-scope-'))
+    t.after(() => fs.rmSync(projectHome, { recursive: true, force: true }))
     const result = await registerConnection({
       localId: 'cursor-chat-a',
       projectId: '11111111-1111-4111-8111-111111111111',
+      projectHome,
       resolveAuth: () => ({ ok: true, token: 'dvs_token', mcp_url: 'https://example.test/api/mcp' }),
       emitPhase: async () => {},
-      mcpCall: async () => ({ data: { connection_id: '22222222-2222-4222-8222-222222222222' }, meta: null }),
+      mcpCall: async () => ({ data: { connection_id: '22222222-2222-4222-8222-222222222222', project_id: '11111111-1111-4111-8111-111111111111' }, meta: null }),
       persistCapability: () => ({ ok: false }),
     })
     assert.equal(result.ok, false)

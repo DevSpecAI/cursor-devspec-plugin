@@ -18,7 +18,7 @@ describe('Cursor shared-session-plan surfaces', () => {
     // extension is gone, so the surface a user actually reaches is the plugin's
     // skills directory — the assertion is the same one, against where it now lives.
     const skills = fs.readdirSync(new URL('../skills', import.meta.url)).sort()
-    assert.deepEqual(skills, ['devspec.remote', 'devspec.remote-stop'])
+    assert.deepEqual(skills, ['devspec.project', 'devspec.remote', 'devspec.remote-stop'])
     assert.equal(skills.includes('devspec.work'), false)
     assert.equal(skills.includes('devspec.managePlan'), false)
   })

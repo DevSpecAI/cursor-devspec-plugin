@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.24
+
+Choose a DevSpec project for one Cursor conversation with `/devspec.remote --project <name-or-id>`. Ambiguous names return project and organisation choices rather than guessing. `/devspec.project` offers details, separately confirmed folder defaults, and a fresh native chat when changing projects. Resumes keep their scope; changing a folder pin does not redirect existing conversations.
+
+Refresh the existing MCP configuration with `node scripts/setup-cursor.mjs --refresh`, then restart Cursor. The server's opt-in tool namespace lets Cursor's input hook stamp scope, while its server-aware hook checks the destination. Normal clients keep the canonical catalogue; credentials and other MCP servers are unchanged. Node 18+ is required.
+
 ## 0.13.23
 
 Registration and attachment now carry the executing DevSpec plugin version. Native MCP calls use Cursor's own `preToolUse.updated_input` field without making a permission decision; host version comes only from Cursor's documented `cursor_version`/`CURSOR_VERSION` values when available. Installed cache copies still require their normal update/restart, and a marketplace index alone is not evidence that a new plugin is running.
