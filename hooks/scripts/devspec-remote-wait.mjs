@@ -1154,6 +1154,7 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     events.push({
       type: 'owner_message',
       session_id: sessionId,
+      ...(typeof batch?.instruction_context_file === 'string' ? {instruction_context_file:batch.instruction_context_file} : {}),
       ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
       message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
       ...(senderResponseStyle ? { sender_response_style: senderResponseStyle } : {}),

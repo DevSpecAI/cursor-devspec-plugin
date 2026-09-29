@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { connectionVersionHook } from './connection-version.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
-import { storeRepositorySnapshot } from './repository-context.mjs'
+import { storeRepositorySnapshot, refreshRepositoryRules } from './repository-context.mjs'
 import { UUID, firingConversation, namespacedVerb, isDevspecServer as isServer, PROJECTLESS, readProjectContext, selectProjectContext, candidate, toolArguments } from './project-context.mjs'
 const deny = message => ({ permission: 'deny', user_message: message, agent_message: message })
 export function projectInput(mode, input, { home } = {}) {
@@ -34,12 +34,16 @@ export function projectInput(mode, input, { home } = {}) {
     } catch (error) { return deny(error.message) }
   }
   if (mode === 'after') {
-    if (!isServer(input?.mcp_server_name) || namespaced !== 'register_connection') return null
+    if (!isServer(input?.mcp_server_name) || !['register_connection','attach_connection'].includes(namespaced)) return null
     try {
       const id = firingConversation(input), args = toolArguments(input)
       const result = typeof input.result_json === 'string' ? JSON.parse(input.result_json) : input.result_json
-      if (!id || args.local_id !== id || result?.isError || !Array.isArray(result?.content)) return null
+      if (!id || (namespaced === 'register_connection' && args.local_id !== id) || result?.isError || !Array.isArray(result?.content)) return null
       const data = JSON.parse(result.content.filter(block => block.type === 'text').map(block => block.text).join('\n'))
+      if(namespaced==='attach_connection') {
+        if(data.connection_id===args.connection_id && UUID.test(data.connection_id??'')) refreshRepositoryRules(id,data,home)
+        return null
+      }
       const project = candidate(data.project_selection?.project) ?? candidate({ id: data.project_id, name: data.project_id })
       if (!project || data.project_id !== project.id || !UUID.test(data.connection_id ?? '')) return null
       selectProjectContext(id, input.mcp_server_url || input.url, project, data.project_selection?.source ?? 'conversation', home)

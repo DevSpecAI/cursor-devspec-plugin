@@ -4,7 +4,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { selectProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile } from './repository-context.mjs'
+import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { buildOwnerMessageEvents, parseWakeBatches } from './devspec-remote-wait.mjs'
+import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingress-test-fixtures.mjs'
+import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
+import { projectInput } from './project-input.mjs'
 const A={id:'11111111-1111-4111-8111-111111111111',name:'A'},B={id:'22222222-2222-4222-8222-222222222222',name:'B'}
 const endpoint='https://fixture.invalid/api/mcp'
 function setup(fn){const home=fs.mkdtempSync(path.join(os.tmpdir(),'cursor-repository-context-'));try{fn(home)}finally{fs.rmSync(home,{recursive:true,force:true})}}
@@ -32,6 +36,31 @@ test('fresh conversations never consume another project inventory or rules',()=>
  assert.throws(()=>storeRepositorySnapshot('one',registration(B),home),/does not belong/)
  const text=repositoryContextHook({conversation_id:'two'},{home}).additional_context
  assert.match(text,/B\/repo-24/);assert.doesNotMatch(text,/A\/repo/)
+}))
+
+test('attach and canonical refreshes preserve repos, clear old rules and carry immutable context',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(A),home)
+ const oldPath=repositoryContextTextFile('one',home),oldBytes=fs.readFileSync(oldPath,'utf8')
+ const file=refreshRepositoryRules('one',{project_agent_rules:null,owner_agent_rules:'Updated machine'},home)
+ const snapshot=readRepositorySnapshot('one',home)
+ assert.equal(snapshot.rules.project_agent_rules,null);assert.equal(snapshot.rules.owner_agent_rules,'Updated machine')
+ assert.equal(snapshot.repository_context.repositories.length,25)
+ assert.equal(fs.readFileSync(oldPath,'utf8'),oldBytes)
+ const envelope=fixtureEnvelope()
+ const typed=emptyFixtureContext()
+ const batch={type:'owner_messages',connection_id:FIXTURE_ID.connection,messages:envelope.commands,acceptance_key:canonicalAcceptanceKey(envelope),instruction_context_file:file,context:{
+  advisory:true,typed,windows:[envelope.window],locally_omitted:0,locally_omitted_by_bucket:Object.fromEntries(Object.keys(typed).map(k=>[k,0])),windows_omitted:0,local_omission_reason:null,note:'advisory',
+ },ingress:{canonical:true,envelope}}
+ const recovered=parseWakeBatches([JSON.stringify(batch)],{canonicalOnly:true,connectionId:FIXTURE_ID.connection})
+ assert.equal(recovered.length,1,'the strict durable-inbox validator must accept the new context pointer')
+ const events=buildOwnerMessageEvents(recovered[0])
+ assert.equal(events.find(e=>e.type==='owner_message').instruction_context_file,file)
+ assert.equal(refreshRepositoryRules('one',{instructions_unchanged:true},home),null)
+ assert.throws(()=>refreshRepositoryRules('one',{project_id:B.id,project_agent_rules:'foreign'},home),/another project/)
+ const connection='33333333-3333-4333-8333-333333333333'
+ projectInput('after',{conversation_id:'one',mcp_server_name:'devspec',tool_name:'devspec__attach_connection',tool_input:{connection_id:connection},result_json:{content:[{type:'text',text:JSON.stringify({connection_id:connection,project_agent_rules:'Attached rules'})}]}},{home})
+ assert.equal(readRepositorySnapshot('one',home).rules.project_agent_rules,'Attached rules')
 }))
 
 test('real host size limit has a complete file continuation, never a lost tail',()=>setup(home=>{

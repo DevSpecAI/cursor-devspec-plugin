@@ -76,6 +76,7 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { distinctTokenPairs, enumerateCredentialPairs, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { refreshRepositoryRules } from './repository-context.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
@@ -359,7 +360,7 @@ function appendInbox(
   messages,
   {
     type = 'owner_messages', nextCursor = null, sessionId = null, context = null,
-    ingress = null, acceptanceKey = null,
+    ingress = null, acceptanceKey = null, instructionContextFile = null,
   } = {},
 ) {
   if (!connectionId || !messages?.length) return { ok: false, duplicate: false }
@@ -372,6 +373,9 @@ function appendInbox(
     next_after_message_id: nextCursor,
     ...(context ? { context } : {}),
     ...(ingress ? { ingress } : {}),
+    // Adapter metadata stays outside the exact-key canonical context schema:
+    // older wait processes can ignore it without dropping the command on upgrade.
+    ...(instructionContextFile ? {instruction_context_file:instructionContextFile} : {}),
     messages,
   }
   if (acceptanceKey) {
@@ -740,11 +744,12 @@ async function deliverOwnerMessages(
   sessionId,
   context = null,
   ingress = null,
+  instructionContextFile = null,
 ) {
   // The durable inbox is the wake payload source. Stable turn identity makes replay
   // after an append-before-cursor crash a no-op rather than a second execution.
   const accepted = appendInbox(connectionId, ownerMsgs, {
-    type: 'owner_messages', nextCursor, sessionId, context, ingress,
+    type: 'owner_messages', nextCursor, sessionId, context, ingress, instructionContextFile,
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
@@ -1132,6 +1137,7 @@ async function main() {
     const interactionArgs = interactionNegotiationArgs({ capability, sessionId })
     const negotiatesInteraction = Object.keys(interactionArgs).length > 0
     const ack = negotiatesInteraction ? pendingInteractionAck : null
+    const tierState = readState(connectionId)
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -1141,6 +1147,9 @@ async function main() {
         connection_id: connectionId,
         agent_name: agentName,
         ...remoteIngressNegotiationArgs(),
+        ...(tierState?.instruction_tiers_version === 1 && typeof tierState.instruction_tiers_hash === 'string' ? {
+          known_instruction_tiers_version: 1, known_instruction_tiers_hash: tierState.instruction_tiers_hash,
+        } : {}),
         ...interactionArgs,
         ...(ack ? questionEventAckArgs(ack) : {}),
         wait_ms: waitMs,
@@ -1427,8 +1436,11 @@ async function main() {
     const nextCarry = mergeCanonicalContextCarry(canonicalCarry, envelope)
     const ingress = { canonical: true, envelope }
     let newlyDelivered = false
+    let instructionContextFile = null
+    let instructionContextDelivered = false
 
     if (accepted.canonicalWake) {
+      instructionContextFile = refreshRepositoryRules(readState(connectionId)?.local_id, res)
       const context = {
         advisory: true,
         typed: nextCarry.context,
@@ -1467,8 +1479,10 @@ async function main() {
         sessionId,
         context,
         ingress,
+        instructionContextFile,
       )
       if (!delivered.ok) return false
+      instructionContextDelivered = Boolean(!delivered.duplicate && instructionContextFile)
       newlyDelivered ||= !delivered.duplicate
       // Do NOT append a thin `{ type: owner_message, count }` wake here (item 9ed0d42e).
       // Host wake-follow (`devspec-remote-wait --follow --wake-file`) owns the wake file
@@ -1547,6 +1561,9 @@ async function main() {
       ingress_envelope_id: envelope.envelope_id,
       ingress_window: envelope.window,
       ingress_context_carry: canonicalCarry,
+      ...(instructionContextDelivered && res.instruction_tiers_version === 1 && typeof res.instruction_tiers_hash === 'string' ? {
+        instruction_tiers_version: 1, instruction_tiers_hash: res.instruction_tiers_hash,
+      } : {}),
       active_session_plans: activeSessionPlans,
       ingress_continuation: {
         truncated: envelope.window.truncated,

@@ -17,7 +17,7 @@ import path from 'node:path'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
-import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile } from './repository-context.mjs'
+import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import {
   durationMs,
@@ -256,7 +256,11 @@ export async function fastConnect(opts = {}) {
   const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
   const resolveGitRemoteFn = opts.resolveGitRemoteFn || resolveGitRemote
   const registerFn = opts.registerFn || registerConnection
-  const attachFn = opts.attachFn || attachConnection
+  const attachFn = async args => {
+    const attached = await (opts.attachFn || attachConnection)({...args,localId,projectHome:opts.projectHome})
+    if(attached.ok) refreshRepositoryRules(localId,attached,opts.projectHome)
+    return attached
+  }
   const writeFn = opts.writeFn || writeConnectionState
   const resolveLocalFn = opts.resolveLocalFn || resolveLocalAction
   const detectLocalIdFn = opts.detectLocalIdFn || detectLocalId

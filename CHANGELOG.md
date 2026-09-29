@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.26
+
+Session attachment and validated command responses retain refreshed project/machine rules, including explicit cleared values, without replacing the repository inventory. Both native MCP attachments and helper/launcher attachment paths update the same conversation snapshot. A remote command can name its complete immutable instruction-context file; the pointer travels with the existing command rather than creating a new wake. Existing cached installs still require their normal update/restart; staging development uses --plugin-dir.
+
 ## 0.13.25
 
 Cursor now retains complete selected-project repository facts and existing project/machine rules from registration. Manual fast-connect returns them, and Cursor's native post-tool context supplies them to launcher-started or resumed conversations. Project switches keep separate conversation snapshots; unavailable information is not presented as an empty project.

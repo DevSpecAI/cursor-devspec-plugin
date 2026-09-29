@@ -88,7 +88,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot } from './repository-context.mjs'
+import { storeRepositorySnapshot, refreshRepositoryRules } from './repository-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
@@ -1767,6 +1767,7 @@ export async function attachConnection(opts) {
       arguments: { connection_id: connectionId, session_id: sessionId },
       timeoutMs: 60_000,
     })
+    if(!opts.localId) refreshRepositoryRules(readJson(connectionPath(connectionId))?.local_id, result, opts.projectHome)
     await emitPhase({
       phase: 'attach_connection',
       outcome: 'ok',

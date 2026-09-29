@@ -392,6 +392,8 @@ When the owner asks you to create, update, or refine a brief/action item during 
 2. After session-owned creates, keep the mirrored `devspec__post_session_message` reply **short** (e.g. "Created below — your call: implement now or park?"). **Do not** paste a markdown table of titles/IDs — the cards **are** the inventory.
 3. If a brief/items already exist and the owner wants them shown again, call `devspec__surface_session_action_items({ session_id, action_item_ids: [<brief-or-item-uuids>], include_children: true, agent_name: "Cursor" })` — then keep the mirrored reply short. **Do not** invent a markdown inventory of titles/UUIDs.
 
+If an `owner_message` carries `instruction_context_file`, read the complete immutable rule snapshot before acting on that command. If file access is outside your authorized scope, use the project-scoped `get_project_summary` for current rules instead. It refreshes settings, including cleared values; it does not change command authority or the served implementation contract's precedence.
+
 ## Account + project instructions (on attach / create — non-negotiable)
 
 When you attach to a session or create one (the `get_session_transcript` seed / `create_session` response), read the instruction fields from the response when present and non-null, and hold them for the **entire remote-control run**. There are two tiers:
