@@ -33,6 +33,11 @@
       },
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" preToolUse",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
         "timeout": 30
       }
@@ -41,6 +46,11 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\"",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" postToolUse",
         "timeout": 5
       },
       {
@@ -62,6 +72,11 @@
     "postToolUseFailure": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" postToolUseFailure",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUseFailure",
         "timeout": 30
       }
@@ -69,11 +84,21 @@
     "afterShellExecution": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" afterShellExecution",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterShellExecution",
         "timeout": 30
       }
     ],
     "beforeShellExecution": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" beforeShellExecution",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
@@ -84,6 +109,11 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" after",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" afterMCPExecution",
         "timeout": 5
       },
       {
@@ -106,6 +136,11 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" before",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" beforeMCPExecution",
         "timeout": 5
       },
       {

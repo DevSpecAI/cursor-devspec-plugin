@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.27
+
+Live remote answer turns emit per-tool timings into Axiom (`kind=turn_tool`) via the same Remote-control story / `/api/log` path as connect-phase timings. Cursor before/after tool, shell, and MCP hooks record duration without logging arguments or message bodies. Refresh the executing plugin copy (marketplace update or `--plugin-dir`) and restart Cursor so hook registration picks up the new scripts. Package version bump for cache refresh is a follow-up if the install path is version-keyed.
+
 ## 0.13.26
 
 Session attachment and validated command responses retain refreshed project/machine rules, including explicit cleared values, without replacing the repository inventory. Both native MCP attachments and helper/launcher attachment paths update the same conversation snapshot. A remote command can name its complete immutable instruction-context file; the pointer travels with the existing command rather than creating a new wake. Existing cached installs still require their normal update/restart; staging development uses --plugin-dir.

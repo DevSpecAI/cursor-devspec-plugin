@@ -215,6 +215,28 @@ The stamped prompt and launcher log print `launch_id=…` so you can paste that 
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.
 
+### Live answer turn — per-tool timings (item `f719e846`)
+
+Connect phases above cover cold launch only. While a remote answer turn is marked active, Cursor hook events (`preToolUse` / `postToolUse`, shell before/after, MCP before/after) emit the same `Remote-control story` shape with `kind == "turn_tool"`: tool name, channel (`tool` | `shell` | `mcp`), `duration_ms`, and join keys (`connectionId`, optional `turn_id` / `launch_id`). No tool arguments or message bodies.
+
+**Axiom APL (one connection’s tool timeline):**
+
+```
+['devspec']
+| where ['data']['client']['kind'] == "turn_tool"
+| where ['data']['client']['connectionId'] == "<connection-uuid>"
+| sort by _time asc
+| project _time,
+    tool = ['data']['client']['tool'],
+    channel = ['data']['client']['channel'],
+    outcome = ['data']['client']['outcome'],
+    duration_ms = toint(['data']['client']['duration_ms']),
+    turn_id = ['data']['client']['turn_id'],
+    phase = ['data']['client']['phase']
+```
+
+Filter further on `turn_id` when the connection state stamped one. Prefer Cursor-reported hook `duration` when present; otherwise wall-clock from the paired before-hook start.
+
 ## Directed-question answers (item `b9f2c77a`)
 
 An answer to a question this agent asked is its own lane, not a command. The poller
