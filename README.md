@@ -88,14 +88,14 @@ edit you make. Add a `devspec` entry to your Cursor MCP config file:
 {
   "mcpServers": {
     "devspec": {
-      "url": "https://api.devspec.ai/api/mcp",
+      "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec",
       "headers": { "Authorization": "Bearer dvs_your_token_here" }
     }
   }
 }
 ```
 
-Use `https://api.devspecstaging.com/api/mcp` for staging.
+Use `https://api.devspecstaging.com/api/mcp?tool_namespace=devspec` for staging. This is the plugin's fixed tool view, not a project preference.
 
 If you have a clone of this repo, the same edit is scripted — it merges into an existing file
 rather than replacing it, and never echoes your token back:
@@ -110,7 +110,7 @@ The config file lives at:
 - **macOS / Linux:** `~/.cursor/mcp.json`
 - **Windows:** `%USERPROFILE%\.cursor\mcp.json`
 
-It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart `cursor-agent`** afterwards so it picks up the new server.
+It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp?tool_namespace=devspec` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart `cursor-agent`** afterwards so it picks up the new server.
 
 > **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Coding agents**.
 
@@ -146,11 +146,13 @@ Cursor's existing Resume behavior is unchanged: CLI launches mint a native chat,
 
 ## How it finds the right project
 
+These controls require plugin 0.13.24+ and a DevSpec server with the namespaced tool view. Work merged to `staging` is not automatically a release to `main` or an update of the installed cache. Check `/plugins`, refresh the MCP entry as below, and restart after updating.
+
 Bare `/devspec.remote` stays automatic when a remote identifies one accessible project, or a greenfield folder has a valid `.devspec/project.json` pin. A unique remote beats a stale pin; a pin naming one of several matching projects breaks that tie.
 
 For an explicit choice, use `/devspec.remote --project "Project name"` or a full ID (`--project-id` remains supported). Ambiguity produces project **and organisation** choices; the agent asks rather than picking one. The selection belongs to this Cursor conversation and its resume, including ordinary DevSpec tools. It does not change a folder default or another conversation in the same directory.
 
-Use `/devspec.project` for details. Remember and forget show the effective file and require separate confirmation; existing conversations stay on their project. Switching projects requires a fresh native Cursor chat, not the old chat's history. The helper returns a verified bare-Cursor command to run in a new terminal and the first project-selection message to send there. It does not launch the chat or change the old one. If your Cursor executable is not discoverable, supply its real path with `--cursor-bin`; never substitute another host's generic `agent` command.
+Use `/devspec.project` for details. Remember and forget show the effective file and require separate confirmation; existing conversations stay on their project. Removing a local pin can reveal an inherited default, so check the resulting details. Switching projects requires a fresh native Cursor chat, not the old chat's history. The helper returns a verified bare-Cursor command to run in a new terminal and the first project-selection message to send there. It does not launch the chat or change the old one. If your Cursor executable is not discoverable, supply its real path with `--cursor-bin`; never substitute another host's generic `agent` command.
 
 **After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the supported namespaced view, preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
 
