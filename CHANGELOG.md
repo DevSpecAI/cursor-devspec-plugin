@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.28
+
+Cursor's submit hook now checks the generated shared launcher, including OS registration and readiness, without maintaining a separate launcher implementation. The manual installer delegates to the same path and retains Cursor's space-safe plugin pin. Cursor authentication and connection setup remain in the Cursor adapter; OpenCode's credential-bearing adapter belongs to its own plugin. Launch scripts no longer add an execution-policy bypass. Update/restart the installed plugin to load the change; source and package versions do not establish OS readiness.
+
 ## 0.13.27
 
 Live remote answer turns emit per-tool timings into Axiom (`kind=turn_tool`) via the same Remote-control story / `/api/log` path as connect-phase timings. Cursor before/after tool, shell, and MCP hooks record duration without logging arguments or message bodies. Refresh the executing plugin copy (marketplace update or `--plugin-dir`) and restart Cursor so hook registration picks up the new scripts. Package version bump for cache refresh is a follow-up if the install path is version-keyed.

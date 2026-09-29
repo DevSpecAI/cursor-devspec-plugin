@@ -8,9 +8,12 @@ import {
 } from './launch-pi-session.mjs'
 
 describe('buildPiLaunchArgs', () => {
+  it('keeps a flag-shaped prompt behind the Pi option boundary', () => {
+    assert.deepEqual(buildPiLaunchArgs('--help'), ['--', '--help'])
+  })
   it('keeps the default launch free of frozen runtime overrides', () => {
     assert.deepEqual(buildPiLaunchArgs('Use devspec.remote for session abc'), [
-      'Use devspec.remote for session abc',
+      '--', 'Use devspec.remote for session abc',
     ])
   })
 
@@ -20,12 +23,12 @@ describe('buildPiLaunchArgs', () => {
         model: 'anthropic/claude-sonnet-5',
         thinking: 'high',
       }),
-      ['--model', 'anthropic/claude-sonnet-5', '--thinking', 'high', 'Connect now'],
+      ['--model', 'anthropic/claude-sonnet-5', '--thinking', 'high', '--', 'Connect now'],
     )
   })
 
   it('rejects unknown thinking values rather than forwarding arbitrary flags', () => {
-    assert.deepEqual(buildPiLaunchArgs('Connect now', { thinking: 'turbo' }), ['Connect now'])
+    assert.deepEqual(buildPiLaunchArgs('Connect now', { thinking: 'turbo' }), ['--', 'Connect now'])
     assert.deepEqual(PI_THINKING_LEVELS, [
       'off',
       'minimal',

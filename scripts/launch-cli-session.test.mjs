@@ -340,7 +340,9 @@ describe('stamped prompt file / short argv (item e949305f)', () => {
   })
 
   it('open-handler --install ensures the space-free pin (item 6de4b055)', () => {
-    const src = fs.readFileSync(new URL('./open-handler.mjs', import.meta.url), 'utf8')
+    const entry = fs.readFileSync(new URL('./open-handler.mjs', import.meta.url), 'utf8')
+    assert.match(entry, /await setupCursorLauncher\(\)/)
+    const src = fs.readFileSync(new URL('./setup-launcher.mjs', import.meta.url), 'utf8')
     assert.match(src, /ensureSpaceSafePluginPin/)
     assert.match(src, /space-safe-plugin-root\.mjs/)
   })
@@ -417,8 +419,6 @@ describe('resolveWindowsAgentInvocation', () => {
     assert.match(inv.command.toLowerCase(), /powershell\.exe$/)
     assert.deepEqual(inv.prefixArgs.slice(0, 3), [
       '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
     ])
     assert.equal(inv.prefixArgs[3], '-File')
     assert.equal(inv.prefixArgs[4], ps1)

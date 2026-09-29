@@ -66,7 +66,7 @@ describe('resolveRepoFolder learning from recorded connection cwds', () => {
 
   it('persists what it learned so the next launch skips the scan', async () => {
     await core.resolveRepoFolder('acme/widgets')
-    const map = JSON.parse(await fs.readFile(path.join(home, '.cursor', 'devspec', 'repo-folder-map.json'), 'utf8'))
+    const map = JSON.parse(await fs.readFile(core.MAP_PATH, 'utf8'))
     assert.equal(map['acme/widgets'], repoRoot)
   })
 
@@ -75,7 +75,7 @@ describe('resolveRepoFolder learning from recorded connection cwds', () => {
   })
 
   it('re-learns when a stored mapping points at a folder that is gone', async () => {
-    const mapPath = path.join(home, '.cursor', 'devspec', 'repo-folder-map.json')
+    const mapPath = core.MAP_PATH
     await fs.mkdir(path.dirname(mapPath), { recursive: true })
     await fs.writeFile(
       mapPath,
@@ -104,7 +104,7 @@ describe('resolveRepoFolder learning from recorded connection cwds', () => {
       JSON.stringify({ connection_id: 'aaaaaaaa-0000-4000-8000-000000000002', cwd: other }),
       'utf8',
     )
-    await fs.rm(path.join(home, '.cursor', 'devspec', 'repo-folder-map.json'), { force: true })
+    await fs.rm(core.MAP_PATH, { force: true })
 
     assert.equal(await core.resolveRepoFolder('acme/gadgets'), other)
     assert.equal(await core.resolveRepoFolder('acme/widgets'), repoRoot)

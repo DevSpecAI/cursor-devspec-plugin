@@ -96,9 +96,12 @@ describe('devspec-handler.sh', () => {
     assert.match(body, /exec "\$NODE" "\$HANDLER" --url "\$URL"/)
   })
 
-  it('is copied by --install so the Exec target exists', () => {
+  it('delegates installation to the shared payload instead of maintaining a file-copy list', () => {
     const installer = fs.readFileSync(path.join(SCRIPTS_DIR, 'open-handler.mjs'), 'utf8')
-    assert.match(installer, /'devspec-handler\.sh',/)
+    assert.match(installer, /await setupCursorLauncher\(\)/)
+    const manifest = JSON.parse(fs.readFileSync(path.join(SCRIPTS_DIR, '..', 'launcher', 'LAUNCHER-MANIFEST.json'), 'utf8'))
+    assert.ok(manifest.files['launcher.mjs'])
+    assert.ok(manifest.files['devspec-handler.sh'])
   })
 })
 

@@ -6,7 +6,7 @@ import { expandFleetRecipe, recipeFromHandoffPayload } from './fleet-recipe.mjs'
 describe('handoff-verify materializeHandoffData', () => {
   const base = {
     repo: 'DevSpecAI/DevSpecV2',
-    exp: Math.floor(Date.now() / 1000) + 3600,
+    exp: Math.floor(Date.now() / 1000) + 300, // matches the web signer's five-minute TTL
     title: 'Warm local agents',
     surface: 'cli',
     tool: 'cursor',
@@ -49,10 +49,8 @@ describe('handoff-verify materializeHandoffData', () => {
     assert.equal(recipeFromHandoffPayload(verified.data), null)
   })
 
-  it('drops non-object recipe values', () => {
+  it('refuses a malformed recipe instead of silently launching one Cursor', () => {
     const verified = materializeHandoffData({ ...base, recipe: 'nope' })
-    assert.equal(verified.ok, true)
-    if (!verified.ok) return
-    assert.equal(verified.data.recipe, undefined)
+    assert.deepEqual(verified, { ok: false, error: 'invalid_recipe' })
   })
 })

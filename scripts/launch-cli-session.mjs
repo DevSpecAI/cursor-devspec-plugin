@@ -388,7 +388,7 @@ export function resolveWindowsAgentInvocation(agentBin, io = { existsSync: fs.ex
         command: process.env.SystemRoot
           ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
           : 'powershell.exe',
-        prefixArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', candidate],
+        prefixArgs: ['-NoProfile', '-File', candidate],
         mode: 'powershell-ps1',
       }
     }
