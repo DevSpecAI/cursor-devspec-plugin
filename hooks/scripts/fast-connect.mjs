@@ -17,6 +17,7 @@ import path from 'node:path'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
+import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile } from './repository-context.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import {
   durationMs,
@@ -347,7 +348,7 @@ export async function fastConnect(opts = {}) {
   /** @type {string | null} */
   let attachedSessionId = sessionId
 
-  if (localAction.action === 'already_live' && localAction.connection_id && projectContext) {
+  if (localAction.action === 'already_live' && localAction.connection_id && projectContext && readRepositorySnapshot(localId, opts.projectHome)?.repository_context.status === 'available') {
     connectionId = localAction.connection_id
     codename = localAction.session_codename || null
     // Attach only when the launch asked for a (possibly new) session.
@@ -426,6 +427,7 @@ export async function fastConnect(opts = {}) {
     try {
       if (prepared.project_id && prepared.project_id !== project.id) throw new Error('DevSpec confirmed a different project than requested.')
       projectContext = selectProjectContext(localId, auth.mcp_url, project, registered.project_selection?.source ?? 'conversation', opts.projectHome)
+      if (!readRepositorySnapshot(localId, opts.projectHome)) storeRepositorySnapshot(localId, registered, opts.projectHome)
     } catch (error) { return { ok: false, error: error.message, local_id: localId, connection_id: null } }
     connectionId = registered.connection_id
     codename = registered.codename || registered.session_codename || null
@@ -534,6 +536,8 @@ export async function fastConnect(opts = {}) {
     action: localAction.action,
     project_id: projectContext?.project.id,
     project_selection: projectContext,
+    project_context: readRepositorySnapshot(localId, opts.projectHome),
+    project_context_file: repositoryContextTextFile(localId, opts.projectHome),
     poller,
     warning_tokens: written.warning_tokens || null,
   }

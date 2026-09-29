@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.25
+
+Cursor now retains complete selected-project repository facts and existing project/machine rules from registration. Manual fast-connect returns them, and Cursor's native post-tool context supplies them to launcher-started or resumed conversations. Project switches keep separate conversation snapshots; unavailable information is not presented as an empty project.
+
+Cursor's measured hook carrier limit is 10,000 characters. Larger context is preserved in a private, complete readable file with an explicit continuation, not silently dropped or reduced to an arbitrary number of repositories. Description and vision remain on demand. Update the executing plugin and restart Cursor; a staging checkout does not refresh an installed marketplace cache.
+
 ## 0.13.24
 
 Choose a DevSpec project for one Cursor conversation with `/devspec.remote --project <name-or-id>`. Ambiguous names return project and organisation choices rather than guessing. `/devspec.project` offers details, separately confirmed folder defaults, and a fresh native chat when changing projects. Resumes keep their scope; changing a folder pin does not redirect existing conversations.

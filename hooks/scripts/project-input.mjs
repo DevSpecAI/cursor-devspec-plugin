@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { connectionVersionHook } from './connection-version.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { storeRepositorySnapshot } from './repository-context.mjs'
 import { UUID, firingConversation, namespacedVerb, isDevspecServer as isServer, PROJECTLESS, readProjectContext, selectProjectContext, candidate, toolArguments } from './project-context.mjs'
 const deny = message => ({ permission: 'deny', user_message: message, agent_message: message })
 export function projectInput(mode, input, { home } = {}) {
@@ -42,6 +43,7 @@ export function projectInput(mode, input, { home } = {}) {
       const project = candidate(data.project_selection?.project) ?? candidate({ id: data.project_id, name: data.project_id })
       if (!project || data.project_id !== project.id || !UUID.test(data.connection_id ?? '')) return null
       selectProjectContext(id, input.mcp_server_url || input.url, project, data.project_selection?.source ?? 'conversation', home)
+      storeRepositorySnapshot(id, data, home)
     } catch { /* no invented or partial selection from an unproven receipt */ }
     return null
   }

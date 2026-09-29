@@ -144,6 +144,14 @@ Plan mutation uses a narrow connection-bound helper shipped with the plugin. It 
 
 Cursor's existing Resume behavior is unchanged: CLI launches mint a native chat, run `agent --resume`, and stamp that chat id as `local_session_id`.
 
+### Repository facts
+
+From 0.13.25, connection supplies the project's repository names, safe remote URLs and tracked/default branches, alongside existing project and machine rules. Manual connection returns this context directly. Launcher-started conversations receive it through Cursor's native post-tool context, including after arming their first wait. A fresh project conversation uses its own snapshot, never another chat's folder-based guess.
+
+These are remote project facts, not proof that a repository is cloned or writable locally. Empty and unavailable inventories are distinct; description and vision remain available on demand. No fixed repository-count cap is applied. Cursor itself limits hook context to 10,000 characters, so larger results name a private local file containing the complete context. Repository facts still appear inline when they fit; the continuation supplies complete rules and any larger inventory.
+
+Install/update the plugin version and restart Cursor, or use an explicit development `--plugin-dir`. A source checkout update alone does not refresh the marketplace cache.
+
 ## How it finds the right project
 
 These controls require plugin 0.13.24+ and a DevSpec server with the namespaced tool view. Work merged to `staging` is not automatically a release to `main` or an update of the installed cache. Check `/plugins`, refresh the MCP entry as below, and restart after updating.

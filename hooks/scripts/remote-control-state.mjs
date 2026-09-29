@@ -88,6 +88,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
+import { storeRepositorySnapshot } from './repository-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
@@ -1667,6 +1668,7 @@ export async function registerConnection(opts) {
       if (!persisted.ok) {
         throw new Error('register_connection did not return a valid hidden connection capability')
       }
+      storeRepositorySnapshot(localId, result, opts.projectHome)
     }
     await emitPhase({
       phase: 'register_connection',

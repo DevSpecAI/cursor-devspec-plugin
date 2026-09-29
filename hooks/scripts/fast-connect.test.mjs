@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { selectProjectContext } from './project-context.mjs'
+import { storeRepositorySnapshot } from './repository-context.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -398,8 +399,9 @@ describe('fastConnect', () => {
     assert.equal(result.project_id, projectId)
   })
 
-  it('already_live with saved scope skips register when no new session', async () => {
+  it('already_live with saved scope and repository facts skips register when no new session', async () => {
     selectProjectContext(localId, 'https://example.test/api/mcp', { id: projectId, name: 'Project' }, 'explicit', projectHome)
+    storeRepositorySnapshot(localId, {project_id:projectId, repository_context:{version:1,project_id:projectId,status:'available',repositories:[]}}, projectHome)
     const calls = []
     const r = await fastConnect({
       localId,

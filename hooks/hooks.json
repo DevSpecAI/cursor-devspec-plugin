@@ -2,6 +2,13 @@
   "version": 1,
   "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. Cursor CLI loads this file from the installed plugin (CLAUDE_PLUGIN_ROOT); there is no IDE extension activate() merge into ~/.cursor/hooks.json.",
   "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\" start",
+        "timeout": 5
+      }
+    ],
     "stop": [
       {
         "type": "command",
@@ -31,6 +38,11 @@
       }
     ],
     "postToolUse": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\"",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
