@@ -9,6 +9,7 @@
  */
 
 import fs from 'node:fs'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -90,7 +91,8 @@ export function pendingKey(data, channel, tool) {
     data?.id ||
     null
   if (typeof id === 'string' && id.trim()) return `${channel}:${id.trim()}`
-  // Shell often has no call id — pair on normalized command fingerprint.
+  // Pair shell hooks without persisting the command itself (it may contain secrets).
+  if (channel === 'shell') return `shell:${createHash('sha256').update(String(data?.command || '')).digest('hex')}`
   return `${channel}:${tool}`
 }
 
@@ -103,9 +105,7 @@ export function resolveToolIdentity(mode, data) {
   if (!data || typeof data !== 'object') return null
 
   if (mode === 'beforeShellExecution' || mode === 'afterShellExecution') {
-    const cmd = String(data.command || '').trim() || 'shell'
-    const short = cmd.length > 80 ? `${cmd.slice(0, 77)}…` : cmd
-    return { channel: 'shell', tool: short }
+    return { channel: 'shell', tool: 'shell' }
   }
 
   if (mode === 'beforeMCPExecution' || mode === 'afterMCPExecution') {
@@ -318,7 +318,7 @@ export async function handleTurnToolHook(mode, data, ctx) {
 
   const reason =
     mode === 'postToolUseFailure'
-      ? String(data.error_message || data.errorMessage || data.failure_type || 'failed')
+      ? 'tool_failed'
       : null
 
   return emitTurnToolTiming({

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.30
+
+Cursor's detached progress reporter now preserves safe failure categories in a private, bounded diagnostic log instead of losing them on discarded stderr. Shell timing events no longer include command text, and tool failures use a fixed label rather than error prose. Posting, polling, timeouts and resume behaviour are unchanged. Update the installed plugin and restart Cursor to load the new reporter; an existing process does not reload after a repository update.
+
 ## 0.13.29
 
 Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and return loopback errors to the existing handoff page. Update/restart the installed plugin to run the shared update check.

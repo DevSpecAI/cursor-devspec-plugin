@@ -25,6 +25,7 @@ import { spawn } from 'node:child_process'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { postTrailFromTranscript } from './post-trail-from-transcript.mjs'
+import { recordProgressFailure } from './progress-diagnostics.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -220,9 +221,9 @@ async function main() {
         agentName: AGENT_NAME,
       })
     } catch (e) {
-      process.stderr.write(
-        `cli-trail-watch: post failed: ${e instanceof Error ? e.message : String(e)}\n`,
-      )
+      // Detached watcher stderr is intentionally ignored. Persist only a safe,
+      // bounded diagnostic instead of losing the failure or capturing raw output.
+      recordProgressFailure(connectionId, e)
     }
 
     await sleep(args.pollMs)
@@ -241,7 +242,7 @@ async function main() {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
   main().catch((e) => {
-    process.stderr.write(`cli-trail-watch: ${e instanceof Error ? e.message : String(e)}\n`)
+    recordProgressFailure(parseArgs(process.argv.slice(2)).connectionId, e, { source: 'watch_exit' })
     process.exit(1)
   })
 }

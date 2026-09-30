@@ -215,9 +215,17 @@ The stamped prompt and launcher log print `launch_id=…` so you can paste that 
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.
 
+### Safe refusal diagnostics (item `d50b8d6e`)
+
+The detached progress reporter keeps `<connection-id>.progress-diagnostics.jsonl` in the user's `.devspec/remote-control/connections` directory. Each record contains timestamp, connection UUID, fixed source/phase/reason and, when known, HTTP status and a reviewed server auth-failure code. It never copies raw stderr, MCP response bodies, shell commands, credentials or conversation text. Unknown errors are explicitly unclassified. The file rotates at 128 KiB with one archive (256 KiB total); failed logging never changes reporter behaviour. Unix files are mode 0600; Windows uses the user's profile ACL.
+
+The DevSpec server records refusal categories and supplied turn UUIDs on `post_session_message` failures. Its logged `statusCode=400` means a tool refusal, not necessarily an HTTP 400. Compare these server events with local failures and deployment/database evidence before deciding the cause. A successful `/api/log` response alone is not proof of event admission; query the timing record downstream.
+
+After updating/restarting Cursor, verify the executing pinned plugin version and perform a real question/answer turn. Do not treat a source push or a synthetic timing event as proof that a running Cursor process loaded the change. Timing and failure diagnostics do not change resume, retry or timeout behaviour.
+
 ### Live answer turn — per-tool timings (item `f719e846`)
 
-Connect phases above cover cold launch only. While a remote answer turn is marked active, Cursor hook events (`preToolUse` / `postToolUse`, shell before/after, MCP before/after) emit the same `Remote-control story` shape with `kind == "turn_tool"`: tool name, channel (`tool` | `shell` | `mcp`), `duration_ms`, and join keys (`connectionId`, optional `turn_id` / `launch_id`). No tool arguments or message bodies.
+Connect phases above cover cold launch only. While a remote answer turn is marked active, Cursor hook events (`preToolUse` / `postToolUse`, shell before/after, MCP before/after) emit the same `Remote-control story` shape with `kind == "turn_tool"`: tool name, channel (`tool` | `shell` | `mcp`), `duration_ms`, and join keys (`connectionId`, optional `turn_id` / `launch_id`). No tool arguments or message bodies. Shell operations are labelled `shell` (not their command text); missing call IDs pair through an opaque command fingerprint. The server admits only reviewed tool names (unknown names become `other`), bounded duration/outcome fields and UUID correlation keys under untrusted `data.client`. It drops arbitrary phase strings, error prose and extra fields.
 
 **Axiom APL (one connection’s tool timeline):**
 

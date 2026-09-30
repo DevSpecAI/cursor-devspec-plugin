@@ -23,7 +23,7 @@ describe('resolveToolIdentity', () => {
   it('names shell / mcp / generic tools', () => {
     assert.deepEqual(resolveToolIdentity('beforeShellExecution', { command: 'git status' }), {
       channel: 'shell',
-      tool: 'git status',
+      tool: 'shell',
     })
     assert.deepEqual(resolveToolIdentity('afterMCPExecution', { tool_name: 'search_memories' }), {
       channel: 'mcp',
@@ -42,6 +42,13 @@ describe('pendingKey / resolveDurationMs', () => {
       pendingKey({ tool_call_id: 'abc' }, 'mcp', 'search_memories'),
       'mcp:abc',
     )
+  })
+
+  it('pairs shell calls by an opaque fingerprint without retaining command secrets', () => {
+    const key = pendingKey({ command: 'curl -H "Bearer SYMBOLIC_SECRET"' }, 'shell', 'shell')
+    assert.match(key, /^shell:[a-f0-9]{64}$/)
+    assert.equal(key.includes('SYMBOLIC'), false)
+    assert.notEqual(key, pendingKey({ command: 'git status' }, 'shell', 'shell'))
   })
 
   it('prefers reported duration over wall clock', () => {
