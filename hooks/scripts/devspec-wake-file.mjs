@@ -9,6 +9,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+// The host-owned wake stream and its model notification must include the same events.
+export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|question_answer|question_dismissal|session_ended|automation_dispatch'
+
 const CONNECTION_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

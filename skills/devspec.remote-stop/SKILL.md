@@ -11,7 +11,7 @@ Cleanly disconnect **this** conversation's connection so the **Agents page** dro
 
 Use the **installed Cursor DevSpec plugin** scripts only.
 
-1. Prefer a prompt line `PLUGIN=<absolute-path>` when present (the launcher injects it).
+1. Use the installed Cursor plugin location supplied by the host when available; verify its helper belongs to this plugin.
 2. Otherwise find it under `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`), taking the most recently modified match:
 
    ```bash

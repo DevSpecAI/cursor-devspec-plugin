@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { describe, it } from 'node:test'
-import { buildPostLiveRemoteBrief } from './pin-remote-plugin.mjs'
 
 const read = (relative) => fs.readFileSync(new URL(`../${relative}`, import.meta.url), 'utf8')
 const packageJson = JSON.parse(read('package.json'))
@@ -22,7 +21,6 @@ describe('Cursor shared-session-plan surfaces', () => {
     const debugSkill = read('skills/devspec.debug/SKILL.md')
     assert.match(debugSkill, /only after the person asks/i)
     assert.match(debugSkill, /no automatic uploads/i)
-    assert.match(buildPostLiveRemoteBrief({ pluginPath: '/cursor/devspec-autopilot', connectionId: '11111111-1111-4111-8111-111111111111', sessionId: '22222222-2222-4222-8222-222222222222', localId: 'cursor-chat-a' }), /devspec\.debug/)
     assert.equal(skills.includes('devspec.work'), false)
     assert.equal(skills.includes('devspec.managePlan'), false)
   })
@@ -117,47 +115,14 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.equal(variables.properties.DEVSPEC_API_URL.default, 'https://api.devspec.ai')
   })
 
-  it('keeps plan schema on demand and bounds prompt bytes before/after plan guidance', () => {
-    const brief = buildPostLiveRemoteBrief({
-      pluginPath: '/cursor/devspec-autopilot',
-      connectionId: '11111111-1111-4111-8111-111111111111',
-      sessionId: '22222222-2222-4222-8222-222222222222',
-      codename: 'Calm Fox',
-      localId: 'cursor-chat-a',
-    })
-    const afterBytes = Buffer.byteLength(brief)
-    const beforePlanLines = brief.split('\n').filter((line) =>
-      !line.includes('**Active plans:**') &&
-      !line.includes('Cursor plan mutations use the connection-bound helper only:'),
-    ).join('\n')
-    const beforeBytes = Buffer.byteLength(beforePlanLines)
-    assert.ok(afterBytes > beforeBytes)
-    assert.ok(afterBytes - beforeBytes < 1_600, `plan guidance delta ${afterBytes - beforeBytes} bytes`)
-    assert.ok(afterBytes < 8_000, `thin post-Live brief ${afterBytes} bytes`)
-    assert.match(brief, /manage-plan describe/)
-    assert.doesNotMatch(brief, /"current_step_id"|"next_step_id"|"retryable"/)
-    assert.match(remoteSkill, /complete schema.*on demand|bounded on-demand discovery/i)
-  })
-
-  it('every capability-bound bridge is discoverable from the brief a Connect launch loads', () => {
-    // A Connect launch reads this brief, NOT the 44KB SKILL.md. Directed questions
-    // shipped with their guidance only in the skill, so a Cursor agent could be woken
-    // by an answer but had no way to learn it could ask (item b9f2c77a, round 2). Any
-    // future connection-bound bridge has the same requirement: name it here or it does
-    // not exist as far as a Connect agent is concerned. Schemas stay on demand.
-    const brief = buildPostLiveRemoteBrief({
-      pluginPath: '/cursor/devspec-autopilot',
-      connectionId: '11111111-1111-4111-8111-111111111111',
-      sessionId: '22222222-2222-4222-8222-222222222222',
-      codename: 'Calm Fox',
-      localId: 'cursor-chat-a',
-    })
-    for (const bridge of ['manage-plan describe', 'manage-question describe', 'manage-question respond']) {
-      assert.match(brief, new RegExp(bridge.replace(' ', '\\s')), `${bridge} must be reachable from the brief`)
+  it('keeps capability-bound helpers discoverable through the normal Remote skill', () => {
+    // Standalone launching now invokes the installed skill, not a plugin-owned
+    // launcher-generated thin brief. The full host instructions remain intact.
+    for (const command of ['manage-plan describe', 'manage-question describe', 'manage-question respond']) {
+      assert.ok(remoteSkill.includes(command), `${command} must remain discoverable`)
     }
-    // Discovery, not the schema: the brief names the command and nothing more.
-    assert.doesNotMatch(brief, /"client_request_id"|"response_kind"|"allow_custom"/)
-    assert.ok(Buffer.byteLength(brief) < 8_000, `thin post-Live brief ${Buffer.byteLength(brief)} bytes`)
+    assert.match(remoteSkill, /complete schema.*on demand|bounded on-demand discovery/i)
+    assert.equal(fs.existsSync(new URL('./pin-remote-plugin.mjs', import.meta.url)), false)
   })
 
   it('preserves Cursor-native resume and local-session documentation', () => {

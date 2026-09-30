@@ -21,18 +21,17 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 | Situation | What to do |
 |---|---|
-| **Stamped “already Live” brief** (Agents launch / protocol handoff) | Mechanical Connect **already ran** in `launch-cli-session` (`fast-connect`). Bond IDs are in the prompt. **Do not** call `register_connection` / `attach_connection`. Arm the argv **background tail** (`block_until_ms: 0` + `notify_on_output`); host already follows the inbox. **Do not** run `devspec-remote-wait.mjs --from-end` and **do not** re-arm wait after `turn_ended`. |
 | **`resolve-local` → `already_live`** | Re-arm wait only (attach only if `--session` changed). |
 | **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers (Axiom `connect_phase`). Fall back to MCP only if helpers are missing. |
 
-Cold **Agents** Connect does **not** need the LLM to walk register/attach — the launcher already did.
+An optional standalone launcher starts Cursor normally; it does not authenticate or register this connection. Use this installed skill's mechanical Connect helper, just as when Cursor was started manually. The plugin never installs the DevSpec Launcher.
 
 ## Plugin root (non-negotiable)
 
 All poller / state scripts come from the **installed Cursor DevSpec plugin** — never from Claude Code or another agent's plugin cache.
 
-1. **If your prompt already includes** a line `PLUGIN=<absolute-path>` (injected by the launcher), use that path exactly.
-2. **Otherwise** find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). A marketplace install lives at `plugins/marketplaces/<host>/<owner>/<repo>/<commit-sha>/`, a local one at `plugins/local/<name>/`:
+1. Use the installed Cursor plugin location supplied by the host when available; verify the helper below belongs to that plugin.
+2. Otherwise find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). A marketplace install lives at `plugins/marketplaces/<host>/<owner>/<repo>/<commit-sha>/`, a local one at `plugins/local/<name>/`:
 
    ```bash
    HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
@@ -64,7 +63,7 @@ All poller / state scripts come from the **installed Cursor DevSpec plugin** —
 
 Never rejoin/attach a session because it shared a repo/cwd or another agent stopped recently. The bond is conversation-scoped (`CURSOR_CONVERSATION_ID` / local id), never cwd-scoped. Multiple terminals own independent connections.
 
-## Steps (manual cold Connect only — skip if already Live / stamped brief)
+## Steps (cold Connect; an already-live conversation only needs its existing connection)
 
 ### 1. Parse arguments
 

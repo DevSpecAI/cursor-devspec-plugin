@@ -19,11 +19,6 @@
     "beforeSubmitPrompt": [
       {
         "type": "command",
-        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/setup-launcher.mjs\"",
-        "timeout": 60
-      },
-      {
-        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" user_prompt",
         "timeout": 30
       }

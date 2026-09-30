@@ -9,7 +9,6 @@ const operationalFiles = [
   'hooks/scripts/devspec-remote-poll.mjs',
   'hooks/scripts/devspec-remote-wait.mjs',
   'hooks/scripts/resolve-mcp-auth.mjs',
-  'scripts/pin-remote-plugin.mjs',
 ]
 
 const contents = new Map(
@@ -92,7 +91,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
   })
 
   it('keeps interaction policy item-scoped on every work surface', () => {
-    for (const file of ['skills/devspec.remote/SKILL.md', 'scripts/pin-remote-plugin.mjs']) {
+    for (const file of ['skills/devspec.remote/SKILL.md']) {
       const content = contents.get(file)
       assert.match(content, /multiple items do not change (?:that )?interaction policy/i, file)
       assert.match(content, /each claimed item[^\n]*served[^\n]*implementation(?:-| )contract/i, file)

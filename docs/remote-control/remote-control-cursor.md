@@ -3,23 +3,15 @@
 **Family:** local-poller.  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
 **Plugin repo:** `cursor-devspec-plugin` (a cursor-agent CLI plugin; hooks under `hooks/scripts/`). There is no VSIX and no IDE extension — both were deleted in item 19956e89.  
-**Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md` (manual Connect + post-Live; Agents launches use mechanical Connect + thin brief).
+**Operational runbook:** plugin skill `skills/devspec.remote/SKILL.md`. Both manual startup and the optional standalone launcher use the normal host/plugin Connect path.
 
 ## Cold Connect is mechanical (plugin-owned)
 
-On **Agents CLI / protocol handoff** (`launch-cli-session.mjs`), Connect no longer asks the model to walk `register_connection` / `attach_connection`. After `agent create-chat` and **before** `agent --resume`, Node runs **fast-connect**:
+The plugin's `fast-connect` helper resolves native conversation identity, project scope, registration and optional room attachment, then arms the host-owned connection machinery. It runs inside the normal Cursor conversation through the installed Remote skill.
 
-1. Resolve `local_id` (chat id / `CURSOR_CONVERSATION_ID`)
-2. Resolve project (`git remote` + `list_projects`)
-3. `register_connection`
-4. `attach_connection` when the launch prompt has `--session <uuid>`
-5. Write connection state (**poller deferred** — no durable owner PID exists yet)
-6. Stamp a **thin post-Live brief** (PLUGIN= + bond IDs + background tail / answer) — **not** the full ~32k skill body
-7. Spawn `agent --resume`, then `ensure-poller` **and host-owned wait follow** anchored to a durable host **in that child tree** (`cursor-agent` node.exe / `agent.exe`). Walking ancestors of `launch-cli-session` cannot see the CLI agent; pinning to `Cursor.exe` (the IDE) would not reap when the terminal closes (item f099fc6e).
+The optional standalone DevSpec Launcher only starts the native Cursor CLI. It does not read plugin credentials, create a DevSpec connection, stamp a post-Live brief or install this plugin. This plugin does not install or register that launcher. For a cold conversation, follow the Remote skill; for an existing bond, `resolve-local` prevents duplicate registration. Preserve native `agent --resume` and conversation identity.
 
-The model’s job after resume: arm the argv **background tail** (`block_until_ms: 0` + `notify_on_output`), handle owner commands, post answers. **Do not** run one-shot `devspec-remote-wait.mjs --from-end` on a Connect launch — the launcher already follows the inbox into a space-free wake file (item 9d89a6d2). `--from-end` on that host follow skips advisory inbox history but **does not** skip `owner_messages` the poller already queued (item 1f177af4). Do **not** re-register on a stamped “already Live” launch.
-
-**Launcher path (item 94b11df6):** `open-handler --install` writes `~/.cursor/devspec/extension-root.json` (extension activate used to as well, before the IDE half was deleted). Protocol CLI launches resolve `launch-cli-session.mjs` in this order: **extension scripts/** (marker) → installed `~/.cursor/devspec` copy → sibling of the handler module. A stale installed copy must never shadow mechanical fast-connect after a plugin update.
+Host poller/wake-follow and its capability-bound helpers stay in this repository. They are normal connection machinery, not the separately installed machine-level launcher. Their ownership and re-arm rules below remain unchanged.
 
 **Invoke fast-connect manually:**
 
@@ -115,7 +107,7 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 | Owner pid | Prefer omit or `"$PPID"`; on Windows the write path self-resolves up to `Cursor.exe` / CLI `agent.exe` / `claude.exe`, or `node.exe` hosting cursor-agent `--resume` (Cursor CLI often has no `agent.exe` — item c57dc381). **Never** pin to `index.js worker-server` — that child exits while `--resume` lives and fires `owner_gone` (item 5c884554). **Never** pass tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`) — those exit when the tool call ends and fire `owner_gone` (item f3a88333). Invalid MSYS `$PPID` is ignored and self-resolved. |
 | Mirror / trail hooks | The plugin's own `hooks/hooks.json`, which Cursor loads from the installed plugin and whose commands name the target scripts directly via `${CLAUDE_PLUGIN_ROOT}`. There is no `~/.cursor/hooks.json` and no `run-mirror-turn.mjs` launcher — both existed to survive VSIX version bumps and went with the VSIX (item 19956e89). Modes: `user_prompt` / `stop` → `mirror-turn.mjs`; mid-turn modes → `trail-turn.mjs` |
 | CLI trail feed | Cursor Agents CLI (`agent --resume`) often **does not** invoke mid-turn hooks. On attached owner-command pickup the poller starts `cli-trail-watch.mjs`, which tails `~/.cursor/projects/*/agent-transcripts/<local_id>/<local_id>.jsonl` and posts throttled `phase=trail` until the turn marker clears. Hook path stays for IDE; transcript watcher is the CLI-safe path (item 63f3db87). |
-| PLUGIN pin (Agents launch) | Cold Agents launches stamp `PLUGIN=<plugin-root>` via `scripts/pin-remote-plugin.mjs` (also copied to stable `~/.cursor/devspec/pin-remote-plugin.mjs`), resolved from the running scripts tree. The old second route — scan `~/.cursor/extensions` for the newest `devspecai.devspec-autopilot-<version>` and sort by semver — is gone with the VSIX; it returned null once that directory stopped existing. Connect stamps a **thin post-Live brief**, not the full skill. |
+| Plugin location | The Remote skill uses this host's installed Cursor plugin directory. Standalone launch does not inject a plugin path or copy executable helpers to another location. Never use another coding agent's plugin cache. |
 
 ## What not to change lightly
 
@@ -150,9 +142,8 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 
 ## Key files
 
-- `scripts/launch-cli-session.mjs` (create-chat → **fast-connect (no poller)** → thin stamp → `--resume` → **ensure-poller** + **host wait follow** from child tree)
+- `hooks/scripts/native-agent-spawn.mjs` (Cursor-native executable invocation used by project-choice helpers; no launcher installation or service)
 - `hooks/scripts/fast-connect.mjs` (mechanical Connect orchestrator)
-- `scripts/pin-remote-plugin.mjs` (PLUGIN= + thin post-Live brief)
 - `hooks/scripts/devspec-remote-poll.mjs`
 - `hooks/scripts/devspec-remote-wait.mjs` (one-shot for manual Connect; `--follow --wake-file` for host-owned Connect follow)
 - `hooks/scripts/devspec-wake-tail.mjs` (Connect argv background tail of the space-free wake file)

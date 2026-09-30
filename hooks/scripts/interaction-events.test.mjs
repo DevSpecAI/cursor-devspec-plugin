@@ -225,7 +225,7 @@ describe('exact targeting and non-authority', () => {
     // The whole chain is worthless if Cursor is never told to notify: this event type
     // and REMOTE_WAKE_NOTIFY_PATTERN must move together or the room reads Live and
     // is deaf.
-    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('../../scripts/launch-cli-session.mjs')
+    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('./devspec-wake-file.mjs')
     const [answer] = buildInteractionAnswerEvents(record())
     assert.ok(REMOTE_WAKE_NOTIFY_PATTERN.split('|').includes(answer.type))
   })
@@ -788,10 +788,10 @@ describe('Cursor dismissal boundaries', () => {
     assert.equal(Object.hasOwn(args, 'interaction_response_id'), false)
     assert.equal(turnEndInteractionDecision({ continuation: { ...held, wake_offset_after: null }, wakeFileBytes: 999 }).action, 'hold')
   })
-  it('launcher and pinned wake filters include the distinct dismissal event', async () => {
-    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('../../scripts/launch-cli-session.mjs')
+  it('host wake filters and the Remote skill include the distinct dismissal event', async () => {
+    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('./devspec-wake-file.mjs')
     assert.match('question_dismissal', new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
-    assert.match(source('scripts/pin-remote-plugin.mjs'), /owner_message\|question_answer\|question_dismissal\|session_ended/)
+    assert.match(source('skills/devspec.remote/SKILL.md'), /question_dismissal/)
     assert.match(source('hooks/scripts/devspec-remote-wait.mjs'), /appendWakeEvents\(args.wakeFile, events\)[^]*dismissalWakeDeliveryContinuation\(held, batch, fs.statSync\(args.wakeFile\).size\)/)
   })
 })

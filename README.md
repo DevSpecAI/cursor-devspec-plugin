@@ -142,7 +142,7 @@ Plan awareness is all-room and advisory: Cursor can see every active plan in the
 
 Plan mutation uses a narrow connection-bound helper shipped with the plugin. It negotiates and stores a per-conversation capability without putting the secret in prompts or the global MCP config. The helper exposes the complete `manage_plan` schema only on demand (`manage-plan describe`) and accepts operations on stdin (`manage-plan use`). Native chats bind through Cursor's host conversation id; a manual chat without that id is accepted only when the host's minted-bond index has exactly one live, attached, capability-bound Cursor connection in the current workspace. Ambiguous sibling connections fail closed. Ordinary MCP tools keep using the normal Cursor registration in `~/.cursor/mcp.json`.
 
-Cursor's existing Resume behavior is unchanged: CLI launches mint a native chat, run `agent --resume`, and stamp that chat id as `local_session_id`.
+Cursor's native `agent --resume` behavior is unchanged. The plugin reports the real host conversation identity as `local_session_id`; it does not require the optional launcher.
 
 ### Repository facts
 
@@ -164,42 +164,13 @@ Use `/devspec.project` for details. Remember and forget show the effective file 
 
 **After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the supported namespaced view, preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
 
-## Open in Cursor from DevSpec
+## Optional launching from DevSpec
 
-When you click **Open in Cursor** on the DevSpec web app, DevSpec opens a signed `devspec://` URL (Windows/Linux) or the macOS localhost bridge fallback.
+Start Cursor yourself and use `/devspec.remote`, or use DevSpec's Copy command. The agent's normal connection and native resume do not need a launcher.
 
-### Setup
+**DevSpec Launcher is a separate optional application.** Launcher-dependent buttons in DevSpec require an explicit installation; the Coding agents settings explain availability and setup. This plugin does not bundle, install, update or start that app, register its URL handler or create a login service. Native Cursor authentication and connection helpers stay in this plugin.
 
-Run the handler installer once:
-
-```bash
-node scripts/open-handler.mjs --install
-```
-
-It:
-
-1. **Windows / Linux:** registers `devspec://` in the OS (per-user, no admin)
-2. **macOS:** starts the localhost bridge on port **42731**
-3. Copies the handler to `~/.cursor/devspec/`
-4. Runs on demand — no always-on bridge or Windows login startup entry
-
-Or, without Node: **Windows** double-click `scripts/install-protocol-handler.cmd`;
-**Linux / macOS** run `bash scripts/install-protocol-handler.sh`.
-
-### What happens when you click the rocket
-
-1. Cursor opens the mapped project folder.
-2. A moment later, the Agent chat is pre-filled with your prompt — press Enter to send.
-
-### macOS health check
-
-`http://127.0.0.1:42731/health` should return `{"ok":true,"mode":"macos_bridge"}` when the fallback bridge is running.
-
-DevSpec never receives or stores your local filesystem paths.
-
-### Signing keys
-
-The handler bundles `scripts/handoff-public-key.pem` for offline verification of the signed handoff.
+A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone source and release information lives in [DevSpec-Launcher](https://github.com/DevSpecAI/DevSpec-Launcher); a repository is not a promise that an installer has been published.
 
 ## Contributing
 

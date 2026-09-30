@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.33
+
+- Remove bundled/shared launcher code, protocol installers, browser bridges and automatic setup. The optional standalone launcher now starts Cursor normally; the installed Remote skill owns connection setup.
+- Keep native project-choice executable invocation inside the plugin without importing the retired launch script. Preserve wake/interaction contracts and native resume; remove obsolete launcher-generated prompt instructions.
+
 ## 0.13.32
 
 Cursor investigation diagnostics are now local-only and off by default. `/devspec.debug` documents start/status/stop/export for one connection, automatic expiry, bounded private files and explicit redacted sharing. Tool/connect timing uploads have been removed, including their awaited network overhead. Plugin MCP timings and transcript append observations are recorded locally when enabled; unavailable host measurements and unknown gaps are stated rather than guessed. Safe ordinary server refusal logging remains separate. Update the actual installed plugin and restart Cursor; a source push alone does not activate new hooks.
