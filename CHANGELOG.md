@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.29
+
+Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and return loopback errors to the existing handoff page. Update/restart the installed plugin to run the shared update check.
+
 ## 0.13.28
 
 Cursor's submit hook now checks the generated shared launcher, including OS registration and readiness, without maintaining a separate launcher implementation. The manual installer delegates to the same path and retains Cursor's space-safe plugin pin. Cursor authentication and connection setup remain in the Cursor adapter; OpenCode's credential-bearing adapter belongs to its own plugin. Launch scripts no longer add an execution-policy bypass. Update/restart the installed plugin to load the change; source and package versions do not establish OS readiness.
