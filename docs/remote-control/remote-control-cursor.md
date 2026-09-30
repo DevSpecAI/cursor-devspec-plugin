@@ -135,8 +135,8 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - CLI Show work stuck at a one-liner / seed only → mid-turn hooks not firing; confirm poller is 0.4.15+ and `cli-trail-watch` starts on pickup (item 63f3db87).
 - Wait exit **1** after a host/redeploy-shaped end (not UI `end_reason` / local stop) → re-register the **same** `local_id` and re-arm (see skill); standing down orphans the bond.
 - Ignoring canonical `attachments[].resource_id` on `owner_message` → miss a stable referenced resource that is part of the command.
-- Fast-connect abort (auth / project / register / attach) → launcher exits **before** `--resume` (no half-Live agent). Missing owner-pid at pre-resume poller time is **not** fatal; poller starts after spawn (item f099fc6e).
-- Mechanical Connect `ensure-poller` before `--resume` on Windows → refuse owner-pid, launcher exits, connection idle_timeout (Restless Owl). Fixed in 0.5.2: defer poller until the CLI child tree exists.
+- Fast-connect failure (auth / project / register / attach) → connection setup fails; keep the ordinary Cursor terminal available and report the failure rather than inventing a live bond.
+- A Windows poller must bind to the durable Cursor CLI process, never a transient tool shell or Node helper. The former pre-resume launcher timing bug is historical; standalone launch now starts the host before its plugin connects.
 - First canonical command after Connect skipped (Emerald Ocelot). Wait `--from-end` seeked to EOF past `owner_messages` the poller already queued. Fixed in 0.5.3: skip advisory history only (item 1f177af4).
 - Poller `--owner-pid` pinned to cursor-agent `index.js worker-server` → `owner_gone` while `agent --resume` is still alive (Copper Sparrow / Azure Bison / Azure Raccoon). Fixed in 0.5.4: skip worker-server; pin to `--resume` (item 5c884554).
 

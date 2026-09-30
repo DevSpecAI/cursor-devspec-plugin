@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.34
+
+- Remove the remaining operational descriptions of launcher-side fast-connect. The normal Cursor host is already running when its plugin connects; host wake/ownership safeguards remain unchanged.
+
 ## 0.13.33
 
 - Remove bundled/shared launcher code, protocol installers, browser bridges and automatic setup. The optional standalone launcher now starts Cursor normally; the installed Remote skill owns connection setup.

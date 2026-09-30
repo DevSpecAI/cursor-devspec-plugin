@@ -1,14 +1,14 @@
 /**
- * Mechanical Cursor Connect (item 1cc2a2d5) — register / optional attach / write
- * state BEFORE the agent resumes. The poller is started after `agent --resume`
- * has a durable owner PID (item f099fc6e). The model only arms wait and handles
- * owner commands (thin post-Live brief).
+ * Mechanical Cursor Connect (item 1cc2a2d5): register, optionally attach and
+ * write the current native conversation's state. A poller needs a durable host
+ * owner PID (item f099fc6e). This is plugin connection machinery, not the
+ * independent DevSpec Launcher.
  *
  * Usage (CLI via remote-control-state.mjs):
  *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
  *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
  *
- * Or import { fastConnect } from './fast-connect.mjs' (launch-cli-session).
+ * Native host helpers may also import fastConnect directly.
  */
 
 import { execFileSync } from 'node:child_process'
