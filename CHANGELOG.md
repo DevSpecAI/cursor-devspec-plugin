@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.32
+
+Cursor investigation diagnostics are now local-only and off by default. `/devspec.debug` documents start/status/stop/export for one connection, automatic expiry, bounded private files and explicit redacted sharing. Tool/connect timing uploads have been removed, including their awaited network overhead. Plugin MCP timings and transcript append observations are recorded locally when enabled; unavailable host measurements and unknown gaps are stated rather than guessed. Safe ordinary server refusal logging remains separate. Update the actual installed plugin and restart Cursor; a source push alone does not activate new hooks.
+
 ## 0.13.30
 
 Cursor's detached progress reporter now preserves safe failure categories in a private, bounded diagnostic log instead of losing them on discarded stderr. Shell timing events no longer include command text, and tool failures use a fixed label rather than error prose. Posting, polling, timeouts and resume behaviour are unchanged. Update the installed plugin and restart Cursor to load the new reporter; an existing process does not reload after a repository update.

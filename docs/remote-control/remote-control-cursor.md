@@ -166,84 +166,64 @@ Do **not** clear Working on interim `post_session_message` alone (omit `complete
 - `hooks/scripts/remote-control-state.mjs` (`register` / `attach` / `write` / `fast-connect`)
 - `hooks/scripts/resolve-mcp-auth.mjs` (**plugin-owned**)
 - `hooks/scripts/agent-identity.mjs`
-- `hooks/scripts/connect-phase-timing.mjs` (dense `connect_phase` → Axiom)
+- `hooks/scripts/connect-phase-timing.mjs` (opt-in local connect timings)
+- `hooks/scripts/local-diagnostics.mjs` / `diagnostics-command.mjs` (default-off local collector and explicit export)
 - `hooks/scripts/remote-control-story.mjs` (shared phase vocabulary + local `story ` emitter)
 
 ## Logging — reconstructing a connection story
 
-Fragile remote sessions are debugged from two places that share one phase vocabulary:
+Detailed investigation timing is default-off and local-only (item `d1d9a961`). Existing service lifecycle logs remain separate from these opt-in traces:
 
 | Source | Where | What |
 |---|---|---|
 | **Axiom (server)** | DevSpec MCP tool logs | `msg == "Remote-control story"` with `connectionId`, `sessionId`, `data.phase`, `data.outcome`, `reason` |
-| **Axiom (client phases)** | Plugin POST `/api/log` | Same message; payload under `['data']['client']` with `kind == "connect_phase"`, `duration_ms`, `launch_id` (item 383de0cd / mechanical Connect) |
+| **Local diagnostic run** | Explicit `diagnostics-command.mjs start` | Structured tool/connect/MCP spans, safe failure categories and transcript append observations. Nothing uploads. |
 | **Local poll.log** | `~/.devspec/remote-control/connections/<connection_id>.poll.log` | Poller stderr/stdout (spawn redirect). Structured lines prefixed `story ` plus human poller messages. Kept for offline debug. |
 
 **Shared lifecycle phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
 
 **Cold-launch / connect timing phases** (Node-measured): `create_chat` · `expand_stamp` / `skip_stamp` · `write_stamp` · `agent_resume` · `resolve_local_id` · `resolve_local` · `project_resolve` · `register_connection` · `attach_connection` · `write_state` · `ensure_poller` · `wait_armed`
 
-Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). Launcher + connect timings ship via `connect-phase-timing.mjs` → `/api/log`. The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
+Cursor emits client-side stories from `devspec-remote-poll.mjs` (seed filter, **`inject`** = inbox write, wake, poll errors, max-turn stall) and `mirror-turn.mjs stop` (`complete_turn`). Connect timings write only to an explicitly enabled matching local run; they never call `/api/log`. The agent’s `post_session_message` path is covered by server breadcrumbs after staging deploy.
 
 **Axiom recipe** — connection lifecycle (dataset `devspec`):
 
 ```
 ['devspec']
-| where message == "Remote-control story" or ['data']['client']['kind'] == "connect_phase"
-| where connectionId == "<connection-uuid>" or ['data']['client']['connectionId'] == "<connection-uuid>"
+| where msg == "Remote-control story"
+| where connectionId == "<connection-uuid>"
 | sort by _time asc
-| project _time, message, source, ['data'], connectionId, sessionId
+| project _time, msg, ['data'], connectionId, sessionId
 ```
 
-**Axiom recipe** — one cold launch timeline by `launch_id` (primary Connect debug):
+**Local diagnostic commands** (Node 18+, this plugin's own `PLUGIN` root):
 
-```
-['devspec']
-| where ['data']['client']['kind'] == "connect_phase"
-| where ['data']['client']['launch_id'] == "<launch-uuid>"
-| sort by _time asc
-| project _time,
-    phase = ['data']['client']['phase'],
-    outcome = ['data']['client']['outcome'],
-    duration_ms = toint(['data']['client']['duration_ms']),
-    connectionId = ['data']['client']['connectionId'],
-    local_id = ['data']['client']['local_id'],
-    reason = ['data']['client']['reason']
+```text
+node "$PLUGIN/hooks/scripts/diagnostics-command.mjs" start --connection <connection-uuid> --minutes 15
+node "$PLUGIN/hooks/scripts/diagnostics-command.mjs" status --connection <connection-uuid>
+node "$PLUGIN/hooks/scripts/diagnostics-command.mjs" stop --connection <connection-uuid>
+node "$PLUGIN/hooks/scripts/diagnostics-command.mjs" export --connection <connection-uuid>
 ```
 
-The stamped prompt and launcher log print `launch_id=…` so you can paste that UUID into the filter. Expect a dense chain: `create_chat` → `project_resolve` → `register_connection` → optional `attach_connection` → `write_state` → `ensure_poller` → `expand_stamp` → `write_stamp` → `agent_resume` (then model-side `wait_armed`).
+Inside the native Cursor conversation, its connection can be resolved from `CURSOR_CONVERSATION_ID`; outside it pass the exact connection UUID. Start requires an existing enabled local connection and refuses another active diagnostic run on the same connection. No folder-wide or sibling enablement. `status` returns the immediately readable directory and expiry; `export` writes a reviewed-schema JSON file there without uploading it. Inspect it before explicitly sharing it. `/devspec.debug` documents the same command.
+
+Collection expires after 15 minutes by default (1–60 allowed) or explicit stop. Maximum four retained runs; each has two 512 KiB event segments, at most 10,000 events, a bounded pending-start file, and one export capped at 1.5 MiB. Retention is 24 hours, with expired runs removed on the next diagnostic command; no always-on cleanup daemon is installed. Starting a run also evicts oldest inactive runs at the count limit. Local files are mode 0600 and directories 0700 on Unix; on Windows they inherit the user's profile ACL. Existing poll logs and historical pre-0.13.32 diagnostics are not rewritten or deleted.
 
 **Local recipe:** open the connection’s `.poll.log` and grep `story `. Do not dump model token streams into either log.
 
-### Safe refusal diagnostics (item `d50b8d6e`)
+### Safe refusal diagnostics
 
-The detached progress reporter keeps `<connection-id>.progress-diagnostics.jsonl` in the user's `.devspec/remote-control/connections` directory. Each record contains timestamp, connection UUID, fixed source/phase/reason and, when known, HTTP status and a reviewed server auth-failure code. It never copies raw stderr, MCP response bodies, shell commands, credentials or conversation text. Unknown errors are explicitly unclassified. The file rotates at 128 KiB with one archive (256 KiB total); failed logging never changes reporter behaviour. Unix files are mode 0600; Windows uses the user's profile ACL.
+The detached progress reporter now records failures in the same opt-in local run, not in an always-on diagnostic file. Records include fixed categories and HTTP status when known, never response bodies, command contents, credentials or raw error prose. Diagnostic I/O failure cannot change the reporter's retry, polling or exit behavior.
 
-The DevSpec server records refusal categories and supplied turn UUIDs on `post_session_message` failures. Its logged `statusCode=400` means a tool refusal, not necessarily an HTTP 400. Compare these server events with local failures and deployment/database evidence before deciding the cause. A successful `/api/log` response alone is not proof of event admission; query the timing record downstream.
+Ordinary DevSpec service logs still record safe refusal categories for `post_session_message`. A logged `statusCode=400` denotes a tool refusal, not necessarily HTTP 400 or a database outage. That service logging does not enable host diagnostics or authorize their upload. The server timing exception introduced by `d50b8d6e` is withdrawn; production-preparation logging/consent boundaries are preserved.
 
-After updating/restarting Cursor, verify the executing pinned plugin version and perform a real question/answer turn. Do not treat a source push or a synthetic timing event as proof that a running Cursor process loaded the change. Timing and failure diagnostics do not change resume, retry or timeout behaviour.
+### Reading the local timeline
 
-### Live answer turn — per-tool timings (item `f719e846`)
+`events.jsonl` is written as observations happen. Records have ordered sequence numbers, observation time, nondecreasing elapsed time, connection/chat/launch IDs when known, and source labels. Hook start/end pairs have an opaque invocation ID and measured/reported duration; unmatched ends leave duration unknown. Shell tools are called `shell`, never their command text. No tool arguments, full URLs, headers, credentials or raw errors are retained.
 
-Connect phases above cover cold launch only. While a remote answer turn is marked active, Cursor hook events (`preToolUse` / `postToolUse`, shell before/after, MCP before/after) emit the same `Remote-control story` shape with `kind == "turn_tool"`: tool name, channel (`tool` | `shell` | `mcp`), `duration_ms`, and join keys (`connectionId`, optional `turn_id` / `launch_id`). No tool arguments or message bodies. Shell operations are labelled `shell` (not their command text); missing call IDs pair through an opaque command fingerprint. The server admits only reviewed tool names (unknown names become `other`), bounded duration/outcome fields and UUID correlation keys under untrusted `data.client`. It drops arbitrary phase strings, error prose and extra fields.
+`plugin_mcp` spans cover only calls made by the plugin's MCP helper. They record `tools/call`, safe tool identifiers, timestamps, monotonic duration, outcome/timeout and request/response body byte counts, excluding headers and bodies. Native host tool hooks are labelled `cursor_hook`, so overlapping observations must not be summed as separate work. A metadata-only observer timestamps size changes in the selected chat's transcript; it never reads or exports its text. Existing native trace-directory presence is inventoried, but raw host logs/state are not parsed or copied into the export. Thus host-owned schema-discovery timings can remain unavailable. Unknown gaps are not asserted to be model thinking, and activity before enabling diagnostics cannot be reconstructed.
 
-**Axiom APL (one connection’s tool timeline):**
-
-```
-['devspec']
-| where ['data']['client']['kind'] == "turn_tool"
-| where ['data']['client']['connectionId'] == "<connection-uuid>"
-| sort by _time asc
-| project _time,
-    tool = ['data']['client']['tool'],
-    channel = ['data']['client']['channel'],
-    outcome = ['data']['client']['outcome'],
-    duration_ms = toint(['data']['client']['duration_ms']),
-    turn_id = ['data']['client']['turn_id'],
-    phase = ['data']['client']['phase']
-```
-
-Filter further on `turn_id` when the connection state stamped one. Prefer Cursor-reported hook `duration` when present; otherwise wall-clock from the paired before-hook start.
+No automatic per-tool/connect network request remains, including when callers pass obsolete `ship` options. Confirm the executing installed plugin version after update/restart, enable diagnostics for the chosen connection, and verify a real question/answer turn on the actual host. Local fixtures alone do not prove Windows hooks fire. Exports include source availability and the available plugin/host versions, with unknowns stated honestly.
 
 ## Directed-question answers (item `b9f2c77a`)
 

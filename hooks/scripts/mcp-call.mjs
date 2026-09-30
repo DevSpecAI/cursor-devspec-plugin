@@ -19,6 +19,10 @@
  */
 
 import { versionedConnectionArguments } from './connection-version.mjs'
+import { randomUUID } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
+import { activeDiagnostics, appendDiagnostic } from './local-diagnostics.mjs'
+import { classifyProgressFailure } from './progress-diagnostics.mjs'
 
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
@@ -128,7 +132,27 @@ export class CursorMcpRefusal extends Error {
   constructor(text, details) { super(text); this.name = 'CursorMcpRefusal'; this.details = details }
 }
 
-export async function mcpToolsCall({
+export async function mcpToolsCall(options) {
+  const fields = { connectionId: options.arguments?.connection_id, local_id: process.env.CURSOR_CONVERSATION_ID }
+  // Capture only if this exact connection/chat opted in. No server URLs, headers,
+  // request/response bodies or tool arguments enter the diagnostic records.
+  const run = activeDiagnostics(fields)
+  if (!run) return performMcpToolsCall(options, null)
+  const measurement = {}, recording = { runId: run.meta.runId }
+  const started = performance.now(), started_at = new Date().toISOString(), invocationId = randomUUID()
+  const event = { kind: 'mcp', source: 'plugin_mcp', tool: options.name, method: 'tools/call', server: 'devspec', invocationId, started_at, turn_id: options.arguments?.command_turn_id, sessionId: options.arguments?.session_id }
+  appendDiagnostic(fields, { ...event, phase: 'start' }, recording)
+  try {
+    const result = await performMcpToolsCall(options, measurement)
+    appendDiagnostic(fields, { ...event, phase: 'end', ended_at: new Date().toISOString(), duration_ms: performance.now() - started, outcome: 'ok', ...measurement }, recording)
+    return result
+  } catch (error) {
+    appendDiagnostic(fields, { ...event, phase: 'end', ended_at: new Date().toISOString(), duration_ms: performance.now() - started, outcome: error?.code === 'timeout' ? 'timeout' : 'error', ...measurement, ...classifyProgressFailure(error) }, recording)
+    throw error
+  }
+}
+
+async function performMcpToolsCall({
   mcpUrl,
   token,
   name,
@@ -138,7 +162,7 @@ export async function mcpToolsCall({
   aliveCheckMs = 2_000,
   connectionCapability = null,
   includeMeta = false,
-}) {
+}, measurement) {
   const body = {
     jsonrpc: '2.0',
     id: Date.now(),
@@ -146,6 +170,8 @@ export async function mcpToolsCall({
     params: { name, arguments: versionedConnectionArguments(name, toolArgs || {}) },
   }
 
+  const bodyText = JSON.stringify(body)
+  if (measurement) measurement.request_bytes = Buffer.byteLength(bodyText)
   const controller = new AbortController()
   let abortCode = null
   let timeoutTimer = null
@@ -178,7 +204,7 @@ export async function mcpToolsCall({
     res = await fetch(mcpUrl, {
       method: 'POST',
       headers: mcpRequestHeaders({ token, connectionCapability }),
-      body: JSON.stringify(body),
+      body: bodyText,
       signal: controller.signal,
     })
   } catch (e) {
@@ -194,6 +220,7 @@ export async function mcpToolsCall({
   }
 
   const text = await res.text()
+  if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
     // Message text is deliberately unchanged — logs and existing matching read it.
     const err = new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)

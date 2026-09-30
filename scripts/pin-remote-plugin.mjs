@@ -195,6 +195,7 @@ export function buildPostLiveRemoteBrief(opts) {
     '7. When attached, post the **final** answer with `post_session_message({ connection_id, message, phase: "answer", complete_turn: true, agent_name: "Cursor" })`. Omit `complete_turn` on rare mid-turn posts. **Never** post status chrome / connect banners into the session.',
     '8. **Do not re-arm wait.** Leave the background tail running. Host follow keeps writing the wake file after Cursor `turn_ended`. Never run `devspec-remote-wait.mjs --from-end` on a Connect launch.',
     '9. Stop with `devspec.remote-stop` when done.',
+    'Diagnostics are off by default. When explicitly requested, `/devspec.debug` documents local start/status/stop/export with expiry; no automatic uploads. Do not enable diagnostics during routine work.',
     '',
     'Canonical exact-target commands only. Trail / Working chrome is plugin-owned — you own the final answer.',
     'If `resolve-local` later says `already_live`, keep the background tail — do not re-register.',

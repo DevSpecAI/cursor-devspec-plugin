@@ -18,7 +18,11 @@ describe('Cursor shared-session-plan surfaces', () => {
     // extension is gone, so the surface a user actually reaches is the plugin's
     // skills directory — the assertion is the same one, against where it now lives.
     const skills = fs.readdirSync(new URL('../skills', import.meta.url)).sort()
-    assert.deepEqual(skills, ['devspec.project', 'devspec.remote', 'devspec.remote-stop'])
+    assert.deepEqual(skills, ['devspec.debug', 'devspec.project', 'devspec.remote', 'devspec.remote-stop'])
+    const debugSkill = read('skills/devspec.debug/SKILL.md')
+    assert.match(debugSkill, /only after the person asks/i)
+    assert.match(debugSkill, /no automatic uploads/i)
+    assert.match(buildPostLiveRemoteBrief({ pluginPath: '/cursor/devspec-autopilot', connectionId: '11111111-1111-4111-8111-111111111111', sessionId: '22222222-2222-4222-8222-222222222222', localId: 'cursor-chat-a' }), /devspec\.debug/)
     assert.equal(skills.includes('devspec.work'), false)
     assert.equal(skills.includes('devspec.managePlan'), false)
   })

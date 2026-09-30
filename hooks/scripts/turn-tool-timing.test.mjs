@@ -1,149 +1,43 @@
-#!/usr/bin/env node
-/**
- * Live-turn tool timing helpers (item f719e846).
- */
 import assert from 'node:assert/strict'
+import { test } from 'node:test'
 import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
-import { describe, it } from 'node:test'
-import {
-  TURN_TOOL_KIND,
-  TURN_TOOL_SOURCE,
-  buildTurnToolPayload,
-  emitTurnToolTiming,
-  handleTurnToolHook,
-  pendingKey,
-  resolveDurationMs,
-  resolveToolIdentity,
-  turnToolPendingPath,
-} from './turn-tool-timing.mjs'
+import { handleTurnToolHook, emitTurnToolTiming, pendingKey, resolveDurationMs, resolveToolIdentity } from './turn-tool-timing.mjs'
+import { fixture, ID, OTHER } from '../../tests/helpers/local-diagnostics.mjs'
+import { stopDiagnostics } from './local-diagnostics.mjs'
 
-describe('resolveToolIdentity', () => {
-  it('names shell / mcp / generic tools', () => {
-    assert.deepEqual(resolveToolIdentity('beforeShellExecution', { command: 'git status' }), {
-      channel: 'shell',
-      tool: 'shell',
-    })
-    assert.deepEqual(resolveToolIdentity('afterMCPExecution', { tool_name: 'search_memories' }), {
-      channel: 'mcp',
-      tool: 'search_memories',
-    })
-    assert.deepEqual(resolveToolIdentity('postToolUse', { toolName: 'Shell' }), {
-      channel: 'tool',
-      tool: 'Shell',
-    })
-  })
-})
+test('off by default: no pending files or upload, even with legacy ship flags', () => fixture(async ({ root }) => {
+  const original = globalThis.fetch; globalThis.fetch = () => { throw Error('Unexpected upload') }
+  try {
+    assert.deepEqual(await handleTurnToolHook('beforeMCPExecution', { tool_name: 'get_action_item' }, { connectionId: ID }), { skipped: 'disabled' })
+    assert.deepEqual(await emitTurnToolTiming({ connectionId: ID, channel: 'mcp', tool: 'read', duration_ms: 1, ship: true }), { local: false })
+    assert.equal(fs.existsSync(root), false)
+  } finally { globalThis.fetch = original }
+}))
 
-describe('pendingKey / resolveDurationMs', () => {
-  it('pairs on tool_call_id when present', () => {
-    assert.equal(
-      pendingKey({ tool_call_id: 'abc' }, 'mcp', 'search_memories'),
-      'mcp:abc',
-    )
-  })
+test('paired hooks produce local starts/ends with safe names and no command/error prose', () => fixture(async ({ events }) => {
+  const data = { command: 'curl -H "Bearer SYMBOLIC_SECRET"', tool_call_id: 'SYMBOLIC_CALL' }
+  const now = Date.now()
+  await handleTurnToolHook('beforeShellExecution', data, { connectionId: ID, now })
+  await handleTurnToolHook('afterShellExecution', { ...data, error: 'SYMBOLIC_ERROR' }, { connectionId: ID, now: now + 125 })
+  const rows = events()
+  assert.equal(rows.length, 2); assert.equal(rows[0].invocationId, rows[1].invocationId)
+  assert.equal(rows[1].duration_ms, 125); assert.equal(rows[1].outcome, 'error')
+  assert.equal(rows[1].tool, 'shell'); assert.ok(rows[1].ended_at)
+  assert.equal(JSON.stringify(rows).includes('SYMBOLIC'), false)
+  assert.deepEqual(await handleTurnToolHook('beforeShellExecution', data, { connectionId: OTHER }), { skipped: 'disabled' })
+  stopDiagnostics(ID)
+  assert.deepEqual(await handleTurnToolHook('beforeShellExecution', data, { connectionId: ID }), { skipped: 'disabled' })
+}, true))
 
-  it('pairs shell calls by an opaque fingerprint without retaining command secrets', () => {
-    const key = pendingKey({ command: 'curl -H "Bearer SYMBOLIC_SECRET"' }, 'shell', 'shell')
-    assert.match(key, /^shell:[a-f0-9]{64}$/)
-    assert.equal(key.includes('SYMBOLIC'), false)
-    assert.notEqual(key, pendingKey({ command: 'git status' }, 'shell', 'shell'))
-  })
+test('missing start stays unmeasured, and hook phases do not invent thinking time', () => fixture(async ({ events }) => {
+  await handleTurnToolHook('afterMCPExecution', { tool_name: 'get_action_item' }, { connectionId: ID })
+  assert.equal(events()[0].duration_ms, undefined)
+  assert.equal(events()[0].started_at, undefined)
+}, true))
 
-  it('prefers reported duration over wall clock', () => {
-    assert.equal(resolveDurationMs({ duration: 1234.6 }, 0, 9999), 1235)
-    assert.equal(resolveDurationMs({}, 1000, 1400), 400)
-    assert.equal(resolveDurationMs({}, null, 1400), 0)
-  })
-})
-
-describe('buildTurnToolPayload', () => {
-  it('builds a lean turn_tool payload', () => {
-    const p = buildTurnToolPayload({
-      tool: 'search_memories',
-      channel: 'mcp',
-      duration_ms: 88.2,
-      connectionId: 'conn-1',
-      sessionId: 'sess-1',
-      turn_id: 'turn-1',
-      agent: 'Cursor',
-    })
-    assert.deepEqual(p, {
-      phase: 'tool:mcp:search_memories',
-      tool: 'search_memories',
-      channel: 'mcp',
-      outcome: 'ok',
-      duration_ms: 88,
-      kind: TURN_TOOL_KIND,
-      source: TURN_TOOL_SOURCE,
-      connectionId: 'conn-1',
-      sessionId: 'sess-1',
-      turn_id: 'turn-1',
-      agent: 'Cursor',
-    })
-  })
-})
-
-describe('emitTurnToolTiming', () => {
-  it('ships Remote-control story via /api/log', async () => {
-    /** @type {RequestInit | undefined} */
-    let seen
-    const fetchImpl = async (_url, init) => {
-      seen = init
-      return { ok: true, status: 200 }
-    }
-    const r = await emitTurnToolTiming({
-      tool: 'Shell',
-      channel: 'tool',
-      duration_ms: 50,
-      connectionId: 'c1',
-      mcpUrl: 'https://api.devspec.ai/api/mcp',
-      fetchImpl,
-    })
-    assert.equal(r.axiom.ok, true)
-    const body = JSON.parse(String(seen?.body || '{}'))
-    assert.equal(body.logs[0].msg, 'Remote-control story')
-    assert.equal(body.logs[0].data.kind, 'turn_tool')
-    assert.equal(body.logs[0].data.tool, 'Shell')
-  })
-})
-
-describe('handleTurnToolHook', () => {
-  it('records before and emits after with pending start', async () => {
-    const connectionId = `test-turn-tool-${Date.now()}`
-    const pendingFile = turnToolPendingPath(connectionId)
-    try {
-      await handleTurnToolHook(
-        'beforeMCPExecution',
-        { tool_name: 'get_action_item', tool_call_id: 'call-9' },
-        { connectionId, sessionId: 's1', ship: false, now: 1_000 },
-      )
-      const pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'))
-      assert.equal(pending['mcp:call-9'].startedAt, 1_000)
-
-      const result = await handleTurnToolHook(
-        'afterMCPExecution',
-        { tool_name: 'get_action_item', tool_call_id: 'call-9' },
-        { connectionId, sessionId: 's1', ship: false, now: 1_250 },
-      )
-      assert.equal(result.local, true)
-      assert.ok(!fs.existsSync(pendingFile) || !JSON.parse(fs.readFileSync(pendingFile, 'utf8'))['mcp:call-9'])
-    } finally {
-      try {
-        fs.rmSync(pendingFile, { force: true })
-      } catch {
-        /* ignore */
-      }
-    }
-  })
-
-  it('skips DevSpec post_session_message recursion', async () => {
-    const r = await handleTurnToolHook(
-      'afterMCPExecution',
-      { tool_name: 'post_session_message' },
-      { connectionId: 'c', ship: false },
-    )
-    assert.deepEqual(r, { skipped: 'post_session' })
-  })
+test('identity and pending keys never contain raw command text', () => {
+  assert.deepEqual(resolveToolIdentity('beforeShellExecution', { command: 'private' }), { channel: 'shell', tool: 'shell' })
+  assert.match(pendingKey({ command: 'SYMBOLIC_PRIVATE' }, 'shell', 'shell'), /^shell:[a-f0-9]{64}$/)
+  assert.equal(resolveDurationMs({}, undefined, 1000), undefined)
+  assert.equal(resolveDurationMs({ duration: 12.6 }, 0, 999), 13)
 })
