@@ -487,11 +487,11 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
 }
 
 /**
- * Resolve a durable owner PID from a process we just spawned (item f099fc6e).
+ * Resolve a durable owner PID from a supplied process tree (item f099fc6e).
  *
- * Mechanical Connect runs *before* `agent --resume`, so walking *ancestors* of
- * launch-cli-session never sees cursor-agent. After spawn, walk *descendants*
- * of the child PID (often powershell.exe wrapping agent.ps1 on Windows).
+ * An explicit owner hint may identify a shell wrapping the already-running
+ * Cursor CLI rather than the durable host. Walk its descendants to find the
+ * native agent (often powershell.exe wrapping agent.ps1 on Windows).
  *
  * POSIX: the spawn PID is the agent — return it.
  * Windows: wait briefly for cursor-agent/agent.exe in the child tree; never
@@ -552,44 +552,6 @@ function persistOwnerPidOnConnection(connectionId, ownerPid) {
   } catch {
     /* poller still receives --owner-pid on argv */
   }
-}
-
-/**
- * After `agent --resume` is spawned, find a durable owner in that child tree
- * and start the poller. Does not abort the CLI on failure — the agent is already
- * running; a warning is the caller's job.
- *
- * @param {string} connectionId
- * @param {string | number | null | undefined} spawnPid
- * @param {{
- *   cwd?: string,
- *   sessionId?: string | null,
- *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
- *   ensurePoller?: typeof ensurePollerForConnection,
- *   childTreeOpts?: object,
- * }} [opts]
- */
-export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
-  if (!connectionId || connectionId.length < 8) {
-    return { ok: false, error: 'missing connection id', owner_pid: null }
-  }
-  const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
-  const ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
-  if (!ownerPid) {
-    return {
-      ok: false,
-      error:
-        'no durable owner-pid in spawned agent tree (waited for cursor-agent --resume / agent.exe descendant; powershell/cmd/launch-cli-session/Cursor.exe/worker-server are not anchors)',
-      owner_pid: null,
-    }
-  }
-  const ensure = opts.ensurePoller || ensurePollerForConnection
-  const poller = ensure(connectionId, {
-    cwd: opts.cwd,
-    sessionId: opts.sessionId || null,
-    ownerPid,
-  })
-  return { ...poller, owner_pid: ownerPid }
 }
 
 /**
@@ -742,54 +704,6 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
     wake_file: wakeFile,
     arm: armFlag,
   }
-}
-
-/**
- * After `agent --resume` is spawned, start host-owned inbox follow with the
- * same durable owner as the poller.
- *
- * @param {string} connectionId
- * @param {string | number | null | undefined} spawnPid
- * @param {{
- *   cwd?: string,
- *   launchId?: string | null,
- *   wakeFile: string,
- *   ownerPid?: number | null,
- *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
- *   ensureFollow?: typeof ensureWakeFollowForConnection,
- *   childTreeOpts?: object,
- * }} [opts]
- */
-export function ensureWakeFollowAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
-  if (!connectionId || connectionId.length < 8) {
-    return { ok: false, error: 'missing connection id', owner_pid: null }
-  }
-  const wakeFile = typeof opts.wakeFile === 'string' ? opts.wakeFile.trim() : ''
-  if (!wakeFile) return { ok: false, error: 'missing wake file', owner_pid: null }
-  let ownerPid = opts.ownerPid != null ? Number(opts.ownerPid) : null
-  if (!Number.isInteger(ownerPid) || ownerPid < 1) {
-    const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
-    ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
-  }
-  if (!ownerPid) {
-    return {
-      ok: false,
-      error:
-        'no durable owner-pid in spawned agent tree for wake follow (same --resume / agent.exe rule as the poller)',
-      owner_pid: null,
-    }
-  }
-  const ensure = opts.ensureFollow || ensureWakeFollowForConnection
-  const follow = ensure(connectionId, {
-    cwd: opts.cwd,
-    ownerPid,
-    launchId: opts.launchId || null,
-    wakeFile,
-    // Cold first-arm after Connect / --resume (host follow only — model wake-tail
-    // still must not pass --from-end; decision 70b0d7d6).
-    fromEnd: true,
-  })
-  return { ...follow, owner_pid: ownerPid }
 }
 
 /**

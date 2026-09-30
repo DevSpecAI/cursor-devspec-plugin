@@ -3,6 +3,15 @@ import { test } from 'node:test'
 import fs from 'node:fs'
 import { nativeInvocation } from '../hooks/scripts/native-agent-spawn.mjs'
 import { findNativeCursorCli } from '../hooks/scripts/project-command.mjs'
+import * as connectionState from '../hooks/scripts/remote-control-state.mjs'
+
+test('connection helpers belong to the running host, not a removed pre-connect launcher', () => {
+  assert.equal('ensurePollerAfterAgentSpawn' in connectionState, false)
+  assert.equal('ensureWakeFollowAfterAgentSpawn' in connectionState, false)
+  assert.equal(typeof connectionState.ensurePollerForConnection, 'function')
+  assert.equal(typeof connectionState.ensureWakeFollowForConnection, 'function')
+  assert.equal(typeof connectionState.resolveOwnerPidFromChildTree, 'function')
+})
 test('Cursor has no launcher payload, installers or automatic setup hook', () => {
   for (const relative of ['../launcher', './setup-launcher.mjs', './open-handler.mjs', './launch-cli-session.mjs', './pin-remote-plugin.mjs']) assert.equal(fs.existsSync(new URL(relative, import.meta.url)), false, relative)
   const hooks = JSON.parse(fs.readFileSync(new URL('../hooks/hooks.json', import.meta.url)))

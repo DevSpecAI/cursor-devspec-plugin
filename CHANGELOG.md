@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.35
+
+- Remove unused post-launch connection wrappers left behind by the Launcher separation. Native host ownership, polling and wake-follow behavior are unchanged.
+- Correct hook documentation to describe direct plugin-owned scripts, not the retired hook launcher. Update the installed plugin and restart Cursor to load this version.
+
 ## 0.13.34
 
 - Remove the remaining operational descriptions of launcher-side fast-connect. The normal Cursor host is already running when its plugin connects; host wake/ownership safeguards remain unchanged.

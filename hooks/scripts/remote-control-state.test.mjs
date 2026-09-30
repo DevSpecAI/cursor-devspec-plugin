@@ -31,8 +31,6 @@ import {
   resolveOwnerPidAutoWindows,
   resolveOwnerPidFromChildTree,
   walkChildTreeForDurableOwner,
-  ensurePollerAfterAgentSpawn,
-  ensureWakeFollowAfterAgentSpawn,
   CLI_SPAWN_OWNER_WALK_TIMEOUT_MS,
   registerConnection,
 } from './remote-control-state.mjs'
@@ -1131,68 +1129,6 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
     )
   })
 
-  it('ensurePollerAfterAgentSpawn passes the descendant owner pid', () => {
-    const r = ensurePollerAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
-      cwd: '/tmp',
-      sessionId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-      resolveOwnerPidFromChildTree: () => 200,
-      ensurePoller: (connectionId, opts) => {
-        assert.equal(connectionId, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
-        assert.equal(opts.ownerPid, 200)
-        assert.equal(opts.sessionId, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
-        return { ok: true, pid: 999 }
-      },
-    })
-    assert.equal(r.ok, true)
-    assert.equal(r.owner_pid, 200)
-    assert.equal(r.pid, 999)
-  })
-
-  it('ensurePollerAfterAgentSpawn fails closed when the child tree has no owner', () => {
-    const r = ensurePollerAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
-      resolveOwnerPidFromChildTree: () => null,
-      ensurePoller: () => {
-        throw new Error('must not spawn')
-      },
-    })
-    assert.equal(r.ok, false)
-    assert.equal(r.owner_pid, null)
-    assert.match(r.error, /spawned agent tree/)
-  })
-
-  it('ensureWakeFollowAfterAgentSpawn reuses the poller owner pid and passes the wake file', () => {
-    const r = ensureWakeFollowAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
-      ownerPid: 200,
-      wakeFile: 'C:\\ProgramData\\DevSpec\\wakes\\aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl',
-      launchId: 'launch-1',
-      cwd: '/tmp',
-      resolveOwnerPidFromChildTree: () => {
-        throw new Error('must not walk when ownerPid is set')
-      },
-      ensureFollow: (connectionId, opts) => {
-        assert.equal(connectionId, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
-        assert.equal(opts.ownerPid, 200)
-        assert.equal(opts.launchId, 'launch-1')
-        assert.equal(opts.fromEnd, true)
-        assert.match(opts.wakeFile, /aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\.jsonl/)
-        return { ok: true, pid: 888 }
-      },
-    })
-    assert.equal(r.ok, true)
-    assert.equal(r.owner_pid, 200)
-    assert.equal(r.pid, 888)
-  })
-
-  it('ensureWakeFollowAfterAgentSpawn fails closed without a wake file', () => {
-    const r = ensureWakeFollowAfterAgentSpawn('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, {
-      ownerPid: 200,
-      ensureFollow: () => {
-        throw new Error('must not spawn')
-      },
-    })
-    assert.equal(r.ok, false)
-    assert.match(r.error, /wake file/)
-  })
 })
 
 describe('ensureWakeFollowForConnection (item 1badd088)', () => {
