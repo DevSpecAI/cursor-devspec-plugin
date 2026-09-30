@@ -170,7 +170,7 @@ Start Cursor yourself and use `/devspec.remote`, or use DevSpec's Copy command. 
 
 **DevSpec Launcher is a separate optional application.** Launcher-dependent buttons in DevSpec require an explicit installation; the Coding agents settings explain availability and setup. This plugin does not bundle, install, update or start that app, register its URL handler or create a login service. Native Cursor authentication and connection helpers stay in this plugin.
 
-A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone source and release information lives in [DevSpec-Launcher](https://github.com/DevSpecAI/DevSpec-Launcher); a repository is not a promise that an installer has been published.
+A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone installers are not yet published; Coding agents settings will show downloads when they are available.
 
 ## Contributing
 
