@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.36
+
+DevSpec's personal settings page for your token is now the **Agents** page at `/settings/agents`. Instead of naming a path through the menus, the plugin now gives you a link to it. `npm run setup`, the more-than-one-key warning and the "no reachable key owns this connection" error all print the link for the DevSpec environment you're actually connected to: https://app.devspec.ai/settings/agents in production, https://app.devspecstaging.com/settings/agents on staging. If two keys belong to two environments, the warning links both pages. `DEVSPEC_APP_URL` overrides the app host. The README and the token prompt link to the page too, and call the other tools you reuse your token in "agents". How the plugin connects is unchanged. Update the installed plugin and restart Cursor to load this version.
+
 ## 0.13.35
 
 - Remove unused post-launch connection wrappers left behind by the Launcher separation. Native host ownership, polling and wake-follow behavior are unchanged.

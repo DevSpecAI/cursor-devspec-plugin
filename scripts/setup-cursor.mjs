@@ -22,6 +22,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { agentsPageUrl } from '../hooks/scripts/app-pages.mjs'
 
 const DEFAULT_API_URL = 'https://api.devspec.ai'
 const SERVER_KEY = 'devspec'
@@ -75,7 +76,7 @@ export function resolveInputs({ args, env }) {
   if (!token) {
     throw new Error(
       'No token. Pass --token dvs_… or set DEVSPEC_MCP_TOKEN.\n' +
-        'Create one in DevSpec under You → Coding agents → Create your token (Read & write).',
+        `Create one on DevSpec's Agents page: ${agentsPageUrl(base, { env })} (Create your token, then pick Read & write).`,
     )
   }
   if (!/^https?:\/\//.test(base)) {

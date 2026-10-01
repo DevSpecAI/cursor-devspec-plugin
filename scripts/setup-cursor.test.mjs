@@ -61,6 +61,21 @@ describe('setup-cursor', () => {
     assert.throws(() => resolveInputs({ args: {}, env: {} }), /No token/)
   })
 
+  it('links the Agents page of the environment being set up, not a breadcrumb', () => {
+    const message = (args, env = {}) => {
+      try {
+        resolveInputs({ args, env })
+      } catch (err) {
+        return err.message
+      }
+      throw new Error('expected resolveInputs to refuse without a token')
+    }
+    assert.match(message({}), /Agents page: https:\/\/app\.devspec\.ai\/settings\/agents /)
+    assert.match(message({ apiUrl: 'https://api.devspecstaging.com' }), /Agents page: https:\/\/app\.devspecstaging\.com\/settings\/agents /)
+    assert.match(message({}, { DEVSPEC_API_URL: 'https://api.devspecstaging.com/' }), /https:\/\/app\.devspecstaging\.com\/settings\/agents /)
+    assert.doesNotMatch(message({}), /You →|Coding agents/)
+  })
+
   it('refuses a non-URL api base', () => {
     assert.throws(() => resolveInputs({ args: { apiUrl: 'api.devspec.ai' }, env: { DEVSPEC_MCP_TOKEN: 'dvs_x' } }), /http\(s\) URL/)
   })

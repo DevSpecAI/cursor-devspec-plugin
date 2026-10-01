@@ -24,9 +24,9 @@ You'll need:
 
 - **Cursor's CLI agent** (`cursor-agent`). This is a CLI plugin: it is installed with `cursor-agent plugin`, and its hooks run in `cursor-agent` sessions. There is no VS Code extension and no VSIX.
 - A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repo(s).
-- A **DevSpec API token**. Create one in DevSpec under **You → Coding agents** → **Create your token** (pick **Read & write**); it starts with `dvs_`.
+- A **DevSpec API token**. Create one on DevSpec's [Agents page](https://app.devspec.ai/settings/agents) with **Create your token** (pick **Read & write**); it starts with `dvs_`.
   - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
-  - It's **retrievable.** Reveal and copy it again any time at **You → Coding agents** (no more show-once).
+  - It's **retrievable.** Reveal and copy it again any time on the [Agents page](https://app.devspec.ai/settings/agents) (no more show-once).
   - You don't paste a project id — the project for a run is resolved from your repo's git remote.
 - **Node.js 18+** — needed by the installed agent hooks and remote-control scripts (check with `node --version`). Plain MCP tool access is provided by Cursor itself.
 
@@ -95,7 +95,7 @@ edit you make. Add a `devspec` entry to your Cursor MCP config file:
 }
 ```
 
-Use `https://api.devspecstaging.com/api/mcp?tool_namespace=devspec` for staging. This is the plugin's fixed tool view, not a project preference.
+Use `https://api.devspecstaging.com/api/mcp?tool_namespace=devspec` for staging (its Agents page is [app.devspecstaging.com/settings/agents](https://app.devspecstaging.com/settings/agents)). This is the plugin's fixed tool view, not a project preference.
 
 If you have a clone of this repo, the same edit is scripted — it merges into an existing file
 rather than replacing it, and never echoes your token back:
@@ -112,7 +112,7 @@ The config file lives at:
 
 It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp?tool_namespace=devspec` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart `cursor-agent`** afterwards so it picks up the new server.
 
-> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Coding agents**.
+> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other agents, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again on the [Agents page](https://app.devspec.ai/settings/agents).
 
 ## Verify
 
@@ -168,9 +168,9 @@ Use `/devspec.project` for details. Remember and forget show the effective file 
 
 Start Cursor yourself and use `/devspec.remote`, or use DevSpec's Copy command. The agent's normal connection and native resume do not need a launcher.
 
-**DevSpec Launcher is a separate optional application.** Launcher-dependent buttons in DevSpec require an explicit installation; the Coding agents settings explain availability and setup. This plugin does not bundle, install, update or start that app, register its URL handler or create a login service. Native Cursor authentication and connection helpers stay in this plugin.
+**DevSpec Launcher is a separate optional application.** Launcher-dependent buttons in DevSpec require an explicit installation; the [Agents settings page](https://app.devspec.ai/settings/agents) explains availability and setup. This plugin does not bundle, install, update or start that app, register its URL handler or create a login service. Native Cursor authentication and connection helpers stay in this plugin.
 
-A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone installers are not yet published; Coding agents settings will show downloads when they are available.
+A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone installers are not yet published; the [Agents settings page](https://app.devspec.ai/settings/agents) will show downloads when they are available.
 
 ## Contributing
 

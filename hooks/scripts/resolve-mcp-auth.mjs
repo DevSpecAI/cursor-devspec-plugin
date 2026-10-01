@@ -31,14 +31,24 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { agentsPageLinks } from './app-pages.mjs'
 
 const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 const WRONG_TOKEN_RE = /belongs to a different token/i
 
 export const DEFAULT_MCP_URL = DEFAULT_PROD_URL
 
-export const TOKENS_WARNING_FIX =
-  'Open You → Coding agents, reveal the key you want, and make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
+/**
+ * How to settle more than one key: reveal the right one on the Agents page of
+ * the environment(s) those keys belong to, never a fixed production link.
+ */
+export function tokensWarningFix(pairs, opts = {}) {
+  const links = agentsPageLinks((pairs || []).map((pair) => pair?.mcp_url), opts)
+  return (
+    `Open DevSpec's Agents page at ${links} to reveal the key you want, ` +
+    'then make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
+  )
+}
 
 // Captured at load so tests that overwrite HOME/USERPROFILE cannot make a
 // project walk climb into the real ~/.cursor/mcp.json.
@@ -348,7 +358,7 @@ export function distinctTokenPairs(pairs) {
   return out
 }
 
-export function buildTokensWarning(pairs) {
+export function buildTokensWarning(pairs, opts = {}) {
   const tokens = distinctTokenPairs(pairs)
   if (tokens.length < 2) return null
   const named = tokens
@@ -356,7 +366,16 @@ export function buildTokensWarning(pairs) {
     .join(', ')
   return (
     `This machine has more than one DevSpec key: ${named}. ` +
-    `Connect will use the key that owns this connection. ${TOKENS_WARNING_FIX}`
+    `Connect will use the key that owns this connection. ${tokensWarningFix(tokens, opts)}`
+  )
+}
+
+/** Every reachable key was refused by this connection: send the person to the page(s) that hold them. */
+export function noOwningKeyError(pairs, opts = {}) {
+  const links = agentsPageLinks(distinctTokenPairs(pairs).map((pair) => pair.mcp_url), opts)
+  return (
+    'No reachable DevSpec key owns this connection. ' +
+    `Open DevSpec's Agents page at ${links} and make the Cursor MCP key and the project .mcp.json key the same.`
   )
 }
 

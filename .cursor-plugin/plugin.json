@@ -1,7 +1,7 @@
 {
   "name": "devspec-autopilot",
   "description": "Connect Cursor's AI agent to DevSpec — pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.13.35",
+  "version": "0.13.36",
   "author": {
     "name": "DevSpec"
   },
@@ -21,7 +21,7 @@
       "DEVSPEC_MCP_TOKEN": {
         "type": "string",
         "title": "DevSpec token",
-        "description": "Your DevSpec connection key. Create or reveal one in DevSpec under You → Coding agents."
+        "description": "Your DevSpec connection key. Create or reveal one on DevSpec's Agents page: https://app.devspec.ai/settings/agents"
       },
       "DEVSPEC_API_URL": {
         "type": "string",
