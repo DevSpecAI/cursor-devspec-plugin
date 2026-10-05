@@ -70,6 +70,13 @@ export function mergeMcpConfig(existing, { url, token }) {
   return { config, changed: before !== JSON.stringify(entry) }
 }
 
+/**
+ * The plugin's fixed tool view: `devspec__` names, and the two connection-plumbing tools
+ * the model calls itself (offline heartbeat and detach, in devspec.remote-stop). DevSpec
+ * lists only model tools plus the plumbing a host declares here.
+ */
+export const MCP_ENDPOINT_QUERY = '?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection'
+
 export function resolveInputs({ args, env }) {
   const token = (args.token ?? env.DEVSPEC_MCP_TOKEN ?? env.DEVSPEC_TOKEN ?? '').trim()
   const base = (args.apiUrl ?? env.DEVSPEC_API_URL ?? DEFAULT_API_URL).trim().replace(/\/+$/, '')
@@ -82,7 +89,7 @@ export function resolveInputs({ args, env }) {
   if (!/^https?:\/\//.test(base)) {
     throw new Error(`--api-url must be an http(s) URL, got: ${base}`)
   }
-  return { token, url: `${base}/api/mcp?tool_namespace=devspec` }
+  return { token, url: `${base}/api/mcp${MCP_ENDPOINT_QUERY}` }
 }
 
 async function main(argv, env, homedir) {
@@ -105,9 +112,9 @@ async function main(argv, env, homedir) {
   if (args.refresh) {
     const entry = existing?.mcpServers?.[SERVER_KEY]
     if (!entry || typeof entry.url !== 'string') throw new Error('No existing DevSpec HTTP server to refresh. Run normal setup first.')
-    const updated = new URL(entry.url)
-    updated.searchParams.set('tool_namespace', 'devspec')
-    url = updated.toString()
+    // The same address normal setup writes, on the server this entry already uses.
+    const current = new URL(entry.url)
+    url = `${current.origin}${current.pathname}${MCP_ENDPOINT_QUERY}`
     config = structuredClone(existing)
     changed = config.mcpServers[SERVER_KEY].url !== url
     config.mcpServers[SERVER_KEY].url = url

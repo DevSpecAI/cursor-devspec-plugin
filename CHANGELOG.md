@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+DevSpec now shows Cursor only the DevSpec tools it should call. The connection plumbing that the plugin's scripts use (registering, polling, keep-alives, pickup and completion reports) no longer appears in Cursor's tool list. The plugin's server address now also declares the two plumbing tools Cursor calls itself, the offline heartbeat and detach in `devspec.remote-stop`, so those stay available. The remote-control skill no longer offers in-chat fallbacks for registering, attaching or polling when the plugin's scripts are missing; they ship with the plugin, so remote control needs Node.js 18+. Update the installed plugin, run `node scripts/setup-cursor.mjs --refresh` from it so `~/.cursor/mcp.json` gets the new address (credentials and other servers are kept), and restart Cursor.
+
 ## 0.13.36
 
 DevSpec's personal settings page for your token is now the **Agents** page at `/settings/agents`. Instead of naming a path through the menus, the plugin now gives you a link to it. `npm run setup`, the more-than-one-key warning and the "no reachable key owns this connection" error all print the link for the DevSpec environment you're actually connected to: https://app.devspec.ai/settings/agents in production, https://app.devspecstaging.com/settings/agents on staging. If two keys belong to two environments, the warning links both pages. `DEVSPEC_APP_URL` overrides the app host. The README and the token prompt link to the page too, and call the other tools you reuse your token in "agents". How the plugin connects is unchanged. Update the installed plugin and restart Cursor to load this version.

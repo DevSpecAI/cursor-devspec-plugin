@@ -15,14 +15,14 @@ Register **this** local Cursor conversation as a first-class DevSpec **connectio
 
 This is **DevSpec** remote control — distinct from any built-in remote-control feature of your host app.
 
-**Requirement:** the preferred remote-control path needs **Node.js 18+** (`node` on PATH) for the packaged poller scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens. Without Node, use the fallback in-agent poll loop (less reliable).
+**Requirement:** remote control needs **Node.js 18+** (`node` on PATH) for the packaged scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens.
 
 ## Prefer the fast path (read this first)
 
 | Situation | What to do |
 |---|---|
 | **`resolve-local` → `already_live`** | Re-arm wait only (attach only if `--session` changed). |
-| **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers (Axiom `connect_phase`). Fall back to MCP only if helpers are missing. |
+| **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers (Axiom `connect_phase`). |
 
 An optional standalone launcher starts Cursor normally; it does not authenticate or register this connection. Use this installed skill's mechanical Connect helper, just as when Cursor was started manually. The plugin never installs the DevSpec Launcher.
 
@@ -115,15 +115,13 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
   [--session "<uuid>"] [--project "<name-or-id>"] [--launch-id "<launch_id>"]
 ```
 
-Or **register** via the Node-measured helper (emits Axiom `connect_phase`; item 383de0cd). Fall back to MCP only if the helper is missing:
+Or **register** via the Node-measured helper (emits Axiom `connect_phase`; item 383de0cd):
 
 ```bash
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" register \
   --local-id "<local_id>" --project-id "<project_id>" --agent "Cursor" \
   --cwd "$(pwd)" [--git-remote "<url>"] [--codename "<--name>"] [--launch-id "<launch_id>"]
 ```
-
-Or MCP (remote control fallback only): `devspec__register_connection({ project_id, local_id: "<local_id>", agent_name: "Cursor", machine_hostname?, cwd?, name?: "<--name value, only if the user passed one>" })`. This model-visible fallback cannot transport Cursor's hidden per-connection plan capability; remote control still works, but `manage_plan` must fail closed until the Node helper re-registers the bond.
 
 The Node register helper automatically negotiates `connection_capability_version: 1`, retains the raw capability only in a mode-0600 connection file, and never prints it. Do not request, read, paste, or pass that value yourself.
 
@@ -136,7 +134,6 @@ Now handle the session attachment by invocation:
   node "$PLUGIN/hooks/scripts/remote-control-state.mjs" attach \
     --connection-id "<connection_id>" --session "<uuid>" [--launch-id "<launch_id>"]
   ```
-  Or MCP: `devspec__attach_connection({ connection_id, session_id: <uuid> })`.
 - **`--new`** → `devspec__create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Cursor", project_id, title?, initial_message? })`, then attach as above.
 
 Never scan by cwd. Other agents' files under `~/.devspec` are irrelevant.
@@ -348,19 +345,6 @@ Settle a `possible_conflict` yourself when the facts are plain: rule on it via `
 ### 9. Stopping
 
 Prefer **`devspec.remote-stop`** — it detaches + marks the connection offline immediately. Simply exiting Cursor leaves a stale chip briefly (the poller self-terminates on owner death).
-
----
-
-## Fallback only (if poller scripts missing)
-
-If `$PLUGIN/hooks/scripts/devspec-remote-poll.mjs` does not exist, use this **exact** fallback (do not invent another):
-
-1. Keep-alive: `devspec__heartbeat_connection(connection_id, status: "live", agent_name: "Cursor")` — one path, attached or sessionless. If a result flags `status: "not_found"` (the connection was ended), stop.
-2. Poll `devspec__poll_connection({ connection_id, ingress_version: 1, delegated_scope_version: 1, active_plan_projection_version: 1, system_notice_version: 1, sender_style_version: 1 })`. Accept only complete exact-target canonical conversation turns authorized by the served `devspec://product/remote-ingress-contract`; preserve requester provenance and the validated authority/`project_scope` pair. Render delegated server instructions verbatim and do not inject one for owner commands. Treat typed context as advisory and controls as host-only. Handle explicit owner-scoped `automation_dispatch` separately under its typed claim/record instruction.
-3. Acquire requested action items independently: `reserve_work_items` first, then `claim_work_item` in order and follow the served `devspec://product/implementation-contract`. The poll response never delivers action-item work.
-4. Background: short sleep, then re-poll (in Cursor, drive the loop with the `monitor` tool rather than a foreground sleep).
-
-Resolve `mcp_url` from MCP config; never hardcode a server URL. Prefer fixing the plugin path over living in fallback.
 
 ---
 

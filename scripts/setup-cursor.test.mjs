@@ -52,9 +52,9 @@ describe('setup-cursor', () => {
 
   it('selects the host namespace without changing the chosen environment', () => {
     assert.equal(resolveInputs({ args: {}, env: { DEVSPEC_MCP_TOKEN: 'dvs_x' } }).url,
-      'https://api.devspec.ai/api/mcp?tool_namespace=devspec')
+      'https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
     assert.equal(resolveInputs({ args: { apiUrl: 'https://api.devspecstaging.com/' }, env: { DEVSPEC_MCP_TOKEN: 'dvs_x' } }).url,
-      'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec')
+      'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
   })
 
   it('refuses without a token rather than writing a broken config', () => {
@@ -115,7 +115,7 @@ describe('setup-cursor', () => {
       await fs.writeFile(file, JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspecstaging.com/api/mcp', headers }, neighbour: { command: 'unchanged' } } }))
       const { stdout } = await run('node', [SCRIPT, '--refresh', '--home', home])
       const result = JSON.parse(await fs.readFile(file, 'utf8'))
-      assert.equal(result.mcpServers.devspec.url, 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec')
+      assert.equal(result.mcpServers.devspec.url, 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
       assert.deepEqual(result.mcpServers.devspec.headers, headers)
       assert.deepEqual(result.mcpServers.neighbour, { command: 'unchanged' })
       assert.equal(stdout.includes('fixture-secret'), false)
