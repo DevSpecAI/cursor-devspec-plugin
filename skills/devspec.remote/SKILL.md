@@ -258,6 +258,8 @@ Read `~/.devspec/remote-control/connections/<connection_id>.json` and look at `e
 
 **Delivery (one path):** when attached, you post answers via `post_session_message({ connection_id, message })`. On the **final** direct answer also pass **`complete_turn: true`** (and `phase: "answer"` when you set a phase) so Working/dots clear and the trail collapses under Show work in the same request as the bubble (item d4014e58). Mid-turn conversation posts omit `complete_turn` (item 5e7aac1c). Hooks never post assistant **answers** — `UserPromptSubmit` may mirror local_prompt and seed trail only. **Stop** (when IDE hooks fire) clears the local turn marker + trail state, heartbeats `busy:false`, and `report_complete` — same Working clear as wait `--after-reply`. Cursor CLI often never fires Stop; **`--pending --after-reply` after the reply is the required backstop**. A sessionless connection has no room, so never invent a chat post.
 
+**Reaching a person:** writing @ and their name in your answer (`@Brandon`, or `@Brandon Smith`) notifies them, if they are in the room or on the project. Mention someone only when they need to see it.
+
 **Owner attachments:** canonical `metadata` attachments remain stable `resource_id` references with `delivery: "resource"`. Treat the reference as part of the command. `unavailable` commands fail closed before wake. See `devspec://product/remote-ingress-contract`.
 
 ### Shared session plans (attached connections only)
