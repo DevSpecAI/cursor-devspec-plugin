@@ -32,11 +32,13 @@ const HISTORY_OPTIONS = ['--amend', '--reuse-message', '--reedit-message', '--fi
 const MESSAGE_SOURCE_OPTIONS = ['--message', '--file', '--template']
 const CURSOR_COAUTHOR_TRAILER = 'Co-authored-by: Cursor <cursoragent@cursor.com>'
 
-export const AMBIGUOUS_REFERENCE_MESSAGE =
-  'DevSpec commit provenance: this readable commit message has malformed or multiple DevSpec references. Keep exactly one full [devspec:<uuid>] reference and retry. Nothing else is blocked.'
+// A commit may name several items (DevSpec decision ee4102eb, contract 4.13.0,
+// item 96f3dfb7): only a malformed marker is refused, never a second reference.
+export const MALFORMED_REFERENCE_MESSAGE =
+  'DevSpec commit provenance: this readable commit message has a malformed DevSpec reference. Write each one as a full [devspec:<uuid>] and retry. Nothing else is blocked.'
 
 export const MULTIPLE_CLAIMS_MESSAGE =
-  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Keep exactly one correct [devspec:<uuid>] reference in the message and retry. Nothing else is blocked.'
+  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each item this commit delivers and retry. Nothing else is blocked.'
 
 export function unresolvedReferenceMessage(reference) {
   return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
@@ -376,11 +378,12 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
 }
 
 export function inspectReferences(message) {
-  const valid = [...String(message || '').matchAll(VALID_REFERENCE)].map((match) => match[1].toLowerCase())
+  const found = [...String(message || '').matchAll(VALID_REFERENCE)].map((match) => match[1].toLowerCase())
   const starts = [...String(message || '').matchAll(REFERENCE_START)]
   return {
-    valid,
-    malformedOrAmbiguous: starts.length !== valid.length || valid.length > 1,
+    // Repeats of one id are one reference, as the server reads them.
+    valid: [...new Set(found)],
+    malformed: starts.length !== found.length,
   }
 }
 
@@ -388,7 +391,12 @@ export function appendReference(parsed, actionItemId) {
   return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
 }
 
-export async function confirmReferenceOnline(commitMessage, options = {}) {
+/**
+ * Validate a commit message's references online. With one reference the server
+ * answers in `online`; with several it answers per reference in `references`,
+ * and any reference it cannot find is returned in `unresolved`.
+ */
+export async function confirmReferencesOnline(commitMessage, options = {}) {
   const {
     cwd,
     mainWorktree = null,
@@ -405,16 +413,16 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
   try {
     auth = resolveAuth(cwd, { env, mainWorktree })
   } catch {
-    return 'unavailable'
+    return { status: 'unavailable', unresolved: [] }
   }
-  if (!auth?.ok || !auth.token || !auth.mcp_url) return 'unavailable'
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return { status: 'unavailable', unresolved: [] }
 
   const args = { commit_message: commitMessage }
   try {
     const selected = readProjectContext(conversationId, auth.mcp_url, projectHome)
-    if (selected?.status === 'blocked') return 'indeterminate'
+    if (selected?.status === 'blocked') return { status: 'indeterminate', unresolved: [] }
     if (selected?.status === 'selected') args.project_id = selected.project.id
-  } catch { return 'indeterminate' }
+  } catch { return { status: 'indeterminate', unresolved: [] } }
   if (pin?.projectId) args.pinned_project_id = pin.projectId
   const gitRemote = gitRemoteOrigin(cwd)
   if (gitRemote) args.git_remote = gitRemote
@@ -429,13 +437,27 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
       timeoutMs,
     })
   } catch {
-    return 'unavailable'
+    return { status: 'unavailable', unresolved: [] }
   }
 
+  if (Array.isArray(result?.references)) {
+    const statuses = result.references.map((entry) => entry?.online?.status)
+    const unresolved = result.references
+      .filter((entry) => entry?.online?.status === 'not_found' && typeof entry.reference === 'string')
+      .map((entry) => entry.reference)
+    if (unresolved.length > 0) return { status: 'not_found', unresolved }
+    if (statuses.length > 0 && statuses.every((status) => status === 'valid')) return { status: 'valid', unresolved: [] }
+    return { status: 'indeterminate', unresolved: [] }
+  }
   const status = result?.online?.status
-  if (status === 'not_found') return 'not_found'
-  if (status === 'valid') return 'valid'
-  return 'indeterminate'
+  if (status === 'not_found') return { status: 'not_found', unresolved: [] }
+  if (status === 'valid') return { status: 'valid', unresolved: [] }
+  return { status: 'indeterminate', unresolved: [] }
+}
+
+/** The single-verdict form: valid, not_found, unavailable or indeterminate. */
+export async function confirmReferenceOnline(commitMessage, options = {}) {
+  return (await confirmReferencesOnline(commitMessage, options)).status
 }
 
 function toolFields(data) {
@@ -602,10 +624,12 @@ export function handleHook(mode, data, options = {}) {
     const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === projectId)
 
     const refs = inspectReferences(parsed.message)
-    if (refs.valid.length === 1 && !refs.malformedOrAmbiguous) {
-      const reference = refs.valid[0]
+    if (refs.malformed) {
+      return { permission: 'deny', user_message: MALFORMED_REFERENCE_MESSAGE, agent_message: MALFORMED_REFERENCE_MESSAGE }
+    }
+    if (refs.valid.length > 0) {
       const mainWorktree = options.mainWorktree === undefined ? gitMainWorktree(parsed.targetCwd) : options.mainWorktree
-      return confirmReferenceOnline(parsed.message, {
+      return confirmReferencesOnline(parsed.message, {
         cwd: parsed.targetCwd,
         mainWorktree,
         conversationId,
@@ -616,13 +640,10 @@ export function handleHook(mode, data, options = {}) {
         call: options.onlineCall,
         resolveAuth: options.resolveAuth,
       }).then((outcome) => {
-        if (outcome !== 'not_found') return null
-        const message = unresolvedReferenceMessage(reference)
+        if (outcome.status !== 'not_found') return null
+        const message = unresolvedReferenceMessage(outcome.unresolved[0] ?? refs.valid[0])
         return { permission: 'deny', user_message: message, agent_message: message }
       }).catch(() => null)
-    }
-    if (refs.malformedOrAmbiguous) {
-      return { permission: 'deny', user_message: AMBIGUOUS_REFERENCE_MESSAGE, agent_message: AMBIGUOUS_REFERENCE_MESSAGE }
     }
     if (eligibleClaims.length === 0) return null
     if (eligibleClaims.length > 1) {

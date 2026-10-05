@@ -6,7 +6,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
 import {
-  AMBIGUOUS_REFERENCE_MESSAGE,
+  MALFORMED_REFERENCE_MESSAGE,
   MULTIPLE_CLAIMS_MESSAGE,
   ONLINE_REFERENCE_TIMEOUT_MS,
   appendReference,
@@ -19,6 +19,7 @@ import {
   parseMcpExecution,
   parseReadableCommit,
   readConversationState,
+  unresolvedReferenceMessage,
   writeConversationState,
 } from './provenance-assistance.mjs'
 
@@ -154,15 +155,14 @@ describe('readable Cursor commit shapes', () => {
     ]) assert.equal(parseReadableCommit(command, '/workspace'), null, command)
   })
 
-  it('distinguishes one valid full reference from malformed or multiple markers', () => {
-    assert.deepEqual(inspectReferences(`ship [devspec:${ITEM_A}]`), {
-      valid: [ITEM_A],
-      malformedOrAmbiguous: false,
-    })
-    assert.equal(inspectReferences('ship [devspec:aaaaaaaa]').malformedOrAmbiguous, true)
-    assert.equal(inspectReferences(`ship [devspec:${ITEM_A}`).malformedOrAmbiguous, true)
-    assert.equal(inspectReferences(`ship [devspec : ${ITEM_A}]`).malformedOrAmbiguous, true)
-    assert.equal(inspectReferences(`ship [devspec:${ITEM_A}] [devspec:${ITEM_B}]`).malformedOrAmbiguous, true)
+  it('reads every valid full reference and flags only malformed markers', () => {
+    assert.deepEqual(inspectReferences(`ship [devspec:${ITEM_A}]`), { valid: [ITEM_A], malformed: false })
+    assert.equal(inspectReferences('ship [devspec:aaaaaaaa]').malformed, true)
+    assert.equal(inspectReferences(`ship [devspec:${ITEM_A}`).malformed, true)
+    assert.equal(inspectReferences(`ship [devspec : ${ITEM_A}]`).malformed, true)
+    // A commit may name several items (contract 4.13.0, item 96f3dfb7); a repeat is one.
+    assert.deepEqual(inspectReferences(`ship [devspec:${ITEM_A}] [devspec:${ITEM_B}]`), { valid: [ITEM_A, ITEM_B], malformed: false })
+    assert.deepEqual(inspectReferences(`ship [devspec:${ITEM_A}] [devspec:${ITEM_A}]`), { valid: [ITEM_A], malformed: false })
   })
 })
 
@@ -338,6 +338,32 @@ describe('online reference confirmation', () => {
     }), null)
   })
 
+  it('lets a commit naming several valid items through, and refuses one that names an unknown item', async () => {
+    const { home, repo } = gitPinnedRepo()
+    const stateRoot = tempRoot()
+    const message = `git commit -m 'ship [devspec:${ITEM_A}] [devspec:${ITEM_B}]'`
+    const options = (references) => ({
+      home, repoRoot: repo, mainWorktree: repo,
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }),
+      onlineCall: async () => ({ references }),
+    })
+    assert.equal(await pre(message, repo, stateRoot, options([
+      { reference: ITEM_A, online: { status: 'valid' } },
+      { reference: ITEM_B, online: { status: 'valid' } },
+    ])), null)
+    const refused = await pre(message, repo, stateRoot, options([
+      { reference: ITEM_A, online: { status: 'valid' } },
+      { reference: ITEM_B, online: { status: 'not_found' } },
+    ]))
+    assert.equal(refused?.permission, 'deny')
+    assert.equal(refused?.agent_message, unresolvedReferenceMessage(ITEM_B))
+    // An undecided reference fails open, as a single one does.
+    assert.equal(await pre(message, repo, stateRoot, options([
+      { reference: ITEM_A, online: { status: 'valid' } },
+      { reference: ITEM_B, online: { status: 'unavailable' } },
+    ])), null)
+  })
+
   it('makes no online call without credentials, without a reference, or while stamping', async () => {
     const { home, repo } = gitPinnedRepo()
     const stateRoot = tempRoot()
@@ -437,7 +463,7 @@ describe('claim observation and commit decisions', () => {
 
     const malformed = pre("git commit -m 'ship [devspec:short]'", repo, stateRoot, { home, repoRoot: repo })
     assert.equal(malformed?.permission, 'deny')
-    assert.equal(malformed?.agent_message, AMBIGUOUS_REFERENCE_MESSAGE)
+    assert.equal(malformed?.agent_message, MALFORMED_REFERENCE_MESSAGE)
   })
 
   it('fails open for opaque shell and marker-less folders even with a claim', () => {

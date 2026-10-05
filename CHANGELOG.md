@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.3
+
+A commit may name more than one DevSpec item. The commit check no longer refuses a message carrying several valid `[devspec:<uuid>]` references; it checks each one and refuses only a reference that doesn't exist in the project, naming it. A malformed reference is still refused. Update the installed plugin to pick this up.
+
 ## 0.14.2
 
 DevSpec now works out for itself whether an agent's work was unattended, so the remote-control guidance no longer tells Cursor to leave out a setting that no longer exists. Update the installed plugin to pick this up.
