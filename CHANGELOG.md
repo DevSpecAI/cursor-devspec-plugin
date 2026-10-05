@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.2
+
+DevSpec now works out for itself whether an agent's work was unattended, so the remote-control guidance no longer tells Cursor to leave out a setting that no longer exists. Update the installed plugin to pick this up.
+
 ## 0.14.1
 
 The remote-control guidance now tells Cursor that writing @ and a person's name in an answer in a DevSpec room notifies that person, if they are in the room or on the project. Update the installed plugin and restart Cursor to load this version.
