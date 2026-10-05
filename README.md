@@ -2,7 +2,7 @@
 
 **Build on your team’s best thinking.**
 
-[DevSpec](https://devspec.ai) helps your team and AI agents turn ideas and experience into better software.
+[DevSpec](https://devspec.ai) is where your team, your knowledge and your agents build software together, made for AI-native development from the ground up.
 
 Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the terminal. This plugin connects Cursor's agent to your DevSpec account over MCP so it can pull that work into the chat, do it, and record what it did — all tracked in DevSpec.
 
