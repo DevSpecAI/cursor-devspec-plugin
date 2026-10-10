@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.4
+
+Cursor now tells DevSpec which model it is running, so its card on the Agents page shows the model (and the effort setting, when Cursor reports one) even when it is not in a session. It updates each time you send a prompt. Update the installed plugin and restart Cursor to pick this up.
+
 ## 0.14.3
 
 A commit may name more than one DevSpec item. The commit check no longer refuses a message carrying several valid `[devspec:<uuid>]` references; it checks each one and refuses only a reference that doesn't exist in the project, naming it. A malformed reference is still refused. Update the installed plugin to pick this up.

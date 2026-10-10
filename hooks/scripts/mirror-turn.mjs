@@ -32,6 +32,7 @@ import {
 } from './interaction-events.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
+import { recordRuntimeReport } from './agent-telemetry.mjs'
 
 const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
@@ -374,6 +375,8 @@ async function main() {
   const connectionId = state.connection_id
   const sessionId = state.session_id || null // null = sessionless (no room to mirror into)
   const localId = state.local_id || null
+  // The model Cursor says this turn runs, for the Agents page (item cc47378e).
+  recordRuntimeReport(connectionId, raw)
 
   const text = extractLastText(raw, mode)
   const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || isHarnessInjection(text))

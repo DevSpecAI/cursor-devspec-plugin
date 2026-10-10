@@ -98,6 +98,7 @@ import {
   automationAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
+import { agentStatsArgs } from './agent-telemetry.mjs'
 import {
   buildActiveSessionPlanGuidance,
   clearConnectionCapability,
@@ -1163,6 +1164,8 @@ async function main() {
         }),
         ...(busy !== null && busy !== undefined ? { busy } : {}),
         ...(checkTier ? { check_tier: checkTier } : {}),
+        // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
+        ...agentStatsArgs(connectionId),
       },
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
