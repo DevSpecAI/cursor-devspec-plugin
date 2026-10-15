@@ -527,8 +527,8 @@ function hasOuterFailure(result) {
   const status = normalizeStatus(result?.status)
   return !result || result.success === false || result.ok === false || result.isError === true ||
     result.claim_success === false || result.claimed === false || result.not_claimed === true ||
-    Boolean(result.error) || Boolean(result.conflict) || Boolean(result.possible_conflict) ||
-    ['error', 'failure', 'conflict', 'possible_conflict', 'not_claimed', 'unclaimed'].includes(status)
+    Boolean(result.error) || Boolean(result.conflict) ||
+    ['error', 'failure', 'conflict', 'not_claimed', 'unclaimed'].includes(status)
 }
 
 export function parseMcpExecution(data) {

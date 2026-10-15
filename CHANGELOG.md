@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.5
+
+The remote-control guidance no longer describes DevSpec's retired conflict flags. It used to tell Cursor to rule on a `possible_conflict` with `resolve_action_item_conflict` and to preview rulings with `preview_conflict_resolution`; DevSpec removed all three, so an agent following it called tools that no longer exist. When one item replaces another, Cursor now previews it with `preview_supersession` and then calls `supersede_action_item`, asking first when the item that would close is someone else's work or the person has not shown they understand what would close. A memory or document flagged as possibly out of date is answered by fixing the record, or by saying it is still accurate. Whether either commits or is queued stays the served contract's decision. The commit check no longer looks for a `possible_conflict` field the server never sends. Update the installed plugin and restart Cursor to load this version.
+
 ## 0.14.4
 
 Cursor now tells DevSpec which model it is running, so its card on the Agents page shows the model (and the effort setting, when Cursor reports one) even when it is not in a session. It updates each time you send a prompt. Update the installed plugin and restart Cursor to pick this up.
