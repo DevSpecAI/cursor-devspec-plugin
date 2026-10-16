@@ -5,9 +5,12 @@
  * Run: node --test hooks/scripts/mcp-call.test.mjs
  */
 import assert from 'node:assert/strict'
+import http from 'node:http'
+import { readFileSync } from 'node:fs'
 import { describe, it } from 'node:test'
 import {
   DEFAULT_MCP_CALL_TIMEOUT_MS,
+  mcpToolsCall,
   mcpRequestHeaders,
   readServerFailure,
   isRetryableHttpFailure,
@@ -28,6 +31,48 @@ describe('connection capability header', () => {
       mcpRequestHeaders({ token: 'dvs_token', connectionCapability: 'dvsc_hidden' })['X-DevSpec-Connection-Capability'],
       'dvsc_hidden',
     )
+  })
+})
+
+/**
+ * x-devspec-plugin on the wire (item f6566758). Every script's DevSpec request goes
+ * through mcpToolsCall, so a real socket receiving it is the closest check short of
+ * the server recording the header (DevSpec item 2295e089 builds that).
+ */
+describe('x-devspec-plugin header', () => {
+  const version = JSON.parse(readFileSync(new URL('../../.cursor-plugin/plugin.json', import.meta.url), 'utf8')).version
+
+  it('names this plugin and its manifest version on every request, beside the capability header', () => {
+    assert.equal(mcpRequestHeaders({ token: 'dvs_token' })['x-devspec-plugin'], `cursor/${version}`)
+    const bound = mcpRequestHeaders({ token: 'dvs_token', connectionCapability: 'dvsc_hidden' })
+    assert.equal(bound['x-devspec-plugin'], `cursor/${version}`)
+    assert.equal(bound['X-DevSpec-Connection-Capability'], 'dvsc_hidden')
+  })
+
+  it('reaches the server on a real socket for plain, connection and capability-bound calls', async () => {
+    const seen = []
+    const server = http.createServer(async (req, res) => {
+      let body = ''
+      for await (const chunk of req) body += chunk
+      seen.push({ tool: JSON.parse(body).params.name, plugin: req.headers['x-devspec-plugin'], capability: req.headers['x-devspec-connection-capability'] ?? null })
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }))
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    try {
+      await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_action_item', arguments: {} })
+      await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'register_connection', arguments: { connection_id: 'c' } })
+      await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'poll_connection', arguments: { connection_id: 'c' }, connectionCapability: 'dvsc_fixture', timeoutMs: 5_000 })
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+    assert.deepEqual(seen, [
+      { tool: 'get_action_item', plugin: `cursor/${version}`, capability: null },
+      { tool: 'register_connection', plugin: `cursor/${version}`, capability: null },
+      { tool: 'poll_connection', plugin: `cursor/${version}`, capability: 'dvsc_fixture' },
+    ])
   })
 })
 

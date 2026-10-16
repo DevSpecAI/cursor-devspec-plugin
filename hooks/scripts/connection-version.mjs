@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { PLUGIN_ID } from './agent-identity.mjs'
 
 const label = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._+\/-]{0,63}$/.test(value) ? value : undefined
 function pluginVersion() {
@@ -10,6 +11,24 @@ function pluginVersion() {
 }
 
 export const LOADED_PLUGIN_VERSION = pluginVersion()
+
+/**
+ * DevSpec tells plugins apart by `x-devspec-plugin: <id>/<version>` on every MCP
+ * request (ADR "Protecting intent" §14; contract on DevSpec item 2295e089). It
+ * identifies the plugin and unlocks nothing. The version is this artifact's own
+ * manifest, read once at load like plugin_version above, so the header can never
+ * name a release other than the one running (item f6566758). An unreadable
+ * manifest sends no header rather than a malformed one.
+ */
+export const PLUGIN_HEADER = 'x-devspec-plugin'
+export function pluginHeaderValue(version = LOADED_PLUGIN_VERSION) {
+  const checked = label(version)
+  return checked && !checked.includes('/') ? `${PLUGIN_ID}/${checked}` : undefined
+}
+export function pluginHeaders(version = LOADED_PLUGIN_VERSION) {
+  const value = pluginHeaderValue(version)
+  return value ? { [PLUGIN_HEADER]: value } : {}
+}
 // Cursor documents this own-host variable for hook processes. If a separately
 // launched helper does not inherit it, host version remains unknown.
 const LOADED_HOST_VERSION = label(process.env.CURSOR_VERSION)

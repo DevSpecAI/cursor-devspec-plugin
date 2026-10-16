@@ -6,12 +6,16 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
-import { mergeMcpConfig, resolveInputs, fingerprint, parseArgs } from './setup-cursor.mjs'
+import { mergeMcpConfig, refreshMcpEntry, resolveInputs, fingerprint, parseArgs } from './setup-cursor.mjs'
+import { readFileSync } from 'node:fs'
 
 const run = promisify(execFile)
 // fileURLToPath, not .pathname: this repo lives under a directory with a space
 // in it, and .pathname hands back %20 which node cannot resolve.
 const SCRIPT = fileURLToPath(new URL('./setup-cursor.mjs', import.meta.url))
+// The released version, from the manifest the script itself reads (item f6566758).
+const PLUGIN_VERSION = JSON.parse(readFileSync(new URL('../.cursor-plugin/plugin.json', import.meta.url), 'utf8')).version
+const IDENTIFICATION = `cursor/${PLUGIN_VERSION}`
 
 const withHome = async (fn) => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'devspec-setup-'))
@@ -27,6 +31,27 @@ describe('setup-cursor', () => {
     const { config } = mergeMcpConfig(null, { url: 'https://api.devspec.ai/api/mcp', token: 'dvs_abc' })
     assert.equal(config.mcpServers.devspec.url, 'https://api.devspec.ai/api/mcp')
     assert.equal(config.mcpServers.devspec.headers.Authorization, 'Bearer dvs_abc')
+  })
+
+  it("makes Cursor's own MCP client name this plugin and its manifest version", () => {
+    const { config } = mergeMcpConfig(null, { url: 'https://api.devspec.ai/api/mcp', token: 'dvs_abc' })
+    assert.equal(config.mcpServers.devspec.headers['x-devspec-plugin'], IDENTIFICATION)
+  })
+
+  it('refresh moves the header to the running version and keeps every other header', () => {
+    const existing = { url: 'https://old/api/mcp', headers: { Authorization: 'Bearer kept', 'X-Keep': '1', 'x-devspec-plugin': 'cursor/0.0.1' } }
+    const { entry, changed } = refreshMcpEntry(existing, { url: 'https://new/api/mcp' })
+    assert.equal(changed, true)
+    assert.deepEqual(entry.headers, { Authorization: 'Bearer kept', 'X-Keep': '1', 'x-devspec-plugin': IDENTIFICATION })
+    assert.equal(existing.headers['x-devspec-plugin'], 'cursor/0.0.1', 'the parsed file is not mutated in place')
+    assert.equal(refreshMcpEntry(entry, { url: 'https://new/api/mcp' }).changed, false)
+  })
+
+  it('without a readable manifest version it writes no identification rather than a malformed one', () => {
+    const { config } = mergeMcpConfig(null, { url: 'https://u/api/mcp', token: 'dvs_abc', identification: {} })
+    assert.equal(config.mcpServers.devspec.headers['x-devspec-plugin'], undefined)
+    const { entry } = refreshMcpEntry({ url: 'https://u/api/mcp', headers: { Authorization: 'Bearer t' } }, { url: 'https://u/api/mcp', identification: {} })
+    assert.deepEqual(entry.headers, { Authorization: 'Bearer t' })
   })
 
   it('leaves other servers and other headers alone', () => {
@@ -101,13 +126,15 @@ describe('setup-cursor', () => {
       const { stdout } = await run('node', [SCRIPT, '--token', 'dvs_endtoendtokenvalue', '--home', home])
       const written = JSON.parse(await fs.readFile(path.join(home, '.cursor', 'mcp.json'), 'utf8'))
       assert.equal(written.mcpServers.devspec.headers.Authorization, 'Bearer dvs_endtoendtokenvalue')
+      assert.equal(written.mcpServers.devspec.headers['x-devspec-plugin'], IDENTIFICATION)
+      assert.match(stdout, new RegExp(`plugin: ${IDENTIFICATION.replaceAll('.', '\\.')}`))
       assert.equal(written.mcpServers.neighbour.url, 'https://n/mcp')
       assert.equal(stdout.includes('endtoendtokenvalue'), false)
       assert.match(stdout, /left alone: neighbour/)
     })
   })
 
-  it('refreshes an existing server without a token argument or touching credentials/neighbours', async () => {
+  it('refreshes an existing server without a token argument or touching credentials/neighbours, and names this plugin version', async () => {
     await withHome(async (home) => {
       await fs.mkdir(path.join(home, '.cursor'), { recursive: true })
       const file = path.join(home, '.cursor', 'mcp.json')
@@ -116,7 +143,7 @@ describe('setup-cursor', () => {
       const { stdout } = await run('node', [SCRIPT, '--refresh', '--home', home])
       const result = JSON.parse(await fs.readFile(file, 'utf8'))
       assert.equal(result.mcpServers.devspec.url, 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
-      assert.deepEqual(result.mcpServers.devspec.headers, headers)
+      assert.deepEqual(result.mcpServers.devspec.headers, { ...headers, 'x-devspec-plugin': IDENTIFICATION })
       assert.deepEqual(result.mcpServers.neighbour, { command: 'unchanged' })
       assert.equal(stdout.includes('fixture-secret'), false)
     })

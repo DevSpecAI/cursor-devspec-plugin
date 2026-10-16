@@ -5,7 +5,7 @@ import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, symlinkSync, rmSyn
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { LOADED_PLUGIN_VERSION, connectionVersions, connectionVersionHook } from './connection-version.mjs'
+import { LOADED_PLUGIN_VERSION, PLUGIN_HEADER, connectionVersions, connectionVersionHook, pluginHeaderValue, pluginHeaders } from './connection-version.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -16,6 +16,17 @@ test('package, plugin, marketplace and executing reporter agree', () => {
   assert.equal(LOADED_PLUGIN_VERSION, version)
   assert.equal(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version, version)
   assert.equal(JSON.parse(readFileSync(join(root, '.cursor-plugin/marketplace.json'), 'utf8')).plugins[0].version, version)
+  // JSON cannot read the manifest, so the plugin's own MCP config carries the one
+  // literal copy of the header; this is what stops a version bump leaving it behind.
+  assert.equal(JSON.parse(readFileSync(join(root, 'mcp.json'), 'utf8')).mcpServers.devspec.headers[PLUGIN_HEADER], `cursor/${version}`)
+})
+test('the x-devspec-plugin header is cursor/<the loaded manifest version>, or absent', () => {
+  assert.equal(PLUGIN_HEADER, 'x-devspec-plugin')
+  assert.equal(pluginHeaderValue(), `cursor/${version}`)
+  assert.deepEqual(pluginHeaders(), { 'x-devspec-plugin': `cursor/${version}` })
+  assert.equal(pluginHeaderValue('1.2.3-rc.1'), 'cursor/1.2.3-rc.1')
+  // <id>/<version> must stay one split: an unreadable or slash-bearing version sends nothing.
+  for (const bad of [null, '', 'has space', 'a/b', '../1']) assert.deepEqual(pluginHeaders(bad), {}, String(bad))
 })
 test('internal MCP register/attach requests report the artifact without changing scope', async () => {
   const original = globalThis.fetch
@@ -62,6 +73,8 @@ test('a commit-keyed cache/junction reads its own artifact and keeps the loaded 
     writeFileSync(manifest, JSON.stringify({ name: 'devspec-autopilot', version: '1.2.3' }))
     const script = join(artifact, 'hooks/scripts/connection-version.mjs')
     writeFileSync(script, readFileSync(join(here, 'connection-version.mjs')))
+    // Its one import: the plugin id for the x-devspec-plugin header.
+    writeFileSync(join(artifact, 'hooks/scripts/agent-identity.mjs'), readFileSync(join(here, 'agent-identity.mjs')))
     const linked = join(temp, 'junction')
     symlinkSync(artifact, linked, 'junction')
     const linkedScript = join(linked, 'hooks/scripts/connection-version.mjs')
@@ -72,5 +85,17 @@ test('a commit-keyed cache/junction reads its own artifact and keeps the loaded 
     writeFileSync(manifest, JSON.stringify({ name: 'devspec-autopilot', version: '9.9.9' }))
     assert.equal(loaded.connectionVersions().plugin_version, '1.2.3')
     assert.equal(execFileSync(process.execPath, [linkedScript], { input: 'invalid JSON', encoding: 'utf8' }), '')
+  } finally { rmSync(temp, { recursive: true, force: true }) }
+})
+test('a commit-keyed cache reports its own manifest version in the header', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'cursor-header-artifact-'))
+  try {
+    const artifact = join(temp, 'cache/devspec/fixture-sha')
+    mkdirSync(join(artifact, '.cursor-plugin'), { recursive: true })
+    mkdirSync(join(artifact, 'hooks/scripts'), { recursive: true })
+    writeFileSync(join(artifact, '.cursor-plugin/plugin.json'), JSON.stringify({ name: 'devspec-autopilot', version: '4.5.6' }))
+    for (const file of ['connection-version.mjs', 'agent-identity.mjs']) writeFileSync(join(artifact, 'hooks/scripts', file), readFileSync(join(here, file)))
+    const loaded = await import(pathToFileURL(join(artifact, 'hooks/scripts/connection-version.mjs')).href)
+    assert.deepEqual(loaded.pluginHeaders(), { 'x-devspec-plugin': 'cursor/4.5.6' })
   } finally { rmSync(temp, { recursive: true, force: true }) }
 })

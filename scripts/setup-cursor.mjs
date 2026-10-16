@@ -12,6 +12,12 @@
  * The shape written here is the shape hooks/scripts/resolve-mcp-auth.mjs
  * reads: mcpServers.devspec = { url, headers.Authorization = "Bearer …" }.
  *
+ * It also writes `x-devspec-plugin: cursor/<version>` into that entry's headers,
+ * so Cursor's own MCP client says which plugin it is on every request, as the
+ * plugin's scripts do (item f6566758). The version is the running plugin's
+ * manifest; --refresh after an update rewrites it with the URL, and never
+ * touches the credentials.
+ *
  *   node scripts/setup-cursor.mjs --token dvs_…
  *   node scripts/setup-cursor.mjs --token dvs_… --api-url https://api.devspecstaging.com
  *   DEVSPEC_MCP_TOKEN=dvs_… node scripts/setup-cursor.mjs
@@ -23,6 +29,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { agentsPageUrl } from '../hooks/scripts/app-pages.mjs'
+import { PLUGIN_HEADER, pluginHeaders } from '../hooks/scripts/connection-version.mjs'
 
 const DEFAULT_API_URL = 'https://api.devspec.ai'
 const SERVER_KEY = 'devspec'
@@ -52,7 +59,7 @@ export function fingerprint(token) {
  * Returns { config, changed } so a re-run can say "already correct" rather
  * than rewriting a file and claiming it did something.
  */
-export function mergeMcpConfig(existing, { url, token }) {
+export function mergeMcpConfig(existing, { url, token, identification = pluginHeaders() }) {
   const config =
     existing && typeof existing === 'object' && !Array.isArray(existing)
       ? structuredClone(existing)
@@ -64,10 +71,23 @@ export function mergeMcpConfig(existing, { url, token }) {
   const before = JSON.stringify(servers[SERVER_KEY] ?? null)
   const entry = structuredClone(servers[SERVER_KEY] ?? {})
   entry.url = url
-  entry.headers = { ...(entry.headers ?? {}), Authorization: `Bearer ${token}` }
+  entry.headers = { ...(entry.headers ?? {}), Authorization: `Bearer ${token}`, ...identification }
   servers[SERVER_KEY] = entry
   config.mcpServers = servers
   return { config, changed: before !== JSON.stringify(entry) }
+}
+
+/**
+ * --refresh after a plugin update: the current address and this plugin's
+ * identification header, with every other header (the credentials included) kept
+ * exactly as it was. Exported for tests.
+ */
+export function refreshMcpEntry(existing, { url, identification = pluginHeaders() }) {
+  const entry = structuredClone(existing)
+  const before = JSON.stringify(entry)
+  entry.url = url
+  if (Object.keys(identification).length) entry.headers = { ...(entry.headers ?? {}), ...identification }
+  return { entry, changed: before !== JSON.stringify(entry) }
 }
 
 /**
@@ -116,8 +136,9 @@ async function main(argv, env, homedir) {
     const current = new URL(entry.url)
     url = `${current.origin}${current.pathname}${MCP_ENDPOINT_QUERY}`
     config = structuredClone(existing)
-    changed = config.mcpServers[SERVER_KEY].url !== url
-    config.mcpServers[SERVER_KEY].url = url
+    const refreshed = refreshMcpEntry(config.mcpServers[SERVER_KEY], { url })
+    changed = refreshed.changed
+    config.mcpServers[SERVER_KEY] = refreshed.entry
   } else {
     ({ token, url } = resolveInputs({ args, env }))
     ;({ config, changed } = mergeMcpConfig(existing, { url, token }))
@@ -128,6 +149,8 @@ async function main(argv, env, homedir) {
   const others = Object.keys(config.mcpServers).filter((k) => k !== SERVER_KEY)
   console.log(`${changed ? 'Registered' : 'Already registered'} DevSpec MCP in ${file}`)
   console.log(`  url:   ${url}`)
+  const identification = config.mcpServers[SERVER_KEY].headers?.[PLUGIN_HEADER]
+  if (identification) console.log(`  plugin: ${identification}`)
   console.log(args.refresh ? '  credentials: preserved unchanged' : `  token: ${fingerprint(token)}`)
   if (others.length) console.log(`  left alone: ${others.join(', ')}`)
   console.log('\nRestart cursor-agent so it picks up the server.')

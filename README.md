@@ -89,7 +89,10 @@ edit you make. Add a `devspec` entry to your Cursor MCP config file:
   "mcpServers": {
     "devspec": {
       "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
-      "headers": { "Authorization": "Bearer dvs_your_token_here" }
+      "headers": {
+        "Authorization": "Bearer dvs_your_token_here",
+        "x-devspec-plugin": "cursor/<plugin version>"
+      }
     }
   }
 }
@@ -110,7 +113,7 @@ The config file lives at:
 - **macOS / Linux:** `~/.cursor/mcp.json`
 - **Windows:** `%USERPROFILE%\.cursor\mcp.json`
 
-It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart `cursor-agent`** afterwards so it picks up the new server.
+It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. It also sends `x-devspec-plugin: cursor/<plugin version>`, which tells DevSpec the DevSpec plugin for Cursor is installed and which version; if you write the entry by hand, use the version `/plugins` shows. The script fills it in for you. **Restart `cursor-agent`** afterwards so it picks up the new server.
 
 > **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other agents, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again on the [Agents page](https://app.devspec.ai/settings/agents).
 
@@ -162,7 +165,7 @@ For an explicit choice, use `/devspec.remote --project "Project name"` or a full
 
 Use `/devspec.project` for details. Remember and forget show the effective file and require separate confirmation; existing conversations stay on their project. Removing a local pin can reveal an inherited default, so check the resulting details. Switching projects requires a fresh native Cursor chat, not the old chat's history. The helper returns a verified bare-Cursor command to run in a new terminal and the first project-selection message to send there. It does not launch the chat or change the old one. If your Cursor executable is not discoverable, supply its real path with `--cursor-bin`; never substitute another host's generic `agent` command.
 
-**After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the plugin's tool view (the `devspec__` namespace, plus the two plumbing tools Cursor calls itself), preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
+**After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the plugin's tool view (the `devspec__` namespace, plus the two plumbing tools Cursor calls itself) and the `x-devspec-plugin` header to the version you just installed, preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
 
 ## Optional launching from DevSpec
 

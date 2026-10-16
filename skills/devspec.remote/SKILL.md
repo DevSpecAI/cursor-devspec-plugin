@@ -7,7 +7,7 @@ description: Connect this Cursor agent to DevSpec as a first-class agent connect
 
 Use the installed Node helper below. Do not add a list-projects preflight to an already-resolving connect. The server ranks remote and folder-pin facts; only an explicit name choice needs discovery. Use the DevSpec tool names actually advertised by Cursor—transport names can be namespaced, so do not invent a prefix.
 
-Once you have resolved `PLUGIN` below, after updating this plugin refresh the existing DevSpec MCP entry with `node "$PLUGIN/scripts/setup-cursor.mjs" --refresh` and restart Cursor so it loads the namespaced tool catalogue. This preserves the configured credentials and other servers; it is setup, never a per-project or per-conversation preference.
+Once you have resolved `PLUGIN` below, after updating this plugin refresh the existing DevSpec MCP entry with `node "$PLUGIN/scripts/setup-cursor.mjs" --refresh` and restart Cursor so it loads the namespaced tool catalogue and tells DevSpec the plugin version it now runs. This preserves the configured credentials and other servers; it is setup, never a per-project or per-conversation preference.
 
 # DevSpec Remote Control (connection-native)
 

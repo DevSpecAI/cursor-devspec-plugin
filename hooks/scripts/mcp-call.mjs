@@ -18,7 +18,7 @@
  * must pass an explicit timeout above the server hold.
  */
 
-import { versionedConnectionArguments } from './connection-version.mjs'
+import { pluginHeaders, versionedConnectionArguments } from './connection-version.mjs'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { activeDiagnostics, appendDiagnostic } from './local-diagnostics.mjs'
@@ -27,11 +27,18 @@ import { classifyProgressFailure } from './progress-diagnostics.mjs'
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
 
+/**
+ * Every MCP request the plugin's own scripts make (poller, wait, mirror-turn,
+ * connect, plan/question bridges, trail) goes through here, so this is where they
+ * all say which plugin they are. Cursor's own MCP client sends the same header from
+ * ~/.cursor/mcp.json, which scripts/setup-cursor.mjs writes (item f6566758).
+ */
 export function mcpRequestHeaders({ token, connectionCapability = null }) {
   return {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    ...pluginHeaders(),
     ...(typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_')
       ? { 'X-DevSpec-Connection-Capability': connectionCapability }
       : {}),

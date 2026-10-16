@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.0
+
+Cursor now tells DevSpec it is running the DevSpec plugin, and which version, on every request it makes to DevSpec: Cursor's own MCP connection and the plugin's background scripts (remote control, turn mirroring, the work trail, session plans and questions) all send `x-devspec-plugin: cursor/0.15.0`. DevSpec uses it to recognise agents that have the plugin installed; it changes nothing you can do today. The version always comes from the installed plugin. After updating, run `node scripts/setup-cursor.mjs --refresh` from the installed plugin so `~/.cursor/mcp.json` sends it too (your credentials and other servers are kept), then restart Cursor. Running `setup-cursor.mjs` for the first time writes it for you.
+
 ## 0.14.5
 
 The remote-control guidance no longer describes DevSpec's retired conflict flags. It used to tell Cursor to rule on a `possible_conflict` with `resolve_action_item_conflict` and to preview rulings with `preview_conflict_resolution`; DevSpec removed all three, so an agent following it called tools that no longer exist. When one item replaces another, Cursor now previews it with `preview_supersession` and then calls `supersede_action_item`, asking first when the item that would close is someone else's work or the person has not shown they understand what would close. A memory or document flagged as possibly out of date is answered by fixing the record, or by saying it is still accurate. Whether either commits or is queued stays the served contract's decision. The commit check no longer looks for a `possible_conflict` field the server never sends. Update the installed plugin and restart Cursor to load this version.

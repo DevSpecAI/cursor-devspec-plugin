@@ -3,7 +3,8 @@
     "devspec": {
       "url": "${DEVSPEC_API_URL}/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
-        "Authorization": "Bearer ${DEVSPEC_MCP_TOKEN}"
+        "Authorization": "Bearer ${DEVSPEC_MCP_TOKEN}",
+        "x-devspec-plugin": "cursor/0.15.0"
       }
     }
   }

@@ -33,6 +33,6 @@ Ask for explicit confirmation. Only after a yes, repeat with `--confirm --expect
 
 ## Runtime requirements
 
-The complete flow uses Node 18+ and the installed Cursor plugin. Refresh the existing DevSpec MCP entry with `node "$PLUGIN/scripts/setup-cursor.mjs" --refresh`, preserving its credentials, then restart Cursor after updating. The namespaced MCP catalogue lets the native input hook identify DevSpec calls without guessing; the server-aware send guard checks the actual destination. Never disable either guard to get past a project mismatch. Other MCP servers remain independent.
+The complete flow uses Node 18+ and the installed Cursor plugin. Refresh the existing DevSpec MCP entry with `node "$PLUGIN/scripts/setup-cursor.mjs" --refresh`, preserving its credentials and updating the plugin version it reports, then restart Cursor after updating. The namespaced MCP catalogue lets the native input hook identify DevSpec calls without guessing; the server-aware send guard checks the actual destination. Never disable either guard to get past a project mismatch. Other MCP servers remain independent.
 
 Non-interactive helpers return actionable choices or errors; they never wait for keyboard input or silently choose a fallback project.
