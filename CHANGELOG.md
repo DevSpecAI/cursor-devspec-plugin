@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1
+
+When Cursor has several independent choices for the same person, it now asks them together instead of one at a time, so they can be answered in one sitting and in any order. A question that depends on an earlier answer still waits for that answer.
+
 ## 0.15.0
 
 Cursor now tells DevSpec it is running the DevSpec plugin, and which version, on every request it makes to DevSpec: Cursor's own MCP connection and the plugin's background scripts (remote control, turn mirroring, the work trail, session plans and questions) all send `x-devspec-plugin: cursor/0.15.0`. DevSpec uses it to recognise agents that have the plugin installed; it changes nothing you can do today. The version always comes from the installed plugin. After updating, run `node scripts/setup-cursor.mjs --refresh` from the installed plugin so `~/.cursor/mcp.json` sends it too (your credentials and other servers are kept), then restart Cursor. Running `setup-cursor.mjs` for the first time writes it for you.

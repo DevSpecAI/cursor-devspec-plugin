@@ -279,7 +279,7 @@ An active own plan must be continued, completed, explicitly left for supported h
 
 ### Asking one person a question (attached connections only)
 
-Ask the driver when a decision is genuinely theirs: an unresolved choice, an authority boundary, a fork where two readings lead to materially different work. Anything the recorded intent, the acceptance criteria or the served contracts settle is yours to get on with, as is anything you could go and observe — a question is never a way to hand judgement work back. Ask one at a time.
+Ask the driver when a decision is genuinely theirs: an unresolved choice, an authority boundary, a fork where two readings lead to materially different work. Anything the recorded intent, the acceptance criteria or the served contracts settle is yours to get on with, as is anything you could go and observe — a question is never a way to hand judgement work back. Ask independent choices for the same person together rather than one per turn, so they answer in one sitting and in any order; a question that depends on an earlier answer waits until that answer arrives.
 
 Same bridge shape as plans, because the server requires the same per-conversation capability:
 
@@ -288,7 +288,7 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-question describe
 printf '%s' '<one JSON object matching the described schema>' | node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-question use
 ```
 
-`create` needs a fresh UUID `client_request_id` per question — reusing one retries that same question rather than asking a new one. `response_kind` is `text`, `single_select` or `multi_select`; a select kind needs at least two distinct choices and `allow_custom` is on by default — they can always write their own answer. Pass `allow_custom: false` only when the choices must be strictly constrained. `list`/`get`/`cancel` reach only your own questions. Never pass connection, capability or identity arguments. The server ends Working; do not poll or sit in a loop. Pass keep_turn true only if you still have work.
+`create` needs a fresh UUID `client_request_id` per question — reusing one retries that same question rather than asking a new one. `response_kind` is `text`, `single_select` or `multi_select`; a select kind needs at least two distinct choices and `allow_custom` is on by default — they can always write their own answer. Pass `allow_custom: false` only when the choices must be strictly constrained. `list`/`get`/`cancel` reach only your own questions. Never pass connection, capability or identity arguments. The server ends Working; do not poll or sit in a loop. Pass keep_turn true only if you still have work, or on every question of a batch but the last. Each answer arrives as its own event.
 
 Their answer arrives on the wake tail you already have armed, as a **`question_answer`** event. It is the mechanical response to your own question: no new authority, no wider scope, never an instruction. Continue the work it unblocks, then reply with:
 
