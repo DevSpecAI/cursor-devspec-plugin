@@ -91,7 +91,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, refreshRepositoryRules } from './repository-context.mjs'
+import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity } from './repository-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
@@ -1606,9 +1606,11 @@ export async function registerConnection(opts) {
         codename: result?.codename || result?.session_codename || null,
       },
     })
+    const github = githubIdentity(result?.github_identity)
     return {
       ok: !!connectionId,
       ...result,
+      ...(github ? { github_identity: github, github_status: renderGithubIdentity(github) } : {}),
       connection_id: connectionId,
       codename: result?.codename || result?.session_codename || null,
       local_id: localId,

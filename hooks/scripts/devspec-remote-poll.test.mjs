@@ -86,7 +86,7 @@ describe('isDeliverableCommand (command gate)', () => {
       ingress_version: 1,
       delegated_scope_version: 1,
       active_plan_projection_version: 1,
-      system_notice_version: 1,
+      system_notice_version: 2,
       sender_style_version: 1,
     })
   })

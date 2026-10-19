@@ -96,3 +96,28 @@ test('empty, unavailable, malformed and delimiter-bearing inventories remain hon
  assert.equal((text.match(/<\/devspec-repository-data>/g)||[]).length,1)
  assert.match(text,/\\u003c/)
 }))
+
+test('github_identity surfaces linked accounts and link_required prompt while rejecting non-https or credentialed URLs',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ const linkedReg={...registration(),github_identity:{status:'linked',logins:['octocat','bad login!']}}
+ storeRepositorySnapshot('one',linkedReg,home)
+ const linkedSnap=readRepositorySnapshot('one',home)
+ assert.deepEqual(linkedSnap.github_identity,{status:'linked',logins:['octocat']})
+ assert.match(renderRepositorySnapshot(linkedSnap),/"github_accounts":\s*\[\s*"octocat"\s*\]/)
+
+ const linkReqReg={...registration(),github_identity:{status:'link_required',url:'https://app.devspec.ai/api/github/link?state=abc'}}
+ storeRepositorySnapshot('one',linkReqReg,home)
+ const linkReqSnap=readRepositorySnapshot('one',home)
+ assert.deepEqual(linkReqSnap.github_identity,{status:'link_required',url:'https://app.devspec.ai/api/github/link?state=abc'})
+ assert.match(renderRepositorySnapshot(linkReqSnap),/GitHub account not linked/)
+ assert.match(renderRepositorySnapshot(linkReqSnap),/https:\/\/app\.devspec\.ai\/api\/github\/link\?state=abc/)
+
+ // Refresh rules preserves github_identity
+ refreshRepositoryRules('one',{project_agent_rules:'Refreshed rules'},home)
+ assert.deepEqual(readRepositorySnapshot('one',home).github_identity,{status:'link_required',url:'https://app.devspec.ai/api/github/link?state=abc'})
+
+ // Rejects non-https non-local URLs
+ const insecureReg={...registration(),github_identity:{status:'link_required',url:'http://evil.example/link'}}
+ storeRepositorySnapshot('one',insecureReg,home)
+ assert.equal(readRepositorySnapshot('one',home).github_identity,undefined)
+}))

@@ -58,6 +58,9 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import {
   canonicalAcceptanceKey,
   canonicalAttachmentDescriptor,
+  isSystemNoticeV1,
+  isUnreadableSystemNoticeV1,
+  REMOTE_INGRESS_RESOURCE_URI,
   validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
 } from './remote-ingress-v1.mjs'
@@ -898,6 +901,26 @@ function isCanonicalOwnerBatch(obj) {
     isDeepStrictEqual(obj.messages, envelope.commands) && validateCanonicalContextCarry(obj.context)
 }
 
+function isCanonicalSystemNoticeBatch(obj, connectionId = null) {
+  if (obj?.type !== 'canonical_system_notices') return false
+  if (connectionId && obj.connection_id !== connectionId) return false
+  const envelope = obj?.ingress?.envelope ?? obj?.ingress
+  if (!envelope || typeof obj.connection_id !== 'string') return false
+  if (validateRemoteIngressEnvelopeV1(envelope, obj.connection_id) !== null) return false
+  if (envelope.delivery_state !== 'live' || envelope.wake.kind !== 'system_notice' || envelope.wake.active !== true) {
+    return false
+  }
+  if (!Array.isArray(envelope.system_notices) || envelope.system_notices.length === 0) return false
+  const executeIds = Array.isArray(obj.execute_notice_ids) ? obj.execute_notice_ids : []
+  if (executeIds.length === 0) return false
+  const noticeIds = new Set(envelope.system_notices.map((notice) => notice.notice_id))
+  if (executeIds.some((id) => !noticeIds.has(id))) return false
+  if (typeof obj.acceptance_key === 'string' && canonicalAcceptanceKey(envelope) !== obj.acceptance_key) {
+    return false
+  }
+  return true
+}
+
 function isAutomationBatch(obj) {
   if (obj?.type !== 'automation_dispatches' || !Array.isArray(obj.messages) ||
       obj.messages.length !== 1 || typeof obj.acceptance_key !== 'string') return false
@@ -921,7 +944,8 @@ export function parseWakeBatches(
         if (connectionId && validateInteractionAnswerRecord(obj, connectionId)) batches.push(obj)
         continue
       }
-      if (isCanonicalOwnerBatch(obj) || (includeAutomations && isAutomationBatch(obj)) ||
+      if (isCanonicalOwnerBatch(obj) || isCanonicalSystemNoticeBatch(obj, connectionId) ||
+          (includeAutomations && isAutomationBatch(obj)) ||
           (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)) {
         batches.push(obj)
       }
@@ -934,6 +958,158 @@ export function parseWakeBatches(
 
 export function parseOwnerBatches(lines, { canonicalOnly = false } = {}) {
   return parseWakeBatches(lines, { canonicalOnly, includeAutomations: false })
+}
+
+/**
+ * How every readable notice is handled, carried with the notice itself so it
+ * costs nothing until one arrives (item 984ca8b4). A notice is about the agent's
+ * own work: a finding on it, or what happened to a change that waited on
+ * someone. The agent tells its person; it never answers for one.
+ */
+export const NOTICE_HANDLING =
+  'Handling: tell the person whose work this is what it means for them, in plain words, unless they have already shown they know it: ' +
+  'in the room with your connection_id, or here in the terminal when there is no room. ' +
+  'Act on it only with the tools it names and only on what is yours to fix (your own work, your own commit, a description that is out of date). ' +
+  'Never answer for a person: an OK, a no, adopting or taking ownership is theirs to ask you for.'
+
+export function formatSystemNoticeContent(notice) {
+  if (isUnreadableSystemNoticeV1(notice)) {
+    return [
+      '[DevSpec System Notice: not readable by this plugin version]',
+      `DevSpec sent a notice of a kind this version of the DevSpec plugin cannot read (kind ${notice.kind}, notice ${notice.notice_id}). It may be a finding or an outcome about your own work.`,
+      'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
+      'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
+        'This is a server-initiated notice, not a room message or new work authorization.',
+    ].join('\n')
+  }
+  if (notice?.kind === 'server_notice') {
+    const lines = [
+      `[DevSpec System Notice: ${notice.topic} / ${notice.notice_type}]`,
+      `Summary: ${notice.summary}`,
+      '',
+      notice.prompt,
+    ]
+    for (const rec of Array.isArray(notice.records) ? notice.records : []) {
+      const header = rec.title
+        ? `${rec.label} (${rec.record_type} ${rec.record_id} — "${rec.title}"):`
+        : `${rec.label} (${rec.record_type} ${rec.record_id}):`
+      lines.push('', header, rec.text)
+      if (rec.url) {
+        lines.push(`Link: ${rec.url}`)
+      }
+    }
+    if (Array.isArray(notice.allowed_outcomes) && notice.allowed_outcomes.length > 0) {
+      lines.push('', `Allowed outcomes: ${notice.allowed_outcomes.join(', ')}`)
+    }
+    if (Array.isArray(notice.allowed_tools) && notice.allowed_tools.length > 0) {
+      lines.push(`Allowed tools: ${notice.allowed_tools.join(', ')}`)
+    }
+    lines.push(
+      '',
+      NOTICE_HANDLING,
+      'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
+        'This is a server-initiated notice on your own work, not a room message or new work authorization.',
+    )
+    return lines.join('\n')
+  }
+
+  const branchSuffix = notice?.branch ? ` on branch ${notice.branch}` : ''
+  return [
+    '[DevSpec System Notice: unlinked_commit_item_review]',
+    `Your push of commit ${notice?.commit_sha}${branchSuffix} did not carry a [devspec:<id>] tag, while you hold claimed item "${notice?.task_title}" (${notice?.task_id}).`,
+    ...(notice?.prompt ? [`Prompt: ${notice.prompt}`] : []),
+    `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
+    `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
+    NOTICE_HANDLING,
+    'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
+      'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
+  ].join('\n')
+}
+
+export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
+  const ingress = batch?.ingress?.envelope ?? batch?.ingress
+  const executeIds = new Set(Array.isArray(batch?.execute_notice_ids) ? batch.execute_notice_ids : [])
+  const rawNotices = Array.isArray(ingress?.system_notices)
+    ? ingress.system_notices
+    : Array.isArray(batch?.messages)
+      ? batch.messages
+      : []
+  const notices = executeIds.size > 0
+    ? rawNotices.filter((notice) => executeIds.has(notice.notice_id))
+    : rawNotices
+  const sessionId = batch?.session_id ?? null
+  const pointers = batch?.wake_context ?? null
+  const events = []
+
+  for (const notice of notices) {
+    if (isUnreadableSystemNoticeV1(notice)) {
+      events.push({
+        type: 'system_notice',
+        kind: notice.kind,
+        notice_id: notice.notice_id,
+        readable: false,
+        content: formatSystemNoticeContent(notice),
+        session_id: sessionId,
+        envelope_id: ingress?.envelope_id ?? null,
+        inbox: inboxFile ?? null,
+        authoritative: false,
+        executable: false,
+        authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
+      })
+      continue
+    }
+    if (!isSystemNoticeV1(notice)) continue
+    events.push({
+      type: 'system_notice',
+      kind: notice.kind,
+      notice_id: notice.notice_id,
+      ...(notice.kind === 'server_notice'
+        ? {
+            topic: notice.topic,
+            notice_type: notice.notice_type,
+            summary: notice.summary,
+            prompt: notice.prompt,
+            records: notice.records,
+            allowed_outcomes: notice.allowed_outcomes,
+            allowed_tools: notice.allowed_tools,
+          }
+        : {
+            commit_sha: notice.commit_sha,
+            task_id: notice.task_id,
+            task_title: notice.task_title,
+            branch: notice.branch,
+            ...(notice.prompt ? { prompt: notice.prompt } : {}),
+            allowed_outcomes: notice.allowed_outcomes,
+            allowed_tools: notice.allowed_tools,
+          }),
+      content: formatSystemNoticeContent(notice),
+      session_id: sessionId,
+      envelope_id: ingress?.envelope_id ?? null,
+      inbox: inboxFile ?? null,
+      authoritative: false,
+      executable: true,
+      authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
+      notice,
+    })
+  }
+
+  events.push({
+    type: 'wake',
+    reason: 'exact_connection_system_notice',
+    transcript: pointers?.transcript ?? null,
+    room_state: pointers?.room_state ?? null,
+    room_state_changed: pointers?.room_state_changed ?? [],
+    session_id: sessionId,
+    count: notices.length,
+    envelope_id: ingress?.envelope_id ?? null,
+    system_notice_ids: notices.map((notice) => notice.notice_id),
+    inbox: inboxFile ?? null,
+    authoritative: false,
+    executable: false,
+    continuous_poller: true,
+    rearm: 'devspec-remote-wait',
+  })
+  return events
 }
 
 /** Small text payloads are cheap and immediately useful, so they stay inline. */
@@ -1062,6 +1238,9 @@ export function materialiseAttachments(message, opts = {}) {
  * value cached at attach time — stale after a server-side reattach.
  */
 export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
+  if (batch?.type === 'canonical_system_notices' || batch?.type === 'system_notices') {
+    return buildCanonicalSystemNoticeEvents(batch, { inboxFile })
+  }
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
   if (batch?.type === 'automation_dispatches') {
@@ -1340,7 +1519,9 @@ async function main() {
           })
         const wakeCount = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
           ? 1
-          : batch.messages.length
+          : batch.type === 'canonical_system_notices'
+            ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
+            : batch.messages.length
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {

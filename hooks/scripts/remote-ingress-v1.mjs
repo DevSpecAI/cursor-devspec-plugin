@@ -208,6 +208,106 @@ function withinWindow(row, window) {
   return !!start && !!end && row.order.sequence >= start.sequence && row.order.sequence <= end.sequence
 }
 
+export const SYSTEM_NOTICE_VERSION = 1
+export const READABLE_SYSTEM_NOTICE_KINDS = Object.freeze(['unlinked_commit_item_review', 'server_notice'])
+const FULL_LOWERCASE_SHA = /^[0-9a-f]{40}$/
+const NOTICE_KIND = /^[a-z][a-z0-9_.-]{0,119}$/
+const UNLINKED_COMMIT_NOTICE_OUTCOMES = [
+  'correct_item',
+  'link_item',
+  'resolve_duplicate',
+  'dismiss_item',
+  'confirm_item_correct',
+  'defer_follow_up',
+]
+const UNLINKED_COMMIT_NOTICE_TOOLS = [
+  'get_task',
+  'update_task',
+  'link_tasks',
+  'supersede_task',
+]
+
+function exactStringTuple(value, expected) {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((item, index) => item === expected[index])
+  )
+}
+
+function serverNoticeRecord(value) {
+  return (
+    exact(value, ['label', 'record_type', 'record_id', 'title', 'text', 'url']) &&
+    text(value.label) && value.label.length <= 200 &&
+    text(value.record_type) && value.record_type.length <= 120 &&
+    text(value.record_id) && value.record_id.length <= 200 &&
+    (value.title === null || (text(value.title) && value.title.length <= 500)) &&
+    text(value.text) && value.text.length <= 8000 &&
+    (value.url === null || (text(value.url) && value.url.length <= 1000))
+  )
+}
+
+export function isSystemNoticeV1(value) {
+  if (!object(value) || value.version !== SYSTEM_NOTICE_VERSION || value.contract_uri !== REMOTE_INGRESS_RESOURCE_URI) {
+    return false
+  }
+  if (value.kind === 'unlinked_commit_item_review') {
+    const keys = [
+      'version', 'kind', 'notice_id', 'commit_sha', 'task_id',
+      'task_title', 'branch', ...(Object.hasOwn(value, 'prompt') ? ['prompt'] : []),
+      'contract_uri', 'allowed_outcomes', 'allowed_tools',
+    ]
+    return (
+      exact(value, keys) &&
+      uuid(value.notice_id) &&
+      typeof value.commit_sha === 'string' && FULL_LOWERCASE_SHA.test(value.commit_sha) &&
+      uuid(value.task_id) &&
+      text(value.task_title) && value.task_title.length <= 500 &&
+      text(value.branch) && value.branch.length <= 500 &&
+      (!Object.hasOwn(value, 'prompt') || (text(value.prompt) && value.prompt.length <= 8000)) &&
+      exactStringTuple(value.allowed_outcomes, UNLINKED_COMMIT_NOTICE_OUTCOMES) &&
+      exactStringTuple(value.allowed_tools, UNLINKED_COMMIT_NOTICE_TOOLS)
+    )
+  }
+  if (value.kind === 'server_notice') {
+    return (
+      exact(value, [
+        'version', 'kind', 'notice_id', 'topic', 'notice_type',
+        'summary', 'prompt', 'contract_uri', 'records', 'allowed_outcomes', 'allowed_tools',
+      ]) &&
+      uuid(value.notice_id) &&
+      text(value.topic) && value.topic.length <= 120 &&
+      text(value.notice_type) && value.notice_type.length <= 120 &&
+      text(value.summary) && value.summary.length <= 500 &&
+      text(value.prompt) && value.prompt.length <= 8000 &&
+      Array.isArray(value.records) && value.records.length >= 1 && value.records.length <= 10 &&
+      value.records.every(serverNoticeRecord) &&
+      Array.isArray(value.allowed_outcomes) && value.allowed_outcomes.length <= 16 &&
+      value.allowed_outcomes.every((entry) => text(entry) && entry.length <= 120) &&
+      Array.isArray(value.allowed_tools) && value.allowed_tools.length <= 16 &&
+      value.allowed_tools.every((entry) => text(entry) && entry.length <= 120)
+    )
+  }
+  return false
+}
+
+/**
+ * A notice of a kind this plugin version cannot read: still a DevSpec notice for
+ * this connection (version, id and contract), but nothing else in it is read.
+ * DevSpec counts a notice as delivered once it is handed over, so rejecting the
+ * whole package would lose it silently (item 984ca8b4).
+ */
+export function isUnreadableSystemNoticeV1(value) {
+  return (
+    object(value) &&
+    value.version === SYSTEM_NOTICE_VERSION &&
+    value.contract_uri === REMOTE_INGRESS_RESOURCE_URI &&
+    typeof value.kind === 'string' && NOTICE_KIND.test(value.kind) &&
+    !READABLE_SYSTEM_NOTICE_KINDS.includes(value.kind) &&
+    uuid(value.notice_id)
+  )
+}
+
 /** Sender response style for one delivered command (item 7c421a20). Read verbatim, never recomputed. */
 export function isSenderResponseStyleV1(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -243,6 +343,10 @@ export function validateRemoteIngressEnvelopeV1(envelope, connectionId) {
     const hasNotices = envelope.system_notices.length > 0
     if (hasNotices !== (envelope.wake.kind === 'system_notice')) return 'system notices must be nonempty iff wake kind is system_notice'
     if (hasNotices && (envelope.commands.length > 0 || envelope.control !== null)) return 'system notices cannot accompany commands or control'
+    if (hasNotices && (!envelope.system_notices.every((notice) => isSystemNoticeV1(notice) || isUnreadableSystemNoticeV1(notice)) ||
+        new Set(envelope.system_notices.map((notice) => notice.notice_id)).size !== envelope.system_notices.length)) {
+      return 'malformed system notices'
+    }
   }
   if (senderStyleContract && Object.hasOwn(envelope, 'sender_response_styles')) {
     const styles = envelope.sender_response_styles
@@ -296,9 +400,12 @@ export function normalizeRemoteIngressV1(response, connectionId) {
   const error = validateRemoteIngressEnvelopeV1(response.ingress, connectionId)
   if (error) return { ok: false, error }
   const envelope = response.ingress
-  const wake = envelope.delivery_state === 'live' && envelope.wake.kind === 'conversational_command' &&
+  const conversationalWake = envelope.delivery_state === 'live' && envelope.wake.kind === 'conversational_command' &&
     envelope.wake.active === true && envelope.commands.length > 0
-  return { ok: true, changed: true, envelope, wake }
+  const systemNoticeWake = envelope.delivery_state === 'live' && envelope.wake.kind === 'system_notice' &&
+    envelope.wake.active === true && Array.isArray(envelope.system_notices) && envelope.system_notices.length > 0
+  const wake = conversationalWake || systemNoticeWake
+  return { ok: true, changed: true, envelope, wake, reason: envelope.wake.kind }
 }
 
 export const REMOTE_INGRESS_CONTEXT_BUCKETS = ['human_context', 'agent_context', 'ai_context', 'system_context']
@@ -421,6 +528,9 @@ export function canonicalAcceptanceKey(envelope) {
   if (envelope.wake.kind === 'conversational_command' && envelope.commands.length > 0) {
     const first = envelope.commands[0]
     return `command-messages:${first.delivery.turn_id}:${first.delivery.primary_provenance_ref}:${envelope.command_message_ids.join(',')}`
+  }
+  if (envelope.wake.kind === 'system_notice' && Array.isArray(envelope.system_notices) && envelope.system_notices.length > 0) {
+    return `system-notices:${envelope.system_notices.map((notice) => notice.notice_id).join(',')}`
   }
   if (envelope.wake.kind === 'control' && envelope.control) return `control:${envelope.control.id}`
   return canonicalContextAcceptanceKey(envelope)

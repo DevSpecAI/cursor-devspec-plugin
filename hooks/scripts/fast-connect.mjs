@@ -17,7 +17,7 @@ import path from 'node:path'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
-import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import {
   durationMs,
@@ -530,6 +530,8 @@ export async function fastConnect(opts = {}) {
     }
   }
 
+  const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
+  const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
   return {
     ok: true,
     connection_id: connectionId,
@@ -540,8 +542,10 @@ export async function fastConnect(opts = {}) {
     action: localAction.action,
     project_id: projectContext?.project.id,
     project_selection: projectContext,
-    project_context: readRepositorySnapshot(localId, opts.projectHome),
+    project_context: projectSnapshot,
     project_context_file: repositoryContextTextFile(localId, opts.projectHome),
+    ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
+    ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
     warning_tokens: written.warning_tokens || null,
   }

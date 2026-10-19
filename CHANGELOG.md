@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.1
+
+Negotiate `system_notice_version: 2` in `devspec-remote-poll.mjs`, validate and wake on `server_notice` and `unlinked_commit_item_review` notices (with graceful degradation for unknown future notice kinds) in `remote-ingress-v1.mjs` and `devspec-remote-wait.mjs` (`REMOTE_WAKE_NOTIFY_PATTERN` includes `system_notice`), surface `register_connection`'s `github_identity` in `repository-context.mjs`, `remote-control-state.mjs`, and `fast-connect.mjs`, and update `skills/devspec.remote/SKILL.md`, `rules/devspec.mdc`, `README.md`, and `docs/remote-control/remote-control-cursor.md` for Protecting Intent (`waiting_for_ok` / Experiment branches, immediate action on clear user authority, Review decision tools, and the decision capture bar).
+
 ## 0.16.0
 
 Cut over the Cursor plugin to the Tasks contract (`get_tasks`, `get_task`, `get_task_history`, `get_task_siblings`, `search_tasks`, `create_task`, `update_task`, `spin_off_task`, `supersede_task`, `link_tasks`, `unlink_tasks`, `reopen_task`, `surface_session_tasks`, `verify_task`, `task_id`, `task_ids`, and nested `task` responses) across `provenance-assistance.mjs`, hooks, skills, documentation, tests, and package metadata, with a scoped one-time normalization of transient pre-cutover `pending_stamps` entries that preserves active claims and nudged projects.

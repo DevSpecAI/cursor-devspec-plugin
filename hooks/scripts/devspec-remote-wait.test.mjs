@@ -21,6 +21,9 @@ import {
   parseOwnerBatches,
   parseWakeBatches,
   buildOwnerMessageEvents,
+  buildCanonicalSystemNoticeEvents,
+  formatSystemNoticeContent,
+  NOTICE_HANDLING,
   describeAttachment,
   materialiseAttachments,
   MAX_INLINE_ATTACHMENT_CHARS,
@@ -37,6 +40,8 @@ import {
   resolveConnectionsDir,
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { SYSTEM_NOTICE_CHANNEL_VERSION, remoteIngressNegotiationArgs } from './devspec-remote-poll.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { automationAcceptanceKey } from './remote-poll-acceptance.mjs'
 import {
@@ -48,6 +53,9 @@ import {
   fixtureAutomationDispatch,
   fixtureSenderResponseStyle,
   fixtureSenderStyleEnvelope,
+  fixtureServerNotice,
+  fixtureSystemNoticeEnvelope,
+  fixtureUnlinkedCommitNotice,
 } from './remote-ingress-test-fixtures.mjs'
 
 const CANONICAL_CONNECTION = FIXTURE_ID.connection
@@ -1300,3 +1308,64 @@ describe('Cursor dismissal reader source gate before stdout and wake-file', () =
     for (const key of ['event_id', 'question_id', 'claim_token', 'attempt_id', 'connection_id', 'session_id']) assert.equal(dismissalDeliveryDecision(record, { ...state, interaction_continuation: { ...state.interaction_continuation, [key]: ROOM_B } }, CANONICAL_CONNECTION), 'obsolete', key)
   })
 })
+
+describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
+  it('negotiates system_notice_version: 2 and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
+    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 2)
+    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 2)
+    assert.match(REMOTE_WAKE_NOTIFY_PATTERN, /system_notice/)
+  })
+
+  it('delivers server_notice and unlinked_commit_item_review wakes with NOTICE_HANDLING and degrades gracefully on unknown notice kinds', () => {
+    const serverNotice = fixtureServerNotice()
+    const unlinkedNotice = fixtureUnlinkedCommitNotice()
+    const futureNotice = {
+      version: 1,
+      kind: 'future_notice_kind',
+      notice_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      contract_uri: 'devspec://product/remote-ingress-contract',
+    }
+    const envelope = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [],
+      systemNotices: [
+        serverNotice,
+        { ...unlinkedNotice, notice_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' },
+        futureNotice,
+      ],
+    })
+    const batch = {
+      type: 'canonical_system_notices',
+      connection_id: CANONICAL_CONNECTION,
+      session_id: ROOM_A,
+      execute_notice_ids: envelope.system_notices.map((n) => n.notice_id),
+      acceptance_key: canonicalAcceptanceKey(envelope),
+      ingress: { canonical: true, envelope },
+      messages: envelope.system_notices,
+    }
+    const parsed = parseWakeBatches([JSON.stringify(batch)], {
+      canonicalOnly: true,
+      connectionId: CANONICAL_CONNECTION,
+    })
+    assert.equal(parsed.length, 1)
+    const events = buildOwnerMessageEvents(parsed[0], { inboxFile: '/tmp/inbox.jsonl' })
+    assert.equal(events.length, 4)
+    assert.equal(events[0].type, 'system_notice')
+    assert.equal(events[0].kind, 'server_notice')
+    assert.equal(events[0].executable, true)
+    assert.ok(events[0].content.includes(NOTICE_HANDLING))
+    assert.equal(events[1].type, 'system_notice')
+    assert.equal(events[1].kind, 'unlinked_commit_item_review')
+    assert.equal(events[1].executable, true)
+    assert.ok(events[1].content.includes(NOTICE_HANDLING))
+    assert.equal(events[2].type, 'system_notice')
+    assert.equal(events[2].kind, 'future_notice_kind')
+    assert.equal(events[2].readable, false)
+    assert.equal(events[2].executable, false)
+    assert.match(events[2].content, /not readable by this plugin version/)
+    assert.equal(events[3].type, 'wake')
+    assert.equal(events[3].reason, 'exact_connection_system_notice')
+    assert.equal(events[3].count, 3)
+  })
+})
+

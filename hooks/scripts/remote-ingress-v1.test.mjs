@@ -17,7 +17,9 @@ import {
   fixtureEnvelope,
   fixtureSenderResponseStyle,
   fixtureSenderStyleEnvelope,
+  fixtureServerNotice,
   fixtureSystemNoticeEnvelope,
+  fixtureUnlinkedCommitNotice,
   fixtureUuid,
   fixtureWindow as windowFor,
 } from './remote-ingress-test-fixtures.mjs'
@@ -343,7 +345,7 @@ describe('canonical remote ingress v1', () => {
     // (same order as the Claude host validator); the accompany rule is the
     // second gate when the wake kind already says system_notice.
     const noticesWithCommands = fixtureSystemNoticeEnvelope({
-      systemNotices: [{ id: ID.control }],
+      systemNotices: [fixtureServerNotice()],
     })
     assert.match(
       validateRemoteIngressEnvelopeV1(noticesWithCommands, ID.connection),
@@ -355,16 +357,40 @@ describe('canonical remote ingress v1', () => {
     const noticeWake = fixtureSystemNoticeEnvelope({
       wakeKind: 'system_notice',
       commands: [],
-      systemNotices: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }],
+      systemNotices: [fixtureServerNotice()],
     })
     assert.equal(validateRemoteIngressEnvelopeV1(noticeWake, ID.connection), null)
+    const normalized = normalizeRemoteIngressV1({ changed: true, ingress: noticeWake }, ID.connection)
+    assert.equal(normalized.ok, true)
+    assert.equal(normalized.wake, true)
+    assert.equal(normalized.reason, 'system_notice')
+
+    const unlinkedWake = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [],
+      systemNotices: [fixtureUnlinkedCommitNotice()],
+    })
+    assert.equal(validateRemoteIngressEnvelopeV1(unlinkedWake, ID.connection), null)
+
+    const futureKindWake = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [],
+      systemNotices: [{
+        version: 1,
+        kind: 'future_notice_kind',
+        notice_id: ID.control,
+        contract_uri: 'devspec://product/remote-ingress-contract',
+        extra_field: 'ignored',
+      }],
+    })
+    assert.equal(validateRemoteIngressEnvelopeV1(futureKindWake, ID.connection), null)
 
     // fixtureEnvelope only auto-fills commands for conversational_command;
     // pass an explicit command so the accompany gate is what fires.
     const noticeWithCommand = fixtureSystemNoticeEnvelope({
       wakeKind: 'system_notice',
       commands: [command('ship it')],
-      systemNotices: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }],
+      systemNotices: [fixtureServerNotice()],
     })
     assert.match(
       validateRemoteIngressEnvelopeV1(noticeWithCommand, ID.connection),

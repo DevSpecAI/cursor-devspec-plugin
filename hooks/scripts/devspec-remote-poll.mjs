@@ -86,6 +86,7 @@ import {
   canonicalContextAcceptanceKey,
   emptyCanonicalContextCarry,
   mergeCanonicalContextCarry,
+  REMOTE_INGRESS_RESOURCE_URI,
   validCommandProjectScope,
 } from './remote-ingress-v1.mjs'
 import {
@@ -707,21 +708,22 @@ export function isDeliverableCommand(msg, connectionId) {
 }
 
 /** The nested ingress ladder. Each tier requires the one below it (item 7c421a20). */
-export const SYSTEM_NOTICE_VERSION = 1
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_VERSION = SYSTEM_NOTICE_CHANNEL_VERSION
 export const SENDER_STYLE_VERSION = 1
 
 /**
  * Feature negotiation for canonical ingress. `sender_style_version` makes the
  * person who SENT a command decide how they get answered, rather than whoever
- * owns this connection; the server refuses it without `system_notice_version`,
- * so notices come along for the ride and are treated as advisory.
+ * owns this connection; `system_notice_version: 2` delivers server_notice and
+ * unlinked_commit_item_review wakes.
  */
 export function remoteIngressNegotiationArgs() {
   return {
     ingress_version: 1,
     delegated_scope_version: 1,
     active_plan_projection_version: 1,
-    system_notice_version: SYSTEM_NOTICE_VERSION,
+    system_notice_version: SYSTEM_NOTICE_CHANNEL_VERSION,
     sender_style_version: SENDER_STYLE_VERSION,
   }
 }
@@ -829,6 +831,53 @@ async function deliverOwnerMessages(
     /* ignore */
   }
   return { ok: true, duplicate: false }
+}
+
+export async function deliverSystemNotices(
+  connectionId,
+  systemNotices,
+  nextCursor,
+  sessionId,
+  ingress = null,
+) {
+  const notices = Array.isArray(systemNotices) ? systemNotices : []
+  if (!connectionId || notices.length === 0 || !ingress?.envelope) {
+    return { ok: false, duplicate: false }
+  }
+  const envelope = ingress.envelope
+  const executeNoticeIds = notices.map((notice) => notice.notice_id)
+  const record = {
+    type: 'canonical_system_notices',
+    connection_id: connectionId,
+    session_id: sessionId,
+    received_at: new Date().toISOString(),
+    count: notices.length,
+    next_after_message_id: nextCursor,
+    authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
+    execute_notice_ids: executeNoticeIds,
+    ingress,
+    messages: notices,
+  }
+  const accepted = appendAcceptedJsonl(
+    inboxPathForConnection(connectionId),
+    record,
+    canonicalAcceptanceKey(envelope),
+  )
+  if (!accepted.ok || accepted.duplicate) return accepted
+  for (const notice of notices) {
+    process.stdout.write(JSON.stringify({ type: 'system_notice', kind: notice.kind, notice_id: notice.notice_id, notice }) + '\n')
+  }
+  process.stdout.write(
+    JSON.stringify({
+      type: 'wake',
+      reason: 'exact_connection_system_notice',
+      count: notices.length,
+      next_cursor: nextCursor,
+      inbox: inboxPathForConnection(connectionId),
+      continuous: true,
+    }) + '\n',
+  )
+  return { ok: true, duplicate: false, executeNoticeIds }
 }
 
 async function deliverAutomationDispatches(connectionId, dispatches, nextDispatchCursor, sessionId) {
@@ -1443,7 +1492,19 @@ async function main() {
     let instructionContextFile = null
     let instructionContextDelivered = false
 
-    if (accepted.canonicalWake) {
+    if (accepted.canonicalWake && envelope.wake.kind === 'system_notice') {
+      ensureHostWakeFollow(connectionId, ownerAnchor)
+      const delivered = await deliverSystemNotices(
+        connectionId,
+        envelope.system_notices,
+        accepted.liveCursorV2,
+        sessionId,
+        ingress,
+      )
+      if (!delivered.ok) return false
+      newlyDelivered ||= !delivered.duplicate
+      canonicalCarry = nextCarry
+    } else if (accepted.canonicalWake) {
       instructionContextFile = refreshRepositoryRules(readState(connectionId)?.local_id, res)
       const context = {
         advisory: true,

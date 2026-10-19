@@ -146,11 +146,21 @@ Plan mutation uses a narrow connection-bound helper shipped with the plugin. It 
 
 Cursor's native `agent --resume` behavior is unchanged. The plugin reports the real host conversation identity as `local_session_id`; it does not require the optional launcher.
 
-### Repository facts
+### Repository facts and GitHub account link
 
 From 0.13.25, connection supplies the project's repository names, safe remote URLs and tracked/default branches, alongside existing project and machine rules. Manual connection returns this context directly. Launcher-started conversations receive it through Cursor's native post-tool context, including after arming their first wait. A fresh project conversation uses its own snapshot, never another chat's folder-based guess.
 
+When the project tracks GitHub repositories, `register_connection` also reports the person's `github_identity`: either `linked` (`github_accounts` in `<devspec-repository-data>` and `linked as @login` in the connect status) or `link_required` (a verified `https://` one-click GitHub App identity link so their pull requests and commits show as theirs in DevSpec without granting DevSpec access to their GitHub account).
+
 These are remote project facts, not proof that a repository is cloned or writable locally. Empty and unavailable inventories are distinct; description and vision remain available on demand. No fixed repository-count cap is applied. Cursor itself limits hook context to 10,000 characters, so larger results name a private local file containing the complete context. Repository facts still appear inline when they fit; the continuation supplies complete rules and any larger inventory.
+
+### Protecting intent, Review decisions, and System Notices
+
+- **Work that waits (`waiting_for_ok`) or Experiment branches:** When a claim or write result carries `waiting_for_ok`, the claim still goes through — build and push the work on its own branch in every repository it touches, **never merge it into the tracking branch**, and record the implementation as usual (`core.waiting-work-stays-on-its-branch`).
+- **Immediate action on clear user authority (`acting_rule`):** Act for the person asking with their authority (`authority_contract`). When their request is clear and they evidently know what it does, act immediately without asking them to confirm what they just said or sending them to Review.
+- **Review decision tools:** Use `get_review_queue` first, then `decide_proposal`, `manage_protected_intent`, `resolve_duplicate`, `record_duplicate_nonmatch`, `resolve_memory_flag`, and `resolve_resource_flag`, relaying each result's `summary` (or `note`) and `next` in plain words.
+- **System Notices (`system_notice_version: 2`):** The poller and wait watcher deliver `server_notice` and `unlinked_commit_item_review` wakes (`REMOTE_WAKE_NOTIFY_PATTERN` includes `system_notice`) with `NOTICE_HANDLING` instructions and graceful degradation for future notice kinds.
+- **Decision capture bar:** Record a decision memory only when it is a real choice between alternatives with a reason, steers work beyond this change, is not obvious from the code, and comes from the person's own answer when asked whether it was deliberate and why.
 
 Install/update the plugin version and restart Cursor, or use an explicit development `--plugin-dir`. A source checkout update alone does not refresh the marketplace cache.
 
