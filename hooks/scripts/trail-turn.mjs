@@ -27,6 +27,7 @@ import {
   renderHookTrailPart,
   writeTrailState,
 } from './work-trail.mjs'
+import { recordTurnActivity } from './turn-liveness.mjs'
 
 const VALID_MODES = new Set([
   'seed',
@@ -87,6 +88,9 @@ async function main() {
   // active turn must not assert busy state or open transient streaming bubbles.
   if (mode !== 'seed' && !hasActiveTurnMarker(state.connection_id)) {
     process.exit(0)
+  }
+  if (mode !== 'seed') {
+    recordTurnActivity(state.connection_id)
   }
 
   let token = state.mcp_token || state.token || null

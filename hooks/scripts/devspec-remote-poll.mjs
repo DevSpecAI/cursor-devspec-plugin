@@ -153,6 +153,13 @@ import {
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
 import { openRequest } from './requests.mjs'
 import { attachmentFromPoll } from './local-turn.mjs'
+import {
+  NO_SIGN_OF_LIFE_MS,
+  readTurnActivity,
+  turnActivityPath,
+  turnIsLive,
+} from './turn-liveness.mjs'
+import { closeCursorOnEnd } from './close-on-end.mjs'
 
 export { roomStatePath }
 
@@ -224,16 +231,22 @@ function readTurnMarker(connectionId) {
 }
 /**
  * Start a turn at honest canonical-command or explicit-automation pickup.
- * The long-lived poller re-asserts busy while this marker is fresh; Stop /
+ * The long-lived poller re-asserts busy while this marker is live; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
-function writeTurnMarker(connectionId) {
+function writeTurnMarker(connectionId, { held = false } = {}) {
   if (!connectionId) return
+  const existing = readTurnMarker(connectionId)
+  const startedAt = turnIsLive(existing, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
+    ? existing.startedAt
+    : Date.now()
   try {
     fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
-      mode: 0o600,
-    })
+    fs.writeFileSync(
+      turnMarkerPath(connectionId),
+      JSON.stringify(held ? { startedAt, held: true } : { startedAt }),
+      { mode: 0o600 },
+    )
   } catch {
     /* non-fatal — immediate busy heartbeat at call site still fires */
   }
@@ -244,6 +257,11 @@ export function handleKeepaliveRejection(errorMessage, connectionId, io = {}) {
   if (/no working attempt|not working/i.test(errorMessage || '')) {
     try {
       rmSync(turnMarkerPath(connectionId), { force: true })
+    } catch {
+      /* ignore */
+    }
+    try {
+      rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
     } catch {
       /* ignore */
     }
@@ -265,6 +283,11 @@ function clearTurnMarker(connectionId) {
   if (!connectionId) return
   try {
     fs.rmSync(turnMarkerPath(connectionId), { force: true })
+  } catch {
+    /* non-fatal */
+  }
+  try {
+    fs.rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
   } catch {
     /* non-fatal */
   }
@@ -425,6 +448,18 @@ function appendInbox(
   }
 }
 
+export function disabledStatePatch(reason) {
+  return {
+    enabled: false,
+    // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
+    // this poller's own legacy label. Both must set the flag, or a genuine UI
+    // End would stop stamping it the moment the server started telling the
+    // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
+    ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
+    end_reason: reason,
+  }
+}
+
 /** Disable THIS connection only — never other remotes on the machine. */
 function disableLocalState({ connectionId, reason }) {
   clearConnectionCapability(connectionId)
@@ -433,14 +468,8 @@ function disableLocalState({ connectionId, reason }) {
     writeState(
       {
         ...prev,
-        enabled: false,
+        ...disabledStatePatch(reason),
         connection_id: connectionId || prev.connection_id,
-        // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
-        // this poller's own legacy label. Both must set the flag, or a genuine UI
-        // End would stop stamping it the moment the server started telling the
-        // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
-        ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
-        end_reason: reason,
         updated_at: new Date().toISOString(),
       },
       connectionId,
@@ -1833,6 +1862,12 @@ async function main() {
   // Consecutive teardowns the server would not attribute to a person. Reset by any
   // clean poll, so only a SUSTAINED absence stands the poller down (brief e691c68a).
   let consecutiveRecoverableEnds = 0
+  let sawLive = Boolean(
+    state &&
+      state.enabled !== false &&
+      state.ended_from_ui !== true &&
+      state.end_reason !== 'ui',
+  )
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1872,11 +1907,15 @@ async function main() {
       return
     }
 
-    // Agent-authoritative "working": re-assert busy while a fresh turn marker exists.
+    // Agent-authoritative "working": re-assert busy while the turn is live. Live is what
+    // Cursor shows (held for this command's own background work, or a tool call /
+    // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
     const marker = readTurnMarker(connectionId)
+    const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
-    let turnActive = !!marker && turnElapsed < MAX_TURN_MS
-    if (marker && turnElapsed >= MAX_TURN_MS && prevTurnActive) {
+    let turnActive = turnIsLive(marker, { activity })
+    const stalling = !!(marker && !turnActive && prevTurnActive)
+    if (stalling) {
       logRemoteControlStory({
         phase: 'stall',
         outcome: 'stalled',
@@ -1885,10 +1924,9 @@ async function main() {
         agent: AGENT_NAME,
         tool: 'turn_marker',
         reason: 'max_turn_ms',
-        data: { elapsed_ms: turnElapsed, max_turn_ms: MAX_TURN_MS },
+        data: { elapsed_ms: turnElapsed, no_sign_of_life_ms: NO_SIGN_OF_LIFE_MS },
       })
     }
-    const stalling = !!(marker && turnElapsed >= MAX_TURN_MS && prevTurnActive)
 
     // ADDITIVE (item 71a8b201): emit the connection activity verb DIRECTLY off the
     // turn-active transition (pickup / keepalive / complete). This is ON TOP of the
@@ -2030,6 +2068,15 @@ async function main() {
       // must stick — item 32e423fb exists so a UI End stops a zombie poller.
       const reason = terminal.reason || 'ended_from_ui'
       disableLocalState({ connectionId, reason })
+      const disabledState = readState(connectionId) || {
+        ...(liveState || {}),
+        ...disabledStatePatch(reason),
+      }
+      closeCursorOnEnd({
+        state: disabledState,
+        sawLive,
+        ownerPid: ownerAnchor,
+      })
       process.stdout.write(
         JSON.stringify({
           type: 'session_ended',
@@ -2044,6 +2091,7 @@ async function main() {
     }
     // A clean poll clears the recoverable streak — a blip that resolves is over.
     consecutiveRecoverableEnds = 0
+    sawLive = true
 
     // Server-authoritative attachment — still the SOLE adoption path, now sourced
     // from the poll response's `session_id` (read from the markers, so it is the

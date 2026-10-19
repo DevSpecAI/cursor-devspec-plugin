@@ -114,6 +114,11 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/room-unread.mjs\" post-tool",
         "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "for f in \"$HOME\"/.devspec/remote-control/connections/*.turn; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-liveness.mjs\" touch; break; fi; done; exit 0",
+        "timeout": 5
       }
     ],
     "postToolUseFailure": [

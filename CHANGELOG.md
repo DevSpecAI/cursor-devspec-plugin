@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.6
+
+Replace the fixed 1-hour `MAX_TURN_MS` wall-clock turn cutoff with activity-based turn liveness in `hooks/scripts/turn-liveness.mjs` (`<connectionId>.turn-activity.json` refreshed on `postToolUse` hooks, `trail-turn.mjs`, and `cli-trail-watch.mjs` transcript growth, expiring only after 1 hour of inactivity), remove the cross-connection `reapDeadPollers` sweep on `writeConnectionState` in `hooks/scripts/remote-control-state.mjs` so connecting a second Cursor window never terminates a quiet sibling window's poller, and add `hooks/scripts/close-on-end.mjs` (`closeCursorOnEnd` / `closeOnEndDecision`) wired into `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` to cleanly terminate the owning Cursor session when ended from the DevSpec UI (`end_reason: 'ui'`).
+
 ## 0.16.5
 
 Add `hooks/scripts/commit-observation.mjs` (`preToolUse` and `postToolUse` on `Shell` / `Bash`) to observe direct Git commits and report newly created commit SHAs to DevSpec with the connection capability (`X-DevSpec-Connection-Capability`), add `hooks/scripts/pin-check.mjs` to validate `.devspec/project.json` after writes or edits and surface corrective feedback when malformed or missing `project_id`, and add `hooks/scripts/repo-link-nudge.mjs` (`hooks/scripts/devspec-scope.mjs`) to nudge once per conversation, project, and remote when a newly created or re-pointed `origin` is not yet linked to the pinned DevSpec project.

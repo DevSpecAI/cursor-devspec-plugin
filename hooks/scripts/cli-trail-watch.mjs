@@ -27,6 +27,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { postTrailFromTranscript } from './post-trail-from-transcript.mjs'
 import { recordProgressFailure } from './progress-diagnostics.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { recordTurnActivity } from './turn-liveness.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const DEFAULT_POLL_MS = 800
@@ -197,6 +198,7 @@ async function main() {
       await sleep(args.pollMs)
       continue
     }
+    recordTurnActivity(connectionId, { dir: CONNECTIONS_DIR })
 
     let token = state.mcp_token || state.token || null
     let mcpUrl = state.mcp_url || null

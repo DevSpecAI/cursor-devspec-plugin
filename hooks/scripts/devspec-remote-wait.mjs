@@ -86,6 +86,8 @@ import {
 import { isDirectRun } from './is-direct-run.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import { wakeNotice } from './room-unread.mjs'
+import { closeCursorOnEnd } from './close-on-end.mjs'
+import { turnActivityPath } from './turn-liveness.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -109,6 +111,11 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   try {
     fs.rmSync(path.join(dir, `${connectionId}.turn`), { force: true })
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.rmSync(turnActivityPath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }
@@ -1487,8 +1494,26 @@ async function main() {
     })
   }
 
+  let sawLive = Boolean(
+    state &&
+      state.enabled !== false &&
+      state.ended_from_ui !== true &&
+      state.end_reason !== 'ui',
+  )
   while (args.follow || Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)
+    if (live?.end_reason === 'ui' || live?.ended_from_ui) {
+      closeCursorOnEnd({
+        state: live,
+        sawLive,
+        ownerPid: ownerAnchor,
+      })
+      await emitEnded(
+        { type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId },
+        args.wakeFile,
+      )
+      process.exit(1)
+    }
     if (live && live.enabled === false) {
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
@@ -1501,13 +1526,7 @@ async function main() {
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
-    if (live?.end_reason === 'ui' || live?.ended_from_ui) {
-      await emitEnded(
-        { type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId },
-        args.wakeFile,
-      )
-      process.exit(1)
-    }
+    if (live) sawLive = true
 
     // Rotation or truncate/regrow may happen while this one-shot wait is armed.
     // Rebind before reading so a stale byte count never starts inside a new record.

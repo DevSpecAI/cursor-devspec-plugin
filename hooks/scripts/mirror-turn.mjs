@@ -48,6 +48,7 @@ import {
   UNSTATED,
 } from './requests.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
+import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -74,16 +75,32 @@ function patchOwnState(connectionId, patch) {
 // UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The long-lived
 // poller reads it (by connection_id) to re-assert busy on heartbeats while a turn
 // runs, so long turns stay "working" and the server's busy freshness doesn't decay.
-export function turnMarkerPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
+export function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.turn`)
 }
-export function writeTurnMarker(connectionId) {
+function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  try {
+    const marker = JSON.parse(fs.readFileSync(turnMarkerPath(connectionId, dir), 'utf8'))
+    return typeof marker?.startedAt === 'number' ? marker : null
+  } catch {
+    return null
+  }
+}
+function markerIsLive(connectionId, marker, { dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
+  return turnIsLive(marker, { activity: readTurnActivity(connectionId, dir), now })
+}
+export function writeTurnMarker(connectionId, { held = false } = {}) {
   if (!connectionId) return
+  const existing = readTurnMarker(connectionId)
+  const startedAt = markerIsLive(connectionId, existing) ? existing.startedAt : Date.now()
   try {
     fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
-      mode: 0o600,
-    })
+    fs.writeFileSync(
+      turnMarkerPath(connectionId),
+      JSON.stringify(held ? { startedAt, held: true } : { startedAt }),
+      { mode: 0o600 },
+    )
   } catch {
     /* non-fatal — the immediate busy heartbeat below still fires */
   }
@@ -95,15 +112,21 @@ export function clearTurnMarker(connectionId) {
   } catch {
     /* ignore */
   }
+  try {
+    fs.rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
+  } catch {
+    /* ignore */
+  }
 }
-export function hasActiveTurnMarker(connectionId, maxAgeMs = 300_000) {
+export function hasActiveTurnMarker(connectionId, maxAgeMs) {
   if (!connectionId) return false
   try {
-    const p = turnMarkerPath(connectionId)
-    if (!fs.existsSync(p)) return false
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'))
-    const startedAt = typeof raw?.startedAt === 'number' ? raw.startedAt : 0
-    return Date.now() - startedAt < maxAgeMs
+    const marker = readTurnMarker(connectionId)
+    if (!marker) return false
+    if (typeof maxAgeMs === 'number') {
+      return Date.now() - marker.startedAt < maxAgeMs
+    }
+    return markerIsLive(connectionId, marker)
   } catch {
     return false
   }
