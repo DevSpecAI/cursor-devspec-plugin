@@ -40,6 +40,10 @@ export const MALFORMED_REFERENCE_MESSAGE =
 export const MULTIPLE_CLAIMS_MESSAGE =
   'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each item this commit delivers and retry. Nothing else is blocked.'
 
+export const NO_CLAIM_MESSAGE =
+  'DevSpec commit provenance: this commit has no [devspec:<uuid>] reference and no active DevSpec claim is observed in this project, so it would land unlinked. ' +
+  'Recover without leaving this turn: reuse or create the smallest item that covers it (search_tasks, or create_task with a one-line description — a thin last-mile item is fine), then add [devspec:<full-uuid>] to the commit message and retry. Nothing else is blocked.'
+
 export function unresolvedReferenceMessage(reference) {
   return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
     'This usually means the UUID tail is wrong or the item belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
@@ -298,13 +302,9 @@ function resolvedDirectory(base, token) {
   return path.resolve(base, token.value)
 }
 
-/**
- * Read only the narrow commit shapes authorized by ADR 71c23b46:
- *   git commit ... -m '<message>'
- *   cd <single-path> && git commit ... -m '<message>'
- *   git -C <path> commit ... -m '<message>'
- */
-export function parseReadableCommit(command, cwd = process.cwd()) {
+const HEREDOC_DELIMITER = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function parseSimpleCommit(command, cwd = process.cwd()) {
   const tokens = lexCommand(command)
   if (!tokens || tokens.some((token) => /%[^%]+%/.test(token.value)) ||
     tokens.some((token) => token.quote !== "'" && /[$`!]/.test(token.value)) ||
@@ -317,6 +317,10 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
     if (!directory || tokens[index + 2]?.value !== '&&') return null
     targetCwd = directory
     index += 3
+  } else if (tokens[index]?.value === 'git' && tokens[index + 1]?.value === 'add') {
+    const sep = tokens.findIndex((token, idx) => idx >= index + 2 && token.value === '&&')
+    if (sep <= index + 1) return null
+    index = sep + 1
   }
 
   if (tokens[index]?.value !== 'git') return null
@@ -350,31 +354,152 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
     if (token.value === '-C' || token.value === '-c' || /^-[Cc].+/.test(token.value) ||
       token.value === '-n' || token.value === '-e' || /^-e.+/.test(token.value) ||
       token.value === '-s' || /^-s.+/.test(token.value)) return true
-    if (token.value === '-F' || /^-F.+/.test(token.value) || token.value === '-t' || /^-t.+/.test(token.value)) return true
+    if (/^-F.+/.test(token.value) || token.value === '-t' || /^-t.+/.test(token.value)) return true
     if (token.value.startsWith('-m') && token.value !== '-m') return true
     if (!token.value.startsWith('--')) return false
     const optionName = token.value.split('=', 1)[0]
+    const isExactMessageOption = token.value === '--message'
+    const isExactFileOption = token.value === '--file' || token.value.startsWith('--file=')
     return HISTORY_OPTIONS.some((option) => option.startsWith(optionName)) ||
-      MESSAGE_SOURCE_OPTIONS.some((option) => option.startsWith(optionName) &&
-        !(option === '--message' && optionName === '--message' && token.value === '--message'))
+      MESSAGE_SOURCE_OPTIONS.some((option) => option.startsWith(optionName) && !isExactMessageOption && !isExactFileOption)
   })) return null
 
   let messageToken = null
+  let fileSource = null
   for (let i = 0; i < rest.length; i += 1) {
-    if (rest[i].value !== '-m' && rest[i].value !== '--message') continue
-    if (messageToken || !rest[i + 1]?.quote) return null
-    messageToken = rest[i + 1]
-    i += 1
+    const token = rest[i]
+    if (token.value === '-m' || token.value === '--message') {
+      if (messageToken || fileSource || !rest[i + 1]?.quote) return null
+      messageToken = rest[i + 1]
+      i += 1
+      continue
+    }
+    if (token.value === '-F' || token.value === '--file') {
+      const pathToken = rest[i + 1]
+      if (messageToken || fileSource || !safeLiteralPath(pathToken)) return null
+      fileSource = { rawPath: pathToken.value, start: token.start, end: pathToken.end }
+      i += 1
+      continue
+    }
+    if (token.value.startsWith('--file=')) {
+      const rawPath = token.value.slice('--file='.length)
+      const pseudoToken = { value: rawPath, quote: token.quote }
+      if (messageToken || fileSource || !safeLiteralPath(pseudoToken)) return null
+      fileSource = { rawPath, start: token.start, end: token.end }
+    }
   }
-  if (!messageToken) return null
-  if (messageToken.quote === '"' && /[`$]/.test(messageToken.value)) return null
 
+  if (messageToken) {
+    if (messageToken.quote === '"' && /[`$]/.test(messageToken.value)) return null
+    return {
+      command,
+      targetCwd,
+      message: messageToken.value,
+      insertAt: messageToken.end - 1,
+    }
+  }
+
+  if (fileSource) {
+    const filePath = path.resolve(targetCwd, fileSource.rawPath)
+    let stat
+    try {
+      stat = fs.statSync(filePath)
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 32_768 || (stat.mode & 0o222) === 0) return null
+      fs.accessSync(filePath, fs.constants.R_OK | fs.constants.W_OK)
+    } catch {
+      return null
+    }
+    let rawMessage
+    try {
+      rawMessage = fs.readFileSync(filePath, 'utf8')
+    } catch {
+      return null
+    }
+    const message = rawMessage.replace(/\r?\n$/, '')
+    if (!message.trim()) return null
+    return {
+      command,
+      targetCwd,
+      message,
+      insertAt: null,
+      filePath,
+      fileSpan: { start: fileSource.start, end: fileSource.end },
+    }
+  }
+
+  return null
+}
+
+function parseHeredocCommit(command, cwd = process.cwd()) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 32_768 || command.includes('`')) return null
+  const open = command.indexOf('<<')
+  if (open === -1 || command.indexOf('<<', open + 2) !== -1) return null
+  const headerSlice = command.slice(open)
+  const delimMatch = /^<<[ \t]*'([A-Za-z_][A-Za-z0-9_]*)'([^\r\n]*)\r?\n/.exec(headerSlice)
+  if (!delimMatch) return null
+  const delimiter = delimMatch[1]
+  if (!HEREDOC_DELIMITER.test(delimiter)) return null
+  const headerRest = delimMatch[2] || ''
+  const bodyStart = open + delimMatch[0].length
+
+  const terminator = `\n${delimiter}`
+  let close = command.indexOf(terminator, bodyStart - 1)
+  while (close !== -1) {
+    const after = command[close + terminator.length]
+    if (after === undefined || after === '\n' || after === '\r') break
+    close = command.indexOf(terminator, close + 1)
+  }
+  if (close === -1 || close < bodyStart - 1) return null
+
+  const rawBody = command.slice(bodyStart, close)
+  const body = rawBody.endsWith('\r') ? rawBody.slice(0, -1) : rawBody
+  const head = command.slice(0, open)
+  const tail = command.slice(close + terminator.length)
+  if (head.includes('\n') || head.includes('\r')) return null
+
+  let normalised = null
+  const viaStdin = /^(?<pre>.*?)\s(?:(?:-F|--file)\s+-|--file=-)\s*$/.exec(head)
+  const viaSubstitution = /^(?<pre>.*?)\s(?:-m|--message)\s+"\$\(cat\s*$/.exec(head)
+
+  if (viaStdin) {
+    if (headerRest.trim() !== '' || tail.trim() !== '' || head.includes('$')) return null
+    normalised = `${viaStdin.groups.pre} -m 'x'`
+  } else if (viaSubstitution) {
+    const closedOnHeader = headerRest.trim() === ')"' && tail.trim() === ''
+    const closedOnTail = headerRest.trim() === '' && /^\r?\n\)"\s*$/.test(tail)
+    if (!closedOnHeader && !closedOnTail) return null
+    if (command.indexOf('$(') !== command.lastIndexOf('$(')) return null
+    if (viaSubstitution.groups.pre.includes('$')) return null
+    normalised = `${viaSubstitution.groups.pre} -m 'x'`
+  } else {
+    return null
+  }
+
+  const simple = parseSimpleCommit(normalised, cwd)
+  if (!simple || simple.message !== 'x' || simple.fileSpan) return null
+
+  const lineBreak = body.search(/\r?\n/)
+  const subjectEnd = lineBreak === -1 ? bodyStart + body.length : bodyStart + lineBreak
   return {
     command,
-    targetCwd,
-    message: messageToken.value,
-    insertAt: messageToken.end - 1,
+    targetCwd: simple.targetCwd,
+    message: body,
+    insertAt: subjectEnd,
+    bodyStart,
+    heredoc: true,
   }
+}
+
+/**
+ * Read only the narrow commit shapes authorized by ADR 71c23b46 and brief 5f9fd5dc:
+ *   git commit ... -m '<message>'
+ *   git commit ... -F - <<'DELIM' ... DELIM
+ *   git commit ... -m "$(cat <<'DELIM' ... DELIM)"
+ *   git commit ... -F <path> / --file=<path> (when <path> is an existing readable & writable file)
+ *   with optional leading `cd <single-path> &&`, `git add <pathspec...> &&`, or `git -C <path>`
+ */
+export function parseReadableCommit(command, cwd = process.cwd()) {
+  return parseSimpleCommit(command, cwd) ?? parseHeredocCommit(command, cwd)
 }
 
 export function inspectReferences(message) {
@@ -388,6 +513,23 @@ export function inspectReferences(message) {
 }
 
 export function appendReference(parsed, actionItemId) {
+  if (parsed.fileSpan) {
+    const lineBreak = parsed.message.search(/\r?\n/)
+    const subject = lineBreak === -1 ? parsed.message : parsed.message.slice(0, lineBreak)
+    const rest = lineBreak === -1 ? '' : parsed.message.slice(lineBreak)
+    const stampedMessage = `${subject}${subject ? ' ' : ''}[devspec:${actionItemId}]${rest}`
+    let delimiter = 'DEVSPEC_COMMIT_MSG'
+    let suffix = 1
+    while (stampedMessage.includes(delimiter)) {
+      delimiter = `DEVSPEC_COMMIT_MSG_${suffix++}`
+    }
+    const rewrittenFlags = `${parsed.command.slice(0, parsed.fileSpan.start)}-F -${parsed.command.slice(parsed.fileSpan.end)}`
+    return `${rewrittenFlags} <<'${delimiter}'\n${stampedMessage}\n${delimiter}`
+  }
+  if (parsed.heredoc) {
+    const subjectSlice = parsed.command.slice(parsed.bodyStart ?? 0, parsed.insertAt)
+    return `${parsed.command.slice(0, parsed.insertAt)}${subjectSlice ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
+  }
   return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
 }
 
@@ -645,7 +787,9 @@ export function handleHook(mode, data, options = {}) {
         return { permission: 'deny', user_message: message, agent_message: message }
       }).catch(() => null)
     }
-    if (eligibleClaims.length === 0) return null
+    if (eligibleClaims.length === 0) {
+      return { permission: 'deny', user_message: NO_CLAIM_MESSAGE, agent_message: NO_CLAIM_MESSAGE }
+    }
     if (eligibleClaims.length > 1) {
       return { permission: 'deny', user_message: MULTIPLE_CLAIMS_MESSAGE, agent_message: MULTIPLE_CLAIMS_MESSAGE }
     }
@@ -685,10 +829,14 @@ export function handleHook(mode, data, options = {}) {
     if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
     state.nudged_projects.push(projectId)
     writeConversationState(conversationId, state, stateRoot)
+    const nudgeMessage =
+      `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
+      'Continue working—do not stop or retry, and editing is never blocked. ' +
+      'Claim one before you commit — search_tasks for an existing item, or create_task for a thin last-mile one — and put [devspec:<full-uuid>] in the commit message. ' +
+      'Authority: devspec://product/implementation-contract.'
     return {
-      additional_context:
-        `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
-        'Continue working—do not stop or retry. When practical, search/reuse/create and claim the smallest covering item; commit linkage and server reconciliation remain authoritative.',
+      additional_context: nudgeMessage,
+      agent_message: nudgeMessage,
     }
   }
 

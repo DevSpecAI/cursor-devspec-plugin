@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.6
+
+Extended `provenance-assistance.mjs` to inspect and stamp multi-line commits (`git commit -F - <<'DELIM'`, `git commit -m "$(cat <<'DELIM' … DELIM)"`, and readable/writable `git commit -F <path>` / `--file=<path>`), deny readable unreferenced commits when no active claim is held, and emit the bounded post-edit provenance nudge on both `additional_context` and `agent_message` without promising refusal or pointing at server-side reconciliation as a fallback.
+
 ## 0.15.5
 
 Fixed held-message (`delivery_retry`) cursor handling in `remote-poll-acceptance.mjs` and `devspec-remote-poll.mjs` so a forward continuation cursor is never saved as an older-history `catch_up_cursor`, and added automatic recovery when the server refuses a pre-existing poisoned catch-up cursor.

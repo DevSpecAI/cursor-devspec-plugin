@@ -8,6 +8,7 @@ import { after, describe, it } from 'node:test'
 import {
   MALFORMED_REFERENCE_MESSAGE,
   MULTIPLE_CLAIMS_MESSAGE,
+  NO_CLAIM_MESSAGE,
   ONLINE_REFERENCE_TIMEOUT_MS,
   appendReference,
   confirmReferenceOnline,
@@ -86,7 +87,7 @@ function pre(command, cwd, stateRoot, extra = {}) {
 }
 
 describe('readable Cursor commit shapes', () => {
-  it('reads bare, cd-prefix, and git -C forms and preserves the target cwd', () => {
+  it('reads bare, cd-prefix, git add &&, and git -C forms and preserves the target cwd', () => {
     const cwd = '/workspace/main'
     const bare = parseReadableCommit("git commit -m 'ship'", cwd)
     assert.equal(bare?.targetCwd, cwd)
@@ -97,6 +98,11 @@ describe('readable Cursor commit shapes', () => {
     assert.equal(cd?.targetCwd, '/workspace/work tree')
     assert.equal(appendReference(cd, ITEM_A), `cd '../work tree' && git commit --allow-empty -m \"ship [devspec:${ITEM_A}]\"`)
 
+    const gitAdd = parseReadableCommit("git add src/index.ts && git commit -m 'ship'", cwd)
+    assert.equal(gitAdd?.targetCwd, cwd)
+    assert.equal(gitAdd?.message, 'ship')
+    assert.equal(appendReference(gitAdd, ITEM_A), `git add src/index.ts && git commit -m 'ship [devspec:${ITEM_A}]'`)
+
     const dashC = parseReadableCommit("git -C '../work tree' commit -m 'ship'", cwd)
     assert.equal(dashC?.targetCwd, '/workspace/work tree')
 
@@ -106,7 +112,94 @@ describe('readable Cursor commit shapes', () => {
     assert.equal(cursorTrailer?.message, 'ship')
   })
 
-  it('fails open for opaque, compound, history-rewriting, and expansion forms', () => {
+  it('reads -F - <<\'DELIM\', -m "$(cat <<\'DELIM\' … DELIM)", and readable/writable -F <path> multi-line forms and round-trips stamped commands through real git commit', () => {
+    const repo = tempRoot('devspec-cursor-git-roundtrip-')
+    execFileSync('git', ['-C', repo, 'init', '-q', '-b', 'main'])
+    execFileSync('git', ['-C', repo, 'config', 'user.name', 'Cursor MultiLine Test'])
+    execFileSync('git', ['-C', repo, 'config', 'user.email', 'cursor-multiline@example.invalid'])
+
+    // 1. git commit -F - <<'MSG'
+    const stdinHeredoc = [
+      "git commit --allow-empty -F - <<'MSG'",
+      'feat: multi-line via stdin heredoc',
+      '',
+      'Explain why the change is needed in the body.',
+      'MSG',
+    ].join('\n')
+    const parsedStdin = parseReadableCommit(stdinHeredoc, repo)
+    assert.equal(parsedStdin?.targetCwd, repo)
+    assert.equal(parsedStdin?.message, 'feat: multi-line via stdin heredoc\n\nExplain why the change is needed in the body.')
+    const stampedStdin = appendReference(parsedStdin, ITEM_A)
+    assert.equal(stampedStdin, [
+      "git commit --allow-empty -F - <<'MSG'",
+      `feat: multi-line via stdin heredoc [devspec:${ITEM_A}]`,
+      '',
+      'Explain why the change is needed in the body.',
+      'MSG',
+    ].join('\n'))
+    execFileSync('/bin/sh', ['-c', stampedStdin], { cwd: repo })
+    const log1 = execFileSync('git', ['-C', repo, 'log', '-1', '--format=%B'], { encoding: 'utf8' }).trim()
+    assert.equal(log1, `feat: multi-line via stdin heredoc [devspec:${ITEM_A}]\n\nExplain why the change is needed in the body.`)
+
+    // Also --file=- and cd prefix with heredoc
+    const fileEqDash = parseReadableCommit("cd . && git commit --file=- <<'EOF'\nsubject only\nEOF", repo)
+    assert.equal(fileEqDash?.message, 'subject only')
+    assert.equal(appendReference(fileEqDash, ITEM_A), `cd . && git commit --file=- <<'EOF'\nsubject only [devspec:${ITEM_A}]\nEOF`)
+
+    // 2. git commit -m "$(cat <<'MSG' ... MSG\n)" and closed-on-header form
+    const catSub = [
+      'git commit --allow-empty -m "$(cat <<\'MSG\'',
+      'fix: multi-line via cat substitution',
+      '',
+      'Second paragraph with details.',
+      'MSG',
+      ')"',
+    ].join('\n')
+    const parsedCat = parseReadableCommit(catSub, repo)
+    assert.equal(parsedCat?.targetCwd, repo)
+    assert.equal(parsedCat?.message, 'fix: multi-line via cat substitution\n\nSecond paragraph with details.')
+    const stampedCat = appendReference(parsedCat, ITEM_A)
+    assert.equal(stampedCat, [
+      'git commit --allow-empty -m "$(cat <<\'MSG\'',
+      `fix: multi-line via cat substitution [devspec:${ITEM_A}]`,
+      '',
+      'Second paragraph with details.',
+      'MSG',
+      ')"',
+    ].join('\n'))
+    execFileSync('/bin/sh', ['-c', stampedCat], { cwd: repo })
+    const log2 = execFileSync('git', ['-C', repo, 'log', '-1', '--format=%B'], { encoding: 'utf8' }).trim()
+    assert.equal(log2, `fix: multi-line via cat substitution [devspec:${ITEM_A}]\n\nSecond paragraph with details.`)
+
+    const catClosedOnHeader = parseReadableCommit('git commit --allow-empty --message "$(cat <<\'EOF\')"\nchore: header close\n\nBody.\nEOF', repo)
+    assert.equal(catClosedOnHeader?.message, 'chore: header close\n\nBody.')
+
+    // 3. git commit -F <path> / --file=<path> when <path> exists, is readable, and is writable
+    const msgFile = path.join(repo, 'COMMIT_MSG.txt')
+    fs.writeFileSync(msgFile, 'refactor: commit from file\n\nBody from file.\n', 'utf8')
+    const parsedFile = parseReadableCommit('git commit --allow-empty -F COMMIT_MSG.txt', repo)
+    assert.equal(parsedFile?.targetCwd, repo)
+    assert.equal(parsedFile?.message, 'refactor: commit from file\n\nBody from file.')
+    const stampedFile = appendReference(parsedFile, ITEM_A)
+    assert.match(stampedFile, new RegExp(`refactor: commit from file \\[devspec:${ITEM_A}\\]`))
+    execFileSync('/bin/sh', ['-c', stampedFile], { cwd: repo })
+    const log3 = execFileSync('git', ['-C', repo, 'log', '-1', '--format=%B'], { encoding: 'utf8' }).trim()
+    assert.equal(log3, `refactor: commit from file [devspec:${ITEM_A}]\n\nBody from file.`)
+
+    const parsedLongFile = parseReadableCommit('git commit --allow-empty --file=COMMIT_MSG.txt', repo)
+    assert.equal(parsedLongFile?.message, 'refactor: commit from file\n\nBody from file.')
+  })
+
+  it('fails open for opaque, compound, history-rewriting, expansion, and ambiguous multi-line forms', () => {
+    const dir = tempRoot('devspec-cursor-fail-open-')
+    const readonlyFile = path.join(dir, 'readonly.txt')
+    fs.writeFileSync(readonlyFile, 'feat: readonly message\n', 'utf8')
+    fs.chmodSync(readonlyFile, 0o444)
+    const emptyFile = path.join(dir, 'empty.txt')
+    fs.writeFileSync(emptyFile, '   \n', 'utf8')
+    const subDir = path.join(dir, 'subdir')
+    fs.mkdirSync(subDir)
+
     for (const command of [
       "cd repo && git commit -m 'x' && git push",
       "git -c user.name=x commit -m 'x'",
@@ -132,6 +225,10 @@ describe('readable Cursor commit shapes', () => {
       "git commit -m unquoted",
       "eval git commit -m 'x'",
       "git commit -F message.txt",
+      "git commit -F readonly.txt",
+      "git commit --file=readonly.txt",
+      "git commit -F empty.txt",
+      "git commit -F subdir",
       "git commit -Fmessage.txt -m 'x'",
       "git commit --file=message.txt -m 'x'",
       "git commit --fi=message.txt -m 'x'",
@@ -152,7 +249,17 @@ describe('readable Cursor commit shapes', () => {
       "git commit -m 'x' | tee out",
       "git commit -m 'x'; echo done",
       "git commit -m 'x'\necho done",
-    ]) assert.equal(parseReadableCommit(command, '/workspace'), null, command)
+      // Ambiguous multi-line / heredoc forms:
+      "git commit -F - <<MSG\nfeat: unquoted delimiter\nMSG",
+      "git commit -F - <<\"MSG\"\nfeat: double-quoted delimiter\nMSG",
+      "git commit -F - <<-'MSG'\n\tfeat: tab-stripped heredoc\nMSG",
+      "git commit -m \"$(cat <<MSG\nfeat: unquoted substitution\nMSG\n)\"",
+      "git commit -m \"$(echo <<'MSG'\nfeat: non-cat substitution\nMSG\n)\"",
+      "git commit -m \"$(cat <<'MSG'\nfeat: $(whoami)\nMSG\n)\"",
+      "git commit -F - <<'MSG'\nfeat: first\nMSG\ngit commit -F - <<'MSG2'\nfeat: second\nMSG2",
+      "git commit -F - <<'MSG'\nfeat: trailing command\nMSG\necho done",
+      "git commit --amend -F - <<'MSG'\nfeat: amend heredoc\nMSG",
+    ]) assert.equal(parseReadableCommit(command, dir), null, command)
   })
 
   it('reads every valid full reference and flags only malformed markers', () => {
@@ -372,10 +479,12 @@ describe('online reference confirmation', () => {
     assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo, resolveAuth: () => ({ ok: false }), onlineCall,
     }), null)
-    assert.equal(pre("git commit -m 'plain'", repo, stateRoot, {
+    const unreferenced = pre("git commit -m 'plain'", repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo,
       resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
-    }), null)
+    })
+    assert.equal(unreferenced?.permission, 'deny')
+    assert.equal(unreferenced?.agent_message, NO_CLAIM_MESSAGE)
     assert.equal(pre(`git commit --message=hidden -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo,
       resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
@@ -402,15 +511,45 @@ describe('online reference confirmation', () => {
 })
 
 describe('claim observation and commit decisions', () => {
-  it('accepts a valid reference without any live claim and allows no-claim/offline work', async () => {
+  it('accepts a valid reference without any live claim, denies unreferenced readable commits without a claim, and allows offline/non-commit work', async () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_B}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: null, resolveAuth: () => ({ ok: false }),
     }), null)
-    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo }), null)
+    const noClaimSingle = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
+    assert.equal(noClaimSingle?.permission, 'deny')
+    assert.equal(noClaimSingle?.agent_message, NO_CLAIM_MESSAGE)
     assert.equal(pre("git commit -m 'broken [devspec:not-a-uuid]'", repo, stateRoot, { home, repoRoot: repo })?.permission, 'deny')
     assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_name: 'Write' }), null)
+  })
+
+  it('denies without a claim and stamps with exactly one claim across all three multi-line commit shapes', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    const msgFile = path.join(repo, 'COMMIT_MSG.txt')
+    fs.writeFileSync(msgFile, 'feat: from file\n\nBody text.\n', 'utf8')
+
+    const shapes = [
+      "git commit -F - <<'MSG'\nfeat: stdin heredoc\n\nBody text.\nMSG",
+      "git commit -m \"$(cat <<'MSG'\nfeat: cat substitution\n\nBody text.\nMSG\n)\"",
+      'git commit -F COMMIT_MSG.txt',
+    ]
+
+    for (const cmd of shapes) {
+      const denied = pre(cmd, repo, stateRoot, { home, repoRoot: repo })
+      assert.equal(denied?.permission, 'deny', `expected deny without claim for: ${cmd}`)
+      assert.equal(denied?.agent_message, NO_CLAIM_MESSAGE)
+    }
+
+    observeClaim(stateRoot, ITEM_A)
+
+    for (let i = 0; i < shapes.length; i += 1) {
+      const stamped = pre(shapes[i], repo, stateRoot, { home, repoRoot: repo, tool_use_id: `ml-${i}` })
+      assert.equal(stamped?.permission, 'allow', `expected allow+stamp with one claim for: ${shapes[i]}`)
+      assert.match(stamped?.updated_input?.command || '', new RegExp(`\\[devspec:${ITEM_A}\\]`))
+      assert.match(stamped?. updated_input?.command || '', /Body text\./)
+    }
   })
 
   it('stamps exactly one observed claim through structured preToolUse updated_input', () => {
@@ -447,7 +586,10 @@ describe('claim observation and commit decisions', () => {
       { claim_success: true, project_id: '99999999-8888-7777-6666-555555555555', id: ITEM_A },
       { action_item_id: ITEM_A },
     ), { stateRoot })
-    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo }), null)
+    const output = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
+    assert.equal(output?.updated_input, undefined)
+    assert.equal(output?.permission, 'deny')
+    assert.equal(output?.agent_message, NO_CLAIM_MESSAGE)
   })
 
   it('denies only readable ambiguity with observed recovery and never terminates the turn', () => {
@@ -486,23 +628,29 @@ describe('claim observation and commit decisions', () => {
     assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((claim) => claim.id), [ITEM_B])
   })
 
-  it('expires stale claim observations and fails open for legacy timeless state', () => {
+  it('expires stale claim observations and never stamps legacy timeless state', () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     const observed = Date.parse('2026-02-01T00:00:00Z')
     observeClaim(stateRoot, ITEM_A, 'chat-a', observed)
     assert.match(pre("git commit -m 'fresh'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 1_000 })?.updated_input?.command || '', new RegExp(ITEM_A))
-    assert.equal(pre("git commit -m 'stale'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 24 * 60 * 60 * 1_000 + 1 }), null)
+    const stale = pre("git commit -m 'stale'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 24 * 60 * 60 * 1_000 + 1 })
+    assert.equal(stale?.updated_input, undefined)
+    assert.equal(stale?.permission, 'deny')
+    assert.equal(stale?.agent_message, NO_CLAIM_MESSAGE)
 
     writeConversationState('chat-old', { active_claims: [ITEM_A] }, stateRoot)
-    assert.equal(pre("git commit -m 'legacy'", repo, stateRoot, {
+    const legacy = pre("git commit -m 'legacy'", repo, stateRoot, {
       home, repoRoot: repo, conversation_id: 'chat-old', nowMs: observed + 1_000,
-    }), null)
+    })
+    assert.equal(legacy?.updated_input, undefined)
+    assert.equal(legacy?.permission, 'deny')
+    assert.equal(legacy?.agent_message, NO_CLAIM_MESSAGE)
   })
 })
 
 describe('bounded after-the-fact nudge', () => {
-  it('injects at most one postToolUse nudge per conversation/project and never blocks the edit', () => {
+  it('injects at most one postToolUse nudge per conversation/project on agent-visible channels without promising refusal or pointing at the analyser', () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     const first = handleHook('postToolUse', {
@@ -510,6 +658,10 @@ describe('bounded after-the-fact nudge', () => {
       tool_input: { path: path.join(repo, 'src', 'one.ts') },
     }, { stateRoot, pinOptions: { home, repoRoot: repo } })
     assert.match(first?.additional_context || '', /edit already completed/i)
+    assert.equal(first?.agent_message, first?.additional_context)
+    assert.match(first?.agent_message || '', /search_tasks|create_task/)
+    assert.match(first?.agent_message || '', /\[devspec:<full-uuid>\]/)
+    assert.doesNotMatch(first?.agent_message || '', /refused|reconciliation|analy[sz]er/i)
     assert.equal(first?.permission, undefined)
     const second = handleHook('postToolUse', {
       conversation_id: 'chat-a', tool_name: 'Edit', tool_use_id: 'edit-2', cwd: repo,
