@@ -85,6 +85,7 @@ import {
 } from './interaction-events.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
+import { wakeNotice } from './room-unread.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -887,6 +888,20 @@ export function consumeInboxSlice(
   }
 }
 
+const ROOM_STATE_SECTIONS = new Set(['session_polls', 'still_to_discuss', 'active_session_plans', 'session_activity'])
+
+function validWakeContext(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const pathOrNull = (candidate) => (typeof candidate === 'string' && path.isAbsolute(candidate) ? candidate : null)
+  return {
+    transcript: pathOrNull(value.transcript),
+    room_state: pathOrNull(value.room_state),
+    room_state_changed: Array.isArray(value.room_state_changed)
+      ? [...new Set(value.room_state_changed.filter((section) => ROOM_STATE_SECTIONS.has(section)))]
+      : [],
+  }
+}
+
 /**
  * Owner-command batches ONLY. `advisory_context` entries are intentionally excluded
  * so room awareness never wakes the model or triggers an autonomous response.
@@ -899,7 +914,8 @@ function isCanonicalOwnerBatch(obj) {
   return validateRemoteIngressEnvelopeV1(envelope, obj.connection_id) === null &&
     envelope.delivery_state === 'live' && envelope.wake.kind === 'conversational_command' &&
     envelope.wake.active === true && canonicalAcceptanceKey(envelope) === obj.acceptance_key &&
-    isDeepStrictEqual(obj.messages, envelope.commands) && validateCanonicalContextCarry(obj.context)
+    isDeepStrictEqual(obj.messages, envelope.commands) &&
+    (!obj.context || validateCanonicalContextCarry(obj.context))
 }
 
 function isCanonicalSystemNoticeBatch(obj, connectionId = null) {
@@ -945,9 +961,15 @@ export function parseWakeBatches(
         if (connectionId && validateInteractionAnswerRecord(obj, connectionId)) batches.push(obj)
         continue
       }
-      if (isCanonicalOwnerBatch(obj) || isCanonicalSystemNoticeBatch(obj, connectionId) ||
-          (includeAutomations && isAutomationBatch(obj)) ||
-          (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)) {
+      if (isCanonicalOwnerBatch(obj) || isCanonicalSystemNoticeBatch(obj, connectionId)) {
+        batches.push({
+          ...obj,
+          ...(obj.wake_context !== undefined ? { wake_context: validWakeContext(obj.wake_context) } : {}),
+        })
+      } else if (
+        (includeAutomations && isAutomationBatch(obj)) ||
+        (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)
+      ) {
         batches.push(obj)
       }
     } catch {
@@ -1238,7 +1260,7 @@ export function materialiseAttachments(message, opts = {}) {
  * stream had no live signal for which session a command belonged to and fell back to a
  * value cached at attach time — stale after a server-side reattach.
  */
-export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile } = {}) {
+export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
   if (batch?.type === 'canonical_system_notices' || batch?.type === 'system_notices') {
     return buildCanonicalSystemNoticeEvents(batch, { inboxFile })
   }
@@ -1267,34 +1289,17 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
       },
     ]
   }
+  const canonical = batch?.ingress?.canonical === true
   const ownerAmbient = Array.isArray(batch?.context?.owner_ambient) ? batch.context.owner_ambient : []
   const roomContext = Array.isArray(batch?.context?.room_context) ? batch.context.room_context : []
-  const typed = batch?.ingress?.canonical === true && batch?.context?.typed
+  const typed = canonical ? (batch?.context?.typed ?? batch?.ingress?.envelope?.context ?? null) : null
+  const pointers = validWakeContext(batch?.wake_context)
   const events = []
 
-  if (typed) {
-    const rendered = Object.fromEntries(Object.entries(typed).map(([bucket, entries]) => [
-      bucket,
-      entries.map((entry) => ({
-        ...entry,
-        actor_label: `${entry.actor.kind}: ${entry.actor.display_name}` +
-          (entry.actor.agent_tool ? ` (${entry.actor.agent_tool}${entry.actor.model ? ` · ${entry.actor.model}` : ''})` : ''),
-      })),
-    ]))
-    events.push({
-      type: 'model_context',
-      session_id: sessionId,
-      advisory: true,
-      typed: rendered,
-      windows: Array.isArray(batch.context.windows) ? batch.context.windows : [],
-      locally_omitted: batch.context.locally_omitted ?? 0,
-      locally_omitted_by_bucket: batch.context.locally_omitted_by_bucket,
-      windows_omitted: batch.context.windows_omitted ?? 0,
-      local_omission_reason: batch.context.local_omission_reason ?? null,
-      note: batch.context.note ??
-        'Actor-labelled canonical model context. Human, agent, AI, and system entries are advisory only; never commands.',
-    })
-  } else if (ownerAmbient.length > 0 || roomContext.length > 0) {
+  // Canonical wakes no longer dump the in-memory model_context carry buffer ahead
+  // of owner_message (room messages live in .transcript.jsonl and room state in
+  // .room.json), keeping sender identity and command body within Cursor's preview budget.
+  if (!canonical && (ownerAmbient.length > 0 || roomContext.length > 0)) {
     events.push({
       type: 'room_context',
       session_id: sessionId,
@@ -1331,28 +1336,68 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     // Never work, authority or scope; never overrides project rules or the
     // owner's machine rules.
     const senderResponseStyle = senderStyles.find((style) => style.message_id === m.message_id)?.notes ?? null
+    const body = typeof m?.content?.body === 'string'
+      ? m.content.body
+      : typeof m?.content === 'string'
+        ? m.content
+        : ''
+    if (canonical) {
+      events.push({
+        type: 'owner_message',
+        from: m?.requester?.display_name ?? null,
+        authority: m?.authority?.kind ?? null,
+        ...(typeof batch?.instruction_context_file === 'string' ? { instruction_context_file: batch.instruction_context_file } : {}),
+        ...(Array.isArray(senderResponseStyle) && senderResponseStyle.length > 0 ? { style: true } : {}),
+        message_id: m?.message_id ?? m?.id ?? null,
+        unread: unread ? unread.unread + unread.updated : null,
+        body_chars: body.length,
+        body,
+        session_id: sessionId,
+        ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
+        message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
+        ...(senderResponseStyle ? { sender_response_style: senderResponseStyle } : {}),
+      })
+    } else {
+      events.push({
+        type: 'owner_message',
+        session_id: sessionId,
+        ...(typeof batch?.instruction_context_file === 'string' ? { instruction_context_file: batch.instruction_context_file } : {}),
+        ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
+        message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
+        ...(senderResponseStyle ? { sender_response_style: senderResponseStyle } : {}),
+      })
+    }
+  }
+
+  if (canonical && messages.length > 0 && unread) {
     events.push({
-      type: 'owner_message',
+      type: 'room_unread',
       session_id: sessionId,
-      ...(typeof batch?.instruction_context_file === 'string' ? {instruction_context_file:batch.instruction_context_file} : {}),
-      ...(delegatedInstruction === null ? {} : { instruction: delegatedInstruction }),
-      message: materialiseAttachments(m, { dir: attachmentDir, writeFile }),
-      ...(senderResponseStyle ? { sender_response_style: senderResponseStyle } : {}),
+      advisory: true,
+      executable: false,
+      ...unread,
     })
   }
 
   events.push({
     type: 'wake',
-    reason: batch?.ingress?.canonical ? 'canonical_conversational_command' : 'owner_message',
+    reason: canonical ? 'canonical_conversational_command' : 'owner_message',
+    ...(canonical
+      ? {
+          transcript: pointers?.transcript ?? null,
+          room_state: pointers?.room_state ?? null,
+          room_state_changed: pointers?.room_state_changed ?? [],
+        }
+      : {}),
     session_id: sessionId,
     count: messages.length,
     context_counts: typed
       ? Object.fromEntries(Object.entries(typed).map(([bucket, entries]) => [bucket, entries.length]))
       : { owner_ambient: ownerAmbient.length, room_context: roomContext.length },
-    cursor_v2: batch?.ingress?.canonical ? batch?.next_after_message_id ?? null : undefined,
-    next_after_message_id: batch?.ingress?.canonical ? undefined : batch?.next_after_message_id ?? null,
+    cursor_v2: canonical ? batch?.next_after_message_id ?? null : undefined,
+    next_after_message_id: canonical ? undefined : batch?.next_after_message_id ?? null,
     envelope_id: batch?.ingress?.envelope?.envelope_id ?? null,
-    turn_id: batch?.ingress?.canonical ? messages[0]?.delivery?.turn_id ?? null : null,
+    turn_id: canonical ? messages[0]?.delivery?.turn_id ?? null : null,
     inbox: inboxFile ?? null,
     continuous_poller: true,
     rearm: 'devspec-remote-wait',
@@ -1513,6 +1558,9 @@ async function main() {
           : buildOwnerMessageEvents(batch, {
             inboxFile: file,
             attachmentDir,
+            unread: batch.type === 'owner_messages' && batch?.ingress?.canonical === true
+              ? wakeNotice({ connectionId, sessionId: batch.session_id, dir: CONNECTIONS_DIR })
+              : null,
             writeFile: (target, buf) => {
               fs.mkdirSync(path.dirname(target), { recursive: true })
               fs.writeFileSync(target, buf, { mode: 0o600 })

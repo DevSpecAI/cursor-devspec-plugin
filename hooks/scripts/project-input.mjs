@@ -22,6 +22,7 @@ import {
   toolArguments,
 } from './project-context.mjs'
 import { readOwnConnectionState, withOwnConnection } from './own-connection.mjs'
+import { prePostHoldReason } from './room-unread.mjs'
 import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 
@@ -66,6 +67,19 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
           )
         }
         projectPatch = { project_id: selected.project.id }
+      }
+
+      if (
+        namespaced === 'post_session_message' &&
+        args.phase !== 'trail' &&
+        args.phase !== 'needs_input'
+      ) {
+        const holdReason = prePostHoldReason({
+          input,
+          env,
+          ...(home ? { home } : {}),
+        })
+        if (holdReason) return deny(holdReason)
       }
 
       const connState = readOwnConnectionState(id, { ...(home ? { home } : {}), env })

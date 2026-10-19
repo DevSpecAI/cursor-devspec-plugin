@@ -112,22 +112,41 @@ describe('parseOwnerBatches', () => {
 })
 
 describe('canonical one-command-turn wake', () => {
-  it('renders every typed context bucket as actor-labelled advisory data', () => {
+  it('omits the in-memory model_context carry buffer ahead of owner_message and keeps sender identity + body inside the 500-char preview budget', () => {
     const typed = emptyFixtureContext()
     for (const [index, kind] of ['human', 'agent', 'ai', 'system'].entries()) {
       typed[`${kind}_context`].push(fixtureContextEntry({ sequence: index + 2, kind, content: `${kind} context` }))
     }
-    const batch = canonicalBatch()
+    const batch = canonicalBatch(fixtureCommand('x'.repeat(2000)), {
+      wake_context: {
+        transcript: '/tmp/conn.sess.transcript.jsonl',
+        room_state: '/tmp/conn.room.json',
+        room_state_changed: ['session_polls'],
+      },
+    })
     batch.context.typed = typed
-    batch.context.locally_omitted = 3
-    batch.context.locally_omitted_by_bucket.ai_context = 3
-    batch.context.local_omission_reason = 'model_budget'
-    const events = buildOwnerMessageEvents(batch)
-    const context = events[0]
-    assert.equal(context.type, 'model_context')
-    assert.equal(context.advisory, true)
-    assert.equal(context.locally_omitted, 3)
-    for (const bucket of Object.keys(typed)) assert.match(context.typed[bucket][0].actor_label, /:/)
+    const unread = {
+      unread: 2,
+      updated: 1,
+      to_you: 1,
+      oldest_at: '2026-10-06T13:00:00Z',
+      by: { 'Ali Price': 3 },
+      read_with: 'node room-unread.mjs read --connection-id c',
+    }
+    const events = buildOwnerMessageEvents(batch, { unread })
+    assert.deepEqual(events.map((e) => e.type), ['owner_message', 'room_unread', 'wake'])
+    assert.equal(events.some((e) => e.type === 'model_context'), false)
+    const ownerLine = JSON.stringify(events[0])
+    const cut = ownerLine.slice(0, 500)
+    assert.ok(cut.includes(`"from":${JSON.stringify(batch.messages[0].requester.display_name)}`))
+    assert.ok(cut.includes('"authority":"owner"'))
+    assert.ok(cut.includes(`"message_id":${JSON.stringify(batch.messages[0].message_id)}`))
+    assert.ok(cut.includes('"unread":3'))
+    assert.ok(cut.includes('"body_chars":2000'))
+    assert.ok(cut.includes('"body":"xxxx'))
+    assert.equal(events.at(-1).transcript, '/tmp/conn.sess.transcript.jsonl')
+    assert.equal(events.at(-1).room_state, '/tmp/conn.room.json')
+    assert.deepEqual(events.at(-1).room_state_changed, ['session_polls'])
     assert.equal(events.at(-1).turn_id, '77777777-7777-4777-8777-777777777777')
     assert.equal(events.at(-1).envelope_id, FIXTURE_ID.envelope)
   })
