@@ -114,7 +114,7 @@ function tokenNotFoundError(log, { urlOnly = false } = {}) {
   const looked = formatLookedIn(log)
   const unreadable = [...new Set((log?.entries || []).filter((e) => e.status === 'unreadable').map((e) => e.path))]
   const hint =
-    'Run: node scripts/setup-cursor.mjs --token <your DevSpec token> (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.'
+    'Run: node scripts/setup-cursor.mjs (reading DEVSPEC_MCP_TOKEN, stdin, or ~/.devspec/auth.json to write ~/.cursor/mcp.json).'
   if (unreadable.length) {
     return `Found a DevSpec MCP config but could not parse it: ${unreadable.join(', ')}.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
   }

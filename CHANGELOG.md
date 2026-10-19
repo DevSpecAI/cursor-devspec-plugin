@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.2
+
+`manage-question-bridge.mjs` now accepts `keep_turn` on `create` so batched independent questions pass validation, and `scripts/setup-cursor.mjs` rejects `--token` on the command line in favour of `DEVSPEC_MCP_TOKEN`, standard input, or `~/.devspec/auth.json`.
+
 ## 0.15.1
 
 When Cursor has several independent choices for the same person, it now asks them together instead of one at a time, so they can be answered in one sitting and in any order. A question that depends on an earlier answer still waits for that answer.

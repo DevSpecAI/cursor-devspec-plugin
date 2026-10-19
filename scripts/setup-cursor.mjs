@@ -18,11 +18,13 @@
  * manifest; --refresh after an update rewrites it with the URL, and never
  * touches the credentials.
  *
- *   node scripts/setup-cursor.mjs --token dvs_…
- *   node scripts/setup-cursor.mjs --token dvs_… --api-url https://api.devspecstaging.com
  *   DEVSPEC_MCP_TOKEN=dvs_… node scripts/setup-cursor.mjs
+ *   printf '%s' "$DEVSPEC_MCP_TOKEN" | node scripts/setup-cursor.mjs
+ *   node scripts/setup-cursor.mjs --api-url https://api.devspecstaging.com   # reads ~/.devspec/auth.json or env
  *
- * Other servers in the file are preserved. The token is never printed back.
+ * Never pass a token on the command line (--token is rejected so tokens never
+ * land in process listings or shell history). Other servers in the file are
+ * preserved. The token is never printed back.
  */
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -40,12 +42,74 @@ export function parseArgs(argv) {
     const arg = argv[i]
     const eq = arg.indexOf('=')
     const [flag, inline] = eq === -1 ? [arg, null] : [arg.slice(0, eq), arg.slice(eq + 1)]
-    if (flag === '--token') out.token = inline ?? argv[++i]
+    if (flag === '--token') {
+      out.rejectedTokenFlag = true
+      if (inline === null && argv[i + 1] && !argv[i + 1].startsWith('--')) i++
+    } else if (flag === '--token-stdin') out.tokenStdin = true
     else if (flag === '--api-url') out.apiUrl = inline ?? argv[++i]
     else if (flag === '--home') out.home = inline ?? argv[++i]
     else if (flag === '--refresh') out.refresh = true
   }
   return out
+}
+
+export async function readPinnedAuth(home) {
+  if (!home) return null
+  try {
+    const raw = await fs.readFile(path.join(home, '.devspec', 'auth.json'), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    const token = typeof parsed.token === 'string' ? parsed.token.trim() : ''
+    let apiUrl = typeof parsed.api_url === 'string' ? parsed.api_url.trim() : ''
+    if (!apiUrl && typeof parsed.mcp_url === 'string' && parsed.mcp_url.trim()) {
+      try {
+        apiUrl = new URL(parsed.mcp_url.trim()).origin
+      } catch {
+        apiUrl = ''
+      }
+    }
+    return token ? { token, apiUrl: apiUrl || null } : null
+  } catch {
+    return null
+  }
+}
+
+export async function readStdinToken(stream = process.stdin, { timeoutMs = 50 } = {}) {
+  if (!stream || stream.isTTY) return ''
+  return new Promise((resolve) => {
+    const chunks = []
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      stream.removeListener('data', onData)
+      stream.removeListener('end', onEnd)
+      stream.removeListener('error', onEnd)
+      if (typeof stream.pause === 'function') stream.pause()
+      const text = Buffer.concat(chunks).toString('utf8').trim()
+      if (!text) return resolve('')
+      if (text.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(text)
+          return resolve(typeof parsed?.token === 'string' ? parsed.token.trim() : '')
+        } catch {
+          return resolve('')
+        }
+      }
+      resolve(text)
+    }
+    const onData = (chunk) => {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+    }
+    const onEnd = () => finish()
+    const timer = setTimeout(finish, timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    stream.on('data', onData)
+    stream.once('end', onEnd)
+    stream.once('error', onEnd)
+    if (typeof stream.resume === 'function') stream.resume()
+  })
 }
 
 /** A token is identified by shape, never echoed: first four and last four. */
@@ -97,12 +161,18 @@ export function refreshMcpEntry(existing, { url, identification = pluginHeaders(
  */
 export const MCP_ENDPOINT_QUERY = '?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection'
 
-export function resolveInputs({ args, env }) {
-  const token = (args.token ?? env.DEVSPEC_MCP_TOKEN ?? env.DEVSPEC_TOKEN ?? '').trim()
-  const base = (args.apiUrl ?? env.DEVSPEC_API_URL ?? DEFAULT_API_URL).trim().replace(/\/+$/, '')
+export function resolveInputs({ args = {}, env = {}, stdinToken = '', pinnedAuth = null }) {
+  if (args.rejectedTokenFlag) {
+    throw new Error(
+      'Do not pass --token on the command line (command-line arguments are visible to other local processes and shell history). ' +
+        'Set DEVSPEC_MCP_TOKEN, pipe the token on stdin, or store it in ~/.devspec/auth.json.',
+    )
+  }
+  const token = (stdinToken || env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || pinnedAuth?.token || '').trim()
+  const base = (args.apiUrl ?? env.DEVSPEC_API_URL ?? pinnedAuth?.apiUrl ?? DEFAULT_API_URL).trim().replace(/\/+$/, '')
   if (!token) {
     throw new Error(
-      'No token. Pass --token dvs_… or set DEVSPEC_MCP_TOKEN.\n' +
+      'No token. Set DEVSPEC_MCP_TOKEN, pipe the token on stdin, or store it in ~/.devspec/auth.json.\n' +
         `Create one on DevSpec's Agents page: ${agentsPageUrl(base, { env })} (Create your token, then pick Read & write).`,
     )
   }
@@ -140,11 +210,14 @@ async function main(argv, env, homedir) {
     changed = refreshed.changed
     config.mcpServers[SERVER_KEY] = refreshed.entry
   } else {
-    ({ token, url } = resolveInputs({ args, env }))
+    const pinnedAuth = await readPinnedAuth(home)
+    const hasEnvOrPinned = Boolean((env.DEVSPEC_MCP_TOKEN || env.DEVSPEC_TOKEN || pinnedAuth?.token || '').trim())
+    const stdinToken = args.tokenStdin || !hasEnvOrPinned ? await readStdinToken(process.stdin) : ''
+    ;({ token, url } = resolveInputs({ args, env, stdinToken, pinnedAuth }))
     ;({ config, changed } = mergeMcpConfig(existing, { url, token }))
   }
-  await fs.mkdir(path.dirname(file), { recursive: true })
-  await fs.writeFile(file, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+  await fs.writeFile(file, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
 
   const others = Object.keys(config.mcpServers).filter((k) => k !== SERVER_KEY)
   console.log(`${changed ? 'Registered' : 'Already registered'} DevSpec MCP in ${file}`)

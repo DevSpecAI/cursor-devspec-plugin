@@ -111,11 +111,42 @@ describe('setup-cursor', () => {
     assert.match(fp, /^dvs_….*\(\d+ chars\)$/)
   })
 
-  it('parses --flag=value as well as --flag value', () => {
-    assert.deepEqual(parseArgs(['--token=abc', '--api-url', 'https://x']), { token: 'abc', apiUrl: 'https://x' })
+  it('parses --flag=value as well as --flag value and flags --token for rejection', () => {
+    assert.deepEqual(parseArgs(['--api-url=https://x', '--home', '/tmp/h']), { apiUrl: 'https://x', home: '/tmp/h' })
+    assert.deepEqual(parseArgs(['--token=abc', '--api-url', 'https://x']), { rejectedTokenFlag: true, apiUrl: 'https://x' })
+    assert.deepEqual(parseArgs(['--token', 'abc', '--api-url', 'https://x']), { rejectedTokenFlag: true, apiUrl: 'https://x' })
   })
 
-  it('end to end: creates the file, preserves a neighbour, and prints no token', async () => {
+  it('rejects --token on the command line so tokens do not land in argv or shell history', () => {
+    assert.throws(
+      () => resolveInputs({ args: parseArgs(['--token', 'dvs_secret']), env: {} }),
+      /Do not pass --token on the command line/,
+    )
+    assert.throws(
+      () => resolveInputs({ args: parseArgs(['--token=dvs_secret']), env: {} }),
+      /Do not pass --token on the command line/,
+    )
+  })
+
+  it('reads token and API URL from ~/.devspec/auth.json or stdin when env is unset', async () => {
+    await withHome(async (home) => {
+      await fs.mkdir(path.join(home, '.devspec'), { recursive: true })
+      await fs.writeFile(
+        path.join(home, '.devspec', 'auth.json'),
+        JSON.stringify({ token: 'dvs_from_auth_json_file', mcp_url: 'https://api.devspecstaging.com/api/mcp' }),
+        'utf8',
+      )
+      await run('node', [SCRIPT, '--home', home])
+      const written = JSON.parse(await fs.readFile(path.join(home, '.cursor', 'mcp.json'), 'utf8'))
+      assert.equal(written.mcpServers.devspec.headers.Authorization, 'Bearer dvs_from_auth_json_file')
+      assert.equal(
+        written.mcpServers.devspec.url,
+        'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection',
+      )
+    })
+  })
+
+  it('end to end: creates the file from env without --token, preserves a neighbour, and prints no token', async () => {
     await withHome(async (home) => {
       await fs.mkdir(path.join(home, '.cursor'), { recursive: true })
       await fs.writeFile(
@@ -123,7 +154,9 @@ describe('setup-cursor', () => {
         JSON.stringify({ mcpServers: { neighbour: { url: 'https://n/mcp' } } }),
         'utf8',
       )
-      const { stdout } = await run('node', [SCRIPT, '--token', 'dvs_endtoendtokenvalue', '--home', home])
+      const { stdout } = await run('node', [SCRIPT, '--home', home], {
+        env: { ...process.env, DEVSPEC_MCP_TOKEN: 'dvs_endtoendtokenvalue' },
+      })
       const written = JSON.parse(await fs.readFile(path.join(home, '.cursor', 'mcp.json'), 'utf8'))
       assert.equal(written.mcpServers.devspec.headers.Authorization, 'Bearer dvs_endtoendtokenvalue')
       assert.equal(written.mcpServers.devspec.headers['x-devspec-plugin'], IDENTIFICATION)
@@ -155,7 +188,7 @@ describe('setup-cursor', () => {
       const file = path.join(home, '.cursor', 'mcp.json')
       await fs.writeFile(file, '{ this is not json', 'utf8')
       await assert.rejects(
-        run('node', [SCRIPT, '--token', 'dvs_token', '--home', home]),
+        run('node', [SCRIPT, '--home', home], { env: { ...process.env, DEVSPEC_MCP_TOKEN: 'dvs_token' } }),
         (err) => /could not be parsed/.test(err.stderr),
       )
       assert.equal(await fs.readFile(file, 'utf8'), '{ this is not json')

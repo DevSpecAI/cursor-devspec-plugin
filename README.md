@@ -100,11 +100,10 @@ edit you make. Add a `devspec` entry to your Cursor MCP config file:
 
 Use `https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection` for staging (its Agents page is [app.devspecstaging.com/settings/agents](https://app.devspecstaging.com/settings/agents)). This is the plugin's fixed tool view, not a project preference.
 
-If you have a clone of this repo, the same edit is scripted — it merges into an existing file
-rather than replacing it, and never echoes your token back:
+If you have a clone of this repo, the same edit is scripted — it reads your token from `DEVSPEC_MCP_TOKEN`, `~/.devspec/auth.json`, or standard input (never pass a token as a `--token` command-line flag, which exposes it in process listings and shell history), merges into an existing file rather than replacing it, and never echoes your token back:
 
 ```bash
-node scripts/setup-cursor.mjs --token dvs_…            # or set DEVSPEC_MCP_TOKEN
+DEVSPEC_MCP_TOKEN=dvs_… node scripts/setup-cursor.mjs
 node scripts/setup-cursor.mjs --api-url https://api.devspecstaging.com
 ```
 
