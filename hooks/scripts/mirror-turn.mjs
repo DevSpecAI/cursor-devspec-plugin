@@ -47,11 +47,28 @@ import {
   rotateRequestLog,
   UNSTATED,
 } from './requests.mjs'
+import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+
+function patchOwnState(connectionId, patch) {
+  const file = path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+  if (!connectionId || !fs.existsSync(file)) return false
+  try {
+    const existing = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (!existing || typeof existing !== 'object') return false
+    const next = { ...existing, ...patch, updated_at: new Date().toISOString() }
+    const tmp = `${file}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+    fs.renameSync(tmp, file)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Turn marker — the connected agent is the SOLE authority for the "working" state.
 // UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The long-lived
@@ -305,7 +322,10 @@ export function isHarnessInjection(text) {
     t.includes('<system_notification>') ||
     t.includes('Arm wait FIRST as a background Shell') ||
     t.includes('devspec-wake-tail.mjs') ||
-    t.includes('devspec-remote-wait')
+    t.includes('devspec-remote-wait') ||
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+      t,
+    )
   )
 }
 
@@ -334,7 +354,9 @@ export function promptOrigin(hookInput, text = null) {
     t.includes('<task-notification') ||
     t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
     t.includes('This is an automated background-task event') ||
-    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch)"/.test(t)
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+      t,
+    )
   ) {
     return 'task-notification'
   }
@@ -557,6 +579,35 @@ async function main() {
   }
 
   try {
+    // A prompt typed at this terminal opens the owner's own turn, admitted with the
+    // connection capability BEFORE the model starts, so every write it makes names
+    // the owner as the person who asked (item b59a201c, local-turn.mjs). Nothing
+    // else does: a room command carries its own requester, a background wake
+    // continues the turn that is already open, and a scheduled firing was asked for
+    // by nobody at this moment.
+    if (fromAPerson && connectionId && sessionId && text && String(text).trim()) {
+      const scope = localTurnScope(
+        { ...state, connection_capability: connectionCapability },
+        sessionId,
+      )
+      if (scope) {
+        const admitted = await startLocalTurn({
+          scope,
+          previousAttemptId: state.local_turn?.attempt_id ?? null,
+          call: (args) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability,
+              name: 'report_pickup',
+              arguments: args,
+              timeoutMs: 10_000,
+            }),
+        })
+        if (admitted) patchOwnState(connectionId, { local_turn: admitted })
+      }
+    }
+
     if (typedRequest && connectionCapability) {
       const opened = await openRequest({
         connectionId,
@@ -664,6 +715,7 @@ async function main() {
         // follow's poll interval, and the turn the answer starts owns the completion.
         stopDecisionAction = decision.action
         if (decision.action !== 'hold') {
+          const localAttempt = localTurnToComplete(state.local_turn, sessionId)
           try {
             await mcpToolsCall({
               mcpUrl,
@@ -679,7 +731,9 @@ async function main() {
                     reason: 'turn_end',
                     ...continuationIdentity(decision.continuation),
                   }
-                : { connection_id: connectionId, reason: 'turn_end' },
+                : localAttempt
+                  ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
+                  : { connection_id: connectionId, reason: 'turn_end' },
               timeoutMs: 15_000,
             })
             if (decision.action === 'complete') clearInteractionContinuation(connectionId)
@@ -694,6 +748,7 @@ async function main() {
           } catch {
             /* non-fatal — the poller's marker-driven backstop still runs */
           }
+          if (state.local_turn) patchOwnState(connectionId, { local_turn: null })
         }
       }
     }

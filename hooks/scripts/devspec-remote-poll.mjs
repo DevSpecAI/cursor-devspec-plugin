@@ -130,6 +130,7 @@ import {
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
 import { openRequest } from './requests.mjs'
+import { attachmentFromPoll } from './local-turn.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -1919,8 +1920,23 @@ async function main() {
         ingress_catch_up_cursor: null,
         ingress_context_carry: canonicalCarry,
         active_session_plans: null,
+        speech_attachment_id: null,
+        attached_at: null,
       })
       continue
+    }
+
+    // The prompt hook admits the owner's terminal turns against this exact
+    // attachment (item b59a201c, local-turn.mjs). Compared with the FILE rather than
+    // memory, so a record lost to a concurrent hook write is put back on the next poll.
+    const attachmentRecord = attachmentFromPoll(res)
+    const recorded = readState(connectionId)
+    if (
+      recorded &&
+      ((recorded.speech_attachment_id ?? null) !== attachmentRecord.speech_attachment_id ||
+        (recorded.attached_at ?? null) !== attachmentRecord.attached_at)
+    ) {
+      patchState(attachmentRecord)
     }
 
     // Directed-question answers first: an event-only response deliberately carries no

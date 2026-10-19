@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.3
+
+Admit owner-typed terminal turns with `report_pickup` (`local_activity_version: 1`, `local_turn: true`, and exact room attachment from `poll_connection`) using the connection capability in `hooks/scripts/local-turn.mjs`, `hooks/scripts/mirror-turn.mjs`, and `hooks/scripts/devspec-remote-poll.mjs`, complete that exact attempt on Stop, and ensure room commands and background wakes open no terminal turn.
+
 ## 0.16.2
 
 Add per-connection request ledger (`hooks/scripts/requests.mjs`, `hooks/scripts/request-ref.mjs`, `hooks/scripts/own-connection.mjs`, `hooks/scripts/launch-guard.mjs`) and mechanical stamping in `hooks/scripts/project-input.mjs` for `connection_id`, `provenance_ref`, `request_ref`, and `local_turn` across DevSpec MCP calls, stripping model-supplied `request_ref`, opening/closing requests across `devspec-remote-poll.mjs`, `devspec-remote-wait.mjs`, `mirror-turn.mjs`, and `mark-explicit-reply.mjs`, and refusing writes and background launches on undecided multi-requester turns until disambiguated via `requests.mjs serve`.
