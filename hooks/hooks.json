@@ -33,6 +33,12 @@
       },
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/launch-guard.mjs\"",
+        "matcher": "^(Bash|Shell|Agent|Task|Workflow|Monitor|ScheduleWakeup|CronCreate)$",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" preToolUse",
         "timeout": 5
       },
@@ -47,6 +53,12 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\"",
         "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" background_launch",
+        "matcher": "^(Bash|Shell|Agent|Task|Workflow|Monitor|ScheduleWakeup|CronCreate)$",
+        "timeout": 10
       },
       {
         "type": "command",

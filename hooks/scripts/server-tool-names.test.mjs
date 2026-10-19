@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
+import { REQUEST_REF_TOOLS } from './request-ref.mjs'
 
 const SELF = fileURLToPath(import.meta.url)
 const ROOT = path.resolve(path.dirname(SELF), '../..')
@@ -50,20 +51,27 @@ function serverCheckout() {
   }
 }
 
-let serverNames = null
-function serverToolNames(root) {
-  if (serverNames) return serverNames
+let serverTools = null
+function serverToolList(root) {
+  if (serverTools) return serverTools
   const tsx = path.join(root, 'node_modules/.bin/tsx')
   assert.ok(fs.existsSync(tsx), `${root} has no node_modules/.bin/tsx; run npm ci there`)
   const script = `import { getMcpAllTools } from ${JSON.stringify(path.join(root, DEFINITIONS))}
-process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => tool.name)))`
+process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => ({
+  name: tool.name,
+  requestRef: Boolean(tool.inputSchema?.properties?.request_ref),
+}))))`
   const out = execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
   })
-  serverNames = new Set(JSON.parse(out))
-  return serverNames
+  serverTools = JSON.parse(out)
+  return serverTools
+}
+
+function serverToolNames(root) {
+  return new Set(serverToolList(root).map((tool) => tool.name))
 }
 
 function referencedNames() {
@@ -87,9 +95,9 @@ function referencedNames() {
   return found
 }
 
-function pairedServer(t) {
+function pairedServer(t, read = serverToolNames) {
   const checkout = serverCheckout()
-  if (checkout.root && fs.existsSync(path.join(checkout.root, DEFINITIONS))) return serverToolNames(checkout.root)
+  if (checkout.root && fs.existsSync(path.join(checkout.root, DEFINITIONS))) return read(checkout.root)
   if (checkout.named) assert.fail(`DEVSPEC_V2_ROOT names ${checkout.root}, which has no ${DEFINITIONS}`)
   t.skip('no devspecv2 checkout beside this repo')
   return null
@@ -115,5 +123,18 @@ describe('DevSpec tools this plugin names', () => {
       assert.ok(found.has(name), `${name} is set aside but nothing here names it any more; remove it`)
       assert.ok(!server.has(name), `${name} is set aside but it is a DevSpec tool now; remove it so it is checked`)
     }
+  })
+})
+
+describe('the DevSpec writes that record who asked', () => {
+  // request-ref.mjs refuses one of these while a turn carries two people's requests
+  // (item 56ba1b79), so the list must be the server's: a write missing from it
+  // would be credited by guess, and a read on it refused for nothing.
+  it('are exactly the tools that take request_ref', (t) => {
+    const tools = pairedServer(t, serverToolList)
+    if (!tools) return
+    const server = tools.filter((tool) => tool.requestRef).map((tool) => tool.name).sort()
+    if (server.length === 0) return t.skip('this server predates request_ref (item 7a4d04fd)')
+    assert.deepEqual([...REQUEST_REF_TOOLS].sort(), server)
   })
 })

@@ -84,6 +84,7 @@ import {
   validateInteractionAnswerRecord,
 } from './interaction-events.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
+import { recordDeliveredBatchRequests } from './requests.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1546,6 +1547,7 @@ async function main() {
         }
         offset = newOffset
         offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+        recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

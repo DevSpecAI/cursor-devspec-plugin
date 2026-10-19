@@ -129,6 +129,7 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
+import { openRequest } from './requests.mjs'
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -1442,6 +1443,33 @@ async function main() {
     return { lane: true, delivered }
   }
 
+  async function openCommandRequests(commands) {
+    const connectionCapability = readConnectionCapability(connectionId)
+    if (!connectionCapability) return
+    const call = (args) => mcpToolsCall({
+      mcpUrl,
+      token,
+      connectionCapability,
+      name: 'report_request',
+      arguments: args,
+      timeoutMs: 5_000,
+    })
+    for (const command of Array.isArray(commands) ? commands : []) {
+      try {
+        await openRequest({
+          connectionId,
+          kind: 'command',
+          provenanceRef: command?.delivery?.provenance_ref,
+          messageId: command?.message_id,
+          call,
+          dir: CONNECTIONS_DIR,
+        })
+      } catch {
+        /* an unopened request changes nothing that worked before */
+      }
+    }
+  }
+
   let lastIngressAccepted = false
 
   /** Accept one server response atomically across canonical, automation, control and cursor lanes. */
@@ -1506,6 +1534,7 @@ async function main() {
       canonicalCarry = nextCarry
     } else if (accepted.canonicalWake) {
       instructionContextFile = refreshRepositoryRules(readState(connectionId)?.local_id, res)
+      await openCommandRequests(envelope.commands)
       const context = {
         advisory: true,
         typed: nextCarry.context,

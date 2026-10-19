@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.2
+
+Add per-connection request ledger (`hooks/scripts/requests.mjs`, `hooks/scripts/request-ref.mjs`, `hooks/scripts/own-connection.mjs`, `hooks/scripts/launch-guard.mjs`) and mechanical stamping in `hooks/scripts/project-input.mjs` for `connection_id`, `provenance_ref`, `request_ref`, and `local_turn` across DevSpec MCP calls, stripping model-supplied `request_ref`, opening/closing requests across `devspec-remote-poll.mjs`, `devspec-remote-wait.mjs`, `mirror-turn.mjs`, and `mark-explicit-reply.mjs`, and refusing writes and background launches on undecided multi-requester turns until disambiguated via `requests.mjs serve`.
+
 ## 0.16.1
 
 Negotiate `system_notice_version: 2` in `devspec-remote-poll.mjs`, validate and wake on `server_notice` and `unlinked_commit_item_review` notices (with graceful degradation for unknown future notice kinds) in `remote-ingress-v1.mjs` and `devspec-remote-wait.mjs` (`REMOTE_WAKE_NOTIFY_PATTERN` includes `system_notice`), surface `register_connection`'s `github_identity` in `repository-context.mjs`, `remote-control-state.mjs`, and `fast-connect.mjs`, and update `skills/devspec.remote/SKILL.md`, `rules/devspec.mdc`, `README.md`, and `docs/remote-control/remote-control-cursor.md` for Protecting Intent (`waiting_for_ok` / Experiment branches, immediate action on clear user authority, Review decision tools, and the decision capture bar).

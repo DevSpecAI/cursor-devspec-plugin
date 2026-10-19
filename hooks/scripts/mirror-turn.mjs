@@ -33,8 +33,23 @@ import {
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { recordRuntimeReport } from './agent-telemetry.mjs'
+import {
+  absentLaunches,
+  appendRequestEvent,
+  closeRequest,
+  launchForRequest,
+  openRequest,
+  promptArrival,
+  readRequestState,
+  requestFinished,
+  requestForLaunch,
+  requestsWithWorkPending,
+  rotateRequestLog,
+  UNSTATED,
+} from './requests.mjs'
 
-const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
+const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
+const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -294,6 +309,114 @@ export function isHarnessInjection(text) {
   )
 }
 
+const PROMPT_ORIGINS_OF_A_PERSON = new Set(['composer', 'bridge', 'sdk'])
+
+/** The running turn a prompt was submitted into, or null. */
+export function promptTurnId(hookInput) {
+  try {
+    const turnId = JSON.parse(hookInput || '{}')?.turn_id
+    return typeof turnId === 'string' && turnId ? turnId : null
+  } catch {
+    return null
+  }
+}
+
+export function promptOrigin(hookInput, text = null) {
+  try {
+    const kind = JSON.parse(hookInput || '{}')?.origin?.kind
+    if (typeof kind === 'string') return kind
+  } catch {
+    /* fall through */
+  }
+  const t = String(text ?? '')
+  if (!t.trim()) return null
+  if (
+    t.includes('<task-notification') ||
+    t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
+    t.includes('This is an automated background-task event') ||
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch)"/.test(t)
+  ) {
+    return 'task-notification'
+  }
+  if (!isHarnessInjection(t)) return 'composer'
+  return null
+}
+
+/** True when a prompt came from a person (explicit composer/bridge/sdk origin or non-harness terminal prompt). */
+export function promptCameFromAPerson(hookInput, text = null) {
+  try {
+    const parsed = JSON.parse(hookInput || '{}')
+    if (parsed?.origin && typeof parsed.origin === 'object' && typeof parsed.origin.kind === 'string') {
+      return PROMPT_ORIGINS_OF_A_PERSON.has(parsed.origin.kind)
+    }
+  } catch {
+    return false
+  }
+  const resolved = text ?? extractLastText(hookInput, 'user_prompt')
+  return Boolean(resolved && String(resolved).trim() && !isHarnessInjection(resolved))
+}
+
+export function parseBackgroundTasks(hookInput) {
+  try {
+    const data = JSON.parse(hookInput || '{}')
+    return Array.isArray(data.background_tasks) ? data.background_tasks : null
+  } catch {
+    return null
+  }
+}
+
+export function parseSessionCrons(hookInput) {
+  try {
+    const data = JSON.parse(hookInput || '{}')
+    return Array.isArray(data.session_crons) ? data.session_crons : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * PostToolUse for a call that left work running or set up a wake: record which
+ * request it belongs to (item 56ba1b79, requests.mjs), so the wake it causes later
+ * continues that request.
+ */
+export function recordRequestLaunch(raw, { load = loadState, dir = CONNECTIONS_DIR } = {}) {
+  let input
+  try {
+    input = JSON.parse(raw || '{}')
+  } catch {
+    return false
+  }
+  const toolName = input?.tool_name ?? input?.toolName ?? input?.tool ?? null
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.arguments ?? input?.args ?? null
+  const toolResponse = input?.tool_response ?? input?.toolResponse ?? input?.result ?? input?.output ?? null
+  const toolUseId = input?.tool_use_id ?? input?.toolUseId ?? input?.call_id ?? null
+  const launch = launchForRequest(toolName, toolInput, toolResponse, toolUseId)
+  if (!launch) return false
+  const state = load(resolveHookConversationId(raw))
+  if (!state?.connection_id) return false
+  const agentId = typeof input?.agent_id === 'string' && input.agent_id ? input.agent_id : null
+  const { request, also } = requestForLaunch(readRequestState(state.connection_id, { dir }), agentId)
+  return launch.schedule
+    ? appendRequestEvent(
+        state.connection_id,
+        { op: 'schedule', prompt: launch.prompt, id: launch.id, request, also },
+        { dir },
+      )
+    : appendRequestEvent(
+        state.connection_id,
+        {
+          op: 'launch',
+          key: launch.key,
+          alias: launch.alias,
+          kind: launch.kind,
+          notifies: launch.notifies,
+          request,
+          also,
+        },
+        { dir },
+      )
+}
+
 const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
 
 /**
@@ -356,6 +479,15 @@ export function prepareAgentMirrorText(text) {
 
 async function main() {
   const raw = readStdin()
+  if (mode === 'background_launch') {
+    try {
+      recordRequestLaunch(raw)
+    } catch {
+      /* an unrecorded launch only means its wake is credited as nobody's request */
+    }
+    process.exit(0)
+  }
+
   const conversationId = resolveHookConversationId(raw)
   const state = loadState(conversationId)
   if (!state) process.exit(0)
@@ -375,11 +507,42 @@ async function main() {
   const connectionId = state.connection_id
   const sessionId = state.session_id || null // null = sessionless (no room to mirror into)
   const localId = state.local_id || null
+  const connectionCapability = state.connection_capability || readConnectionCapability(connectionId)
+  const callRequest = (args, timeoutMs = 5_000) =>
+    mcpToolsCall({
+      mcpUrl,
+      token,
+      connectionCapability,
+      name: 'report_request',
+      arguments: args,
+      timeoutMs,
+    })
+
   // The model Cursor says this turn runs, for the Agents page (item cc47378e).
   recordRuntimeReport(connectionId, raw)
 
   const text = extractLastText(raw, mode)
-  const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || isHarnessInjection(text))
+  const fromAPerson = mode === 'user_prompt' && promptCameFromAPerson(raw, text)
+  const origin = mode === 'user_prompt' ? promptOrigin(raw, text) : null
+  const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || !fromAPerson)
+
+  let typedRequest = null
+  if (mode === 'user_prompt' && connectionId && (fromAPerson || origin)) {
+    try {
+      const midTurn = promptTurnId(raw) !== null
+      const arrival = promptArrival({
+        fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
+        origin,
+        text,
+        midTurn,
+        state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
+      })
+      for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
+      if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }
+    } catch {
+      /* an unrecorded request only leaves DevSpec to resolve who asked itself */
+    }
+  }
 
   // Consume any explicit-reply marker so it cannot bleed into a later turn.
   // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
@@ -394,6 +557,19 @@ async function main() {
   }
 
   try {
+    if (typedRequest && connectionCapability) {
+      const opened = await openRequest({
+        connectionId,
+        kind: 'typed_prompt',
+        call: callRequest,
+        dir: CONNECTIONS_DIR,
+        id: typedRequest.id,
+      }).catch(() => null)
+      if (!opened && typedRequest.midTurn) {
+        appendRequestEvent(connectionId, { op: 'joined', id: UNSTATED }, { dir: CONNECTIONS_DIR })
+      }
+    }
+
     // LOCAL PROMPT only: mirror owner text typed in the terminal into the room
     // when attached (two-sided transcript). Agent Stop text is NOT posted here —
     // the skill must post_session_message the direct answer (prefer connection_id).
@@ -445,6 +621,7 @@ async function main() {
     // marker so the poller re-asserts); stop ends it (busy:false + clear marker).
     // Marker is keyed by connection_id (the poller reads it by connection_id).
     const turnActive = mode === 'user_prompt'
+    let stopDecisionAction = null
     if (turnActive) writeTurnMarker(connectionId)
     else clearTurnMarker(connectionId)
 
@@ -485,13 +662,14 @@ async function main() {
         // 'hold' completes nothing at all: the answer is still in flight, and closing
         // the connection's current attempt now would close THAT one. The window is the
         // follow's poll interval, and the turn the answer starts owns the completion.
+        stopDecisionAction = decision.action
         if (decision.action !== 'hold') {
           try {
             await mcpToolsCall({
               mcpUrl,
               token,
               ...(decision.action === 'complete'
-                ? { connectionCapability: readConnectionCapability(connectionId) }
+                ? { connectionCapability }
                 : {}),
               name: 'report_complete',
               arguments: decision.action === 'complete'
@@ -518,6 +696,35 @@ async function main() {
           }
         }
       }
+    }
+
+    if (mode === 'stop' && connectionId && connectionCapability) {
+      const requests = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
+      const backgroundTasks = parseBackgroundTasks(raw)
+      if (requests.open.size > 0) {
+        const pending = requestsWithWorkPending(requests, {
+          backgroundTasks,
+          sessionCrons: parseSessionCrons(raw),
+        })
+        const awaitingAnswer = stopDecisionAction === 'hold' ? requests.current : null
+        const finished = [...requests.open.keys()].filter(
+          (id) => requestFinished(requests, id, pending) && id !== awaitingAnswer,
+        )
+        await Promise.all(
+          finished.map((requestId) =>
+            closeRequest({
+              connectionId,
+              requestId,
+              call: (args) => callRequest(args, 3_000),
+              dir: CONNECTIONS_DIR,
+            }),
+          ),
+        )
+      }
+      for (const key of absentLaunches(requests, backgroundTasks)) {
+        appendRequestEvent(connectionId, { op: 'absent', key }, { dir: CONNECTIONS_DIR })
+      }
+      rotateRequestLog(connectionId, { dir: CONNECTIONS_DIR })
     }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)
