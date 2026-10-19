@@ -11,6 +11,7 @@ import {
   buildPollCursorArgs,
   inspectPollResponseV1,
   automationAcceptanceKey,
+  automationRunInstruction,
 } from './remote-poll-acceptance.mjs'
 import { canonicalAcceptanceKey, validateRemoteIngressEnvelopeV1 } from './remote-ingress-v1.mjs'
 import {
@@ -248,5 +249,20 @@ describe('poll acceptance integration seam', () => {
     assert.equal(executed.executed, true)
     assert.equal(executed.ackId, control.id)
     assert.deepEqual(buildPollCursorArgs({ controlAck: executed.ackId }), { control_ack: control.id })
+  })
+
+  it('renders delivery_connection_id in both claim_automation_run and record_automation_run and drops provider/model prose', () => {
+    const dispatch = fixtureAutomationDispatch()
+    const prompt = automationRunInstruction(dispatch)
+    assert.match(
+      prompt,
+      new RegExp(`claim_automation_run\\(\\{ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}" \\}\\)`),
+    )
+    assert.match(
+      prompt,
+      new RegExp(`record_automation_run\\(\\{ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}"`),
+    )
+    assert.doesNotMatch(prompt, /always pass provider/i)
+    assert.doesNotMatch(prompt, /provider:\s*"cursor"/i)
   })
 })

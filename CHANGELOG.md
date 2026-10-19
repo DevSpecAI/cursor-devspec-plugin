@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.3
+
+When an automation run is dispatched to a Cursor connection, the run prompt now passes `connection_id` to both `claim_automation_run` and `record_automation_run` and drops the retired `provider`/`model` instruction.
+
 ## 0.15.2
 
 `manage-question-bridge.mjs` now accepts `keep_turn` on `create` so batched independent questions pass validation, and `scripts/setup-cursor.mjs` rejects `--token` on the command line in favour of `DEVSPEC_MCP_TOKEN`, standard input, or `~/.devspec/auth.json`.

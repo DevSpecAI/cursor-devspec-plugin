@@ -323,9 +323,9 @@ export function automationRunInstruction(dispatch) {
     `Owner: ${ownerName}`,
     '',
     'What to do:',
-    `1. claim_automation_run({ run_id: "${dispatch.run_id}", provider: "cursor" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}" }) — follow the tool's own description for its arguments. If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Follow the instruction returned by that claim, in this repo.',
-    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    `3. record_automation_run({ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}", ... }) — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts (follow the tool's own description).`,
     '',
     `Permission: ${permission}`,
   ].join('\n')
