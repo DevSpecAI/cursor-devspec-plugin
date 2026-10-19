@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.5
+
+Add `hooks/scripts/commit-observation.mjs` (`preToolUse` and `postToolUse` on `Shell` / `Bash`) to observe direct Git commits and report newly created commit SHAs to DevSpec with the connection capability (`X-DevSpec-Connection-Capability`), add `hooks/scripts/pin-check.mjs` to validate `.devspec/project.json` after writes or edits and surface corrective feedback when malformed or missing `project_id`, and add `hooks/scripts/repo-link-nudge.mjs` (`hooks/scripts/devspec-scope.mjs`) to nudge once per conversation, project, and remote when a newly created or re-pointed `origin` is not yet linked to the pinned DevSpec project.
+
 ## 0.16.4
 
 Materialize local room transcripts (`<connectionId>.<sessionId>.transcript.jsonl`) and room state (`<connectionId>.room.json` including `session_polls`, `still_to_discuss`, `active_session_plans`, `system_notices`, and `session_activity`) in `hooks/scripts/room-transcript.mjs` and `hooks/scripts/devspec-remote-poll.mjs`, add `hooks/scripts/room-unread.mjs` with separate `.read.json` and `.presented.json` watermarks, bounded oldest-first `read`, `postToolUse` unread counts, and one-shot `post_session_message` holds in `hooks/scripts/project-input.mjs`, and stop dumping `model_context` ahead of `owner_message` in `hooks/scripts/devspec-remote-wait.mjs` so sender identity and command body stay within Cursor's notification preview budget.

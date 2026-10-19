@@ -46,6 +46,12 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
         "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-observation.mjs\" pre",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
       }
     ],
     "postToolUse": [
@@ -69,6 +75,30 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
         "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-observation.mjs\" post",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *remote*|*'repo create'*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\" ;; esac; exit 0",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
+        "matcher": "^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$",
+        "timeout": 10
       },
       {
         "type": "command",
