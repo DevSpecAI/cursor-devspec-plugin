@@ -60,10 +60,12 @@
  *       launch defers it until after agent --resume)
  *   node remote-control-state.mjs manage-plan describe
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-plan use
+ *   node remote-control-state.mjs manage-poll describe
+ *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-poll use
  *   node remote-control-state.mjs manage-question describe|status
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-question use
  *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs manage-question respond
- *     → capability-bound manage_plan for THIS Cursor conversation (no identity args)
+ *     → capability-bound manage_plan / manage_poll / manage_directed_question for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -96,6 +98,10 @@ import {
   persistConnectionCapability,
   useManagePlanBridge,
 } from './manage-plan-bridge.mjs'
+import {
+  describeManagePollBridge,
+  useManagePollBridge,
+} from './manage-poll-bridge.mjs'
 import {
   describeManageQuestionBridge,
   manageQuestionStatus,
@@ -1962,6 +1968,36 @@ async function runCli() {
     // --connection-id / --local-id / --capability escape hatch on this command.
     const localId = detectLocalId({}, process.env).local_id
     const result = await useManagePlanBridge(input, {
+      localId,
+      agent: AGENT_NAME,
+      hostToken: hostTokenFromEnv(process.env),
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
+  if (cmd === 'manage-poll') {
+    const action = args._[1] || 'describe'
+    if (action === 'describe') {
+      process.stdout.write(JSON.stringify(describeManagePollBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    if (action !== 'use') {
+      process.stderr.write('Usage: remote-control-state.mjs manage-poll describe|use\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write('manage-poll use requires one JSON object on stdin\n')
+      process.exit(2)
+    }
+    // Identity is host-derived only: no --connection-id / --local-id / --capability
+    // escape hatch on this command, and no directed-question turn/wake machinery.
+    const localId = detectLocalId({}, process.env).local_id
+    const result = await useManagePollBridge(input, {
       localId,
       agent: AGENT_NAME,
       hostToken: hostTokenFromEnv(process.env),

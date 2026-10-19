@@ -10,12 +10,21 @@ import { connectionVersionHook } from './connection-version.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules } from './repository-context.mjs'
 import { UUID, firingConversation, namespacedVerb, isDevspecServer as isServer, PROJECTLESS, readProjectContext, selectProjectContext, candidate, toolArguments } from './project-context.mjs'
+const CAPABILITY_BRIDGE_HELPERS = {
+  manage_plan: 'manage-plan',
+  manage_poll: 'manage-poll',
+  manage_directed_question: 'manage-question',
+}
 const deny = message => ({ permission: 'deny', user_message: message, agent_message: message })
 export function projectInput(mode, input, { home } = {}) {
   const name = input?.tool_name ?? input?.toolName
   const namespaced = namespacedVerb(name)
   if (mode === 'pre') {
     if (!namespaced) return connectionVersionHook(input)
+    if (CAPABILITY_BRIDGE_HELPERS[namespaced]) {
+      const helper = CAPABILITY_BRIDGE_HELPERS[namespaced]
+      return deny(`${namespaced} requires the per-connection capability header. Use \`remote-control-state.mjs ${helper} describe\` and \`remote-control-state.mjs ${helper} use\` instead of calling it over global MCP.`)
+    }
     const versions = connectionVersionHook({ ...input, tool_name: namespaced })?.updated_input ?? {}
     if (PROJECTLESS.has(namespaced)) return Object.keys(versions).length ? { updated_input: versions } : null
     const id = firingConversation(input)
@@ -55,6 +64,10 @@ export function projectInput(mode, input, { home } = {}) {
   if (namespaced && !isServer(input?.mcp_server_name)) return deny('A DevSpec-namespaced tool was routed to another MCP server. Check the MCP configuration; no request was sent.')
   if (!isServer(input?.mcp_server_name)) return null
   const verb = namespaced ?? String(name ?? '')
+  if (CAPABILITY_BRIDGE_HELPERS[verb]) {
+    const helper = CAPABILITY_BRIDGE_HELPERS[verb]
+    return deny(`${verb} requires the per-connection capability header. Use \`remote-control-state.mjs ${helper} describe\` and \`remote-control-state.mjs ${helper} use\` instead of calling it over global MCP.`)
+  }
   if (PROJECTLESS.has(verb)) return null
   const id = firingConversation(input)
   if (!id) return deny('Cursor did not provide this conversation’s identity. Restart the agent before using DevSpec.')

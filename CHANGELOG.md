@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.4
+
+Added the capability-bound `remote-control-state.mjs manage-poll describe|use` bridge beside `manage-plan` so attached Cursor connections can create and manage session polls without exposing connection identity or invoking directed-question turn machinery.
+
 ## 0.15.3
 
 When an automation run is dispatched to a Cursor connection, the run prompt now passes `connection_id` to both `claim_automation_run` and `record_automation_run` and drops the retired `provider`/`model` instruction.

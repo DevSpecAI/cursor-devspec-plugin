@@ -277,6 +277,17 @@ printf '%s' '<one JSON object matching the described schema>' | node "$PLUGIN/ho
 
 An active own plan must be continued, completed, explicitly left for supported handoff/adoption, or abandoned; never silently restart it. Prefer atomic `advance` over separate complete/start calls. Complete only when the outcome is achieved; otherwise abandon with a specific reason.
 
+### Session polls (attached connections only)
+
+Session polls use the same capability-bound bridge shape as plans (`manage_poll` requires the per-connection capability header, and global MCP calls fail closed):
+
+```bash
+node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-poll describe
+printf '%s' '<one JSON object matching the described schema>' | node "$PLUGIN/hooks/scripts/remote-control-state.mjs" manage-poll use
+```
+
+A poll is a non-blocking room ballot (`create`, `list`, `get`, `update`, `end`, `retract`, `supersede`), never a blocking agent driver — it does not end or hold the turn or use directed-question wake machinery. Never pass `connection_id`, `local_id`, or `capability`; existing-poll mutations require `poll_id` and `expected_revision`, and `create`/`supersede` require `client_request_id`.
+
 ### Asking one person a question (attached connections only)
 
 Ask the driver when a decision is genuinely theirs: an unresolved choice, an authority boundary, a fork where two readings lead to materially different work. Anything the recorded intent, the acceptance criteria or the served contracts settle is yours to get on with, as is anything you could go and observe — a question is never a way to hand judgement work back. Ask independent choices for the same person together rather than one per turn, so they answer in one sitting and in any order; a question that depends on an earlier answer waits until that answer arrives.

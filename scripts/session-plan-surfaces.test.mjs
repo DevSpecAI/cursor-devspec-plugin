@@ -118,7 +118,7 @@ describe('Cursor shared-session-plan surfaces', () => {
   it('keeps capability-bound helpers discoverable through the normal Remote skill', () => {
     // Standalone launching now invokes the installed skill, not a plugin-owned
     // launcher-generated thin brief. The full host instructions remain intact.
-    for (const command of ['manage-plan describe', 'manage-question describe', 'manage-question respond']) {
+    for (const command of ['manage-plan describe', 'manage-poll describe', 'manage-question describe', 'manage-question respond']) {
       assert.ok(remoteSkill.includes(command), `${command} must remain discoverable`)
     }
     assert.match(remoteSkill, /complete schema.*on demand|bounded on-demand discovery/i)
