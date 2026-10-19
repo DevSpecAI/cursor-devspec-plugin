@@ -95,6 +95,7 @@ import {
   buildPollCursorArgs,
   hasAcceptedKey,
   inspectPollResponseV1,
+  isCatchUpCursorRefusal,
   automationAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
@@ -1571,7 +1572,7 @@ async function main() {
       ingress_continuation: {
         truncated: envelope.window.truncated,
         has_more: envelope.window.has_more,
-        catch_up_cursor: envelope.window.next_cursor,
+        catch_up_cursor: catchUpCursor,
         fetch_id: envelope.window.fetch_id,
         omission_reason: envelope.window.omission_reason,
       },
@@ -1716,6 +1717,13 @@ async function main() {
         )
         await offlineAndExit('owner_gone', 1)
         return
+      }
+      if (catchUpCursor && isCatchUpCursorRefusal(e)) {
+        process.stderr.write('devspec-remote-poll: server refused the catch-up cursor; re-reading the room\n')
+        catchUpCursor = null
+        needsSeed = true
+        patchState({ ingress_catch_up_cursor: null })
+        continue
       }
       consecutiveErrors++
       const rateLimited = /rate limit/i.test(e?.message || '')

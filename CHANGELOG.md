@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.5
+
+Fixed held-message (`delivery_retry`) cursor handling in `remote-poll-acceptance.mjs` and `devspec-remote-poll.mjs` so a forward continuation cursor is never saved as an older-history `catch_up_cursor`, and added automatic recovery when the server refuses a pre-existing poisoned catch-up cursor.
+
 ## 0.15.4
 
 Added the capability-bound `remote-control-state.mjs manage-poll describe|use` bridge beside `manage-plan` so attached Cursor connections can create and manage session polls without exposing connection identity or invoking directed-question turn machinery.
