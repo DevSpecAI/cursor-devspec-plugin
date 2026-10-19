@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { startDiagnostics, stopDiagnostics, exportDiagnostics } from './local-diagnostics.mjs'
 import { fixture, ID } from '../../tests/helpers/local-diagnostics.mjs'
-const options = { mcpUrl: 'https://example.invalid/mcp', token: 'SYMBOLIC_TOKEN', name: 'get_action_item', arguments: { connection_id: ID, message: 'SYMBOLIC_PRIVATE' } }
+const options = { mcpUrl: 'https://example.invalid/mcp', token: 'SYMBOLIC_TOKEN', name: 'get_task', arguments: { connection_id: ID, message: 'SYMBOLIC_PRIVATE' } }
 const reply = () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }), { status: 200 })
 
 test('enabled MCP timing counts bytes and outcomes without an extra request or changed result', () => fixture(async ({ events }) => {

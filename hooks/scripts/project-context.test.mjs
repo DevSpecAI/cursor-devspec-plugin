@@ -55,9 +55,9 @@ test('registration uses the firing Cursor identity and learns only a valid serve
 })
 test('blocked and corrupt state never silently fall through',()=>{
  blockProjectContext('chat',endpoint,'Choose a project',home,true)
- assert.equal(projectInput('pre',hook('MCP:devspec__get_action_items'),{home}).permission,'deny')
+ assert.equal(projectInput('pre',hook('MCP:devspec__get_tasks'),{home}).permission,'deny')
  fs.writeFileSync(contextFile('chat',home),'broken')
- assert.equal(projectInput('pre',hook('MCP:devspec__get_action_items'),{home}).permission,'deny')
+ assert.equal(projectInput('pre',hook('MCP:devspec__get_tasks'),{home}).permission,'deny')
 })
 test('register sends greenfield pin as a hint and preserves structured ambiguity',async()=>{
  fs.mkdirSync(path.join(cwd,'.devspec'));fs.writeFileSync(path.join(cwd,'.devspec','project.json'),JSON.stringify({project_id:B.id}))
@@ -82,7 +82,7 @@ test('commit checks prefer conversation scope while keeping folder pins as hints
 })
 test('native text-block claim receipts keep their project and exclude foreign servers',()=>{
  const item='33333333-3333-4333-8333-333333333333'
- const input={tool_name:'devspec__claim_work_item',mcp_server_name:'devspec',tool_input:JSON.stringify({action_item_id:item,pinned_project_id:A.id}),result_json:JSON.stringify({content:[{type:'text',text:JSON.stringify({claim_success:true,project_id:B.id,id:item})}],isError:false})}
+ const input={tool_name:'devspec__claim_work_item',mcp_server_name:'devspec',tool_input:JSON.stringify({task_id:item,pinned_project_id:A.id}),result_json:JSON.stringify({content:[{type:'text',text:JSON.stringify({claim_success:true,project_id:B.id,id:item})}],isError:false})}
  assert.equal(parseMcpExecution(input).successful,true)
  assert.equal(parseMcpExecution(input).projectId,B.id)
  assert.equal(parseMcpExecution({...input,mcp_server_name:'foreign'}).successful,false)

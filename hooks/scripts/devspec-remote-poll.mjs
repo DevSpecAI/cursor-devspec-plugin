@@ -23,7 +23,7 @@
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
  * (optional shared context). Both poll the same canonical connection endpoint;
  * attachment affects transcript context and replies, not authority or work
- * acquisition. Action-item work never arrives through ingress: agents reserve the
+ * acquisition. Task work never arrives through ingress: agents reserve the
  * requested ids, then claim them under the served implementation contract.
  * Attach/detach is picked up live from the server, so the poller adapts without a
  * restart — local state is never used to override server attachment authority.
@@ -1129,7 +1129,7 @@ async function main() {
   // --- THE tick: heartbeat + canonical ingress + independent automations ---------
   // Exact-target command authority is enforced server-side and revalidated against
   // the canonical envelope here. That is what stops one agent acting on another's
-  // command [devspec:3e76a6cc]; action-item work never enters this response.
+  // command [devspec:3e76a6cc]; task work never enters this response.
   async function pollOnce({ waitMs, busy, checkTier, catchUp = false }) {
     // Directed-question answers are an independent lane, negotiated only while this
     // connection holds the capability the claim, the ACK and the continuation start

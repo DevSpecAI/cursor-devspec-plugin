@@ -55,10 +55,10 @@ describe('poll acceptance integration seam', () => {
     assert.equal(automationAcceptanceKey(automation), `automation:${automation.run_id}`)
   })
 
-  it('rejects action-item/unknown dispatches rather than reviving assignment delivery', () => {
-    const actionAssignment = { ...fixtureAutomationDispatch(), kind: 'action_item_assignment' }
+  it('rejects task/unknown dispatches rather than reviving assignment delivery', () => {
+    const taskAssignment = { ...fixtureAutomationDispatch(), kind: 'task_assignment' }
     const accepted = inspectPollResponseV1(
-      fixturePollResponse({ dispatches: [actionAssignment] }),
+      fixturePollResponse({ dispatches: [taskAssignment] }),
       FIXTURE_ID.connection,
     )
     assert.equal(accepted.ok, false)

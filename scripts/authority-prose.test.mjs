@@ -72,7 +72,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /devspec:\/\/product\/remote-ingress-contract/, file)
       assert.match(content, /devspec:\/\/product\/implementation-contract/, file)
       assertInOrder(content, 'reserve_work_items', 'claim_work_item', file)
-      assert.match(content, /nothing (?:is (?:ever )?sent work|sends action-item work)/i, file)
+      assert.match(content, /nothing (?:is (?:ever )?sent work|sends task work)/i, file)
     }
   })
 

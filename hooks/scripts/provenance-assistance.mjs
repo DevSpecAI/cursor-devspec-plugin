@@ -107,6 +107,17 @@ function emptyState(conversationId) {
   }
 }
 
+function normalizePendingStamps(rawPending) {
+  if (!rawPending || typeof rawPending !== 'object' || Array.isArray(rawPending)) return {}
+  const normalized = {}
+  for (const [toolUseId, entry] of Object.entries(rawPending)) {
+    const taskId = cleanUuid(entry?.task_id)
+    const at = cleanString(entry?.at)
+    if (taskId && at) normalized[toolUseId] = { task_id: taskId, at }
+  }
+  return normalized
+}
+
 export function readConversationState(conversationId, stateRoot = defaultStateRoot()) {
   if (!conversationId) return null
   try {
@@ -122,9 +133,7 @@ export function readConversationState(conversationId, stateRoot = defaultStateRo
           .filter((claim) => claim.id && claim.project_id && claim.observed_at)
         : [],
       nudged_projects: Array.isArray(parsed.nudged_projects) ? parsed.nudged_projects.filter((id) => typeof id === 'string') : [],
-      pending_stamps: parsed.pending_stamps && typeof parsed.pending_stamps === 'object' && !Array.isArray(parsed.pending_stamps)
-        ? parsed.pending_stamps
-        : {},
+      pending_stamps: normalizePendingStamps(parsed.pending_stamps),
     }
   } catch {
     return emptyState(conversationId)
@@ -512,12 +521,12 @@ export function inspectReferences(message) {
   }
 }
 
-export function appendReference(parsed, actionItemId) {
+export function appendReference(parsed, taskId) {
   if (parsed.fileSpan) {
     const lineBreak = parsed.message.search(/\r?\n/)
     const subject = lineBreak === -1 ? parsed.message : parsed.message.slice(0, lineBreak)
     const rest = lineBreak === -1 ? '' : parsed.message.slice(lineBreak)
-    const stampedMessage = `${subject}${subject ? ' ' : ''}[devspec:${actionItemId}]${rest}`
+    const stampedMessage = `${subject}${subject ? ' ' : ''}[devspec:${taskId}]${rest}`
     let delimiter = 'DEVSPEC_COMMIT_MSG'
     let suffix = 1
     while (stampedMessage.includes(delimiter)) {
@@ -528,9 +537,9 @@ export function appendReference(parsed, actionItemId) {
   }
   if (parsed.heredoc) {
     const subjectSlice = parsed.command.slice(parsed.bodyStart ?? 0, parsed.insertAt)
-    return `${parsed.command.slice(0, parsed.insertAt)}${subjectSlice ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
+    return `${parsed.command.slice(0, parsed.insertAt)}${subjectSlice ? ' ' : ''}[devspec:${taskId}]${parsed.command.slice(parsed.insertAt)}`
   }
-  return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
+  return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${taskId}]${parsed.command.slice(parsed.insertAt)}`
 }
 
 /**
@@ -611,35 +620,35 @@ function toolFields(data) {
 }
 
 function claimedItemId(args) {
-  return cleanUuid(args?.action_item_id) || cleanUuid(args?.actionItemId) || cleanUuid(args?.id)
+  return cleanUuid(args?.task_id) || cleanUuid(args?.taskId) || cleanUuid(args?.id)
 }
 
 function resultItemValues(result) {
   return [
     result?.id,
-    result?.action_item_id,
-    result?.action_item?.id,
+    result?.task_id,
+    result?.task?.id,
     result?.work_item?.id,
     result?.item?.id,
     result?.data?.id,
-    result?.data?.action_item_id,
-    result?.data?.action_item?.id,
+    result?.data?.task_id,
+    result?.data?.task?.id,
     result?.result?.id,
-    result?.result?.action_item_id,
-    result?.result?.action_item?.id,
+    result?.result?.task_id,
+    result?.result?.task?.id,
   ].map(cleanString).filter(Boolean)
 }
 
 function resultProjectValues(result) {
   return [
     result?.project_id,
-    result?.action_item?.project_id,
+    result?.task?.project_id,
     result?.work_item?.project_id,
     result?.item?.project_id,
     result?.data?.project_id,
-    result?.data?.action_item?.project_id,
+    result?.data?.task?.project_id,
     result?.result?.project_id,
-    result?.result?.action_item?.project_id,
+    result?.result?.task?.project_id,
   ].map(cleanString).filter(Boolean)
 }
 
@@ -653,9 +662,9 @@ function structuredStatuses(result) {
     result?.outcome,
     result?.claim_status,
     result?.lifecycle,
-    result?.action_item?.status,
-    result?.action_item?.state,
-    result?.action_item?.lifecycle,
+    result?.task?.status,
+    result?.task?.state,
+    result?.task?.lifecycle,
     result?.work_item?.status,
     result?.item?.status,
     result?.data?.status,
@@ -682,7 +691,7 @@ export function parseMcpExecution(data) {
     ? parseJsonObject(envelope.content.filter(block => block.type === 'text').map(block => block.text).join('\n'))
     : envelope
   const requestedId = claimedItemId(args)
-  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) return { verb, args, successful: false, actionItemId: requestedId, projectId: null }
+  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) return { verb, args, successful: false, taskId: requestedId, projectId: null }
   const rawProjects = resultProjectValues(result)
   const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
   const projectId = rawProjects.length === returnedProjects.length && returnedProjects.length &&
@@ -695,7 +704,7 @@ export function parseMcpExecution(data) {
     const returned = rawReturned.map(cleanUuid).filter(Boolean)
     const successful = result.claim_success === true && Boolean(requestedId) && Boolean(projectId) && projectAgrees &&
       rawReturned.length === returned.length && returned.length > 0 && returned.every((id) => id === requestedId)
-    return { verb, args, successful, actionItemId: requestedId, projectId }
+    return { verb, args, successful, taskId: requestedId, projectId }
   }
   const allowedStatuses = {
     record_implementation: new Set(['success', 'ok', 'implemented', 'done']),
@@ -707,7 +716,7 @@ export function parseMcpExecution(data) {
     (verb === 'release_work_item' && result.released === true) ||
     (verb === 'fail_work_item' && result.failed === true) ||
     structuredStatuses(result).some((status) => allowedStatuses.has(status))
-  return { verb, args, successful, actionItemId: requestedId, projectId }
+  return { verb, args, successful, taskId: requestedId, projectId }
 }
 
 function withinObservationWindow(value, now) {
@@ -716,7 +725,10 @@ function withinObservationWindow(value, now) {
 }
 
 function prunePending(pending, now = Date.now()) {
-  return Object.fromEntries(Object.entries(pending || {}).filter(([, value]) => withinObservationWindow(value?.at, now)))
+  return Object.fromEntries(
+    Object.entries(normalizePendingStamps(pending))
+      .filter(([, value]) => withinObservationWindow(value?.at, now)),
+  )
 }
 
 function pruneClaims(claims, now = Date.now()) {
@@ -735,15 +747,15 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'afterMCPExecution') {
     const call = parseMcpExecution(data)
-    if (!call.successful || !call.actionItemId) return null
+    if (!call.successful || !call.taskId) return null
     if (call.verb === 'claim_work_item') {
       state.active_claims = [
-        ...state.active_claims.filter((claim) => claim.id !== call.actionItemId),
-        { id: call.actionItemId, project_id: call.projectId, observed_at: new Date(nowMs).toISOString() },
+        ...state.active_claims.filter((claim) => claim.id !== call.taskId),
+        { id: call.taskId, project_id: call.projectId, observed_at: new Date(nowMs).toISOString() },
       ]
     }
     if (TERMINAL_WORK_VERBS.has(call.verb)) {
-      state.active_claims = state.active_claims.filter((claim) => claim.id !== call.actionItemId)
+      state.active_claims = state.active_claims.filter((claim) => claim.id !== call.taskId)
     }
     writeConversationState(conversationId, state, stateRoot)
     return null
@@ -794,24 +806,24 @@ export function handleHook(mode, data, options = {}) {
       return { permission: 'deny', user_message: MULTIPLE_CLAIMS_MESSAGE, agent_message: MULTIPLE_CLAIMS_MESSAGE }
     }
 
-    const actionItemId = eligibleClaims[0].id
-    const updatedCommand = appendReference(parsed, actionItemId)
+    const taskId = eligibleClaims[0].id
+    const updatedCommand = appendReference(parsed, taskId)
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
     if (toolUseId) {
-      state.pending_stamps[toolUseId] = { action_item_id: actionItemId, at: new Date(nowMs).toISOString() }
+      state.pending_stamps[toolUseId] = { task_id: taskId, at: new Date(nowMs).toISOString() }
       writeConversationState(conversationId, state, stateRoot)
     }
     return {
       permission: 'allow',
       updated_input: { ...toolInput, [commandKey]: updatedCommand },
-      agent_message: `DevSpec appended [devspec:${actionItemId}] to this commit message.`,
+      agent_message: `DevSpec appended [devspec:${taskId}] to this commit message.`,
     }
   }
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
     if (toolUseId && state.pending_stamps[toolUseId]) {
-      const item = state.pending_stamps[toolUseId].action_item_id
+      const item = state.pending_stamps[toolUseId].task_id
       delete state.pending_stamps[toolUseId]
       writeConversationState(conversationId, state, stateRoot)
       return { additional_context: `DevSpec appended [devspec:${item}] to the commit message that just ran.` }

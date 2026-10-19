@@ -10,11 +10,11 @@ Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, 
 
 ## What you can do with it
 
-- **Work a task in chat.** Point the agent at an action item and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
+- **Work a task in chat.** Point the agent at a task and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
 - **Work a batch in one go.** Tell the Agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time. DevSpec's web app has a copy button that writes that line for you.
 - **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
 - **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
-- **Use DevSpec directly from Agent chat.** The MCP tools exposed in chat cover action items, tracked implementations, project memory, and product help.
+- **Use DevSpec directly from Agent chat.** The MCP tools exposed in chat cover tasks, tracked implementations, project memory, and product help.
 
 Everything runs against your own DevSpec account and repositories, using an API token you control.
 
@@ -70,10 +70,10 @@ re-resolve and it re-fetches the same commit. Removing and re-adding resolves th
 Measured against cursor-agent 2026.09.18; if a later version keeps the branch name, this section
 should go.
 
-Once it is enabled, the plugin provides:
+Once it is enabled, the plugin provides (executed from the installed plugin root `${CLAUDE_PLUGIN_ROOT}`):
 
-- the remote-control and project **skills** (`devspec.remote`, `devspec.remote-stop`, `devspec.project`),
-- the agent **hooks** for remote-control telemetry and commit-provenance assistance,
+- the remote-control and project **skills** (`skills/devspec.remote/SKILL.md`, `skills/devspec.remote-stop/SKILL.md`, `skills/devspec.project/SKILL.md`),
+- the agent **hooks** declared in `hooks/hooks.json` (`hooks/scripts/provenance-assistance.mjs`, `hooks/scripts/project-context.mjs`, `hooks/scripts/mirror-turn.mjs`, `hooks/scripts/trail-turn.mjs`, `hooks/scripts/remote-control-state.mjs`, `hooks/scripts/devspec-remote-poll.mjs`, `hooks/scripts/devspec-remote-wait.mjs`),
 - the managed **project rule** (`rules/devspec.mdc`), which Cursor picks up from the plugin.
 
 Registering the MCP server is a separate step, below — Cursor reads MCP config only from
@@ -132,7 +132,7 @@ The plugin contributes these skills, invoked from a `cursor-agent` session:
 | `devspec.remote-stop` | Disconnect this session from the Agents page |
 | `devspec.project` | Inspect project scope, manage folder defaults, or prepare a fresh chat for another project |
 
-Action-item, memory, help, and implementation operations are MCP tools used from the agent
+Task, memory, help, and implementation operations are MCP tools used from the agent
 session; they are not separate skills. Cursor receives concise tool discovery rather than a
 giant static catalog; detailed schemas are resolved only when used.
 

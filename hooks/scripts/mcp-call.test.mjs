@@ -61,7 +61,7 @@ describe('x-devspec-plugin header', () => {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
     try {
-      await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_action_item', arguments: {} })
+      await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_task', arguments: {} })
       await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'register_connection', arguments: { connection_id: 'c' } })
       await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'poll_connection', arguments: { connection_id: 'c' }, connectionCapability: 'dvsc_fixture', timeoutMs: 5_000 })
     } finally {
@@ -69,7 +69,7 @@ describe('x-devspec-plugin header', () => {
       await new Promise((resolve) => server.close(resolve))
     }
     assert.deepEqual(seen, [
-      { tool: 'get_action_item', plugin: `cursor/${version}`, capability: null },
+      { tool: 'get_task', plugin: `cursor/${version}`, capability: null },
       { tool: 'register_connection', plugin: `cursor/${version}`, capability: null },
       { tool: 'poll_connection', plugin: `cursor/${version}`, capability: 'dvsc_fixture' },
     ])

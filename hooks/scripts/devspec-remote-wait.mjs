@@ -1072,7 +1072,7 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
         session_id: sessionId,
         dispatch,
         instruction: automationRunInstruction(dispatch),
-        note: 'Explicit automation dispatch; not a canonical conversation command or action-item assignment.',
+        note: 'Explicit automation dispatch; not a canonical conversation command or task assignment.',
       },
       {
         type: 'wake',

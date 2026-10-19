@@ -34,7 +34,7 @@ import {
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
 const NON_SESSION_UUID_KEY =
-  /(?:project_id|automation_id|run_id|connection_id|local_id|launch_id|automation_run_id|action_item_id|item_id)\s*=\s*$/i
+  /(?:project_id|automation_id|run_id|connection_id|local_id|launch_id|automation_run_id|task_id|item_id)\s*=\s*$/i
 
 /**
  * Pull `--session <uuid>` / `--session=<uuid>` from a Connect prompt.

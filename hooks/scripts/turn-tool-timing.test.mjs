@@ -8,7 +8,7 @@ import { stopDiagnostics } from './local-diagnostics.mjs'
 test('off by default: no pending files or upload, even with legacy ship flags', () => fixture(async ({ root }) => {
   const original = globalThis.fetch; globalThis.fetch = () => { throw Error('Unexpected upload') }
   try {
-    assert.deepEqual(await handleTurnToolHook('beforeMCPExecution', { tool_name: 'get_action_item' }, { connectionId: ID }), { skipped: 'disabled' })
+    assert.deepEqual(await handleTurnToolHook('beforeMCPExecution', { tool_name: 'get_task' }, { connectionId: ID }), { skipped: 'disabled' })
     assert.deepEqual(await emitTurnToolTiming({ connectionId: ID, channel: 'mcp', tool: 'read', duration_ms: 1, ship: true }), { local: false })
     assert.equal(fs.existsSync(root), false)
   } finally { globalThis.fetch = original }
@@ -30,7 +30,7 @@ test('paired hooks produce local starts/ends with safe names and no command/erro
 }, true))
 
 test('missing start stays unmeasured, and hook phases do not invent thinking time', () => fixture(async ({ events }) => {
-  await handleTurnToolHook('afterMCPExecution', { tool_name: 'get_action_item' }, { connectionId: ID })
+  await handleTurnToolHook('afterMCPExecution', { tool_name: 'get_task' }, { connectionId: ID })
   assert.equal(events()[0].duration_ms, undefined)
   assert.equal(events()[0].started_at, undefined)
 }, true))

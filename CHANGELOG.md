@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+Cut over the Cursor plugin to the Tasks contract (`get_tasks`, `get_task`, `get_task_history`, `get_task_siblings`, `search_tasks`, `create_task`, `update_task`, `spin_off_task`, `supersede_task`, `link_tasks`, `unlink_tasks`, `reopen_task`, `surface_session_tasks`, `verify_task`, `task_id`, `task_ids`, and nested `task` responses) across `provenance-assistance.mjs`, hooks, skills, documentation, tests, and package metadata, with a scoped one-time normalization of transient pre-cutover `pending_stamps` entries that preserves active claims and nudged projects.
+
 ## 0.15.6
 
 Extended `provenance-assistance.mjs` to inspect and stamp multi-line commits (`git commit -F - <<'DELIM'`, `git commit -m "$(cat <<'DELIM' … DELIM)"`, and readable/writable `git commit -F <path>` / `--file=<path>`), deny readable unreferenced commits when no active claim is held, and emit the bounded post-edit provenance nudge on both `additional_context` and `agent_message` without promising refusal or pointing at server-side reconciliation as a fallback.

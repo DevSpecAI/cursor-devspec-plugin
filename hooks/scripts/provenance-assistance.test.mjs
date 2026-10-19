@@ -61,8 +61,8 @@ function mcp(toolName, result, args = {}, conversationId = 'chat-a') {
 function observeClaim(stateRoot, item = ITEM_A, conversationId = 'chat-a', nowMs) {
   handleHook('afterMCPExecution', mcp(
     'devspec__claim_work_item',
-    { claim_success: true, project_id: PROJECT, action_item: { id: item, status: 'active' } },
-    { action_item_id: item },
+    { claim_success: true, project_id: PROJECT, task: { id: item, status: 'active' } },
+    { task_id: item },
     conversationId,
   ), { stateRoot, nowMs })
 }
@@ -560,13 +560,31 @@ describe('claim observation and commit decisions', () => {
     assert.equal(output?.permission, 'allow')
     assert.equal(output?.updated_input?.command, `cd . && git commit -m 'ship [devspec:${ITEM_A}]'`)
     assert.match(output?.agent_message || '', new RegExp(ITEM_A))
-    assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'].action_item_id, ITEM_A)
+    assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'].task_id, ITEM_A)
 
     const reported = handleHook('postToolUse', {
       conversation_id: 'chat-a', tool_name: 'Shell', tool_use_id: 'stamp-1', cwd: repo,
     }, { stateRoot, pinOptions: { home, repoRoot: repo } })
     assert.match(reported?.additional_context || '', new RegExp(`appended \\[devspec:${ITEM_A}\\]`))
     assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'], undefined)
+  })
+
+  it('resets pre-cutover transient pending_stamps entries without deleting active_claims or nudged_projects', () => {
+    const stateRoot = tempRoot()
+    const nowIso = new Date().toISOString()
+    writeConversationState('chat-migrated', {
+      active_claims: [{ id: ITEM_A, project_id: PROJECT, observed_at: nowIso }],
+      nudged_projects: [PROJECT],
+      pending_stamps: {
+        legacy_tool: { id: undefined, at: nowIso },
+        current_tool: { task_id: ITEM_B, at: nowIso },
+      },
+    }, stateRoot)
+    const state = readConversationState('chat-migrated', stateRoot)
+    assert.deepEqual(state.active_claims.map((claim) => claim.id), [ITEM_A])
+    assert.deepEqual(state.nudged_projects, [PROJECT])
+    assert.deepEqual(Object.keys(state.pending_stamps), ['current_tool'])
+    assert.equal(state.pending_stamps.current_tool.task_id, ITEM_B)
   })
 
   it('never overwrites an existing different reference', async () => {
@@ -584,7 +602,7 @@ describe('claim observation and commit decisions', () => {
     handleHook('afterMCPExecution', mcp(
       'claim_work_item',
       { claim_success: true, project_id: '99999999-8888-7777-6666-555555555555', id: ITEM_A },
-      { action_item_id: ITEM_A },
+      { task_id: ITEM_A },
     ), { stateRoot })
     const output = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
     assert.equal(output?.updated_input, undefined)
@@ -622,9 +640,9 @@ describe('claim observation and commit decisions', () => {
     const stateRoot = tempRoot()
     observeClaim(stateRoot, ITEM_A)
     observeClaim(stateRoot, ITEM_B)
-    handleHook('afterMCPExecution', mcp('record_implementation', { status: 'implemented' }, { action_item_id: ITEM_A }), { stateRoot })
+    handleHook('afterMCPExecution', mcp('record_implementation', { status: 'implemented' }, { task_id: ITEM_A }), { stateRoot })
     assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((claim) => claim.id), [ITEM_B])
-    handleHook('afterMCPExecution', mcp('record_implementation', { error: 'not recorded' }, { action_item_id: ITEM_B }), { stateRoot })
+    handleHook('afterMCPExecution', mcp('record_implementation', { error: 'not recorded' }, { task_id: ITEM_B }), { stateRoot })
     assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((claim) => claim.id), [ITEM_B])
   })
 
@@ -717,21 +735,28 @@ describe('executable fail-open boundary', () => {
 })
 
 describe('hook input and MCP result validation', () => {
-  it('parses hook JSON and requires explicit matching claim success', () => {
+  it('parses hook JSON and requires explicit matching claim success under the Tasks contract', () => {
     assert.deepEqual(parseHookInput('{"conversation_id":"chat-a"}'), { conversation_id: 'chat-a' })
     assert.deepEqual(parseHookInput('broken'), {})
     assert.equal(parseMcpExecution(mcp('devspec__claim_work_item', {
       claim_success: true, project_id: PROJECT.toUpperCase(), id: ITEM_A.toUpperCase(),
-    }, { action_item_id: ITEM_A, pinned_project_id: PROJECT })).successful, true)
-    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, id: ITEM_A }, { action_item_id: ITEM_A })).successful, false)
-    assert.equal(parseMcpExecution(mcp('claim_work_item', { ok: true, project_id: PROJECT, id: ITEM_A }, { action_item_id: ITEM_A })).successful, false)
-    assert.equal(parseMcpExecution(mcp('other__claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_A }, { action_item_id: ITEM_A })).successful, false)
-    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_B }, { action_item_id: ITEM_A })).successful, false)
+    }, { task_id: ITEM_A, pinned_project_id: PROJECT })).successful, true)
+    assert.equal(parseMcpExecution(mcp('devspec__claim_work_item', {
+      claim_success: true, task: { id: ITEM_A, project_id: PROJECT, status: 'active' },
+    }, { task_id: ITEM_A })).successful, true)
+    assert.equal(parseMcpExecution(mcp('devspec__claim_work_item', {
+      claim_success: true, data: { task: { id: ITEM_A, project_id: PROJECT } },
+    }, { task_id: ITEM_A })).successful, true)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', { ok: true, project_id: PROJECT, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
+    assert.equal(parseMcpExecution(mcp('other__claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_B }, { task_id: ITEM_A })).successful, false)
     assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_A }, {
-      action_item_id: ITEM_A, project_id: '99999999-8888-7777-6666-555555555555',
+      task_id: ITEM_A, project_id: '99999999-8888-7777-6666-555555555555',
     })).successful, false)
-    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: 'invalid', id: ITEM_A }, { action_item_id: ITEM_A })).successful, false)
-    assert.equal(parseMcpExecution(mcp('record_implementation', { action_item: { lifecycle: 'done' } }, { action_item_id: ITEM_A })).successful, true)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: 'invalid', id: ITEM_A }, { task_id: ITEM_A })).successful, false)
+    assert.equal(parseMcpExecution(mcp('record_implementation', { task: { lifecycle: 'done' } }, { task_id: ITEM_A })).successful, true)
     assert.equal(parseMcpExecution({ tool_name: 'claim_work_item', tool_input: '{}', result_json: 'broken' }).successful, false)
   })
 })
+
