@@ -159,6 +159,8 @@ import {
   turnActivityPath,
   turnIsLive,
 } from './turn-liveness.mjs'
+import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
+import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 
 export { roomStatePath }
@@ -1910,7 +1912,42 @@ async function main() {
     // Agent-authoritative "working": re-assert busy while the turn is live. Live is what
     // Cursor shows (held for this command's own background work, or a tool call /
     // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
-    const marker = readTurnMarker(connectionId)
+    let marker = readTurnMarker(connectionId)
+    const erroredEnd = marker
+      ? erroredTurnEnd({
+          transcriptPath: resolveAgentTranscriptPath(liveState?.local_id),
+          startedAt: marker.startedAt,
+        })
+      : null
+    if (erroredEnd) {
+      // Cursor ended the turn itself (usage limit, provider error): no Stop hook ran and
+      // the model cannot reply, so say so in the room and close the working attempt now
+      // rather than after the 1h no-sign-of-life backstop (item 45eb0708).
+      if (sessionId) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'post_session_message',
+            arguments: {
+              connection_id: connectionId,
+              message: erroredTurnNotice(erroredEnd),
+              agent_name: agentName,
+              turn_kind: 'agent',
+              phase: 'answer',
+            },
+            timeoutMs: 10_000,
+          })
+        } catch (e) {
+          process.stderr.write(`devspec-remote-poll: errored-turn notice failed: ${e.message}\n`)
+        }
+      }
+      await emitActivityVerb('complete', extraActivityVerbArgs({ stalling: true, verb: 'complete' }))
+      clearTurnMarker(connectionId)
+      prevTurnActive = false
+      marker = null
+      process.stderr.write(`devspec-remote-poll: turn ended with a Cursor error connection=${connectionId}\n`)
+    }
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
     let turnActive = turnIsLive(marker, { activity })

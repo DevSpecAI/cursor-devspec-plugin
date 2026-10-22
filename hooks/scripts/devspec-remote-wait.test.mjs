@@ -151,6 +151,14 @@ describe('canonical one-command-turn wake', () => {
     assert.equal(events.at(-1).envelope_id, FIXTURE_ID.envelope)
   })
 
+  it('wakes the chat once per command: the trailing summary lines never match the notify pattern (item ee82801c)', () => {
+    const unread = { unread: 1, updated: 0, to_you: 1, oldest_at: '2026-10-06T13:00:00Z', by: { 'Ali Price': 1 }, read_with: 'node room-unread.mjs read' }
+    const events = buildOwnerMessageEvents(canonicalBatch(), { unread })
+    const notify = new RegExp(REMOTE_WAKE_NOTIFY_PATTERN)
+    const woken = events.filter((event) => notify.test(JSON.stringify(event) + '\n'))
+    assert.deepEqual(woken.map((event) => event.type), ['owner_message'])
+  })
+
   it('revalidates the full canonical envelope and exact message binding before execution', () => {
     const valid = canonicalBatch()
     assert.equal(parseOwnerBatches([JSON.stringify(valid)], { canonicalOnly: true }).length, 1)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.8
+
+When Cursor ends a turn with its own error (for example a usage limit), `hooks/scripts/turn-error-end.mjs` detects the errored `turn_ended` line at the end of the bonded agent transcript and `devspec-remote-poll.mjs` posts a short notice to the room and closes the working attempt on the next tick, instead of leaving the Working dots up until the 1 hour no-sign-of-life backstop. `devspec-remote-wait.test.mjs` now pins that only the `owner_message` line of a canonical command matches `REMOTE_WAKE_NOTIFY_PATTERN`, so its trailing `room_unread` and `wake` lines never wake the chat a second time.
+
 ## 0.16.6
 
 Replace the fixed 1-hour `MAX_TURN_MS` wall-clock turn cutoff with activity-based turn liveness in `hooks/scripts/turn-liveness.mjs` (`<connectionId>.turn-activity.json` refreshed on `postToolUse` hooks, `trail-turn.mjs`, and `cli-trail-watch.mjs` transcript growth, expiring only after 1 hour of inactivity), remove the cross-connection `reapDeadPollers` sweep on `writeConnectionState` in `hooks/scripts/remote-control-state.mjs` so connecting a second Cursor window never terminates a quiet sibling window's poller, and add `hooks/scripts/close-on-end.mjs` (`closeCursorOnEnd` / `closeOnEndDecision`) wired into `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` to cleanly terminate the owning Cursor session when ended from the DevSpec UI (`end_reason: 'ui'`).
