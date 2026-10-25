@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.9
+
+Add task field partitioning guidance for `devspec__create_task` and `devspec__update_task` in `rules/devspec.mdc` and `skills/devspec.remote/SKILL.md`: place *why* the task exists, speaker attribution/quotes, and desired outcome in `intent`; write the complete product behaviour and architectural or technical mechanism in natural English in `description` (since duplicate and reversal screening reads `title`, `intent`, and `description`, never `ai_instructions`); keep `acceptance_criteria` as plain-prose checkable conditions; and place raw file paths, line numbers, code snippets, CSS classes, and file-by-file edit recipes in `ai_instructions`.
+
 ## 0.16.8
 
 When Cursor ends a turn with its own error (for example a usage limit), `hooks/scripts/turn-error-end.mjs` detects the errored `turn_ended` line at the end of the bonded agent transcript and `devspec-remote-poll.mjs` posts a short notice to the room and closes the working attempt on the next tick, instead of leaving the Working dots up until the 1 hour no-sign-of-life backstop. `devspec-remote-wait.test.mjs` now pins that only the `owner_message` line of a canonical command matches `REMOTE_WAKE_NOTIFY_PATTERN`, so its trailing `room_unread` and `wake` lines never wake the chat a second time.
