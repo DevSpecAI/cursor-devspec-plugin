@@ -4,8 +4,6 @@ import { describe, it } from 'node:test'
 
 const operationalFiles = [
   'skills/devspec.remote/SKILL.md',
-  'docs/remote-control/remote-control-overview.md',
-  'docs/remote-control/remote-control-cursor.md',
   'hooks/scripts/devspec-remote-poll.mjs',
   'hooks/scripts/devspec-remote-wait.mjs',
   'hooks/scripts/resolve-mcp-auth.mjs',
@@ -18,7 +16,7 @@ const contents = new Map(
   ]),
 )
 
-const primers = operationalFiles.slice(0, 3)
+const primers = ['skills/devspec.remote/SKILL.md']
 
 function assertInOrder(content, first, second, file) {
   const firstIndex = content.indexOf(first)

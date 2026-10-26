@@ -4,85 +4,58 @@
 
 [DevSpec](https://devspec.ai) is where your team, your knowledge and your agents build software together, made for AI-native development from the ground up.
 
-Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the terminal. This plugin connects Cursor's agent to your DevSpec account over MCP so it can pull that work into the chat, do it, and record what it did — all tracked in DevSpec.
+Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the terminal. This plugin connects Cursor's CLI agent (`cursor-agent`) to your DevSpec account over MCP so it can pull work into the chat, implement it, and record what it did back in DevSpec.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## What you can do with it
 
-- **Work a task in chat.** Point the agent at a task and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
-- **Work a batch in one go.** Tell the Agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time. DevSpec's web app has a copy button that writes that line for you.
-- **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
-- **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
-- **Use DevSpec directly from Agent chat.** The MCP tools exposed in chat cover tasks, tracked implementations, project memory, and product help.
+- **Work a task in chat.** Point the agent at a task and it implements the change, runs your project's tests, commits, and records what it did back on the task.
+- **Work a batch in one go.** Tell the agent *"Work these DevSpec tasks in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time.
+- **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone.
+- **Use DevSpec directly from chat.** Query and update tasks, shared project memory, documents, and review queues in plain language.
 
-Everything runs against your own DevSpec account and repositories, using an API token you control.
+---
 
 ## Before you start
 
 You'll need:
 
-- **Cursor's CLI agent** (`cursor-agent`). This is a CLI plugin: it is installed with `cursor-agent plugin`, and its hooks run in `cursor-agent` sessions. There is no VS Code extension and no VSIX.
-- A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repo(s).
+- **Cursor's CLI agent** (`cursor-agent`).
+- A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repositories.
 - A **DevSpec API token**. Create one on DevSpec's [Agents page](https://app.devspec.ai/settings/agents) with **Create your token** (pick **Read & write**); it starts with `dvs_`.
-  - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
-  - It's **retrievable.** Reveal and copy it again any time on the [Agents page](https://app.devspec.ai/settings/agents) (no more show-once).
-  - You don't paste a project id — the project for a run is resolved from your repo's git remote.
-- **Node.js 18+** — needed by the installed agent hooks and remote-control scripts (check with `node --version`). Plain MCP tool access is provided by Cursor itself.
+  - **One token, everywhere.** Reuse the same token across every tool and every machine.
+  - **Retrievable.** Reveal and copy it again any time on the [Agents page](https://app.devspec.ai/settings/agents).
+- **Node.js 18+** (`node --version`).
+
+---
 
 ## Install
 
-The plugin installs from this git repo as a custom marketplace — no clone, no VSIX.
+Add this repository as a Cursor plugin marketplace:
 
 ```bash
 cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
 ```
 
-Then enable it: run `cursor-agent`, type `/plugins`, and install **devspec-autopilot** from the
-marketplace you just added. **Adding a marketplace does not install the plugin** — that second
-step is what makes it load, and skipping it looks exactly like a working install until you go
-looking for a hook.
-
-`--git-ref <branch>` **pins** to a branch rather than tracking it — see updating, below.
+Then enable it: run `cursor-agent`, type `/plugins`, and install **devspec-autopilot** from the marketplace you just added. **Adding a marketplace does not install the plugin** — installing it from `/plugins` is what loads the skills, hooks, and project rule.
 
 ### Updating
 
-Three steps — remove the marketplace, re-add it, then reinstall the plugin. Do not use
-`marketplace update`:
+To update to a newer release, remove and re-add the marketplace, then reinstall **devspec-autopilot** from `/plugins`:
 
 ```bash
 cursor-agent plugin marketplace remove devspec-autopilot
 cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
 ```
 
-Then run `cursor-agent`, `/plugins`, and install **devspec-autopilot** again.
+Then run `node scripts/setup-cursor.mjs --refresh` (if you manage `~/.cursor/mcp.json` via the setup script) and restart `cursor-agent`.
 
-**All three are needed.** Re-adding the marketplace moves the index but leaves the installed
-plugin where it was, and removing the marketplace does not uninstall the plugin — so after the
-first two steps you are running one commit while the marketplace advertises another, with
-nothing to tell you. Reinstalling without re-adding first is equally useless: the install copies
-from the index, so it reproduces the commit you already had.
-
-`cursor-agent plugin marketplace update` prints `✓ Updated marketplace` and fetches nothing
-new. Cursor resolves whatever ref you gave it to a commit SHA when you add the marketplace and
-stores only that SHA — the branch name is not kept — so there is nothing left for `update` to
-re-resolve and it re-fetches the same commit. Removing and re-adding resolves the branch afresh.
-Measured against cursor-agent 2026.09.18; if a later version keeps the branch name, this section
-should go.
-
-Once it is enabled, the plugin provides (executed from the installed plugin root `${CLAUDE_PLUGIN_ROOT}`):
-
-- the remote-control and project **skills** (`skills/devspec.remote/SKILL.md`, `skills/devspec.remote-stop/SKILL.md`, `skills/devspec.project/SKILL.md`),
-- the agent **hooks** declared in `hooks/hooks.json` (`hooks/scripts/provenance-assistance.mjs`, `hooks/scripts/project-context.mjs`, `hooks/scripts/mirror-turn.mjs`, `hooks/scripts/trail-turn.mjs`, `hooks/scripts/remote-control-state.mjs`, `hooks/scripts/devspec-remote-poll.mjs`, `hooks/scripts/devspec-remote-wait.mjs`),
-- the managed **project rule** (`rules/devspec.mdc`), which Cursor picks up from the plugin.
-
-Registering the MCP server is a separate step, below — Cursor reads MCP config only from
-`~/.cursor/mcp.json` and a workspace `.cursor/mcp.json`, never from a plugin.
+---
 
 ## Connect your token
 
-Cursor reads MCP servers from your own config file, not from a plugin, so this is a one-time
-edit you make. Add a `devspec` entry to your Cursor MCP config file:
+Add a `devspec` entry to `~/.cursor/mcp.json` (macOS/Linux) or `%USERPROFILE%\.cursor\mcp.json` (Windows):
 
 ```json
 {
@@ -91,109 +64,59 @@ edit you make. Add a `devspec` entry to your Cursor MCP config file:
       "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
         "Authorization": "Bearer dvs_your_token_here",
-        "x-devspec-plugin": "cursor/<plugin version>"
+        "x-devspec-plugin": "cursor/0.16.10"
       }
     }
   }
 }
 ```
 
-Use `https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection` for staging (its Agents page is [app.devspecstaging.com/settings/agents](https://app.devspecstaging.com/settings/agents)). This is the plugin's fixed tool view, not a project preference.
-
-If you have a clone of this repo, the same edit is scripted — it reads your token from `DEVSPEC_MCP_TOKEN`, `~/.devspec/auth.json`, or standard input (never pass a token as a `--token` command-line flag, which exposes it in process listings and shell history), merges into an existing file rather than replacing it, and never echoes your token back:
+Or run the setup helper from a clone of this repository (it reads `DEVSPEC_MCP_TOKEN` or `~/.devspec/auth.json` and merges the `devspec` entry into `~/.cursor/mcp.json` without echoing your token):
 
 ```bash
 DEVSPEC_MCP_TOKEN=dvs_… node scripts/setup-cursor.mjs
-node scripts/setup-cursor.mjs --api-url https://api.devspecstaging.com
 ```
 
-The config file lives at:
+Restart `cursor-agent` afterwards so it picks up the server.
 
-- **macOS / Linux:** `~/.cursor/mcp.json`
-- **Windows:** `%USERPROFILE%\.cursor\mcp.json`
-
-It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. It also sends `x-devspec-plugin: cursor/<plugin version>`, which tells DevSpec the DevSpec plugin for Cursor is installed and which version; if you write the entry by hand, use the version `/plugins` shows. The script fills it in for you. **Restart `cursor-agent`** afterwards so it picks up the new server.
-
-> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other agents, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again on the [Agents page](https://app.devspec.ai/settings/agents).
+---
 
 ## Verify
 
-Run `cursor-agent` and ask it to call the DevSpec `verify_agent_connection` tool. You should see confirmation that the MCP server is reachable and connected as your DevSpec user.
-
-To check the plugin itself loaded — a separate thing from MCP working — run `/plugins` and confirm **devspec-autopilot** is listed as installed.
+Run `cursor-agent` and ask it to call the DevSpec `verify_agent_connection` tool, or run `/plugins` to confirm **devspec-autopilot** is installed.
 
 ### Skills
 
-The plugin contributes these skills, invoked from a `cursor-agent` session:
-
 | Skill | What it does |
 |---|---|
-| `devspec.remote` | Connect this session to DevSpec's Agents page |
+| `devspec.remote` | Connect this session to DevSpec's Agents page (`--new` or `--session <id>` to attach to a room) |
 | `devspec.remote-stop` | Disconnect this session from the Agents page |
 | `devspec.project` | Inspect project scope, manage folder defaults, or prepare a fresh chat for another project |
+| `devspec.debug` | Start, inspect, stop, or export local Cursor diagnostics when requested |
 
-Task, memory, help, and implementation operations are MCP tools used from the agent
-session; they are not separate skills. Cursor receives concise tool discovery rather than a
-giant static catalog; detailed schemas are resolved only when used.
+---
+
+## Project selection
+
+Bare `/devspec.remote` resolves your project automatically when your repository's `origin` remote identifies one accessible project, or when the folder has a `.devspec/project.json` pin.
+
+To choose a project explicitly for this conversation, run `/devspec.remote --project "Project name"` (or pass a project ID). Use `/devspec.project` to inspect the active project, remember or forget a folder default, or prepare a fresh Cursor chat for a different project.
 
 ### Shared session plans during remote control
 
-The current `devspec://product/implementation-contract` decides whether work warrants a shared session plan. The threshold is deliberately high: routine investigation and one-run checks remain unplanned. When a qualifying attached-session plan exists, Cursor continues it across reconnects using its authoritative revision and advances meaningful milestones atomically.
+When a qualifying multi-phase plan exists in an attached session, Cursor continues it across reconnects using its authoritative revision and advances milestones atomically. Plan awareness is room-wide and advisory. Native chats bind through Cursor's host conversation id; a manual chat without that id is accepted only when the host's minted-bond index has exactly one live, attached, capability-bound Cursor connection in the current workspace. Ambiguous sibling connections fail closed.
 
-Plan awareness is all-room and advisory: Cursor can see every active plan in the attached session, but another owner's plan grants no mutation authority. Same-owner cross-plan work and orphan adoption require explicit plan id plus expected revision and remain server-authorized.
+Cursor's native `agent --resume` behavior is preserved, and the plugin reports the host conversation identity as `local_session_id`.
 
-Plan mutation uses a narrow connection-bound helper shipped with the plugin. It negotiates and stores a per-conversation capability without putting the secret in prompts or the global MCP config. The helper exposes the complete `manage_plan` schema only on demand (`manage-plan describe`) and accepts operations on stdin (`manage-plan use`). Native chats bind through Cursor's host conversation id; a manual chat without that id is accepted only when the host's minted-bond index has exactly one live, attached, capability-bound Cursor connection in the current workspace. Ambiguous sibling connections fail closed. Ordinary MCP tools keep using the normal Cursor registration in `~/.cursor/mcp.json`.
-
-Cursor's native `agent --resume` behavior is unchanged. The plugin reports the real host conversation identity as `local_session_id`; it does not require the optional launcher.
-
-### Repository facts and GitHub account link
-
-From 0.13.25, connection supplies the project's repository names, safe remote URLs and tracked/default branches, alongside existing project and machine rules. Manual connection returns this context directly. Launcher-started conversations receive it through Cursor's native post-tool context, including after arming their first wait. A fresh project conversation uses its own snapshot, never another chat's folder-based guess.
-
-When the project tracks GitHub repositories, `register_connection` also reports the person's `github_identity`: either `linked` (`github_accounts` in `<devspec-repository-data>` and `linked as @login` in the connect status) or `link_required` (a verified `https://` one-click GitHub App identity link so their pull requests and commits show as theirs in DevSpec without granting DevSpec access to their GitHub account).
-
-These are remote project facts, not proof that a repository is cloned or writable locally. Empty and unavailable inventories are distinct; description and vision remain available on demand. No fixed repository-count cap is applied. Cursor itself limits hook context to 10,000 characters, so larger results name a private local file containing the complete context. Repository facts still appear inline when they fit; the continuation supplies complete rules and any larger inventory.
-
-### Protecting intent, Review decisions, and System Notices
-
-- **Work that waits (`waiting_for_ok`) or Experiment branches:** When a claim or write result carries `waiting_for_ok`, the claim still goes through — build and push the work on its own branch in every repository it touches, **never merge it into the tracking branch**, and record the implementation as usual (`core.waiting-work-stays-on-its-branch`).
-- **Immediate action on clear user authority (`acting_rule`):** Act for the person asking with their authority (`authority_contract`). When their request is clear and they evidently know what it does, act immediately without asking them to confirm what they just said or sending them to Review.
-- **Review decision tools:** Use `get_review_queue` first, then `decide_proposal`, `manage_protected_intent`, `resolve_duplicate`, `record_duplicate_nonmatch`, `resolve_memory_flag`, and `resolve_resource_flag`, relaying each result's `summary` (or `note`) and `next` in plain words.
-- **System Notices (`system_notice_version: 2`):** The poller and wait watcher deliver `server_notice` and `unlinked_commit_item_review` wakes (`REMOTE_WAKE_NOTIFY_PATTERN` includes `system_notice`) with `NOTICE_HANDLING` instructions and graceful degradation for future notice kinds.
-- **Decision capture bar:** Record a decision memory only when it is a real choice between alternatives with a reason, steers work beyond this change, is not obvious from the code, and comes from the person's own answer when asked whether it was deliberate and why.
-
-Install/update the plugin version and restart Cursor, or use an explicit development `--plugin-dir`. A source checkout update alone does not refresh the marketplace cache.
-
-## How it finds the right project
-
-These controls require plugin 0.13.24+ and a DevSpec server with the namespaced tool view. Work merged to `staging` is not automatically a release to `main` or an update of the installed cache. Check `/plugins`, refresh the MCP entry as below, and restart after updating.
-
-Bare `/devspec.remote` stays automatic when a remote identifies one accessible project, or a greenfield folder has a valid `.devspec/project.json` pin. A unique remote beats a stale pin; a pin naming one of several matching projects breaks that tie.
-
-For an explicit choice, use `/devspec.remote --project "Project name"` or a full ID (`--project-id` remains supported). Ambiguity produces project **and organisation** choices; the agent asks rather than picking one. The selection belongs to this Cursor conversation and its resume, including ordinary DevSpec tools. It does not change a folder default or another conversation in the same directory.
-
-Use `/devspec.project` for details. Remember and forget show the effective file and require separate confirmation; existing conversations stay on their project. Removing a local pin can reveal an inherited default, so check the resulting details. Switching projects requires a fresh native Cursor chat, not the old chat's history. The helper returns a verified bare-Cursor command to run in a new terminal and the first project-selection message to send there. It does not launch the chat or change the old one. If your Cursor executable is not discoverable, supply its real path with `--cursor-bin`; never substitute another host's generic `agent` command.
-
-**After updating:** run `node scripts/setup-cursor.mjs --refresh` from the installed plugin (or its checkout), then restart Cursor. This updates the existing MCP URL to the plugin's tool view (the `devspec__` namespace, plus the two plumbing tools Cursor calls itself) and the `x-devspec-plugin` header to the version you just installed, preserving credentials and neighbouring servers. Choosing projects never rewrites that shared MCP configuration. Cursor CLI and Node 18+ are required; this is not an IDE/VSIX feature.
-
-## Optional launching from DevSpec
-
-Start Cursor yourself and use `/devspec.remote`, or use DevSpec's Copy command. The agent's normal connection and native resume do not need a launcher.
-
-**DevSpec Launcher is a separate optional application.** Launcher-dependent buttons in DevSpec require an explicit installation; the [Agents settings page](https://app.devspec.ai/settings/agents) explains availability and setup. This plugin does not bundle, install, update or start that app, register its URL handler or create a login service. Native Cursor authentication and connection helpers stay in this plugin.
-
-A launcher that cannot be reached may be stopped, blocked or not installed. Manual commands remain available. Standalone installers are not yet published; the [Agents settings page](https://app.devspec.ai/settings/agents) will show downloads when they are available.
+---
 
 ## Contributing
 
-This is a plain Node plugin — no build step, no bundler, no VSIX. Clone it and run the tests:
+Run the test suite:
 
 ```bash
 npm test
 ```
-
-To try a change before pushing, point `cursor-agent` at your clone with
-`cursor-agent --plugin-dir /path/to/cursor-devspec-plugin`.
 
 Release notes are in [CHANGELOG.md](./CHANGELOG.md).
 

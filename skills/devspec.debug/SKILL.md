@@ -22,4 +22,4 @@ Read the local event file rather than waiting for a remote logging service. It c
 
 `export` creates a separate sanitized local JSON file. Inspect it before sharing, and upload or attach it only when the person explicitly asks. Never send raw Cursor transcripts, connection state, authentication files, shell arguments or native trace bodies as a substitute. There are no automatic uploads, no diagnostic proxy and no changes to normal polling/resume behavior.
 
-The collector keeps bounded files and at most four runs. Expired retained runs are pruned on the next diagnostic command after 24 hours; no permanent cleanup service is installed. See `docs/remote-control/remote-control-cursor.md` for limits, available sources and runtime verification.
+The collector keeps bounded files and at most four runs. Expired retained runs are pruned on the next diagnostic command after 24 hours; no permanent cleanup service is installed.

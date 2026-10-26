@@ -751,11 +751,8 @@ describe('poller round trip', () => {
 describe('Cursor directed-question policy surfaces', () => {
   it('teaches asking and the reply that closes the turn', () => {
     const skill = source('skills/devspec.remote/SKILL.md')
-    const doc = source('docs/remote-control/remote-control-cursor.md')
     assert.match(skill, /manage-question/)
     assert.match(skill, /question_answer/)
-    assert.match(doc, /question_answer/)
-    assert.match(doc, /devspec:\/\/product\/interaction-event-contract/)
   })
 })
 
