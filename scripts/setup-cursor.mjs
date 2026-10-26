@@ -173,7 +173,7 @@ export function resolveInputs({ args = {}, env = {}, stdinToken = '', pinnedAuth
   if (!token) {
     throw new Error(
       'No token. Set DEVSPEC_MCP_TOKEN, pipe the token on stdin, or store it in ~/.devspec/auth.json.\n' +
-        `Create one on DevSpec's Agents page: ${agentsPageUrl(base, { env })} (Create your token, then pick Read & write).`,
+        `Create one on DevSpec's Agent setup page: ${agentsPageUrl(base, { env })} (Create your token, then pick Read & write).`,
     )
   }
   if (!/^https?:\/\//.test(base)) {

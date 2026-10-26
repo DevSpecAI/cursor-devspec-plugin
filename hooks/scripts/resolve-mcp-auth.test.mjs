@@ -279,11 +279,11 @@ describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', 
     const warning = buildTokensWarning(pairs, { env: {} })
     assert.match(warning, /Cursor MCP config/)
     assert.match(warning, /project \.mcp\.json/)
-    // One key per environment, so each environment's Agents page is linked —
+    // One key per environment, so each environment's Agent setup page is linked —
     // never a breadcrumb, never production alone for a staging key.
     assert.ok(
       warning.includes(
-        "Open DevSpec's Agents page at https://app.devspec.ai/settings/agents or https://app.devspecstaging.com/settings/agents to reveal the key you want",
+        "Open DevSpec's Agent setup page at https://app.devspec.ai/settings/agents or https://app.devspecstaging.com/settings/agents to reveal the key you want",
       ),
       warning,
     )
@@ -293,24 +293,24 @@ describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', 
     assert.doesNotMatch(warning, /dvs_cursor_prod|dvs_project_staging/)
   })
 
-  it('links one Agents page when every key is on the same environment', () => {
+  it('links one Agent setup page when every key is on the same environment', () => {
     const pairs = [
       { sourceLabel: 'Cursor MCP config', token: 'dvs_a', mcp_url: 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec' },
       { sourceLabel: 'project .mcp.json', token: 'dvs_b', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
     ]
     const warning = buildTokensWarning(pairs, { env: {} })
-    assert.ok(warning.includes('Agents page at https://app.devspecstaging.com/settings/agents to reveal'), warning)
+    assert.ok(warning.includes('Agent setup page at https://app.devspecstaging.com/settings/agents to reveal'), warning)
     assert.doesNotMatch(warning, /app\.devspec\.ai/)
   })
 
-  it('the no-owning-key error links the Agents page of the keys it tried', () => {
+  it('the no-owning-key error links the Agent setup page of the keys it tried', () => {
     const staging = [
       { token: 'dvs_a', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
       { token: 'dvs_b', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
     ]
     assert.equal(
       noOwningKeyError(staging, { env: {} }),
-      "No reachable DevSpec key owns this connection. Open DevSpec's Agents page at https://app.devspecstaging.com/settings/agents and make the Cursor MCP key and the project .mcp.json key the same.",
+      "No reachable DevSpec key owns this connection. Open DevSpec's Agent setup page at https://app.devspecstaging.com/settings/agents and make the Cursor MCP key and the project .mcp.json key the same.",
     )
     const mixed = [
       { token: 'dvs_a', mcp_url: 'https://api.devspec.ai/api/mcp' },

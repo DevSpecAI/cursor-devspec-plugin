@@ -35,7 +35,7 @@ describe('resolveAppBaseUrl', () => {
   })
 })
 
-describe('Agents page links', () => {
+describe('Agent setup page links', () => {
   it('is /settings/agents on the app host of the environment in use', () => {
     assert.equal(agentsPageUrl('https://api.devspec.ai/api/mcp', none), 'https://app.devspec.ai/settings/agents')
     assert.equal(agentsPageUrl('https://api.devspecstaging.com/api/mcp', none), 'https://app.devspecstaging.com/settings/agents')

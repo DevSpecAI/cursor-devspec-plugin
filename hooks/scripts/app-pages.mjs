@@ -16,7 +16,7 @@
 
 export const DEFAULT_APP_URL = 'https://app.devspec.ai'
 
-/** Personal settings → Agents: where a person creates or reveals their key. */
+/** Personal settings → Agent setup: where a person creates or reveals their key. */
 export const AGENTS_PAGE_PATH = '/settings/agents'
 
 const APP_BASE_FOR_HOST = new Map([
@@ -53,13 +53,13 @@ export function resolveAppBaseUrl(apiUrl, opts = {}) {
   return DEFAULT_APP_URL
 }
 
-/** The full Agents page URL for the environment behind `apiUrl`. */
+/** The full Agent setup page URL for the environment behind `apiUrl`. */
 export function agentsPageUrl(apiUrl, opts = {}) {
   return `${resolveAppBaseUrl(apiUrl, opts)}${AGENTS_PAGE_PATH}`
 }
 
 /**
- * The Agents page link(s) for every environment in play, joined for a
+ * The Agent setup page link(s) for every environment in play, joined for a
  * sentence. Two keys on two environments are revealed on two different pages,
  * so each distinct environment gets its own link, in the order given.
  * @param {Array<string | null | undefined>} apiUrls

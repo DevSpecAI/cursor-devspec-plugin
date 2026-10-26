@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.11
+
+Use DevSpec's new settings page names: the personal settings page at `/settings/agents` where you create or reveal your key is now **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. The two-keys warning and no-owning-key error in `hooks/scripts/resolve-mcp-auth.mjs`, the missing-token error in `scripts/setup-cursor.mjs`, the plugin's token prompt and the README now link to the Agent setup page. URLs are unchanged.
+
 ## 0.16.10
 
 Streamline `README.md` for customer setup and usage (removing staging URLs, internal constant names, and marketplace caching commentary) and remove internal engineering notes under `docs/`.
