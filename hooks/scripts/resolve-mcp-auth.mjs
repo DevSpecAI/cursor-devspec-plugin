@@ -39,13 +39,13 @@ const WRONG_TOKEN_RE = /belongs to a different token/i
 export const DEFAULT_MCP_URL = DEFAULT_PROD_URL
 
 /**
- * How to settle more than one key: reveal the right one on the Agents page of
+ * How to settle more than one key: reveal the right one on the Agent setup page of
  * the environment(s) those keys belong to, never a fixed production link.
  */
 export function tokensWarningFix(pairs, opts = {}) {
   const links = agentsPageLinks((pairs || []).map((pair) => pair?.mcp_url), opts)
   return (
-    `Open DevSpec's Agents page at ${links} to reveal the key you want, ` +
+    `Open DevSpec's Agent setup page at ${links} to reveal the key you want, ` +
     'then make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
   )
 }
@@ -375,7 +375,7 @@ export function noOwningKeyError(pairs, opts = {}) {
   const links = agentsPageLinks(distinctTokenPairs(pairs).map((pair) => pair.mcp_url), opts)
   return (
     'No reachable DevSpec key owns this connection. ' +
-    `Open DevSpec's Agents page at ${links} and make the Cursor MCP key and the project .mcp.json key the same.`
+    `Open DevSpec's Agent setup page at ${links} and make the Cursor MCP key and the project .mcp.json key the same.`
   )
 }
 

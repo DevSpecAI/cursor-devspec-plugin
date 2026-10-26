@@ -23,9 +23,9 @@ You'll need:
 
 - **Cursor's CLI agent** (`cursor-agent`).
 - A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repositories.
-- A **DevSpec API token**. Create one on DevSpec's [Agents page](https://app.devspec.ai/settings/agents) with **Create your token** (pick **Read & write**); it starts with `dvs_`.
+- A **DevSpec API token**. Create one on DevSpec's [Agent setup page](https://app.devspec.ai/settings/agents) with **Create your token** (pick **Read & write**); it starts with `dvs_`.
   - **One token, everywhere.** Reuse the same token across every tool and every machine.
-  - **Retrievable.** Reveal and copy it again any time on the [Agents page](https://app.devspec.ai/settings/agents).
+  - **Retrievable.** Reveal and copy it again any time on the [Agent setup page](https://app.devspec.ai/settings/agents).
 - **Node.js 18+** (`node --version`).
 
 ---
