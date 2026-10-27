@@ -485,6 +485,12 @@ describe('online reference confirmation', () => {
     })
     assert.equal(unreferenced?.permission, 'deny')
     assert.equal(unreferenced?.agent_message, NO_CLAIM_MESSAGE)
+    // Recovery asks for the smallest adequate task and a retry; the server refuses a
+    // thin task, and the hook appends the reference once one is claimed (item 8f047489).
+    assert.match(NO_CLAIM_MESSAGE, /smallest adequate task/)
+    assert.match(NO_CLAIM_MESSAGE, /claim_work_item/)
+    assert.match(NO_CLAIM_MESSAGE, /retry the same commit/)
+    assert.doesNotMatch(NO_CLAIM_MESSAGE, /last-mile|thin (item|one|task) is fine|<full-uuid>/i)
     assert.equal(pre(`git commit --message=hidden -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo,
       resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
@@ -678,7 +684,12 @@ describe('bounded after-the-fact nudge', () => {
     assert.match(first?.additional_context || '', /edit already completed/i)
     assert.equal(first?.agent_message, first?.additional_context)
     assert.match(first?.agent_message || '', /search_tasks|create_task/)
-    assert.match(first?.agent_message || '', /\[devspec:<full-uuid>\]/)
+    // The smallest adequate task, never a thin one, and no tag to type: with one claim
+    // the hook appends it (item 8f047489).
+    assert.match(first?.agent_message || '', /smallest adequate task/)
+    assert.match(first?.agent_message || '', /claim_work_item/)
+    assert.match(first?.agent_message || '', /added to the commit message for you/)
+    assert.doesNotMatch(first?.agent_message || '', /thin|last-mile|<full-uuid>/i)
     assert.doesNotMatch(first?.agent_message || '', /refused|reconciliation|analy[sz]er/i)
     assert.equal(first?.permission, undefined)
     const second = handleHook('postToolUse', {

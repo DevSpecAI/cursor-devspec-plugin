@@ -40,9 +40,14 @@ export const MALFORMED_REFERENCE_MESSAGE =
 export const MULTIPLE_CLAIMS_MESSAGE =
   'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each item this commit delivers and retry. Nothing else is blocked.'
 
+// The server refuses a thin task (contract 5.4.0's work_entry_contract), and with
+// exactly one claim this hook appends the reference itself (appendReference), so the
+// agent is asked for the smallest adequate task and a retry, never a tag (item 8f047489).
 export const NO_CLAIM_MESSAGE =
   'DevSpec commit provenance: this commit has no [devspec:<uuid>] reference and no active DevSpec claim is observed in this project, so it would land unlinked. ' +
-  'Recover without leaving this turn: reuse or create the smallest item that covers it (search_tasks, or create_task with a one-line description — a thin last-mile item is fine), then add [devspec:<full-uuid>] to the commit message and retry. Nothing else is blocked.'
+  'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item); ' +
+  'if none covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed (the server refuses a thin one), and claim that. ' +
+  "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you. Nothing else is blocked."
 
 export function unresolvedReferenceMessage(reference) {
   return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
@@ -844,7 +849,8 @@ export function handleHook(mode, data, options = {}) {
     const nudgeMessage =
       `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
       'Continue working—do not stop or retry, and editing is never blocked. ' +
-      'Claim one before you commit — search_tasks for an existing item, or create_task for a thin last-mile one — and put [devspec:<full-uuid>] in the commit message. ' +
+      'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
+      'with a real description and the reason for it, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
       'Authority: devspec://product/implementation-contract.'
     return {
       additional_context: nudgeMessage,

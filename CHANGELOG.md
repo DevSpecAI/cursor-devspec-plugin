@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.12
+
+The commit-provenance messages no longer recommend a thin "last-mile" item, which the DevSpec server now refuses. When a readable commit is stopped because no task is claimed, and in the one-time reminder after an edit, the agent is told to find the task its work belongs to and claim it, or create the smallest adequate task with a real description of the change and the reason for it, and then retry the same commit or commit as usual. With exactly one task claimed, the plugin adds the `[devspec:<id>]` reference itself, so the agent no longer types it. Several claims still ask the agent to write the right reference, as before.
+
 ## 0.16.11
 
 Use DevSpec's new settings page names: the personal settings page at `/settings/agents` where you create or reveal your key is now **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. The two-keys warning and no-owning-key error in `hooks/scripts/resolve-mcp-auth.mjs`, the missing-token error in `scripts/setup-cursor.mjs`, the plugin's token prompt and the README now link to the Agent setup page. URLs are unchanged.
