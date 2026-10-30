@@ -64,7 +64,7 @@ Add a `devspec` entry to `~/.cursor/mcp.json` (macOS/Linux) or `%USERPROFILE%\.c
       "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
         "Authorization": "Bearer dvs_your_token_here",
-        "x-devspec-plugin": "cursor/0.16.12"
+        "x-devspec-plugin": "cursor/0.16.13"
       }
     }
   }
