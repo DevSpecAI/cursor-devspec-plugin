@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.13
+
+Updated `rules/devspec.mdc` and `skills/devspec.remote/SKILL.md` for required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`) on `devspec__update_task` (`lifecycle: "dismissed"`), including `target_task_id` linking, held-replacement behaviour for unmerged replacements, and required rejection notes on `not_wanted`.
+
 ## 0.16.12
 
 The commit-provenance messages no longer recommend a thin "last-mile" item, which the DevSpec server now refuses. When a readable commit is stopped because no task is claimed, and in the one-time reminder after an edit, the agent is told to find the task its work belongs to and claim it, or create the smallest adequate task with a real description of the change and the reason for it, and then retry the same commit or commit as usual. With exactly one task claimed, the plugin adds the `[devspec:<id>]` reference itself, so the agent no longer types it. Several claims still ask the agent to write the right reference, as before.
