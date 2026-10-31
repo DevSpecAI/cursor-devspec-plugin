@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.15
+
+Cursor now works with DevSpec goals. When a person asks a Cursor agent to create or change a goal or one of its outcomes, DevSpec records who asked for the change and which agent made it, just as it does for tasks, memories and documents. The plugin's guidance also tells the agent how to read the project's goals and change them.
+
 ## 0.16.14
 
 When Cursor can't finish a message sent from a DevSpec session (for example it has hit its usage limit or the model service is down), it now says so in the session straight away, quoting Cursor's own error, and stops showing as working. If the turn is stopped in Cursor before it finishes, the session is told that too. Before, the session showed nothing in either case. A message typed in Cursor's own terminal gets no session reply, because Cursor already shows what happened there.
