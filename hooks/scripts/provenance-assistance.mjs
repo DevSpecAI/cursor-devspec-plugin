@@ -44,7 +44,7 @@ export const MALFORMED_REFERENCE_MESSAGE =
   'DevSpec commit provenance: this readable commit message has a malformed DevSpec reference. Write each one as a full [devspec:<uuid>] and retry. Nothing else is blocked.'
 
 export const MULTIPLE_CLAIMS_MESSAGE =
-  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each item this commit delivers and retry. Nothing else is blocked.'
+  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each task this commit delivers and retry. Nothing else is blocked.'
 
 // The server refuses a thin task (contract 5.4.0's work_entry_contract), and with
 // exactly one claim this hook appends the reference itself (appendReference), so the
@@ -56,8 +56,8 @@ export const NO_CLAIM_MESSAGE =
   "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you. Nothing else is blocked."
 
 export function unresolvedReferenceMessage(reference) {
-  return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
-    'This usually means the UUID tail is wrong or the item belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
+  return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no task in this project. ` +
+    'This usually means the UUID tail is wrong or the task belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
 }
 
 function cleanString(value) {
@@ -877,8 +877,8 @@ export function handleHook(mode, data, options = {}) {
       `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
       'Continue working—do not stop or retry, and editing is never blocked. ' +
       'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
-      'with a real description and the reason for it, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
-      'Authority: devspec://product/implementation-contract.'
+      'with a real description of the change and the reason it is needed, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
+      'When to create one is the work_entry_contract in devspec://product/implementation-contract.'
     return {
       additional_context: nudgeMessage,
       agent_message: nudgeMessage,

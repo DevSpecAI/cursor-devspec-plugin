@@ -1169,10 +1169,20 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
   return events
 }
 
-/** Small text payloads are cheap and immediately useful, so they stay inline. */
+/**
+ * Where a text attachment goes, never how much of it: at or under this size it rides
+ * inline in the wake event, above it the whole file is written to disk and its path is
+ * handed over. Either way every byte is delivered; this only keeps a long document from
+ * being printed into the wake stream when a path to it serves just as well.
+ */
 export const MAX_INLINE_ATTACHMENT_CHARS = 2048
 
-/** Filesystem-safe leaf name; never lets a filename escape the attachment dir. */
+/**
+ * Filesystem-safe leaf name; never lets a filename escape the attachment dir. Kept to
+ * 120 characters so the leaf, with its message and index prefix, stays inside the
+ * 255-byte file name limit of common filesystems. Only the name is shortened, never the
+ * file's contents.
+ */
 function safeAttachmentName(filename) {
   const base = path.basename(String(filename || 'attachment'))
   const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '')

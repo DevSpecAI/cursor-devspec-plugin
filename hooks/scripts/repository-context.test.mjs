@@ -121,3 +121,16 @@ test('github_identity surfaces linked accounts and link_required prompt while re
  storeRepositorySnapshot('one',insecureReg,home)
  assert.equal(readRepositorySnapshot('one',home).github_identity,undefined)
 }))
+
+test("the run-wide project context never carries the owner's reply style",()=>setup(home=>{
+ // Reply style belongs to each command's sender; a file the model applies for the whole
+ // run must not present the owner's as governing replies to anyone else (item ac7d624b).
+ selectProjectContext('style',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('style',{...registration(),owner_custom_instructions:'Answer me in haiku.',owner_custom_instructions_note:'Apply as personal style for this run.'},home)
+ const file=repositoryContextTextFile('style',home)
+ const text=fs.readFileSync(file,'utf8')
+ assert.match(text,/Full machine rules/)
+ assert.doesNotMatch(text,/haiku|owner_custom_instructions|personal style/)
+ assert.doesNotMatch(repositoryContextHook({conversation_id:'style'},{home,force:true}).additional_context,/haiku/)
+ assert.equal(refreshRepositoryRules('style',{project_id:A.id,owner_custom_instructions:'Answer me in limericks.'},home),null,'a style-only refresh changes no run-wide tier')
+}))

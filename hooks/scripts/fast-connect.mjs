@@ -206,7 +206,7 @@ export async function resolveProjectForConnect(opts) {
     })
     return { ok: true, project_id, git_remote: gitRemote, source }
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    const reason = err instanceof Error ? err.message : String(err)
     await emitPhase({
       phase: 'project_resolve',
       outcome: 'error',

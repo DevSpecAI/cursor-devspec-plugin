@@ -692,6 +692,9 @@ describe('bounded after-the-fact nudge', () => {
     assert.match(first?.agent_message || '', /claim_work_item/)
     assert.match(first?.agent_message || '', /added to the commit message for you/)
     assert.doesNotMatch(first?.agent_message || '', /thin|last-mile|<full-uuid>/i)
+    // When a task is warranted is the served contract's, not this message's.
+    assert.match(first?.agent_message || '', /work_entry_contract/)
+    assert.match(first?.agent_message || '', /reason it is needed/)
     assert.doesNotMatch(first?.agent_message || '', /refused|reconciliation|analy[sz]er/i)
     assert.equal(first?.permission, undefined)
     const second = handleHook('postToolUse', {

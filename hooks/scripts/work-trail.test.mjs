@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { ROOM_MESSAGE_MAX_CHARS } from './room-message.mjs'
 import {
   TRAIL_MAX_CHARS,
+  TRAIL_PART_MAX_CHARS,
   TRAIL_POST_MIN_GAP_MS,
   TRAIL_SEED_TEXT,
+  TRAIL_TRIM_NOTICE,
   advanceTrailState,
   clampTrail,
   elideLongOutput,
@@ -151,13 +154,37 @@ describe('clamp / elide / serialize', () => {
     const big = 'x'.repeat(TRAIL_MAX_CHARS + 50)
     const out = clampTrail(big)
     assert.ok(out.length <= TRAIL_MAX_CHARS)
-    assert.ok(out.startsWith('… earlier output trimmed'))
+    assert.ok(out.startsWith(TRAIL_TRIM_NOTICE))
+    // The newest output survives; the notice says why the oldest went and where it is.
+    assert.ok(out.endsWith('x'.repeat(1000)))
+    assert.match(TRAIL_TRIM_NOTICE, /earlier steps are not shown/)
+    assert.match(TRAIL_TRIM_NOTICE, /100,000 characters/)
+    assert.match(TRAIL_TRIM_NOTICE, /Cursor conversation/)
+  })
+
+  it('is bounded by the room message limit and nothing smaller', () => {
+    // The trail is posted as one room message, so the server's own limit is its only one.
+    assert.equal(TRAIL_MAX_CHARS, ROOM_MESSAGE_MAX_CHARS)
+    const justFits = 'y'.repeat(ROOM_MESSAGE_MAX_CHARS)
+    assert.equal(clampTrail(justFits), justFits)
   })
 
   it('elides long outputs', () => {
     const out = elideLongOutput('a'.repeat(20_000), 100)
     assert.ok(out.length < 200)
     assert.match(out, /chars elided/)
+  })
+
+  it('elides a long step visibly, within its bound, keeping its head and tail', () => {
+    const text = `HEAD${'m'.repeat(20_000)}TAIL`
+    const out = elideLongOutput(text)
+    assert.ok(out.length <= TRAIL_PART_MAX_CHARS)
+    assert.ok(out.startsWith('HEAD'))
+    assert.ok(out.endsWith('TAIL'))
+    const elided = Number(/\((\d+) chars elided; the full output is in the Cursor conversation\)/.exec(out)?.[1])
+    // The count is exactly what is missing.
+    assert.equal(out.length - out.match(/\n… \(.*\) …\n/)[0].length + elided, text.length)
+    assert.equal(elideLongOutput('short'), 'short')
   })
 
   it('serializeTranscriptJsonl keeps tool_use, skips long narration', () => {

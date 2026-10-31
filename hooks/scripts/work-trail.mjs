@@ -10,12 +10,33 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { withoutStandInPrefix } from './git-observer.mjs'
+import { ROOM_MESSAGE_MAX_CHARS } from './room-message.mjs'
 
-export const TRAIL_MAX_CHARS = 100_000
+/**
+ * The trail is posted as one room message (post_session_message, phase trail), so it is
+ * bounded by the room's own message limit and by nothing smaller. Past it the OLDEST
+ * steps go first, under a visible notice: the newest work is what a person watching
+ * needs, and every step stays in this Cursor conversation.
+ */
+export const TRAIL_MAX_CHARS = ROOM_MESSAGE_MAX_CHARS
 export const TRAIL_POST_MIN_GAP_MS = 1_000
-export const TRAIL_TRIM_NOTICE = '… earlier output trimmed …\n'
+export const TRAIL_TRIM_NOTICE =
+  '… earlier steps are not shown: the live trail is one room message, which holds at most ' +
+  `${ROOM_MESSAGE_MAX_CHARS.toLocaleString('en-US')} characters. Every step is in the Cursor conversation. …\n`
 export const TRAIL_SEED_TEXT = 'Working…'
+/**
+ * One step's output (a shell result, a tool result, a thought) is shown head and tail,
+ * with the middle elided under a visible count. Because the whole trail shares one
+ * room message and drops its oldest steps first, a single long output would otherwise
+ * push every earlier step out of view. The full output is in the Cursor conversation.
+ */
 export const TRAIL_PART_MAX_CHARS = 8_000
+/**
+ * A tool's arguments on its one-line `$ tool …` header, ending in `…` when longer. The
+ * header names the step; the step's output follows it, and the full arguments are in
+ * the Cursor conversation.
+ */
+export const TRAIL_HEADER_ARGS_CHARS = 120
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -53,11 +74,11 @@ export function hashPostedContent(text) {
   return crypto.createHash('sha256').update(String(text || '').replace(/\r\n/g, '\n').trim()).digest('hex').slice(0, 32)
 }
 
-/** @param {string} trail */
-export function clampTrail(trail) {
+/** @param {string} trail @param {number} [max] */
+export function clampTrail(trail, max = TRAIL_MAX_CHARS) {
   const s = String(trail || '')
-  if (s.length <= TRAIL_MAX_CHARS) return s
-  const keep = TRAIL_MAX_CHARS - TRAIL_TRIM_NOTICE.length
+  if (s.length <= max) return s
+  const keep = Math.max(0, max - TRAIL_TRIM_NOTICE.length)
   return TRAIL_TRIM_NOTICE + s.slice(s.length - keep)
 }
 
@@ -65,9 +86,12 @@ export function clampTrail(trail) {
 export function elideLongOutput(text, max = TRAIL_PART_MAX_CHARS) {
   const s = String(text || '')
   if (s.length <= max) return s
-  const head = Math.floor(max / 2) - 20
-  const tail = max - head - 40
-  return `${s.slice(0, head)}\n… (${s.length - head - tail} chars elided) …\n${s.slice(-tail)}`
+  const marker = (n) => `\n… (${n} chars elided; the full output is in the Cursor conversation) …\n`
+  // Sized for the largest count it could report; the real count is never longer.
+  const room = Math.max(0, max - marker(s.length).length)
+  const head = Math.floor(room / 2)
+  const tail = room - head
+  return `${s.slice(0, head)}${marker(s.length - head - tail)}${tail ? s.slice(-tail) : ''}`
 }
 
 /**
@@ -227,7 +251,7 @@ export function renderHookTrailPart(mode, rawData) {
 
   if (mode === 'afterAgentThought') {
     const text = String(data.text || '').trim()
-    return text ? `» ${elideLongOutput(text, 4_000)}` : null
+    return text ? `» ${elideLongOutput(text)}` : null
   }
 
   return null
@@ -310,27 +334,27 @@ export function serializeTranscriptJsonl(jsonl, maxChars = TRAIL_MAX_CHARS) {
       }
     }
   }
-  return clampTrail(blocks.join('\n\n').trimEnd()).slice(0, maxChars)
+  return clampTrail(blocks.join('\n\n').trimEnd(), maxChars)
+}
+
+/** One line of arguments for a step header, ending in `…` when it is longer. */
+function headerArgs(text) {
+  return text.length > TRAIL_HEADER_ARGS_CHARS ? `${text.slice(0, TRAIL_HEADER_ARGS_CHARS - 1)}…` : text
 }
 
 /** @param {unknown} input */
 function summarizeInput(input) {
   if (input == null) return ''
-  if (typeof input === 'string') {
-    const t = input.trim().replace(/\s+/g, ' ')
-    return t.length > 120 ? `${t.slice(0, 117)}…` : t
-  }
+  if (typeof input === 'string') return headerArgs(input.trim().replace(/\s+/g, ' '))
   if (typeof input !== 'object') return String(input)
   const obj = /** @type {Record<string, unknown>} */ (input)
   const preferred =
     obj.command ?? obj.path ?? obj.file_path ?? obj.query ?? obj.pattern ?? obj.toolName ?? obj.name
   if (typeof preferred === 'string' && preferred.trim()) {
-    const t = preferred.trim().replace(/\s+/g, ' ')
-    return t.length > 120 ? `${t.slice(0, 117)}…` : t
+    return headerArgs(preferred.trim().replace(/\s+/g, ' '))
   }
   try {
-    const raw = JSON.stringify(obj)
-    return raw.length > 120 ? `${raw.slice(0, 117)}…` : raw
+    return headerArgs(JSON.stringify(obj))
   } catch {
     return ''
   }

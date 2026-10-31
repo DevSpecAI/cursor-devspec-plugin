@@ -207,17 +207,6 @@ const MAX_TURN_MS = 60 * 60 * 1000
 /** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
 export const TURN_SILENCE_MS = 90_000
 
-/**
- * How much advisory room context is carried forward and attached to the next owner
- * command. Per tier (owner-ambient and everyone-else are budgeted separately so a
- * noisy room can never starve out the owner's own untargeted messages, which are the
- * higher-signal tier). Newest wins: when the budget is exceeded the OLDEST context is
- * dropped, and the count of what was dropped is reported to the model rather than
- * silently hidden.
- */
-const ADVISORY_CARRY_MAX_COUNT = 20
-const ADVISORY_CARRY_MAX_CHARS = 12_000
-
 function turnMarkerPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
 }
@@ -571,35 +560,6 @@ export function writeRoomState(
     return seen
   }
   return { doc: key }
-}
-
-/**
- * Trim an advisory carry buffer to its budget, newest-first.
- *
- * The buffer exists because a long-poll answers the instant anything lands, so room
- * context and the command that needs it almost never arrive in the same response.
- * Dropping is by AGE (oldest first) because the messages nearest the command are the
- * ones it is most likely to refer to, and a single over-budget message is kept rather
- * than discarded — an owner pasting one huge message must not silently vanish.
- *
- * @returns {{ kept: any[], dropped: number }}
- */
-export function trimAdvisoryCarry(
-  list,
-  { maxCount = ADVISORY_CARRY_MAX_COUNT, maxChars = ADVISORY_CARRY_MAX_CHARS } = {},
-) {
-  const items = Array.isArray(list) ? list : []
-  const kept = []
-  let chars = 0
-  for (let i = items.length - 1; i >= 0 && kept.length < maxCount; i--) {
-    const m = items[i]
-    const size = typeof m?.content === 'string' ? m.content.length : 0
-    if (kept.length > 0 && chars + size > maxChars) break
-    chars += size
-    kept.push(m)
-  }
-  kept.reverse()
-  return { kept, dropped: items.length - kept.length }
 }
 
 /**

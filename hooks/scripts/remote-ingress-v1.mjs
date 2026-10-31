@@ -14,6 +14,12 @@ export const REMOTE_INGRESS_SENDER_STYLE_POLICY_VERSION = '2026-09-18.1'
 export const REMOTE_INGRESS_ROOM_CONTEXT_CONTRACT_VERSION = '1.6.0'
 export const REMOTE_INGRESS_ROOM_CONTEXT_POLICY_VERSION = '2026-09-24.1'
 export const ROOM_CONTEXT_VERSION = 1
+// The numeric bounds in this file validate what the server sends and cut nothing
+// (the one local bound is CONTEXT_CARRY_BOUNDS, documented there). Each mirrors the served contract's wire schema (room_context_envelope_v1:
+// messages 500 = policy.bounds.transcript_page_max, session_activity entries 1,000,
+// session_events 2,000, notice and plan field lengths) or the server's own projection
+// constants (session polls, Still to Discuss), at the same value or looser, so a
+// message the server may send is never refused here.
 export const ROOM_PAGE_MAX = 500
 export const SESSION_ACTIVITY_MAX_ENTRIES = 1000
 export const SESSION_EVENTS_VERSION = 1
@@ -807,11 +813,31 @@ export function emptyCanonicalContextCarry() {
   }
 }
 
+/**
+ * How much advisory room context a connection carries between polls until a command
+ * arrives. One definition, used by the poller that builds the carry and the wait that
+ * validates it.
+ *
+ * Why it is bounded: the carry is rewritten into the connection's state file on every
+ * poll for as long as no command comes, so in a busy room it would otherwise grow
+ * without end. Nothing the model needs is lost: a canonical wake does not print these
+ * rows at all; it names the local room transcript (room-transcript.mjs), which keeps
+ * every message whole, and the room is always readable with get_session_transcript.
+ * What is left out is counted (`locally_omitted`, by bucket) and labelled
+ * `model_budget`, as the ingress contract asks of a bounded working set
+ * (`policy.bounds.context_projection_default`: omissions are disclosed).
+ */
+export const CONTEXT_CARRY_BOUNDS = Object.freeze({ maxCount: 20, maxChars: 12_000, maxWindows: 20 })
+
 /** Strictly bound the complete advisory rows and source-window ledger, newest first. */
 export function mergeCanonicalContextCarry(
   carry,
   envelope,
-  { maxCount = 20, maxChars = 12_000, maxWindows = 20 } = {},
+  {
+    maxCount = CONTEXT_CARRY_BOUNDS.maxCount,
+    maxChars = CONTEXT_CARRY_BOUNDS.maxChars,
+    maxWindows = CONTEXT_CARRY_BOUNDS.maxWindows,
+  } = {},
 ) {
   const next = emptyCanonicalContextCarry()
   const priorWindows = Array.isArray(carry?.windows) ? carry.windows : []
@@ -869,7 +895,11 @@ export function mergeCanonicalContextCarry(
 
 export function validateCanonicalContextCarry(
   carry,
-  { maxCount = 20, maxChars = 12_000, maxWindows = 20 } = {},
+  {
+    maxCount = CONTEXT_CARRY_BOUNDS.maxCount,
+    maxChars = CONTEXT_CARRY_BOUNDS.maxChars,
+    maxWindows = CONTEXT_CARRY_BOUNDS.maxWindows,
+  } = {},
 ) {
   const hasPlans = Object.hasOwn(carry ?? {}, 'active_session_plans') ||
     Object.hasOwn(carry ?? {}, 'active_session_plan_guidance')

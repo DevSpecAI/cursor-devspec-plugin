@@ -28,13 +28,16 @@ import {
   continuationIdentity,
   INTERACTION_EVENT_CONTRACT_URI,
 } from './interaction-events.mjs'
+import { roomMessageTooLong } from './room-message.mjs'
 
 const TOOL = 'manage_directed_question'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+// The server's own manage_directed_question schema: prompt maxLength 4000, options
+// 2 to 20 items of at most 200 characters each. Checked here only so a bad question is
+// refused with its reason before the capability call; the server enforces the same.
 const MAX_PROMPT_CODE_POINTS = 4000
 const MAX_OPTION_CODE_POINTS = 200
 const MAX_OPTIONS = 20
-const MAX_REPLY_CHARS = 12_000
 
 export const MANAGE_QUESTION_DESCRIPTION =
   "Ask the one person driving this Cursor connection's DevSpec session a single question, " +
@@ -289,7 +292,7 @@ export function respondArguments({ connectionId, continuation, message, agent })
 export async function respondToQuestion(
   input,
   { localId, agent = 'Cursor', hostToken = null, mcpCall = mcpToolsCall,
-    resolveAuth = resolveDevspecMcpAuth, clearContinuation = null } = {},
+    resolveAuth = resolveDevspecMcpAuth, clearContinuation = null, root = undefined } = {},
 ) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return { ok: false, error: 'respond input must be an object' }
@@ -299,8 +302,12 @@ export async function respondToQuestion(
   }
   const message = typeof input.message === 'string' ? input.message.trim() : ''
   if (!message) return { ok: false, error: 'respond requires a non-empty message' }
+  // Sent whole: a reply used to be cut at 12,000 characters without a word (item
+  // ac7d624b). Past the room's real limit it is refused with the numbers, never cut.
+  const tooLong = roomMessageTooLong(message)
+  if (tooLong) return { ok: false, error: tooLong }
 
-  const bound = resolveConnectionBridgeContext({ localId, agent })
+  const bound = resolveConnectionBridgeContext({ localId, agent }, root ? { root } : undefined)
   if (!bound.ok) return bound
   const continuation = activeContinuation(bound.state.interaction_continuation, {
     connectionId: bound.connectionId,
@@ -318,7 +325,7 @@ export async function respondToQuestion(
     args: respondArguments({
       connectionId: bound.connectionId,
       continuation,
-      message: message.slice(0, MAX_REPLY_CHARS),
+      message,
       agent,
     }),
     hostToken,

@@ -89,7 +89,10 @@ describe('the reminder', () => {
     assert.equal(out?.hookSpecificOutput?.hookEventName, 'PostToolUse')
     assert.equal(out?.additional_context, text)
     assert.match(text, /"Greenfield"/)
-    assert.match(text, /Settings → Integrations → Repositories/)
+    // The page moved from Settings → Integrations → Repositories to its own
+    // Settings → Repositories; the old route is only a redirect now.
+    assert.match(text, /Settings → Repositories/)
+    assert.doesNotMatch(text, /Integrations/)
     assert.ok(text.includes(REMOTE))
     assert.doesNotMatch(text, new RegExp(PROJECT), 'the person needs the name, not our id')
   })

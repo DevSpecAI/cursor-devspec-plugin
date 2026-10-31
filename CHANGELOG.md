@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.17
+## 0.16.18
 
 DevSpec now hears about each commit the Cursor agent makes with `git commit` while it is connected, however the command was written, and the claimed task's reference is added for the agent, as in the other DevSpec plugins. Before, the plugin read the text of a plain `git commit` command, so it missed many commits: ones with a multi-line message, ones made in a script or a longer compound command, through an alias, and amends, among others. Those reached DevSpec later from GitHub, often with no task reference, and were not credited to Cursor.
 
@@ -10,6 +10,18 @@ DevSpec now hears about each commit the Cursor agent makes with `git commit` whi
 - **Other repositories are left alone.** A commit in a repository that is not one of the project's is not changed and not reported.
 - **Alongside other DevSpec plugins.** The stand-in follows the same agreement as the other DevSpec plugins' stand-ins, so two of them on one `PATH` never take each other for git.
 - **Nothing reported twice.** The older checks that read the command text stand down whenever the stand-in ran. They still apply on native Windows, where Cursor runs commands in PowerShell, which can't take the added line: there, only straightforward `git commit` commands the agent runs directly are noticed and tagged. In a conversation that isn't connected, those commands are still tagged as before. The README's new **Commit tracking** section says which setups get full tracking.
+
+## 0.16.17
+
+The Cursor plugin's instructions to the agent now match what DevSpec actually does, and nothing the plugin posts is cut short without saying so.
+
+- **Work that waits for an OK.** The agent keeps such work on its own branch until it has the OK, not for ever. Who can give the OK now comes from DevSpec's own rules, instead of a blanket rule never to clear a wait on the agent's own work, which DevSpec allows in some cases.
+- **Fewer rules copied from DevSpec.** Which fields DevSpec checks for duplicates, what each kind of task dismissal needs, and who decides a proposed change are now pointers to DevSpec's own rules and tool descriptions, so they stay right when DevSpec changes. The copied versions had already drifted: they left out acceptance criteria, and said only a maintainer could accept a proposal.
+- **Tool details corrected.** Memory types match DevSpec's list, and a memory edit is previewed with the memory tool's own preview instead of the task supersession preview. All three "still valid" flag rulings say which values they need. A refused commit or the one-time reminder after an edit asks for a task with a real description and the reason it is needed. The reminder to link a repository points at the project's Settings → Repositories page.
+- **Your reply style is yours.** The connect result no longer presents the owner's personal reply style as an instruction for the whole run. Each message is answered in the style of the person who sent it, which DevSpec delivers with that message.
+- **Long text arrives whole.** Replies to a question, mirrored prompts and replies, and messages about a failed turn are no longer cut at 12,000 characters without a word. They are posted whole up to DevSpec's 100,000-character room message limit; beyond it, a question reply is refused with both numbers, and anything else ends with a note saying how much is not shown and where the full text is. The live work trail says the same when its oldest steps make way for new ones.
+- **Error messages say what they leave out.** A long error response is quoted in part with a count of what was left out, and the full response is kept with the error.
+- **Checks.** The plugin's self-check now also reads Cursor's project rule file, accepts DevSpec argument names in prose while still catching retired or misspelt tools, checks the arguments of calls written out in the instructions, and checks that every pointer to DevSpec's rules names a part those rules have.
 
 ## 0.16.16
 
