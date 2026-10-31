@@ -136,6 +136,41 @@ describe('registerConnection capability negotiation', () => {
     assert.doesNotMatch(JSON.stringify(result), /hidden-secret/)
   })
 
+  it("never hands the model the owner's reply style as a run-wide instruction", async (t) => {
+    // Reply style belongs to whoever sent each command (sender_response_style). The
+    // server returns the owner's beside the run-wide tiers; the connect result the
+    // model reads must not present it as governing every reply (item ac7d624b).
+    const projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-register-scope-'))
+    t.after(() => fs.rmSync(projectHome, { recursive: true, force: true }))
+    const result = await registerConnection({
+      localId: 'cursor-chat-style',
+      projectId: '11111111-1111-4111-8111-111111111111',
+      projectHome,
+      resolveAuth: () => ({ ok: true, token: 'dvs_token', mcp_url: 'https://example.test/api/mcp' }),
+      emitPhase: async () => {},
+      mcpCall: async () => ({
+        data: {
+          connection_id: '22222222-2222-4222-8222-222222222222',
+          project_id: '11111111-1111-4111-8111-111111111111',
+          owner_custom_instructions: 'Answer me in haiku.',
+          owner_custom_instructions_note: 'Apply as personal style for this run.',
+          owner_agent_rules: 'Port 3000 is mine.',
+          project_agent_rules: 'Never git stash.',
+        },
+        meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_style-secret' } } },
+      }),
+      persistCapability: () => ({ ok: true }),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(Object.hasOwn(result, 'owner_custom_instructions'), false)
+    assert.equal(Object.hasOwn(result, 'owner_custom_instructions_note'), false)
+    assert.doesNotMatch(JSON.stringify(result), /haiku|personal style for this run/)
+    assert.match(result.reply_style, /sender_response_style/)
+    // The run-wide tiers still arrive.
+    assert.equal(result.owner_agent_rules, 'Port 3000 is mine.')
+    assert.equal(result.project_agent_rules, 'Never git stash.')
+  })
+
   it('fails closed when a negotiated register omits the hidden capability', async (t) => {
     const projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-register-scope-'))
     t.after(() => fs.rmSync(projectHome, { recursive: true, force: true }))

@@ -3,6 +3,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 
+// Diagnostics is an opt-in recorder writing to the person's own disk while a run is
+// live; these bound how long it records and how much disk it can take there. They cut
+// no DevSpec content: an export reports `truncated` and the total observed beside what
+// it kept, and the skill tells the person the run's duration and where the files are.
 export const LIMITS = Object.freeze({ minutes: 15, maxMinutes: 60, retentionMs: 24 * 60 * 60 * 1000, runs: 4, segmentBytes: 512 * 1024, events: 10000 })
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 const KINDS = new Set(['tool', 'mcp', 'connect', 'progress_failure', 'transcript', 'lifecycle'])

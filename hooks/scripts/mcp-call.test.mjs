@@ -15,6 +15,7 @@ import {
   readServerFailure,
   isRetryableHttpFailure,
   mcpToolsCallWithRetry,
+  ERROR_BODY_EXCERPT_CHARS,
 } from './mcp-call.mjs'
 
 describe('DEFAULT_MCP_CALL_TIMEOUT_MS', () => {
@@ -197,5 +198,33 @@ describe('mcpToolsCallWithRetry — the one-shot connect path', () => {
       call: async (args) => { seen = args; return 'ok' },
     })
     assert.deepEqual(seen, { name: 'x', arguments: { a: 1 } })
+  })
+})
+
+describe('a failed response in an error', () => {
+  // The message quotes a one-line excerpt; it must say what it left out, and the whole
+  // body must still be on the error rather than lost (item ac7d624b).
+  it('quotes a long body with the count left out and keeps the whole body', async () => {
+    const page = `<html>${'p'.repeat(5_000)}</html>`
+    const server = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.statusCode = 502
+      res.end(page)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    try {
+      const error = await mcpToolsCall({ mcpUrl, token: 'dvs_fixture', name: 'get_task', arguments: {} }).then(
+        () => assert.fail('a 502 must reject'),
+        (e) => e,
+      )
+      assert.equal(error.status, 502)
+      assert.match(error.message, /^MCP HTTP 502: <html>/)
+      assert.match(error.message, new RegExp(`\\(${page.length - ERROR_BODY_EXCERPT_CHARS} more characters; the full response is on the error's body\\)$`))
+      assert.equal(error.body, page)
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
   })
 })

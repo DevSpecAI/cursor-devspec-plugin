@@ -17,7 +17,6 @@ import {
   TURN_SILENCE_MS,
   isTurnMarkerStale,
   shouldForceCompleteAndInject,
-  trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
   errorBackoffMs,
@@ -161,55 +160,6 @@ describe('cadenceFor (hold length, not interval)', () => {
       ].map(([attached, turnActive]) => cadenceFor({ attached, turnActive }).tier),
     )
     assert.deepEqual([...tiers].sort(), ['attended', 'idle'])
-  })
-})
-
-/**
- * The advisory carry buffer. A long-poll answers the instant anything lands, so the
- * room and the command that needs it arrive in SEPARATE responses — this buffer is
- * what makes "the room arrives with the command" true rather than nominally true.
- */
-describe('trimAdvisoryCarry', () => {
-  const msg = (id, len = 10) => ({ id, content: 'x'.repeat(len) })
-
-  it('keeps everything inside budget, oldest-first order preserved', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')])
-    assert.deepEqual(kept.map((m) => m.id), ['a', 'b', 'c'])
-    assert.equal(dropped, 0)
-  })
-
-  it('drops the OLDEST when over the count budget — nearest context survives', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')], { maxCount: 2 })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('drops the oldest when over the character budget', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a', 100), msg('b', 100), msg('c', 100)], {
-      maxChars: 250,
-    })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('keeps a single over-budget message rather than delivering nothing', () => {
-    const { kept } = trimAdvisoryCarry([msg('huge', 50_000)], { maxChars: 100 })
-    assert.deepEqual(kept.map((m) => m.id), ['huge'])
-  })
-
-  it('handles empty and malformed input without throwing', () => {
-    assert.deepEqual(trimAdvisoryCarry([]), { kept: [], dropped: 0 })
-    assert.deepEqual(trimAdvisoryCarry(null), { kept: [], dropped: 0 })
-    assert.equal(trimAdvisoryCarry([{ id: 'no-content' }]).kept.length, 1)
-  })
-
-  it('THE 1-2-3 CASE: three separate arrivals still reach the command together', () => {
-    // Each untargeted message came back in its own long-poll response.
-    let carry = []
-    for (const n of ['1', '2', '3']) {
-      carry = trimAdvisoryCarry([...carry, { id: n, content: n }]).kept
-    }
-    assert.deepEqual(carry.map((m) => m.content), ['1', '2', '3'])
   })
 })
 

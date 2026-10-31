@@ -67,6 +67,21 @@ const CONNECT_BACKOFF_MS = [300, 1_200]
  * `err.code` already means the ABORT reason ('timeout' | 'owner_gone') and callers
  * switch on it. Exported for tests.
  */
+/**
+ * How much of an unreadable or failed HTTP response an error's message quotes. The
+ * message is one line for logs and for the agent; a body can be a whole HTML error
+ * page from a proxy. The excerpt says how much it left out, and the error keeps the
+ * complete body on `err.body`, with the server's structured failure beside it.
+ */
+export const ERROR_BODY_EXCERPT_CHARS = 400
+
+/** The start of `text` for an error message, saying how much it left out. */
+export function bodyExcerpt(text, max = ERROR_BODY_EXCERPT_CHARS) {
+  const s = String(text ?? '')
+  if (s.length <= max) return s
+  return `${s.slice(0, max)}… (${s.length - max} more characters; the full response is on the error's body)`
+}
+
 export function readServerFailure(status, bodyText) {
   const out = {
     status: Number.isInteger(status) ? status : null,
@@ -229,9 +244,9 @@ async function performMcpToolsCall({
   const text = await res.text()
   if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
-    // Message text is deliberately unchanged — logs and existing matching read it.
-    const err = new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
-    Object.assign(err, readServerFailure(res.status, text))
+    // The message keeps its `MCP HTTP <status>: …` shape — logs and existing matching read it.
+    const err = new Error(`MCP HTTP ${res.status}: ${bodyExcerpt(text)}`)
+    Object.assign(err, readServerFailure(res.status, text), { body: text })
     throw err
   }
 
@@ -255,7 +270,7 @@ async function performMcpToolsCall({
   }
 
   if (!payload) {
-    throw new Error(`Unparseable MCP response: ${text.slice(0, 200)}`)
+    throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
     throw new Error(payload.error.message || JSON.stringify(payload.error))

@@ -91,7 +91,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity } from './repository-context.mjs'
+import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
@@ -1514,7 +1514,7 @@ export async function registerConnection(opts) {
     const github = githubIdentity(result?.github_identity)
     return {
       ok: !!connectionId,
-      ...result,
+      ...withoutOwnerReplyStyle(result),
       ...(github ? { github_identity: github, github_status: renderGithubIdentity(github) } : {}),
       connection_id: connectionId,
       codename: result?.codename || result?.session_codename || null,
@@ -1523,7 +1523,7 @@ export async function registerConnection(opts) {
       ...(connectionId ? {} : { error: 'register_connection returned no connection_id' }),
     }
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    const reason = err instanceof Error ? err.message : String(err)
     await emitPhase({
       phase: 'register_connection',
       outcome: 'error',
@@ -1609,13 +1609,13 @@ export async function attachConnection(opts) {
     })
     return {
       ok: true,
-      ...result,
+      ...withoutOwnerReplyStyle(result),
       connection_id: result?.connection_id || connectionId,
       session_id: result?.session_id || sessionId,
       launch_id: launchId,
     }
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    const reason = err instanceof Error ? err.message : String(err)
     await emitPhase({
       phase: 'attach_connection',
       outcome: 'error',

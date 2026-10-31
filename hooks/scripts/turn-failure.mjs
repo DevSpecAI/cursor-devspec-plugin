@@ -24,6 +24,7 @@
 
 import fs from 'node:fs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
+import { fitRoomMessage } from './room-message.mjs'
 
 // How much of the transcript's end is read to find the turn's turn_ended line. Cursor
 // writes it as the turn's final line, so it sits within the last few hundred bytes;
@@ -111,7 +112,10 @@ export async function postTurnFailure({ raw, connectionId, post, dir, agentName 
   await post({
     connection_id: connectionId,
     agent_name: agentName,
-    message: turnFailureMessage(failure, agentName),
+    // Cursor's error text is quoted whole; only past the room's own limit is it cut, visibly.
+    message: fitRoomMessage(turnFailureMessage(failure, agentName), {
+      whereRest: `The full error is in ${agentName}'s terminal.`,
+    }),
     complete_turn: true,
   })
   for (const id of commands) appendRequestEvent(connectionId, { op: 'answered', id }, { dir })
