@@ -18,7 +18,7 @@ test('package, plugin, marketplace and executing reporter agree', () => {
   assert.equal(JSON.parse(readFileSync(join(root, '.cursor-plugin/marketplace.json'), 'utf8')).plugins[0].version, version)
   // JSON cannot read the manifest, so the plugin's own MCP config carries the one
   // literal copy of the header; this is what stops a version bump leaving it behind.
-  assert.equal(JSON.parse(readFileSync(join(root, 'mcp.json'), 'utf8')).mcpServers.devspec.headers[PLUGIN_HEADER], `cursor/${version}`)
+  assert.equal(JSON.parse(readFileSync(join(root, 'mcp.json'), 'utf8')).mcpServers['devspec-cursor'].headers[PLUGIN_HEADER], `cursor/${version}`)
 })
 test('the x-devspec-plugin header is cursor/<the loaded manifest version>, or absent', () => {
   assert.equal(PLUGIN_HEADER, 'x-devspec-plugin')

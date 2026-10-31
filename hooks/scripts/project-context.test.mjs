@@ -37,11 +37,14 @@ test('the server this plugin declares is recognised by the name Cursor gives it,
  const root=fileURLToPath(new URL('../..',import.meta.url))
  const plugin=JSON.parse(fs.readFileSync(path.join(root,'.cursor-plugin/plugin.json'),'utf8'))
  const servers=Object.keys(JSON.parse(fs.readFileSync(path.join(root,'mcp.json'),'utf8')).mcpServers)
- assert.deepEqual(servers,['devspec'])
+ assert.deepEqual(servers,['devspec-cursor'])
  const pluginServer=`plugin-${plugin.name}-${servers[0]}`
  assert.equal(isDevspecServer(pluginServer),true)
  assert.equal(isDevspecServer('devspec'),true,'the entry in Cursor\'s own MCP settings file')
- for(const name of ['other','plugin-other-devspec','plugin-devspec-other','devspec-evil',null,undefined])assert.equal(isDevspecServer(name),false,String(name))
+ // DevSpec's Claude Code plugin is also called devspec with a server called devspec,
+ // and Cursor loads it too. That server is the Claude Code plugin's, never this one's.
+ assert.notEqual(pluginServer,'plugin-devspec-devspec','must not collide with the Claude Code plugin\'s server')
+ for(const name of ['other','plugin-other-devspec','plugin-devspec-other','plugin-devspec-devspec','devspec-evil',null,undefined])assert.equal(isDevspecServer(name),false,String(name))
  selectProjectContext('chat',endpoint,B,'explicit',home)
  const pre=projectInput('pre',hook('MCP:devspec__get_project_summary'),{home})
  assert.equal(projectInput('before',{...hook('devspec__get_project_summary',pre.updated_input),mcp_server_name:pluginServer,mcp_server_url:endpoint},{home}),null)
