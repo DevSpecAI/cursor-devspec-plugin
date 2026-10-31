@@ -3,7 +3,7 @@ description: DevSpec workflow — claim early, link commits, and follow the serv
 alwaysApply: true
 ---
 
-<!-- devspec-autopilot-rules:9 -->
+<!-- devspec-rules:9 -->
 
 ## Working with DevSpec
 

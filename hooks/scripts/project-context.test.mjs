@@ -3,8 +3,9 @@ import { test, beforeEach, afterEach } from 'node:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { projectInput } from './project-input.mjs'
-import { readProjectContext, selectProjectContext, blockProjectContext, contextFile, endpointIdentity } from './project-context.mjs'
+import { readProjectContext, selectProjectContext, blockProjectContext, contextFile, endpointIdentity, isDevspecServer } from './project-context.mjs'
 import { folderDefault, prepareCursorProject, findNativeCursorCli } from './project-command.mjs'
 import { registerConnection, parseArgs } from './remote-control-state.mjs'
 import { findProjectPin, confirmReferenceOnline, parseMcpExecution } from './provenance-assistance.mjs'
@@ -29,6 +30,22 @@ test('namespace mode does not change endpoint identity or merge different conver
  assert.equal(readProjectContext('b',endpoint,home).project.id,B.id)
  assert.throws(()=>selectProjectContext('a',endpoint,B,'explicit',home),/fresh Cursor/)
  assert.throws(()=>readProjectContext('a','https://other.invalid/api/mcp',home),/another DevSpec server/)
+})
+test('the server this plugin declares is recognised by the name Cursor gives it, and only DevSpec servers are',()=>{
+ // Cursor names a plugin's MCP server plugin-<plugin name>-<server key> (its plugins
+ // reference), and passes that name to hooks as mcp_server_name.
+ const root=fileURLToPath(new URL('../..',import.meta.url))
+ const plugin=JSON.parse(fs.readFileSync(path.join(root,'.cursor-plugin/plugin.json'),'utf8'))
+ const servers=Object.keys(JSON.parse(fs.readFileSync(path.join(root,'mcp.json'),'utf8')).mcpServers)
+ assert.deepEqual(servers,['devspec'])
+ const pluginServer=`plugin-${plugin.name}-${servers[0]}`
+ assert.equal(isDevspecServer(pluginServer),true)
+ assert.equal(isDevspecServer('devspec'),true,'the entry in Cursor\'s own MCP settings file')
+ for(const name of ['other','plugin-other-devspec','plugin-devspec-other','devspec-evil',null,undefined])assert.equal(isDevspecServer(name),false,String(name))
+ selectProjectContext('chat',endpoint,B,'explicit',home)
+ const pre=projectInput('pre',hook('MCP:devspec__get_project_summary'),{home})
+ assert.equal(projectInput('before',{...hook('devspec__get_project_summary',pre.updated_input),mcp_server_name:pluginServer,mcp_server_url:endpoint},{home}),null)
+ assert.equal(projectInput('before',{...hook('devspec__get_project_summary',{project_id:A.id}),mcp_server_name:pluginServer,mcp_server_url:endpoint},{home}).permission,'deny','the plugin server gets the same project guard')
 })
 test('Cursor native input merge stamps scope without allowing permissions; server guard proves destination',()=>{
  selectProjectContext('chat',endpoint,B,'explicit',home)

@@ -113,8 +113,13 @@ try{
  assert.equal((await invoke('devspec__get_project_summary',{project_id:'11111111-1111-4111-8111-111111111111'})).result.case,'permissionDenied')
  assert.equal((await invoke('devspec__get_project_summary',{},'foreign')).result.case,'permissionDenied')
  assert.equal(requests.length,sent,'neither wrong scope nor spoofed namespace may reach a server')
+ // Cursor names the server a plugin declares plugin-<plugin>-<server>: that one is DevSpec's own.
+ const pluginServer=`plugin-${JSON.parse(fs.readFileSync(path.join(root,'.cursor-plugin/plugin.json'),'utf8')).name}-devspec`
+ assert.equal((await invoke('devspec__get_project_summary',{},pluginServer)).result.case,'success')
+ assert.equal(requests.at(-1).server,pluginServer)
+ const reached=requests.length
  failPre=true
  assert.equal((await invoke('devspec__get_project_summary')).result.case,'permissionDenied')
- assert.equal(requests.length,sent,'missing required namespaced hook fails closed')
- console.log(JSON.stringify({result:'PASS',hostVersion:path.basename(versionDir),method:'installed Cursor MCP hook executor in isolated harness',nativeInputMerge:true,serverIdentityGuard:true,registrationReceipt:true,repositoryContextInNativeCarrier:true,wrongScopeDenied:true,hookFailureClosed:true,modelCalls:0,liveRecords:0}))
+ assert.equal(requests.length,reached,'missing required namespaced hook fails closed')
+ console.log(JSON.stringify({result:'PASS',hostVersion:path.basename(versionDir),method:'installed Cursor MCP hook executor in isolated harness',nativeInputMerge:true,serverIdentityGuard:true,pluginServerAccepted:true,registrationReceipt:true,repositoryContextInNativeCarrier:true,wrongScopeDenied:true,hookFailureClosed:true,modelCalls:0,liveRecords:0}))
 }finally{fs.rmSync(home,{recursive:true,force:true})}

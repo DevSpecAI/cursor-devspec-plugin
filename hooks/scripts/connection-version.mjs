@@ -2,11 +2,14 @@ import { readFileSync, realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { PLUGIN_ID } from './agent-identity.mjs'
 
+/** This plugin's name in its own manifest, which is how it recognises its own installed copy. */
+export const PLUGIN_NAME = 'devspec'
+
 const label = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._+\/-]{0,63}$/.test(value) ? value : undefined
 function pluginVersion() {
   try {
     const manifest = JSON.parse(readFileSync(new URL('../../.cursor-plugin/plugin.json', import.meta.url), 'utf8'))
-    return manifest.name === 'devspec-autopilot' ? label(manifest.version) : undefined
+    return manifest.name === PLUGIN_NAME ? label(manifest.version) : undefined
   } catch { return undefined }
 }
 

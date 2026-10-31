@@ -91,7 +91,13 @@ export function namespacedVerb(name) {
   const value = String(name ?? '').replace(/^MCP:/, '')
   return /^devspec__[a-z][a-z0-9_]*$/.test(value) ? value.slice('devspec__'.length) : null
 }
-export function isDevspecServer(value) { return ['devspec', 'plugin:devspec-autopilot:devspec', 'devspec-autopilot:devspec'].includes(String(value ?? '').toLowerCase()) }
+/**
+ * The MCP servers DevSpec's tools may come from, as Cursor names them to hooks
+ * (`mcp_server_name`): `devspec`, the entry in Cursor's own MCP settings file, and
+ * `plugin-<plugin>-<server>` for the server this plugin's mcp.json declares.
+ */
+export const DEVSPEC_SERVER_NAMES = Object.freeze(['devspec', 'plugin-devspec-devspec'])
+export function isDevspecServer(value) { return DEVSPEC_SERVER_NAMES.includes(String(value ?? '').toLowerCase()) }
 export const PROJECTLESS = new Set(['list_projects', 'verify_agent_connection', 'devspec_help_search', 'get_personal_instructions', 'update_personal_instructions'])
 export function toolArguments(input) {
   const value = input?.tool_input ?? input?.toolInput ?? {}
