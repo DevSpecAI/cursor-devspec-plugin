@@ -88,6 +88,19 @@ describe('current Cursor authority and work-acquisition prose', () => {
     }
   })
 
+  // Prose guard for item 5f8fe76a; the behaviour is tested in
+  // hooks/scripts/notice-reply.test.mjs, which runs the hooks themselves.
+  it('teaches a notice reply by pointing at the served rules, never as a command answer', () => {
+    for (const file of ['skills/devspec.remote/SKILL.md', 'rules/devspec.mdc']) {
+      const content = fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+      assert.match(content, /semantics\.notice_reply/, file)
+      assert.match(content, /system_notice_ids/, file)
+      for (const sentence of content.split(/(?<=[.!?|])\s+/).filter((text) => /notice/i.test(text))) {
+        assert.doesNotMatch(sentence, /complete_turn:\s*true/, `${file} pairs a notice with complete_turn: ${sentence.slice(0, 160)}`)
+      }
+    }
+  })
+
   it('keeps interaction policy item-scoped on every work surface', () => {
     for (const file of ['skills/devspec.remote/SKILL.md']) {
       const content = contents.get(file)

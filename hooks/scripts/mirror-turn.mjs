@@ -7,7 +7,9 @@
  * user_prompt → optional local_prompt bubble when attached (literal owner text)
  *             → also seeds phase=trail "Working…" so the live bubble opens immediately
  * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state;
- *               a room command whose turn errored or was stopped is told so (turn-failure.mjs)
+ *               a room command whose turn errored or was stopped is told so (turn-failure.mjs);
+ *               a turn woken only by DevSpec notices whose model posted no reply ends with
+ *               its final message as a reply to those notices (notice-reply.mjs)
  *
  * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
@@ -52,6 +54,7 @@ import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-tur
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 import { postTurnFailure } from './turn-failure.mjs'
 import { fitRoomMessage } from './room-message.mjs'
+import { clearTurnWakes, postNoticeTurnReply, recordPromptWake } from './notice-reply.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -593,6 +596,22 @@ async function main() {
     }
   }
 
+  // What this prompt brought into the turn: DevSpec notices, or anything else
+  // (notice-reply.mjs). Recorded before the harness-injection exit below, because a
+  // notice reaches the model as exactly such an injection.
+  if (mode === 'user_prompt' && connectionId) {
+    try {
+      recordPromptWake(connectionId, {
+        fromAPerson,
+        text,
+        midTurn: promptTurnId(raw) !== null,
+        dir: CONNECTIONS_DIR,
+      })
+    } catch {
+      /* an unrecorded wake only means the model passes the notice ids itself */
+    }
+  }
+
   // Consume any explicit-reply marker so it cannot bleed into a later turn.
   // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
   // assistant text as a primary path — dual writers caused wrong-voice dupes
@@ -714,6 +733,29 @@ async function main() {
       } catch {
         /* non-fatal: the turn still ends below */
       }
+    }
+
+    // A turn woken only by DevSpec notices, whose model posted no reply to them, ends
+    // with its final message as a reply to those notices: bound to no command turn,
+    // so it never answers or closes anyone's command (notice-reply.mjs). Then what
+    // woke the turn is forgotten.
+    if (mode === 'stop' && connectionId) {
+      try {
+        await postNoticeTurnReply({
+          raw,
+          connectionId,
+          sessionId,
+          connectionState: state,
+          agentName,
+          dir: CONNECTIONS_DIR,
+          prepare: prepareAgentMirrorText,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+      } catch {
+        /* non-fatal: the person still has the final message in the terminal */
+      }
+      clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
     }
 
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +
