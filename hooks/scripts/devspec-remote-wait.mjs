@@ -85,6 +85,13 @@ import {
 } from './interaction-events.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
+import {
+  clearTurnWakes,
+  noticeReplyCall,
+  noticeReplyInstruction,
+  recordTurnWake,
+  turnWakeFromEvents,
+} from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
@@ -151,6 +158,8 @@ export function armEndsTurn({ fromEnd, pending, afterReply } = {}) {
 export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR) {
   if (!armEndsTurn(args)) return false
   clearTurnMarker(connectionId, dir)
+  // What woke the ended turn no longer describes the next one (notice-reply.mjs).
+  clearTurnWakes(connectionId, { dir })
   return true
 }
 
@@ -1001,14 +1010,22 @@ export const NOTICE_HANDLING =
   'Act only within the allowed outcomes and tools, based on who asked for the work (remember a teammate can drive someone else\'s agent, so the requester\'s authority is what counts), their authority, and whether this finding is already understood or new information: ' +
   '(1) If it is a descriptive staleness flag and the change the requester asked for clearly makes that detail out of date, update or retire it straight away without asking permission and mention what you updated in one brief sentence (or say it was queued if their role queues a proposal); ask only if the right change is unclear or surfaces something new. ' +
   '(2) If it is a decision conflict or duplicate and the requester has authority to settle it and has already clearly asked to proceed despite the earlier record, act for them straight away without a redundant confirmation and confirm briefly in context. ' +
-  '(3) If the finding brings new information or a consequence the requester did not appear aware of, or if the requester does not have authority to settle it themselves, explain what clashes and why in plain words in context (plus who it waits on when they cannot give the OK) and recommend the practical options.'
+  '(3) If the finding brings new information or a consequence the requester did not appear aware of, or if the requester does not have authority to settle it themselves, explain what clashes and why in plain words in context (plus who it waits on when they cannot give the OK) and recommend the practical options. ' +
+  'Telling the person about the notice in the room is the notice reply below, never an answer to a command.'
 
-export function formatSystemNoticeContent(notice) {
+/**
+ * The model-readable rendering of one notice. Every kind ends with the exact notice
+ * reply for its own id (notice-reply.mjs): telling the person about a notice in the
+ * room is a reply to that notice, never an answer to a command.
+ */
+export function formatSystemNoticeContent(notice, { connectionId = null } = {}) {
+  const reply = noticeReplyInstruction([notice?.notice_id], { connectionId })
   if (isUnreadableSystemNoticeV1(notice)) {
     return [
       '[DevSpec System Notice: not readable by this plugin version]',
       `DevSpec sent a notice of a kind this version of the DevSpec plugin cannot read (kind ${notice.kind}, notice ${notice.notice_id}). It may be a finding or an outcome about your own work.`,
       'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
+      reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice, not a room message or new work authorization.',
     ].join('\n')
@@ -1038,6 +1055,7 @@ export function formatSystemNoticeContent(notice) {
     lines.push(
       '',
       NOTICE_HANDLING,
+      reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
     )
@@ -1052,6 +1070,7 @@ export function formatSystemNoticeContent(notice) {
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
     NOTICE_HANDLING,
+    reply,
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
   ].join('\n')
@@ -1069,17 +1088,21 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     ? rawNotices.filter((notice) => executeIds.has(notice.notice_id))
     : rawNotices
   const sessionId = batch?.session_id ?? null
+  const connectionId = typeof batch?.connection_id === 'string' ? batch.connection_id : null
   const pointers = batch?.wake_context ?? null
   const events = []
 
+  // Each notice names the exact reply to it near the start of its line, ahead of the
+  // records, so a cut-short preview still shows it (notice-reply.mjs).
   for (const notice of notices) {
     if (isUnreadableSystemNoticeV1(notice)) {
       events.push({
         type: 'system_notice',
         kind: notice.kind,
         notice_id: notice.notice_id,
+        notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
         readable: false,
-        content: formatSystemNoticeContent(notice),
+        content: formatSystemNoticeContent(notice, { connectionId }),
         session_id: sessionId,
         envelope_id: ingress?.envelope_id ?? null,
         inbox: inboxFile ?? null,
@@ -1094,6 +1117,7 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
       type: 'system_notice',
       kind: notice.kind,
       notice_id: notice.notice_id,
+      notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
       ...(notice.kind === 'server_notice'
         ? {
             topic: notice.topic,
@@ -1113,7 +1137,7 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
             allowed_outcomes: notice.allowed_outcomes,
             allowed_tools: notice.allowed_tools,
           }),
-      content: formatSystemNoticeContent(notice),
+      content: formatSystemNoticeContent(notice, { connectionId }),
       session_id: sessionId,
       envelope_id: ingress?.envelope_id ?? null,
       inbox: inboxFile ?? null,
@@ -1134,6 +1158,8 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     count: notices.length,
     envelope_id: ingress?.envelope_id ?? null,
     system_notice_ids: notices.map((notice) => notice.notice_id),
+    // One reply can answer every notice this wake handed over, and no others.
+    notice_reply: noticeReplyInstruction(notices.map((notice) => notice.notice_id), { connectionId }),
     inbox: inboxFile ?? null,
     authoritative: false,
     executable: false,
@@ -1616,6 +1642,9 @@ async function main() {
         offset = newOffset
         offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        // What this delivery brings into the turn: notice ids, or that something
+        // other than a notice woke it (notice-reply.mjs).
+        recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,
