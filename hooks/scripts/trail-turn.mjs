@@ -28,6 +28,7 @@ import {
   writeTrailState,
 } from './work-trail.mjs'
 import { recordTurnActivity } from './turn-liveness.mjs'
+import { currentTurnNoticeIds } from './notice-reply.mjs'
 
 const VALID_MODES = new Set([
   'seed',
@@ -87,6 +88,11 @@ async function main() {
   // while a turn is actively marked running. Background IDE tool executions outside an
   // active turn must not assert busy state or open transient streaming bubbles.
   if (mode !== 'seed' && !hasActiveTurnMarker(state.connection_id)) {
+    process.exit(0)
+  }
+  // A turn woken only by DevSpec notices belongs to no command, so its work is never
+  // posted as a trail, which DevSpec would file under someone's command (notice-reply.mjs).
+  if (currentTurnNoticeIds(state.connection_id, { connectionState: state })) {
     process.exit(0)
   }
   if (mode !== 'seed') {
