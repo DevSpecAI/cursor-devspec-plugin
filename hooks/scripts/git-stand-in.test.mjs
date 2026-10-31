@@ -282,7 +282,7 @@ describe('commits in the connected project\'s repositories', () => {
     assert.match(result.stderr, /DevSpec stopped this commit before git ran, so nothing was changed/)
     assert.match(result.stderr, /claim_work_item/)
     assert.match(result.stderr, /create_task/)
-    assert.match(result.stderr, /run the same commit again/)
+    assert.match(result.stderr, /retry the same commit: its \[devspec:<id>\] reference is added for you/)
     assert.equal(git(repo, 'rev-parse', 'HEAD'), head)
     assert.equal(git(repo, 'diff', '--cached', '--name-only'), index)
     assert.equal((await report(home)).calls.length, 0)
@@ -295,7 +295,7 @@ describe('commits in the connected project\'s repositories', () => {
     const result = inShell(prepared(home, 'git commit -q --allow-empty -m "Which one"', [TASK_A, TASK_B]), { cwd: repo, home })
     assert.equal(result.status, 1)
     assert.match(result.stderr, /2 tasks are claimed/)
-    assert.match(result.stderr, new RegExp(`\\[devspec:${TASK_A}\\] or \\[devspec:${TASK_B}\\]`))
+    assert.match(result.stderr, new RegExp(`claimed: \\[devspec:${TASK_A}\\], \\[devspec:${TASK_B}\\]`))
     assert.equal(git(repo, 'rev-parse', 'HEAD'), head)
   })
 

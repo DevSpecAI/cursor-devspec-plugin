@@ -68,12 +68,8 @@ const PROVIDER_HOSTS = { github: 'github.com', gitlab: 'gitlab.com', bitbucket: 
 /** The comment that ends the line, and identifies it to every hook that reads commands. */
 export const PREFIX_MARKER = '# DevSpec notes the git commits this command makes'
 
-/** Envelopes kept per connection; the oldest go first. Each is one small file. */
-const MAX_ENVELOPES = 200
-/** The journal is rotated once fully read past this size, so it never grows unbounded. */
+/** The journal is rotated once fully read past this size, so it never grows unbounded on disk. */
 const JOURNAL_ROTATE_BYTES = 1024 * 1024
-/** Observations remembered as already read, so a re-read never reports twice. */
-const MAX_DRAINED_KEYS = 500
 
 export function observerRoot(home = os.homedir()) {
   return path.join(home, '.devspec', 'cursor-git-stand-in')
@@ -312,24 +308,22 @@ export function projectRepositoryKeys(conversationId, projectId, { home = os.hom
   return [...keys]
 }
 
-function pruneFiles(dir, now) {
+/**
+ * Remove envelopes past the window in which their command's commits still count. The
+ * window alone bounds the folder: one small file per command in it. No count is capped,
+ * because that could only drop the envelope of a command still running.
+ */
+function pruneEnvelopes(dir, now) {
   try {
-    const files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'))
-    if (files.length <= MAX_ENVELOPES / 2) return
-    const aged = files
-      .map((name) => {
-        const file = path.join(dir, name)
-        try {
-          return { file, at: fs.statSync(file).mtimeMs }
-        } catch {
-          return null
-        }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.at - a.at)
-    aged.forEach((entry, index) => {
-      if (index >= MAX_ENVELOPES || now - entry.at > ENVELOPE_TTL_MS) fs.rmSync(entry.file, { force: true })
-    })
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue
+      const file = path.join(dir, name)
+      try {
+        if (now - fs.statSync(file).mtimeMs > ENVELOPE_TTL_MS + 60_000) fs.rmSync(file, { force: true })
+      } catch {
+        /* gone already */
+      }
+    }
   } catch {
     /* pruning is housekeeping */
   }
@@ -387,7 +381,7 @@ export function prepareStandIn({
       claims: project ? claimsFor(claims, project) : [],
       created_at: now,
     })
-    pruneFiles(envelopes, now)
+    pruneEnvelopes(envelopes, now)
     return {
       command: `${standInPrefix(generation, observationId)}${command}`,
       observationId,
@@ -424,8 +418,8 @@ function validLine(row) {
   return Boolean(
     row && row.v === 1 && UUID.test(row.generation ?? '') && UUID.test(row.observation ?? '') &&
       typeof row.sha === 'string' && FULL_SHA.test(row.sha) &&
-      (row.branch === null || (typeof row.branch === 'string' && row.branch.length <= 255)) &&
-      (row.remote === null || (typeof row.remote === 'string' && row.remote.length <= 1024)) &&
+      (row.branch === null || typeof row.branch === 'string') &&
+      (row.remote === null || typeof row.remote === 'string') &&
       typeof row.worktree === 'string' && path.isAbsolute(row.worktree) &&
       (row.previous_head === null || (typeof row.previous_head === 'string' && FULL_SHA.test(row.previous_head))) &&
       typeof row.amend === 'boolean',
@@ -510,11 +504,15 @@ export function drainObservations(dir, { now = Date.now() } = {}) {
       })
     }
     offset += Buffer.byteLength(tail.slice(0, end + 1))
+    // The keys guard the lines of the journal being read; a rotated journal takes its
+    // keys with it, so they never outgrow one journal's lines.
+    let keys = [...seen]
     if (offset === data.length && data.length > JOURNAL_ROTATE_BYTES) {
       fs.renameSync(journal, `${journal}.1`)
       offset = 0
+      keys = []
     }
-    writePrivateJson(stateFile, { offset, keys: [...seen].slice(-MAX_DRAINED_KEYS) })
+    writePrivateJson(stateFile, { offset, keys })
     return observed
   } catch {
     return []

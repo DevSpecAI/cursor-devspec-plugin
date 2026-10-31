@@ -45,10 +45,9 @@ const FULL_SHA = /^[0-9a-f]{40}$/
 export const MAX_ATTEMPTS = 6
 export const REPORT_TTL_MS = 24 * 60 * 60 * 1000
 const BACKOFF_MS = [0, 15_000, 60_000, 4 * 60_000, 10 * 60_000, 10 * 60_000]
-/** Waiting reports kept per connection; past this the oldest is dropped, and logged. */
-export const MAX_QUEUED = 200
 /** One request's wait. The hook has 15 seconds in all. */
 const CALL_TIMEOUT_MS = 5_000
+/** The commits log is rotated past this size, so it never grows unbounded on disk. */
 const LOG_ROTATE_BYTES = 1024 * 1024
 
 export function commitsLogPath(connectionId, home = os.homedir()) {
@@ -78,7 +77,7 @@ export function logCommit(connectionId, entry, { home = os.homedir(), now = Date
 export function sanitizeRemote(raw) {
   if (typeof raw !== 'string') return null
   const value = raw.trim()
-  if (!value || value.length > 512 || /[\s?#\u0000-\u001f\u007f]/.test(value)) return null
+  if (!value || /[\s?#\u0000-\u001f\u007f]/.test(value)) return null
   const scp = /^([^/@:]+)@([^/:]+):(.+)$/.exec(value)
   if (scp) return scp[1] === 'git' ? value : null
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
@@ -209,11 +208,6 @@ async function reportFolder({ dir, connectionId }, { home, call, now, deadline }
       queue.push(prepared.item)
       log({ outcome: 'observed', commit_sha: commit.sha, branch: commit.branch, amend: commit.amend, repository: repositoryLabel(prepared.item) })
     }
-    while (queue.length > MAX_QUEUED) {
-      const dropped = queue.shift()
-      log({ outcome: 'dropped', commit_sha: dropped.commit_sha, reason: `more than ${MAX_QUEUED} reports were waiting` })
-      outcomes.push({ connectionId, sha: dropped.commit_sha, outcome: 'dropped' })
-    }
 
     const kept = []
     for (const item of queue) {
@@ -260,7 +254,10 @@ async function reportFolder({ dir, connectionId }, { home, call, now, deadline }
  * A folder for a connection that has since ended is still served, so its commits are
  * sent, refused or visibly dropped.
  */
-export async function reportCommits({ home = os.homedir(), call = mcpToolsCall, now = Date.now(), budgetMs = 8_000 } = {}) {
+/** How long one hook spends sending: the hook has 15 seconds, and Node needs some of them. */
+const SEND_BUDGET_MS = 8_000
+
+export async function reportCommits({ home = os.homedir(), call = mcpToolsCall, now = Date.now(), budgetMs = SEND_BUDGET_MS } = {}) {
   const deadline = Date.now() + budgetMs
   const outcomes = []
   for (const folder of pendingFolders({ home })) {

@@ -25,7 +25,6 @@ import { withoutStandInPrefix } from './git-observer.mjs'
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const REPORT_TIMEOUT_MS = 2_500
 const OBSERVATION_TTL_MS = 10 * 60_000
-const MAX_PENDING = 100
 const FULL_SHA = /^[0-9a-f]{40}$/i
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const HEREDOC_DELIMITER = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -46,7 +45,8 @@ function readablePrefix(prefix) {
 }
 
 export function simpleGitCommit(command, { onInvocation } = {}) {
-  if (typeof command !== 'string' || command.length === 0 || command.length > 8192) return null
+  // No length bound: the reader is one linear pass, and a long message is still a commit.
+  if (typeof command !== 'string' || command.length === 0) return null
 
   const segments = [[]]
   let word = ''
@@ -174,7 +174,7 @@ export function simpleGitCommit(command, { onInvocation } = {}) {
 }
 
 export function heredocGitCommit(command, options = {}) {
-  if (typeof command !== 'string' || command.length === 0 || command.length > 8192) return null
+  if (typeof command !== 'string' || command.length === 0) return null
   if (command.includes('`')) return null
 
   const open = command.indexOf("<<'")
@@ -355,9 +355,11 @@ function pruneMarkers(now) {
   fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 })
   const files = fs.readdirSync(stateDir()).filter(name => name.endsWith('.observation-v1.json'))
     .map(name => { const file = path.join(stateDir(), name); return { file, at: fs.statSync(file).mtimeMs } })
-    .sort((a, b) => b.at - a.at)
-  for (let i = 0; i < files.length; i++) {
-    if (i >= MAX_PENDING - 1 || now - files[i].at > OBSERVATION_TTL_MS) fs.rmSync(files[i].file, { force: true })
+  // The age bound alone keeps this small: one marker per commit command, consumed by
+  // its post hook, and any left behind gone after OBSERVATION_TTL_MS. A count cap
+  // could drop the marker of a commit still running.
+  for (const { file, at } of files) {
+    if (now - at > OBSERVATION_TTL_MS) fs.rmSync(file, { force: true })
   }
 }
 

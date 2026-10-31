@@ -150,7 +150,6 @@ export function loopStoppedText() {
 // Trace2 output of one git command, hooks included, is a few kilobytes; a trace past
 // this is not read (and that one commit goes unobserved) rather than held in memory.
 const MAX_TRACE_BYTES = 4 * 1024 * 1024
-const MAX_JOURNAL_LINE_BYTES = 8 * 1024
 
 /**
  * Git's own commands that are not `commit`. Anything else that is not `commit` may be
@@ -292,8 +291,8 @@ export function confirmCommit(realGit, worktree, previousHead, amend, env = proc
   const remote = quiet(realGit, ['-C', worktree, 'remote', 'get-url', 'origin'], env)
   return {
     sha,
-    branch: branch ? branch.slice(0, 255) : null,
-    remote: remote ? remote.slice(0, 1024) : null,
+    branch: branch || null,
+    remote: remote || null,
   }
 }
 
@@ -514,21 +513,28 @@ export function taggedText(id) {
   return `DevSpec: added [devspec:${id}] to the end of this commit's subject line, because it is the one task claimed in this conversation.`
 }
 
+/*
+ * The two recovery texts follow the wording of provenance-assistance.mjs's
+ * NO_CLAIM_MESSAGE and MULTIPLE_CLAIMS_MESSAGE (the command-text path), said for a
+ * commit the stand-in stopped. They are written out here because this file is copied
+ * alone and imports nothing of the plugin's.
+ */
+
 /** Why a commit with no reference was stopped when no task is claimed. */
 export function unclaimedText() {
   return [
-    'DevSpec stopped this commit before git ran, so nothing was changed: its message has no [devspec:<id>] reference and no task is claimed in this conversation, so it would land unlinked.',
-    'To recover without leaving this turn: search_tasks for the task this work belongs to and claim it with claim_work_item.',
-    'If no task covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed, and claim that.',
-    'Then run the same commit again: the claimed task\'s reference is added to the message for you.',
+    'DevSpec stopped this commit before git ran, so nothing was changed: it has no [devspec:<uuid>] reference and no task is claimed in this conversation, so it would land unlinked.',
+    'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item);',
+    'if none covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed (the server refuses a thin one), and claim that.',
+    "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you.",
   ].join(' ')
 }
 
 /** Why a commit with no reference was stopped when several tasks are claimed. */
 export function severalClaimsText(claims) {
   return [
-    `DevSpec stopped this commit before git ran, so nothing was changed: its message has no [devspec:<id>] reference and ${claims.length} tasks are claimed in this conversation, so DevSpec will not guess which one it belongs to.`,
-    `Add the reference of each task this commit delivers to the end of the subject line (${claims.map((id) => `[devspec:${id}]`).join(' or ')}) and run the commit again.`,
+    `DevSpec stopped this commit before git ran, so nothing was changed: it has no [devspec:<uuid>] reference and ${claims.length} tasks are claimed in this conversation, so DevSpec will not guess which reference belongs in the commit.`,
+    `Add a [devspec:<uuid>] reference for each task this commit delivers (claimed: ${claims.map((id) => `[devspec:${id}]`).join(', ')}) and retry.`,
   ].join(' ')
 }
 
@@ -779,11 +785,10 @@ export async function runShim(argv = process.argv.slice(2), env = process.env, h
           amend: found.amend,
           observed_at: new Date().toISOString(),
         })
-        if (Buffer.byteLength(line) < MAX_JOURNAL_LINE_BYTES) {
-          fs.appendFileSync(path.join(here, 'observations.jsonl'), `${line}\n`, { mode: 0o600 })
-          // Tells the reporting hook there is something to read, without starting Node.
-          fs.writeFileSync(path.join(here, 'pending'), '', { mode: 0o600 })
-        }
+        // One append per line: concurrent stand-ins never interleave a line.
+        fs.appendFileSync(path.join(here, 'observations.jsonl'), `${line}\n`, { mode: 0o600 })
+        // Tells the reporting hook there is something to read, without starting Node.
+        fs.writeFileSync(path.join(here, 'pending'), '', { mode: 0o600 })
       }
     } catch {
       /* noting the commit never affects git */
