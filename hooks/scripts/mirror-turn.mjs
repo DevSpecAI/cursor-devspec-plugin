@@ -6,7 +6,8 @@
  *
  * user_prompt → optional local_prompt bubble when attached (literal owner text)
  *             → also seeds phase=trail "Working…" so the live bubble opens immediately
- * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state
+ * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state;
+ *               a room command whose turn errored or was stopped is told so (turn-failure.mjs)
  *
  * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
@@ -49,6 +50,7 @@ import {
 } from './requests.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
+import { postTurnFailure } from './turn-failure.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -690,6 +692,24 @@ async function main() {
     }
 
     if (mode === 'stop' && connectionId) clearTrailState(connectionId)
+
+    // A turn that errored or was stopped never answered its room command: say so in
+    // the room before the turn ends (item 9a850303, turn-failure.mjs). It marks the
+    // command answered, so the request bookkeeping below closes it.
+    if (mode === 'stop' && connectionId && sessionId) {
+      try {
+        await postTurnFailure({
+          raw,
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+      } catch {
+        /* non-fatal: the turn still ends below */
+      }
+    }
 
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +
     // marker so the poller re-asserts); stop ends it (busy:false + clear marker).
