@@ -156,7 +156,7 @@ export function refreshMcpEntry(existing, { url, identification = pluginHeaders(
 
 /**
  * The plugin's fixed tool view: `devspec__` names, and the two connection-plumbing tools
- * the model calls itself (offline heartbeat and detach, in devspec.remote-stop). DevSpec
+ * the model calls itself (offline heartbeat and detach, in devspec-remote-stop). DevSpec
  * lists only model tools plus the plumbing a host declares here.
  */
 export const MCP_ENDPOINT_QUERY = '?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection'

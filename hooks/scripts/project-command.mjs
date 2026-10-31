@@ -66,7 +66,7 @@ export async function prepareCursorProject(selector, { cwd = process.cwd(), curs
   // Bare Cursor starts a fresh chat. Do not mint a look-alike ID, reuse a
   // previous --resume, or kill create-chat while its store is still disposing.
   return { ok: true, project: matches[0], launch_argv: [executable], requires_fresh_chat: true,
-    first_message: `/devspec.remote --project ${matches[0].id}`,
+    first_message: `/devspec-remote --project ${matches[0].id}`,
     message: 'Start this Cursor command in a new terminal, without --resume or --continue, then send first_message there. This is a handoff, not a launched chat: your current conversation and folder default are unchanged.' }
 }
 async function main() {

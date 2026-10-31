@@ -77,7 +77,7 @@ Then restart `cursor-agent`. If you only want DevSpec's tools in chat, you can s
 
 1. Start `cursor-agent` in your project's folder.
 2. Ask: *"Check my DevSpec connection."* The agent checks with DevSpec and tells you which DevSpec account it is connected as.
-3. Type `/devspec.remote`. The conversation appears on your project's **Agents** page in DevSpec, ready to take work from your browser or phone.
+3. Type `/devspec-remote`. The conversation appears on your project's **Agents** page in DevSpec, ready to take work from your browser or phone.
 
 If DevSpec's tools are missing, type `/mcp` to see whether Cursor could reach DevSpec, then check your token and restart `cursor-agent`.
 
@@ -108,19 +108,19 @@ You can ask the agent to do anything in DevSpec in plain words (*"Work on DevSpe
 
 | Command | What it does |
 |---|---|
-| `/devspec.remote` | Puts this conversation on your project's **Agents** page, ready to take work from your browser or phone. |
-| `/devspec.remote --new` | Connects and starts a new DevSpec session for this conversation. |
-| `/devspec.remote --session <id>` | Connects and joins an existing DevSpec session. |
-| `/devspec.remote --project "<name>"` | Connects to that project for this conversation only, without changing the folder's default. |
-| `/devspec.remote-stop` | Disconnects this conversation from DevSpec, leaving other `cursor-agent` conversations connected. |
-| `/devspec.project` | Shows this conversation's project, chooses another one, or remembers or forgets a default project for the folder. |
-| `/devspec.debug` | Collects diagnostics on your machine when you ask it to while looking into a problem. Nothing is uploaded unless you ask. |
+| `/devspec-remote` | Puts this conversation on your project's **Agents** page, ready to take work from your browser or phone. |
+| `/devspec-remote --new` | Connects and starts a new DevSpec session for this conversation. |
+| `/devspec-remote --session <id>` | Connects and joins an existing DevSpec session. |
+| `/devspec-remote --project "<name>"` | Connects to that project for this conversation only, without changing the folder's default. |
+| `/devspec-remote-stop` | Disconnects this conversation from DevSpec, leaving other `cursor-agent` conversations connected. |
+| `/devspec-project` | Shows this conversation's project, chooses another one, or remembers or forgets a default project for the folder. |
+| `/devspec-debug` | Collects diagnostics on your machine when you ask it to while looking into a problem. Nothing is uploaded unless you ask. |
 
 ## Choosing a project
 
-`/devspec.remote` finds your project by itself when your repository's `origin` belongs to one DevSpec project you can access, or when the folder has a `.devspec/project.json` file naming the project.
+`/devspec-remote` finds your project by itself when your repository's `origin` belongs to one DevSpec project you can access, or when the folder has a `.devspec/project.json` file naming the project.
 
-When the agent can't tell which project you mean, it asks you. Use `/devspec.project` to see which project this conversation uses, to remember a default for the folder (saved in `.devspec/project.json`, which you can commit for your team), or to forget it. Moving to a different project needs a fresh conversation, and the agent gives you the command to start one, so nothing from one project carries over into another.
+When the agent can't tell which project you mean, it asks you. Use `/devspec-project` to see which project this conversation uses, to remember a default for the folder (saved in `.devspec/project.json`, which you can commit for your team), or to forget it. Moving to a different project needs a fresh conversation, and the agent gives you the command to start one, so nothing from one project carries over into another.
 
 If you attach the agent to a DevSpec session that has a shared plan, it picks the plan up where it left off after it reconnects.
 

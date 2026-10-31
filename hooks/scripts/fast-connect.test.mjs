@@ -24,10 +24,17 @@ describe('parseSessionIdFromPrompt', () => {
   it('parses --session <uuid> and --session=<uuid>', () => {
     const id = '7e3afc79-abf4-48e4-ae33-aed27b00944d'
     assert.equal(
-      parseSessionIdFromPrompt(`Run the \`devspec.remote\` skill with this input: --session ${id}`),
+      parseSessionIdFromPrompt(`Run the \`devspec-remote\` skill with this input: --session ${id}`),
       id,
     )
-    assert.equal(parseSessionIdFromPrompt(`devspec.remote --session=${id}`), id)
+    assert.equal(parseSessionIdFromPrompt(`devspec-remote --session=${id}`), id)
+  })
+
+  it('does not take a helper script that shares the skill prefix for the skill', () => {
+    const connection = '7e3afc79-abf4-48e4-ae33-aed27b00944d'
+    assert.equal(parseSessionIdFromPrompt(`node "$PLUGIN/hooks/scripts/devspec-remote-wait.mjs" --connection-id ${connection} --from-end`), null)
+    assert.equal(parseSessionIdFromPrompt(`/devspec-remote-stop ${connection}`), null)
+    assert.equal(parseSessionIdFromPrompt(`/devspec-remote ${connection}`), connection)
   })
 
   it('returns null for non-remote prompts', () => {

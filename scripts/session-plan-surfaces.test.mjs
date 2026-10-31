@@ -9,7 +9,7 @@ const marketplaceJson = JSON.parse(read('.cursor-plugin/marketplace.json'))
 const mcp = JSON.parse(read('mcp.json'))
 const readme = read('README.md')
 const changelog = read('CHANGELOG.md')
-const remoteSkill = read('skills/devspec.remote/SKILL.md')
+const remoteSkill = read('skills/devspec-remote/SKILL.md')
 
 describe('Cursor shared-session-plan surfaces', () => {
   it('keeps the command surface Cursor-operational and does not revive a prose work command', () => {
@@ -17,8 +17,8 @@ describe('Cursor shared-session-plan surfaces', () => {
     // extension is gone, so the surface a user actually reaches is the plugin's
     // skills directory — the assertion is the same one, against where it now lives.
     const skills = fs.readdirSync(new URL('../skills', import.meta.url)).sort()
-    assert.deepEqual(skills, ['devspec.debug', 'devspec.project', 'devspec.remote', 'devspec.remote-stop'])
-    const debugSkill = read('skills/devspec.debug/SKILL.md')
+    assert.deepEqual(skills, ['devspec-debug', 'devspec-project', 'devspec-remote', 'devspec-remote-stop'])
+    const debugSkill = read('skills/devspec-debug/SKILL.md')
     assert.match(debugSkill, /only after the person asks/i)
     assert.match(debugSkill, /no automatic uploads/i)
     assert.equal(skills.includes('devspec.work'), false)

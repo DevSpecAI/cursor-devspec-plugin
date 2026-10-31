@@ -22,7 +22,7 @@
  *   ~/.devspec/remote-control.json
  *
  * Product rules (connection-native):
- *   - bare `/devspec.remote` → register a SESSIONLESS connection for THIS
+ *   - bare `/devspec-remote` → register a SESSIONLESS connection for THIS
  *     conversation (no create_session), unless it is already live (re-arm) or has a
  *     recoverable local_stop bond (reconnect).
  *   - `--session <uuid>` → attach the connection to that session (explicit only).
@@ -1263,7 +1263,7 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
 }
 
 /**
- * Resolve what bare /devspec.remote should do for THIS local conversation
+ * Resolve what bare /devspec-remote should do for THIS local conversation
  * (connection-native). Never scans by cwd.
  *
  * Actions:

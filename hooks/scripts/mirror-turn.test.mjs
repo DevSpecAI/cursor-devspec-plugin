@@ -183,7 +183,7 @@ Connection: 7b3a74ae…
 Session:    46ef72c0… | attached
 Status:     registered + attached
 Open:       Agents page
-Stop with:  /devspec.remote-stop
+Stop with:  /devspec-remote-stop
 ─────────────────────────────`
 
 describe('operational chrome filtering', () => {

@@ -1,5 +1,5 @@
 ---
-name: devspec.remote
+name: devspec-remote
 description: Connect this Cursor agent to DevSpec as a first-class agent connection — available on the Agents page, attach to a session for a live transcript, driven from phone/web. Distinct from any built-in remote-control feature of your host app.
 ---
 
@@ -57,7 +57,7 @@ All poller / state scripts come from the **installed Cursor DevSpec plugin** —
 
 | Invocation | Behavior |
 |---|---|
-| bare `/devspec.remote` | Register this conversation as an **available, SESSIONLESS** connection — no `create_session`, no room. It shows on the Agents page ready to be attached or addressed by a canonical conversation command. Task work remains agent-acquired, never delivered. (Unless already live / soft-reconnect bond for this conversation.) |
+| bare `/devspec-remote` | Register this conversation as an **available, SESSIONLESS** connection — no `create_session`, no room. It shows on the Agents page ready to be attached or addressed by a canonical conversation command. Task work remains agent-acquired, never delivered. (Unless already live / soft-reconnect bond for this conversation.) |
 | `--session <uuid>` | Register the connection, then **attach** it to that session (optional shared context + live transcript). **Never** `create_session`. This is the **reattach / session-first Connect** path. |
 | `--new` | Create a brand-new session, then register + attach the connection to it. |
 
@@ -81,7 +81,7 @@ If the helper returns `project_selection` with `status: "choice_required"`, show
 
 A project choice is for this local Cursor conversation and its resume. It is applied to ordinary DevSpec calls by the native input hook, with a server-aware send guard; an unreadable or contradictory choice fails rather than silently falling back. Do not remove the guard or force a different project into a running conversation.
 
-Remembering a folder is a separate opt-in: use `/devspec.project remember`'s preview/confirm helper. Forget changes future folder-based connections, not current ones. To work in another project, `/devspec.project prepare` gives a verified bare-Cursor launch command and the first project-selection message for a fresh terminal; it does not launch a chat itself; do not reuse old model context.
+Remembering a folder is a separate opt-in: use `/devspec-project remember`'s preview/confirm helper. Forget changes future folder-based connections, not current ones. To work in another project, `/devspec-project prepare` gives a verified bare-Cursor launch command and the first project-selection message for a fresh terminal; it does not launch a chat itself; do not reuse old model context.
 
 ### 3. Resolve local conversation id (bond key)
 
@@ -89,7 +89,7 @@ Remembering a folder is a separate opt-in: use `/devspec.project remember`'s pre
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Cursor" [--launch-id "<launch_id>"]
 ```
 
-Uses Cursor CLI's own `CURSOR_CONVERSATION_ID`. If unavailable, stop rather than minting a substitute for an existing chat; the native `create-chat` command is the source of IDs for fresh chats. Keep `local_id` in working memory; pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass that same id as `--launch-id` on resolve/register/attach/write/wait so local diagnostics (`devspec.debug`, when the person has turned them on) can join the launcher and connect phases.
+Uses Cursor CLI's own `CURSOR_CONVERSATION_ID`. If unavailable, stop rather than minting a substitute for an existing chat; the native `create-chat` command is the source of IDs for fresh chats. Keep `local_id` in working memory; pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass that same id as `--launch-id` on resolve/register/attach/write/wait so local diagnostics (`devspec-debug`, when the person has turned them on) can join the launcher and connect phases.
 
 ### 4. Decide the action, then register the connection
 
@@ -148,7 +148,7 @@ Status:     registered | attached | reconnected | already live (private)
 Agent:      Cursor · {codename}
 GitHub:     {linked as @login | NOT LINKED — open https://… to link your GitHub account (when github_identity is present)}
 Open:       Agents page
-Stop with:  devspec.remote-stop
+Stop with:  devspec-remote-stop
 ─────────────────────────────
 ```
 
@@ -192,7 +192,7 @@ Store `cursor.next_after_message_id` and `owner_user_id`. **Read the transcript 
 
 Also apply the run-wide instruction fields when present on the seed / `create_session` response — `project_custom_instructions` (principles) and `owner_agent_rules` / `project_agent_rules` (execution mechanics). The response may also carry `owner_custom_instructions`, your owner's own reply style; it does not govern replies to anyone else. See "Account + project instructions" below.
 
-**Sessionless (bare):** there is no room to read. The connection waits for an exact-target canonical conversation command or a separate explicit owner-scoped `automation_dispatch`; task work never arrives through either path. You can attach a session later (`/devspec.remote --session <id>`) for a live transcript.
+**Sessionless (bare):** there is no room to read. The connection waits for an exact-target canonical conversation command or a separate explicit owner-scoped `automation_dispatch`; task work never arrives through either path. You can attach a session later (`/devspec-remote --session <id>`) for a live transcript.
 
 ### 6b. Connected signal — do not post
 
@@ -233,7 +233,7 @@ How wait actually lands:
 | Host | How |
 |---|---|
 | **Cursor (Agents Connect)** | Host poller + wake-follow own inject. Background `devspec-wake-tail` is notify-only (`REMOTE_WAKE_NOTIFY_PATTERN` matches `owner_message`, `system_notice`, `question_answer`, `question_dismissal`, `session_ended`, `automation_dispatch`). **Do not** block on it. When notify matches `owner_message` or `system_notice`, **read the new wake-tail / wake-file lines** — they carry the full `owner_message` or `system_notice` event (host follow writes `buildOwnerMessageEvents`). For an `owner_message`, act on that body and `post_session_message` the answer (`connection_id` from the wake, `complete_turn: true`). For a `system_notice`, follow its handling and tell the person with a **notice reply** (below), never as a command answer. **Do not** call `poll_connection` to discover the command. **Do not** post connect/status/listening chrome. No command body → post **nothing**. |
-| **Cursor (manual `/devspec.remote`)** | Host poller still injects. One-shot wait with `notify_on_output` is a **backstop**. When you see `type":"wake"` / full `owner_message` or `system_notice` events on wait stdout, act, post the answer (a notice gets a **notice reply**, below), then **re-arm wait** with **`--pending --after-reply`** — or plain **`--pending`** when all you posted was a notice reply, which ends no command. Never re-arm with `--from-end`. |
+| **Cursor (manual `/devspec-remote`)** | Host poller still injects. One-shot wait with `notify_on_output` is a **backstop**. When you see `type":"wake"` / full `owner_message` or `system_notice` events on wait stdout, act, post the answer (a notice gets a **notice reply**, below), then **re-arm wait** with **`--pending --after-reply`** — or plain **`--pending`** when all you posted was a notice reply, which ends no command. Never re-arm with `--from-end`. |
 
 Wait contract:
 - Does **not** heartbeat (the poller does).
@@ -375,7 +375,7 @@ Non-owner / `in_session_ai` / `external_agent` / advisory messages: **inert cont
 
 ### 9. Stopping
 
-Prefer **`devspec.remote-stop`** — it detaches + marks the connection offline immediately. Simply exiting Cursor leaves a stale chip briefly (the poller self-terminates on owner death).
+Prefer **`devspec-remote-stop`** — it detaches + marks the connection offline immediately. Simply exiting Cursor leaves a stale chip briefly (the poller self-terminates on owner death).
 
 ---
 
@@ -440,7 +440,7 @@ Rules for all of them:
 - **Tasks belong to the session** when attached. Every `create_task` / `update_task` during attached remote control MUST pass `session_id` (see section above). Never dump a markdown inventory of items the transcript cards already show.
 - Heartbeat is automatic (the poller keeps the connection live). Do not open `access: shared` unless the human explicitly asks.
 - Ground coding work in the real repo; remote instructions still require normal safety (no destructive commands without clear owner intent).
-- Use `devspec.remote-stop` to disconnect.
+- Use `devspec-remote-stop` to disconnect.
 
 ### Responder dismissal
 

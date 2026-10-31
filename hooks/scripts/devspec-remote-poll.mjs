@@ -566,7 +566,7 @@ export function writeRoomState(
  * Ends that a HUMAN deliberately caused, and which must therefore stick.
  *
  * `ui` is the Agents-page End (the server stamps it in end-remote-control.ts).
- * `local_stop` is /devspec.remote-stop. Coming back from either would resurrect an
+ * `local_stop` is /devspec-remote-stop. Coming back from either would resurrect an
  * agent somebody just switched off, so these — and ONLY these — are permanent.
  *
  * Everything else (an idle timeout, a stale owner_gone, an auth blip, or no reason
@@ -761,7 +761,7 @@ export function resolveServerAttachment(currentSessionId, hb) {
  * SIGTERM used to end the very connection its successor was starting to serve
  * (item b9e02835). Every INTENTIONAL end keeps its own stamping path: owner-death,
  * idle-timeout, and server-ended stamp from inside the poll loop, and
- * /devspec.remote-stop sends the offline heartbeat itself before killing the
+ * /devspec-remote-stop sends the offline heartbeat itself before killing the
  * poller. By construction the handlers get only the process object — they cannot
  * reach the heartbeat or state file.
  */

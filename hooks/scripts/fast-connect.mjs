@@ -61,9 +61,11 @@ export function parseSessionIdFromPrompt(promptBody) {
   if (/--project(?:-id|_id)?(?:\s|=)/i.test(promptBody)) return null
 
   // Bare uuid only when the prompt is clearly remote connect — skip project/automation/run ids.
+  // The skill's own name, not the helper scripts that share its prefix
+  // (devspec-remote-wait.mjs --connection-id <uuid> names a connection, not a room).
   const lower = promptBody.toLowerCase()
   if (
-    lower.includes('devspec.remote') ||
+    /devspec-remote(?![\w-])/.test(lower) ||
     lower.includes('register_connection') ||
     lower.includes('attach_connection')
   ) {
