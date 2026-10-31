@@ -2,6 +2,11 @@
 /** Cursor native input update + server-aware send guard (e1b5eda7, 56ba1b79).
  * PreToolUse has no provider identity, so only reserved transport names are patched.
  * BeforeMCPExecution proves the server before any of those arguments leave the host.
+ *
+ * A post_session_message that replies to DevSpec notices goes out as a notice reply
+ * (notice-reply.mjs): the model's `system_notice_ids` as an array, or, in a turn every
+ * wake of which was a notice, those notices' ids on a plain post; always with the
+ * connection, and never with the local-turn flags a typed turn's answer carries.
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -25,6 +30,7 @@ import { readOwnConnectionState, withOwnConnection } from './own-connection.mjs'
 import { prePostHoldReason } from './room-unread.mjs'
 import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
+import { currentTurnNoticeIds, normalizeNoticeIds, prepareNoticeReply, recordNoticeReply } from './notice-reply.mjs'
 
 const CAPABILITY_BRIDGE_HELPERS = {
   manage_plan: 'manage-plan',
@@ -89,13 +95,30 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
         namespaced === 'post_session_message' && Object.hasOwn(args, 'provenance_ref')
 
       if (!connectionId && !hasModelRequestRef && !hasPostProvenanceRef) {
-        const patch = { ...versions, ...identity, ...projectPatch }
+        // No connection here, but ids a stale tool list sent as text still go out as
+        // the list DevSpec takes, so its refusal (no room) is about the room, not the shape.
+        const ids = namespaced === 'post_session_message' && typeof args.system_notice_ids === 'string'
+          ? normalizeNoticeIds(args.system_notice_ids)
+          : undefined
+        const patch = { ...versions, ...identity, ...projectPatch, ...(Array.isArray(ids) ? { system_notice_ids: ids } : {}) }
         return Object.keys(patch).length ? { updated_input: patch } : null
       }
 
       let next = { ...args, ...versions, ...identity, ...projectPatch }
       if (hasPostProvenanceRef) {
         delete next.provenance_ref
+      }
+      const connDir = path.join(home || os.homedir(), '.devspec', 'remote-control', 'connections')
+      let noticeReply = false
+      if (namespaced === 'post_session_message') {
+        const turnNotices = connectionId && args.system_notice_ids === undefined
+          ? currentTurnNoticeIds(connectionId, { dir: connDir, connectionState: connState })
+          : null
+        const prepared = prepareNoticeReply(next, { connectionId, turnNotices })
+        if (prepared) {
+          next = prepared
+          noticeReply = true
+        }
       }
       next = withOwnConnection(namespaced, next, connectionId)
       const stamped = stampRequest(namespaced, next, connectionId, input?.agent_id, {
@@ -106,8 +129,13 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       if (stamped.deny) return deny(stamped.deny)
       next = stamped.args
 
+      // A notice reply is outside every turn: it takes no local-turn flags, and a
+      // later Stop must not post the turn's final words as a second reply.
+      if (noticeReply && connectionId) recordNoticeReply(connectionId, { dir: connDir })
+
       if (
         namespaced === 'post_session_message' &&
+        !noticeReply &&
         next.phase !== 'trail' &&
         next.phase !== 'needs_input' &&
         next.turn_kind !== 'local_prompt' &&
@@ -118,7 +146,6 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       ) {
         const targetConnId = next.connection_id || connectionId
         if (targetConnId) {
-          const connDir = path.join(home || os.homedir(), '.devspec', 'remote-control', 'connections')
           const reqState = readRequestState(targetConnId, { dir: connDir })
           const currentReq = reqState?.current ? reqState.open.get(reqState.current) : null
           const isLocalTurn = Boolean(connState?.local_turn || currentReq?.kind === 'typed_prompt')

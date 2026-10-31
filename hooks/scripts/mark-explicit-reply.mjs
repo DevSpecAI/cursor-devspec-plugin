@@ -6,6 +6,10 @@
  * `.explicit-reply` marker so Stop skips mirroring redundant narration), AND if the post
  * completed the turn (`complete_turn: true`), immediately clears the local `<connection_id>.turn`
  * marker so the poller stops asserting busy: true and Working dots clear without lag.
+ *
+ * A reply to DevSpec notices (notice-reply.mjs) is neither: it answers no command and
+ * completes no turn, even when it passes complete_turn, so a command being worked still
+ * needs its own answer and keeps showing Working until it gets one.
  */
 
 import fs from 'node:fs'
@@ -20,6 +24,7 @@ import {
 } from './mirror-turn.mjs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
+import { currentTurnNoticeIds, isNoticeReplyPost } from './notice-reply.mjs'
 
 function readStdin() {
   try {
@@ -100,6 +105,14 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
     null
 
   if (!connectionId) return false
+
+  // A notice reply is not the turn's reply (notice-reply.mjs). It names its notices,
+  // or preToolUse gave it the turn's own because every wake of the turn was a notice.
+  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+  const turnNotices = args && args.system_notice_ids === undefined
+    ? currentTurnNoticeIds(connectionId, { dir: connDir, connectionState: state })
+    : null
+  if (isNoticeReplyPost(args, { turnNotices })) return false
 
   try {
     const markerPath = explicitReplyMarkerPath(connectionId)

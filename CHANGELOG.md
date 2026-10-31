@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.16
+
+When DevSpec tells the Cursor agent about its own work (a conflict with someone else's work, a failed check on its pull request, a review finding, or what happened to an edit that waited for someone's OK), and the agent tells you about it in the session, that message now shows as a reply to the notice. Before, it was posted as an answer to whatever you last asked the agent, and it could finish a request it had nothing to do with.
+
+- **It never touches your request.** A reply to a notice never answers, finishes or reopens a request. If a notice arrives while the agent is working on something you asked for, it tells you about the notice in a separate message, and your request still ends with its own answer.
+- **One reply for a batch.** When several notices arrive together, one reply can answer all of them, and it names only those.
+- **No ids typed from memory.** Every notice the agent receives ends with the exact message to send, with the notice's id in it. When everything that woke the agent was a notice, the plugin adds the ids itself, and if the agent finishes without posting, its final message goes to the session as the reply. Work steps are not shown in the session for such a turn, because DevSpec would file them under an earlier request.
+- **Older tool lists still work.** If Cursor still holds the tool list from before DevSpec accepted notice replies and the agent sends the ids as text, the plugin turns them into the list DevSpec expects.
+- **Refusals say why.** If DevSpec refuses a reply, the agent sees DevSpec's reason. When the agent isn't attached to a session, it tells you in the terminal instead.
+- **Guidance.** `skills/devspec.remote/SKILL.md` and `rules/devspec.mdc` no longer tell the agent to answer a notice like a request. They point at DevSpec's own rules for notice replies.
+
+Update the plugin and restart Cursor to pick this up.
+
+## 0.16.15
+
+Cursor now works with DevSpec goals. When a person asks a Cursor agent to create or change a goal or one of its outcomes, DevSpec records who asked for the change and which agent made it, just as it does for tasks, memories and documents. The plugin's guidance also tells the agent how to read the project's goals and change them.
+
 ## 0.16.14
 
 When Cursor can't finish a message sent from a DevSpec session (for example it has hit its usage limit or the model service is down), it now says so in the session straight away, quoting Cursor's own error, and stops showing as working. If the turn is stopped in Cursor before it finishes, the session is told that too. Before, the session showed nothing in either case. A message typed in Cursor's own terminal gets no session reply, because Cursor already shows what happened there.
