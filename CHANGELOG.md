@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.14
+
+When Cursor can't finish a message sent from a DevSpec session (for example it has hit its usage limit or the model service is down), it now says so in the session straight away, quoting Cursor's own error, and stops showing as working. If the turn is stopped in Cursor before it finishes, the session is told that too. Before, the session showed nothing in either case. A message typed in Cursor's own terminal gets no session reply, because Cursor already shows what happened there.
+
 ## 0.16.13
 
 Updated `rules/devspec.mdc` and `skills/devspec.remote/SKILL.md` for required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`) on `devspec__update_task` (`lifecycle: "dismissed"`), including `target_task_id` linking, held-replacement behaviour for unmerged replacements, and required rejection notes on `not_wanted`.
