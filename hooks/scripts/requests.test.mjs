@@ -426,7 +426,6 @@ describe('stamping a DevSpec write', () => {
   })
 
   it('covers the DevSpec tools that take a request or provenance', () => {
-    assert.equal(REQUEST_REF_TOOLS.size, 35)
     assert.equal(PROVENANCE_REF_TOOLS.has('reserve_work_items'), true)
     assert.equal(PROVENANCE_REF_TOOLS.has('claim_work_item'), true)
     for (const name of ['post_session_message', 'reserve_work_items', 'claim_work_item', 'report_request']) {

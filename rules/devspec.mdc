@@ -40,6 +40,10 @@ Resolve the project from the repository remote with `devspec__list_projects`; us
 
 When Cursor supplies a conversation id (`conversation_id` or `CURSOR_CONVERSATION_ID`), pass it as `local_session_id` where the served contract requests one. Never invent an id. Provenance observations are conversation-scoped; local commit assistance activates only under the nearest valid `.devspec/project.json` pin and never consults `~/.devspec`.
 
+### Goals
+
+Goals are the outcomes the project is working towards; tasks and briefs roll up to them. Read them with `devspec__get_project_goals` (the project's vision and its active goals) or `devspec__get_goals` (one goal in full, or a filtered list). Create or change a goal or one of its outcomes with `devspec__manage_goals` only when a person asks you to; each tool's own description gives its arguments and actions. Like every DevSpec write, a goal change records who asked for it and which agent made it: the plugin adds both for you.
+
 ### Protecting intent: work that waits, experiments, findings, and decisions
 
 1. **"Waiting for <name>'s OK" (`waiting_for_ok`) or "Experiment".** When a claim (`devspec__claim_work_item`) or write result carries `waiting_for_ok`, the claim still went through: build and push the work on its own branch in every repository it touches, **never merge it into the tracking branch**, record the implementation as usual (`devspec__record_implementation`), tell the person plainly, and follow the instruction it carries (`core.waiting-work-stays-on-its-branch`).
