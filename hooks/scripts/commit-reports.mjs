@@ -239,8 +239,14 @@ async function reportFolder({ dir, connectionId }, { home, call, now, deadline }
     }
     if (kept.length > 0) writePrivateJson(path.join(dir, 'queue.json'), { v: 1, reports: kept })
     else fs.rmSync(path.join(dir, 'queue.json'), { force: true })
-    // Nothing left to read or send: the hooks need not start Node for this folder.
-    if (kept.length === 0 && !journalUnread(dir)) fs.rmSync(path.join(dir, 'pending'), { force: true })
+    // Nothing left to read or send: the hooks need not start Node for this folder. The
+    // file goes first, so a line the stand-in appends meanwhile (it writes the file
+    // after the line) is never left without one.
+    if (kept.length === 0) {
+      const pending = path.join(dir, 'pending')
+      fs.rmSync(pending, { force: true })
+      if (journalUnread(dir)) fs.writeFileSync(pending, '', { mode: 0o600 })
+    }
   } catch {
     /* the folder is left as it was for the next hook */
   } finally {
