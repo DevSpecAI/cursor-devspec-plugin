@@ -110,6 +110,19 @@ Cursor's native `agent --resume` behavior is preserved, and the plugin reports t
 
 ---
 
+## Commit tracking
+
+While a conversation is connected to DevSpec, the plugin notices each commit the agent makes with `git commit` and tells DevSpec which agent made it, so the work is credited to Cursor and linked to the right task.
+
+- **macOS, Linux and WSL get full commit tracking.** Each command the agent runs starts with one added line that puts a private stand-in for `git` first on its `PATH`. The stand-in runs your real git unchanged and learns from git itself whether a commit was made, so a commit is noticed however it was made: a multi-line message, a message file, a script, `git -C`, a linked worktree or an alias. Nothing is installed in your repositories, and your git configuration and git hooks are not changed. Cursor's permission prompts and allow-lists check the same commands as before, though a prompt shows the added line above the command.
+- **Task references are added for the agent.** In your project's repositories (one whose `origin` is a repository of the project, or that a `.devspec/project.json` pin names), when exactly one task is claimed, that task's `[devspec:<id>]` reference is added to the end of the commit's subject line before git runs, and the agent is told. With no task claimed, or several, a commit without a reference is stopped before anything changes, and the agent is told how to recover. Amends, fixups, reused messages and messages that already have a reference are left as written.
+- **Other repositories are left alone.** Commits in a repository that is not one of the project's are not changed and are not reported.
+- **What it can't see.** A git run by its full path (such as `/usr/bin/git`) or with a cleared `PATH` bypasses the stand-in, and commits git makes while merging, rebasing or cherry-picking are not reported; DevSpec still links any commit through the task reference in its message.
+- **Nothing is lost quietly.** A report that can't be sent is tried again later, and what happened to each commit is written to `~/.devspec/remote-control/connections/<connection>.commits.log`.
+- **Native Windows is limited.** Cursor runs commands there in PowerShell, which can't take the added line, so only straightforward `git commit` commands that the agent runs directly are noticed and tagged. Use WSL for full commit tracking.
+
+---
+
 ## Contributing
 
 Run the test suite:

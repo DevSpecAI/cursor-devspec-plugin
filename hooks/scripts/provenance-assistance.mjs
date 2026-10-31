@@ -6,6 +6,11 @@
  * input. That is the only enforcement surface used here. File edits are never
  * denied, arbitrary shell is never classified, and every opaque/unsupported
  * commit form fails open to DevSpec ingestion and analyzer recovery.
+ *
+ * While the conversation is connected (outside native Windows), the same hook puts
+ * the git stand-in line in front of every Shell command (git-observer.mjs), and the
+ * stand-in tags or stops commits from git's own arguments; the command-text tagging
+ * here then only applies where the stand-in does not.
  */
 
 import crypto from 'node:crypto'
@@ -17,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
+import { prepareStandIn } from './git-observer.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -773,15 +779,35 @@ export function handleHook(mode, data, options = {}) {
     if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return null
     const commandKey = typeof toolInput.command === 'string' ? 'command' : typeof toolInput.cmd === 'string' ? 'cmd' : null
     if (!commandKey) return null
-    const parsed = parseReadableCommit(toolInput[commandKey], candidateCwd(data))
-    const pin = parsed ? findProjectPin(parsed.targetCwd, options.pinOptions) : null
     let selected
     try { selected = readProjectContext(conversationId, null, options.projectHome) } catch { return null }
     if (selected?.status === 'blocked') return null
+
+    // While this conversation is connected, every Shell command gets the git stand-in
+    // line in front (git-observer.mjs, item c2a7ab72). The stand-in then tags a commit,
+    // or stops one with no reference, from git's own arguments, so the command-text
+    // tagging below is left to Windows and to conversations with no connection. This
+    // hook is the only one that rewrites a Shell command: Cursor keeps only the last
+    // `updated_input` when several hooks return one.
+    const standIn = (options.prepareStandIn ?? prepareStandIn)({
+      command: toolInput[commandKey],
+      conversationId,
+      projectId: selected?.status === 'selected' ? selected.project.id : null,
+      claims: state.active_claims,
+      env,
+      home: options.home,
+      now: nowMs,
+    })
+    // No permission is given: the line changes nothing Cursor's own checks decide.
+    const withStandIn = standIn ? { updated_input: { ...toolInput, [commandKey]: standIn.command } } : null
+
+    const parsed = parseReadableCommit(toolInput[commandKey], candidateCwd(data))
+    const pin = parsed ? findProjectPin(parsed.targetCwd, options.pinOptions) : null
     const projectId = selected?.project?.id ?? pin?.projectId
-    if (!parsed || !projectId) return null
+    if (!parsed || !projectId) return withStandIn
     const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === projectId)
 
+    // A reference the agent wrote is still checked here, with or without the stand-in.
     const refs = inspectReferences(parsed.message)
     if (refs.malformed) {
       return { permission: 'deny', user_message: MALFORMED_REFERENCE_MESSAGE, agent_message: MALFORMED_REFERENCE_MESSAGE }
@@ -799,11 +825,12 @@ export function handleHook(mode, data, options = {}) {
         call: options.onlineCall,
         resolveAuth: options.resolveAuth,
       }).then((outcome) => {
-        if (outcome.status !== 'not_found') return null
+        if (outcome.status !== 'not_found') return withStandIn
         const message = unresolvedReferenceMessage(outcome.unresolved[0] ?? refs.valid[0])
         return { permission: 'deny', user_message: message, agent_message: message }
-      }).catch(() => null)
+      }).catch(() => withStandIn)
     }
+    if (withStandIn) return withStandIn
     if (eligibleClaims.length === 0) {
       return { permission: 'deny', user_message: NO_CLAIM_MESSAGE, agent_message: NO_CLAIM_MESSAGE }
     }

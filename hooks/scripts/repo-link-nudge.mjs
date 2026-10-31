@@ -28,6 +28,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { commitRepoDir, stateDir } from './commit-observation.mjs'
 import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
+import { withoutStandInPrefix } from './git-observer.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
@@ -87,7 +88,9 @@ function defaultReadProject(sessionId, { endpoint = null, home = os.homedir() } 
  * Decide whether to speak, and return the hook output (or null for silence).
  * Every external effect is injectable for tests.
  */
-export async function handleBashPost(input, deps = {}) {
+export async function handleBashPost(hookInput, deps = {}) {
+  // Read the command the agent wrote, not the git stand-in line in front of it.
+  const input = withoutStandInPrefix(hookInput).payload
   const env = deps.env ?? process.env
   const rawInput = input?.tool_input ?? input?.toolInput ?? {}
   const toolInput = typeof rawInput === 'string' ? (() => { try { return JSON.parse(rawInput) } catch { return {} } })() : (rawInput ?? {})
