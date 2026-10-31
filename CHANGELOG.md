@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.22
+
+- Stream live work-trail progress during sessionless remote automation runs (both via Cursor mid-turn hooks and the CLI transcript watcher) without posting placeholder `Working…` seed text or leaking trails from unattached local turns, and retry cleanly if an early step fires before the automation run is claimed.
+
 ## 0.16.21
 
 DevSpec's tools now work in Cursor for people who also use DevSpec in Claude Code. Cursor's command-line agent loads the Claude Code plugins installed on the same computer, and DevSpec's Claude Code plugin shares this plugin's name. Cursor gave the two plugins' DevSpec servers the same name and kept the Claude Code one. That one cannot connect inside Cursor, so this plugin's DevSpec tools disappeared and Cursor showed "Invalid URL".

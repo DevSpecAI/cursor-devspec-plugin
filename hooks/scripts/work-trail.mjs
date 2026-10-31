@@ -40,30 +40,30 @@ export const TRAIL_HEADER_ARGS_CHARS = 120
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
-export function trailStatePath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.trail.json`)
+export function trailStatePath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.trail.json`)
 }
 
-export function readTrailState(connectionId) {
+export function readTrailState(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return null
   try {
-    const raw = JSON.parse(fs.readFileSync(trailStatePath(connectionId), 'utf8'))
+    const raw = JSON.parse(fs.readFileSync(trailStatePath(connectionId, dir), 'utf8'))
     return raw && typeof raw === 'object' ? raw : null
   } catch {
     return null
   }
 }
 
-export function writeTrailState(connectionId, state) {
+export function writeTrailState(connectionId, state, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-  fs.writeFileSync(trailStatePath(connectionId), JSON.stringify(state), { mode: 0o600 })
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(trailStatePath(connectionId, dir), JSON.stringify(state), { mode: 0o600 })
 }
 
-export function clearTrailState(connectionId) {
+export function clearTrailState(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   try {
-    fs.rmSync(trailStatePath(connectionId), { force: true })
+    fs.rmSync(trailStatePath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }

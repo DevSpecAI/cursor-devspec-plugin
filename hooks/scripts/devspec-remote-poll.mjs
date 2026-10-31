@@ -207,12 +207,12 @@ const MAX_TURN_MS = 60 * 60 * 1000
 /** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
 export const TURN_SILENCE_MS = 90_000
 
-function turnMarkerPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
+function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.turn`)
 }
-function readTurnMarker(connectionId) {
+function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   try {
-    const p = turnMarkerPath(connectionId)
+    const p = turnMarkerPath(connectionId, dir)
     if (!fs.existsSync(p)) return null
     const m = JSON.parse(fs.readFileSync(p, 'utf8'))
     return typeof m?.startedAt === 'number' ? m : null
@@ -225,17 +225,24 @@ function readTurnMarker(connectionId) {
  * The long-lived poller re-asserts busy while this marker is live; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
-function writeTurnMarker(connectionId, { held = false } = {}) {
+function writeTurnMarker(
+  connectionId,
+  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR } = {},
+) {
   if (!connectionId) return
-  const existing = readTurnMarker(connectionId)
-  const startedAt = turnIsLive(existing, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
-    ? existing.startedAt
-    : Date.now()
+  const existing = readTurnMarker(connectionId, dir)
+  const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
+  const startedAt = live ? existing.startedAt : Date.now()
+  const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
   try {
-    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(
-      turnMarkerPath(connectionId),
-      JSON.stringify(held ? { startedAt, held: true } : { startedAt }),
+      turnMarkerPath(connectionId, dir),
+      JSON.stringify({
+        startedAt,
+        ...(held ? { held: true } : {}),
+        ...(keepRemote ? { remoteTurn: true } : {}),
+      }),
       { mode: 0o600 },
     )
   } catch {
@@ -949,10 +956,23 @@ export async function deliverSystemNotices(
   return { ok: true, duplicate: false, executeNoticeIds }
 }
 
-async function deliverAutomationDispatches(connectionId, dispatches, nextDispatchCursor, sessionId) {
+export async function deliverAutomationDispatches(
+  connectionId,
+  dispatches,
+  nextDispatchCursor,
+  sessionId,
+  {
+    dir = CONNECTIONS_DIR,
+    ensureWatch = ensureCliTrailWatch,
+    seedFn = seedWorkTrailForConnection,
+    appendInboxFn = appendInbox,
+    readStateFn = readState,
+    emit = (line) => process.stdout.write(line),
+  } = {},
+) {
   let acceptedCount = 0
   for (const dispatch of dispatches) {
-    const accepted = appendInbox(connectionId, [dispatch], {
+    const accepted = appendInboxFn(connectionId, [dispatch], {
       type: 'automation_dispatches',
       nextCursor: nextDispatchCursor,
       sessionId,
@@ -961,27 +981,25 @@ async function deliverAutomationDispatches(connectionId, dispatches, nextDispatc
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
       acceptedCount++
-      process.stdout.write(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
+      emit(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
     }
   }
   if (acceptedCount === 0) return { ok: true, acceptedCount: 0 }
 
   if (sessionId) {
     try {
-      const s = readState(connectionId) || {}
+      const s = readStateFn(connectionId) || {}
       const token = s.token || s.mcp_token || null
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
-        await seedWorkTrailForConnection({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
+        await seedFn({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
       }
     } catch (error) {
       process.stderr.write(`devspec-remote-poll: automation trail seed failed: ${error instanceof Error ? error.message : String(error)}\n`)
     }
   }
-  writeTurnMarker(connectionId)
-  if (sessionId) {
-    try { ensureCliTrailWatch({ connectionId }) } catch { /* best effort */ }
-  }
+  writeTurnMarker(connectionId, { remoteTurn: true, dir })
+  try { ensureWatch({ connectionId, dir }) } catch { /* best effort */ }
   return { ok: true, acceptedCount }
 }
 

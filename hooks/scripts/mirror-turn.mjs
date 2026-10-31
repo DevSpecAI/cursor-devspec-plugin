@@ -96,43 +96,68 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
 function markerIsLive(connectionId, marker, { dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
   return turnIsLive(marker, { activity: readTurnActivity(connectionId, dir), now })
 }
-export function writeTurnMarker(connectionId, { held = false } = {}) {
+export function writeTurnMarker(
+  connectionId,
+  { held = false, remoteTurn = false, dir = CONNECTIONS_DIR } = {},
+) {
   if (!connectionId) return
-  const existing = readTurnMarker(connectionId)
-  const startedAt = markerIsLive(connectionId, existing) ? existing.startedAt : Date.now()
+  const existing = readTurnMarker(connectionId, dir)
+  const live = markerIsLive(connectionId, existing, { dir })
+  const startedAt = live ? existing.startedAt : Date.now()
+  const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
   try {
-    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+    fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(
-      turnMarkerPath(connectionId),
-      JSON.stringify(held ? { startedAt, held: true } : { startedAt }),
+      turnMarkerPath(connectionId, dir),
+      JSON.stringify({
+        startedAt,
+        ...(held ? { held: true } : {}),
+        ...(keepRemote ? { remoteTurn: true } : {}),
+      }),
       { mode: 0o600 },
     )
   } catch {
     /* non-fatal — the immediate busy heartbeat below still fires */
   }
 }
-export function clearTurnMarker(connectionId) {
+export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   try {
-    fs.rmSync(turnMarkerPath(connectionId), { force: true })
+    fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }
   try {
-    fs.rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
+    fs.rmSync(turnActivityPath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }
 }
-export function hasActiveTurnMarker(connectionId, maxAgeMs) {
+export function readActiveTurnMarker(
+  connectionId,
+  { maxAgeMs, dir = CONNECTIONS_DIR, now = Date.now() } = {},
+) {
+  if (!connectionId) return null
+  try {
+    const marker = readTurnMarker(connectionId, dir)
+    if (!marker) return null
+    if (typeof maxAgeMs === 'number') {
+      return now - marker.startedAt < maxAgeMs ? marker : null
+    }
+    return markerIsLive(connectionId, marker, { dir, now }) ? marker : null
+  } catch {
+    return null
+  }
+}
+export function hasActiveTurnMarker(connectionId, maxAgeMs, dir = CONNECTIONS_DIR) {
   if (!connectionId) return false
   try {
-    const marker = readTurnMarker(connectionId)
+    const marker = readTurnMarker(connectionId, dir)
     if (!marker) return false
     if (typeof maxAgeMs === 'number') {
       return Date.now() - marker.startedAt < maxAgeMs
     }
-    return markerIsLive(connectionId, marker)
+    return markerIsLive(connectionId, marker, { dir })
   } catch {
     return false
   }
