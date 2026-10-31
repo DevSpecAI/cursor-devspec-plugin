@@ -64,7 +64,7 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       let projectPatch = {}
       if (selected?.status === 'blocked') {
         if (!(namespaced === 'register_connection' && args.project_id)) {
-          return deny(selected.message || 'Choose a project with /devspec.remote --project <id>.')
+          return deny(selected.message || 'Choose a project with /devspec-remote --project <id>.')
         }
       } else if (selected) {
         if (args.project_id && args.project_id !== selected.project.id) {

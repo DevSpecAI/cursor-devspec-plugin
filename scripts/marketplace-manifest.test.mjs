@@ -190,22 +190,18 @@ describe('Cursor Marketplace submission checklist', () => {
     }
   })
 
-  it('gives every skill a name matching its folder and a description', () => {
+  it('gives every skill a name of lowercase letters, numbers and hyphens, matching its folder, and a description', () => {
     const skills = fs.readdirSync(path.join(root, 'skills'), { withFileTypes: true }).filter((entry) => entry.isDirectory())
     assert.ok(skills.length > 0)
     for (const skill of skills) {
       const file = path.join(root, 'skills', skill.name, 'SKILL.md')
       assert.ok(fs.existsSync(file), `skills/${skill.name} has no SKILL.md`)
       const fields = frontmatter(file)
+      // Cursor's skills page: lowercase letters, numbers and hyphens only, matching the folder.
+      assert.match(fields.name ?? '', KEBAB, `skills/${skill.name}: the name may use only lowercase letters, numbers and hyphens`)
       assert.equal(fields.name, skill.name, `skills/${skill.name}/SKILL.md names a different skill`)
       assert.ok(fields.description, `skills/${skill.name} needs a description`)
     }
-  })
-
-  it('uses only lowercase letters, numbers and hyphens in skill names', {
-    todo: "Cursor's skills page asks for this; the dotted names (/devspec.remote) are also the commands DevSpec sends to Cursor, so changing them is a separate decision",
-  }, () => {
-    for (const skill of fs.readdirSync(path.join(root, 'skills'))) assert.match(skill, KEBAB, `skills/${skill}`)
   })
 
   it('wires every hook to a documented event and a script that exists', () => {

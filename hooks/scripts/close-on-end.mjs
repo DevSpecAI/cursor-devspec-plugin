@@ -10,7 +10,7 @@
  * ## Exactly when, and never otherwise
  *
  * - Only a person's End: the server's `end_reason` `'ui'`, which only the connection's
- *   owner can cause (`endConnection`). Not `/devspec.remote-stop` typed in this
+ *   owner can cause (`endConnection`). Not `/devspec-remote-stop` typed in this
  *   terminal (`local_stop`: the person is right here), not a detach, not a recoverable
  *   server end (a redeploy blip, an idle sweep, `owner_gone`).
  * - Only an end this process watched happen: the caller must have served the connection

@@ -39,7 +39,7 @@ describe('closing Cursor when a person ends the agent from DevSpec', () => {
     assert.deepEqual(kills, [[CURSOR, 'SIGTERM']])
   })
 
-  it('does not close on /devspec.remote-stop typed in this terminal', () => {
+  it('does not close on /devspec-remote-stop typed in this terminal', () => {
     const { outcome, kills } = run({ ...live, ...disabledStatePatch('local_stop') })
     assert.equal(outcome.closed, false)
     assert.equal(outcome.reason, 'not_a_person_end')

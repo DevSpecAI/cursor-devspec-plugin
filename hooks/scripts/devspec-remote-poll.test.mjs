@@ -202,7 +202,7 @@ describe('pollTerminalReason', () => {
     })
   })
 
-  it('keeps /devspec.remote-stop permanent', () => {
+  it('keeps /devspec-remote-stop permanent', () => {
     // Re-registering would resurrect an agent the human just switched off.
     assert.equal(pollTerminalReason({ status: 'ended', end_reason: 'local_stop' }).recoverable, false)
   })

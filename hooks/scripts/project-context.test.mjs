@@ -130,7 +130,7 @@ test('fresh handoff verifies Cursor, never reuses history, and does not claim to
  const previous=selectProjectContext('chat',endpoint,A,'explicit',home)
  const prepared=await prepareCursorProject(B.id,opts)
  assert.deepEqual(prepared.launch_argv,['cursor-agent'])
- assert.equal(prepared.first_message,`/devspec.remote --project ${B.id}`)
+ assert.equal(prepared.first_message,`/devspec-remote --project ${B.id}`)
  assert.equal(prepared.requires_fresh_chat,true)
  assert.deepEqual(readProjectContext('chat',endpoint,home),previous)
  assert.throws(()=>findNativeCursorCli({cwd,spawn:()=>({status:0,stdout:'Grok agent'})}),/Could not find/)

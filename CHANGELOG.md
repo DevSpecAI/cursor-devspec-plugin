@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.20
+
+The plugin's commands now use hyphens: `/devspec-remote`, `/devspec-remote-stop`, `/devspec-project` and `/devspec-debug` replace `/devspec.remote`, `/devspec.remote-stop`, `/devspec.project` and `/devspec.debug`. Cursor allows only lowercase letters, numbers and hyphens in a skill's name, and its Marketplace review checks for that. DevSpec's Codex plugin already uses the same names.
+
+- **Type the new commands.** After this update the dotted commands no longer exist: connect with `/devspec-remote` and disconnect with `/devspec-remote-stop`. The command the plugin gives you for starting a conversation in another project, and its message when a project must be chosen, use the new names. DevSpec's own launch commands for Cursor are moving to the new names too.
+- **A connect request is recognised by the skill's new name.** A helper script that shares the prefix, such as `devspec-remote-wait.mjs` with its connection id, is not mistaken for one.
+- **Check.** The Marketplace manifest test now requires every skill name to use only lowercase letters, numbers and hyphens and to match its folder. In 0.16.19 this was a to-do.
+
 ## 0.16.19
 
 The plugin is now called **DevSpec** (`devspec`), like DevSpec's plugins for Claude Code, Antigravity and Pi, and it is ready to be submitted to the Cursor Marketplace, which will be the way to install and update it.

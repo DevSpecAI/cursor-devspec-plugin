@@ -1,5 +1,5 @@
 ---
-name: devspec.debug
+name: devspec-debug
 description: Explicitly start, inspect, stop or export local Cursor diagnostics for this connection. Off by default; nothing uploads automatically.
 ---
 
@@ -7,7 +7,7 @@ description: Explicitly start, inspect, stop or export local Cursor diagnostics 
 
 Use only after the person asks to diagnose a problem or explicitly enables debug collection. Do not enable it during routine work, silently for another session, or to manufacture completion evidence.
 
-Resolve this installed plugin's `PLUGIN` root as in `devspec.remote`. Run:
+Resolve this installed plugin's `PLUGIN` root as in `devspec-remote`. Run:
 
 ```text
 node "$PLUGIN/hooks/scripts/diagnostics-command.mjs" start --minutes 15

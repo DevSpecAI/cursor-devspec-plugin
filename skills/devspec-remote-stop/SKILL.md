@@ -1,5 +1,5 @@
 ---
-name: devspec.remote-stop
+name: devspec-remote-stop
 description: Disconnect DevSpec remote control for THIS conversation only — connection offline on the Agents page, stop the matching poller, leave other remotes alone.
 ---
 
