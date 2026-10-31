@@ -2,7 +2,7 @@ import { appendDiagnostic } from './local-diagnostics.mjs'
 
 /** Never persist raw stderr, MCP bodies, SQL, tokens or content. */
 export function classifyProgressFailure(error) {
-  const message = typeof error?.message === 'string' ? error.message.slice(0, 8192) : ''
+  const message = typeof error?.message === 'string' ? error.message : ''
   let reason = 'unclassified_failure'
   if (/\bactivity_attempt_closed\b/.test(message)) reason = 'activity_attempt_closed'
   else if (/requires an exact open activity attempt/.test(message)) reason = 'missing_open_attempt'

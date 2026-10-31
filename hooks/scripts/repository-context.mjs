@@ -6,7 +6,42 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-const rules = ['project_custom_instructions', 'project_agent_rules', 'owner_agent_rules']
+/**
+ * The instruction tiers that hold for this conversation's whole run, and the only ones
+ * the run-wide project context file renders. The owner's reply style
+ * (`owner_custom_instructions`) is deliberately not one of them: reply style belongs to
+ * whoever sent each command, and arrives with that command as `sender_response_style`
+ * (remote ingress contract). How the tiers rank is the implementation contract's
+ * `instruction_boundary`.
+ */
+export const RUN_TIER_FIELDS = Object.freeze(['project_custom_instructions', 'project_agent_rules', 'owner_agent_rules'])
+const rules = RUN_TIER_FIELDS
+
+/** What the model is told in place of the owner's reply style on a connect result. */
+export const REPLY_STYLE_POINTER =
+  "Not part of this run's instructions: reply style belongs to whoever sent each command, " +
+  'and arrives with that command as sender_response_style.'
+
+/**
+ * A connect result (register_connection, attach_connection) as the model reads it.
+ * The server returns the connection owner's reply style beside the run-wide tiers; it
+ * is removed here so nothing presents it as governing replies to other people, and a
+ * pointer says where reply style comes from instead.
+ */
+export function withoutOwnerReplyStyle(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result
+  if (!Object.hasOwn(result, 'owner_custom_instructions') && !Object.hasOwn(result, 'owner_custom_instructions_note')) {
+    return result
+  }
+  const { owner_custom_instructions: _style, owner_custom_instructions_note: _note, ...rest } = result
+  return { ...rest, reply_style: REPLY_STYLE_POINTER }
+}
+
+/**
+ * Cursor delivers a hook's `additional_context` only up to 10,000 characters (measured
+ * on Cursor CLI). Past it the hook hands over the complete text as a file instead.
+ */
+export const CURSOR_HOOK_CONTEXT_MAX_CHARS = 10_000
 const snapshotFile = (id, home) => `${contextFile(id, home)}.repositories`
 function read(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null } }
 function write(file, value) {
@@ -142,8 +177,8 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false}={})
   const receipt = `${snapshotFile(id,home)}.delivered`
   if (!force && read(receipt)?.hash === hash) return null
   let content=text
-  // A measured host limit, not an arbitrary repository-count quota.
-  const hostLimit=10_000
+  // Cursor's own hook limit, not an arbitrary repository-count quota.
+  const hostLimit=CURSOR_HOOK_CONTEXT_MAX_CHARS
   if(content.length>hostLimit) {
     const location=JSON.stringify(snapshotTextFile(id,snapshot,home)).replaceAll('<','\\u003c').replaceAll('>','\\u003e')
     const continuation=`Full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and complete rules) exceeds Cursor's ${hostLimit}-character hook limit. Complete text is available with the file-reading tool at ${location}. Nothing was truncated in that file. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.`

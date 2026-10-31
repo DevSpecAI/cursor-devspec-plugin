@@ -1,13 +1,16 @@
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { resolveConnectionBridgeContext } from './manage-plan-bridge.mjs'
+import { SESSION_POLL_MAX_OPTIONS } from './remote-ingress-v1.mjs'
 
 const TOOL = 'manage_poll'
 const READ_ACTIONS = new Set(['list', 'get'])
 const EXISTING_POLL_ACTIONS = new Set(['update', 'end', 'retract', 'supersede'])
 const CLIENT_REQUEST_ID_ACTIONS = new Set(['create', 'supersede'])
+// The server's own poll bounds (SESSION_POLL_MAX_OPTIONS in its poll projection):
+// checked here so a bad poll is refused with its reason before the capability call.
 const MIN_OPTIONS = 2
-const MAX_OPTIONS = 30
+const MAX_OPTIONS = SESSION_POLL_MAX_OPTIONS
 
 export const MANAGE_POLL_DESCRIPTION =
   "Manage the capability-authenticated Cursor connection's session polls. A poll is a non-blocking room ballot — never a blocking agent driver — so creating, updating, or ending a poll never opens, holds, or completes an activity turn or claims a reply channel. Existing-poll mutations require poll_id and expected_revision; create and supersede require a caller-generated client_request_id. There is no vote action: voting is for people in the room, and recommendation_index is advice only."

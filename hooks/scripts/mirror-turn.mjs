@@ -51,6 +51,7 @@ import {
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 import { postTurnFailure } from './turn-failure.mjs'
+import { fitRoomMessage } from './room-message.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -521,7 +522,8 @@ export function prepareAgentMirrorText(text) {
   if (!t) return null
   if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
   if (!t || isOperationalChrome(t)) return null
-  return t.slice(0, 12000)
+  // Whole up to the room's own limit, never a silent cut (item ac7d624b).
+  return fitRoomMessage(t, { whereRest: 'The full reply is in the Cursor conversation that wrote it.' })
 }
 
 async function main() {
@@ -655,7 +657,10 @@ async function main() {
       text &&
       String(text).trim()
     ) {
-      const cleaned = String(text).trim().slice(0, 12000)
+      // Whole up to the room's own limit; past it, visibly marked (item ac7d624b).
+      const cleaned = fitRoomMessage(String(text).trim(), {
+        whereRest: 'The full prompt is in the Cursor conversation it was typed into.',
+      })
       if (cleaned) {
         const postArgs = {
           message: cleaned,
