@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { withoutStandInPrefix } from './git-observer.mjs'
 
 export const TRAIL_MAX_CHARS = 100_000
 export const TRAIL_POST_MIN_GAP_MS = 1_000
@@ -167,8 +168,10 @@ export function isDevspecPostSessionTool(hookEvent) {
  * @param {string} mode
  * @param {Record<string, unknown>} data
  */
-export function renderHookTrailPart(mode, data) {
-  if (!data || typeof data !== 'object') return null
+export function renderHookTrailPart(mode, rawData) {
+  if (!rawData || typeof rawData !== 'object') return null
+  // The room sees the command the agent wrote, never the git stand-in line in front.
+  const data = withoutStandInPrefix(rawData).payload
   if (isDevspecPostSessionTool(data)) return null
 
   if (mode === 'seed') return TRAIL_SEED_TEXT

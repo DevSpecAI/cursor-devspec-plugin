@@ -83,6 +83,8 @@ function pre(command, cwd, stateRoot, extra = {}) {
     resolveAuth: extra.resolveAuth,
     onlineCall: extra.onlineCall,
     onlineTimeoutMs: extra.onlineTimeoutMs,
+    // These cover the command-text path: no git stand-in line (git-stand-in.test.mjs).
+    prepareStandIn: extra.prepareStandIn ?? (() => null),
   })
 }
 

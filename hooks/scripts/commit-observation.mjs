@@ -6,6 +6,10 @@
  * reflog entry, parent continuity, and unchanged repository/connection binding.
  * Merge/rewrite/background/opaque commands remain ingestion/analyzer territory.
  * This is same-user operational evidence, not hostile-process attestation.
+ *
+ * Since item c2a7ab72 this is the fallback: where the git stand-in runs (a connected
+ * conversation outside native Windows, git-observer.mjs), the stand-in notes commits
+ * from git itself and this path stands down, so nothing is reported twice.
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -16,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { devspecFolderMarker, findProjectPin, gitRemoteOrigin, mainWorkTreeFrom } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { withoutStandInPrefix } from './git-observer.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const REPORT_TIMEOUT_MS = 2_500
@@ -421,14 +426,19 @@ function createdSha(repoDir, before, now) {
   return head
 }
 
-export async function handleBashPost(input, options = {}) {
+export async function handleBashPost(rawInput, options = {}) {
   try {
+    // With the git stand-in line on the command (git-observer.mjs), the stand-in noted
+    // any commit from git itself and reports it: this path only clears its marker, so a
+    // commit is never reported twice. Cursor shows postToolUse the rewritten command.
+    const { payload: input, observed } = withoutStandInPrefix(rawInput)
     const sessionId = sessionFromInput(input, options.env)
     if (!sessionId) return null
     const invocation = directInvocation(commandFromInput(input), cwdFromInput(input))
     if (!invocation) return null
     const { repoDir } = invocation
     const before = consumeMarker(markerPath(sessionId, input, repoDir))
+    if (observed) return null
     const now = options.now ?? Date.now()
     if (!before || before.version !== 1 || !Number.isFinite(before.at) || now < before.at || now - before.at > OBSERVATION_TTL_MS) return null
     const response = input.tool_response ?? input.toolResponse
