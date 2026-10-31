@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.21
+
+DevSpec's tools now work in Cursor for people who also use DevSpec in Claude Code. Cursor's command-line agent loads the Claude Code plugins installed on the same computer, and DevSpec's Claude Code plugin shares this plugin's name. Cursor gave the two plugins' DevSpec servers the same name and kept the Claude Code one. That one cannot connect inside Cursor, so this plugin's DevSpec tools disappeared and Cursor showed "Invalid URL".
+
+- **The plugin's server has a name of its own.** It is now `devspec-cursor`, which Cursor shows as `plugin-devspec-devspec-cursor`, so another plugin can no longer replace it. Nothing changes in your settings: the token you saved in the plugin's settings, and the `devspec` entry in `~/.cursor/mcp.json`, keep working.
+- **One DevSpec server either way.** When `~/.cursor/mcp.json` has a `devspec` entry at the same address, Cursor uses that entry and leaves the plugin's own server out, so DevSpec's tools still appear once.
+- **The plugin's checks follow the new name.** DevSpec tools are accepted from the plugin's server under its new name and from the `devspec` entry in `~/.cursor/mcp.json`. They are not accepted from the Claude Code plugin's server, which is that plugin's, not this one's.
+
 ## 0.16.20
 
 The plugin's commands now use hyphens: `/devspec-remote`, `/devspec-remote-stop`, `/devspec-project` and `/devspec-debug` replace `/devspec.remote`, `/devspec.remote-stop`, `/devspec.project` and `/devspec.debug`. Cursor allows only lowercase letters, numbers and hyphens in a skill's name, and its Marketplace review checks for that. DevSpec's Codex plugin already uses the same names.

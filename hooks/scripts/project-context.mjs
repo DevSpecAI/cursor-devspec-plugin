@@ -95,8 +95,16 @@ export function namespacedVerb(name) {
  * The MCP servers DevSpec's tools may come from, as Cursor names them to hooks
  * (`mcp_server_name`): `devspec`, the entry in Cursor's own MCP settings file, and
  * `plugin-<plugin>-<server>` for the server this plugin's mcp.json declares.
+ *
+ * The plugin's server key is `devspec-cursor`, not `devspec` (item 3c4e35bc).
+ * Cursor CLI also loads the user's Claude Code plugins, and DevSpec's Claude Code
+ * plugin is likewise named `devspec` with a server named `devspec`. Two servers
+ * named `plugin-devspec-devspec` collide, and Cursor kept the Claude Code one,
+ * which cannot connect in Cursor (its settings are Claude Code's own), so the
+ * plugin's working server vanished. `plugin-devspec-devspec` is therefore
+ * deliberately NOT a DevSpec server here: it is the Claude Code plugin's.
  */
-export const DEVSPEC_SERVER_NAMES = Object.freeze(['devspec', 'plugin-devspec-devspec'])
+export const DEVSPEC_SERVER_NAMES = Object.freeze(['devspec', 'plugin-devspec-devspec-cursor'])
 export function isDevspecServer(value) { return DEVSPEC_SERVER_NAMES.includes(String(value ?? '').toLowerCase()) }
 export const PROJECTLESS = new Set(['list_projects', 'verify_agent_connection', 'devspec_help_search', 'get_personal_instructions', 'update_personal_instructions'])
 export function toolArguments(input) {
