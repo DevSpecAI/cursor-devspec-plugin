@@ -628,7 +628,7 @@ describe('resolveOwnerPid / resolveOwnerPidAutoWindows (items 3cddb3b4 / f3a8833
     assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', ''), true)
 
     const ephemeral =
-      'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\extensions\\devspecai.devspec-autopilot-0.4.9\\hooks\\scripts\\remote-control-state.mjs ensure-poller'
+      'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\plugins\\cache\\devspec\\devspec\\0123abcd\\hooks\\scripts\\remote-control-state.mjs ensure-poller'
     assert.equal(isWin32CursorAgentNodeCommand(ephemeral), false)
     assert.equal(shouldIgnoreExplicitWin32Owner('node.exe', ephemeral), true)
 
@@ -828,7 +828,7 @@ describe('resolveOwnerPidFromChildTree (item f099fc6e)', () => {
     '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\node.exe" ' +
     '"C:\\Users\\x\\AppData\\Local\\cursor-agent\\versions\\2026.08.11-e8db854\\index.js" worker-server'
   const launcherCmd =
-    'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\extensions\\devspecai.devspec-autopilot-0.5.1\\scripts\\launch-cli-session.mjs --folder x'
+    'C:\\nvm4w\\nodejs\\node.exe C:\\Users\\x\\.cursor\\plugins\\cache\\devspec\\devspec\\0123abcd\\scripts\\launch-cli-session.mjs --folder x'
   const treeOpts = (tree) => ({
     platform: 'win32',
     timeoutMs: 0,

@@ -81,9 +81,14 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.match(changelog, new RegExp(`^# Changelog\\s+## ${packageJson.version.replace(/\./g, '\\.')}\\b`, 'm'))
     assert.match(changelog, /Cursor releases are versioned independently/i)
     assert.match(changelog, /package\.json.*protected.*0\.8\.0/is)
-    assert.match(readme, /Shared session plans during remote control/)
-    assert.match(readme, /manual chat without that id.*exactly one live, attached/i)
-    assert.match(readme, /Ambiguous sibling connections fail closed/i)
+    // The README is the customer's install page, so plan continuity and the rule for a
+    // chat with no Cursor conversation id are said in plain words, not the code's vocabulary.
+    assert.match(readme, /shared plan, it picks the plan up where it left off/i)
+    assert.match(readme, /exactly one live, attached Cursor connection/i)
+    assert.match(readme, /refuses rather than guess/i)
+    for (const term of ['authoritative revision', 'minted-bond', 'capability-bound', 'fails? closed']) {
+      assert.doesNotMatch(readme, new RegExp(term, 'i'), `the README uses internal vocabulary: ${term}`)
+    }
   })
 
   it('declares in the manifest every variable mcp.json references', () => {

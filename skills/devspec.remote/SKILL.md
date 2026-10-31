@@ -31,16 +31,16 @@ An optional standalone launcher starts Cursor normally; it does not authenticate
 All poller / state scripts come from the **installed Cursor DevSpec plugin** — never from Claude Code or another agent's plugin cache.
 
 1. Use the installed Cursor plugin location supplied by the host when available; verify the helper below belongs to that plugin.
-2. Otherwise find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). A marketplace install lives at `plugins/marketplaces/<host>/<owner>/<repo>/<commit-sha>/`, a local one at `plugins/local/<name>/`:
+2. Otherwise find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). An installed copy lives in a folder named after its commit (for example `plugins/cache/devspec/devspec/<commit-sha>/`), a local one at `plugins/local/<name>/`:
 
    ```bash
    HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
    PLUGIN=${HIT%/hooks/scripts/remote-control-state.mjs}
    ```
 
-   If more than one matches, take the most recently modified: a marketplace install is keyed by commit, so older commits stay on disk beside the current one.
+   If more than one matches, take the most recently modified: an install is keyed by commit, so older commits can stay on disk beside the current one.
 3. Confirm `PLUGIN/hooks/scripts/remote-control-state.mjs` exists before running anything.
-4. **Never** use scripts under `~/.claude/plugins/**`, `**/devspec-autopilot-marketplace/**`, or any other agent's plugin cache — those lack Cursor's auth-smoke + `ensure-poller` path and cause slow/broken attaches.
+4. **Never** use scripts under `~/.claude/plugins/**` or any other agent's plugin folder, even one named `devspec`: those lack Cursor's auth-smoke + `ensure-poller` path and cause slow/broken attaches.
 5. Always **quote** `"$PLUGIN"` in shell commands (Windows usernames often contain spaces).
 
 ## Security (non-negotiable)

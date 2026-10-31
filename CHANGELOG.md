@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.19
+
+The plugin is now called **DevSpec** (`devspec`), like DevSpec's plugins for Claude Code, Antigravity and Pi, and it is ready to be submitted to the Cursor Marketplace, which will be the way to install and update it.
+
+**If you have `devspec-autopilot` installed, remove it and install DevSpec.** The old plugin won't turn into the new one by itself. In `cursor-agent`, type `/plugin` and uninstall **devspec-autopilot**, then run `cursor-agent plugin marketplace remove devspec-autopilot`. Until DevSpec is listed in the Cursor Marketplace, install it from GitHub as the README's fallback describes: `cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin`, then install **devspec** from `/plugin`. The `devspec` entry in `~/.cursor/mcp.json` that holds your token keeps working.
+
+- **DevSpec's tools from the plugin's own server are accepted.** Cursor names a plugin's MCP server `plugin-<plugin>-<server>`, so the server the plugin declares is now `plugin-devspec-devspec`. The plugin's checks accept DevSpec tools from that server as well as from the `devspec` entry in `~/.cursor/mcp.json`. Before, they accepted two names Cursor never uses, so a DevSpec tool call through the plugin's own server would have been stopped as if it had gone to some other server.
+- **The plugin still knows its own version.** It recognises its installed copy by the new name, so it keeps telling DevSpec which release is running.
+- **Ready for the Marketplace listing.** The manifest has a logo (the DevSpec duck on a solid plate, so it stays visible on Cursor's dark theme), the display name DevSpec, and descriptions that say the plugin is for Cursor's command-line agent. The Cursor editor isn't supported yet.
+- **A new install page.** The README now walks a newcomer through installing from the Cursor Marketplace, setting the token in the plugin's settings, giving remote control and commit tracking the token, checking it works, and how updates arrive. Installing straight from GitHub is a clearly marked fallback, with a plain warning that Cursor does not update a plugin installed that way. Notes for people working on the plugin moved to its Contributing section.
+- **Checks.** A new test reads the manifests the way Cursor's submission checklist does: a kebab-case name, a square logo with an opaque centre, every `${VAR}` in `mcp.json` declared, no absolute or `..` path, and valid rule, skill and hook files. It also reports, as a to-do, that the skill names use a dot, which Cursor's skills page does not allow; those names are also the commands DevSpec sends to Cursor, so renaming them is a separate decision.
+
 ## 0.16.18
 
 DevSpec now hears about each commit the Cursor agent makes with `git commit` while it is connected, however the command was written, and the claimed task's reference is added for the agent, as in the other DevSpec plugins. Before, the plugin read the text of a plain `git commit` command, so it missed many commits: ones with a multi-line message, ones made in a script or a longer compound command, through an alias, and amends, among others. Those reached DevSpec later from GitHub, often with no task reference, and were not credited to Cursor.
