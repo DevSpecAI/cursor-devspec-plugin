@@ -72,6 +72,22 @@ export function readConnectionState(connectionId, dir = CONNECTIONS_DIR) {
   }
 }
 
+export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  try {
+    const raw = JSON.parse(fs.readFileSync(turnMarkerPath(connectionId, dir), 'utf8'))
+    return typeof raw?.startedAt === 'number' ? raw : null
+  } catch {
+    return null
+  }
+}
+
+export function shouldStreamTurnTrail(state, marker) {
+  if (!state || state.enabled === false) return false
+  if (state.session_id) return true
+  return Boolean(marker?.remoteTurn)
+}
+
 export function isTurnActive(connectionId, dir = CONNECTIONS_DIR) {
   try {
     return fs.existsSync(turnMarkerPath(connectionId, dir))
@@ -167,7 +183,8 @@ async function main() {
     }
     idleSince = null
 
-    if (!state.session_id) {
+    const marker = readTurnMarker(connectionId)
+    if (!shouldStreamTurnTrail(state, marker)) {
       await sleep(args.pollMs)
       continue
     }
