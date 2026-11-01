@@ -226,3 +226,25 @@ describe('Cursor Marketplace submission checklist', () => {
     }
   })
 })
+
+describe('one release version everywhere it is written', () => {
+  // A release bump touches every file below by hand, and a missed one ships a plugin
+  // that names two versions: the Marketplace listing, the version DevSpec is told on
+  // each request, and the header the install page asks people to keep can disagree.
+  it('names the manifest version in the marketplace, package, lockfile, server header and install page', () => {
+    const version = plugin.version
+    const lock = readJson('package-lock.json')
+    const entry = marketplace.plugins.find((p) => p.name === plugin.name)
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
+    const readmeHeaders = [...readme.matchAll(/"x-devspec-plugin":\s*"cursor\/([^"]+)"/g)].map((m) => m[1])
+    assert.equal(entry?.version, version, 'marketplace.json')
+    assert.equal(packageJson.version, version, 'package.json')
+    assert.equal(lock.version, version, 'package-lock.json')
+    assert.equal(lock.packages?.['']?.version, version, 'package-lock.json packages[""]')
+    for (const [name, server] of Object.entries(mcp.mcpServers)) {
+      assert.equal(server.headers?.['x-devspec-plugin'], `cursor/${version}`, `mcp.json ${name}`)
+    }
+    assert.ok(readmeHeaders.length > 0, 'the install page shows no x-devspec-plugin header to keep')
+    for (const named of readmeHeaders) assert.equal(named, version, 'README.md install step')
+  })
+})
