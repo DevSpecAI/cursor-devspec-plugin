@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Cursor Connect wake tail — never-exiting stdout follow of the host-owned
- * wake file. The launcher's argv starts this as a background Shell with
- * block_until_ms: 0 and notify_on_output matching owner_message / session_ended
- * / automation_dispatch. Host follow (wait --follow) writes the file; this
+ * wake file. The host's Remote workflow may use it as a notify-only background
+ * Shell; its wake filter includes owner messages, question answers/dismissals,
+ * session end and automation dispatch. Host follow (wait --follow) writes the file; this
  * process only prints new bytes so Cursor can notify the chat after turn_ended.
  *
  * Does not consume the inbox. Do not pass --from-end.

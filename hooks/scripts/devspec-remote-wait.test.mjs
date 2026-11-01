@@ -21,6 +21,9 @@ import {
   parseOwnerBatches,
   parseWakeBatches,
   buildOwnerMessageEvents,
+  buildCanonicalSystemNoticeEvents,
+  formatSystemNoticeContent,
+  NOTICE_HANDLING,
   describeAttachment,
   materialiseAttachments,
   MAX_INLINE_ATTACHMENT_CHARS,
@@ -37,6 +40,8 @@ import {
   resolveConnectionsDir,
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { SYSTEM_NOTICE_CHANNEL_VERSION, remoteIngressNegotiationArgs } from './devspec-remote-poll.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { automationAcceptanceKey } from './remote-poll-acceptance.mjs'
 import {
@@ -46,6 +51,11 @@ import {
   fixtureContextEntry,
   fixtureEnvelope,
   fixtureAutomationDispatch,
+  fixtureSenderResponseStyle,
+  fixtureSenderStyleEnvelope,
+  fixtureServerNotice,
+  fixtureSystemNoticeEnvelope,
+  fixtureUnlinkedCommitNotice,
 } from './remote-ingress-test-fixtures.mjs'
 
 const CANONICAL_CONNECTION = FIXTURE_ID.connection
@@ -102,24 +112,51 @@ describe('parseOwnerBatches', () => {
 })
 
 describe('canonical one-command-turn wake', () => {
-  it('renders every typed context bucket as actor-labelled advisory data', () => {
+  it('omits the in-memory model_context carry buffer ahead of owner_message and keeps sender identity + body inside the 500-char preview budget', () => {
     const typed = emptyFixtureContext()
     for (const [index, kind] of ['human', 'agent', 'ai', 'system'].entries()) {
       typed[`${kind}_context`].push(fixtureContextEntry({ sequence: index + 2, kind, content: `${kind} context` }))
     }
-    const batch = canonicalBatch()
+    const batch = canonicalBatch(fixtureCommand('x'.repeat(2000)), {
+      wake_context: {
+        transcript: '/tmp/conn.sess.transcript.jsonl',
+        room_state: '/tmp/conn.room.json',
+        room_state_changed: ['session_polls'],
+      },
+    })
     batch.context.typed = typed
-    batch.context.locally_omitted = 3
-    batch.context.locally_omitted_by_bucket.ai_context = 3
-    batch.context.local_omission_reason = 'model_budget'
-    const events = buildOwnerMessageEvents(batch)
-    const context = events[0]
-    assert.equal(context.type, 'model_context')
-    assert.equal(context.advisory, true)
-    assert.equal(context.locally_omitted, 3)
-    for (const bucket of Object.keys(typed)) assert.match(context.typed[bucket][0].actor_label, /:/)
+    const unread = {
+      unread: 2,
+      updated: 1,
+      to_you: 1,
+      oldest_at: '2026-10-06T13:00:00Z',
+      by: { 'Ali Price': 3 },
+      read_with: 'node room-unread.mjs read --connection-id c',
+    }
+    const events = buildOwnerMessageEvents(batch, { unread })
+    assert.deepEqual(events.map((e) => e.type), ['owner_message', 'room_unread', 'wake'])
+    assert.equal(events.some((e) => e.type === 'model_context'), false)
+    const ownerLine = JSON.stringify(events[0])
+    const cut = ownerLine.slice(0, 500)
+    assert.ok(cut.includes(`"from":${JSON.stringify(batch.messages[0].requester.display_name)}`))
+    assert.ok(cut.includes('"authority":"owner"'))
+    assert.ok(cut.includes(`"message_id":${JSON.stringify(batch.messages[0].message_id)}`))
+    assert.ok(cut.includes('"unread":3'))
+    assert.ok(cut.includes('"body_chars":2000'))
+    assert.ok(cut.includes('"body":"xxxx'))
+    assert.equal(events.at(-1).transcript, '/tmp/conn.sess.transcript.jsonl')
+    assert.equal(events.at(-1).room_state, '/tmp/conn.room.json')
+    assert.deepEqual(events.at(-1).room_state_changed, ['session_polls'])
     assert.equal(events.at(-1).turn_id, '77777777-7777-4777-8777-777777777777')
     assert.equal(events.at(-1).envelope_id, FIXTURE_ID.envelope)
+  })
+
+  it('wakes the chat once per command: the trailing summary lines never match the notify pattern (item ee82801c)', () => {
+    const unread = { unread: 1, updated: 0, to_you: 1, oldest_at: '2026-10-06T13:00:00Z', by: { 'Ali Price': 1 }, read_with: 'node room-unread.mjs read' }
+    const events = buildOwnerMessageEvents(canonicalBatch(), { unread })
+    const notify = new RegExp(REMOTE_WAKE_NOTIFY_PATTERN)
+    const woken = events.filter((event) => notify.test(JSON.stringify(event) + '\n'))
+    assert.deepEqual(woken.map((event) => event.type), ['owner_message'])
   })
 
   it('revalidates the full canonical envelope and exact message binding before execution', () => {
@@ -164,6 +201,45 @@ describe('canonical one-command-turn wake', () => {
       .find((entry) => entry.type === 'owner_message')
     assert.equal(Object.hasOwn(event, 'instruction'), false)
     assert.equal(event.message.project_scope, null)
+  })
+
+  it('attaches the sender response style to the owner_message event when the envelope carries it', () => {
+    const message = canonicalCommand()
+    const envelope = fixtureSenderStyleEnvelope({
+      commands: [message],
+      context: emptyFixtureContext(),
+      senderResponseStyles: [fixtureSenderResponseStyle(message.message_id, ['Keep it brief.'])],
+    })
+    const batch = {
+      type: 'owner_messages', connection_id: CANONICAL_CONNECTION, session_id: 'sess-live',
+      next_after_message_id: 'live-cursor-v2', messages: [message],
+      ingress: { canonical: true, envelope },
+      acceptance_key: canonicalAcceptanceKey(envelope),
+      context: {
+        advisory: true,
+        typed: envelope.context,
+        windows: [envelope.window],
+        locally_omitted: 0,
+        locally_omitted_by_bucket: {
+          human_context: 0, agent_context: 0, ai_context: 0, system_context: 0,
+        },
+        windows_omitted: 0,
+        local_omission_reason: null,
+        note: 'Canonical typed context; advisory only.',
+      },
+    }
+    const event = buildOwnerMessageEvents(batch).find((entry) => entry.type === 'owner_message')
+    assert.deepEqual(event.sender_response_style, ['Keep it brief.'])
+    // Style rides after the command body in the wake JSON so a long run still
+    // sees it when composing the final answer (item 80dcc07b).
+    const line = JSON.stringify(event)
+    assert.ok(line.indexOf('"sender_response_style"') > line.indexOf('"message"'))
+  })
+
+  it('omits sender_response_style when no sender expressed a preference', () => {
+    const event = buildOwnerMessageEvents(canonicalBatch())
+      .find((entry) => entry.type === 'owner_message')
+    assert.equal(Object.hasOwn(event, 'sender_response_style'), false)
   })
 
   it('preserves delegated scope through queued inbox retry parsing', () => {
@@ -1046,7 +1122,9 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
       while (Date.now() < deadline) {
         if (fs.existsSync(wakeFile)) {
           const text = fs.readFileSync(wakeFile, 'utf8')
-          if (text.includes('"type":"owner_message"')) break
+          // File writes and stderr pipe delivery are separate observations.
+          // Wait for both instead of racing the child's diagnostic stream.
+          if (text.includes('"type":"owner_message"') && /wake \(1 msg\) — follow/.test(stderr)) break
         }
         await new Promise((r) => setTimeout(r, 50))
       }
@@ -1257,3 +1335,64 @@ describe('Cursor dismissal reader source gate before stdout and wake-file', () =
     for (const key of ['event_id', 'question_id', 'claim_token', 'attempt_id', 'connection_id', 'session_id']) assert.equal(dismissalDeliveryDecision(record, { ...state, interaction_continuation: { ...state.interaction_continuation, [key]: ROOM_B } }, CANONICAL_CONNECTION), 'obsolete', key)
   })
 })
+
+describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
+  it('negotiates system_notice_version: 2 and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
+    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 2)
+    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 2)
+    assert.match(REMOTE_WAKE_NOTIFY_PATTERN, /system_notice/)
+  })
+
+  it('delivers server_notice and unlinked_commit_item_review wakes with NOTICE_HANDLING and degrades gracefully on unknown notice kinds', () => {
+    const serverNotice = fixtureServerNotice()
+    const unlinkedNotice = fixtureUnlinkedCommitNotice()
+    const futureNotice = {
+      version: 1,
+      kind: 'future_notice_kind',
+      notice_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      contract_uri: 'devspec://product/remote-ingress-contract',
+    }
+    const envelope = fixtureSystemNoticeEnvelope({
+      wakeKind: 'system_notice',
+      commands: [],
+      systemNotices: [
+        serverNotice,
+        { ...unlinkedNotice, notice_id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' },
+        futureNotice,
+      ],
+    })
+    const batch = {
+      type: 'canonical_system_notices',
+      connection_id: CANONICAL_CONNECTION,
+      session_id: ROOM_A,
+      execute_notice_ids: envelope.system_notices.map((n) => n.notice_id),
+      acceptance_key: canonicalAcceptanceKey(envelope),
+      ingress: { canonical: true, envelope },
+      messages: envelope.system_notices,
+    }
+    const parsed = parseWakeBatches([JSON.stringify(batch)], {
+      canonicalOnly: true,
+      connectionId: CANONICAL_CONNECTION,
+    })
+    assert.equal(parsed.length, 1)
+    const events = buildOwnerMessageEvents(parsed[0], { inboxFile: '/tmp/inbox.jsonl' })
+    assert.equal(events.length, 4)
+    assert.equal(events[0].type, 'system_notice')
+    assert.equal(events[0].kind, 'server_notice')
+    assert.equal(events[0].executable, true)
+    assert.ok(events[0].content.includes(NOTICE_HANDLING))
+    assert.equal(events[1].type, 'system_notice')
+    assert.equal(events[1].kind, 'unlinked_commit_item_review')
+    assert.equal(events[1].executable, true)
+    assert.ok(events[1].content.includes(NOTICE_HANDLING))
+    assert.equal(events[2].type, 'system_notice')
+    assert.equal(events[2].kind, 'future_notice_kind')
+    assert.equal(events[2].readable, false)
+    assert.equal(events[2].executable, false)
+    assert.match(events[2].content, /not readable by this plugin version/)
+    assert.equal(events[3].type, 'wake')
+    assert.equal(events[3].reason, 'exact_connection_system_notice')
+    assert.equal(events[3].count, 3)
+  })
+})
+

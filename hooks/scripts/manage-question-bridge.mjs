@@ -28,13 +28,16 @@ import {
   continuationIdentity,
   INTERACTION_EVENT_CONTRACT_URI,
 } from './interaction-events.mjs'
+import { roomMessageTooLong } from './room-message.mjs'
 
 const TOOL = 'manage_directed_question'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+// The server's own manage_directed_question schema: prompt maxLength 4000, options
+// 2 to 20 items of at most 200 characters each. Checked here only so a bad question is
+// refused with its reason before the capability call; the server enforces the same.
 const MAX_PROMPT_CODE_POINTS = 4000
 const MAX_OPTION_CODE_POINTS = 200
 const MAX_OPTIONS = 20
-const MAX_REPLY_CHARS = 12_000
 
 export const MANAGE_QUESTION_DESCRIPTION =
   "Ask the one person driving this Cursor connection's DevSpec session a single question, " +
@@ -77,6 +80,11 @@ export const MANAGE_QUESTION_INPUT_SCHEMA = {
     allow_custom: {
       type: 'boolean',
       description: 'Let a select answer be written in instead of chosen. On by default; pass false only when the choices must be strictly constrained. Select kinds only.',
+    },
+    keep_turn: {
+      type: 'boolean',
+      description:
+        'Keep the current turn open after asking (pass true only when you still have work or on every question of an independent batch except the last). create only.',
     },
     provenance_ref: {
       type: 'string',
@@ -136,11 +144,12 @@ export function validateManageQuestionInput(input) {
   if (Object.keys(input).some((key) => !QUESTION_KEYS.has(key))) {
     return 'manage_directed_question input contains an unknown or identity-bearing field'
   }
-  if (!MANAGE_QUESTION_INPUT_SCHEMA.properties.action.enum.includes(input.action)) {
+  const action = input.action === 'ask' ? 'create' : input.action
+  if (!MANAGE_QUESTION_INPUT_SCHEMA.properties.action.enum.includes(action)) {
     return 'invalid manage_directed_question action'
   }
 
-  if (input.action === 'create') {
+  if (action === 'create') {
     if (typeof input.client_request_id !== 'string' || !UUID.test(input.client_request_id)) {
       return 'create requires a caller-generated UUID client_request_id'
     }
@@ -176,6 +185,9 @@ export function validateManageQuestionInput(input) {
     if (Object.hasOwn(input, 'allow_custom') && typeof input.allow_custom !== 'boolean') {
       return 'allow_custom must be a boolean'
     }
+    if (Object.hasOwn(input, 'keep_turn') && typeof input.keep_turn !== 'boolean') {
+      return 'keep_turn must be a boolean'
+    }
     if (Object.hasOwn(input, 'provenance_ref') &&
         (typeof input.provenance_ref !== 'string' || !UUID.test(input.provenance_ref))) {
       return 'provenance_ref must be a full UUID'
@@ -183,15 +195,19 @@ export function validateManageQuestionInput(input) {
     return null
   }
 
-  if (input.action === 'list') {
+  if (Object.hasOwn(input, 'keep_turn')) {
+    return `${action} takes no keep_turn; keep_turn applies only to create`
+  }
+
+  if (action === 'list') {
     const extra = Object.keys(input).find((key) => key !== 'action')
     return extra ? `list takes no ${extra}` : null
   }
 
   if (typeof input.question_id !== 'string' || !UUID.test(input.question_id)) {
-    return `${input.action} requires a full question_id UUID`
+    return `${action} requires a full question_id UUID`
   }
-  if (input.action === 'cancel' &&
+  if (action === 'cancel' &&
       (!Number.isSafeInteger(input.expected_revision) || input.expected_revision < 1)) {
     return 'cancel requires the current expected_revision'
   }
@@ -233,7 +249,8 @@ export async function useManageQuestionBridge(
   if (inputError) return { ok: false, error: inputError }
   const bound = resolveConnectionBridgeContext({ localId, agent })
   if (!bound.ok) return bound
-  return callWithCapability(bound, { name: TOOL, args: input, hostToken, mcpCall, resolveAuth })
+  const normalized = input.action === 'ask' ? { ...input, action: 'create' } : input
+  return callWithCapability(bound, { name: TOOL, args: normalized, hostToken, mcpCall, resolveAuth })
 }
 
 /** Is a reply still owed on an answered question? Never prints the capability. */
@@ -275,7 +292,7 @@ export function respondArguments({ connectionId, continuation, message, agent })
 export async function respondToQuestion(
   input,
   { localId, agent = 'Cursor', hostToken = null, mcpCall = mcpToolsCall,
-    resolveAuth = resolveDevspecMcpAuth, clearContinuation = null } = {},
+    resolveAuth = resolveDevspecMcpAuth, clearContinuation = null, root = undefined } = {},
 ) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return { ok: false, error: 'respond input must be an object' }
@@ -285,8 +302,12 @@ export async function respondToQuestion(
   }
   const message = typeof input.message === 'string' ? input.message.trim() : ''
   if (!message) return { ok: false, error: 'respond requires a non-empty message' }
+  // Sent whole: a reply used to be cut at 12,000 characters without a word (item
+  // ac7d624b). Past the room's real limit it is refused with the numbers, never cut.
+  const tooLong = roomMessageTooLong(message)
+  if (tooLong) return { ok: false, error: tooLong }
 
-  const bound = resolveConnectionBridgeContext({ localId, agent })
+  const bound = resolveConnectionBridgeContext({ localId, agent }, root ? { root } : undefined)
   if (!bound.ok) return bound
   const continuation = activeContinuation(bound.state.interaction_continuation, {
     connectionId: bound.connectionId,
@@ -304,7 +325,7 @@ export async function respondToQuestion(
     args: respondArguments({
       connectionId: bound.connectionId,
       continuation,
-      message: message.slice(0, MAX_REPLY_CHARS),
+      message,
       agent,
     }),
     hostToken,

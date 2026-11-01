@@ -173,9 +173,11 @@ describe('exact targeting and non-authority', () => {
       [event({ version: 2 }), /version/],
       [event({ kind: 'devspec.owner_message' }), /kind/],
       [event({ response_kind: 'poll' }), /response_kind/],
-      [event({ answer: '  ' }), /empty|bound/],
-      [event({ answer: 'x'.repeat(201) }), /bound/],
-      [event({ response_kind: 'multi_select', answer: [] }), /bounded array/],
+      [event({ answer: '  ' }), /non-blank/],
+      [event({ answer: 42 }), /non-blank/],
+      [event({ response_kind: 'text', answer: '' }), /non-blank/],
+      [event({ response_kind: 'multi_select', answer: [] }), /non-empty array/],
+      [event({ response_kind: 'multi_select', answer: ['a', ' '] }), /blank/],
       [event({ response_kind: 'multi_select', answer: ['a', 'a'] }), /distinct/],
       [event({ answered_at: 'later' }), /answered_at/],
       [{ ...event(), extra: 1 }, /exactly match/],
@@ -185,6 +187,24 @@ describe('exact targeting and non-authority', () => {
       })
       assert.equal(result.ok, false)
       assert.match(result.error, pattern)
+    }
+  })
+
+  it('leaves answer length to the server: a long typed-in answer is delivered, not refused', () => {
+    // The server allows 1000 characters typed into a multiple-choice question; this
+    // host must not keep a smaller copy of that number (items 11c7f2cd, 9a1096ae).
+    // Lengths well past any bound the server has ever had pass too, so the next
+    // change to a server limit needs no change here.
+    const target = { connectionId: CONNECTION, sessionId: SESSION }
+    for (const candidate of [
+      event({ response_kind: 'single_select', answer: '😀'.repeat(1000) }),
+      event({ response_kind: 'single_select', answer: 'x'.repeat(20_000) }),
+      event({ response_kind: 'multi_select', answer: ['a', 'y'.repeat(1000)] }),
+      event({ response_kind: 'multi_select', answer: Array.from({ length: 40 }, (_, i) => `choice ${i}`) }),
+      event({ response_kind: 'text', answer: 'z'.repeat(20_000) }),
+    ]) {
+      const result = validateInteractionEvent(candidate, target)
+      assert.equal(result.ok, true, result.error)
     }
   })
 
@@ -205,7 +225,7 @@ describe('exact targeting and non-authority', () => {
     // The whole chain is worthless if Cursor is never told to notify: this event type
     // and REMOTE_WAKE_NOTIFY_PATTERN must move together or the room reads Live and
     // is deaf.
-    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('../../scripts/launch-cli-session.mjs')
+    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('./devspec-wake-file.mjs')
     const [answer] = buildInteractionAnswerEvents(record())
     assert.ok(REMOTE_WAKE_NOTIFY_PATTERN.split('|').includes(answer.type))
   })
@@ -730,12 +750,9 @@ describe('poller round trip', () => {
 
 describe('Cursor directed-question policy surfaces', () => {
   it('teaches asking and the reply that closes the turn', () => {
-    const skill = source('skills/devspec.remote/SKILL.md')
-    const doc = source('docs/remote-control/remote-control-cursor.md')
+    const skill = source('skills/devspec-remote/SKILL.md')
     assert.match(skill, /manage-question/)
     assert.match(skill, /question_answer/)
-    assert.match(doc, /question_answer/)
-    assert.match(doc, /devspec:\/\/product\/interaction-event-contract/)
   })
 })
 
@@ -768,10 +785,10 @@ describe('Cursor dismissal boundaries', () => {
     assert.equal(Object.hasOwn(args, 'interaction_response_id'), false)
     assert.equal(turnEndInteractionDecision({ continuation: { ...held, wake_offset_after: null }, wakeFileBytes: 999 }).action, 'hold')
   })
-  it('launcher and pinned wake filters include the distinct dismissal event', async () => {
-    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('../../scripts/launch-cli-session.mjs')
+  it('host wake filters and the Remote skill include the distinct dismissal event', async () => {
+    const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('./devspec-wake-file.mjs')
     assert.match('question_dismissal', new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
-    assert.match(source('scripts/pin-remote-plugin.mjs'), /owner_message\|question_answer\|question_dismissal\|session_ended/)
+    assert.match(source('skills/devspec-remote/SKILL.md'), /question_dismissal/)
     assert.match(source('hooks/scripts/devspec-remote-wait.mjs'), /appendWakeEvents\(args.wakeFile, events\)[^]*dismissalWakeDeliveryContinuation\(held, batch, fs.statSync\(args.wakeFile\).size\)/)
   })
 })

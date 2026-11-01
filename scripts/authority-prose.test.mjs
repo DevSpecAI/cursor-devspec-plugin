@@ -3,13 +3,10 @@ import fs from 'node:fs'
 import { describe, it } from 'node:test'
 
 const operationalFiles = [
-  'skills/devspec.remote/SKILL.md',
-  'docs/remote-control/remote-control-overview.md',
-  'docs/remote-control/remote-control-cursor.md',
+  'skills/devspec-remote/SKILL.md',
   'hooks/scripts/devspec-remote-poll.mjs',
   'hooks/scripts/devspec-remote-wait.mjs',
   'hooks/scripts/resolve-mcp-auth.mjs',
-  'scripts/pin-remote-plugin.mjs',
 ]
 
 const contents = new Map(
@@ -19,7 +16,7 @@ const contents = new Map(
   ]),
 )
 
-const primers = operationalFiles.slice(0, 3)
+const primers = ['skills/devspec-remote/SKILL.md']
 
 function assertInOrder(content, first, second, file) {
   const firstIndex = content.indexOf(first)
@@ -73,7 +70,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /devspec:\/\/product\/remote-ingress-contract/, file)
       assert.match(content, /devspec:\/\/product\/implementation-contract/, file)
       assertInOrder(content, 'reserve_work_items', 'claim_work_item', file)
-      assert.match(content, /nothing (?:is (?:ever )?sent work|sends action-item work)/i, file)
+      assert.match(content, /nothing (?:is (?:ever )?sent work|sends task work)/i, file)
     }
   })
 
@@ -91,8 +88,21 @@ describe('current Cursor authority and work-acquisition prose', () => {
     }
   })
 
+  // Prose guard for item 5f8fe76a; the behaviour is tested in
+  // hooks/scripts/notice-reply.test.mjs, which runs the hooks themselves.
+  it('teaches a notice reply by pointing at the served rules, never as a command answer', () => {
+    for (const file of ['skills/devspec-remote/SKILL.md', 'rules/devspec.mdc']) {
+      const content = fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+      assert.match(content, /semantics\.notice_reply/, file)
+      assert.match(content, /system_notice_ids/, file)
+      for (const sentence of content.split(/(?<=[.!?|])\s+/).filter((text) => /notice/i.test(text))) {
+        assert.doesNotMatch(sentence, /complete_turn:\s*true/, `${file} pairs a notice with complete_turn: ${sentence.slice(0, 160)}`)
+      }
+    }
+  })
+
   it('keeps interaction policy item-scoped on every work surface', () => {
-    for (const file of ['skills/devspec.remote/SKILL.md', 'scripts/pin-remote-plugin.mjs']) {
+    for (const file of ['skills/devspec-remote/SKILL.md']) {
       const content = contents.get(file)
       assert.match(content, /multiple items do not change (?:that )?interaction policy/i, file)
       assert.match(content, /each claimed item[^\n]*served[^\n]*implementation(?:-| )contract/i, file)

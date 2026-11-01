@@ -1,5 +1,427 @@
 # Changelog
 
+## 0.17.0
+
+Fixes from running the plugin end to end in a real `cursor-agent` session, driven from DevSpec, before its Marketplace release.
+
+- **`/devspec-remote --new` opens a room and joins it in one step.** The agent no longer pieces together several steps to start a room. The new room is shared with your project; add `--private` to make it visible only to you (it only applies to a new room). The connect helper now has real help, and asking for it connects nothing.
+- **Commit tracking works in Cursor.** After the agent claims a task, its commits get the task's reference added automatically. Before, Cursor passed the plugin an empty result for a claim, so the plugin never saw it and stopped every commit that had no reference. The plugin now confirms the claim with DevSpec, and each claim records which Cursor chat holds it.
+- **DevSpec isn't refused before the conversation connects.** Opening a new room, or using DevSpec before a chat was connected, was met with "Permission denied", because one of the plugin's checks said nothing when it had nothing to change and Cursor treated that as a no. It now always answers.
+- **The Agents page shows which model the agent runs.** The plugin now reports it on every tool call, so it appears from the agent's first piece of work and follows a model change.
+- **Install page: keep the `x-devspec-plugin` line.** When `~/.cursor/mcp.json` has a `devspec` entry, Cursor connects the agent through it, so that entry must carry the `x-devspec-plugin` line. Without it, DevSpec tells the agent the plugin is missing. The install steps now show the line, and the update notes no longer say to delete it.
+- **Checks.**
+  - The tests use the claim results Cursor and DevSpec really produce.
+  - The hook that checks DevSpec calls is tested as Cursor runs it.
+  - A new test keeps the release version the same in the manifest, marketplace, package files, server header and install page.
+
+## 0.16.22
+
+- Stream live work-trail progress during sessionless remote automation runs (both via Cursor mid-turn hooks and the CLI transcript watcher) without posting placeholder `Working…` seed text or leaking trails from unattached local turns, and retry cleanly if an early step fires before the automation run is claimed.
+
+## 0.16.21
+
+DevSpec's tools now work in Cursor for people who also use DevSpec in Claude Code. Cursor's command-line agent loads the Claude Code plugins installed on the same computer, and DevSpec's Claude Code plugin shares this plugin's name. Cursor gave the two plugins' DevSpec servers the same name and kept the Claude Code one. That one cannot connect inside Cursor, so this plugin's DevSpec tools disappeared and Cursor showed "Invalid URL".
+
+- **The plugin's server has a name of its own.** It is now `devspec-cursor`, which Cursor shows as `plugin-devspec-devspec-cursor`, so another plugin can no longer replace it. Nothing changes in your settings: the token you saved in the plugin's settings, and the `devspec` entry in `~/.cursor/mcp.json`, keep working.
+- **One DevSpec server either way.** When `~/.cursor/mcp.json` has a `devspec` entry at the same address, Cursor uses that entry and leaves the plugin's own server out, so DevSpec's tools still appear once.
+- **The plugin's checks follow the new name.** DevSpec tools are accepted from the plugin's server under its new name and from the `devspec` entry in `~/.cursor/mcp.json`. They are not accepted from the Claude Code plugin's server, which is that plugin's, not this one's.
+
+## 0.16.20
+
+The plugin's commands now use hyphens: `/devspec-remote`, `/devspec-remote-stop`, `/devspec-project` and `/devspec-debug` replace `/devspec.remote`, `/devspec.remote-stop`, `/devspec.project` and `/devspec.debug`. Cursor allows only lowercase letters, numbers and hyphens in a skill's name, and its Marketplace review checks for that. DevSpec's Codex plugin already uses the same names.
+
+- **Type the new commands.** After this update the dotted commands no longer exist: connect with `/devspec-remote` and disconnect with `/devspec-remote-stop`. The command the plugin gives you for starting a conversation in another project, and its message when a project must be chosen, use the new names. DevSpec's own launch commands for Cursor are moving to the new names too.
+- **A connect request is recognised by the skill's new name.** A helper script that shares the prefix, such as `devspec-remote-wait.mjs` with its connection id, is not mistaken for one.
+- **Check.** The Marketplace manifest test now requires every skill name to use only lowercase letters, numbers and hyphens and to match its folder. In 0.16.19 this was a to-do.
+
+## 0.16.19
+
+The plugin is now called **DevSpec** (`devspec`), like DevSpec's plugins for Claude Code, Antigravity and Pi, and it is ready to be submitted to the Cursor Marketplace, which will be the way to install and update it.
+
+**If you have `devspec-autopilot` installed, remove it and install DevSpec.** The old plugin won't turn into the new one by itself. In `cursor-agent`, type `/plugin` and uninstall **devspec-autopilot**, then run `cursor-agent plugin marketplace remove devspec-autopilot`. Until DevSpec is listed in the Cursor Marketplace, install it from GitHub as the README's fallback describes: `cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin`, then install **devspec** from `/plugin`. The `devspec` entry in `~/.cursor/mcp.json` that holds your token keeps working.
+
+- **DevSpec's tools from the plugin's own server are accepted.** Cursor names a plugin's MCP server `plugin-<plugin>-<server>`, so the server the plugin declares is now `plugin-devspec-devspec`. The plugin's checks accept DevSpec tools from that server as well as from the `devspec` entry in `~/.cursor/mcp.json`. Before, they accepted two names Cursor never uses, so a DevSpec tool call through the plugin's own server would have been stopped as if it had gone to some other server.
+- **The plugin still knows its own version.** It recognises its installed copy by the new name, so it keeps telling DevSpec which release is running.
+- **Ready for the Marketplace listing.** The manifest has a logo (the DevSpec duck on a solid plate, so it stays visible on Cursor's dark theme), the display name DevSpec, and descriptions that say the plugin is for Cursor's command-line agent. The Cursor editor isn't supported yet.
+- **A new install page.** The README now walks a newcomer through installing from the Cursor Marketplace, setting the token in the plugin's settings, giving remote control and commit tracking the token, checking it works, and how updates arrive. Installing straight from GitHub is a clearly marked fallback, with a plain warning that Cursor does not update a plugin installed that way. Notes for people working on the plugin moved to its Contributing section.
+- **Checks.** A new test reads the manifests the way Cursor's submission checklist does: a kebab-case name, a square logo with an opaque centre, every `${VAR}` in `mcp.json` declared, no absolute or `..` path, and valid rule, skill and hook files. It also reports, as a to-do, that the skill names use a dot, which Cursor's skills page does not allow; those names are also the commands DevSpec sends to Cursor, so renaming them is a separate decision.
+
+## 0.16.18
+
+DevSpec now hears about each commit the Cursor agent makes with `git commit` while it is connected, however the command was written, and the claimed task's reference is added for the agent, as in the other DevSpec plugins. Before, the plugin read the text of a plain `git commit` command, so it missed many commits: ones with a multi-line message, ones made in a script or a longer compound command, through an alias, and amends, among others. Those reached DevSpec later from GitHub, often with no task reference, and were not credited to Cursor.
+
+- **A stand-in for git, first on the agent's PATH.** On macOS, Linux and WSL, each command the agent runs in a connected conversation starts with one added line that puts a private stand-in for `git` first on its `PATH`. The stand-in runs your real git unchanged: same arguments, folder, terminal, input, output and exit code. Git itself says whether a commit was made. Nothing is installed in your repositories, and your git configuration and git hooks are not changed. The line carries no connection id, key or identity. Cursor's permission prompts and allow-lists check the same commands as before, though a prompt shows the added line above your command.
+- **Each commit is reported.** DevSpec gets the full commit id, the branch and the repository's `origin` (or the project pin, for a repository with no `origin`). A report that can't be sent is tried again later, and what happened to each commit (sent, refused with DevSpec's reason, skipped or dropped, and whether it was an amend) is written to `~/.devspec/remote-control/connections/<connection>.commits.log`.
+- **Tagging and the commit check.** In the project's repositories (one whose `origin` is a repository of the project, or that a `.devspec/project.json` pin names), with exactly one task claimed, a commit without a reference gets that task's `[devspec:<id>]` reference at the end of its subject line before git runs, whether the message comes from `-m`, a message file (through a private copy, never your file) or standard input, and the command's output says so. With no task claimed, or several, the commit is stopped before anything changes and the agent is told how to recover. Amends, fixups, reused messages and messages that already have a reference run exactly as written.
+- **Other repositories are left alone.** A commit in a repository that is not one of the project's is not changed and not reported.
+- **Alongside other DevSpec plugins.** The stand-in follows the same agreement as the other DevSpec plugins' stand-ins, so two of them on one `PATH` never take each other for git.
+- **Nothing reported twice.** The older checks that read the command text stand down whenever the stand-in ran. They still apply on native Windows, where Cursor runs commands in PowerShell, which can't take the added line: there, only straightforward `git commit` commands the agent runs directly are noticed and tagged. In a conversation that isn't connected, those commands are still tagged as before. On native Windows, a commit command longer than 8,192 characters is no longer skipped. The README's new **Commit tracking** section says which setups get full tracking.
+
+## 0.16.17
+
+The Cursor plugin's instructions to the agent now match what DevSpec actually does, and nothing the plugin posts is cut short without saying so.
+
+- **Work that waits for an OK.** The agent keeps such work on its own branch until it has the OK, not for ever. Who can give the OK now comes from DevSpec's own rules, instead of a blanket rule never to clear a wait on the agent's own work, which DevSpec allows in some cases.
+- **Fewer rules copied from DevSpec.** Which fields DevSpec checks for duplicates, what each kind of task dismissal needs, and who decides a proposed change are now pointers to DevSpec's own rules and tool descriptions, so they stay right when DevSpec changes. The copied versions had already drifted: they left out acceptance criteria, and said only a maintainer could accept a proposal.
+- **Tool details corrected.** Memory types match DevSpec's list, and a memory edit is previewed with the memory tool's own preview instead of the task supersession preview. All three "still valid" flag rulings say which values they need. A refused commit or the one-time reminder after an edit asks for a task with a real description and the reason it is needed. The reminder to link a repository points at the project's Settings → Repositories page.
+- **Your reply style is yours.** The connect result no longer presents the owner's personal reply style as an instruction for the whole run. Each message is answered in the style of the person who sent it, which DevSpec delivers with that message.
+- **Long text arrives whole.** Replies to a question, mirrored prompts and replies, and messages about a failed turn are no longer cut at 12,000 characters without a word. They are posted whole up to DevSpec's 100,000-character room message limit; beyond it, a question reply is refused with both numbers, and anything else ends with a note saying how much is not shown and where the full text is. The live work trail says the same when its oldest steps make way for new ones.
+- **Error messages say what they leave out.** A long error response is quoted in part with a count of what was left out, and the full response is kept with the error.
+- **Checks.** The plugin's self-check now also reads Cursor's project rule file, accepts DevSpec argument names in prose while still catching retired or misspelt tools, checks the arguments of calls written out in the instructions, and checks that every pointer to DevSpec's rules names a part those rules have.
+
+## 0.16.16
+
+When DevSpec tells the Cursor agent about its own work (a conflict with someone else's work, a failed check on its pull request, a review finding, or what happened to an edit that waited for someone's OK), and the agent tells you about it in the session, that message now shows as a reply to the notice. Before, it was posted as an answer to whatever you last asked the agent, and it could finish a request it had nothing to do with.
+
+- **It never touches your request.** A reply to a notice never answers, finishes or reopens a request. If a notice arrives while the agent is working on something you asked for, it tells you about the notice in a separate message, and your request still ends with its own answer.
+- **One reply for a batch.** When several notices arrive together, one reply can answer all of them, and it names only those.
+- **No ids typed from memory.** Every notice the agent receives ends with the exact message to send, with the notice's id in it. When everything that woke the agent was a notice, the plugin adds the ids itself, and if the agent finishes without posting, its final message goes to the session as the reply. Work steps are not shown in the session for such a turn, because DevSpec would file them under an earlier request.
+- **Older tool lists still work.** If Cursor still holds the tool list from before DevSpec accepted notice replies and the agent sends the ids as text, the plugin turns them into the list DevSpec expects.
+- **Refusals say why.** If DevSpec refuses a reply, the agent sees DevSpec's reason. When the agent isn't attached to a session, it tells you in the terminal instead.
+- **Guidance.** `skills/devspec.remote/SKILL.md` and `rules/devspec.mdc` no longer tell the agent to answer a notice like a request. They point at DevSpec's own rules for notice replies.
+
+Update the plugin and restart Cursor to pick this up.
+
+## 0.16.15
+
+Cursor now works with DevSpec goals. When a person asks a Cursor agent to create or change a goal or one of its outcomes, DevSpec records who asked for the change and which agent made it, just as it does for tasks, memories and documents. The plugin's guidance also tells the agent how to read the project's goals and change them.
+
+## 0.16.14
+
+When Cursor can't finish a message sent from a DevSpec session (for example it has hit its usage limit or the model service is down), it now says so in the session straight away, quoting Cursor's own error, and stops showing as working. If the turn is stopped in Cursor before it finishes, the session is told that too. Before, the session showed nothing in either case. A message typed in Cursor's own terminal gets no session reply, because Cursor already shows what happened there.
+
+## 0.16.13
+
+Updated `rules/devspec.mdc` and `skills/devspec.remote/SKILL.md` for required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`) on `devspec__update_task` (`lifecycle: "dismissed"`), including `target_task_id` linking, held-replacement behaviour for unmerged replacements, and required rejection notes on `not_wanted`.
+
+## 0.16.12
+
+The commit-provenance messages no longer recommend a thin "last-mile" item, which the DevSpec server now refuses. When a readable commit is stopped because no task is claimed, and in the one-time reminder after an edit, the agent is told to find the task its work belongs to and claim it, or create the smallest adequate task with a real description of the change and the reason for it, and then retry the same commit or commit as usual. With exactly one task claimed, the plugin adds the `[devspec:<id>]` reference itself, so the agent no longer types it. Several claims still ask the agent to write the right reference, as before.
+
+## 0.16.11
+
+Use DevSpec's new settings page names: the personal settings page at `/settings/agents` where you create or reveal your key is now **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. The two-keys warning and no-owning-key error in `hooks/scripts/resolve-mcp-auth.mjs`, the missing-token error in `scripts/setup-cursor.mjs`, the plugin's token prompt and the README now link to the Agent setup page. URLs are unchanged.
+
+## 0.16.10
+
+Streamline `README.md` for customer setup and usage (removing staging URLs, internal constant names, and marketplace caching commentary) and remove internal engineering notes under `docs/`.
+
+## 0.16.9
+
+Add task field partitioning guidance for `devspec__create_task` and `devspec__update_task` in `rules/devspec.mdc` and `skills/devspec.remote/SKILL.md`: place *why* the task exists, speaker attribution/quotes, and desired outcome in `intent`; write the complete product behaviour and architectural or technical mechanism in natural English in `description` (since duplicate and reversal screening reads `title`, `intent`, and `description`, never `ai_instructions`); keep `acceptance_criteria` as plain-prose checkable conditions; and place raw file paths, line numbers, code snippets, CSS classes, and file-by-file edit recipes in `ai_instructions`.
+
+## 0.16.8
+
+When Cursor ends a turn with its own error (for example a usage limit), `hooks/scripts/turn-error-end.mjs` detects the errored `turn_ended` line at the end of the bonded agent transcript and `devspec-remote-poll.mjs` posts a short notice to the room and closes the working attempt on the next tick, instead of leaving the Working dots up until the 1 hour no-sign-of-life backstop. `devspec-remote-wait.test.mjs` now pins that only the `owner_message` line of a canonical command matches `REMOTE_WAKE_NOTIFY_PATTERN`, so its trailing `room_unread` and `wake` lines never wake the chat a second time.
+
+## 0.16.6
+
+Replace the fixed 1-hour `MAX_TURN_MS` wall-clock turn cutoff with activity-based turn liveness in `hooks/scripts/turn-liveness.mjs` (`<connectionId>.turn-activity.json` refreshed on `postToolUse` hooks, `trail-turn.mjs`, and `cli-trail-watch.mjs` transcript growth, expiring only after 1 hour of inactivity), remove the cross-connection `reapDeadPollers` sweep on `writeConnectionState` in `hooks/scripts/remote-control-state.mjs` so connecting a second Cursor window never terminates a quiet sibling window's poller, and add `hooks/scripts/close-on-end.mjs` (`closeCursorOnEnd` / `closeOnEndDecision`) wired into `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` to cleanly terminate the owning Cursor session when ended from the DevSpec UI (`end_reason: 'ui'`).
+
+## 0.16.5
+
+Add `hooks/scripts/commit-observation.mjs` (`preToolUse` and `postToolUse` on `Shell` / `Bash`) to observe direct Git commits and report newly created commit SHAs to DevSpec with the connection capability (`X-DevSpec-Connection-Capability`), add `hooks/scripts/pin-check.mjs` to validate `.devspec/project.json` after writes or edits and surface corrective feedback when malformed or missing `project_id`, and add `hooks/scripts/repo-link-nudge.mjs` (`hooks/scripts/devspec-scope.mjs`) to nudge once per conversation, project, and remote when a newly created or re-pointed `origin` is not yet linked to the pinned DevSpec project.
+
+## 0.16.4
+
+Materialize local room transcripts (`<connectionId>.<sessionId>.transcript.jsonl`) and room state (`<connectionId>.room.json` including `session_polls`, `still_to_discuss`, `active_session_plans`, `system_notices`, and `session_activity`) in `hooks/scripts/room-transcript.mjs` and `hooks/scripts/devspec-remote-poll.mjs`, add `hooks/scripts/room-unread.mjs` with separate `.read.json` and `.presented.json` watermarks, bounded oldest-first `read`, `postToolUse` unread counts, and one-shot `post_session_message` holds in `hooks/scripts/project-input.mjs`, and stop dumping `model_context` ahead of `owner_message` in `hooks/scripts/devspec-remote-wait.mjs` so sender identity and command body stay within Cursor's notification preview budget.
+
+## 0.16.3
+
+Admit owner-typed terminal turns with `report_pickup` (`local_activity_version: 1`, `local_turn: true`, and exact room attachment from `poll_connection`) using the connection capability in `hooks/scripts/local-turn.mjs`, `hooks/scripts/mirror-turn.mjs`, and `hooks/scripts/devspec-remote-poll.mjs`, complete that exact attempt on Stop, and ensure room commands and background wakes open no terminal turn.
+
+## 0.16.2
+
+Add per-connection request ledger (`hooks/scripts/requests.mjs`, `hooks/scripts/request-ref.mjs`, `hooks/scripts/own-connection.mjs`, `hooks/scripts/launch-guard.mjs`) and mechanical stamping in `hooks/scripts/project-input.mjs` for `connection_id`, `provenance_ref`, `request_ref`, and `local_turn` across DevSpec MCP calls, stripping model-supplied `request_ref`, opening/closing requests across `devspec-remote-poll.mjs`, `devspec-remote-wait.mjs`, `mirror-turn.mjs`, and `mark-explicit-reply.mjs`, and refusing writes and background launches on undecided multi-requester turns until disambiguated via `requests.mjs serve`.
+
+## 0.16.1
+
+Negotiate `system_notice_version: 2` in `devspec-remote-poll.mjs`, validate and wake on `server_notice` and `unlinked_commit_item_review` notices (with graceful degradation for unknown future notice kinds) in `remote-ingress-v1.mjs` and `devspec-remote-wait.mjs` (`REMOTE_WAKE_NOTIFY_PATTERN` includes `system_notice`), surface `register_connection`'s `github_identity` in `repository-context.mjs`, `remote-control-state.mjs`, and `fast-connect.mjs`, and update `skills/devspec.remote/SKILL.md`, `rules/devspec.mdc`, `README.md`, and `docs/remote-control/remote-control-cursor.md` for Protecting Intent (`waiting_for_ok` / Experiment branches, immediate action on clear user authority, Review decision tools, and the decision capture bar).
+
+## 0.16.0
+
+Cut over the Cursor plugin to the Tasks contract (`get_tasks`, `get_task`, `get_task_history`, `get_task_siblings`, `search_tasks`, `create_task`, `update_task`, `spin_off_task`, `supersede_task`, `link_tasks`, `unlink_tasks`, `reopen_task`, `surface_session_tasks`, `verify_task`, `task_id`, `task_ids`, and nested `task` responses) across `provenance-assistance.mjs`, hooks, skills, documentation, tests, and package metadata, with a scoped one-time normalization of transient pre-cutover `pending_stamps` entries that preserves active claims and nudged projects.
+
+## 0.15.6
+
+Extended `provenance-assistance.mjs` to inspect and stamp multi-line commits (`git commit -F - <<'DELIM'`, `git commit -m "$(cat <<'DELIM' … DELIM)"`, and readable/writable `git commit -F <path>` / `--file=<path>`), deny readable unreferenced commits when no active claim is held, and emit the bounded post-edit provenance nudge on both `additional_context` and `agent_message` without promising refusal or pointing at server-side reconciliation as a fallback.
+
+## 0.15.5
+
+Fixed held-message (`delivery_retry`) cursor handling in `remote-poll-acceptance.mjs` and `devspec-remote-poll.mjs` so a forward continuation cursor is never saved as an older-history `catch_up_cursor`, and added automatic recovery when the server refuses a pre-existing poisoned catch-up cursor.
+
+## 0.15.4
+
+Added the capability-bound `remote-control-state.mjs manage-poll describe|use` bridge beside `manage-plan` so attached Cursor connections can create and manage session polls without exposing connection identity or invoking directed-question turn machinery.
+
+## 0.15.3
+
+When an automation run is dispatched to a Cursor connection, the run prompt now passes `connection_id` to both `claim_automation_run` and `record_automation_run` and drops the retired `provider`/`model` instruction.
+
+## 0.15.2
+
+`manage-question-bridge.mjs` now accepts `keep_turn` on `create` so batched independent questions pass validation, and `scripts/setup-cursor.mjs` rejects `--token` on the command line in favour of `DEVSPEC_MCP_TOKEN`, standard input, or `~/.devspec/auth.json`.
+
+## 0.15.1
+
+When Cursor has several independent choices for the same person, it now asks them together instead of one at a time, so they can be answered in one sitting and in any order. A question that depends on an earlier answer still waits for that answer.
+
+## 0.15.0
+
+Cursor now tells DevSpec it is running the DevSpec plugin, and which version, on every request it makes to DevSpec: Cursor's own MCP connection and the plugin's background scripts (remote control, turn mirroring, the work trail, session plans and questions) all send `x-devspec-plugin: cursor/0.15.0`. DevSpec uses it to recognise agents that have the plugin installed; it changes nothing you can do today. The version always comes from the installed plugin. After updating, run `node scripts/setup-cursor.mjs --refresh` from the installed plugin so `~/.cursor/mcp.json` sends it too (your credentials and other servers are kept), then restart Cursor. Running `setup-cursor.mjs` for the first time writes it for you.
+
+## 0.14.5
+
+The remote-control guidance no longer describes DevSpec's retired conflict flags. It used to tell Cursor to rule on a `possible_conflict` with `resolve_action_item_conflict` and to preview rulings with `preview_conflict_resolution`; DevSpec removed all three, so an agent following it called tools that no longer exist. When one item replaces another, Cursor now previews it with `preview_supersession` and then calls `supersede_action_item`, asking first when the item that would close is someone else's work or the person has not shown they understand what would close. A memory or document flagged as possibly out of date is answered by fixing the record, or by saying it is still accurate. Whether either commits or is queued stays the served contract's decision. The commit check no longer looks for a `possible_conflict` field the server never sends. Update the installed plugin and restart Cursor to load this version.
+
+## 0.14.4
+
+Cursor now tells DevSpec which model it is running, so its card on the Agents page shows the model (and the effort setting, when Cursor reports one) even when it is not in a session. It updates each time you send a prompt. Update the installed plugin and restart Cursor to pick this up.
+
+## 0.14.3
+
+A commit may name more than one DevSpec item. The commit check no longer refuses a message carrying several valid `[devspec:<uuid>]` references; it checks each one and refuses only a reference that doesn't exist in the project, naming it. A malformed reference is still refused. Update the installed plugin to pick this up.
+
+## 0.14.2
+
+DevSpec now works out for itself whether an agent's work was unattended, so the remote-control guidance no longer tells Cursor to leave out a setting that no longer exists. Update the installed plugin to pick this up.
+
+## 0.14.1
+
+The remote-control guidance now tells Cursor that writing @ and a person's name in an answer in a DevSpec room notifies that person, if they are in the room or on the project. Update the installed plugin and restart Cursor to load this version.
+
+## 0.14.0
+
+DevSpec now shows Cursor only the DevSpec tools it should call. The connection plumbing that the plugin's scripts use (registering, polling, keep-alives, pickup and completion reports) no longer appears in Cursor's tool list. The plugin's server address now also declares the two plumbing tools Cursor calls itself, the offline heartbeat and detach in `devspec.remote-stop`, so those stay available. The remote-control skill no longer offers in-chat fallbacks for registering, attaching or polling when the plugin's scripts are missing; they ship with the plugin, so remote control needs Node.js 18+. Update the installed plugin, run `node scripts/setup-cursor.mjs --refresh` from it so `~/.cursor/mcp.json` gets the new address (credentials and other servers are kept), and restart Cursor.
+
+## 0.13.36
+
+DevSpec's personal settings page for your token is now the **Agents** page at `/settings/agents`. Instead of naming a path through the menus, the plugin now gives you a link to it. `npm run setup`, the more-than-one-key warning and the "no reachable key owns this connection" error all print the link for the DevSpec environment you're actually connected to (`https://app.devspec.ai/settings/agents`). If two keys belong to two environments, the warning links both pages. `DEVSPEC_APP_URL` overrides the app host. The README and the token prompt link to the page too, and call the other tools you reuse your token in "agents". How the plugin connects is unchanged. Update the installed plugin and restart Cursor to load this version.
+
+## 0.13.35
+
+- Remove unused post-launch connection wrappers left behind by the Launcher separation. Native host ownership, polling and wake-follow behavior are unchanged.
+- Correct hook documentation to describe direct plugin-owned scripts, not the retired hook launcher. Update the installed plugin and restart Cursor to load this version.
+
+## 0.13.34
+
+- Remove the remaining operational descriptions of launcher-side fast-connect. The normal Cursor host is already running when its plugin connects; host wake/ownership safeguards remain unchanged.
+
+## 0.13.33
+
+- Remove bundled/shared launcher code, protocol installers, browser bridges and automatic setup. The optional standalone launcher now starts Cursor normally; the installed Remote skill owns connection setup.
+- Keep native project-choice executable invocation inside the plugin without importing the retired launch script. Preserve wake/interaction contracts and native resume; remove obsolete launcher-generated prompt instructions.
+
+## 0.13.32
+
+Cursor investigation diagnostics are now local-only and off by default. `/devspec.debug` documents start/status/stop/export for one connection, automatic expiry, bounded private files and explicit redacted sharing. Tool/connect timing uploads have been removed, including their awaited network overhead. Plugin MCP timings and transcript append observations are recorded locally when enabled; unavailable host measurements and unknown gaps are stated rather than guessed. Safe ordinary server refusal logging remains separate. Update the actual installed plugin and restart Cursor; a source push alone does not activate new hooks.
+
+## 0.13.30
+
+Cursor's detached progress reporter now preserves safe failure categories in a private, bounded diagnostic log instead of losing them on discarded stderr. Shell timing events no longer include command text, and tool failures use a fixed label rather than error prose. Posting, polling, timeouts and resume behaviour are unchanged. Update the installed plugin and restart Cursor to load the new reporter; an existing process does not reload after a repository update.
+
+## 0.13.29
+
+Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and return loopback errors to the existing handoff page. Update/restart the installed plugin to run the shared update check.
+
+## 0.13.28
+
+Cursor's submit hook now checks the generated shared launcher, including OS registration and readiness, without maintaining a separate launcher implementation. The manual installer delegates to the same path and retains Cursor's space-safe plugin pin. Cursor authentication and connection setup remain in the Cursor adapter; OpenCode's credential-bearing adapter belongs to its own plugin. Launch scripts no longer add an execution-policy bypass. Update/restart the installed plugin to load the change; source and package versions do not establish OS readiness.
+
+## 0.13.27
+
+Live remote answer turns emit per-tool timings into Axiom (`kind=turn_tool`) via the same Remote-control story / `/api/log` path as connect-phase timings. Cursor before/after tool, shell, and MCP hooks record duration without logging arguments or message bodies. Refresh the executing plugin copy (marketplace update or `--plugin-dir`) and restart Cursor so hook registration picks up the new scripts. Package version bump for cache refresh is a follow-up if the install path is version-keyed.
+
+## 0.13.26
+
+Session attachment and validated command responses retain refreshed project/machine rules, including explicit cleared values, without replacing the repository inventory. Both native MCP attachments and helper/launcher attachment paths update the same conversation snapshot. A remote command can name its complete immutable instruction-context file; the pointer travels with the existing command rather than creating a new wake. Existing cached installs still require their normal update/restart; staging development uses --plugin-dir.
+
+## 0.13.25
+
+Cursor now retains complete selected-project repository facts and existing project/machine rules from registration. Manual fast-connect returns them, and Cursor's native post-tool context supplies them to launcher-started or resumed conversations. Project switches keep separate conversation snapshots; unavailable information is not presented as an empty project.
+
+Cursor's measured hook carrier limit is 10,000 characters. Larger context is preserved in a private, complete readable file with an explicit continuation, not silently dropped or reduced to an arbitrary number of repositories. Description and vision remain on demand. Update the executing plugin and restart Cursor; a staging checkout does not refresh an installed marketplace cache.
+
+## 0.13.24
+
+Choose a DevSpec project for one Cursor conversation with `/devspec.remote --project <name-or-id>`. Ambiguous names return project and organisation choices rather than guessing. `/devspec.project` offers details, separately confirmed folder defaults, and a fresh native chat when changing projects. Resumes keep their scope; changing a folder pin does not redirect existing conversations.
+
+Refresh the existing MCP configuration with `node scripts/setup-cursor.mjs --refresh`, then restart Cursor. The server's opt-in tool namespace lets Cursor's input hook stamp scope, while its server-aware hook checks the destination. Normal clients keep the canonical catalogue; credentials and other MCP servers are unchanged. Node 18+ is required.
+
+## 0.13.23
+
+Registration and attachment now carry the executing DevSpec plugin version. Native MCP calls use Cursor's own `preToolUse.updated_input` field without making a permission decision; host version comes only from Cursor's documented `cursor_version`/`CURSOR_VERSION` values when available. Installed cache copies still require their normal update/restart, and a marketplace index alone is not evidence that a new plugin is running.
+
+## 0.13.22
+
+### Delivery evidence stays on action items, out of project memory
+
+The knowledge-capture guidance your agent reads now draws one more line: what shipped, which commit and what passed belong on the action item, not in project memory — and a memory should hold what a future decision needs that the existing record doesn't already preserve. Shared project knowledge stays free of per-task status reports.
+
+## 0.13.21
+
+### The plugin names DevSpec's renamed settings pages
+
+DevSpec's You → Connections page is now **You → Coding agents**, so the setup steps, the token prompt, `npm run setup` and the key-mismatch warnings now send you there to create or reveal your token. The remote-control skill no longer places your response style on the Account page, which has been split into Profile and Sign-in & security; it describes it as what you saved in DevSpec, and names personal agent rules the way the Coding agents page does. Nothing about how the plugin behaves has changed.
+
+## 0.13.20
+
+### A test catches a DevSpec tool name the server no longer has
+
+A new test reads DevSpec's live tool list from a devspecv2 checkout beside this repo and fails if anything in this plugin names a DevSpec tool the server does not have. A tool renamed or retired on the server is then caught here, before an agent is told to call it in someone's session. With no checkout beside it the test skips; `DEVSPEC_V2_ROOT` names one. Nothing about how the plugin behaves has changed.
+
+## 0.13.19
+
+### A long answer typed in your own words reaches the agent
+
+An answer you type yourself to the agent's multiple-choice question now arrives when it is longer than 200 characters. DevSpec accepts up to 1000, but the plugin kept its own, older copy of that limit and turned longer answers away. The plugin now leaves answer limits to DevSpec, so a future change to them needs no plugin update.
+
+## 0.13.18
+
+### Knowledge: the closest match is read, not automatically replaced; open questions are on Review
+
+- Before writing a memory the skill still searches and reads the closest match in full, but no longer tells the agent to supersede it. A similar record may be the same decision, a change to it, a different one, or a disagreement; the agent records, supersedes, links or asks the owner as the comparison warrants.
+- The skill names where open questions about records live — the project's Review queue — and the tools to preview a ruling, link related records and read an item's history. Who may rule stays the served contract's decision.
+
+## 0.13.17
+
+### A proposed change is accepted on the Review page
+
+When a write comes back `queued_for_review`, the skill now says a maintainer accepts it on the project's Review page, under Proposed changes. It used to send people to a "Review tab", which no longer exists.
+
+## 0.13.16
+
+### Fleet Launch agents uses the same remote prompt as a single launch
+
+Empty fleet prompts no longer fall back to a vague `Run the skill` line that
+lets the model wander. Each spawn gets the same `/devspec.remote` (or Cursor
+skill) shape as a single coding-agent launch, and when the handoff carries a
+`sessionId` it attaches with `--session` like an in-session OpenCode launch.
+## 0.13.15
+
+### Fleet headed OpenCode opens a visible connect-client console
+
+`--headed` under `DEVSPEC_FLEET_SETTLE` still exited after server health with a
+stdio-ignored, windowsHide client — so Brandon saw Pi terminals and zero OpenCode
+consoles even when handler.log said 2/2 ok. Fleet headed now opens a titled
+`cmd /k` "DevSpec OpenCode" window for the connect client (same class as Pi);
+settle still exits immediately after spawn.
+
+## 0.13.14
+
+### Fleet OpenCode no longer kills its sibling
+
+Launch agents with 2+ OpenCodes in one folder shared a sessionless server pid
+file, so the second spawn taskkilled the first. Fleet settle now keys pid/state
+by the unique prompt-file stamp.
+
+## 0.13.13
+
+### Headed OpenCode fleet settle no longer hangs
+
+Turning OpenCode headed by default made fleet Launch agents hang on the first
+spawn: serve inherited the settle script's piped stdio, so `close` never fired
+after `process.exit(0)` and Pi never started. Fleet settle never inherits now;
+`runNodeLaunchSettled` resolves on `exit`.
+
+## 0.13.12
+
+### OpenCode launches headed by default
+
+OpenCode was headless so the DevSpec work trail could be the visibility
+surface. Launch agents made that inconsistent with Pi and Cursor CLI, which
+open real terminals. Default is headed again; fleet still settles on server
+health before the next recipe child.
+
+## 0.13.11
+
+### Launch agents Pi opens a visible terminal
+
+Fleet fan-out was settling every tool through `runNodeLaunchSettled`, and Pi's
+settle path spawned with `windowsHide:true` — so Launch agents reported ok with
+no window. Only OpenCode still settles (SQLite ready-gate); Pi uses the same
+visible `cmd start /k` path as session launch, and the settle script opens a
+visible terminal if settle is still requested. OpenCode stays headless.
+
+## 0.13.7
+
+### Start local agents fleet no longer launches empty prompts
+
+Fleet fan-out was hard-coding `promptText: null` for every spawn. Start local
+agents handoffs also arrive with `prompt_chars=0`, so OpenCode exited with
+"You must provide a message or a command" and Cursor skipped mechanical Connect
+(empty body is not remote-connect), leaving stamp-only IDs. Spawns now resolve
+a non-empty handoff prompt when present, otherwise the bare
+`Run the \`devspec.remote\` skill.` default so each tool registers as sessionless
+available capacity.
+
+## 0.13.5
+
+### Sender response style rides each remote command
+
+The poller now negotiates `system_notice_version: 1` and `sender_style_version: 1`
+(strict contract 1.5.0). When the server delivers `sender_response_styles` on the
+command envelope, wait-follow attaches the matching notes as `sender_response_style`
+on the `owner_message` wake event — resolved from whoever sent that message, not
+from the connection owner at connect time. A preference edit takes effect on the
+next command with no reconnect. Skill and remote-control docs point at the served
+contract instead of claiming style is connect-only.
+
+## 0.13.3
+
+### The manifest now declares the variables `mcp.json` needs
+
+`mcp.json` references `${DEVSPEC_MCP_TOKEN}` and `${DEVSPEC_API_URL}`, and the manifest
+declared neither — a guaranteed failure on Cursor's marketplace submission checklist
+("declare every `${VAR}` from `mcp.json` in the manifest schema"), and a worse install than
+the one Cursor built: declared variables are prompted for at install time and editable later
+under Plugins → Configure, so the token becomes a form field instead of a hand-edited file.
+`DEVSPEC_MCP_TOKEN` is required; `DEVSPEC_API_URL` is optional and defaults to production —
+the staging override stays ours, never the shipped default. The surface test that already
+pins the three-version agreement now also fails if any `${VAR}` in `mcp.json` is undeclared,
+and if a schema keyword outside Cursor's accepted subset sneaks in.
+
+## 0.13.2
+
+### The plugin was never installable from its own repo — a marketplace manifest was missing
+
+`cursor-agent plugin marketplace add <gitUrl>` reported success and indexed the repo, and
+the plugin still never loaded. Measured 2026-09-20: with `~/.cursor/plugins/local/` cleared,
+a full `cursor-agent` run fired **no** DevSpec hooks at all, while the same run with a local
+copy present fired them. Adding a marketplace is not installing a plugin, and nothing said so.
+
+The cause is that Cursor discovers plugins in a marketplace repo through
+`.cursor-plugin/marketplace.json` (it also accepts `.claude-plugin/marketplace.json`), and
+this repo only ever had `.cursor-plugin/plugin.json`. A plugin manifest describes the plugin;
+a marketplace manifest is what lists it as installable. Without the second file the repo is a
+marketplace containing nothing, which is indistinguishable from a working install right up
+until you look for a hook.
+
+The version now lives in three files, so the release test checks all three rather than two.
+
+### `marketplace update` does not update, and the README said it did
+
+The install instructions shipped earlier the same day told people to run
+`cursor-agent plugin marketplace update` to get a newer version. It doesn't work, and it
+doesn't fail either: it prints `✓ Updated marketplace` and fetches nothing.
+
+Adding a marketplace resolves the ref with `git ls-remote` and stores the **resolved commit
+SHA**; the branch name is discarded, so a marketplace added from `main` retains no idea that
+it came from `main`. There is nothing for `update` to re-resolve, and it re-fetches the same
+commit. This bites customers, not just us — whoever installs is frozen on whatever commit was
+current that second.
+
+Updating takes **three** steps: remove the marketplace, re-add it, then reinstall the plugin.
+Proven on 2026-09-20 by doing each half separately. Reinstalling the plugin alone reproduces
+the commit you already had, because the install copies from the marketplace index. Re-adding
+the marketplace alone moves the index but leaves the installed copy behind — and removing a
+marketplace does not uninstall its plugin, so in between you are running one commit while the
+marketplace advertises another, with nothing anywhere reporting the difference.
+
+The README now says so, `--git-ref` is described as pinning rather than tracking, and a test
+asserts `marketplace update` never appears inside a copyable code block again. Measured
+against cursor-agent 2026.09.18-9a7762b.
+
 ## 0.13.1
 
 ### A conflict ruling can come back contested, and the skill now says so

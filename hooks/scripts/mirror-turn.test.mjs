@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
+import { ROOM_MESSAGE_MAX_CHARS } from './room-message.mjs'
 import {
   resolveHookConversationId,
   selectBoundState,
@@ -182,7 +183,7 @@ Connection: 7b3a74ae…
 Session:    46ef72c0… | attached
 Status:     registered + attached
 Open:       Agents page
-Stop with:  /devspec.remote-stop
+Stop with:  /devspec-remote-stop
 ─────────────────────────────`
 
 describe('operational chrome filtering', () => {
@@ -224,6 +225,20 @@ describe('operational chrome filtering', () => {
       prepareAgentMirrorText(mixed),
       'Queue same-tab Dev sends while streaming — done on staging.',
     )
+  })
+
+  it('keeps a long reply whole, where it used to be cut at 12,000 characters', () => {
+    const reply = `Findings:\n${'detail '.repeat(5_000)}\nEnd of findings.`
+    assert.ok(reply.length > 30_000)
+    assert.equal(prepareAgentMirrorText(reply), reply)
+  })
+
+  it('marks a reply past the room limit visibly instead of dropping its end silently', () => {
+    const reply = 'z'.repeat(ROOM_MESSAGE_MAX_CHARS + 10)
+    const out = prepareAgentMirrorText(reply)
+    assert.ok(out.length <= ROOM_MESSAGE_MAX_CHARS)
+    assert.match(out, /more characters are not shown/)
+    assert.match(out, /full reply is in the Cursor conversation/)
   })
 })
 

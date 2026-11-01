@@ -105,7 +105,7 @@ export function fixtureEnvelope({
     },
     wake: {
       kind: wakeKind,
-      active: wakeKind === 'conversational_command' || wakeKind === 'control',
+      active: wakeKind === 'conversational_command' || wakeKind === 'control' || wakeKind === 'system_notice',
       reason_id: `${wakeKind}_fixture`,
     },
     delivery_state: deliveryState,
@@ -145,6 +145,76 @@ export function fixtureActivePlanEnvelope(opts = {}) {
   envelope.window.policy_version = '2026-08-21.1'
   envelope.active_session_plans = opts.activeSessionPlans ?? fixtureActiveSessionPlans()
   return envelope
+}
+export function fixtureSystemNoticeEnvelope(opts = {}) {
+  const envelope = fixtureEnvelope(opts)
+  envelope.contract_version = '1.4.0'
+  envelope.policy_version = '2026-08-22.1'
+  envelope.window.policy_version = '2026-08-22.1'
+  envelope.system_notices = opts.systemNotices ?? []
+  if (opts.activeSessionPlans !== undefined) envelope.active_session_plans = opts.activeSessionPlans
+  return envelope
+}
+export function fixtureSenderStyleEnvelope(opts = {}) {
+  const envelope = fixtureEnvelope(opts)
+  envelope.contract_version = '1.5.0'
+  envelope.policy_version = '2026-09-18.1'
+  envelope.window.policy_version = '2026-09-18.1'
+  envelope.system_notices = opts.systemNotices ?? []
+  if (opts.activeSessionPlans !== undefined) envelope.active_session_plans = opts.activeSessionPlans
+  if (opts.senderResponseStyles !== undefined) envelope.sender_response_styles = opts.senderResponseStyles
+  return envelope
+}
+export function fixtureServerNotice(over = {}) {
+  return {
+    version: 1,
+    kind: 'server_notice',
+    notice_id: FIXTURE_ID.control,
+    topic: 'intent_protection',
+    notice_type: 'conflict_detected',
+    summary: 'Your recent commit conflicts with a decided memory.',
+    prompt: 'Tell the person plainly and ask how they want to resolve it.',
+    contract_uri: 'devspec://product/remote-ingress-contract',
+    records: [{
+      label: 'Conflicting decision',
+      record_type: 'memory',
+      record_id: FIXTURE_ID.resource,
+      title: 'Use staging branch for releases',
+      text: 'All release verification must land on staging first.',
+      url: 'https://app.devspec.ai/projects/p1/memory/m1',
+    }],
+    allowed_outcomes: ['go_ahead', 'decline', 'not_a_reversal'],
+    allowed_tools: ['manage_protected_intent', 'get_memory'],
+    ...over,
+  }
+}
+export function fixtureUnlinkedCommitNotice(over = {}) {
+  return {
+    version: 1,
+    kind: 'unlinked_commit_item_review',
+    notice_id: FIXTURE_ID.control,
+    commit_sha: 'a'.repeat(40),
+    task_id: FIXTURE_ID.plan,
+    task_title: 'Ship the shared plan',
+    branch: 'staging',
+    contract_uri: 'devspec://product/remote-ingress-contract',
+    allowed_outcomes: [
+      'correct_item',
+      'link_item',
+      'resolve_duplicate',
+      'dismiss_item',
+      'confirm_item_correct',
+      'defer_follow_up',
+    ],
+    allowed_tools: ['get_task', 'update_task', 'link_tasks', 'supersede_task'],
+    ...over,
+  }
+}
+export function fixtureSenderResponseStyle(
+  messageId = FIXTURE_ID.message,
+  notes = ['Talk to me like a person talking aloud.'],
+) {
+  return { message_id: messageId, notes }
 }
 export function fixtureControl(verb = 'compact', args) {
   return {

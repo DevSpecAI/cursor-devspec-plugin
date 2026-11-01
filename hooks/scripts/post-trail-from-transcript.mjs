@@ -43,6 +43,8 @@ export async function postTrailFromTranscript(opts) {
   const agentName = opts?.agentName || AGENT_NAME
   const timeoutMs = opts?.timeoutMs ?? 15_000
   const now = opts?.now ?? Date.now()
+  const connectionsDir = opts?.connectionsDir || undefined
+  const call = opts?.call || mcpToolsCall
 
   if (!connectionId || !mcpUrl || !token) {
     return { ok: false, skipped: true, reason: 'missing_args' }
@@ -68,7 +70,7 @@ export async function postTrailFromTranscript(opts) {
     return { ok: false, skipped: true, reason: 'transcript_empty', transcriptPath }
   }
 
-  const prev = readTrailState(connectionId)
+  const prev = readTrailState(connectionId, connectionsDir)
   const advanced = advanceTrailState({
     prev,
     part: null,
@@ -83,23 +85,24 @@ export async function postTrailFromTranscript(opts) {
     return { ok: false, skipped: true, reason: 'empty_trail', transcriptPath }
   }
 
-  // Persist only when we have real trail body — do not wipe a Working… seed
-  // with an empty serialize of a transcript that has no assistant tool_use yet.
-  writeTrailState(connectionId, {
-    ...(prev || {}),
-    cumulative: advanced.nextState.cumulative,
-    lastPostedHash: advanced.nextState.lastPostedHash,
-    lastPostedAt: advanced.nextState.lastPostedAt,
-    updatedAt: advanced.nextState.updatedAt,
-    transcriptPath,
-    source: 'transcript',
-  })
-
   if (!advanced.shouldPost) {
+    writeTrailState(
+      connectionId,
+      {
+        ...(prev || {}),
+        cumulative: advanced.nextState.cumulative,
+        lastPostedHash: prev?.lastPostedHash ?? null,
+        lastPostedAt: prev?.lastPostedAt ?? null,
+        updatedAt: advanced.nextState.updatedAt,
+        transcriptPath,
+        source: 'transcript',
+      },
+      connectionsDir,
+    )
     return { ok: false, skipped: true, reason: 'throttle', transcriptPath, trail: advanced.trail }
   }
 
-  await mcpToolsCall({
+  const res = await call({
     mcpUrl,
     token,
     name: 'post_session_message',
@@ -112,6 +115,25 @@ export async function postTrailFromTranscript(opts) {
     },
     timeoutMs,
   })
+  if (res?.isError === true || res?.result?.isError === true) {
+    return { ok: false, skipped: true, reason: 'server_refused', transcriptPath }
+  }
+
+  // Persist lastPostedHash only after the server accepted the trail post so any
+  // pre-claim refusal (before an automation run enters running) retries cleanly.
+  writeTrailState(
+    connectionId,
+    {
+      ...(prev || {}),
+      cumulative: advanced.nextState.cumulative,
+      lastPostedHash: advanced.nextState.lastPostedHash,
+      lastPostedAt: advanced.nextState.lastPostedAt,
+      updatedAt: advanced.nextState.updatedAt,
+      transcriptPath,
+      source: 'transcript',
+    },
+    connectionsDir,
+  )
 
   return { ok: true, trail: advanced.trail, transcriptPath }
 }

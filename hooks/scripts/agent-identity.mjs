@@ -11,6 +11,14 @@
 export const AGENT_NAME = 'Cursor'
 
 /**
+ * This plugin's id in the `x-devspec-plugin: <id>/<version>` header it sends on
+ * every DevSpec MCP request (item f6566758; contract on DevSpec item 2295e089).
+ * It is DevSpec's provider id for this host, the same token the server's provider
+ * enum uses. The header is built in connection-version.mjs, beside the version.
+ */
+export const PLUGIN_ID = 'cursor'
+
+/**
  * The environment variables THIS host uses for its own conversation id.
  *
  * Own host only. Another host's id is a real id for a real conversation — just

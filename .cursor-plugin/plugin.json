@@ -1,12 +1,40 @@
 {
-  "name": "devspec-autopilot",
-  "description": "Connect Cursor's AI agent to DevSpec — pick up action items, work batches you hand it, brainstorm scope, and ship work without leaving the editor.",
-  "version": "0.13.1",
+  "name": "devspec",
+  "displayName": "DevSpec",
+  "description": "DevSpec for Cursor's command-line agent (cursor-agent). Work your team's DevSpec tasks with its decisions and documents to hand, and steer the agent from DevSpec in your browser or on your phone. The Cursor editor is not supported yet.",
+  "version": "0.17.0",
   "author": {
     "name": "DevSpec"
   },
   "homepage": "https://devspec.ai",
   "repository": "https://github.com/DevSpecAI/cursor-devspec-plugin",
   "license": "MIT",
-  "keywords": ["devspec", "agent", "remote-control", "action-items", "planning"]
+  "logo": "assets/logo.png",
+  "keywords": [
+    "devspec",
+    "cursor-cli",
+    "tasks",
+    "remote-control",
+    "planning",
+    "mcp"
+  ],
+  "variables": {
+    "type": "object",
+    "properties": {
+      "DEVSPEC_MCP_TOKEN": {
+        "type": "string",
+        "title": "DevSpec token",
+        "description": "Your DevSpec token, which starts with dvs_. Create or reveal it on DevSpec's Agent setup page: https://app.devspec.ai/settings/agents"
+      },
+      "DEVSPEC_API_URL": {
+        "type": "string",
+        "title": "DevSpec API URL (advanced)",
+        "description": "Which DevSpec service the plugin connects to. Leave it as it is unless DevSpec support asks you to change it.",
+        "default": "https://api.devspec.ai"
+      }
+    },
+    "required": [
+      "DEVSPEC_MCP_TOKEN"
+    ]
+  }
 }

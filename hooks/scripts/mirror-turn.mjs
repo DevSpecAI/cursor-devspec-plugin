@@ -6,7 +6,10 @@
  *
  * user_prompt → optional local_prompt bubble when attached (literal owner text)
  *             → also seeds phase=trail "Working…" so the live bubble opens immediately
- * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state
+ * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state;
+ *               a room command whose turn errored or was stopped is told so (turn-failure.mjs);
+ *               a turn woken only by DevSpec notices whose model posted no reply ends with
+ *               its final message as a reply to those notices (notice-reply.mjs)
  *
  * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
@@ -32,45 +35,129 @@ import {
 } from './interaction-events.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
+import { recordRuntimeReport } from './agent-telemetry.mjs'
+import {
+  absentLaunches,
+  appendRequestEvent,
+  closeRequest,
+  launchForRequest,
+  openRequest,
+  promptArrival,
+  readRequestState,
+  requestFinished,
+  requestForLaunch,
+  requestsWithWorkPending,
+  rotateRequestLog,
+  UNSTATED,
+} from './requests.mjs'
+import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
+import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
+import { postTurnFailure } from './turn-failure.mjs'
+import { fitRoomMessage } from './room-message.mjs'
+import { clearTurnWakes, postNoticeTurnReply, recordPromptWake } from './notice-reply.mjs'
 
-const mode = process.argv[2] === 'user_prompt' ? 'user_prompt' : 'stop'
+const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
+const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+
+function patchOwnState(connectionId, patch) {
+  const file = path.join(CONNECTIONS_DIR, `${connectionId}.json`)
+  if (!connectionId || !fs.existsSync(file)) return false
+  try {
+    const existing = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (!existing || typeof existing !== 'object') return false
+    const next = { ...existing, ...patch, updated_at: new Date().toISOString() }
+    const tmp = `${file}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+    fs.renameSync(tmp, file)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Turn marker — the connected agent is the SOLE authority for the "working" state.
 // UserPromptSubmit (turn start) writes it; Stop (turn end) clears it. The long-lived
 // poller reads it (by connection_id) to re-assert busy on heartbeats while a turn
 // runs, so long turns stay "working" and the server's busy freshness doesn't decay.
-export function turnMarkerPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
+export function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.turn`)
 }
-export function writeTurnMarker(connectionId) {
-  if (!connectionId) return
+function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
   try {
-    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
-      mode: 0o600,
-    })
+    const marker = JSON.parse(fs.readFileSync(turnMarkerPath(connectionId, dir), 'utf8'))
+    return typeof marker?.startedAt === 'number' ? marker : null
+  } catch {
+    return null
+  }
+}
+function markerIsLive(connectionId, marker, { dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
+  return turnIsLive(marker, { activity: readTurnActivity(connectionId, dir), now })
+}
+export function writeTurnMarker(
+  connectionId,
+  { held = false, remoteTurn = false, dir = CONNECTIONS_DIR } = {},
+) {
+  if (!connectionId) return
+  const existing = readTurnMarker(connectionId, dir)
+  const live = markerIsLive(connectionId, existing, { dir })
+  const startedAt = live ? existing.startedAt : Date.now()
+  const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      turnMarkerPath(connectionId, dir),
+      JSON.stringify({
+        startedAt,
+        ...(held ? { held: true } : {}),
+        ...(keepRemote ? { remoteTurn: true } : {}),
+      }),
+      { mode: 0o600 },
+    )
   } catch {
     /* non-fatal — the immediate busy heartbeat below still fires */
   }
 }
-export function clearTurnMarker(connectionId) {
+export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
   try {
-    fs.rmSync(turnMarkerPath(connectionId), { force: true })
+    fs.rmSync(turnMarkerPath(connectionId, dir), { force: true })
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.rmSync(turnActivityPath(connectionId, dir), { force: true })
   } catch {
     /* ignore */
   }
 }
-export function hasActiveTurnMarker(connectionId, maxAgeMs = 300_000) {
+export function readActiveTurnMarker(
+  connectionId,
+  { maxAgeMs, dir = CONNECTIONS_DIR, now = Date.now() } = {},
+) {
+  if (!connectionId) return null
+  try {
+    const marker = readTurnMarker(connectionId, dir)
+    if (!marker) return null
+    if (typeof maxAgeMs === 'number') {
+      return now - marker.startedAt < maxAgeMs ? marker : null
+    }
+    return markerIsLive(connectionId, marker, { dir, now }) ? marker : null
+  } catch {
+    return null
+  }
+}
+export function hasActiveTurnMarker(connectionId, maxAgeMs, dir = CONNECTIONS_DIR) {
   if (!connectionId) return false
   try {
-    const p = turnMarkerPath(connectionId)
-    if (!fs.existsSync(p)) return false
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'))
-    const startedAt = typeof raw?.startedAt === 'number' ? raw.startedAt : 0
-    return Date.now() - startedAt < maxAgeMs
+    const marker = readTurnMarker(connectionId, dir)
+    if (!marker) return false
+    if (typeof maxAgeMs === 'number') {
+      return Date.now() - marker.startedAt < maxAgeMs
+    }
+    return markerIsLive(connectionId, marker, { dir })
   } catch {
     return false
   }
@@ -289,8 +376,121 @@ export function isHarnessInjection(text) {
     t.includes('<system_notification>') ||
     t.includes('Arm wait FIRST as a background Shell') ||
     t.includes('devspec-wake-tail.mjs') ||
-    t.includes('devspec-remote-wait')
+    t.includes('devspec-remote-wait') ||
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+      t,
+    )
   )
+}
+
+const PROMPT_ORIGINS_OF_A_PERSON = new Set(['composer', 'bridge', 'sdk'])
+
+/** The running turn a prompt was submitted into, or null. */
+export function promptTurnId(hookInput) {
+  try {
+    const turnId = JSON.parse(hookInput || '{}')?.turn_id
+    return typeof turnId === 'string' && turnId ? turnId : null
+  } catch {
+    return null
+  }
+}
+
+export function promptOrigin(hookInput, text = null) {
+  try {
+    const kind = JSON.parse(hookInput || '{}')?.origin?.kind
+    if (typeof kind === 'string') return kind
+  } catch {
+    /* fall through */
+  }
+  const t = String(text ?? '')
+  if (!t.trim()) return null
+  if (
+    t.includes('<task-notification') ||
+    t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
+    t.includes('This is an automated background-task event') ||
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+      t,
+    )
+  ) {
+    return 'task-notification'
+  }
+  if (!isHarnessInjection(t)) return 'composer'
+  return null
+}
+
+/** True when a prompt came from a person (explicit composer/bridge/sdk origin or non-harness terminal prompt). */
+export function promptCameFromAPerson(hookInput, text = null) {
+  try {
+    const parsed = JSON.parse(hookInput || '{}')
+    if (parsed?.origin && typeof parsed.origin === 'object' && typeof parsed.origin.kind === 'string') {
+      return PROMPT_ORIGINS_OF_A_PERSON.has(parsed.origin.kind)
+    }
+  } catch {
+    return false
+  }
+  const resolved = text ?? extractLastText(hookInput, 'user_prompt')
+  return Boolean(resolved && String(resolved).trim() && !isHarnessInjection(resolved))
+}
+
+export function parseBackgroundTasks(hookInput) {
+  try {
+    const data = JSON.parse(hookInput || '{}')
+    return Array.isArray(data.background_tasks) ? data.background_tasks : null
+  } catch {
+    return null
+  }
+}
+
+export function parseSessionCrons(hookInput) {
+  try {
+    const data = JSON.parse(hookInput || '{}')
+    return Array.isArray(data.session_crons) ? data.session_crons : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * PostToolUse for a call that left work running or set up a wake: record which
+ * request it belongs to (item 56ba1b79, requests.mjs), so the wake it causes later
+ * continues that request.
+ */
+export function recordRequestLaunch(raw, { load = loadState, dir = CONNECTIONS_DIR } = {}) {
+  let input
+  try {
+    input = JSON.parse(raw || '{}')
+  } catch {
+    return false
+  }
+  const toolName = input?.tool_name ?? input?.toolName ?? input?.tool ?? null
+  const toolInput = input?.tool_input ?? input?.toolInput ?? input?.arguments ?? input?.args ?? null
+  const toolResponse = input?.tool_response ?? input?.toolResponse ?? input?.result ?? input?.output ?? null
+  const toolUseId = input?.tool_use_id ?? input?.toolUseId ?? input?.call_id ?? null
+  const launch = launchForRequest(toolName, toolInput, toolResponse, toolUseId)
+  if (!launch) return false
+  const state = load(resolveHookConversationId(raw))
+  if (!state?.connection_id) return false
+  const agentId = typeof input?.agent_id === 'string' && input.agent_id ? input.agent_id : null
+  const { request, also } = requestForLaunch(readRequestState(state.connection_id, { dir }), agentId)
+  return launch.schedule
+    ? appendRequestEvent(
+        state.connection_id,
+        { op: 'schedule', prompt: launch.prompt, id: launch.id, request, also },
+        { dir },
+      )
+    : appendRequestEvent(
+        state.connection_id,
+        {
+          op: 'launch',
+          key: launch.key,
+          alias: launch.alias,
+          kind: launch.kind,
+          notifies: launch.notifies,
+          request,
+          also,
+        },
+        { dir },
+      )
 }
 
 const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
@@ -350,11 +550,21 @@ export function prepareAgentMirrorText(text) {
   if (!t) return null
   if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
   if (!t || isOperationalChrome(t)) return null
-  return t.slice(0, 12000)
+  // Whole up to the room's own limit, never a silent cut (item ac7d624b).
+  return fitRoomMessage(t, { whereRest: 'The full reply is in the Cursor conversation that wrote it.' })
 }
 
 async function main() {
   const raw = readStdin()
+  if (mode === 'background_launch') {
+    try {
+      recordRequestLaunch(raw)
+    } catch {
+      /* an unrecorded launch only means its wake is credited as nobody's request */
+    }
+    process.exit(0)
+  }
+
   const conversationId = resolveHookConversationId(raw)
   const state = loadState(conversationId)
   if (!state) process.exit(0)
@@ -374,9 +584,58 @@ async function main() {
   const connectionId = state.connection_id
   const sessionId = state.session_id || null // null = sessionless (no room to mirror into)
   const localId = state.local_id || null
+  const connectionCapability = state.connection_capability || readConnectionCapability(connectionId)
+  const callRequest = (args, timeoutMs = 5_000) =>
+    mcpToolsCall({
+      mcpUrl,
+      token,
+      connectionCapability,
+      name: 'report_request',
+      arguments: args,
+      timeoutMs,
+    })
+
+  // The model Cursor says this turn runs, for the Agents page (item cc47378e).
+  recordRuntimeReport(connectionId, raw)
 
   const text = extractLastText(raw, mode)
-  const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || isHarnessInjection(text))
+  const fromAPerson = mode === 'user_prompt' && promptCameFromAPerson(raw, text)
+  const origin = mode === 'user_prompt' ? promptOrigin(raw, text) : null
+  const skipMirror = mode === 'user_prompt' && (!text || !String(text).trim() || !fromAPerson)
+
+  let typedRequest = null
+  if (mode === 'user_prompt' && connectionId && (fromAPerson || origin)) {
+    try {
+      const midTurn = promptTurnId(raw) !== null
+      const arrival = promptArrival({
+        fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
+        origin,
+        text,
+        midTurn,
+        state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
+      })
+      for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
+      if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }
+    } catch {
+      /* an unrecorded request only leaves DevSpec to resolve who asked itself */
+    }
+  }
+
+  // What this prompt brought into the turn: DevSpec notices, or anything else
+  // (notice-reply.mjs). Recorded before the harness-injection exit below, because a
+  // notice reaches the model as exactly such an injection.
+  if (mode === 'user_prompt' && connectionId) {
+    try {
+      recordPromptWake(connectionId, {
+        fromAPerson,
+        text,
+        midTurn: promptTurnId(raw) !== null,
+        dir: CONNECTIONS_DIR,
+      })
+    } catch {
+      /* an unrecorded wake only means the model passes the notice ids itself */
+    }
+  }
 
   // Consume any explicit-reply marker so it cannot bleed into a later turn.
   // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
@@ -391,6 +650,48 @@ async function main() {
   }
 
   try {
+    // A prompt typed at this terminal opens the owner's own turn, admitted with the
+    // connection capability BEFORE the model starts, so every write it makes names
+    // the owner as the person who asked (item b59a201c, local-turn.mjs). Nothing
+    // else does: a room command carries its own requester, a background wake
+    // continues the turn that is already open, and a scheduled firing was asked for
+    // by nobody at this moment.
+    if (fromAPerson && connectionId && sessionId && text && String(text).trim()) {
+      const scope = localTurnScope(
+        { ...state, connection_capability: connectionCapability },
+        sessionId,
+      )
+      if (scope) {
+        const admitted = await startLocalTurn({
+          scope,
+          previousAttemptId: state.local_turn?.attempt_id ?? null,
+          call: (args) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability,
+              name: 'report_pickup',
+              arguments: args,
+              timeoutMs: 10_000,
+            }),
+        })
+        if (admitted) patchOwnState(connectionId, { local_turn: admitted })
+      }
+    }
+
+    if (typedRequest && connectionCapability) {
+      const opened = await openRequest({
+        connectionId,
+        kind: 'typed_prompt',
+        call: callRequest,
+        dir: CONNECTIONS_DIR,
+        id: typedRequest.id,
+      }).catch(() => null)
+      if (!opened && typedRequest.midTurn) {
+        appendRequestEvent(connectionId, { op: 'joined', id: UNSTATED }, { dir: CONNECTIONS_DIR })
+      }
+    }
+
     // LOCAL PROMPT only: mirror owner text typed in the terminal into the room
     // when attached (two-sided transcript). Agent Stop text is NOT posted here —
     // the skill must post_session_message the direct answer (prefer connection_id).
@@ -400,7 +701,10 @@ async function main() {
       text &&
       String(text).trim()
     ) {
-      const cleaned = String(text).trim().slice(0, 12000)
+      // Whole up to the room's own limit; past it, visibly marked (item ac7d624b).
+      const cleaned = fitRoomMessage(String(text).trim(), {
+        whereRest: 'The full prompt is in the Cursor conversation it was typed into.',
+      })
       if (cleaned) {
         const postArgs = {
           message: cleaned,
@@ -438,10 +742,52 @@ async function main() {
 
     if (mode === 'stop' && connectionId) clearTrailState(connectionId)
 
+    // A turn that errored or was stopped never answered its room command: say so in
+    // the room before the turn ends (item 9a850303, turn-failure.mjs). It marks the
+    // command answered, so the request bookkeeping below closes it.
+    if (mode === 'stop' && connectionId && sessionId) {
+      try {
+        await postTurnFailure({
+          raw,
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+      } catch {
+        /* non-fatal: the turn still ends below */
+      }
+    }
+
+    // A turn woken only by DevSpec notices, whose model posted no reply to them, ends
+    // with its final message as a reply to those notices: bound to no command turn,
+    // so it never answers or closes anyone's command (notice-reply.mjs). Then what
+    // woke the turn is forgotten.
+    if (mode === 'stop' && connectionId) {
+      try {
+        await postNoticeTurnReply({
+          raw,
+          connectionId,
+          sessionId,
+          connectionState: state,
+          agentName,
+          dir: CONNECTIONS_DIR,
+          prepare: prepareAgentMirrorText,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+      } catch {
+        /* non-fatal: the person still has the final message in the terminal */
+      }
+      clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
+    }
+
     // Turn lifecycle → "working" authority. user_prompt starts a turn (busy:true +
     // marker so the poller re-asserts); stop ends it (busy:false + clear marker).
     // Marker is keyed by connection_id (the poller reads it by connection_id).
     const turnActive = mode === 'user_prompt'
+    let stopDecisionAction = null
     if (turnActive) writeTurnMarker(connectionId)
     else clearTurnMarker(connectionId)
 
@@ -482,13 +828,15 @@ async function main() {
         // 'hold' completes nothing at all: the answer is still in flight, and closing
         // the connection's current attempt now would close THAT one. The window is the
         // follow's poll interval, and the turn the answer starts owns the completion.
+        stopDecisionAction = decision.action
         if (decision.action !== 'hold') {
+          const localAttempt = localTurnToComplete(state.local_turn, sessionId)
           try {
             await mcpToolsCall({
               mcpUrl,
               token,
               ...(decision.action === 'complete'
-                ? { connectionCapability: readConnectionCapability(connectionId) }
+                ? { connectionCapability }
                 : {}),
               name: 'report_complete',
               arguments: decision.action === 'complete'
@@ -498,7 +846,9 @@ async function main() {
                     reason: 'turn_end',
                     ...continuationIdentity(decision.continuation),
                   }
-                : { connection_id: connectionId, reason: 'turn_end' },
+                : localAttempt
+                  ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
+                  : { connection_id: connectionId, reason: 'turn_end' },
               timeoutMs: 15_000,
             })
             if (decision.action === 'complete') clearInteractionContinuation(connectionId)
@@ -513,8 +863,38 @@ async function main() {
           } catch {
             /* non-fatal — the poller's marker-driven backstop still runs */
           }
+          if (state.local_turn) patchOwnState(connectionId, { local_turn: null })
         }
       }
+    }
+
+    if (mode === 'stop' && connectionId && connectionCapability) {
+      const requests = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
+      const backgroundTasks = parseBackgroundTasks(raw)
+      if (requests.open.size > 0) {
+        const pending = requestsWithWorkPending(requests, {
+          backgroundTasks,
+          sessionCrons: parseSessionCrons(raw),
+        })
+        const awaitingAnswer = stopDecisionAction === 'hold' ? requests.current : null
+        const finished = [...requests.open.keys()].filter(
+          (id) => requestFinished(requests, id, pending) && id !== awaitingAnswer,
+        )
+        await Promise.all(
+          finished.map((requestId) =>
+            closeRequest({
+              connectionId,
+              requestId,
+              call: (args) => callRequest(args, 3_000),
+              dir: CONNECTIONS_DIR,
+            }),
+          ),
+        )
+      }
+      for (const key of absentLaunches(requests, backgroundTasks)) {
+        appendRequestEvent(connectionId, { op: 'absent', key }, { dir: CONNECTIONS_DIR })
+      }
+      rotateRequestLog(connectionId, { dir: CONNECTIONS_DIR })
     }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)

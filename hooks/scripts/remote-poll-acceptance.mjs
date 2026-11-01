@@ -75,6 +75,11 @@ export function inspectPollResponseV1(response, connectionId) {
   const automations = normalizeAutomationDispatches(response.dispatches, connectionId)
   if (!automations.ok) return automations
   const envelope = canonical.envelope
+  // A page the server is holding back (`delivery_retry`) also sets has_more=true,
+  // but its next_cursor is a forward live continuation, never an older-history
+  // pagination cursor. Sending it back as catch_up_cursor makes the server refuse
+  // the wrong direction on every subsequent poll (item 053aaddb).
+  const deliveryRetry = envelope.window.omission_reason === 'delivery_retry'
   return {
     ok: true,
     changed: true,
@@ -84,7 +89,8 @@ export function inspectPollResponseV1(response, connectionId) {
     liveCursorV2: response.cursor_v2 ?? null,
     legacyCursor: response.cursor ?? null,
     dispatchCursor: response.dispatch_cursor ?? null,
-    catchUpCursor: envelope.window.has_more ? envelope.window.next_cursor : null,
+    catchUpCursor: !deliveryRetry && envelope.window.has_more ? envelope.window.next_cursor : null,
+    deliveryRetry,
     control: envelope.wake.kind === 'control' ? envelope.control : null,
   }
 }
@@ -96,8 +102,13 @@ export function advancePollCursorState(current, accepted, { drainingCatchUp = fa
   const legacyCursor = !liveCursorV2 && accepted.legacyCursor
     ? accepted.legacyCursor
     : current.legacyCursor ?? null
+  const deliveryRetry =
+    accepted.deliveryRetry === true ||
+    accepted.envelope?.window?.omission_reason === 'delivery_retry'
   const catchUpCursor = accepted.changed
-    ? accepted.catchUpCursor
+    ? deliveryRetry
+      ? current.catchUpCursor ?? null
+      : accepted.catchUpCursor
     : drainingCatchUp
       ? null
       : current.catchUpCursor ?? null
@@ -107,6 +118,16 @@ export function advancePollCursorState(current, accepted, { drainingCatchUp = fa
     catchUpCursor,
     dispatchCursor: accepted.dispatchCursor ?? current.dispatchCursor ?? null,
   }
+}
+
+/**
+ * The server refused the catch-up cursor itself. That cursor can never become valid,
+ * so retrying it only repeats the refusal; the poller drops it and re-reads the room
+ * instead so a pre-existing poisoned state file recovers automatically.
+ */
+export function isCatchUpCursorRefusal(err) {
+  const message = err instanceof Error ? err.message : String(err ?? '')
+  return /catch_up_cursor has the wrong direction|catch_up_cursor requires catch_up/i.test(message)
 }
 
 /** Build the next call without ever substituting an older-page cursor for the live cursor. */
@@ -323,9 +344,9 @@ export function automationRunInstruction(dispatch) {
     `Owner: ${ownerName}`,
     '',
     'What to do:',
-    `1. claim_automation_run({ run_id: "${dispatch.run_id}", provider: "cursor" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}" }) — follow the tool's own description for its arguments. If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Follow the instruction returned by that claim, in this repo.',
-    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    `3. record_automation_run({ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}", ... }) — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts (follow the tool's own description).`,
     '',
     `Permission: ${permission}`,
   ].join('\n')

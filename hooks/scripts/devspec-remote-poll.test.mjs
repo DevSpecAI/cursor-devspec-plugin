@@ -17,7 +17,6 @@ import {
   TURN_SILENCE_MS,
   isTurnMarkerStale,
   shouldForceCompleteAndInject,
-  trimAdvisoryCarry,
   pollTerminalReason,
   emptyTurnBackoffMs,
   errorBackoffMs,
@@ -81,11 +80,15 @@ describe('isDeliverableCommand (command gate)', () => {
     assert.equal(isDeliverableCommand(command({ project_scope: delegated.project_scope }), ME), false)
   })
 
-  it('negotiates delegated project scope alongside canonical ingress', () => {
+  it('negotiates delegated project scope and room context alongside canonical ingress', () => {
     assert.deepEqual(remoteIngressNegotiationArgs(), {
       ingress_version: 1,
       delegated_scope_version: 1,
       active_plan_projection_version: 1,
+      system_notice_version: 2,
+      sender_style_version: 1,
+      room_context_version: 1,
+      session_polls_projection_version: 2,
     })
   })
 
@@ -161,55 +164,6 @@ describe('cadenceFor (hold length, not interval)', () => {
 })
 
 /**
- * The advisory carry buffer. A long-poll answers the instant anything lands, so the
- * room and the command that needs it arrive in SEPARATE responses — this buffer is
- * what makes "the room arrives with the command" true rather than nominally true.
- */
-describe('trimAdvisoryCarry', () => {
-  const msg = (id, len = 10) => ({ id, content: 'x'.repeat(len) })
-
-  it('keeps everything inside budget, oldest-first order preserved', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')])
-    assert.deepEqual(kept.map((m) => m.id), ['a', 'b', 'c'])
-    assert.equal(dropped, 0)
-  })
-
-  it('drops the OLDEST when over the count budget — nearest context survives', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a'), msg('b'), msg('c')], { maxCount: 2 })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('drops the oldest when over the character budget', () => {
-    const { kept, dropped } = trimAdvisoryCarry([msg('a', 100), msg('b', 100), msg('c', 100)], {
-      maxChars: 250,
-    })
-    assert.deepEqual(kept.map((m) => m.id), ['b', 'c'])
-    assert.equal(dropped, 1)
-  })
-
-  it('keeps a single over-budget message rather than delivering nothing', () => {
-    const { kept } = trimAdvisoryCarry([msg('huge', 50_000)], { maxChars: 100 })
-    assert.deepEqual(kept.map((m) => m.id), ['huge'])
-  })
-
-  it('handles empty and malformed input without throwing', () => {
-    assert.deepEqual(trimAdvisoryCarry([]), { kept: [], dropped: 0 })
-    assert.deepEqual(trimAdvisoryCarry(null), { kept: [], dropped: 0 })
-    assert.equal(trimAdvisoryCarry([{ id: 'no-content' }]).kept.length, 1)
-  })
-
-  it('THE 1-2-3 CASE: three separate arrivals still reach the command together', () => {
-    // Each untargeted message came back in its own long-poll response.
-    let carry = []
-    for (const n of ['1', '2', '3']) {
-      carry = trimAdvisoryCarry([...carry, { id: n, content: n }]).kept
-    }
-    assert.deepEqual(carry.map((m) => m.content), ['1', '2', '3'])
-  })
-})
-
-/**
  * Regression cover for brief e691c68a.
  *
  * On 2026-07-28 a Coolify redeploy of staging made poll_connection briefly answer
@@ -248,7 +202,7 @@ describe('pollTerminalReason', () => {
     })
   })
 
-  it('keeps /devspec.remote-stop permanent', () => {
+  it('keeps /devspec-remote-stop permanent', () => {
     // Re-registering would resurrect an agent the human just switched off.
     assert.equal(pollTerminalReason({ status: 'ended', end_reason: 'local_stop' }).recoverable, false)
   })

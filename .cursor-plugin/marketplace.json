@@ -1,0 +1,27 @@
+{
+  "name": "devspec",
+  "owner": {
+    "name": "DevSpecAI",
+    "email": "hello@devspec.ai"
+  },
+  "metadata": {
+    "description": "DevSpec for Cursor's command-line agent (cursor-agent)."
+  },
+  "plugins": [
+    {
+      "name": "devspec",
+      "displayName": "DevSpec",
+      "source": "./",
+      "description": "DevSpec for Cursor's command-line agent (cursor-agent). Work your team's DevSpec tasks with its decisions and documents to hand, and steer the agent from DevSpec in your browser or on your phone. The Cursor editor is not supported yet.",
+      "version": "0.17.0",
+      "keywords": [
+        "devspec",
+        "cursor-cli",
+        "tasks",
+        "remote-control",
+        "planning",
+        "mcp"
+      ]
+    }
+  ]
+}

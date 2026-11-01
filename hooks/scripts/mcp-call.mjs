@@ -18,14 +18,27 @@
  * must pass an explicit timeout above the server hold.
  */
 
+import { pluginHeaders, versionedConnectionArguments } from './connection-version.mjs'
+import { randomUUID } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
+import { activeDiagnostics, appendDiagnostic } from './local-diagnostics.mjs'
+import { classifyProgressFailure } from './progress-diagnostics.mjs'
+
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
 
+/**
+ * Every MCP request the plugin's own scripts make (poller, wait, mirror-turn,
+ * connect, plan/question bridges, trail) goes through here, so this is where they
+ * all say which plugin they are. Cursor's own MCP client sends the same header from
+ * ~/.cursor/mcp.json, which scripts/setup-cursor.mjs writes (item f6566758).
+ */
 export function mcpRequestHeaders({ token, connectionCapability = null }) {
   return {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    ...pluginHeaders(),
     ...(typeof connectionCapability === 'string' && connectionCapability.startsWith('dvsc_')
       ? { 'X-DevSpec-Connection-Capability': connectionCapability }
       : {}),
@@ -54,6 +67,21 @@ const CONNECT_BACKOFF_MS = [300, 1_200]
  * `err.code` already means the ABORT reason ('timeout' | 'owner_gone') and callers
  * switch on it. Exported for tests.
  */
+/**
+ * How much of an unreadable or failed HTTP response an error's message quotes. The
+ * message is one line for logs and for the agent; a body can be a whole HTML error
+ * page from a proxy. The excerpt says how much it left out, and the error keeps the
+ * complete body on `err.body`, with the server's structured failure beside it.
+ */
+export const ERROR_BODY_EXCERPT_CHARS = 400
+
+/** The start of `text` for an error message, saying how much it left out. */
+export function bodyExcerpt(text, max = ERROR_BODY_EXCERPT_CHARS) {
+  const s = String(text ?? '')
+  if (s.length <= max) return s
+  return `${s.slice(0, max)}… (${s.length - max} more characters; the full response is on the error's body)`
+}
+
 export function readServerFailure(status, bodyText) {
   const out = {
     status: Number.isInteger(status) ? status : null,
@@ -122,7 +150,31 @@ export async function mcpToolsCallWithRetry(args = {}, retryOptions = {}) {
   }
 }
 
-export async function mcpToolsCall({
+export class CursorMcpRefusal extends Error {
+  constructor(text, details) { super(text); this.name = 'CursorMcpRefusal'; this.details = details }
+}
+
+export async function mcpToolsCall(options) {
+  const fields = { connectionId: options.arguments?.connection_id, local_id: process.env.CURSOR_CONVERSATION_ID }
+  // Capture only if this exact connection/chat opted in. No server URLs, headers,
+  // request/response bodies or tool arguments enter the diagnostic records.
+  const run = activeDiagnostics(fields)
+  if (!run) return performMcpToolsCall(options, null)
+  const measurement = {}, recording = { runId: run.meta.runId }
+  const started = performance.now(), started_at = new Date().toISOString(), invocationId = randomUUID()
+  const event = { kind: 'mcp', source: 'plugin_mcp', tool: options.name, method: 'tools/call', server: 'devspec', invocationId, started_at, turn_id: options.arguments?.command_turn_id, sessionId: options.arguments?.session_id }
+  appendDiagnostic(fields, { ...event, phase: 'start' }, recording)
+  try {
+    const result = await performMcpToolsCall(options, measurement)
+    appendDiagnostic(fields, { ...event, phase: 'end', ended_at: new Date().toISOString(), duration_ms: performance.now() - started, outcome: 'ok', ...measurement }, recording)
+    return result
+  } catch (error) {
+    appendDiagnostic(fields, { ...event, phase: 'end', ended_at: new Date().toISOString(), duration_ms: performance.now() - started, outcome: error?.code === 'timeout' ? 'timeout' : 'error', ...measurement, ...classifyProgressFailure(error) }, recording)
+    throw error
+  }
+}
+
+async function performMcpToolsCall({
   mcpUrl,
   token,
   name,
@@ -132,14 +184,16 @@ export async function mcpToolsCall({
   aliveCheckMs = 2_000,
   connectionCapability = null,
   includeMeta = false,
-}) {
+}, measurement) {
   const body = {
     jsonrpc: '2.0',
     id: Date.now(),
     method: 'tools/call',
-    params: { name, arguments: toolArgs || {} },
+    params: { name, arguments: versionedConnectionArguments(name, toolArgs || {}) },
   }
 
+  const bodyText = JSON.stringify(body)
+  if (measurement) measurement.request_bytes = Buffer.byteLength(bodyText)
   const controller = new AbortController()
   let abortCode = null
   let timeoutTimer = null
@@ -172,7 +226,7 @@ export async function mcpToolsCall({
     res = await fetch(mcpUrl, {
       method: 'POST',
       headers: mcpRequestHeaders({ token, connectionCapability }),
-      body: JSON.stringify(body),
+      body: bodyText,
       signal: controller.signal,
     })
   } catch (e) {
@@ -188,10 +242,11 @@ export async function mcpToolsCall({
   }
 
   const text = await res.text()
+  if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
-    // Message text is deliberately unchanged — logs and existing matching read it.
-    const err = new Error(`MCP HTTP ${res.status}: ${text.slice(0, 400)}`)
-    Object.assign(err, readServerFailure(res.status, text))
+    // The message keeps its `MCP HTTP <status>: …` shape — logs and existing matching read it.
+    const err = new Error(`MCP HTTP ${res.status}: ${bodyExcerpt(text)}`)
+    Object.assign(err, readServerFailure(res.status, text), { body: text })
     throw err
   }
 
@@ -215,7 +270,7 @@ export async function mcpToolsCall({
   }
 
   if (!payload) {
-    throw new Error(`Unparseable MCP response: ${text.slice(0, 200)}`)
+    throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
     throw new Error(payload.error.message || JSON.stringify(payload.error))
@@ -229,7 +284,9 @@ export async function mcpToolsCall({
       .map((c) => c.text)
     const joined = textParts.join('\n')
     if (payload.result?.isError) {
-      throw new Error(joined || 'MCP tool error')
+      let details = payload.result.structuredContent
+      if (!details) { try { details = JSON.parse(joined) } catch {} }
+      throw new CursorMcpRefusal(joined || 'MCP tool error', details)
     }
     let data
     try {

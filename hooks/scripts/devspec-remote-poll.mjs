@@ -23,7 +23,7 @@
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
  * (optional shared context). Both poll the same canonical connection endpoint;
  * attachment affects transcript context and replies, not authority or work
- * acquisition. Action-item work never arrives through ingress: agents reserve the
+ * acquisition. Task work never arrives through ingress: agents reserve the
  * requested ids, then claim them under the served implementation contract.
  * Attach/detach is picked up live from the server, so the poller adapts without a
  * restart — local state is never used to override server attachment authority.
@@ -76,16 +76,41 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { distinctTokenPairs, enumerateCredentialPairs, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
+import { refreshRepositoryRules } from './repository-context.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 import {
+  ACTIVE_PLAN_ASSERTION_CONTRACT_VERSIONS,
   canonicalAcceptanceKey,
   canonicalContextAcceptanceKey,
   emptyCanonicalContextCarry,
+  isActiveSessionPlansProjectionV1,
+  isSessionActivityV1,
+  isSessionEventsV1,
+  isSessionPollsProjection,
+  isStillToDiscussProjectionV1,
   mergeCanonicalContextCarry,
+  REMOTE_INGRESS_RESOURCE_URI,
   validCommandProjectScope,
 } from './remote-ingress-v1.mjs'
+import { writePrivateJson } from './private-state.mjs'
+import {
+  applyIngressToStore,
+  beginDrain,
+  completeEmptyDrain,
+  loadTranscriptStore,
+  observeSessionActivity,
+  observeSessionEvents,
+  persistTranscriptStore,
+  roomStatePath,
+  sessionActivityView,
+  takePendingRedrain,
+  transcriptHasHistory,
+  transcriptPaths,
+  transcriptPollArguments,
+  transcriptSummary,
+} from './room-transcript.mjs'
 import {
   advancePollCursorState,
   appendAcceptedCanonicalJsonl,
@@ -93,9 +118,11 @@ import {
   buildPollCursorArgs,
   hasAcceptedKey,
   inspectPollResponseV1,
+  isCatchUpCursorRefusal,
   automationAcceptanceKey,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
+import { agentStatsArgs } from './agent-telemetry.mjs'
 import {
   buildActiveSessionPlanGuidance,
   clearConnectionCapability,
@@ -124,6 +151,19 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
+import { openRequest } from './requests.mjs'
+import { attachmentFromPoll } from './local-turn.mjs'
+import {
+  NO_SIGN_OF_LIFE_MS,
+  readTurnActivity,
+  turnActivityPath,
+  turnIsLive,
+} from './turn-liveness.mjs'
+import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
+import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { closeCursorOnEnd } from './close-on-end.mjs'
+
+export { roomStatePath }
 
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -167,23 +207,12 @@ const MAX_TURN_MS = 60 * 60 * 1000
 /** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
 export const TURN_SILENCE_MS = 90_000
 
-/**
- * How much advisory room context is carried forward and attached to the next owner
- * command. Per tier (owner-ambient and everyone-else are budgeted separately so a
- * noisy room can never starve out the owner's own untargeted messages, which are the
- * higher-signal tier). Newest wins: when the budget is exceeded the OLDEST context is
- * dropped, and the count of what was dropped is reported to the model rather than
- * silently hidden.
- */
-const ADVISORY_CARRY_MAX_COUNT = 20
-const ADVISORY_CARRY_MAX_CHARS = 12_000
-
-function turnMarkerPath(connectionId) {
-  return path.join(CONNECTIONS_DIR, `${connectionId}.turn`)
+function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
+  return path.join(dir, `${connectionId}.turn`)
 }
-function readTurnMarker(connectionId) {
+function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   try {
-    const p = turnMarkerPath(connectionId)
+    const p = turnMarkerPath(connectionId, dir)
     if (!fs.existsSync(p)) return null
     const m = JSON.parse(fs.readFileSync(p, 'utf8'))
     return typeof m?.startedAt === 'number' ? m : null
@@ -193,16 +222,29 @@ function readTurnMarker(connectionId) {
 }
 /**
  * Start a turn at honest canonical-command or explicit-automation pickup.
- * The long-lived poller re-asserts busy while this marker is fresh; Stop /
+ * The long-lived poller re-asserts busy while this marker is live; Stop /
  * mirror-turn clears it when the agent turn ends.
  */
-function writeTurnMarker(connectionId) {
+function writeTurnMarker(
+  connectionId,
+  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR } = {},
+) {
   if (!connectionId) return
+  const existing = readTurnMarker(connectionId, dir)
+  const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
+  const startedAt = live ? existing.startedAt : Date.now()
+  const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
   try {
-    fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(turnMarkerPath(connectionId), JSON.stringify({ startedAt: Date.now() }), {
-      mode: 0o600,
-    })
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      turnMarkerPath(connectionId, dir),
+      JSON.stringify({
+        startedAt,
+        ...(held ? { held: true } : {}),
+        ...(keepRemote ? { remoteTurn: true } : {}),
+      }),
+      { mode: 0o600 },
+    )
   } catch {
     /* non-fatal — immediate busy heartbeat at call site still fires */
   }
@@ -213,6 +255,11 @@ export function handleKeepaliveRejection(errorMessage, connectionId, io = {}) {
   if (/no working attempt|not working/i.test(errorMessage || '')) {
     try {
       rmSync(turnMarkerPath(connectionId), { force: true })
+    } catch {
+      /* ignore */
+    }
+    try {
+      rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
     } catch {
       /* ignore */
     }
@@ -234,6 +281,11 @@ function clearTurnMarker(connectionId) {
   if (!connectionId) return
   try {
     fs.rmSync(turnMarkerPath(connectionId), { force: true })
+  } catch {
+    /* non-fatal */
+  }
+  try {
+    fs.rmSync(turnActivityPath(connectionId, CONNECTIONS_DIR), { force: true })
   } catch {
     /* non-fatal */
   }
@@ -358,7 +410,7 @@ function appendInbox(
   messages,
   {
     type = 'owner_messages', nextCursor = null, sessionId = null, context = null,
-    ingress = null, acceptanceKey = null,
+    ingress = null, acceptanceKey = null, instructionContextFile = null, wakeContext = null,
   } = {},
 ) {
   if (!connectionId || !messages?.length) return { ok: false, duplicate: false }
@@ -371,6 +423,10 @@ function appendInbox(
     next_after_message_id: nextCursor,
     ...(context ? { context } : {}),
     ...(ingress ? { ingress } : {}),
+    ...(wakeContext ? { wake_context: wakeContext } : {}),
+    // Adapter metadata stays outside the exact-key canonical context schema:
+    // older wait processes can ignore it without dropping the command on upgrade.
+    ...(instructionContextFile ? {instruction_context_file:instructionContextFile} : {}),
     messages,
   }
   if (acceptanceKey) {
@@ -390,6 +446,18 @@ function appendInbox(
   }
 }
 
+export function disabledStatePatch(reason) {
+  return {
+    enabled: false,
+    // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
+    // this poller's own legacy label. Both must set the flag, or a genuine UI
+    // End would stop stamping it the moment the server started telling the
+    // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
+    ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
+    end_reason: reason,
+  }
+}
+
 /** Disable THIS connection only — never other remotes on the machine. */
 function disableLocalState({ connectionId, reason }) {
   clearConnectionCapability(connectionId)
@@ -398,14 +466,8 @@ function disableLocalState({ connectionId, reason }) {
     writeState(
       {
         ...prev,
-        enabled: false,
+        ...disabledStatePatch(reason),
         connection_id: connectionId || prev.connection_id,
-        // The server's real word for an Agents-page End is 'ui'; 'ended_from_ui' is
-        // this poller's own legacy label. Both must set the flag, or a genuine UI
-        // End would stop stamping it the moment the server started telling the
-        // truth (brief e691c68a) — and devspec-remote-wait.mjs:533 reads this flag.
-        ended_from_ui: reason === 'ui' || reason === 'ended_from_ui',
-        end_reason: reason,
         updated_at: new Date().toISOString(),
       },
       connectionId,
@@ -430,39 +492,88 @@ export function cadenceFor({ attached = false, turnActive = false } = {}) {
 }
 
 /**
- * Trim an advisory carry buffer to its budget, newest-first.
- *
- * The buffer exists because a long-poll answers the instant anything lands, so room
- * context and the command that needs it almost never arrive in the same response.
- * Dropping is by AGE (oldest first) because the messages nearest the command are the
- * ones it is most likely to refer to, and a single over-budget message is kept rather
- * than discarded — an owner pasting one huge message must not silently vanish.
- *
- * @returns {{ kept: any[], dropped: number }}
+ * Which parts of the room state file moved since the last command was told about
+ * them (items b1e26146, 7fe8e3d1).
  */
-export function trimAdvisoryCarry(
-  list,
-  { maxCount = ADVISORY_CARRY_MAX_COUNT, maxChars = ADVISORY_CARRY_MAX_CHARS } = {},
-) {
-  const items = Array.isArray(list) ? list : []
-  const kept = []
-  let chars = 0
-  for (let i = items.length - 1; i >= 0 && kept.length < maxCount; i--) {
-    const m = items[i]
-    const size = typeof m?.content === 'string' ? m.content.length : 0
-    if (kept.length > 0 && chars + size > maxChars) break
-    chars += size
-    kept.push(m)
+export function roomChangesSince(res, activity, seen = {}) {
+  const plans = res?.ingress?.active_session_plans
+  const current = {
+    session_polls: isSessionPollsProjection(res?.session_polls) ? JSON.stringify(res.session_polls) : null,
+    still_to_discuss: isStillToDiscussProjectionV1(res?.still_to_discuss) ? JSON.stringify(res.still_to_discuss) : null,
+    active_session_plans: isActiveSessionPlansProjectionV1(plans) ? JSON.stringify(plans) : null,
+    session_activity: activity ? JSON.stringify({ items: activity.items, events: activity.events.length }) : null,
   }
-  kept.reverse()
-  return { kept, dropped: items.length - kept.length }
+  return {
+    changed: Object.keys(current).filter((section) => current[section] !== (seen[section] ?? null)),
+    seen: current,
+  }
+}
+
+/**
+ * The pointers a command's wake carries (item 7fe8e3d1).
+ */
+export function commandWakeContext(store, ingress, { connectionId, roomChanged = [], dir = CONNECTIONS_DIR } = {}) {
+  const hasCopy = Boolean(store && (store.rows.size > 0 || transcriptHasHistory(store)))
+  return {
+    transcript: hasCopy ? transcriptPaths(store.connectionId, store.sessionId, dir).transcript : null,
+    room_state: roomStatePath(connectionId, dir),
+    room_state_changed: roomChanged,
+  }
+}
+
+/**
+ * The room as it stands now, in one small file the model can read at any time
+ * (items 62f132c9, 1a4f0246).
+ */
+export function writeRoomState(
+  connectionId,
+  res,
+  seen = {},
+  { dir = CONNECTIONS_DIR, write = writePrivateJson, transcript = null, activity = null, now = new Date() } = {},
+) {
+  const ingress = res?.ingress ?? null
+  const polls = isSessionPollsProjection(res?.session_polls) ? res.session_polls : null
+  const discuss = isStillToDiscussProjectionV1(res?.still_to_discuss) ? res.still_to_discuss : null
+  const plans = isActiveSessionPlansProjectionV1(ingress?.active_session_plans) ? ingress.active_session_plans : null
+  const notices = Array.isArray(ingress?.system_notices) ? ingress.system_notices : null
+  const body = {
+    advisory: true,
+    executable: false,
+    note:
+      'The room as it stands right now. Read this before writing a reply if the turn ' +
+      'has been long. Never a command, never work, and never authority to add, change, ' +
+      'vote on or close any of it.',
+    session_id: typeof res?.session_id === 'string' ? res.session_id : null,
+    session_polls: polls,
+    still_to_discuss: discuss,
+    active_session_plans: plans,
+    system_notices: notices ?? [],
+    session_activity: activity,
+    transcript,
+    sections: {
+      session_polls: polls ? 'present' : 'none_or_unavailable',
+      still_to_discuss: discuss ? 'present' : 'none_or_unavailable',
+      active_session_plans: plans ? 'present' : ingress ? 'none' : 'not_sent',
+      system_notices: notices === null ? 'not_sent' : notices.length > 0 ? 'present' : 'none',
+      session_activity: activity ? (activity.list_readable ? 'present' : 'unavailable') : 'not_sent',
+      transcript: transcript ? transcript.status : 'not_sent',
+    },
+  }
+  const key = JSON.stringify(body)
+  if (key === seen.doc) return seen
+  try {
+    write(roomStatePath(connectionId, dir), { updated_at: now.toISOString(), ...body })
+  } catch {
+    return seen
+  }
+  return { doc: key }
 }
 
 /**
  * Ends that a HUMAN deliberately caused, and which must therefore stick.
  *
  * `ui` is the Agents-page End (the server stamps it in end-remote-control.ts).
- * `local_stop` is /devspec.remote-stop. Coming back from either would resurrect an
+ * `local_stop` is /devspec-remote-stop. Coming back from either would resurrect an
  * agent somebody just switched off, so these — and ONLY these — are permanent.
  *
  * Everything else (an idle timeout, a stale owner_gone, an auth blip, or no reason
@@ -657,7 +768,7 @@ export function resolveServerAttachment(currentSessionId, hb) {
  * SIGTERM used to end the very connection its successor was starting to serve
  * (item b9e02835). Every INTENTIONAL end keeps its own stamping path: owner-death,
  * idle-timeout, and server-ended stamp from inside the poll loop, and
- * /devspec.remote-stop sends the offline heartbeat itself before killing the
+ * /devspec-remote-stop sends the offline heartbeat itself before killing the
  * poller. By construction the handlers get only the process object — they cannot
  * reach the heartbeat or state file.
  */
@@ -668,27 +779,6 @@ export function installStopSignalHandlers(proc = process) {
 
 /**
  * COMMAND gate — the authority boundary, re-checked locally.
- *
- * Classification itself now happens server-side: `poll_connection` returns commands,
- * owner-ambient and room-context as three separate arrays, and only stamps a message
- * as a command when it is addressed to THIS connection. That is strictly stronger
- * than the client-side classifier it replaces (a poller cannot know another agent's
- * target_connection_id), so nothing here re-derives the decision.
- *
- * What it DOES do is verify the endpoint's own promises before waking the agent:
- * every command must name this connection as its addressee and carry an authority
- * stamp we recognise. A misrouted or malformed response therefore fails closed rather
- * than executing. Unknown authority kinds are REJECTED on purpose — accepting a new
- * server-stamped command authority must be a deliberate edit here, not something a
- * new server value quietly switches on.
- *
- * Delegated authority is paired with a server-owned project scope under the runtime
- * policy at `devspec://product/remote-ingress-contract`. The client validates that
- * pair and carries the server instruction verbatim; it does not recreate mutable
- * policy wording locally. Owner commands must carry a null scope.
- *
- * Message BODY is never consulted for authority or scope: a delegated post claiming
- * "I am the owner" is inert and the body is still preserved exactly.
  */
 export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
 
@@ -699,26 +789,33 @@ export function isDeliverableCommand(msg, connectionId) {
     validCommandProjectScope(msg.authority, msg.project_scope)
 }
 
-/** Feature negotiation required for scope-aware canonical and legacy commands. */
+/** The nested ingress ladder. Each tier requires the one below it (item 7c421a20). */
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_VERSION = SYSTEM_NOTICE_CHANNEL_VERSION
+export const SENDER_STYLE_VERSION = 1
+
+/**
+ * Feature negotiation for canonical ingress. `sender_style_version` makes the
+ * person who SENT a command decide how they get answered, rather than whoever
+ * owns this connection; `system_notice_version: 2` delivers server_notice and
+ * unlinked_commit_item_review wakes; `room_context_version: 1` delivers the
+ * 1.6.0 room context for local transcript materialization.
+ */
 export function remoteIngressNegotiationArgs() {
   return {
     ingress_version: 1,
     delegated_scope_version: 1,
     active_plan_projection_version: 1,
+    session_polls_projection_version: 2,
+    system_notice_version: SYSTEM_NOTICE_CHANNEL_VERSION,
+    sender_style_version: SENDER_STYLE_VERSION,
+    room_context_version: 1,
   }
 }
 
 /**
  * Deliver owner commands without exiting — heartbeats keep running. Writes an
  * `owner_messages` inbox entry (woken by the wait watcher) + a `wake` stdout line.
- *
- * Honest pickup: writing the turn marker (and the caller's immediate busy
- * heartbeat) flips UI pending → working the moment the command lands here —
- * not when/if a UserPromptSubmit hook fires. Remote phone/web wakes never go
- * through that hook; this is the one reliable pickup signal.
- *
- * When attached (`sessionId`), also seeds phase=trail "Working…" before the
- * wake so the live bubble opens without relying on Cursor's user_prompt hook.
  */
 async function deliverOwnerMessages(
   connectionId,
@@ -728,11 +825,13 @@ async function deliverOwnerMessages(
   sessionId,
   context = null,
   ingress = null,
+  instructionContextFile = null,
+  wakeContext = null,
 ) {
   // The durable inbox is the wake payload source. Stable turn identity makes replay
   // after an append-before-cursor crash a no-op rather than a second execution.
   const accepted = appendInbox(connectionId, ownerMsgs, {
-    type: 'owner_messages', nextCursor, sessionId, context, ingress,
+    type: 'owner_messages', nextCursor, sessionId, context, ingress, instructionContextFile, wakeContext,
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
@@ -742,7 +841,6 @@ async function deliverOwnerMessages(
     ingress,
   }
   const acceptedMessages = acceptedRecord.messages
-  const acceptedContext = acceptedRecord.context
 
   // Open the Working trail only after first durable acceptance (attached only).
   if (sessionId) {
@@ -763,9 +861,6 @@ async function deliverOwnerMessages(
         `devspec-remote-poll: trail seed failed: ${e instanceof Error ? e.message : String(e)}\n`,
       )
     }
-  }
-  if (acceptedContext) {
-    process.stdout.write(JSON.stringify({ type: 'model_context', session_id: sessionId, ...acceptedContext }) + '\n')
   }
   for (const m of acceptedMessages) {
     process.stdout.write(JSON.stringify({ type: 'owner_message', message: m }) + '\n')
@@ -812,10 +907,72 @@ async function deliverOwnerMessages(
   return { ok: true, duplicate: false }
 }
 
-async function deliverAutomationDispatches(connectionId, dispatches, nextDispatchCursor, sessionId) {
+export async function deliverSystemNotices(
+  connectionId,
+  systemNotices,
+  nextCursor,
+  sessionId,
+  ingress = null,
+  wakeContext = null,
+) {
+  const notices = Array.isArray(systemNotices) ? systemNotices : []
+  if (!connectionId || notices.length === 0 || !ingress?.envelope) {
+    return { ok: false, duplicate: false }
+  }
+  const envelope = ingress.envelope
+  const executeNoticeIds = notices.map((notice) => notice.notice_id)
+  const record = {
+    type: 'canonical_system_notices',
+    connection_id: connectionId,
+    session_id: sessionId,
+    received_at: new Date().toISOString(),
+    count: notices.length,
+    next_after_message_id: nextCursor,
+    authoritative_source: REMOTE_INGRESS_RESOURCE_URI,
+    execute_notice_ids: executeNoticeIds,
+    ingress,
+    ...(wakeContext ? { wake_context: wakeContext } : {}),
+    messages: notices,
+  }
+  const accepted = appendAcceptedJsonl(
+    inboxPathForConnection(connectionId),
+    record,
+    canonicalAcceptanceKey(envelope),
+  )
+  if (!accepted.ok || accepted.duplicate) return accepted
+  for (const notice of notices) {
+    process.stdout.write(JSON.stringify({ type: 'system_notice', kind: notice.kind, notice_id: notice.notice_id, notice }) + '\n')
+  }
+  process.stdout.write(
+    JSON.stringify({
+      type: 'wake',
+      reason: 'exact_connection_system_notice',
+      count: notices.length,
+      next_cursor: nextCursor,
+      inbox: inboxPathForConnection(connectionId),
+      continuous: true,
+    }) + '\n',
+  )
+  return { ok: true, duplicate: false, executeNoticeIds }
+}
+
+export async function deliverAutomationDispatches(
+  connectionId,
+  dispatches,
+  nextDispatchCursor,
+  sessionId,
+  {
+    dir = CONNECTIONS_DIR,
+    ensureWatch = ensureCliTrailWatch,
+    seedFn = seedWorkTrailForConnection,
+    appendInboxFn = appendInbox,
+    readStateFn = readState,
+    emit = (line) => process.stdout.write(line),
+  } = {},
+) {
   let acceptedCount = 0
   for (const dispatch of dispatches) {
-    const accepted = appendInbox(connectionId, [dispatch], {
+    const accepted = appendInboxFn(connectionId, [dispatch], {
       type: 'automation_dispatches',
       nextCursor: nextDispatchCursor,
       sessionId,
@@ -824,27 +981,25 @@ async function deliverAutomationDispatches(connectionId, dispatches, nextDispatc
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
       acceptedCount++
-      process.stdout.write(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
+      emit(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
     }
   }
   if (acceptedCount === 0) return { ok: true, acceptedCount: 0 }
 
   if (sessionId) {
     try {
-      const s = readState(connectionId) || {}
+      const s = readStateFn(connectionId) || {}
       const token = s.token || s.mcp_token || null
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
-        await seedWorkTrailForConnection({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
+        await seedFn({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
       }
     } catch (error) {
       process.stderr.write(`devspec-remote-poll: automation trail seed failed: ${error instanceof Error ? error.message : String(error)}\n`)
     }
   }
-  writeTurnMarker(connectionId)
-  if (sessionId) {
-    try { ensureCliTrailWatch({ connectionId }) } catch { /* best effort */ }
-  }
+  writeTurnMarker(connectionId, { remoteTurn: true, dir })
+  try { ensureWatch({ connectionId, dir }) } catch { /* best effort */ }
   return { ok: true, acceptedCount }
 }
 
@@ -1087,6 +1242,10 @@ async function main() {
   let lastBusySent = null
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
+  let roomAnnounced = {}
+  let roomFileSeen = {}
+  let transcriptStore = sessionId ? loadTranscriptStore(connectionId, sessionId) : null
+  let redrainRequested = false
   // Directed-question answer lane (item b9f2c77a). The open continuation lives in state
   // too, so the question bridge and the turn hook find the same one. The ACK rides the
   // NEXT poll, which happens immediately: delivery continues straight back into the loop.
@@ -1110,7 +1269,7 @@ async function main() {
   // --- THE tick: heartbeat + canonical ingress + independent automations ---------
   // Exact-target command authority is enforced server-side and revalidated against
   // the canonical envelope here. That is what stops one agent acting on another's
-  // command [devspec:3e76a6cc]; action-item work never enters this response.
+  // command [devspec:3e76a6cc]; task work never enters this response.
   async function pollOnce({ waitMs, busy, checkTier, catchUp = false }) {
     // Directed-question answers are an independent lane, negotiated only while this
     // connection holds the capability the claim, the ACK and the continuation start
@@ -1120,6 +1279,7 @@ async function main() {
     const interactionArgs = interactionNegotiationArgs({ capability, sessionId })
     const negotiatesInteraction = Object.keys(interactionArgs).length > 0
     const ack = negotiatesInteraction ? pendingInteractionAck : null
+    const tierState = readState(connectionId)
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -1129,6 +1289,10 @@ async function main() {
         connection_id: connectionId,
         agent_name: agentName,
         ...remoteIngressNegotiationArgs(),
+        ...(transcriptStore ? transcriptPollArguments(transcriptStore) : {}),
+        ...(tierState?.instruction_tiers_version === 1 && typeof tierState.instruction_tiers_hash === 'string' ? {
+          known_instruction_tiers_version: 1, known_instruction_tiers_hash: tierState.instruction_tiers_hash,
+        } : {}),
         ...interactionArgs,
         ...(ack ? questionEventAckArgs(ack) : {}),
         wait_ms: waitMs,
@@ -1142,6 +1306,8 @@ async function main() {
         }),
         ...(busy !== null && busy !== undefined ? { busy } : {}),
         ...(checkTier ? { check_tier: checkTier } : {}),
+        // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
+        ...agentStatsArgs(connectionId),
       },
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
@@ -1368,6 +1534,33 @@ async function main() {
     return { lane: true, delivered }
   }
 
+  async function openCommandRequests(commands) {
+    const connectionCapability = readConnectionCapability(connectionId)
+    if (!connectionCapability) return
+    const call = (args) => mcpToolsCall({
+      mcpUrl,
+      token,
+      connectionCapability,
+      name: 'report_request',
+      arguments: args,
+      timeoutMs: 5_000,
+    })
+    for (const command of Array.isArray(commands) ? commands : []) {
+      try {
+        await openRequest({
+          connectionId,
+          kind: 'command',
+          provenanceRef: command?.delivery?.provenance_ref,
+          messageId: command?.message_id,
+          call,
+          dir: CONNECTIONS_DIR,
+        })
+      } catch {
+        /* an unopened request changes nothing that worked before */
+      }
+    }
+  }
+
   let lastIngressAccepted = false
 
   /** Accept one server response atomically across canonical, automation, control and cursor lanes. */
@@ -1385,6 +1578,10 @@ async function main() {
       { drainingCatchUp },
     )
     if (!accepted.changed) {
+      if (needsSeed && transcriptStore?.backfill.draining) {
+        completeEmptyDrain(transcriptStore)
+        persistTranscriptStore(transcriptStore)
+      }
       liveCursorV2 = advancedCursors.liveCursorV2
       legacyCursor = advancedCursors.legacyCursor
       catchUpCursor = advancedCursors.catchUpCursor
@@ -1401,10 +1598,61 @@ async function main() {
     }
 
     const envelope = accepted.envelope
-    if (envelope.contract_version === '1.3.0') {
-      // Under negotiated 1.3 absence authoritatively means the attached room has no
-      // active plans. Older accepted tiers do not carry that assertion, so they do
-      // not erase a previously observed projection.
+    const drainPoll = Boolean(needsSeed || drainingCatchUp)
+    const activeSessionForRoom =
+      typeof res?.session_id === 'string' && res.session_id ? res.session_id : sessionId
+
+    // Materialize the local transcript FIRST, then the room state file, then the inbox
+    // record, then the cursor (items 1a4f0246, 7fe8e3d1).
+    if (transcriptStore && activeSessionForRoom) {
+      const applied = applyIngressToStore(transcriptStore, envelope, {
+        sessionId: activeSessionForRoom,
+        drainPoll,
+      })
+      if (applied.applied) {
+        observeSessionActivity(
+          transcriptStore,
+          isSessionActivityV1(envelope.session_activity) ? envelope.session_activity : null,
+        )
+        observeSessionEvents(
+          transcriptStore,
+          isSessionEventsV1(envelope.session_events) ? envelope.session_events : null,
+        )
+        if (!persistTranscriptStore(transcriptStore)) {
+          process.stderr.write(
+            'devspec-remote-poll: transcript write failed; the copy is marked incomplete\n',
+          )
+        }
+        if (takePendingRedrain(transcriptStore)) {
+          process.stderr.write(
+            'devspec-remote-poll: transcript disagrees with the room; re-reading its history\n',
+          )
+          redrainRequested = true
+        }
+      }
+    }
+    const activity = sessionActivityView(transcriptStore)
+    roomFileSeen = writeRoomState(
+      connectionId,
+      { ...res, session_id: activeSessionForRoom ?? null },
+      roomFileSeen,
+      {
+        transcript: transcriptSummary(transcriptStore),
+        activity,
+      },
+    )
+    const roomChanges = accepted.canonicalWake ? roomChangesSince(res, activity, roomAnnounced) : null
+    const wakeContext = accepted.canonicalWake
+      ? commandWakeContext(transcriptStore, envelope, {
+          connectionId,
+          roomChanged: roomChanges?.changed ?? [],
+        })
+      : null
+
+    if (ACTIVE_PLAN_ASSERTION_CONTRACT_VERSIONS.has(envelope.contract_version)) {
+      // Under negotiated 1.3+ absence authoritatively means the attached room has
+      // no active plans. Older accepted tiers do not carry that assertion, so they
+      // do not erase a previously observed projection.
       activeSessionPlans = envelope.active_session_plans ?? null
     }
     const transportProgress =
@@ -1415,8 +1663,26 @@ async function main() {
     const nextCarry = mergeCanonicalContextCarry(canonicalCarry, envelope)
     const ingress = { canonical: true, envelope }
     let newlyDelivered = false
+    let instructionContextFile = null
+    let instructionContextDelivered = false
 
-    if (accepted.canonicalWake) {
+    if (accepted.canonicalWake && envelope.wake.kind === 'system_notice') {
+      ensureHostWakeFollow(connectionId, ownerAnchor)
+      const delivered = await deliverSystemNotices(
+        connectionId,
+        envelope.system_notices,
+        accepted.liveCursorV2,
+        sessionId,
+        ingress,
+        wakeContext,
+      )
+      if (!delivered.ok) return false
+      if (roomChanges) roomAnnounced = roomChanges.seen
+      newlyDelivered ||= !delivered.duplicate
+      canonicalCarry = nextCarry
+    } else if (accepted.canonicalWake) {
+      instructionContextFile = refreshRepositoryRules(readState(connectionId)?.local_id, res)
+      await openCommandRequests(envelope.commands)
       const context = {
         advisory: true,
         typed: nextCarry.context,
@@ -1455,8 +1721,12 @@ async function main() {
         sessionId,
         context,
         ingress,
+        instructionContextFile,
+        wakeContext,
       )
       if (!delivered.ok) return false
+      if (roomChanges) roomAnnounced = roomChanges.seen
+      instructionContextDelivered = Boolean(!delivered.duplicate && instructionContextFile)
       newlyDelivered ||= !delivered.duplicate
       // Do NOT append a thin `{ type: owner_message, count }` wake here (item 9ed0d42e).
       // Host wake-follow (`devspec-remote-wait --follow --wake-file`) owns the wake file
@@ -1535,11 +1805,14 @@ async function main() {
       ingress_envelope_id: envelope.envelope_id,
       ingress_window: envelope.window,
       ingress_context_carry: canonicalCarry,
+      ...(instructionContextDelivered && res.instruction_tiers_version === 1 && typeof res.instruction_tiers_hash === 'string' ? {
+        instruction_tiers_version: 1, instruction_tiers_hash: res.instruction_tiers_hash,
+      } : {}),
       active_session_plans: activeSessionPlans,
       ingress_continuation: {
         truncated: envelope.window.truncated,
         has_more: envelope.window.has_more,
-        catch_up_cursor: envelope.window.next_cursor,
+        catch_up_cursor: catchUpCursor,
         fetch_id: envelope.window.fetch_id,
         omission_reason: envelope.window.omission_reason,
       },
@@ -1569,6 +1842,12 @@ async function main() {
   // Consecutive teardowns the server would not attribute to a person. Reset by any
   // clean poll, so only a SUSTAINED absence stands the poller down (brief e691c68a).
   let consecutiveRecoverableEnds = 0
+  let sawLive = Boolean(
+    state &&
+      state.enabled !== false &&
+      state.ended_from_ui !== true &&
+      state.end_reason !== 'ui',
+  )
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1608,11 +1887,50 @@ async function main() {
       return
     }
 
-    // Agent-authoritative "working": re-assert busy while a fresh turn marker exists.
-    const marker = readTurnMarker(connectionId)
+    // Agent-authoritative "working": re-assert busy while the turn is live. Live is what
+    // Cursor shows (held for this command's own background work, or a tool call /
+    // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
+    let marker = readTurnMarker(connectionId)
+    const erroredEnd = marker
+      ? erroredTurnEnd({
+          transcriptPath: resolveAgentTranscriptPath(liveState?.local_id),
+          startedAt: marker.startedAt,
+        })
+      : null
+    if (erroredEnd) {
+      // Cursor ended the turn itself (usage limit, provider error): no Stop hook ran and
+      // the model cannot reply, so say so in the room and close the working attempt now
+      // rather than after the 1h no-sign-of-life backstop (item 45eb0708).
+      if (sessionId) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'post_session_message',
+            arguments: {
+              connection_id: connectionId,
+              message: erroredTurnNotice(erroredEnd),
+              agent_name: agentName,
+              turn_kind: 'agent',
+              phase: 'answer',
+            },
+            timeoutMs: 10_000,
+          })
+        } catch (e) {
+          process.stderr.write(`devspec-remote-poll: errored-turn notice failed: ${e.message}\n`)
+        }
+      }
+      await emitActivityVerb('complete', extraActivityVerbArgs({ stalling: true, verb: 'complete' }))
+      clearTurnMarker(connectionId)
+      prevTurnActive = false
+      marker = null
+      process.stderr.write(`devspec-remote-poll: turn ended with a Cursor error connection=${connectionId}\n`)
+    }
+    const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
-    let turnActive = !!marker && turnElapsed < MAX_TURN_MS
-    if (marker && turnElapsed >= MAX_TURN_MS && prevTurnActive) {
+    let turnActive = turnIsLive(marker, { activity })
+    const stalling = !!(marker && !turnActive && prevTurnActive)
+    if (stalling) {
       logRemoteControlStory({
         phase: 'stall',
         outcome: 'stalled',
@@ -1621,10 +1939,9 @@ async function main() {
         agent: AGENT_NAME,
         tool: 'turn_marker',
         reason: 'max_turn_ms',
-        data: { elapsed_ms: turnElapsed, max_turn_ms: MAX_TURN_MS },
+        data: { elapsed_ms: turnElapsed, no_sign_of_life_ms: NO_SIGN_OF_LIFE_MS },
       })
     }
-    const stalling = !!(marker && turnElapsed >= MAX_TURN_MS && prevTurnActive)
 
     // ADDITIVE (item 71a8b201): emit the connection activity verb DIRECTLY off the
     // turn-active transition (pickup / keepalive / complete). This is ON TOP of the
@@ -1656,6 +1973,15 @@ async function main() {
       patchState({ check_tier: tier.tier })
     }
 
+    if (redrainRequested) {
+      redrainRequested = false
+      catchUpCursor = null
+      needsSeed = true
+    }
+    if (needsSeed && transcriptStore && !transcriptStore.backfill.draining) {
+      beginDrain(transcriptStore)
+    }
+
     // --- ONE held call: heartbeat + dispatches + room, in one response ---------
     let res = null
     const drainingCatchUp = Boolean(catchUpCursor)
@@ -1684,6 +2010,13 @@ async function main() {
         )
         await offlineAndExit('owner_gone', 1)
         return
+      }
+      if (catchUpCursor && isCatchUpCursorRefusal(e)) {
+        process.stderr.write('devspec-remote-poll: server refused the catch-up cursor; re-reading the room\n')
+        catchUpCursor = null
+        needsSeed = true
+        patchState({ ingress_catch_up_cursor: null })
+        continue
       }
       consecutiveErrors++
       const rateLimited = /rate limit/i.test(e?.message || '')
@@ -1750,6 +2083,15 @@ async function main() {
       // must stick — item 32e423fb exists so a UI End stops a zombie poller.
       const reason = terminal.reason || 'ended_from_ui'
       disableLocalState({ connectionId, reason })
+      const disabledState = readState(connectionId) || {
+        ...(liveState || {}),
+        ...disabledStatePatch(reason),
+      }
+      closeCursorOnEnd({
+        state: disabledState,
+        sawLive,
+        ownerPid: ownerAnchor,
+      })
       process.stdout.write(
         JSON.stringify({
           type: 'session_ended',
@@ -1764,6 +2106,7 @@ async function main() {
     }
     // A clean poll clears the recoverable streak — a blip that resolves is over.
     consecutiveRecoverableEnds = 0
+    sawLive = true
 
     // Server-authoritative attachment — still the SOLE adoption path, now sourced
     // from the poll response's `session_id` (read from the markers, so it is the
@@ -1782,6 +2125,10 @@ async function main() {
       needsSeed = true
       canonicalCarry = emptyCanonicalContextCarry()
       activeSessionPlans = null
+      roomAnnounced = {}
+      roomFileSeen = {}
+      redrainRequested = false
+      transcriptStore = sessionId ? loadTranscriptStore(connectionId, sessionId) : null
       patchState({
         session_id: sessionId,
         ingress_cursor_v2: null,
@@ -1789,8 +2136,23 @@ async function main() {
         ingress_catch_up_cursor: null,
         ingress_context_carry: canonicalCarry,
         active_session_plans: null,
+        speech_attachment_id: null,
+        attached_at: null,
       })
       continue
+    }
+
+    // The prompt hook admits the owner's terminal turns against this exact
+    // attachment (item b59a201c, local-turn.mjs). Compared with the FILE rather than
+    // memory, so a record lost to a concurrent hook write is put back on the next poll.
+    const attachmentRecord = attachmentFromPoll(res)
+    const recorded = readState(connectionId)
+    if (
+      recorded &&
+      ((recorded.speech_attachment_id ?? null) !== attachmentRecord.speech_attachment_id ||
+        (recorded.attached_at ?? null) !== attachmentRecord.attached_at)
+    ) {
+      patchState(attachmentRecord)
     }
 
     // Directed-question answers first: an event-only response deliberately carries no

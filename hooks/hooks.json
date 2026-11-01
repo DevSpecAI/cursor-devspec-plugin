@@ -1,12 +1,24 @@
 {
   "version": 1,
-  "description": "DevSpec commit-provenance assistance plus remote-control turn mirroring and work-trail hooks. Cursor's own hook schema: flat per-event arrays and Cursor event names. The extension merges this fragment into ~/.cursor/hooks.json on activate.",
+  "description": "DevSpec commit-provenance assistance (a git stand-in put first on PATH by a one-line prefix on each Shell command of a connected conversation, which tags, checks and reports the agent's commits from git itself) plus remote-control turn mirroring and work-trail hooks. Cursor CLI loads this file from the installed plugin (CLAUDE_PLUGIN_ROOT); there is no IDE extension activate() merge into ~/.cursor/hooks.json.",
   "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\" start",
+        "timeout": 5
+      }
+    ],
     "stop": [
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" stop",
         "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; break; fi; done; exit 0",
+        "timeout": 15
       }
     ],
     "beforeSubmitPrompt": [
@@ -19,15 +31,84 @@
     "preToolUse": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" pre",
+        "matcher": "^(MCP:devspec__.+|devspec__.+|(mcp__(plugin_devspec_)?devspec__|devspec\\.)?(register_connection|attach_connection))$",
+        "failClosed": true,
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/launch-guard.mjs\"",
+        "matcher": "^(Bash|Shell|Agent|Task|Workflow|Monitor|ScheduleWakeup|CronCreate)$",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" preToolUse",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" preToolUse",
         "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-observation.mjs\" pre",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
       }
     ],
     "postToolUse": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\"",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" background_launch",
+        "matcher": "^(Bash|Shell|Agent|Task|Workflow|Monitor|ScheduleWakeup|CronCreate)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" postToolUse",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" postToolUse",
         "timeout": 30
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-observation.mjs\" post",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; break; fi; done; exit 0",
+        "timeout": 15
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *remote*|*'repo create'*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\" ;; esac; exit 0",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
+        "matcher": "^(Bash|Shell)$",
+        "timeout": 10
+      },
+      {
+        "type": "command",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
+        "matcher": "^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$",
+        "timeout": 10
       },
       {
         "type": "command",
@@ -38,9 +119,24 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
         "timeout": 15
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/room-unread.mjs\" post-tool",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "for f in \"$HOME\"/.devspec/remote-control/connections/*.turn; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-liveness.mjs\" touch; break; fi; done; exit 0",
+        "timeout": 5
       }
     ],
     "postToolUseFailure": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" postToolUseFailure",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" postToolUseFailure",
@@ -50,6 +146,11 @@
     "afterShellExecution": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" afterShellExecution",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterShellExecution",
         "timeout": 30
       }
@@ -57,11 +158,26 @@
     "beforeShellExecution": [
       {
         "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" beforeShellExecution",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeShellExecution",
         "timeout": 30
       }
     ],
     "afterMCPExecution": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" after",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" afterMCPExecution",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/provenance-assistance.mjs\" afterMCPExecution",
@@ -79,6 +195,16 @@
       }
     ],
     "beforeMCPExecution": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/project-input.mjs\" before",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-tool-timing.mjs\" beforeMCPExecution",
+        "timeout": 5
+      },
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" beforeMCPExecution",

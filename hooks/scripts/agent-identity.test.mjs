@@ -15,7 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
-import { AGENT_NAME } from './agent-identity.mjs'
+import { AGENT_NAME, PLUGIN_ID } from './agent-identity.mjs'
 
 /** This repo's plugin. Changing this line is changing which plugin this is. */
 const OWN_NAME = 'Cursor'
@@ -37,6 +37,10 @@ function siblingScripts() {
 describe('AGENT_NAME', () => {
   it('is this plugin, not another one', () => {
     assert.equal(AGENT_NAME, OWN_NAME)
+  })
+
+  it("identifies to DevSpec as DevSpec's provider id for Cursor", () => {
+    assert.equal(PLUGIN_ID, 'cursor')
   })
 
   it('is a non-empty, untrimmed-clean string', () => {

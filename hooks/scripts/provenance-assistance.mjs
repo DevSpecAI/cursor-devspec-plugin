@@ -6,6 +6,11 @@
  * input. That is the only enforcement surface used here. File edits are never
  * denied, arbitrary shell is never classified, and every opaque/unsupported
  * commit form fails open to DevSpec ingestion and analyzer recovery.
+ *
+ * While the conversation is connected (outside native Windows), the same hook puts
+ * the git stand-in line in front of every Shell command (git-observer.mjs), and the
+ * stand-in tags or stops commits from git's own arguments; the command-text tagging
+ * here then only applies where the stand-in does not.
  */
 
 import crypto from 'node:crypto'
@@ -16,6 +21,8 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { readProjectContext, isDevspecServer } from './project-context.mjs'
+import { prepareStandIn } from './git-observer.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -31,15 +38,26 @@ const HISTORY_OPTIONS = ['--amend', '--reuse-message', '--reedit-message', '--fi
 const MESSAGE_SOURCE_OPTIONS = ['--message', '--file', '--template']
 const CURSOR_COAUTHOR_TRAILER = 'Co-authored-by: Cursor <cursoragent@cursor.com>'
 
-export const AMBIGUOUS_REFERENCE_MESSAGE =
-  'DevSpec commit provenance: this readable commit message has malformed or multiple DevSpec references. Keep exactly one full [devspec:<uuid>] reference and retry. Nothing else is blocked.'
+// A commit may name several items (DevSpec decision ee4102eb, contract 4.13.0,
+// item 96f3dfb7): only a malformed marker is refused, never a second reference.
+export const MALFORMED_REFERENCE_MESSAGE =
+  'DevSpec commit provenance: this readable commit message has a malformed DevSpec reference. Write each one as a full [devspec:<uuid>] and retry. Nothing else is blocked.'
 
 export const MULTIPLE_CLAIMS_MESSAGE =
-  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Keep exactly one correct [devspec:<uuid>] reference in the message and retry. Nothing else is blocked.'
+  'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each task this commit delivers and retry. Nothing else is blocked.'
+
+// The server refuses a thin task (contract 5.4.0's work_entry_contract), and with
+// exactly one claim this hook appends the reference itself (appendReference), so the
+// agent is asked for the smallest adequate task and a retry, never a tag (item 8f047489).
+export const NO_CLAIM_MESSAGE =
+  'DevSpec commit provenance: this commit has no [devspec:<uuid>] reference and no active DevSpec claim is observed in this project, so it would land unlinked. ' +
+  'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item); ' +
+  'if none covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed (the server refuses a thin one), and claim that. ' +
+  "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you. Nothing else is blocked."
 
 export function unresolvedReferenceMessage(reference) {
-  return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no item in this project. ` +
-    'This usually means the UUID tail is wrong or the item belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
+  return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no task in this project. ` +
+    'This usually means the UUID tail is wrong or the task belongs to another project. Confirm the full id, correct the commit message, and retry. Nothing else is blocked.'
 }
 
 function cleanString(value) {
@@ -100,6 +118,17 @@ function emptyState(conversationId) {
   }
 }
 
+function normalizePendingStamps(rawPending) {
+  if (!rawPending || typeof rawPending !== 'object' || Array.isArray(rawPending)) return {}
+  const normalized = {}
+  for (const [toolUseId, entry] of Object.entries(rawPending)) {
+    const taskId = cleanUuid(entry?.task_id)
+    const at = cleanString(entry?.at)
+    if (taskId && at) normalized[toolUseId] = { task_id: taskId, at }
+  }
+  return normalized
+}
+
 export function readConversationState(conversationId, stateRoot = defaultStateRoot()) {
   if (!conversationId) return null
   try {
@@ -115,9 +144,7 @@ export function readConversationState(conversationId, stateRoot = defaultStateRo
           .filter((claim) => claim.id && claim.project_id && claim.observed_at)
         : [],
       nudged_projects: Array.isArray(parsed.nudged_projects) ? parsed.nudged_projects.filter((id) => typeof id === 'string') : [],
-      pending_stamps: parsed.pending_stamps && typeof parsed.pending_stamps === 'object' && !Array.isArray(parsed.pending_stamps)
-        ? parsed.pending_stamps
-        : {},
+      pending_stamps: normalizePendingStamps(parsed.pending_stamps),
     }
   } catch {
     return emptyState(conversationId)
@@ -133,7 +160,9 @@ export function writeConversationState(conversationId, value, stateRoot = defaul
 }
 
 function candidateCwd(data) {
-  return cleanString(data?.cwd) || cleanString(data?.working_directory) || process.cwd()
+  // MCP hooks carry no cwd, only the workspace roots.
+  const root = Array.isArray(data?.workspace_roots) ? cleanString(data.workspace_roots[0]) : null
+  return cleanString(data?.cwd) || cleanString(data?.working_directory) || root || process.cwd()
 }
 
 function editTargetDirectory(data) {
@@ -205,9 +234,8 @@ function gitRemoteOrigin(cwd) {
 
 function walkForPin(start, repoRoot, home) {
   let current = path.resolve(start)
-  const boundedByHome = isInside(current, home)
   while (true) {
-    if (boundedByHome && current === home) return { pin: null, invalid: false }
+    if (isInside(home, current)) return { pin: null, invalid: false }
     const pinPath = path.join(current, '.devspec', 'project.json')
     try {
       const parsed = JSON.parse(fs.readFileSync(pinPath, 'utf8'))
@@ -229,7 +257,7 @@ function walkForPin(start, repoRoot, home) {
 export function findProjectPin(start, options = {}) {
   const home = path.resolve(options.home || os.homedir())
   const initial = path.resolve(start || process.cwd())
-  const repoRoot = path.resolve(options.repoRoot || gitTopLevel(nearestExistingDirectory(initial)) || initial)
+  const repoRoot = path.resolve(options.repoRoot || gitTopLevel(nearestExistingDirectory(initial)) || path.parse(initial).root)
   const local = walkForPin(initial, repoRoot, home)
   if (local.pin || local.invalid) return local.pin
 
@@ -296,13 +324,9 @@ function resolvedDirectory(base, token) {
   return path.resolve(base, token.value)
 }
 
-/**
- * Read only the narrow commit shapes authorized by ADR 71c23b46:
- *   git commit ... -m '<message>'
- *   cd <single-path> && git commit ... -m '<message>'
- *   git -C <path> commit ... -m '<message>'
- */
-export function parseReadableCommit(command, cwd = process.cwd()) {
+const HEREDOC_DELIMITER = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function parseSimpleCommit(command, cwd = process.cwd()) {
   const tokens = lexCommand(command)
   if (!tokens || tokens.some((token) => /%[^%]+%/.test(token.value)) ||
     tokens.some((token) => token.quote !== "'" && /[$`!]/.test(token.value)) ||
@@ -315,6 +339,10 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
     if (!directory || tokens[index + 2]?.value !== '&&') return null
     targetCwd = directory
     index += 3
+  } else if (tokens[index]?.value === 'git' && tokens[index + 1]?.value === 'add') {
+    const sep = tokens.findIndex((token, idx) => idx >= index + 2 && token.value === '&&')
+    if (sep <= index + 1) return null
+    index = sep + 1
   }
 
   if (tokens[index]?.value !== 'git') return null
@@ -348,53 +376,199 @@ export function parseReadableCommit(command, cwd = process.cwd()) {
     if (token.value === '-C' || token.value === '-c' || /^-[Cc].+/.test(token.value) ||
       token.value === '-n' || token.value === '-e' || /^-e.+/.test(token.value) ||
       token.value === '-s' || /^-s.+/.test(token.value)) return true
-    if (token.value === '-F' || /^-F.+/.test(token.value) || token.value === '-t' || /^-t.+/.test(token.value)) return true
+    if (/^-F.+/.test(token.value) || token.value === '-t' || /^-t.+/.test(token.value)) return true
     if (token.value.startsWith('-m') && token.value !== '-m') return true
     if (!token.value.startsWith('--')) return false
     const optionName = token.value.split('=', 1)[0]
+    const isExactMessageOption = token.value === '--message'
+    const isExactFileOption = token.value === '--file' || token.value.startsWith('--file=')
     return HISTORY_OPTIONS.some((option) => option.startsWith(optionName)) ||
-      MESSAGE_SOURCE_OPTIONS.some((option) => option.startsWith(optionName) &&
-        !(option === '--message' && optionName === '--message' && token.value === '--message'))
+      MESSAGE_SOURCE_OPTIONS.some((option) => option.startsWith(optionName) && !isExactMessageOption && !isExactFileOption)
   })) return null
 
   let messageToken = null
+  let fileSource = null
   for (let i = 0; i < rest.length; i += 1) {
-    if (rest[i].value !== '-m' && rest[i].value !== '--message') continue
-    if (messageToken || !rest[i + 1]?.quote) return null
-    messageToken = rest[i + 1]
-    i += 1
+    const token = rest[i]
+    if (token.value === '-m' || token.value === '--message') {
+      if (messageToken || fileSource || !rest[i + 1]?.quote) return null
+      messageToken = rest[i + 1]
+      i += 1
+      continue
+    }
+    if (token.value === '-F' || token.value === '--file') {
+      const pathToken = rest[i + 1]
+      if (messageToken || fileSource || !safeLiteralPath(pathToken)) return null
+      fileSource = { rawPath: pathToken.value, start: token.start, end: pathToken.end }
+      i += 1
+      continue
+    }
+    if (token.value.startsWith('--file=')) {
+      const rawPath = token.value.slice('--file='.length)
+      const pseudoToken = { value: rawPath, quote: token.quote }
+      if (messageToken || fileSource || !safeLiteralPath(pseudoToken)) return null
+      fileSource = { rawPath, start: token.start, end: token.end }
+    }
   }
-  if (!messageToken) return null
-  if (messageToken.quote === '"' && /[`$]/.test(messageToken.value)) return null
 
+  if (messageToken) {
+    if (messageToken.quote === '"' && /[`$]/.test(messageToken.value)) return null
+    return {
+      command,
+      targetCwd,
+      message: messageToken.value,
+      insertAt: messageToken.end - 1,
+    }
+  }
+
+  if (fileSource) {
+    const filePath = path.resolve(targetCwd, fileSource.rawPath)
+    let stat
+    try {
+      stat = fs.statSync(filePath)
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 32_768 || (stat.mode & 0o222) === 0) return null
+      fs.accessSync(filePath, fs.constants.R_OK | fs.constants.W_OK)
+    } catch {
+      return null
+    }
+    let rawMessage
+    try {
+      rawMessage = fs.readFileSync(filePath, 'utf8')
+    } catch {
+      return null
+    }
+    const message = rawMessage.replace(/\r?\n$/, '')
+    if (!message.trim()) return null
+    return {
+      command,
+      targetCwd,
+      message,
+      insertAt: null,
+      filePath,
+      fileSpan: { start: fileSource.start, end: fileSource.end },
+    }
+  }
+
+  return null
+}
+
+function parseHeredocCommit(command, cwd = process.cwd()) {
+  if (typeof command !== 'string' || !command.trim() || command.length > 32_768 || command.includes('`')) return null
+  const open = command.indexOf('<<')
+  if (open === -1 || command.indexOf('<<', open + 2) !== -1) return null
+  const headerSlice = command.slice(open)
+  const delimMatch = /^<<[ \t]*'([A-Za-z_][A-Za-z0-9_]*)'([^\r\n]*)\r?\n/.exec(headerSlice)
+  if (!delimMatch) return null
+  const delimiter = delimMatch[1]
+  if (!HEREDOC_DELIMITER.test(delimiter)) return null
+  const headerRest = delimMatch[2] || ''
+  const bodyStart = open + delimMatch[0].length
+
+  const terminator = `\n${delimiter}`
+  let close = command.indexOf(terminator, bodyStart - 1)
+  while (close !== -1) {
+    const after = command[close + terminator.length]
+    if (after === undefined || after === '\n' || after === '\r') break
+    close = command.indexOf(terminator, close + 1)
+  }
+  if (close === -1 || close < bodyStart - 1) return null
+
+  const rawBody = command.slice(bodyStart, close)
+  const body = rawBody.endsWith('\r') ? rawBody.slice(0, -1) : rawBody
+  const head = command.slice(0, open)
+  const tail = command.slice(close + terminator.length)
+  if (head.includes('\n') || head.includes('\r')) return null
+
+  let normalised = null
+  const viaStdin = /^(?<pre>.*?)\s(?:(?:-F|--file)\s+-|--file=-)\s*$/.exec(head)
+  const viaSubstitution = /^(?<pre>.*?)\s(?:-m|--message)\s+"\$\(cat\s*$/.exec(head)
+
+  if (viaStdin) {
+    if (headerRest.trim() !== '' || tail.trim() !== '' || head.includes('$')) return null
+    normalised = `${viaStdin.groups.pre} -m 'x'`
+  } else if (viaSubstitution) {
+    const closedOnHeader = headerRest.trim() === ')"' && tail.trim() === ''
+    const closedOnTail = headerRest.trim() === '' && /^\r?\n\)"\s*$/.test(tail)
+    if (!closedOnHeader && !closedOnTail) return null
+    if (command.indexOf('$(') !== command.lastIndexOf('$(')) return null
+    if (viaSubstitution.groups.pre.includes('$')) return null
+    normalised = `${viaSubstitution.groups.pre} -m 'x'`
+  } else {
+    return null
+  }
+
+  const simple = parseSimpleCommit(normalised, cwd)
+  if (!simple || simple.message !== 'x' || simple.fileSpan) return null
+
+  const lineBreak = body.search(/\r?\n/)
+  const subjectEnd = lineBreak === -1 ? bodyStart + body.length : bodyStart + lineBreak
   return {
     command,
-    targetCwd,
-    message: messageToken.value,
-    insertAt: messageToken.end - 1,
+    targetCwd: simple.targetCwd,
+    message: body,
+    insertAt: subjectEnd,
+    bodyStart,
+    heredoc: true,
   }
+}
+
+/**
+ * Read only the narrow commit shapes authorized by ADR 71c23b46 and brief 5f9fd5dc:
+ *   git commit ... -m '<message>'
+ *   git commit ... -F - <<'DELIM' ... DELIM
+ *   git commit ... -m "$(cat <<'DELIM' ... DELIM)"
+ *   git commit ... -F <path> / --file=<path> (when <path> is an existing readable & writable file)
+ *   with optional leading `cd <single-path> &&`, `git add <pathspec...> &&`, or `git -C <path>`
+ */
+export function parseReadableCommit(command, cwd = process.cwd()) {
+  return parseSimpleCommit(command, cwd) ?? parseHeredocCommit(command, cwd)
 }
 
 export function inspectReferences(message) {
-  const valid = [...String(message || '').matchAll(VALID_REFERENCE)].map((match) => match[1].toLowerCase())
+  const found = [...String(message || '').matchAll(VALID_REFERENCE)].map((match) => match[1].toLowerCase())
   const starts = [...String(message || '').matchAll(REFERENCE_START)]
   return {
-    valid,
-    malformedOrAmbiguous: starts.length !== valid.length || valid.length > 1,
+    // Repeats of one id are one reference, as the server reads them.
+    valid: [...new Set(found)],
+    malformed: starts.length !== found.length,
   }
 }
 
-export function appendReference(parsed, actionItemId) {
-  return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${actionItemId}]${parsed.command.slice(parsed.insertAt)}`
+export function appendReference(parsed, taskId) {
+  if (parsed.fileSpan) {
+    const lineBreak = parsed.message.search(/\r?\n/)
+    const subject = lineBreak === -1 ? parsed.message : parsed.message.slice(0, lineBreak)
+    const rest = lineBreak === -1 ? '' : parsed.message.slice(lineBreak)
+    const stampedMessage = `${subject}${subject ? ' ' : ''}[devspec:${taskId}]${rest}`
+    let delimiter = 'DEVSPEC_COMMIT_MSG'
+    let suffix = 1
+    while (stampedMessage.includes(delimiter)) {
+      delimiter = `DEVSPEC_COMMIT_MSG_${suffix++}`
+    }
+    const rewrittenFlags = `${parsed.command.slice(0, parsed.fileSpan.start)}-F -${parsed.command.slice(parsed.fileSpan.end)}`
+    return `${rewrittenFlags} <<'${delimiter}'\n${stampedMessage}\n${delimiter}`
+  }
+  if (parsed.heredoc) {
+    const subjectSlice = parsed.command.slice(parsed.bodyStart ?? 0, parsed.insertAt)
+    return `${parsed.command.slice(0, parsed.insertAt)}${subjectSlice ? ' ' : ''}[devspec:${taskId}]${parsed.command.slice(parsed.insertAt)}`
+  }
+  return `${parsed.command.slice(0, parsed.insertAt)}${parsed.message ? ' ' : ''}[devspec:${taskId}]${parsed.command.slice(parsed.insertAt)}`
 }
 
-export async function confirmReferenceOnline(commitMessage, options = {}) {
+/**
+ * Validate a commit message's references online. With one reference the server
+ * answers in `online`; with several it answers per reference in `references`,
+ * and any reference it cannot find is returned in `unresolved`.
+ */
+export async function confirmReferencesOnline(commitMessage, options = {}) {
   const {
     cwd,
     mainWorktree = null,
     pin = null,
     env = process.env,
     timeoutMs = ONLINE_REFERENCE_TIMEOUT_MS,
+    conversationId = null,
+    projectHome = os.homedir(),
     call = mcpToolsCall,
     resolveAuth = resolveDevspecMcpAuth,
   } = options
@@ -403,11 +577,16 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
   try {
     auth = resolveAuth(cwd, { env, mainWorktree })
   } catch {
-    return 'unavailable'
+    return { status: 'unavailable', unresolved: [] }
   }
-  if (!auth?.ok || !auth.token || !auth.mcp_url) return 'unavailable'
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return { status: 'unavailable', unresolved: [] }
 
   const args = { commit_message: commitMessage }
+  try {
+    const selected = readProjectContext(conversationId, auth.mcp_url, projectHome)
+    if (selected?.status === 'blocked') return { status: 'indeterminate', unresolved: [] }
+    if (selected?.status === 'selected') args.project_id = selected.project.id
+  } catch { return { status: 'indeterminate', unresolved: [] } }
   if (pin?.projectId) args.pinned_project_id = pin.projectId
   const gitRemote = gitRemoteOrigin(cwd)
   if (gitRemote) args.git_remote = gitRemote
@@ -422,52 +601,112 @@ export async function confirmReferenceOnline(commitMessage, options = {}) {
       timeoutMs,
     })
   } catch {
-    return 'unavailable'
+    return { status: 'unavailable', unresolved: [] }
   }
 
+  if (Array.isArray(result?.references)) {
+    const statuses = result.references.map((entry) => entry?.online?.status)
+    const unresolved = result.references
+      .filter((entry) => entry?.online?.status === 'not_found' && typeof entry.reference === 'string')
+      .map((entry) => entry.reference)
+    if (unresolved.length > 0) return { status: 'not_found', unresolved }
+    if (statuses.length > 0 && statuses.every((status) => status === 'valid')) return { status: 'valid', unresolved: [] }
+    return { status: 'indeterminate', unresolved: [] }
+  }
   const status = result?.online?.status
-  if (status === 'not_found') return 'not_found'
-  if (status === 'valid') return 'valid'
-  return 'indeterminate'
+  if (status === 'not_found') return { status: 'not_found', unresolved: [] }
+  if (status === 'valid') return { status: 'valid', unresolved: [] }
+  return { status: 'indeterminate', unresolved: [] }
+}
+
+export const CLAIM_CONFIRM_TIMEOUT_MS = 5_000
+
+/**
+ * Whether this conversation holds the claim on a task, asked of DevSpec: for a claim
+ * whose result Cursor did not pass to the hook (item ef54cfcb). It holds it when the task
+ * is being worked on under this conversation's id, which project-input.mjs stamps on
+ * every claim as local_session_id. Anything less, or no answer, is false: the claim goes
+ * unrecorded and a commit without a reference is stopped, as before.
+ */
+export async function confirmClaimOnline(options = {}) {
+  const {
+    taskId,
+    projectId,
+    conversationId,
+    cwd,
+    env = process.env,
+    timeoutMs = CLAIM_CONFIRM_TIMEOUT_MS,
+    call = mcpToolsCall,
+    resolveAuth = resolveDevspecMcpAuth,
+  } = options
+  if (!cleanUuid(taskId) || !cleanUuid(projectId) || !cleanString(conversationId)) return false
+  let auth
+  try {
+    auth = resolveAuth(cwd, { env })
+  } catch {
+    return false
+  }
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return false
+  let task
+  try {
+    task = await call({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'get_task',
+      arguments: { task_id: taskId, project_id: projectId },
+      timeoutMs,
+    })
+  } catch {
+    return false
+  }
+  return cleanUuid(task?.id) === cleanUuid(taskId) &&
+    task?.agent_activity === 'implementing' &&
+    cleanString(task?.local_session_id) === cleanString(conversationId)
+}
+
+/** The single-verdict form: valid, not_found, unavailable or indeterminate. */
+export async function confirmReferenceOnline(commitMessage, options = {}) {
+  return (await confirmReferencesOnline(commitMessage, options)).status
 }
 
 function toolFields(data) {
-  const lowerName = (cleanString(data?.tool_name) || cleanString(data?.toolName) || '').toLowerCase()
+  if (data?.mcp_server_name && !isDevspecServer(data.mcp_server_name)) return { verb: '', isDevspec: false }
+  const lowerName = (cleanString(data?.tool_name) || cleanString(data?.toolName) || '').toLowerCase().replace(/^mcp:(?=devspec__)/, '')
   const known = ['claim_work_item', ...TERMINAL_WORK_VERBS]
   const verb = known.find((candidate) => lowerName === candidate || lowerName === `devspec__${candidate}` || lowerName === `devspec.${candidate}`) || ''
   return { verb, isDevspec: Boolean(verb) }
 }
 
 function claimedItemId(args) {
-  return cleanUuid(args?.action_item_id) || cleanUuid(args?.actionItemId) || cleanUuid(args?.id)
+  return cleanUuid(args?.task_id) || cleanUuid(args?.taskId) || cleanUuid(args?.id)
 }
 
 function resultItemValues(result) {
   return [
     result?.id,
-    result?.action_item_id,
-    result?.action_item?.id,
+    result?.task_id,
+    result?.task?.id,
     result?.work_item?.id,
     result?.item?.id,
     result?.data?.id,
-    result?.data?.action_item_id,
-    result?.data?.action_item?.id,
+    result?.data?.task_id,
+    result?.data?.task?.id,
     result?.result?.id,
-    result?.result?.action_item_id,
-    result?.result?.action_item?.id,
+    result?.result?.task_id,
+    result?.result?.task?.id,
   ].map(cleanString).filter(Boolean)
 }
 
 function resultProjectValues(result) {
   return [
     result?.project_id,
-    result?.action_item?.project_id,
+    result?.task?.project_id,
     result?.work_item?.project_id,
     result?.item?.project_id,
     result?.data?.project_id,
-    result?.data?.action_item?.project_id,
+    result?.data?.task?.project_id,
     result?.result?.project_id,
-    result?.result?.action_item?.project_id,
+    result?.result?.task?.project_id,
   ].map(cleanString).filter(Boolean)
 }
 
@@ -481,9 +720,9 @@ function structuredStatuses(result) {
     result?.outcome,
     result?.claim_status,
     result?.lifecycle,
-    result?.action_item?.status,
-    result?.action_item?.state,
-    result?.action_item?.lifecycle,
+    result?.task?.status,
+    result?.task?.state,
+    result?.task?.lifecycle,
     result?.work_item?.status,
     result?.item?.status,
     result?.data?.status,
@@ -497,30 +736,52 @@ function hasOuterFailure(result) {
   const status = normalizeStatus(result?.status)
   return !result || result.success === false || result.ok === false || result.isError === true ||
     result.claim_success === false || result.claimed === false || result.not_claimed === true ||
-    Boolean(result.error) || Boolean(result.conflict) || Boolean(result.possible_conflict) ||
-    ['error', 'failure', 'conflict', 'possible_conflict', 'not_claimed', 'unclaimed'].includes(status)
+    Boolean(result.error) || Boolean(result.conflict) ||
+    ['error', 'failure', 'conflict', 'not_claimed', 'unclaimed'].includes(status)
 }
 
 export function parseMcpExecution(data) {
   const { verb, isDevspec } = toolFields(data)
   const args = parseJsonObject(data?.tool_input ?? data?.toolInput) || {}
   const resultPresent = Object.hasOwn(data || {}, 'result_json') || Object.hasOwn(data || {}, 'resultJson')
-  const result = parseJsonObject(data?.result_json ?? data?.resultJson)
+  const envelope = parseJsonObject(data?.result_json ?? data?.resultJson)
+  // DevSpec's own answer is the first text block. It appends its notices (plugin
+  // access, account state) as further blocks, each its own JSON object, so joining the
+  // blocks made a successful claim unreadable whenever one rode along (item ef54cfcb).
+  const result = Array.isArray(envelope?.content)
+    ? parseJsonObject(envelope.content.find((block) => block?.type === 'text')?.text)
+    : envelope
   const requestedId = claimedItemId(args)
-  if (!isDevspec || !resultPresent || hasOuterFailure(result)) return { verb, args, successful: false, actionItemId: requestedId, projectId: null }
+  const requestedProjectValue = cleanString(args?.project_id) // a folder pin is a hint, not an explicit scope
+  const requestedProject = cleanUuid(requestedProjectValue)
+  // cursor-agent hands this hook an empty text block in place of a large result, which
+  // it writes to a file for the model instead: recorded live on 2026.10.22, where every
+  // successful claim (about 52 KB) arrived as "" while a short refusal arrived whole.
+  // Nothing about the outcome can be read from it, so the caller asks DevSpec.
+  const withheld = isDevspec && resultPresent && Array.isArray(envelope?.content) && envelope.isError !== true &&
+    !cleanString(envelope.content.find((block) => block?.type === 'text')?.text)
+  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) {
+    return { verb, args, successful: false, taskId: requestedId, projectId: null, withheld, requestedProject }
+  }
   const rawProjects = resultProjectValues(result)
   const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
-  const projectId = rawProjects.length === returnedProjects.length && returnedProjects.length &&
-    returnedProjects.every((id) => id === returnedProjects[0]) ? returnedProjects[0] : null
-  const requestedProjectValue = cleanString(args?.project_id) || cleanString(args?.pinned_project_id)
-  const requestedProject = cleanUuid(requestedProjectValue)
+  // DevSpec's claim response does not name the task's project (item ef54cfcb), so a
+  // response that names none is read as being in the project the call was scoped to:
+  // the project_id project-input.mjs stamps from this conversation's chosen project.
+  // DevSpec only claims a task inside the project a call names, so a successful claim
+  // proves it. A response that does name a project is still held to it.
+  const projectId = rawProjects.length === 0
+    ? requestedProject
+    : rawProjects.length === returnedProjects.length && returnedProjects.every((id) => id === returnedProjects[0])
+      ? returnedProjects[0]
+      : null
   const projectAgrees = !requestedProjectValue || Boolean(requestedProject && requestedProject === projectId)
   if (verb === 'claim_work_item') {
     const rawReturned = resultItemValues(result)
     const returned = rawReturned.map(cleanUuid).filter(Boolean)
     const successful = result.claim_success === true && Boolean(requestedId) && Boolean(projectId) && projectAgrees &&
       rawReturned.length === returned.length && returned.length > 0 && returned.every((id) => id === requestedId)
-    return { verb, args, successful, actionItemId: requestedId, projectId }
+    return { verb, args, successful, taskId: requestedId, projectId }
   }
   const allowedStatuses = {
     record_implementation: new Set(['success', 'ok', 'implemented', 'done']),
@@ -532,7 +793,7 @@ export function parseMcpExecution(data) {
     (verb === 'release_work_item' && result.released === true) ||
     (verb === 'fail_work_item' && result.failed === true) ||
     structuredStatuses(result).some((status) => allowedStatuses.has(status))
-  return { verb, args, successful, actionItemId: requestedId, projectId }
+  return { verb, args, successful, taskId: requestedId, projectId }
 }
 
 function withinObservationWindow(value, now) {
@@ -541,7 +802,10 @@ function withinObservationWindow(value, now) {
 }
 
 function prunePending(pending, now = Date.now()) {
-  return Object.fromEntries(Object.entries(pending || {}).filter(([, value]) => withinObservationWindow(value?.at, now)))
+  return Object.fromEntries(
+    Object.entries(normalizePendingStamps(pending))
+      .filter(([, value]) => withinObservationWindow(value?.at, now)),
+  )
 }
 
 function pruneClaims(claims, now = Date.now()) {
@@ -560,15 +824,33 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'afterMCPExecution') {
     const call = parseMcpExecution(data)
-    if (!call.successful || !call.actionItemId) return null
-    if (call.verb === 'claim_work_item') {
+    const recordClaim = (projectId) => {
       state.active_claims = [
-        ...state.active_claims.filter((claim) => claim.id !== call.actionItemId),
-        { id: call.actionItemId, project_id: call.projectId, observed_at: new Date(nowMs).toISOString() },
+        ...state.active_claims.filter((claim) => claim.id !== call.taskId),
+        { id: call.taskId, project_id: projectId, observed_at: new Date(nowMs).toISOString() },
       ]
+      writeConversationState(conversationId, state, stateRoot)
+      return null
     }
+    // A claim whose result Cursor withheld is confirmed with DevSpec, the one place
+    // that knows (item ef54cfcb). Without this every claim in Cursor went unrecorded and
+    // the git stand-in stopped every commit.
+    if (call.verb === 'claim_work_item' && call.withheld && call.taskId && call.requestedProject) {
+      return confirmClaimOnline({
+        taskId: call.taskId,
+        projectId: call.requestedProject,
+        conversationId,
+        cwd: candidateCwd(data),
+        env,
+        timeoutMs: options.onlineTimeoutMs,
+        call: options.onlineCall,
+        resolveAuth: options.resolveAuth,
+      }).then((held) => (held ? recordClaim(call.requestedProject) : null)).catch(() => null)
+    }
+    if (!call.successful || !call.taskId) return null
+    if (call.verb === 'claim_work_item') return recordClaim(call.projectId)
     if (TERMINAL_WORK_VERBS.has(call.verb)) {
-      state.active_claims = state.active_claims.filter((claim) => claim.id !== call.actionItemId)
+      state.active_claims = state.active_claims.filter((claim) => claim.id !== call.taskId)
     }
     writeConversationState(conversationId, state, stateRoot)
     return null
@@ -581,55 +863,83 @@ export function handleHook(mode, data, options = {}) {
     if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return null
     const commandKey = typeof toolInput.command === 'string' ? 'command' : typeof toolInput.cmd === 'string' ? 'cmd' : null
     if (!commandKey) return null
+    let selected
+    try { selected = readProjectContext(conversationId, null, options.projectHome) } catch { return null }
+    if (selected?.status === 'blocked') return null
+
+    // While this conversation is connected, every Shell command gets the git stand-in
+    // line in front (git-observer.mjs, item c2a7ab72). The stand-in then tags a commit,
+    // or stops one with no reference, from git's own arguments, so the command-text
+    // tagging below is left to Windows and to conversations with no connection. This
+    // hook is the only one that rewrites a Shell command: Cursor keeps only the last
+    // `updated_input` when several hooks return one.
+    const standIn = (options.prepareStandIn ?? prepareStandIn)({
+      command: toolInput[commandKey],
+      conversationId,
+      projectId: selected?.status === 'selected' ? selected.project.id : null,
+      claims: state.active_claims,
+      env,
+      home: options.home,
+      now: nowMs,
+    })
+    // No permission is given: the line changes nothing Cursor's own checks decide.
+    const withStandIn = standIn ? { updated_input: { ...toolInput, [commandKey]: standIn.command } } : null
+
     const parsed = parseReadableCommit(toolInput[commandKey], candidateCwd(data))
     const pin = parsed ? findProjectPin(parsed.targetCwd, options.pinOptions) : null
-    if (!parsed || !pin) return null
-    const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === pin.projectId)
+    const projectId = selected?.project?.id ?? pin?.projectId
+    if (!parsed || !projectId) return withStandIn
+    const eligibleClaims = state.active_claims.filter((claim) => claim.project_id === projectId)
 
+    // A reference the agent wrote is still checked here, with or without the stand-in.
     const refs = inspectReferences(parsed.message)
-    if (refs.valid.length === 1 && !refs.malformedOrAmbiguous) {
-      const reference = refs.valid[0]
+    if (refs.malformed) {
+      return { permission: 'deny', user_message: MALFORMED_REFERENCE_MESSAGE, agent_message: MALFORMED_REFERENCE_MESSAGE }
+    }
+    if (refs.valid.length > 0) {
       const mainWorktree = options.mainWorktree === undefined ? gitMainWorktree(parsed.targetCwd) : options.mainWorktree
-      return confirmReferenceOnline(parsed.message, {
+      return confirmReferencesOnline(parsed.message, {
         cwd: parsed.targetCwd,
         mainWorktree,
+        conversationId,
+        projectHome: options.projectHome,
         pin,
         env,
         timeoutMs: options.onlineTimeoutMs,
         call: options.onlineCall,
         resolveAuth: options.resolveAuth,
       }).then((outcome) => {
-        if (outcome !== 'not_found') return null
-        const message = unresolvedReferenceMessage(reference)
+        if (outcome.status !== 'not_found') return withStandIn
+        const message = unresolvedReferenceMessage(outcome.unresolved[0] ?? refs.valid[0])
         return { permission: 'deny', user_message: message, agent_message: message }
-      }).catch(() => null)
+      }).catch(() => withStandIn)
     }
-    if (refs.malformedOrAmbiguous) {
-      return { permission: 'deny', user_message: AMBIGUOUS_REFERENCE_MESSAGE, agent_message: AMBIGUOUS_REFERENCE_MESSAGE }
+    if (withStandIn) return withStandIn
+    if (eligibleClaims.length === 0) {
+      return { permission: 'deny', user_message: NO_CLAIM_MESSAGE, agent_message: NO_CLAIM_MESSAGE }
     }
-    if (eligibleClaims.length === 0) return null
     if (eligibleClaims.length > 1) {
       return { permission: 'deny', user_message: MULTIPLE_CLAIMS_MESSAGE, agent_message: MULTIPLE_CLAIMS_MESSAGE }
     }
 
-    const actionItemId = eligibleClaims[0].id
-    const updatedCommand = appendReference(parsed, actionItemId)
+    const taskId = eligibleClaims[0].id
+    const updatedCommand = appendReference(parsed, taskId)
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
     if (toolUseId) {
-      state.pending_stamps[toolUseId] = { action_item_id: actionItemId, at: new Date(nowMs).toISOString() }
+      state.pending_stamps[toolUseId] = { task_id: taskId, at: new Date(nowMs).toISOString() }
       writeConversationState(conversationId, state, stateRoot)
     }
     return {
       permission: 'allow',
       updated_input: { ...toolInput, [commandKey]: updatedCommand },
-      agent_message: `DevSpec appended [devspec:${actionItemId}] to this commit message.`,
+      agent_message: `DevSpec appended [devspec:${taskId}] to this commit message.`,
     }
   }
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
     if (toolUseId && state.pending_stamps[toolUseId]) {
-      const item = state.pending_stamps[toolUseId].action_item_id
+      const item = state.pending_stamps[toolUseId].task_id
       delete state.pending_stamps[toolUseId]
       writeConversationState(conversationId, state, stateRoot)
       return { additional_context: `DevSpec appended [devspec:${item}] to the commit message that just ran.` }
@@ -640,13 +950,22 @@ export function handleHook(mode, data, options = {}) {
     const targetDirectory = editTargetDirectory(data)
     if (!targetDirectory) return null
     const pin = findProjectPin(targetDirectory, options.pinOptions)
-    if (!pin || state.active_claims.some((claim) => claim.project_id === pin.projectId) || state.nudged_projects.includes(pin.projectId)) return null
-    state.nudged_projects.push(pin.projectId)
+    let selected
+    try { selected = readProjectContext(conversationId, null, options.projectHome) } catch { return null }
+    if (selected?.status === 'blocked') return null
+    const projectId = selected?.project?.id ?? pin?.projectId
+    if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
+    state.nudged_projects.push(projectId)
     writeConversationState(conversationId, state, stateRoot)
+    const nudgeMessage =
+      `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
+      'Continue working—do not stop or retry, and editing is never blocked. ' +
+      'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
+      'with a real description of the change and the reason it is needed, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
+      'When to create one is the work_entry_contract in devspec://product/implementation-contract.'
     return {
-      additional_context:
-        `DevSpec provenance note: this edit already completed in project ${pin.projectId}, and this Cursor conversation has no observed active claim. ` +
-        'Continue working—do not stop or retry. When practical, search/reuse/create and claim the smallest covering item; commit linkage and server reconciliation remain authoritative.',
+      additional_context: nudgeMessage,
+      agent_message: nudgeMessage,
     }
   }
 

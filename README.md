@@ -1,148 +1,180 @@
 # DevSpec for Cursor
 
-Bring your team's DevSpec work into Cursor — pick up tasks, brainstorm scope, and ship changes without leaving the editor.
+**Build on your team's best thinking.** [DevSpec](https://devspec.ai) is where your team, your shared knowledge and your coding agents build software together.
 
-[DevSpec](https://devspec.ai) tracks your team's tasks, bugs, and features — called **action items** — against your git repositories, along with the context, decisions, and history around them. This extension connects Cursor's AI agent to your DevSpec account over MCP so it can pull that work into the chat, do it, and record what it did — all tracked in DevSpec.
+This plugin connects Cursor's command-line agent (`cursor-agent`) to your DevSpec projects. The agent can work your team's tasks with the project's decisions and documents to hand, record what it did, and take instructions from DevSpec in your browser or on your phone.
+
+> **Command line only, for now.** The plugin is for Cursor's command-line agent. The Cursor editor isn't supported yet.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## What you can do with it
+---
 
-- **Work a task in chat.** Point the agent at an action item and it implements the change, runs your project's tests, commits, and records what it did back on the task — ready for a human to review.
-- **Work a batch in one go.** Tell the Agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* — it reserves them so nobody else takes one mid-run, then claims and works them one at a time. DevSpec's web app has a copy button that writes that line for you.
-- **Drive a session from DevSpec.** Connect a Cursor session to DevSpec's **Agents page** and steer it from your browser or phone. (Needs Node.js — see below.)
-- **Open in Cursor from DevSpec.** Click a task's rocket in the DevSpec web app and Cursor opens the right repo with your prompt pre-filled. → [Open in Cursor](#open-in-cursor-from-devspec)
-- **Use DevSpec directly from Agent chat.** The MCP tools exposed in chat cover action items, tracked implementations, project memory, and product help.
+## What it does for you
 
-Everything runs against your own DevSpec account and repositories, using an API token you control.
+- **Work a task in chat.** Point the agent at a DevSpec task and it makes the change, runs your project's tests, commits, and records what it did on the task.
+- **Work a batch in one go.** Say *"Work these DevSpec tasks in order: 4f2a, 9c1b, 2e7d"*. The agent reserves them so nobody else picks one up mid-run, then works them one at a time.
+- **Steer it from DevSpec.** Put a `cursor-agent` conversation on your project's **Agents** page, send it work from your browser or phone, and follow along live in a DevSpec session.
+- **Your team's knowledge in chat.** Ask about tasks, decisions, documents and reviews in plain words (*"What did we decide about caching?"*, *"Create a task for the login redirect bug"*).
+- **Commits linked to tasks.** Commits the agent makes are reported to DevSpec and tagged with the task they belong to. See [Commit tracking](#commit-tracking).
 
-## Before you start
+---
 
-You'll need:
+## Requirements
 
-- **Cursor — the classic IDE.** DevSpec works through Cursor's **Agent chat**, which you open with **Ctrl+L** / **Cmd+L**. It does **not** work reliably in Cursor's newer "Agents Window" — stick to classic IDE Agent chat.
-- A **[DevSpec](https://devspec.ai)** account with at least one project connected to your git repo(s).
-- A **DevSpec API token**. Create one in DevSpec under **You → Connections → Connect a tool** (pick **Read & write**); it starts with `dvs_`.
-  - It's **account-wide.** Use the **same** token in every tool and on every machine — do **not** mint one per machine.
-  - It's **retrievable.** Reveal and copy it again any time at **You → Connections** (no more show-once).
-  - You don't paste a project id — the project for a run is resolved from your repo's git remote.
-- **Node.js 18+** — needed by the installed agent hooks and remote-control scripts (check with `node --version`). Plain MCP tool access is provided by Cursor itself.
+- **Cursor's command-line agent**, `cursor-agent` (Cursor also installs it as `agent`). Install it from [Cursor's CLI installation page](https://cursor.com/docs/cli/installation), then check it in a new terminal with `cursor-agent --version`.
+- **A [DevSpec](https://devspec.ai) account** with a project. When the project is linked to your git repository, the plugin finds it for you.
+- **A DevSpec token.** On DevSpec's [Agent setup page](https://app.devspec.ai/settings/agents), choose **Create your token** with **Read & write** access. It starts with `dvs_`. You can use the same token in every tool and on every machine, and reveal it again on the same page at any time.
+- **Node.js 18 or later** (`node --version`; install it from [nodejs.org](https://nodejs.org/en/download) if needed) and **git**.
 
-## Install
+---
 
-The extension ships as a VSIX.
+## Install from the Cursor Marketplace
 
-1. Get `devspec-autopilot.vsix` from the [repo](https://github.com/DevSpecAI/cursor-devspec-plugin) (grab a release, or build one — see [Contributing](#contributing)).
-2. In Cursor, open the command palette (**Ctrl+Shift+P** / **Cmd+Shift+P**) and run **Extensions: Install from VSIX…**
-3. Pick the `.vsix` file, and reload Cursor if prompted.
+### 1. Install the plugin
 
-On first activation the extension:
+1. Start `cursor-agent` and type `/plugin`.
+2. Open the marketplace, search for **DevSpec**, and install it **for your user** rather than for a single project. A user install works in every folder, and it is where Cursor lets you set the token in the next step.
 
-- registers the DevSpec **MCP server** in your Cursor config,
-- installs project rules at `.cursor/rules/devspec.mdc` in git repos and worktrees you open,
-- installs Cursor agent hooks for remote-control telemetry and commit-provenance assistance,
-- adds the setup and remote-control **DevSpec: …** commands to the command palette.
+You can also add DevSpec from its page in the [Cursor Marketplace](https://cursor.com/marketplace) with **Add to Cursor**, then set your token as below.
 
-## Connect your token
+### 2. Set your DevSpec token in the plugin's settings
 
-Open the command palette and run **DevSpec: Set MCP token**. Paste your `dvs_…` token. It connects to the DevSpec API at `https://api.devspec.ai` by default; set the `devspec.apiUrl` setting to `https://api.devspecstaging.com` to use staging. If you clear that setting, the next connect asks for the URL instead.
+1. In `cursor-agent`, type `/plugin`, open **DevSpec** in your installed plugins, and choose **Configure variables**.
+2. Paste your token into **DevSpec token** and save. Leave **DevSpec API URL (advanced)** as it is.
+3. Restart `cursor-agent`.
 
-The extension writes the connection into your Cursor MCP config file:
+This connects the agent to DevSpec's tools.
 
-- **macOS / Linux:** `~/.cursor/mcp.json`
-- **Windows:** `%USERPROFILE%\.cursor\mcp.json`
+### 3. Give remote control and commit tracking the token too
 
-It points the server at the DevSpec MCP endpoint `https://api.devspec.ai/api/mcp` (the API host — the web app itself lives on `https://app.devspec.ai`) and sends your token as a Bearer header. **Restart Cursor** afterwards so it picks up the new server.
+Remote control from DevSpec and commit tracking run in the background, outside the chat, and Cursor doesn't share plugin settings with them. They read your token from Cursor's MCP settings file instead: `~/.cursor/mcp.json` on macOS and Linux, `%USERPROFILE%\.cursor\mcp.json` on Windows. Open it in a text editor and merge in this entry, keeping any servers already there:
 
-> **One token, everywhere.** The `dvs_` token is account-wide — reuse the same one across Cursor, your other coding tools, and every machine you work on. There's no need to generate a fresh token per machine. If you lose track of it, just reveal and copy it again at **You → Connections**.
+```json
+{
+  "mcpServers": {
+    "devspec": {
+      "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
+      "headers": {
+        "Authorization": "Bearer dvs_your_token_here",
+        "x-devspec-plugin": "cursor/0.17.0"
+      }
+    }
+  }
+}
+```
 
-## Verify
+Keep the `x-devspec-plugin` line. With this entry in place, Cursor connects the agent to DevSpec through it instead of through the plugin's own settings, and the line tells DevSpec those calls come from the DevSpec plugin. Without it, DevSpec tells the agent the plugin is missing. You don't need to change it when the plugin updates.
 
-Open Cursor's Agent chat (**Ctrl+L** / **Cmd+L**) and ask it to call the DevSpec `verify_agent_connection` tool. You should see confirmation that the MCP server is reachable and connected as your DevSpec user.
+On macOS and Linux, make the file readable only by you:
 
-### Commands
+```bash
+chmod 600 ~/.cursor/mcp.json
+```
 
-The extension currently contributes these command-palette commands:
+Then restart `cursor-agent`. If you only want DevSpec's tools in chat, you can skip this step.
+
+---
+
+## Check it works
+
+1. Start `cursor-agent` in your project's folder.
+2. Ask: *"Check my DevSpec connection."* The agent checks with DevSpec and tells you which DevSpec account it is connected as.
+3. Type `/devspec-remote`. The conversation appears on your project's **Agents** page in DevSpec, ready to take work from your browser or phone.
+
+If DevSpec's tools are missing, type `/mcp` to see whether Cursor could reach DevSpec, then check your token and restart `cursor-agent`.
+
+---
+
+## Updates
+
+You don't need to do anything. Cursor reviews each new release of the plugin before it reaches you and then updates your installed copy. Restart `cursor-agent` to start using a new release straight away. What changed in each release is in [CHANGELOG.md](./CHANGELOG.md).
+
+### Coming from `devspec-autopilot`
+
+The plugin used to be called **devspec-autopilot**, and it was installed straight from GitHub. That copy will not update to the renamed plugin. Remove it, then install DevSpec as above:
+
+1. In `cursor-agent`, type `/plugin` and uninstall **devspec-autopilot**.
+2. Remove its marketplace:
+
+   ```bash
+   cursor-agent plugin marketplace remove devspec-autopilot
+   ```
+
+3. Install **DevSpec** from the Cursor Marketplace and set your token (steps 1 and 2 above). An existing `devspec` entry in `~/.cursor/mcp.json` keeps working, so step 3 is already done. Make sure that entry has the `x-devspec-plugin` line shown in step 3, and add it if it doesn't.
+
+---
+
+## Commands
+
+You can ask the agent to do anything in DevSpec in plain words (*"Work on DevSpec task 4f2a"*). The plugin also adds these slash commands to `cursor-agent`:
 
 | Command | What it does |
 |---|---|
-| DevSpec: Connect remote control | Connect this session to DevSpec's Agents page |
-| DevSpec: Disconnect remote control | Disconnect this session from the Agents page |
-| DevSpec: Set MCP token | Store the account-wide MCP token |
-| DevSpec: Register MCP server in Cursor config | Write or refresh Cursor's MCP registration |
-| DevSpec: Install rules | Install or overwrite the managed project rule |
-| DevSpec: Install agent hooks | Install remote-control telemetry and commit-provenance hooks |
-| DevSpec: Manage repo folder mappings | Manage local folders used by signed handoffs |
-| DevSpec: Install protocol handler | Register signed `devspec://` handoffs |
-| DevSpec: Install handoff handler | Install the local handoff bridge |
-| DevSpec: Start handoff handler | Start the local handoff bridge |
+| `/devspec-remote` | Puts this conversation on your project's **Agents** page, ready to take work from your browser or phone. |
+| `/devspec-remote --new` | Connects and starts a new DevSpec session for this conversation, shared with the project. Add `--private` to make it visible only to you. |
+| `/devspec-remote --session <id>` | Connects and joins an existing DevSpec session. |
+| `/devspec-remote --project "<name>"` | Connects to that project for this conversation only, without changing the folder's default. |
+| `/devspec-remote-stop` | Disconnects this conversation from DevSpec, leaving other `cursor-agent` conversations connected. |
+| `/devspec-project` | Shows this conversation's project, chooses another one, or remembers or forgets a default project for the folder. |
+| `/devspec-debug` | Collects diagnostics on your machine when you ask it to while looking into a problem. Nothing is uploaded unless you ask. |
 
-Action-item, memory, help, and implementation operations are MCP tools used from Agent chat; they are not separate command-palette commands. Cursor receives concise tool discovery rather than a giant static catalog; detailed schemas are resolved only when used.
+## Choosing a project
 
-### Shared session plans during remote control
+`/devspec-remote` finds your project by itself when your repository's `origin` belongs to one DevSpec project you can access, or when the folder has a `.devspec/project.json` file naming the project.
 
-The current `devspec://product/implementation-contract` decides whether work warrants a shared session plan. The threshold is deliberately high: routine investigation and one-run checks remain unplanned. When a qualifying attached-session plan exists, Cursor continues it across reconnects using its authoritative revision and advances meaningful milestones atomically.
+When the agent can't tell which project you mean, it asks you. Use `/devspec-project` to see which project this conversation uses, to remember a default for the folder (saved in `.devspec/project.json`, which you can commit for your team), or to forget it. Moving to a different project needs a fresh conversation, and the agent gives you the command to start one, so nothing from one project carries over into another.
 
-Plan awareness is all-room and advisory: Cursor can see every active plan in the attached session, but another owner's plan grants no mutation authority. Same-owner cross-plan work and orphan adoption require explicit plan id plus expected revision and remain server-authorized.
+If you attach the agent to a DevSpec session that has a shared plan, it picks the plan up where it left off after it reconnects.
 
-Plan mutation uses a narrow connection-bound helper installed with the extension. It negotiates and stores a per-conversation capability without putting the secret in prompts or the global MCP config. The helper exposes the complete `manage_plan` schema only on demand (`manage-plan describe`) and accepts operations on stdin (`manage-plan use`). Native chats bind through Cursor's host conversation id; a manual chat without that id is accepted only when the host's minted-bond index has exactly one live, attached, capability-bound Cursor connection in the current workspace. Ambiguous sibling connections fail closed. Ordinary MCP tools keep using the normal Cursor registration in `~/.cursor/mcp.json`.
+---
 
-Cursor's existing Resume behavior is unchanged: CLI launches still mint a native chat, run `agent --resume`, and stamp that chat id as `local_session_id`; classic IDE conversations continue using Cursor's supplied conversation id when available.
+## Commit tracking
 
-## How it finds the right project
+While a conversation is connected to DevSpec, the plugin notices each commit the agent makes with `git commit` and tells DevSpec which agent made it, so the work is credited to Cursor and linked to the right task.
 
-You don't pass a project id in most cases. The extension matches the git remote of the repo you're in to the DevSpec project that tracks it. If a single repo is tracked by more than one project, pass `--project-id=<id>` in the command's input.
+- **macOS, Linux and WSL get full commit tracking.** Each command the agent runs starts with one added line that puts a private stand-in for `git` first on its `PATH`. The stand-in runs your real git unchanged and learns from git itself whether a commit was made, so a commit is noticed however it was made: a multi-line message, a message file, a script, `git -C`, a linked worktree or an alias. Nothing is installed in your repositories, and your git configuration and git hooks are not changed. Cursor's permission prompts and allow-lists check the same commands as before, though a prompt shows the added line above the command.
+- **Task references are added for the agent.** In your project's repositories (one whose `origin` is a repository of the project, or that a `.devspec/project.json` pin names), when exactly one task is claimed, that task's `[devspec:<id>]` reference is added to the end of the commit's subject line before git runs, and the agent is told. With no task claimed, or several, a commit without a reference is stopped before anything changes, and the agent is told how to recover. Amends, fixups, reused messages and messages that already have a reference are left as written.
+- **Other repositories are left alone.** Commits in a repository that is not one of the project's are not changed and are not reported.
+- **What it can't see.** A git run by its full path (such as `/usr/bin/git`) or with a cleared `PATH` bypasses the stand-in, and commits git makes while merging, rebasing or cherry-picking are not reported; DevSpec still links any commit through the task reference in its message.
+- **Nothing is lost quietly.** A report that can't be sent is tried again later, and what happened to each commit is written to `~/.devspec/remote-control/connections/<connection>.commits.log`.
+- **Native Windows is limited.** Cursor runs commands there in PowerShell, which can't take the added line, so only straightforward `git commit` commands that the agent runs directly are noticed and tagged. Use WSL for full commit tracking.
 
-## Open in Cursor from DevSpec
+---
 
-When you click **Open in Cursor** on the DevSpec web app, DevSpec opens a signed `devspec://` URL (Windows/Linux) or the macOS localhost bridge fallback.
+## Install straight from GitHub (fallback)
 
-### Automatic setup (recommended)
+Use this only if you can't install from the Cursor Marketplace. **Cursor does not update a plugin installed this way:** it stays on the version you installed until you remove it and add it again.
 
-Installing this extension and connecting DevSpec MCP **automatically**:
+1. Add this repository as a plugin marketplace:
 
-1. **Windows / Linux:** registers `devspec://` in the OS (per-user, no admin)
-2. **macOS:** starts the localhost bridge on port **42731**
-3. Copies the handler to `~/.cursor/devspec/`
-4. Runs on demand — no always-on bridge or Windows login startup entry
+   ```bash
+   cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
+   ```
 
-You can also run **DevSpec: Install protocol handler** from the command palette.
+2. Start `cursor-agent`, type `/plugin`, and install **devspec** from the marketplace you just added. Adding a marketplace does not install the plugin; installing it from `/plugin` is what loads the plugin.
+3. Cursor doesn't offer plugin settings for a plugin installed this way, so add your token to `~/.cursor/mcp.json` as in [step 3](#3-give-remote-control-and-commit-tracking-the-token-too). That entry also connects DevSpec's tools.
+4. Restart `cursor-agent`.
 
-### Manual setup (extension not installed)
-
-**Windows:** double-click `scripts/install-protocol-handler.cmd`
-
-**Linux / macOS:**
+To move to a newer version, remove the marketplace, add it again, and install **devspec** again from `/plugin`. `cursor-agent plugin marketplace update` does not bring a newer version of the plugin.
 
 ```bash
-bash scripts/install-protocol-handler.sh
+cursor-agent plugin marketplace remove devspec
+cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin
 ```
 
-### What happens when you click the rocket
-
-1. Cursor opens the mapped project folder.
-2. A moment later, the Agent chat is pre-filled with your prompt — press Enter to send.
-
-### macOS health check
-
-`http://127.0.0.1:42731/health` should return `{"ok":true,"mode":"macos_bridge"}` when the fallback bridge is running.
-
-DevSpec never receives or stores your local filesystem paths.
-
-### Signing keys
-
-The handler bundles `scripts/handoff-public-key.pem` for offline verification of the signed handoff.
+---
 
 ## Contributing
 
-The extension is TypeScript bundled with esbuild and packaged with `vsce`. To build a VSIX locally:
+For working on the plugin itself:
 
-```bash
-npm install
-npm run package   # → devspec-autopilot.vsix
-```
+- Run a checkout directly with `cursor-agent --plugin-dir <path-to-checkout>`; set `DEVSPEC_MCP_TOKEN` (and `DEVSPEC_API_URL` to point at another DevSpec environment) in the environment you start it from.
+- `node scripts/setup-cursor.mjs` writes or refreshes the `devspec` entry in `~/.cursor/mcp.json`. It reads the token from `DEVSPEC_MCP_TOKEN`, standard input or `~/.devspec/auth.json`, never from the command line, and never prints it.
+- `cursor-agent --resume` works as usual; the plugin reports Cursor's conversation id to DevSpec as `local_session_id`. A chat without a Cursor conversation id is matched to a DevSpec connection only when exactly one live, attached Cursor connection is in the folder; with several, the plugin refuses rather than guess.
+- Run the tests with `npm test`.
 
-The two remote-control skills are packaged in this plugin. Release notes are in [CHANGELOG.md](./CHANGELOG.md).
+Release notes are in [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 

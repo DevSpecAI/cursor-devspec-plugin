@@ -5,7 +5,7 @@
  * WHY THIS IS CURSOR-SPECIFIC (this repo owns every script in it — the plugins are
  * independent implementations and nothing is synced between them). The Cursor
  * extension stores the DevSpec token in Cursor's OWN MCP config —
- * `~/.cursor/mcp.json` (written by the "DevSpec: Set MCP token" command) or a
+ * `~/.cursor/mcp.json` (written by `node scripts/setup-cursor.mjs`) or a
  * project `.cursor/mcp.json` — NOT in a `CLAUDE_PLUGIN_OPTION_*` env var. The
  * detached poller and the turn-mirroring hooks run in a side channel that doesn't
  * share Cursor's config, so they must resolve THAT token — otherwise
@@ -31,14 +31,24 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { agentsPageLinks } from './app-pages.mjs'
 
 const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 const WRONG_TOKEN_RE = /belongs to a different token/i
 
 export const DEFAULT_MCP_URL = DEFAULT_PROD_URL
 
-export const TOKENS_WARNING_FIX =
-  'Open You → Connections, reveal the key you want, and make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
+/**
+ * How to settle more than one key: reveal the right one on the Agent setup page of
+ * the environment(s) those keys belong to, never a fixed production link.
+ */
+export function tokensWarningFix(pairs, opts = {}) {
+  const links = agentsPageLinks((pairs || []).map((pair) => pair?.mcp_url), opts)
+  return (
+    `Open DevSpec's Agent setup page at ${links} to reveal the key you want, ` +
+    'then make the Cursor MCP key (~/.cursor/mcp.json) and the project .mcp.json key the same.'
+  )
+}
 
 // Captured at load so tests that overwrite HOME/USERPROFILE cannot make a
 // project walk climb into the real ~/.cursor/mcp.json.
@@ -104,7 +114,7 @@ function tokenNotFoundError(log, { urlOnly = false } = {}) {
   const looked = formatLookedIn(log)
   const unreadable = [...new Set((log?.entries || []).filter((e) => e.status === 'unreadable').map((e) => e.path))]
   const hint =
-    'Run "DevSpec: Set MCP token" in Cursor (writes ~/.cursor/mcp.json), or set DEVSPEC_MCP_TOKEN.'
+    'Run: node scripts/setup-cursor.mjs (reading DEVSPEC_MCP_TOKEN, stdin, or ~/.devspec/auth.json to write ~/.cursor/mcp.json).'
   if (unreadable.length) {
     return `Found a DevSpec MCP config but could not parse it: ${unreadable.join(', ')}.${looked ? ` Searched: ${looked}.` : ''} ${hint}`
   }
@@ -348,7 +358,7 @@ export function distinctTokenPairs(pairs) {
   return out
 }
 
-export function buildTokensWarning(pairs) {
+export function buildTokensWarning(pairs, opts = {}) {
   const tokens = distinctTokenPairs(pairs)
   if (tokens.length < 2) return null
   const named = tokens
@@ -356,7 +366,16 @@ export function buildTokensWarning(pairs) {
     .join(', ')
   return (
     `This machine has more than one DevSpec key: ${named}. ` +
-    `Connect will use the key that owns this connection. ${TOKENS_WARNING_FIX}`
+    `Connect will use the key that owns this connection. ${tokensWarningFix(tokens, opts)}`
+  )
+}
+
+/** Every reachable key was refused by this connection: send the person to the page(s) that hold them. */
+export function noOwningKeyError(pairs, opts = {}) {
+  const links = agentsPageLinks(distinctTokenPairs(pairs).map((pair) => pair.mcp_url), opts)
+  return (
+    'No reachable DevSpec key owns this connection. ' +
+    `Open DevSpec's Agent setup page at ${links} and make the Cursor MCP key and the project .mcp.json key the same.`
   )
 }
 

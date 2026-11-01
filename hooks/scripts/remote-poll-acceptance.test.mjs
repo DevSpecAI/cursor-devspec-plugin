@@ -1,16 +1,22 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
+import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   advancePollCursorState,
   appendAcceptedCanonicalJsonl,
   appendAcceptedJsonl,
   buildPollCursorArgs,
   inspectPollResponseV1,
+  isCatchUpCursorRefusal,
   automationAcceptanceKey,
+  automationRunInstruction,
 } from './remote-poll-acceptance.mjs'
 import { canonicalAcceptanceKey, validateRemoteIngressEnvelopeV1 } from './remote-ingress-v1.mjs'
 import {
@@ -49,10 +55,10 @@ describe('poll acceptance integration seam', () => {
     assert.equal(automationAcceptanceKey(automation), `automation:${automation.run_id}`)
   })
 
-  it('rejects action-item/unknown dispatches rather than reviving assignment delivery', () => {
-    const actionAssignment = { ...fixtureAutomationDispatch(), kind: 'action_item_assignment' }
+  it('rejects task/unknown dispatches rather than reviving assignment delivery', () => {
+    const taskAssignment = { ...fixtureAutomationDispatch(), kind: 'task_assignment' }
     const accepted = inspectPollResponseV1(
-      fixturePollResponse({ dispatches: [actionAssignment] }),
+      fixturePollResponse({ dispatches: [taskAssignment] }),
       FIXTURE_ID.connection,
     )
     assert.equal(accepted.ok, false)
@@ -248,5 +254,275 @@ describe('poll acceptance integration seam', () => {
     assert.equal(executed.executed, true)
     assert.equal(executed.ackId, control.id)
     assert.deepEqual(buildPollCursorArgs({ controlAck: executed.ackId }), { control_ack: control.id })
+  })
+
+  it('renders delivery_connection_id in both claim_automation_run and record_automation_run and drops provider/model prose', () => {
+    const dispatch = fixtureAutomationDispatch()
+    const prompt = automationRunInstruction(dispatch)
+    assert.match(
+      prompt,
+      new RegExp(`claim_automation_run\\(\\{ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}" \\}\\)`),
+    )
+    assert.match(
+      prompt,
+      new RegExp(`record_automation_run\\(\\{ run_id: "${dispatch.run_id}", connection_id: "${dispatch.delivery_connection_id}"`),
+    )
+    assert.doesNotMatch(prompt, /always pass provider/i)
+    assert.doesNotMatch(prompt, /provider:\s*"cursor"/i)
+  })
+
+  it('never starts a history drain from a page the server is holding back (delivery_retry)', () => {
+    const envelope = fixtureEnvelope({
+      wakeKind: 'advisory_update',
+      commands: [],
+      window: {
+        policy_version: '2026-08-19.3',
+        returned: 0,
+        total_known: null,
+        source_window: {
+          start: { sequence: 9, created_at: '2026-08-19T12:00:09.000Z', message_id: FIXTURE_ID.message },
+          end: { sequence: 9, created_at: '2026-08-19T12:00:09.000Z', message_id: FIXTURE_ID.message },
+        },
+        truncated: true,
+        has_more: true,
+        next_cursor: 'after:held-page',
+        fetch_id: 'session:held:messages',
+        omission_reason: 'delivery_retry',
+      },
+    })
+    const accepted = inspectPollResponseV1(
+      fixturePollResponse({ envelope, over: { cursor_v2: 'live-retry' } }),
+      FIXTURE_ID.connection,
+    )
+    assert.equal(accepted.ok, true)
+    assert.equal(accepted.deliveryRetry, true)
+    assert.equal(accepted.catchUpCursor, null)
+
+    // Steady state: forward delivery_retry continuation is NOT installed as catchUpCursor.
+    assert.deepEqual(
+      advancePollCursorState(
+        { liveCursorV2: 'live-before', legacyCursor: null, catchUpCursor: null, dispatchCursor: 'd1' },
+        accepted,
+      ),
+      {
+        liveCursorV2: 'live-retry',
+        legacyCursor: null,
+        catchUpCursor: null,
+        dispatchCursor: 'dispatch-watermark',
+      },
+    )
+
+    // Draining older history while a live page is held preserves the existing older catchUpCursor.
+    assert.deepEqual(
+      advancePollCursorState(
+        { liveCursorV2: 'live-before', legacyCursor: null, catchUpCursor: 'before:older-page', dispatchCursor: 'd1' },
+        accepted,
+        { drainingCatchUp: true },
+      ),
+      {
+        liveCursorV2: 'live-before',
+        legacyCursor: null,
+        catchUpCursor: 'before:older-page',
+        dispatchCursor: 'dispatch-watermark',
+      },
+    )
+  })
+
+  it('recognises the server refusing a poisoned catch-up cursor', () => {
+    assert.equal(isCatchUpCursorRefusal(new Error('catch_up_cursor has the wrong direction.')), true)
+    assert.equal(
+      isCatchUpCursorRefusal(new Error('catch_up_cursor requires catch_up: true on an attached connection.')),
+      true,
+    )
+    assert.equal(isCatchUpCursorRefusal(new Error('rate limit exceeded')), false)
+    assert.equal(isCatchUpCursorRefusal(null), false)
+  })
+
+  it('recovers a live poller from a persisted poisoned catch_up_cursor, survives a held retry page, and delivers the pending command once', async () => {
+    const POLL_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'devspec-remote-poll.mjs')
+    const SESSION = '20000000-0000-4000-8000-000000000002'
+    const polls = []
+    let heldServed = false
+    let commandDelivered = false
+
+    const heldEnvelope = fixtureEnvelope({
+      envelopeId: 'e0000000-0000-4000-8000-000000000001',
+      wakeKind: 'advisory_update',
+      commands: [],
+      window: {
+        policy_version: '2026-08-19.3',
+        returned: 0,
+        total_known: null,
+        source_window: {
+          start: { sequence: 9, created_at: '2026-08-19T12:00:09.000Z', message_id: FIXTURE_ID.message },
+          end: { sequence: 9, created_at: '2026-08-19T12:00:09.000Z', message_id: FIXTURE_ID.message },
+        },
+        truncated: true,
+        has_more: true,
+        next_cursor: 'after:held-page-2',
+        fetch_id: `session:${SESSION}:messages`,
+        omission_reason: 'delivery_retry',
+      },
+    })
+
+    const liveCommandEnvelope = fixtureEnvelope({
+      envelopeId: 'e0000000-0000-4000-8000-000000000002',
+      body: 'ship the recovered command',
+    })
+
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', async () => {
+        const parsed = JSON.parse(body)
+        const call = parsed.params ?? {}
+        const args = call.arguments ?? {}
+        let result = { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] }
+
+        if (call.name === 'poll_connection') {
+          polls.push(args)
+          if (args.catch_up_cursor && !String(args.catch_up_cursor).startsWith('before:')) {
+            result = {
+              isError: true,
+              content: [{ type: 'text', text: 'catch_up_cursor has the wrong direction.' }],
+            }
+          } else if (!heldServed) {
+            heldServed = true
+            result = {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'live',
+                  session_id: SESSION,
+                  changed: true,
+                  cursor: null,
+                  cursor_v2: 'after:held-tick',
+                  dispatch_cursor: 'dispatch-1',
+                  ingress: heldEnvelope,
+                  dispatches: [],
+                }),
+              }],
+            }
+          } else if (!commandDelivered) {
+            commandDelivered = true
+            result = {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'live',
+                  session_id: SESSION,
+                  changed: true,
+                  cursor: FIXTURE_ID.message,
+                  cursor_v2: 'after:command-tick',
+                  dispatch_cursor: 'dispatch-1',
+                  ingress: liveCommandEnvelope,
+                  dispatches: [],
+                }),
+              }],
+            }
+          } else {
+            await new Promise((r) => setTimeout(r, 150))
+            result = {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'live',
+                  session_id: SESSION,
+                  changed: false,
+                  cursor: FIXTURE_ID.message,
+                  cursor_v2: 'after:command-tick',
+                  dispatch_cursor: 'dispatch-1',
+                }),
+              }],
+            }
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result }))
+      })
+    })
+
+    await new Promise((r) => server.listen(0, '127.0.0.1', r))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/mcp`
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-cursor-recovery-'))
+    const connDir = path.join(home, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(connDir, { recursive: true })
+    const statePath = path.join(connDir, `${FIXTURE_ID.connection}.json`)
+    const inboxPath = path.join(connDir, `${FIXTURE_ID.connection}.inbox.jsonl`)
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        enabled: true,
+        connection_id: FIXTURE_ID.connection,
+        session_id: SESSION,
+        agent_name: 'Cursor',
+        token: 'dvs_test_token',
+        mcp_url: mcpUrl,
+        ingress_version: 1,
+        ingress_cursor_v2: 'before-wedge',
+        ingress_catch_up_cursor: 'after:poisoned-forward-cursor',
+      }),
+      { mode: 0o600 },
+    )
+
+    const child = spawn(process.execPath, [POLL_SCRIPT, '--connection-id', FIXTURE_ID.connection], {
+      env: { ...process.env, HOME: home },
+    })
+    let stderr = ''
+    child.stdout.resume()
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+
+    const readInbox = () => {
+      try {
+        return fs.readFileSync(inboxPath, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
+      } catch {
+        return []
+      }
+    }
+    const readState = () => {
+      try {
+        return JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      } catch {
+        return {}
+      }
+    }
+    const until = async (pred, timeoutMs = 10_000) => {
+      const deadline = Date.now() + timeoutMs
+      while (!pred() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25))
+      }
+      return pred()
+    }
+
+    try {
+      assert.ok(
+        await until(() => readInbox().some((r) => r.type === 'owner_messages')),
+        `poller did not deliver recovered owner_messages; stderr:\n${stderr}`,
+      )
+      // Wait for at least one steady idle poll after command delivery so we verify no re-poisoning or duplicate delivery.
+      assert.ok(await until(() => polls.length >= 4), `expected >= 4 polls, got ${polls.length}`)
+
+      // 1. First poll sent the persisted poisoned cursor and was refused.
+      assert.equal(polls[0].catch_up_cursor, 'after:poisoned-forward-cursor')
+      // 2. Subsequent polls never sent a poisoned catch_up_cursor again, even after receiving a delivery_retry page.
+      assert.equal(polls.slice(1).some((p) => p.catch_up_cursor), false)
+      assert.equal(polls[1].catch_up, true, 'recovery poll re-reads with catch_up: true')
+      assert.equal(readState().ingress_catch_up_cursor, null)
+
+      // 3. The pending command was delivered to the inbox exactly once.
+      const ownerRecords = readInbox().filter((r) => r.type === 'owner_messages')
+      assert.equal(ownerRecords.length, 1)
+      assert.deepEqual(
+        ownerRecords[0].messages.map((m) => m.message_id),
+        [FIXTURE_ID.message],
+      )
+    } finally {
+      child.kill('SIGKILL')
+      try {
+        fs.rmSync(resolveSpaceFreeWakeFile(FIXTURE_ID.connection), { force: true })
+      } catch { /* ignore */ }
+      fs.rmSync(home, { recursive: true, force: true })
+      await new Promise((r) => server.close(r))
+    }
   })
 })

@@ -25,7 +25,10 @@ import { spawn } from 'node:child_process'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { postTrailFromTranscript } from './post-trail-from-transcript.mjs'
+import { recordProgressFailure } from './progress-diagnostics.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { recordTurnActivity } from './turn-liveness.mjs'
+import { currentTurnNoticeIds } from './notice-reply.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const DEFAULT_POLL_MS = 800
@@ -67,6 +70,22 @@ export function readConnectionState(connectionId, dir = CONNECTIONS_DIR) {
   } catch {
     return null
   }
+}
+
+export function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
+  if (!connectionId) return null
+  try {
+    const raw = JSON.parse(fs.readFileSync(turnMarkerPath(connectionId, dir), 'utf8'))
+    return typeof raw?.startedAt === 'number' ? raw : null
+  } catch {
+    return null
+  }
+}
+
+export function shouldStreamTurnTrail(state, marker) {
+  if (!state || state.enabled === false) return false
+  if (state.session_id) return true
+  return Boolean(marker?.remoteTurn)
 }
 
 export function isTurnActive(connectionId, dir = CONNECTIONS_DIR) {
@@ -164,7 +183,15 @@ async function main() {
     }
     idleSince = null
 
-    if (!state.session_id) {
+    const marker = readTurnMarker(connectionId)
+    if (!shouldStreamTurnTrail(state, marker)) {
+      await sleep(args.pollMs)
+      continue
+    }
+
+    // A turn woken only by DevSpec notices posts no trail: DevSpec would file it under
+    // someone's command (notice-reply.mjs).
+    if (currentTurnNoticeIds(connectionId, { dir: CONNECTIONS_DIR, connectionState: state })) {
       await sleep(args.pollMs)
       continue
     }
@@ -196,6 +223,7 @@ async function main() {
       await sleep(args.pollMs)
       continue
     }
+    recordTurnActivity(connectionId, { dir: CONNECTIONS_DIR })
 
     let token = state.mcp_token || state.token || null
     let mcpUrl = state.mcp_url || null
@@ -220,9 +248,9 @@ async function main() {
         agentName: AGENT_NAME,
       })
     } catch (e) {
-      process.stderr.write(
-        `cli-trail-watch: post failed: ${e instanceof Error ? e.message : String(e)}\n`,
-      )
+      // Detached watcher stderr is intentionally ignored. Persist only a safe,
+      // bounded diagnostic instead of losing the failure or capturing raw output.
+      recordProgressFailure(connectionId, e)
     }
 
     await sleep(args.pollMs)
@@ -241,7 +269,7 @@ async function main() {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
   main().catch((e) => {
-    process.stderr.write(`cli-trail-watch: ${e instanceof Error ? e.message : String(e)}\n`)
+    recordProgressFailure(parseArgs(process.argv.slice(2)).connectionId, e, { source: 'watch_exit' })
     process.exit(1)
   })
 }

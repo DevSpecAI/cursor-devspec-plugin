@@ -22,7 +22,7 @@
  *   ~/.devspec/remote-control.json
  *
  * Product rules (connection-native):
- *   - bare `/devspec.remote` → register a SESSIONLESS connection for THIS
+ *   - bare `/devspec-remote` → register a SESSIONLESS connection for THIS
  *     conversation (no create_session), unless it is already live (re-arm) or has a
  *     recoverable local_stop bond (reconnect).
  *   - `--session <uuid>` → attach the connection to that session (explicit only).
@@ -53,17 +53,21 @@
  *   node remote-control-state.mjs attach --connection-id <uuid> --session <uuid>
  *       [--launch-id <uuid>]
  *     → Node-measured attach_connection
- *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
- *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
+ *   node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid>
+ *       [--session <uuid> | --new [--private] [--title "…"]]
+ *       [--cwd <path>] [--launch-id <uuid>] [--project <name-or-id>] [--prompt-file <path>]
  *       [--no-poller]
- *     → Mechanical register → optional attach → write (poller optional; Cursor
- *       launch defers it until after agent --resume)
+ *     → Mechanical register → optional create (--new) → optional attach → write
+ *       (poller optional; Cursor launch defers it until after agent --resume).
+ *       `fast-connect --help` prints its usage and does nothing else.
  *   node remote-control-state.mjs manage-plan describe
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-plan use
+ *   node remote-control-state.mjs manage-poll describe
+ *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-poll use
  *   node remote-control-state.mjs manage-question describe|status
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-question use
  *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs manage-question respond
- *     → capability-bound manage_plan for THIS Cursor conversation (no identity args)
+ *     → capability-bound manage_plan / manage_poll / manage_directed_question for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
  */
@@ -77,6 +81,7 @@ import { fileURLToPath } from 'node:url'
 import {
   enumerateCredentialPairs,
   hostTokenFromEnv,
+  noOwningKeyError,
   proveCredentialPair,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
@@ -86,12 +91,19 @@ import {
   LOCAL_ID_OVERRIDE_ENV_VAR,
 } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { findProjectPin } from './provenance-assistance.mjs'
+import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
+import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
   clearConnectionCapability,
   describeManagePlanBridge,
   persistConnectionCapability,
   useManagePlanBridge,
 } from './manage-plan-bridge.mjs'
+import {
+  describeManagePollBridge,
+  useManagePollBridge,
+} from './manage-poll-bridge.mjs'
 import {
   describeManageQuestionBridge,
   manageQuestionStatus,
@@ -162,11 +174,21 @@ function writeJson(filePath, state) {
   fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = { _: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--session' || a === '--session_id') out.session = argv[++i]
+    const projectEquals = /^--project(?:-id|_id)?=(.*)$/.exec(a)
+    const valueEquals = /^--(session|title)=(.*)$/.exec(a)
+    if (projectEquals) {
+      if (out['project-id'] || !projectEquals[1].trim()) throw new Error('Pass one non-empty project name or full ID.')
+      out['project-id'] = projectEquals[1]
+    } else if (valueEquals) out[valueEquals[1]] = valueEquals[2]
+    else if (a === '--help' || a === '-h') {
+      // Kept positional too, so every other command reads it exactly as before.
+      out.help = true
+      out._.push(a)
+    } else if (a === '--session' || a === '--session_id') out.session = argv[++i]
     else if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
       out['connection-id'] = argv[++i]
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
@@ -186,11 +208,17 @@ function parseArgs(argv) {
       out['except-connection'] = argv[++i]
     } else if (a === '--no-poller' || a === '--skip-poller') {
       out.noPoller = true
-    } else if (a === '--force-new' || a === '--new') {
+    } else if (a === '--force-new') {
       out.forceNew = true
+    } else if (a === '--new') {
+      // fast-connect: open a new room. resolve-local still reads it as --force-new.
+      out.new = true
+    } else if (a === '--private') {
+      out.private = true
     } else if (a === '--launch-id' || a === '--launch_id') {
       out['launch-id'] = argv[++i]
-    } else if (a === '--project-id' || a === '--project_id') {
+    } else if (a === '--project' || a === '--project-id' || a === '--project_id') {
+      if (out['project-id'] || !argv[i + 1]?.trim() || argv[i + 1].startsWith('--')) throw new Error('Pass one project name or full ID after --project.')
       out['project-id'] = argv[++i]
     } else if (a === '--git-remote' || a === '--git_remote') {
       out['git-remote'] = argv[++i]
@@ -479,11 +507,11 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
 }
 
 /**
- * Resolve a durable owner PID from a process we just spawned (item f099fc6e).
+ * Resolve a durable owner PID from a supplied process tree (item f099fc6e).
  *
- * Mechanical Connect runs *before* `agent --resume`, so walking *ancestors* of
- * launch-cli-session never sees cursor-agent. After spawn, walk *descendants*
- * of the child PID (often powershell.exe wrapping agent.ps1 on Windows).
+ * An explicit owner hint may identify a shell wrapping the already-running
+ * Cursor CLI rather than the durable host. Walk its descendants to find the
+ * native agent (often powershell.exe wrapping agent.ps1 on Windows).
  *
  * POSIX: the spawn PID is the agent — return it.
  * Windows: wait briefly for cursor-agent/agent.exe in the child tree; never
@@ -544,44 +572,6 @@ function persistOwnerPidOnConnection(connectionId, ownerPid) {
   } catch {
     /* poller still receives --owner-pid on argv */
   }
-}
-
-/**
- * After `agent --resume` is spawned, find a durable owner in that child tree
- * and start the poller. Does not abort the CLI on failure — the agent is already
- * running; a warning is the caller's job.
- *
- * @param {string} connectionId
- * @param {string | number | null | undefined} spawnPid
- * @param {{
- *   cwd?: string,
- *   sessionId?: string | null,
- *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
- *   ensurePoller?: typeof ensurePollerForConnection,
- *   childTreeOpts?: object,
- * }} [opts]
- */
-export function ensurePollerAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
-  if (!connectionId || connectionId.length < 8) {
-    return { ok: false, error: 'missing connection id', owner_pid: null }
-  }
-  const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
-  const ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
-  if (!ownerPid) {
-    return {
-      ok: false,
-      error:
-        'no durable owner-pid in spawned agent tree (waited for cursor-agent --resume / agent.exe descendant; powershell/cmd/launch-cli-session/Cursor.exe/worker-server are not anchors)',
-      owner_pid: null,
-    }
-  }
-  const ensure = opts.ensurePoller || ensurePollerForConnection
-  const poller = ensure(connectionId, {
-    cwd: opts.cwd,
-    sessionId: opts.sessionId || null,
-    ownerPid,
-  })
-  return { ...poller, owner_pid: ownerPid }
 }
 
 /**
@@ -734,54 +724,6 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
     wake_file: wakeFile,
     arm: armFlag,
   }
-}
-
-/**
- * After `agent --resume` is spawned, start host-owned inbox follow with the
- * same durable owner as the poller.
- *
- * @param {string} connectionId
- * @param {string | number | null | undefined} spawnPid
- * @param {{
- *   cwd?: string,
- *   launchId?: string | null,
- *   wakeFile: string,
- *   ownerPid?: number | null,
- *   resolveOwnerPidFromChildTree?: typeof resolveOwnerPidFromChildTree,
- *   ensureFollow?: typeof ensureWakeFollowForConnection,
- *   childTreeOpts?: object,
- * }} [opts]
- */
-export function ensureWakeFollowAfterAgentSpawn(connectionId, spawnPid, opts = {}) {
-  if (!connectionId || connectionId.length < 8) {
-    return { ok: false, error: 'missing connection id', owner_pid: null }
-  }
-  const wakeFile = typeof opts.wakeFile === 'string' ? opts.wakeFile.trim() : ''
-  if (!wakeFile) return { ok: false, error: 'missing wake file', owner_pid: null }
-  let ownerPid = opts.ownerPid != null ? Number(opts.ownerPid) : null
-  if (!Number.isInteger(ownerPid) || ownerPid < 1) {
-    const resolveTree = opts.resolveOwnerPidFromChildTree || resolveOwnerPidFromChildTree
-    ownerPid = resolveTree(spawnPid, opts.childTreeOpts || {})
-  }
-  if (!ownerPid) {
-    return {
-      ok: false,
-      error:
-        'no durable owner-pid in spawned agent tree for wake follow (same --resume / agent.exe rule as the poller)',
-      owner_pid: null,
-    }
-  }
-  const ensure = opts.ensureFollow || ensureWakeFollowForConnection
-  const follow = ensure(connectionId, {
-    cwd: opts.cwd,
-    ownerPid,
-    launchId: opts.launchId || null,
-    wakeFile,
-    // Cold first-arm after Connect / --resume (host follow only — model wake-tail
-    // still must not pass --from-end; decision 70b0d7d6).
-    fromEnd: true,
-  })
-  return { ...follow, owner_pid: ownerPid }
 }
 
 /**
@@ -1195,101 +1137,6 @@ export function ownerAlive(pid) {
   }
 }
 
-/** Every per-connection state object on disk (raw). */
-function scanConnectionStates() {
-  const out = []
-  try {
-    if (!fs.existsSync(CONNECTIONS_DIR)) return out
-    for (const f of fs.readdirSync(CONNECTIONS_DIR)) {
-      if (!f.endsWith('.json')) continue
-      const s = readJson(path.join(CONNECTIONS_DIR, f))
-      if (s && s.connection_id) out.push(s)
-    }
-  } catch {
-    /* ignore */
-  }
-  return out
-}
-
-/**
- * Legacy backstop threshold. A still-running poller whose connection state carries
- * NO recorded owner_pid can't be proven dead by owner-death — this was the exact
- * zombie gap (item 00bd4f6e). New pollers always record an owner_pid
- * (ensurePollerForConnection refuses to spawn without one), so a live no-owner_pid
- * state is a pre-fix artifact. We reap it only once its local state has been
- * untouched this long, so a freshly-active legacy poller is never killed.
- */
-const STALE_NO_OWNER_REAP_MS = 60 * 60 * 1000 // 1h
-
-/**
- * Reap PROVABLY-DEAD pollers — the connect-time / SessionStart backstop for the
- * self-terminating poller. A poller is reaped when its connection is provably dead
- * (state disabled, ended-from-UI, or its recorded owner process is gone), so a live
- * sibling terminal's poller is NEVER touched. As a legacy safety net, a poller with
- * NO recorded owner_pid (pre-owner-pid-contract artifact — new spawns always record
- * one) is reaped only once its local state has gone stale beyond STALE_NO_OWNER_REAP_MS,
- * so a freshly-active one is left alone. Injectable for tests.
- */
-export function reapDeadPollers({
-  agent = AGENT_NAME,
-  exceptConnectionId = null,
-  now = Date.now(),
-  staleNoOwnerReapMs = STALE_NO_OWNER_REAP_MS,
-  listStates = scanConnectionStates,
-  findPids = findPollerPidsForConnection,
-  isOwnerAlive = ownerAlive,
-  kill = (pid) => {
-    try {
-      process.kill(pid, 'SIGTERM')
-      return true
-    } catch {
-      return false
-    }
-  },
-} = {}) {
-  const reaped = []
-  for (const s of listStates()) {
-    if (!s || !s.connection_id) continue
-    if (exceptConnectionId && s.connection_id === exceptConnectionId) continue
-    if (agent && s.agent_name && String(s.agent_name).toLowerCase() !== String(agent).toLowerCase()) {
-      continue
-    }
-    const pids = findPids(s.connection_id)
-    if (!pids.length) continue
-    const ownerPid = Number.isInteger(s.owner_pid) && s.owner_pid > 1 ? s.owner_pid : null
-    const ownerGone = ownerPid !== null && !isOwnerAlive(ownerPid)
-    const provablyDead = s.enabled === false || s.ended_from_ui === true || ownerGone
-
-    // Legacy backstop: with no owner_pid there is nothing to prove death by, so
-    // reap only when the connection is still nominally enabled but its local state
-    // has been untouched beyond the stale threshold (never a freshly-active one; a
-    // missing/unparsable updated_at is treated as "unknown → leave alone").
-    let staleNoOwner = false
-    if (!provablyDead && ownerPid === null && s.enabled !== false && s.ended_from_ui !== true) {
-      const t = Date.parse(s.updated_at || '')
-      if (Number.isFinite(t) && now - t >= staleNoOwnerReapMs) staleNoOwner = true
-    }
-
-    if (!provablyDead && !staleNoOwner) continue
-    const killed = pids.filter((pid) => kill(pid))
-    clearConnectionCapability(s.connection_id)
-    reaped.push({
-      connection_id: s.connection_id,
-      agent_name: s.agent_name || null,
-      killed,
-      reason:
-        s.enabled === false
-          ? 'disabled'
-          : s.ended_from_ui
-            ? 'ended_from_ui'
-            : ownerGone
-              ? 'owner_gone'
-              : 'stale_no_owner',
-    })
-  }
-  return reaped
-}
-
 function agentSlug(name) {
   const s = String(name || 'agent')
     .toLowerCase()
@@ -1429,7 +1276,7 @@ function markBondsStoppedForConnection(connectionId, endReason = 'local_stop') {
 }
 
 /**
- * Resolve what bare /devspec.remote should do for THIS local conversation
+ * Resolve what bare /devspec-remote should do for THIS local conversation
  * (connection-native). Never scans by cwd.
  *
  * Actions:
@@ -1581,7 +1428,8 @@ export async function registerConnection(opts) {
   const started = Date.now()
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd()
   const localId = opts.localId
-  const projectId = opts.projectId
+  let projectId = typeof opts.projectId === 'string' ? opts.projectId.trim().toLowerCase() : null
+  if (projectId && !UUID.test(projectId)) return { ok: false, error: 'register requires a full project ID. Use fast-connect --project for a project name.' }
   const launchId = resolveLaunchId(opts.launchId)
   const agent = opts.agent || AGENT_NAME
   const mcpCall = opts.mcpCall || mcpToolsCall
@@ -1608,9 +1456,20 @@ export async function registerConnection(opts) {
     return { ok: false, error: auth.error || 'auth_failed' }
   }
 
+  try {
+    const previous = readProjectContext(localId, auth.mcp_url, opts.projectHome)
+    if (previous?.status === 'blocked' && previous.requires_explicit && !projectId) return { ok: false, error: previous.message }
+    if (previous?.status === 'selected') {
+      if (projectId && projectId !== previous.project.id) return { ok: false, error: 'This Cursor conversation uses another project. Start a fresh chat to switch.' }
+      projectId = previous.project.id
+    }
+  } catch (error) { return { ok: false, error: error.message } }
+  const pin = findProjectPin(cwd)
   const toolArgs = {
     local_id: localId,
-    project_id: projectId,
+    ...(projectId ? { project_id: projectId } : {}),
+    ...(pin ? { pinned_project_id: pin.projectId } : {}),
+    project_selection_version: 1,
     agent_name: agent,
     cwd,
     machine_hostname: opts.hostname || os.hostname(),
@@ -1636,6 +1495,9 @@ export async function registerConnection(opts) {
     const capabilityEnvelope = response?.meta?.devspec?.connection_capability
     const connectionId = result?.connection_id || result?.connectionId || null
     if (connectionId) {
+      const project = candidate(result.project_selection?.project) ?? candidate({ id: result.project_id, name: result.project_id })
+      if (!project || (projectId && projectId !== project.id)) throw new Error('DevSpec did not confirm the requested project. No local scope was adopted.')
+      selectProjectContext(localId, auth.mcp_url, project, result.project_selection?.source ?? 'conversation', opts.projectHome)
       const persisted = persistCapability({
         connectionId,
         localId,
@@ -1645,6 +1507,7 @@ export async function registerConnection(opts) {
       if (!persisted.ok) {
         throw new Error('register_connection did not return a valid hidden connection capability')
       }
+      storeRepositorySnapshot(localId, result, opts.projectHome)
     }
     await emitPhase({
       phase: 'register_connection',
@@ -1661,9 +1524,11 @@ export async function registerConnection(opts) {
         codename: result?.codename || result?.session_codename || null,
       },
     })
+    const github = githubIdentity(result?.github_identity)
     return {
       ok: !!connectionId,
-      ...result,
+      ...withoutOwnerReplyStyle(result),
+      ...(github ? { github_identity: github, github_status: renderGithubIdentity(github) } : {}),
       connection_id: connectionId,
       codename: result?.codename || result?.session_codename || null,
       local_id: localId,
@@ -1671,7 +1536,7 @@ export async function registerConnection(opts) {
       ...(connectionId ? {} : { error: 'register_connection returned no connection_id' }),
     }
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    const reason = err instanceof Error ? err.message : String(err)
     await emitPhase({
       phase: 'register_connection',
       outcome: 'error',
@@ -1682,7 +1547,11 @@ export async function registerConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    const choice = choiceFromFailure(err)
+    if (choice || projectId) {
+      try { blockProjectContext(localId, auth.mcp_url, 'Choose a project explicitly with fast-connect --project <name-or-id>.', opts.projectHome, Boolean(projectId)) } catch {}
+    }
+    return { ok: false, error: err instanceof Error ? err.message : String(err), ...(choice ? { code: 'project_choice_required', project_selection: choice } : {}) }
   }
 }
 
@@ -1739,6 +1608,7 @@ export async function attachConnection(opts) {
       arguments: { connection_id: connectionId, session_id: sessionId },
       timeoutMs: 60_000,
     })
+    if(!opts.localId) refreshRepositoryRules(readJson(connectionPath(connectionId))?.local_id, result, opts.projectHome)
     await emitPhase({
       phase: 'attach_connection',
       outcome: 'ok',
@@ -1752,13 +1622,13 @@ export async function attachConnection(opts) {
     })
     return {
       ok: true,
-      ...result,
+      ...withoutOwnerReplyStyle(result),
       connection_id: result?.connection_id || connectionId,
       session_id: result?.session_id || sessionId,
       launch_id: launchId,
     }
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)
+    const reason = err instanceof Error ? err.message : String(err)
     await emitPhase({
       phase: 'attach_connection',
       outcome: 'error',
@@ -1843,7 +1713,7 @@ export async function writeConnectionState(opts) {
         source: fallback.source || fallback.error || null,
         error:
           proven.error === 'no_proven_pair'
-            ? 'No reachable DevSpec key owns this connection. Open You → Connections and make the Cursor MCP key and the project .mcp.json key the same.'
+            ? noOwningKeyError(pairs)
             : proven.error === 'unproven'
               ? 'This machine has more than one DevSpec key; the poller will not start until one is proven to own this connection.'
               : fallback.error,
@@ -1928,12 +1798,7 @@ export async function writeConnectionState(opts) {
 
   const wantPoller = state.auth_ok && !opts.noPoller
   if (wantPoller) {
-    try {
-      const reaped = reapDeadPollers({ agent: agentName, exceptConnectionId: connectionId })
-      if (reaped.length) result.reaped = reaped
-    } catch {
-      /* non-fatal */
-    }
+    // Only THIS connection's poller is touched here — never another's (item 2b840556).
     const reuseRunning =
       !!prev.token &&
       prev.token === state.token &&
@@ -2018,6 +1883,36 @@ async function runCli() {
     // --connection-id / --local-id / --capability escape hatch on this command.
     const localId = detectLocalId({}, process.env).local_id
     const result = await useManagePlanBridge(input, {
+      localId,
+      agent: AGENT_NAME,
+      hostToken: hostTokenFromEnv(process.env),
+    })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
+  if (cmd === 'manage-poll') {
+    const action = args._[1] || 'describe'
+    if (action === 'describe') {
+      process.stdout.write(JSON.stringify(describeManagePollBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    if (action !== 'use') {
+      process.stderr.write('Usage: remote-control-state.mjs manage-poll describe|use\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write('manage-poll use requires one JSON object on stdin\n')
+      process.exit(2)
+    }
+    // Identity is host-derived only: no --connection-id / --local-id / --capability
+    // escape hatch on this command, and no directed-question turn/wake machinery.
+    const localId = detectLocalId({}, process.env).local_id
+    const result = await useManagePollBridge(input, {
       localId,
       agent: AGENT_NAME,
       hostToken: hostTokenFromEnv(process.env),
@@ -2276,7 +2171,7 @@ async function runCli() {
     const result = resolveLocalAction({
       agent: agentName,
       localId,
-      forceNew: !!args.forceNew,
+      forceNew: !!(args.forceNew || args.new),
       maxAgeMinutes,
     })
 
@@ -2341,19 +2236,6 @@ async function runCli() {
     }
     process.stdout.write(JSON.stringify(s, null, 2) + '\n')
     process.exit(s ? 0 : 1)
-  }
-
-  if (cmd === 'reap') {
-    // Connect-time / SessionStart backstop: SIGTERM provably-dead pollers only.
-    const agentName = args.agent || AGENT_NAME
-    const reaped = reapDeadPollers({
-      agent: agentName,
-      exceptConnectionId: args['except-connection'] || args['connection-id'] || null,
-    })
-    process.stdout.write(
-      JSON.stringify({ ok: true, agent: agentName, count: reaped.length, reaped }) + '\n',
-    )
-    process.exit(0)
   }
 
   if (cmd === 'ensure-poller' || cmd === 'start-poller') {
