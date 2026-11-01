@@ -304,3 +304,21 @@ describe('projectInput mechanical stamping', () => {
     assert.match(pre.user_message, /requests\.mjs" serve --connection-id/)
   })
 })
+
+describe('claims carry this conversation (item ef54cfcb)', () => {
+  it('stamps the host conversation id onto a claim, over anything the model sent', () => {
+    selectProjectContext(CONVERSATION, ENDPOINT, PROJECT, 'explicit', home)
+    const pre = projectInput(
+      'pre',
+      {
+        conversation_id: CONVERSATION,
+        cwd: home,
+        tool_name: 'MCP:devspec__claim_work_item',
+        tool_input: { task_id: REQ_A, agent_branch: 'work/x', local_session_id: 'not-this-chat' },
+      },
+      { home },
+    )
+    assert.equal(pre.updated_input.local_session_id, CONVERSATION)
+    assert.equal(pre.updated_input.project_id, PROJECT.id)
+  })
+})

@@ -56,7 +56,14 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
     if (!id) return deny('Cursor did not provide this conversation’s identity. Restart the agent before using DevSpec.')
     try {
       const args = toolArguments(input)
-      const identity = namespaced === 'register_connection' ? { local_id: id, agent_name: AGENT_NAME } : {}
+      // A claim carries this conversation's id, so DevSpec records which conversation
+      // holds it, and provenance-assistance.mjs can confirm a claim whose result Cursor
+      // did not pass to the hook (item ef54cfcb). The host's id, never the model's.
+      const identity = namespaced === 'register_connection'
+        ? { local_id: id, agent_name: AGENT_NAME }
+        : namespaced === 'claim_work_item'
+          ? { local_session_id: id }
+          : {}
       if (namespaced === 'register_connection' && args.local_id && args.local_id !== id) {
         return deny('Register only this Cursor conversation; do not reuse another conversation’s ID.')
       }
