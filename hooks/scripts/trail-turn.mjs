@@ -29,6 +29,7 @@ import {
 } from './work-trail.mjs'
 import { recordTurnActivity } from './turn-liveness.mjs'
 import { currentTurnNoticeIds } from './notice-reply.mjs'
+import { recordRuntimeReport } from './agent-telemetry.mjs'
 
 const VALID_MODES = new Set([
   'seed',
@@ -89,6 +90,13 @@ export async function runTrailTurn({
   if (!state?.enabled || !state.connection_id) {
     return { ok: false, skipped: true, reason: 'disabled_or_unbound' }
   }
+  // The model this tool call runs, for the Agents page (item 30cd0424). Every Cursor hook
+  // names it. The prompt-submit and stop hooks also report it, but neither is dependable
+  // for a connected conversation (measured on cursor-agent 2026.10.22): prompt-submit runs
+  // only for a prompt typed in the terminal, never for a room command, and stop is skipped
+  // whenever Cursor ends a turn on its own "WritableIterable is closed" error, which it did
+  // after nearly every turn of a long remote-driven session. So no model ever arrived.
+  recordRuntimeReport(state.connection_id, raw, connectionsDir ? { dir: connectionsDir, now: new Date(now) } : { now: new Date(now) })
   if (mode === 'seed' && !state.session_id) {
     return { ok: false, skipped: true, reason: 'seed_requires_session' }
   }
