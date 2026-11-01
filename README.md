@@ -109,7 +109,7 @@ You can ask the agent to do anything in DevSpec in plain words (*"Work on DevSpe
 | Command | What it does |
 |---|---|
 | `/devspec-remote` | Puts this conversation on your project's **Agents** page, ready to take work from your browser or phone. |
-| `/devspec-remote --new` | Connects and starts a new DevSpec session for this conversation. |
+| `/devspec-remote --new` | Connects and starts a new DevSpec session for this conversation, shared with the project. Add `--private` to make it visible only to you. |
 | `/devspec-remote --session <id>` | Connects and joins an existing DevSpec session. |
 | `/devspec-remote --project "<name>"` | Connects to that project for this conversation only, without changing the folder's default. |
 | `/devspec-remote-stop` | Disconnects this conversation from DevSpec, leaving other `cursor-agent` conversations connected. |

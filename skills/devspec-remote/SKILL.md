@@ -59,7 +59,7 @@ All poller / state scripts come from the **installed Cursor DevSpec plugin** —
 |---|---|
 | bare `/devspec-remote` | Register this conversation as an **available, SESSIONLESS** connection — no `create_session`, no room. It shows on the Agents page ready to be attached or addressed by a canonical conversation command. Task work remains agent-acquired, never delivered. (Unless already live / soft-reconnect bond for this conversation.) |
 | `--session <uuid>` | Register the connection, then **attach** it to that session (optional shared context + live transcript). **Never** `create_session`. This is the **reattach / session-first Connect** path. |
-| `--new` | Create a brand-new session, then register + attach the connection to it. |
+| `--new` | Create a brand-new session, then register + attach the connection to it. The session is shared with the project unless `--private` is also given. |
 
 Never rejoin/attach a session because it shared a repo/cwd or another agent stopped recently. The bond is conversation-scoped (`CURSOR_CONVERSATION_ID` / local id), never cwd-scoped. Multiple terminals own independent connections.
 
@@ -70,8 +70,9 @@ Never rejoin/attach a session because it shared a repo/cwd or another agent stop
 - `--project <name-or-id>` → explicitly choose a project for this local conversation, without writing a folder pin. Pass it to `fast-connect`; `--project-id` remains an ID-compatible spelling.
 - `--session=<uuid>` → **attach** the connection to that session (never `create_session`). Treat this run as **reattach / session-first Connect**.
 - `--new` → create a new session, then attach.
+- `--private` → only with `--new`: the new session is private, so only the person connecting can open it. Alone or with `--session` it does nothing, and `fast-connect` refuses it — say so rather than dropping it.
 - bare → register a sessionless connection.
-- `--title="…"` and remaining free text → used for `--new` (session title / opening note) only.
+- `--title="…"` → used for `--new` only, as the new session's title.
 
 ### 2. Resolve project
 
@@ -105,15 +106,17 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local \
 | `already_live` | This conversation already owns a live connection (`connection_id` in the result). Skip re-registering; just re-arm the wait (step 7). If args change the attachment (a new `--session`), attach as below. |
 | `reconnect` | Recent recoverable stop of this conversation's connection — resume it (re-register the same conversation; reattach its prior session only if it had one). |
 | `register` | Register a fresh **sessionless** connection. |
-| `create_and_attach` | `--new`: create a session, then attach. |
+| `create_and_attach` | `--new`: create a session, then attach — the single `fast-connect … --new` command under **`--new`** below. |
 
 **One-shot (preferred for cold manual Connect):**
 
 ```bash
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
-  --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" \
+  --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" \
   [--session "<uuid>"] [--project "<name-or-id>"] [--launch-id "<launch_id>"]
 ```
+
+`--owner-pid "$PPID"` anchors the poller to this Cursor process; without it the poller does not start. For `--new`, use the command under **`--new`** below. `fast-connect --help` lists its flags and connects nothing.
 
 Or **register** via the Node helper:
 
@@ -134,7 +137,11 @@ Now handle the session attachment by invocation:
   node "$PLUGIN/hooks/scripts/remote-control-state.mjs" attach \
     --connection-id "<connection_id>" --session "<uuid>" [--launch-id "<launch_id>"]
   ```
-- **`--new`** → `devspec__create_session({ session_type: "agent_remote_control", access: "private", agent_name: "Cursor", project_id, title?, initial_message? })`, then attach as above.
+- **`--new`** → one command registers the connection, creates the session and attaches to it; do not run `register`, `create_session` or `attach` yourself. The session is shared with the project; add `--private` only when the person asked for a private one:
+  ```bash
+  node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" --new [--private] [--title "…"]
+  ```
+  It returns the new session's `session_id` and `session_url`. If it fails, `code` names the step (`create_session_failed` or `attach_failed`) and the connection is not in a new session.
 
 Never scan by cwd. Other agents' files under `~/.devspec` are irrelevant.
 

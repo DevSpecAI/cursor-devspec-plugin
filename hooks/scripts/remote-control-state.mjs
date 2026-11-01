@@ -53,11 +53,13 @@
  *   node remote-control-state.mjs attach --connection-id <uuid> --session <uuid>
  *       [--launch-id <uuid>]
  *     → Node-measured attach_connection
- *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
- *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
+ *   node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid>
+ *       [--session <uuid> | --new [--private] [--title "…"]]
+ *       [--cwd <path>] [--launch-id <uuid>] [--project <name-or-id>] [--prompt-file <path>]
  *       [--no-poller]
- *     → Mechanical register → optional attach → write (poller optional; Cursor
- *       launch defers it until after agent --resume)
+ *     → Mechanical register → optional create (--new) → optional attach → write
+ *       (poller optional; Cursor launch defers it until after agent --resume).
+ *       `fast-connect --help` prints its usage and does nothing else.
  *   node remote-control-state.mjs manage-plan describe
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-plan use
  *   node remote-control-state.mjs manage-poll describe
@@ -177,9 +179,15 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const projectEquals = /^--project(?:-id|_id)?=(.*)$/.exec(a)
+    const valueEquals = /^--(session|title)=(.*)$/.exec(a)
     if (projectEquals) {
       if (out['project-id'] || !projectEquals[1].trim()) throw new Error('Pass one non-empty project name or full ID.')
       out['project-id'] = projectEquals[1]
+    } else if (valueEquals) out[valueEquals[1]] = valueEquals[2]
+    else if (a === '--help' || a === '-h') {
+      // Kept positional too, so every other command reads it exactly as before.
+      out.help = true
+      out._.push(a)
     } else if (a === '--session' || a === '--session_id') out.session = argv[++i]
     else if (a === '--connection-id' || a === '--connection_id' || a === '--connection') {
       out['connection-id'] = argv[++i]
@@ -200,8 +208,13 @@ export function parseArgs(argv) {
       out['except-connection'] = argv[++i]
     } else if (a === '--no-poller' || a === '--skip-poller') {
       out.noPoller = true
-    } else if (a === '--force-new' || a === '--new') {
+    } else if (a === '--force-new') {
       out.forceNew = true
+    } else if (a === '--new') {
+      // fast-connect: open a new room. resolve-local still reads it as --force-new.
+      out.new = true
+    } else if (a === '--private') {
+      out.private = true
     } else if (a === '--launch-id' || a === '--launch_id') {
       out['launch-id'] = argv[++i]
     } else if (a === '--project' || a === '--project-id' || a === '--project_id') {
@@ -2158,7 +2171,7 @@ async function runCli() {
     const result = resolveLocalAction({
       agent: agentName,
       localId,
-      forceNew: !!args.forceNew,
+      forceNew: !!(args.forceNew || args.new),
       maxAgeMinutes,
     })
 
