@@ -4,9 +4,10 @@
  * owner PID (item f099fc6e). This is plugin connection machinery, not the
  * independent DevSpec Launcher.
  *
- * Usage (CLI via remote-control-state.mjs):
- *   node remote-control-state.mjs fast-connect --local-id <id> [--session <uuid>]
- *       [--cwd <path>] [--launch-id <uuid>] [--project-id <uuid>] [--prompt-file <path>]
+ * Usage (CLI via remote-control-state.mjs; `fast-connect --help` prints it):
+ *   node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid>
+ *       [--session <uuid> | --new [--private] [--title <text>]]
+ *       [--cwd <path>] [--launch-id <uuid>] [--project <name-or-id>] [--prompt-file <path>]
  *
  * Native host helpers may also import fastConnect directly.
  */
@@ -223,12 +224,55 @@ export async function resolveProjectForConnect(opts) {
 }
 
 /**
+ * `--new`: open a room in the confirmed project for this connection. It is an
+ * ordinary shared room unless `--private` asked for one only the person can open.
+ * Called once, without the connect retry: a create is not idempotent, so a retried
+ * one whose first attempt landed would leave a second, empty room behind.
+ * @returns {Promise<{ ok: true, session_id: string, session_url: string | null, title: string | null } | { ok: false, error: string }>}
+ */
+async function createRoomForConnection({ auth, agent, projectId, title, codename, makePrivate, mcpCall }) {
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return { ok: false, error: auth?.error || 'auth_failed' }
+  if (!projectId) return { ok: false, error: 'The connection has no confirmed project to open the room in.' }
+  try {
+    const created = await mcpCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'create_session',
+      arguments: {
+        session_type: 'agent_remote_control',
+        access: makePrivate ? 'private' : 'shared',
+        agent_name: agent,
+        project_id: projectId,
+        ...(title ? { title } : {}),
+        ...(codename ? { session_codename: codename } : {}),
+      },
+      timeoutMs: 60_000,
+    })
+    const sessionId = [created?.session_id, created?.id].find(id => typeof id === 'string' && id.trim())
+    if (!sessionId) return { ok: false, error: 'DevSpec returned no session id for the new room.' }
+    return {
+      ok: true,
+      session_id: sessionId.trim(),
+      session_url: typeof created.session_url === 'string' ? created.session_url : null,
+      title: typeof created.title === 'string' ? created.title : title || null,
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
  * Mechanical Connect: local_id → project → register → optional attach → write/poller.
+ * With `newSession` (`--new`), the attach target is a room created for this
+ * connection after it is registered (or found already live).
  *
  * @param {{
  *   localId?: string | null,
  *   cwd?: string,
  *   sessionId?: string | null,
+ *   newSession?: boolean,
+ *   title?: string | null,
+ *   private?: boolean,
  *   launchId?: string | null,
  *   projectId?: string | null,
  *   agent?: string,
@@ -276,6 +320,31 @@ export async function fastConnect(opts = {}) {
     typeof opts.sessionId === 'string' && opts.sessionId.length >= 8
       ? opts.sessionId
       : parseSessionIdFromPrompt(opts.promptText)
+  const newSession = !!opts.newSession
+  const makePrivate = !!opts.private
+  const title = typeof opts.title === 'string' && opts.title.trim() ? opts.title.trim() : null
+  if (newSession && sessionId) {
+    return {
+      ok: false,
+      code: 'new_with_session',
+      error: '--new opens a new room and --session attaches to an existing one. Pass one or the other, not both.',
+      local_id: null,
+      connection_id: null,
+      session_id: null,
+    }
+  }
+  if (makePrivate && !newSession) {
+    return {
+      ok: false,
+      code: 'private_without_new',
+      error: sessionId
+        ? '--private does nothing with --session: it only applies to the room --new opens. Nothing was connected.'
+        : '--private does nothing without --new: it only applies to the room --new opens. Nothing was connected.',
+      local_id: null,
+      connection_id: null,
+      session_id: null,
+    }
+  }
 
   // --- resolve_local_id ---
   const idStarted = Date.now()
@@ -469,6 +538,60 @@ export async function fastConnect(opts = {}) {
     }
   }
 
+  // --- --new: create the room, then attach exactly as --session does ---
+  /** @type {{ session_id: string, session_url: string | null, title: string | null } | null} */
+  let createdRoom = null
+  if (newSession) {
+    const created = await createRoomForConnection({
+      auth,
+      agent,
+      projectId: projectContext?.project.id ?? null,
+      title,
+      codename,
+      makePrivate,
+      mcpCall: opts.mcpCall || mcpToolsCall,
+    })
+    if (!created.ok) {
+      return {
+        ok: false,
+        code: 'create_session_failed',
+        error: `create_session_failed: ${created.error}`,
+        local_id: localId,
+        launch_id: launchId,
+        connection_id: connectionId,
+        session_id: null,
+        codename,
+      }
+    }
+    const attached = await attachFn({
+      connectionId,
+      sessionId: created.session_id,
+      cwd,
+      launchId,
+      agent,
+      hostToken,
+      mcpCall,
+      resolveAuth,
+      emitPhase,
+    })
+    if (!attached.ok) {
+      // The room exists but this connection is not in it: name it, never claim it.
+      return {
+        ok: false,
+        code: 'attach_failed',
+        error: `attach_failed: ${attached.error || 'attach_connection failed'}`,
+        local_id: localId,
+        launch_id: launchId,
+        connection_id: connectionId,
+        session_id: null,
+        created_session_id: created.session_id,
+        codename,
+      }
+    }
+    attachedSessionId = attached.session_id || created.session_id
+    createdRoom = created
+  }
+
   // --- write_state (+ poller) ---
   const written = await writeFn({
     connectionId,
@@ -481,6 +604,7 @@ export async function fastConnect(opts = {}) {
     noPoller: !!opts.noPoller,
     hostToken,
     codename,
+    ...(createdRoom?.title ? { title: createdRoom.title } : {}),
     resolveAuth,
     emitPhase,
   })
@@ -542,6 +666,7 @@ export async function fastConnect(opts = {}) {
     local_id: localId,
     launch_id: launchId,
     action: localAction.action,
+    ...(createdRoom ? { new_session: true, session_url: createdRoom.session_url, title: createdRoom.title, access: makePrivate ? 'private' : 'shared' } : {}),
     project_id: projectContext?.project.id,
     project_selection: projectContext,
     project_context: projectSnapshot,
@@ -553,11 +678,40 @@ export async function fastConnect(opts = {}) {
   }
 }
 
+export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid> [options]
+
+Connect this Cursor conversation to DevSpec in one command: register it, attach
+it to a room if asked, write its state and start its poller.
+
+  --local-id <id>          This conversation's id (CURSOR_CONVERSATION_ID).
+  --agent <name>           Agent name shown in DevSpec. Default: Cursor.
+  --cwd <path>             The working folder. Default: the current directory.
+  --owner-pid <pid>        The Cursor process this connection belongs to; pass "$PPID".
+                           The poller does not start without it.
+  --session <uuid>         Attach to this existing room.
+  --new                    Open a new room for this conversation and attach to it.
+                           Shared with the project. Not with --session.
+  --private                With --new only: open the room so that only you can see it.
+  --title <text>           With --new: the new room's title.
+  --project <name-or-id>   Choose this conversation's project. --project-id is the same.
+  --launch-id <uuid>       The launch id stamped in the prompt, for local diagnostics.
+  --codename <name>        This agent's codename instead of a minted one.
+  -h, --help               Print this help and exit. Connects nothing.
+
+Prints one JSON result; exits 0 when connected, 1 when not.
+`
+
 /**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
  */
 export async function runFastConnectCli(args) {
+  // Help is read before anything else: it registers, writes and calls nothing.
+  if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
+    process.stdout.write(FAST_CONNECT_USAGE)
+    process.exit(0)
+  }
+
   let promptText = null
   if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
     try {
@@ -574,6 +728,9 @@ export async function runFastConnectCli(args) {
     localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
     cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
     sessionId: typeof args.session === 'string' ? args.session : null,
+    newSession: !!args.new,
+    title: typeof args.title === 'string' ? args.title : null,
+    private: !!args.private,
     launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
     projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
     agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
