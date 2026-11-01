@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * The model a connected Cursor conversation runs reaches DevSpec from the hooks
- * cursor-agent does run (item 30cd0424). cursor-agent 2026.10.22 never runs the
- * prompt-submit or stop hooks that used to be the only reporters, so the Agents page
- * showed no model for any Cursor agent.
+ * The model a connected Cursor conversation runs reaches DevSpec from the tool hooks
+ * cursor-agent runs on every tool call (item 30cd0424). The prompt-submit and stop hooks
+ * that used to be the only reporters are not dependable there: prompt-submit never runs
+ * for a room command, and stop is skipped when a turn ends on Cursor's own connection
+ * error, so in a live remote-driven session the Agents page showed no model at all.
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
