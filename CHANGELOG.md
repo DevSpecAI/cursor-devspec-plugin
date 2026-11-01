@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.0
+
+Fixes from running the plugin end to end in a real `cursor-agent` session, driven from DevSpec, before its Marketplace release.
+
+- **`/devspec-remote --new` opens a room and joins it in one step.** The agent no longer pieces together several steps to start a room. The new room is shared with your project; add `--private` to make it visible only to you (it only applies to a new room). The connect helper now has real help, and asking for it connects nothing.
+- **Commit tracking works in Cursor.** After the agent claims a task, its commits get the task's reference added automatically. Before, Cursor passed the plugin an empty result for a claim, so the plugin never saw it and stopped every commit that had no reference. The plugin now confirms the claim with DevSpec, and each claim records which Cursor chat holds it.
+- **DevSpec isn't refused before the conversation connects.** Opening a new room, or using DevSpec before a chat was connected, was met with "Permission denied", because one of the plugin's checks said nothing when it had nothing to change and Cursor treated that as a no. It now always answers.
+- **The Agents page shows which model the agent runs.** The plugin now reports it on every tool call, so it appears from the agent's first piece of work and follows a model change.
+- **Install page: keep the `x-devspec-plugin` line.** When `~/.cursor/mcp.json` has a `devspec` entry, Cursor connects the agent through it, so that entry must carry the `x-devspec-plugin` line. Without it, DevSpec tells the agent the plugin is missing. The install steps now show the line, and the update notes no longer say to delete it.
+- **Checks.**
+  - The tests use the claim results Cursor and DevSpec really produce.
+  - The hook that checks DevSpec calls is tested as Cursor runs it.
+  - A new test keeps the release version the same in the manifest, marketplace, package files, server header and install page.
+
 ## 0.16.22
 
 - Stream live work-trail progress during sessionless remote automation runs (both via Cursor mid-turn hooks and the CLI transcript watcher) without posting placeholder `Working…` seed text or leaking trails from unattached local turns, and retry cleanly if an early step fires before the automation run is claimed.

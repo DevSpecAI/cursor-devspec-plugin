@@ -56,12 +56,15 @@ Remote control from DevSpec and commit tracking run in the background, outside t
     "devspec": {
       "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
-        "Authorization": "Bearer dvs_your_token_here"
+        "Authorization": "Bearer dvs_your_token_here",
+        "x-devspec-plugin": "cursor/0.17.0"
       }
     }
   }
 }
 ```
+
+Keep the `x-devspec-plugin` line. With this entry in place, Cursor connects the agent to DevSpec through it instead of through the plugin's own settings, and the line tells DevSpec those calls come from the DevSpec plugin. Without it, DevSpec tells the agent the plugin is missing. You don't need to change it when the plugin updates.
 
 On macOS and Linux, make the file readable only by you:
 
@@ -98,7 +101,7 @@ The plugin used to be called **devspec-autopilot**, and it was installed straigh
    cursor-agent plugin marketplace remove devspec-autopilot
    ```
 
-3. Install **DevSpec** from the Cursor Marketplace and set your token (steps 1 and 2 above). An existing `devspec` entry in `~/.cursor/mcp.json` keeps working, so step 3 is already done. If that entry has an `x-devspec-plugin` line, delete the line: it names the old plugin's version.
+3. Install **DevSpec** from the Cursor Marketplace and set your token (steps 1 and 2 above). An existing `devspec` entry in `~/.cursor/mcp.json` keeps working, so step 3 is already done. Make sure that entry has the `x-devspec-plugin` line shown in step 3, and add it if it doesn't.
 
 ---
 
