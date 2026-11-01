@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.1
+
+The install page now reads like DevSpec's other plugin pages, for the Cursor Marketplace listing.
+
+- **What DevSpec does for you comes first.** The page opens with a short "Why DevSpec + Cursor?" list: shared team memory, steering the agent from your phone or the web, tasks with automatic commit tracking, and protection for your team's decisions.
+- **A shorter quick start.** Four steps: install from the Marketplace, enter your token, let remote control and commit tracking use it, and connect. There's a new tip on choosing **Run Everything** so an agent you drive from your phone doesn't wait at your desk for approval.
+- **Less about the plugin's insides.** Commit tracking is described by what it does for you. A new "How it works & data handling" section says plainly what the plugin connects to, runs in the background and stores on your machine.
+- **The Marketplace is the way to install.** Installing straight from GitHub is no longer offered as a customer route. Trying unreleased versions, from a local plugin folder that updates with one `git pull`, is now in the section for contributors.
+
 ## 0.17.0
 
 Fixes from running the plugin end to end in a real `cursor-agent` session, driven from DevSpec, before its Marketplace release.
