@@ -10,8 +10,10 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { ownConnectionId, withOwnConnection } from './own-connection.mjs'
-import { projectInput } from './project-input.mjs'
+import { hookOutput, projectInput } from './project-input.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { appendRequestEvent } from './requests.mjs'
 
@@ -320,5 +322,76 @@ describe('claims carry this conversation (item ef54cfcb)', () => {
     )
     assert.equal(pre.updated_input.local_session_id, CONVERSATION)
     assert.equal(pre.updated_input.project_id, PROJECT.id)
+  })
+})
+
+describe('the hook always answers Cursor (item 46dd5fc4)', () => {
+  // The preToolUse entry is fail-closed, and Cursor refuses a fail-closed hook that
+  // prints nothing ("Permission denied", logged as blocked / empty_stdout), so the
+  // no-op path must print an explicit empty answer. Run as Cursor runs it: a process
+  // reading the hook input on stdin, with nothing connected and no project chosen.
+  const script = fileURLToPath(new URL('./project-input.mjs', import.meta.url))
+  const runHook = (mode, input) =>
+    spawnSync(process.execPath, [script, mode], {
+      input: typeof input === 'string' ? input : JSON.stringify(input),
+      env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home },
+      encoding: 'utf8',
+    })
+
+  it('lets a DevSpec call through before the conversation is connected or has a project', () => {
+    const run = runHook('pre', {
+      conversation_id: CONVERSATION,
+      cwd: home,
+      tool_name: 'MCP:devspec__create_session',
+      tool_input: { session_type: 'agent_remote_control', title: 'New room' },
+    })
+    assert.equal(run.status, 0)
+    assert.deepEqual(JSON.parse(run.stdout), {})
+  })
+
+  it('lets a project-free call through when there is nothing to stamp', () => {
+    const run = runHook('pre', {
+      conversation_id: CONVERSATION,
+      cwd: home,
+      tool_name: 'MCP:devspec__list_projects',
+      tool_input: {},
+    })
+    assert.equal(run.status, 0)
+    assert.deepEqual(JSON.parse(run.stdout), {})
+  })
+
+  it('still refuses what it refused before', () => {
+    const run = runHook('pre', {
+      conversation_id: CONVERSATION,
+      cwd: home,
+      tool_name: 'MCP:devspec__manage_plan',
+      tool_input: {},
+    })
+    assert.equal(run.status, 0)
+    assert.equal(JSON.parse(run.stdout).permission, 'deny')
+  })
+
+  it('refuses input it cannot read instead of printing nothing', () => {
+    const run = runHook('pre', 'not json')
+    assert.equal(run.status, 0)
+    assert.equal(JSON.parse(run.stdout).permission, 'deny')
+  })
+
+  it('answers the server-aware check with no override when the call needs none', () => {
+    assert.equal(
+      hookOutput(
+        'before',
+        JSON.stringify({
+          conversation_id: CONVERSATION,
+          cwd: home,
+          mcp_server_name: 'devspec',
+          mcp_server_url: ENDPOINT,
+          tool_name: 'devspec__create_session',
+          tool_input: { title: 'New room' },
+        }),
+        { home },
+      ),
+      '{}',
+    )
   })
 })

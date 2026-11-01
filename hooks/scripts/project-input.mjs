@@ -243,13 +243,32 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
     return deny(error.message)
   }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * What this hook prints for one invocation: always one JSON object, never nothing.
+ *
+ * The preToolUse entry runs fail-closed (hooks.json), and Cursor treats a fail-closed
+ * hook that prints nothing as a refusal: cursor-agent 2026.10.22 logged it as
+ * `blocked` / `empty_stdout` and the model saw "Permission denied" (item 46dd5fc4).
+ * So "nothing to change" is said out loud as `{}`: no permission and no updated input,
+ * which leaves the call to Cursor's own permissions exactly as if no hook had run. A
+ * hook that cannot read its input still refuses.
+ */
+export function hookOutput(mode, rawInput, options) {
   try {
-    const output = projectInput(process.argv[2], JSON.parse(fs.readFileSync(0, 'utf8')))
-    if (output) process.stdout.write(JSON.stringify(output))
+    return JSON.stringify(projectInput(mode, JSON.parse(rawInput), options) ?? {})
   } catch {
-    process.stdout.write(
-      JSON.stringify(deny('DevSpec could not safely read the current conversation scope. Reconnect before using its project tools.')),
+    return JSON.stringify(
+      deny('DevSpec could not safely read the current conversation scope. Reconnect before using its project tools.'),
     )
   }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  let raw = ''
+  try {
+    raw = fs.readFileSync(0, 'utf8')
+  } catch {
+    /* unreadable input is refused by hookOutput, like any other unparseable input */
+  }
+  process.stdout.write(hookOutput(process.argv[2], raw))
 }
