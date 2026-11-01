@@ -160,7 +160,9 @@ export function writeConversationState(conversationId, value, stateRoot = defaul
 }
 
 function candidateCwd(data) {
-  return cleanString(data?.cwd) || cleanString(data?.working_directory) || process.cwd()
+  // MCP hooks carry no cwd, only the workspace roots.
+  const root = Array.isArray(data?.workspace_roots) ? cleanString(data.workspace_roots[0]) : null
+  return cleanString(data?.cwd) || cleanString(data?.working_directory) || root || process.cwd()
 }
 
 function editTargetDirectory(data) {
@@ -617,6 +619,51 @@ export async function confirmReferencesOnline(commitMessage, options = {}) {
   return { status: 'indeterminate', unresolved: [] }
 }
 
+export const CLAIM_CONFIRM_TIMEOUT_MS = 5_000
+
+/**
+ * Whether this conversation holds the claim on a task, asked of DevSpec: for a claim
+ * whose result Cursor did not pass to the hook (item ef54cfcb). It holds it when the task
+ * is being worked on under this conversation's id, which project-input.mjs stamps on
+ * every claim as local_session_id. Anything less, or no answer, is false: the claim goes
+ * unrecorded and a commit without a reference is stopped, as before.
+ */
+export async function confirmClaimOnline(options = {}) {
+  const {
+    taskId,
+    projectId,
+    conversationId,
+    cwd,
+    env = process.env,
+    timeoutMs = CLAIM_CONFIRM_TIMEOUT_MS,
+    call = mcpToolsCall,
+    resolveAuth = resolveDevspecMcpAuth,
+  } = options
+  if (!cleanUuid(taskId) || !cleanUuid(projectId) || !cleanString(conversationId)) return false
+  let auth
+  try {
+    auth = resolveAuth(cwd, { env })
+  } catch {
+    return false
+  }
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return false
+  let task
+  try {
+    task = await call({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'get_task',
+      arguments: { task_id: taskId, project_id: projectId },
+      timeoutMs,
+    })
+  } catch {
+    return false
+  }
+  return cleanUuid(task?.id) === cleanUuid(taskId) &&
+    task?.agent_activity === 'implementing' &&
+    cleanString(task?.local_session_id) === cleanString(conversationId)
+}
+
 /** The single-verdict form: valid, not_found, unavailable or indeterminate. */
 export async function confirmReferenceOnline(commitMessage, options = {}) {
   return (await confirmReferencesOnline(commitMessage, options)).status
@@ -698,17 +745,36 @@ export function parseMcpExecution(data) {
   const args = parseJsonObject(data?.tool_input ?? data?.toolInput) || {}
   const resultPresent = Object.hasOwn(data || {}, 'result_json') || Object.hasOwn(data || {}, 'resultJson')
   const envelope = parseJsonObject(data?.result_json ?? data?.resultJson)
+  // DevSpec's own answer is the first text block. It appends its notices (plugin
+  // access, account state) as further blocks, each its own JSON object, so joining the
+  // blocks made a successful claim unreadable whenever one rode along (item ef54cfcb).
   const result = Array.isArray(envelope?.content)
-    ? parseJsonObject(envelope.content.filter(block => block.type === 'text').map(block => block.text).join('\n'))
+    ? parseJsonObject(envelope.content.find((block) => block?.type === 'text')?.text)
     : envelope
   const requestedId = claimedItemId(args)
-  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) return { verb, args, successful: false, taskId: requestedId, projectId: null }
-  const rawProjects = resultProjectValues(result)
-  const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
-  const projectId = rawProjects.length === returnedProjects.length && returnedProjects.length &&
-    returnedProjects.every((id) => id === returnedProjects[0]) ? returnedProjects[0] : null
   const requestedProjectValue = cleanString(args?.project_id) // a folder pin is a hint, not an explicit scope
   const requestedProject = cleanUuid(requestedProjectValue)
+  // cursor-agent hands this hook an empty text block in place of a large result, which
+  // it writes to a file for the model instead: recorded live on 2026.10.22, where every
+  // successful claim (about 52 KB) arrived as "" while a short refusal arrived whole.
+  // Nothing about the outcome can be read from it, so the caller asks DevSpec.
+  const withheld = isDevspec && resultPresent && Array.isArray(envelope?.content) && envelope.isError !== true &&
+    !cleanString(envelope.content.find((block) => block?.type === 'text')?.text)
+  if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) {
+    return { verb, args, successful: false, taskId: requestedId, projectId: null, withheld, requestedProject }
+  }
+  const rawProjects = resultProjectValues(result)
+  const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
+  // DevSpec's claim response does not name the task's project (item ef54cfcb), so a
+  // response that names none is read as being in the project the call was scoped to:
+  // the project_id project-input.mjs stamps from this conversation's chosen project.
+  // DevSpec only claims a task inside the project a call names, so a successful claim
+  // proves it. A response that does name a project is still held to it.
+  const projectId = rawProjects.length === 0
+    ? requestedProject
+    : rawProjects.length === returnedProjects.length && returnedProjects.every((id) => id === returnedProjects[0])
+      ? returnedProjects[0]
+      : null
   const projectAgrees = !requestedProjectValue || Boolean(requestedProject && requestedProject === projectId)
   if (verb === 'claim_work_item') {
     const rawReturned = resultItemValues(result)
@@ -758,13 +824,31 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'afterMCPExecution') {
     const call = parseMcpExecution(data)
-    if (!call.successful || !call.taskId) return null
-    if (call.verb === 'claim_work_item') {
+    const recordClaim = (projectId) => {
       state.active_claims = [
         ...state.active_claims.filter((claim) => claim.id !== call.taskId),
-        { id: call.taskId, project_id: call.projectId, observed_at: new Date(nowMs).toISOString() },
+        { id: call.taskId, project_id: projectId, observed_at: new Date(nowMs).toISOString() },
       ]
+      writeConversationState(conversationId, state, stateRoot)
+      return null
     }
+    // A claim whose result Cursor withheld is confirmed with DevSpec, the one place
+    // that knows (item ef54cfcb). Without this every claim in Cursor went unrecorded and
+    // the git stand-in stopped every commit.
+    if (call.verb === 'claim_work_item' && call.withheld && call.taskId && call.requestedProject) {
+      return confirmClaimOnline({
+        taskId: call.taskId,
+        projectId: call.requestedProject,
+        conversationId,
+        cwd: candidateCwd(data),
+        env,
+        timeoutMs: options.onlineTimeoutMs,
+        call: options.onlineCall,
+        resolveAuth: options.resolveAuth,
+      }).then((held) => (held ? recordClaim(call.requestedProject) : null)).catch(() => null)
+    }
+    if (!call.successful || !call.taskId) return null
+    if (call.verb === 'claim_work_item') return recordClaim(call.projectId)
     if (TERMINAL_WORK_VERBS.has(call.verb)) {
       state.active_claims = state.active_claims.filter((claim) => claim.id !== call.taskId)
     }

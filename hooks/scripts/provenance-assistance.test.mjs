@@ -58,11 +58,30 @@ function mcp(toolName, result, args = {}, conversationId = 'chat-a') {
   }
 }
 
+// The shape DevSpec's claim_work_item really returns: the claimed task's own fields at
+// the top level and no project_id (item ef54cfcb). The call carries the project_id
+// project-input.mjs stamped from the conversation's chosen project.
+function claimResponse(item) {
+  return { id: item, title: 'Fixture task', agent_activity: 'implementing', agent_branch: 'work/fixture', claim_success: true, work_claim_ref: '44444444-4444-4444-8444-444444444444' }
+}
+
+// How Cursor hands afterMCPExecution the reply (recorded live on cursor-agent
+// 2026.10.22): the MCP envelope, DevSpec's answer in the first text block and any notice
+// DevSpec appends in a block of its own after it.
+function envelope(answer, ...notices) {
+  return {
+    content: [answer, ...notices].map((block) => ({ type: 'text', text: JSON.stringify(block) })),
+    isError: false,
+  }
+}
+
+const PLUGIN_NOTICE = { devspec_plugin_notice: { kind: 'no_plugin', limited: 'Fixture notice.' } }
+
 function observeClaim(stateRoot, item = ITEM_A, conversationId = 'chat-a', nowMs) {
   handleHook('afterMCPExecution', mcp(
     'devspec__claim_work_item',
-    { claim_success: true, project_id: PROJECT, task: { id: item, status: 'active' } },
-    { task_id: item },
+    envelope(claimResponse(item)),
+    { task_id: item, project_id: PROJECT },
     conversationId,
   ), { stateRoot, nowMs })
 }
@@ -763,7 +782,17 @@ describe('hook input and MCP result validation', () => {
     assert.equal(parseMcpExecution(mcp('devspec__claim_work_item', {
       claim_success: true, data: { task: { id: ITEM_A, project_id: PROJECT } },
     }, { task_id: ITEM_A })).successful, true)
+    // The real response names no project: the claim counts in the project the call named, and nowhere without one.
+    const real = parseMcpExecution(mcp('devspec__claim_work_item', claimResponse(ITEM_A), { task_id: ITEM_A, project_id: PROJECT }))
+    assert.equal(real.successful, true)
+    assert.equal(real.projectId, PROJECT)
+    // A notice DevSpec appends after its answer does not hide the answer.
+    const noticed = parseMcpExecution(mcp('devspec__claim_work_item', envelope(claimResponse(ITEM_A), PLUGIN_NOTICE), { task_id: ITEM_A, project_id: PROJECT }))
+    assert.equal(noticed.successful, true)
+    assert.equal(noticed.projectId, PROJECT)
     assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', claimResponse(ITEM_A), { task_id: ITEM_A, pinned_project_id: PROJECT })).successful, false)
+    assert.equal(parseMcpExecution(mcp('claim_work_item', { ...claimResponse(ITEM_A), claim_success: false }, { task_id: ITEM_A, project_id: PROJECT })).successful, false)
     assert.equal(parseMcpExecution(mcp('claim_work_item', { ok: true, project_id: PROJECT, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
     assert.equal(parseMcpExecution(mcp('other__claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_A }, { task_id: ITEM_A })).successful, false)
     assert.equal(parseMcpExecution(mcp('claim_work_item', { claim_success: true, project_id: PROJECT, id: ITEM_B }, { task_id: ITEM_A })).successful, false)
@@ -776,3 +805,54 @@ describe('hook input and MCP result validation', () => {
   })
 })
 
+
+describe('a claim whose result Cursor withheld (item ef54cfcb)', () => {
+  // Recorded live on cursor-agent 2026.10.22: a successful claim's ~52 KB result reached
+  // afterMCPExecution as one empty text block, the model reading it from a file instead.
+  const withheld = { content: [{ type: 'text', text: '' }], isError: false }
+  const auth = () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' })
+  const claimCall = (conversationId = 'chat-a') => ({
+    ...mcp('devspec__claim_work_item', withheld, { task_id: ITEM_A, project_id: PROJECT, local_session_id: conversationId }, conversationId),
+    workspace_roots: ['/work/repo'],
+  })
+
+  it('records the claim once DevSpec confirms this conversation holds it', async () => {
+    const stateRoot = tempRoot()
+    const requests = []
+    await handleHook('afterMCPExecution', claimCall(), {
+      stateRoot,
+      resolveAuth: auth,
+      onlineCall: async (request) => {
+        requests.push(request)
+        return { id: ITEM_A, agent_activity: 'implementing', local_session_id: 'chat-a' }
+      },
+    })
+    assert.deepEqual(requests.map((r) => [r.name, r.arguments]), [['get_task', { task_id: ITEM_A, project_id: PROJECT }]])
+    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((c) => [c.id, c.project_id]), [[ITEM_A, PROJECT]])
+  })
+
+  it('does not record a claim held by another conversation, or none, or when DevSpec cannot answer', async () => {
+    for (const answer of [
+      async () => ({ id: ITEM_A, agent_activity: 'implementing', local_session_id: 'chat-elsewhere' }),
+      async () => ({ id: ITEM_A, agent_activity: 'idle', local_session_id: 'chat-a' }),
+      async () => { throw new Error('offline') },
+    ]) {
+      const stateRoot = tempRoot()
+      await handleHook('afterMCPExecution', claimCall(), { stateRoot, resolveAuth: auth, onlineCall: answer })
+      assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims, [])
+    }
+  })
+
+  it('never asks DevSpec about a claim Cursor reported as refused', async () => {
+    const stateRoot = tempRoot()
+    let asked = false
+    const refused = { content: [{ type: 'text', text: 'Claim failed: item is already claimed.' }], isError: true }
+    await handleHook('afterMCPExecution', mcp('devspec__claim_work_item', refused, { task_id: ITEM_A, project_id: PROJECT }), {
+      stateRoot,
+      resolveAuth: auth,
+      onlineCall: async () => { asked = true; return {} },
+    })
+    assert.equal(asked, false)
+    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims, [])
+  })
+})

@@ -56,7 +56,14 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
     if (!id) return deny('Cursor did not provide this conversation’s identity. Restart the agent before using DevSpec.')
     try {
       const args = toolArguments(input)
-      const identity = namespaced === 'register_connection' ? { local_id: id, agent_name: AGENT_NAME } : {}
+      // A claim carries this conversation's id, so DevSpec records which conversation
+      // holds it, and provenance-assistance.mjs can confirm a claim whose result Cursor
+      // did not pass to the hook (item ef54cfcb). The host's id, never the model's.
+      const identity = namespaced === 'register_connection'
+        ? { local_id: id, agent_name: AGENT_NAME }
+        : namespaced === 'claim_work_item'
+          ? { local_session_id: id }
+          : {}
       if (namespaced === 'register_connection' && args.local_id && args.local_id !== id) {
         return deny('Register only this Cursor conversation; do not reuse another conversation’s ID.')
       }
@@ -236,13 +243,32 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
     return deny(error.message)
   }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * What this hook prints for one invocation: always one JSON object, never nothing.
+ *
+ * The preToolUse entry runs fail-closed (hooks.json), and Cursor treats a fail-closed
+ * hook that prints nothing as a refusal: cursor-agent 2026.10.22 logged it as
+ * `blocked` / `empty_stdout` and the model saw "Permission denied" (item 46dd5fc4).
+ * So "nothing to change" is said out loud as `{}`: no permission and no updated input,
+ * which leaves the call to Cursor's own permissions exactly as if no hook had run. A
+ * hook that cannot read its input still refuses.
+ */
+export function hookOutput(mode, rawInput, options) {
   try {
-    const output = projectInput(process.argv[2], JSON.parse(fs.readFileSync(0, 'utf8')))
-    if (output) process.stdout.write(JSON.stringify(output))
+    return JSON.stringify(projectInput(mode, JSON.parse(rawInput), options) ?? {})
   } catch {
-    process.stdout.write(
-      JSON.stringify(deny('DevSpec could not safely read the current conversation scope. Reconnect before using its project tools.')),
+    return JSON.stringify(
+      deny('DevSpec could not safely read the current conversation scope. Reconnect before using its project tools.'),
     )
   }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  let raw = ''
+  try {
+    raw = fs.readFileSync(0, 'utf8')
+  } catch {
+    /* unreadable input is refused by hookOutput, like any other unparseable input */
+  }
+  process.stdout.write(hookOutput(process.argv[2], raw))
 }
