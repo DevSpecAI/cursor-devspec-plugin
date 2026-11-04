@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.2
+
+- When DevSpec's check finds that a task your Cursor agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.
+
 ## 0.18.1
 
 When your agent revises a decision, convention or requirement, DevSpec may now accept the change and hold it until its checks are ruled. The remote skill now tells the agent what that result means: accepted but not in effect yet, taking effect by itself once checked or waiting for the OK of the person it names, with DevSpec's own note on the result saying where it stands.
