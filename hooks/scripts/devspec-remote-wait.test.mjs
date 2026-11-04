@@ -260,10 +260,10 @@ describe('canonical one-command-turn wake', () => {
       const line = JSON.stringify(canonicalBatch(delegated)) + '\n'
       fs.writeFileSync(file, line)
       const first = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       const retry = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.deepEqual(retry.batches[0].messages[0].project_scope, first.batches[0].messages[0].project_scope)
       assert.equal(retry.newOffset, Buffer.byteLength(line, 'utf8'))
@@ -287,7 +287,7 @@ describe('canonical one-command-turn wake', () => {
       acceptance_key: automationAcceptanceKey(dispatch),
     }
     assert.equal(parseWakeBatches([JSON.stringify(batch)], {
-      canonicalOnly: true, includeAutomations: true,
+      canonicalOnly: true, includeDispatches: true,
     }).length, 1)
     const events = buildOwnerMessageEvents(batch)
     assert.deepEqual(events.map((event) => event.type), ['automation_dispatch', 'wake'])
@@ -304,11 +304,11 @@ describe('canonical one-command-turn wake', () => {
       const secondMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
       const second = JSON.stringify(canonicalBatch(secondMessage)) + '\n'
       fs.writeFileSync(file, first + second)
-      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
+      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includeDispatches: true, oneCommandTurn: true })
       assert.equal(slice.batches.length, 1)
       assert.equal(slice.batches[0].messages[0].message_id, canonicalCommand().message_id)
       assert.equal(slice.newOffset, Buffer.byteLength(first, 'utf8'))
-      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
+      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includeDispatches: true, oneCommandTurn: true })
       assert.equal(queued.batches[0].messages[0].message_id, secondMessage.message_id)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -825,7 +825,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].message_id, unreadMessage.message_id)
     } finally {
@@ -858,7 +858,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].run_id, unreadDispatch.run_id)
     } finally {

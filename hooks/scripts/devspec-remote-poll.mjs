@@ -19,6 +19,9 @@
  *      own cursor and typed claim/record wake, separate from canonical conversation.
  *   5. ACTIVE SESSION PLANS — strict 1.3 all-room inventory carried as advisory
  *      read awareness; it never grants execution or mutation authority.
+ *   6. CHECK JOBS — negotiated `check_job_version: 1`; a check DevSpec asks this
+ *      agent to rule arrives beside automation runs on the dispatch lane, is kept
+ *      once per id and wakes with one line (`check_job`), never as a command.
  *
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
  * (optional shared context). Both poll the same canonical connection endpoint;
@@ -120,6 +123,8 @@ import {
   inspectPollResponseV1,
   isCatchUpCursorRefusal,
   automationAcceptanceKey,
+  checkJobAcceptanceKey,
+  CHECK_JOB_VERSION,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
 import { agentStatsArgs } from './agent-telemetry.mjs'
@@ -799,7 +804,9 @@ export const SENDER_STYLE_VERSION = 1
  * person who SENT a command decide how they get answered, rather than whoever
  * owns this connection; `system_notice_version: 2` delivers server_notice and
  * unlinked_commit_item_review wakes; `room_context_version: 1` delivers the
- * 1.6.0 room context for local transcript materialization.
+ * 1.6.0 room context for local transcript materialization; `check_job_version: 1`
+ * says this poller reads check jobs beside automation runs in `dispatches[]`
+ * (remote-poll-acceptance.mjs), and DevSpec offers them only while it is sent.
  */
 export function remoteIngressNegotiationArgs() {
   return {
@@ -810,6 +817,7 @@ export function remoteIngressNegotiationArgs() {
     system_notice_version: SYSTEM_NOTICE_CHANNEL_VERSION,
     sender_style_version: SENDER_STYLE_VERSION,
     room_context_version: 1,
+    check_job_version: CHECK_JOB_VERSION,
   }
 }
 
@@ -1000,6 +1008,46 @@ export async function deliverAutomationDispatches(
   }
   writeTurnMarker(connectionId, { remoteTurn: true, dir })
   try { ensureWatch({ connectionId, dir }) } catch { /* best effort */ }
+  return { ok: true, acceptedCount }
+}
+
+/**
+ * Check jobs: DevSpec asks this agent to rule the checks on a change, its own
+ * changes included (DevSpec item 55d71b0c). Each one is kept in the inbox once,
+ * keyed by its id, because the server lists every open job on every poll until it
+ * is ruled or dropped. A newly kept one starts the turn that will rule it, so the
+ * poller reports busy while the agent works it and not after the turn ends: DevSpec
+ * drops a job nobody took when a turn that started after delivery ends, and a taken
+ * one when its taker stops working. A check job is nobody's command, so it opens
+ * no work trail and no command turn in the room (notice-reply.mjs keeps its work
+ * out of the room the same way it does for notices).
+ */
+export async function deliverCheckJobDispatches(
+  connectionId,
+  checkJobs,
+  nextDispatchCursor,
+  sessionId,
+  {
+    dir = CONNECTIONS_DIR,
+    appendInboxFn = appendInbox,
+    emit = (line) => process.stdout.write(line),
+  } = {},
+) {
+  let acceptedCount = 0
+  for (const job of checkJobs) {
+    const accepted = appendInboxFn(connectionId, [job], {
+      type: 'check_job_dispatches',
+      nextCursor: nextDispatchCursor,
+      sessionId,
+      acceptanceKey: checkJobAcceptanceKey(job),
+    })
+    if (!accepted.ok) return { ok: false, acceptedCount }
+    if (!accepted.duplicate) {
+      acceptedCount++
+      emit(JSON.stringify({ type: 'check_job', check_job_id: job.check_job_id, check_job: job }) + '\n')
+    }
+  }
+  if (acceptedCount > 0) writeTurnMarker(connectionId, { remoteTurn: false, dir })
   return { ok: true, acceptedCount }
 }
 
@@ -1790,6 +1838,18 @@ async function main() {
     if (!automations.ok) return false
     newlyDelivered ||= automations.acceptedCount > 0
 
+    // A check job wakes through the host follow like a notice, so make sure it is
+    // there (a live one is reused) before the job lands in the inbox.
+    if (accepted.checkJobs.length > 0) ensureHostWakeFollow(connectionId, ownerAnchor)
+    const checkJobs = await deliverCheckJobDispatches(
+      connectionId,
+      accepted.checkJobs,
+      accepted.dispatchCursor,
+      sessionId,
+    )
+    if (!checkJobs.ok) return false
+    newlyDelivered ||= checkJobs.acceptedCount > 0
+
     // Commit all independent clocks only after their complete durable acceptance.
     liveCursorV2 = advancedCursors.liveCursorV2
     legacyCursor = advancedCursors.legacyCursor
@@ -1818,12 +1878,18 @@ async function main() {
       },
     })
     logRemoteControlStory({
-      phase: accepted.canonicalWake || automations.acceptedCount > 0 ? 'inject' : 'wake',
+      phase: accepted.canonicalWake || automations.acceptedCount > 0 || checkJobs.acceptedCount > 0 ? 'inject' : 'wake',
       outcome: newlyDelivered ? 'delivered' : 'deduped',
       connectionId, sessionId, agent: AGENT_NAME, tool: 'poll_connection',
       reason: accepted.control ? 'control' : accepted.canonicalWake ? 'canonical_conversational_command' :
-        automations.acceptedCount > 0 ? 'automation_dispatch' : envelope.wake.kind,
-      data: { commands: envelope.commands.length, context: rows.length, automations: accepted.automations.length },
+        automations.acceptedCount > 0 ? 'automation_dispatch' :
+        checkJobs.acceptedCount > 0 ? 'check_job' : envelope.wake.kind,
+      data: {
+        commands: envelope.commands.length,
+        context: rows.length,
+        automations: accepted.automations.length,
+        check_jobs: accepted.checkJobs.length,
+      },
     })
     lastIngressAccepted = true
     return newlyDelivered || Boolean(transportProgress)

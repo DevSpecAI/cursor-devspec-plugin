@@ -15,7 +15,7 @@ function text(value) { return typeof value === 'string' && value.length > 0 }
 function datetime(value) { return typeof value === 'string' && DATETIME.test(value) }
 function nullableCursor(value) { return value === null || value === undefined || text(value) }
 
-/** Strictly accept the one independent non-conversation dispatch type the server emits. */
+/** Strictly accept an automation run, one of the two non-conversation dispatch types the server emits. */
 export function validateAutomationDispatch(dispatch, connectionId) {
   if (!exact(dispatch, [
     'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
@@ -36,21 +36,74 @@ export function validateAutomationDispatch(dispatch, connectionId) {
   return null
 }
 
-export function normalizeAutomationDispatches(input, connectionId) {
-  if (!Array.isArray(input)) return { ok: false, error: 'missing automation dispatch list' }
+/**
+ * Check jobs (DevSpec item 55d71b0c; this plugin's item 9b6b66d1). Negotiated by
+ * `check_job_version` on every poll: a connection that never sends it is never
+ * offered one, because a validator that only knew automation runs would reject the
+ * whole batch, automation runs included.
+ */
+export const CHECK_JOB_VERSION = 1
+
+/** The server's CHECK_JOB_WAKE_KEYS: inbox metadata only, never record text. */
+export const CHECK_JOB_WAKE_KEYS = [
+  'id', 'kind', 'check_job_id', 'check_kind', 'record', 'entries', 'high_risk', 'yours', 'offered_at', 'delivery_connection_id',
+]
+export const CHECK_JOB_KINDS = ['conflict', 'conflict_decisions', 'duplicate', 'staleness']
+export const CHECK_JOB_RECORD_TYPES = ['task', 'memory', 'artifact', 'proposal']
+
+function count(value) { return Number.isSafeInteger(value) && value >= 0 }
+
+/** Strictly accept a check job: exactly the server's envelope, addressed to this connection. */
+export function validateCheckJobDispatch(dispatch, connectionId) {
+  if (!exact(dispatch, CHECK_JOB_WAKE_KEYS) || !exact(dispatch.record, ['type', 'id', 'title'])) {
+    return 'malformed check job dispatch'
+  }
+  // A record whose title is unset arrives with an empty one; the wake names it by type and id.
+  if (dispatch.kind !== 'check_job' || !uuid(dispatch.id) || dispatch.check_job_id !== dispatch.id ||
+      !CHECK_JOB_KINDS.includes(dispatch.check_kind) ||
+      !CHECK_JOB_RECORD_TYPES.includes(dispatch.record.type) || !uuid(dispatch.record.id) ||
+      typeof dispatch.record.title !== 'string' ||
+      !count(dispatch.entries) || !count(dispatch.high_risk) || dispatch.high_risk > dispatch.entries ||
+      typeof dispatch.yours !== 'boolean' || !datetime(dispatch.offered_at) ||
+      dispatch.delivery_connection_id !== connectionId) return 'invalid check job dispatch'
+  return null
+}
+
+/**
+ * One wake-channel item: an automation run (its exact shape, unchanged) or a check
+ * job (its exact shape). The `kind` picks which shape it must be; anything else is
+ * held to the automation run's shape and rejected exactly as before check jobs.
+ */
+export function validateConnectionDispatch(dispatch, connectionId) {
+  return object(dispatch) && dispatch.kind === 'check_job'
+    ? validateCheckJobDispatch(dispatch, connectionId)
+    : validateAutomationDispatch(dispatch, connectionId)
+}
+
+/**
+ * The whole `dispatches[]` list, or the reason it is refused. One bad item refuses
+ * the response, as it always has: nothing in it is half-accepted.
+ */
+export function normalizeConnectionDispatches(input, connectionId) {
+  if (!Array.isArray(input)) return { ok: false, error: 'missing dispatch list' }
   const seen = new Set()
   for (const dispatch of input) {
-    const error = validateAutomationDispatch(dispatch, connectionId)
+    const error = validateConnectionDispatch(dispatch, connectionId)
     if (error) return { ok: false, error }
-    if (seen.has(dispatch.id)) return { ok: false, error: 'duplicate automation dispatch id' }
+    if (seen.has(dispatch.id)) return { ok: false, error: 'duplicate dispatch id' }
     seen.add(dispatch.id)
   }
-  return { ok: true, dispatches: input }
+  return {
+    ok: true,
+    dispatches: input,
+    automations: input.filter((dispatch) => dispatch.kind === 'automation_run'),
+    checkJobs: input.filter((dispatch) => dispatch.kind === 'check_job'),
+  }
 }
 
 /**
  * Execute the negotiated response acceptance seam, without performing I/O.
- * Canonical conversation/context and explicit automations remain separate outputs.
+ * Canonical conversation/context, explicit automations and check jobs remain separate outputs.
  */
 export function inspectPollResponseV1(response, connectionId) {
   if (!object(response)) return { ok: false, error: 'malformed poll response' }
@@ -63,6 +116,7 @@ export function inspectPollResponseV1(response, connectionId) {
       envelope: null,
       canonicalWake: false,
       automations: [],
+      checkJobs: [],
       liveCursorV2: response.cursor_v2 ?? null,
       legacyCursor: response.cursor ?? null,
       dispatchCursor: response.dispatch_cursor ?? null,
@@ -72,8 +126,8 @@ export function inspectPollResponseV1(response, connectionId) {
   }
   const canonical = normalizeRemoteIngressV1(response, connectionId)
   if (!canonical.ok) return canonical
-  const automations = normalizeAutomationDispatches(response.dispatches, connectionId)
-  if (!automations.ok) return automations
+  const dispatches = normalizeConnectionDispatches(response.dispatches, connectionId)
+  if (!dispatches.ok) return dispatches
   const envelope = canonical.envelope
   // A page the server is holding back (`delivery_retry`) also sets has_more=true,
   // but its next_cursor is a forward live continuation, never an older-history
@@ -85,7 +139,8 @@ export function inspectPollResponseV1(response, connectionId) {
     changed: true,
     envelope,
     canonicalWake: canonical.wake,
-    automations: automations.dispatches,
+    automations: dispatches.automations,
+    checkJobs: dispatches.checkJobs,
     liveCursorV2: response.cursor_v2 ?? null,
     legacyCursor: response.cursor ?? null,
     dispatchCursor: response.dispatch_cursor ?? null,
@@ -350,4 +405,19 @@ export function automationRunInstruction(dispatch) {
     '',
     `Permission: ${permission}`,
   ].join('\n')
+}
+
+export function checkJobAcceptanceKey(job) {
+  return `check_job:${job.check_job_id}`
+}
+
+/** The record a check job is about, as the wake names it. */
+function checkJobSubject(job) {
+  const title = typeof job.record?.title === 'string' ? job.record.title.trim() : ''
+  return title ? `"${title}"` : `${job.record?.type ?? 'record'} ${job.record?.id ?? ''}`.trim()
+}
+
+/** The one line that wakes the agent for a check job (the frozen contract's wake text). */
+export function checkJobWakeText(job) {
+  return `A check is waiting on ${checkJobSubject(job)}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`
 }

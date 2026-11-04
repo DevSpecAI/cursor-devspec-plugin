@@ -80,7 +80,7 @@ describe('isDeliverableCommand (command gate)', () => {
     assert.equal(isDeliverableCommand(command({ project_scope: delegated.project_scope }), ME), false)
   })
 
-  it('negotiates delegated project scope and room context alongside canonical ingress', () => {
+  it('negotiates delegated project scope, room context and check jobs alongside canonical ingress', () => {
     assert.deepEqual(remoteIngressNegotiationArgs(), {
       ingress_version: 1,
       delegated_scope_version: 1,
@@ -89,6 +89,7 @@ describe('isDeliverableCommand (command gate)', () => {
       sender_style_version: 1,
       room_context_version: 1,
       session_polls_projection_version: 2,
+      check_job_version: 1,
     })
   })
 

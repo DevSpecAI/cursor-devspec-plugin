@@ -28,7 +28,7 @@ import {
   writeTrailState,
 } from './work-trail.mjs'
 import { recordTurnActivity } from './turn-liveness.mjs'
-import { currentTurnNoticeIds } from './notice-reply.mjs'
+import { currentTurnOwnsNoCommand } from './notice-reply.mjs'
 import { recordRuntimeReport } from './agent-telemetry.mjs'
 
 const VALID_MODES = new Set([
@@ -116,15 +116,16 @@ export async function runTrailTurn({
       return { ok: false, skipped: true, reason: 'unattached_local_turn' }
     }
   }
-  // A turn woken only by DevSpec notices belongs to no command, so its work is never
-  // posted as a trail, which DevSpec would file under someone's command (notice-reply.mjs).
+  // A turn woken only by DevSpec notices and check jobs belongs to no command, so its
+  // work is never posted as a trail, which DevSpec would file under someone's command
+  // (notice-reply.mjs).
   if (
-    currentTurnNoticeIds(state.connection_id, {
+    currentTurnOwnsNoCommand(state.connection_id, {
       ...(connectionsDir ? { dir: connectionsDir } : {}),
       connectionState: state,
     })
   ) {
-    return { ok: false, skipped: true, reason: 'notice_turn' }
+    return { ok: false, skipped: true, reason: 'no_command_turn' }
   }
   if (mode !== 'seed') {
     recordTurnActivity(state.connection_id, connectionsDir ? { dir: connectionsDir } : undefined)
