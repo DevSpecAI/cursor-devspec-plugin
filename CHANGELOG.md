@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1
+
+When your agent revises a decision, convention or requirement, DevSpec may now accept the change and hold it until its checks are ruled. The remote skill now tells the agent what that result means: accepted but not in effect yet, taking effect by itself once checked or waiting for the OK of the person it names, with DevSpec's own note on the result saying where it stands.
+
 ## 0.18.0
 
 Your Cursor agent can now rule DevSpec's checks itself, starting with the checks on its own changes.
