@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.0
+
+Your Cursor agent can now rule DevSpec's checks itself, starting with the checks on its own changes.
+
+- **Checks arrive as check jobs.** When the agent is connected to DevSpec, the plugin tells DevSpec it can take check jobs. Each check DevSpec runs on a change (a conflict, a clash with a decision, a duplicate, something out of date) can then come to the agent as a check job, beside automation runs. The agent is woken with one line naming the record. It takes the job, rules every entry with the definition the job carries, and carries on with what it was doing.
+- **Only the two shapes DevSpec sends.** The plugin accepts an automation run exactly as before, or a check job, and still refuses anything else. A check job is kept once, however often DevSpec lists it.
+- **Working while it rules.** The agent shows as working while it rules a job, and stops when the turn ends. DevSpec uses this to hand a job nobody took to the next agent in line. Ruling a check posts nothing to the room unless the agent has something to tell you.
+
 ## 0.17.1
 
 The install page now reads like DevSpec's other plugin pages, for the Cursor Marketplace listing.

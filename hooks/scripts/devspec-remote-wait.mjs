@@ -11,7 +11,8 @@
  *   - Grok Build:  monitor tool on this process stdout → chat notification
  *
  * It wakes only on twice-validated canonical `owner_messages` turns and, on its
- * separate typed path, explicit owner-scoped `automation_dispatch` records. Canonical
+ * separate typed path, explicit owner-scoped `automation_dispatch` records and
+ * `check_job` records (a check DevSpec asks this agent to rule). Canonical
  * commands retain their exact addressee, server-decided owner/delegated authority,
  * and immutable requester provenance. `advisory_context` inbox entries are
  * DELIBERATELY ignored as a WAKE TRIGGER — advisory must never force a model wake or
@@ -67,7 +68,10 @@ import {
 import {
   automationAcceptanceKey,
   automationRunInstruction,
+  checkJobAcceptanceKey,
+  checkJobWakeText,
   validateAutomationDispatch,
+  validateCheckJobDispatch,
 } from './remote-poll-acceptance.mjs'
 import {
   durationMs,
@@ -746,7 +750,7 @@ export function offsetAfterAdvisoryHistory(text) {
     if (parsed?.type === QUESTION_DISMISSAL_RECORD_TYPE) return Buffer.byteLength(src.slice(0, searchFrom), 'utf8')
     const canonicalWake = parseWakeBatches([line], {
       canonicalOnly: true,
-      includeAutomations: true,
+      includeDispatches: true,
     }).length > 0
     if (canonicalWake || (
       parsed?.type === 'owner_messages' &&
@@ -842,7 +846,7 @@ export function readNewLines(file, offset) {
 export function consumeInboxSlice(
   file,
   offset,
-  { canonicalOnly = false, includeAutomations = false, oneCommandTurn = false, connectionId = null } = {},
+  { canonicalOnly = false, includeDispatches = false, oneCommandTurn = false, connectionId = null } = {},
 ) {
   if (!oneCommandTurn) {
     const { lines, newOffset } = readNewLines(file, offset)
@@ -850,7 +854,7 @@ export function consumeInboxSlice(
       lines,
       newOffset,
       batches: lines.length > 0
-        ? parseWakeBatches(lines, { canonicalOnly, includeAutomations, connectionId })
+        ? parseWakeBatches(lines, { canonicalOnly, includeDispatches, connectionId })
         : [],
       evidence: createInboxCursorEvidence(file, newOffset),
     }
@@ -882,7 +886,7 @@ export function consumeInboxSlice(
       const line = segment.slice(0, -1)
       if (!line.trim()) continue
       lines.push(line)
-      const found = parseWakeBatches([line], { canonicalOnly, includeAutomations, connectionId })
+      const found = parseWakeBatches([line], { canonicalOnly, includeDispatches, connectionId })
       if (found.length > 0) {
         batches = found
         break
@@ -954,17 +958,24 @@ function isCanonicalSystemNoticeBatch(obj, connectionId = null) {
   return true
 }
 
-function isAutomationBatch(obj) {
-  if (obj?.type !== 'automation_dispatches' || !Array.isArray(obj.messages) ||
+/** The two dispatch records the poller keeps, each revalidated against its own exact shape. */
+const DISPATCH_RECORDS = {
+  automation_dispatches: { validate: validateAutomationDispatch, key: automationAcceptanceKey },
+  check_job_dispatches: { validate: validateCheckJobDispatch, key: checkJobAcceptanceKey },
+}
+
+function isDispatchBatch(obj) {
+  const record = Object.hasOwn(DISPATCH_RECORDS, obj?.type) ? DISPATCH_RECORDS[obj.type] : null
+  if (!record || !Array.isArray(obj.messages) ||
       obj.messages.length !== 1 || typeof obj.acceptance_key !== 'string') return false
   const dispatch = obj.messages[0]
-  return validateAutomationDispatch(dispatch, obj.connection_id) === null &&
-    automationAcceptanceKey(dispatch) === obj.acceptance_key
+  return record.validate(dispatch, obj.connection_id) === null &&
+    record.key(dispatch) === obj.acceptance_key
 }
 
 export function parseWakeBatches(
   lines,
-  { canonicalOnly = false, includeAutomations = false, connectionId = null } = {},
+  { canonicalOnly = false, includeDispatches = false, connectionId = null } = {},
 ) {
   const batches = []
   for (const line of lines) {
@@ -983,7 +994,7 @@ export function parseWakeBatches(
           ...(obj.wake_context !== undefined ? { wake_context: validWakeContext(obj.wake_context) } : {}),
         })
       } else if (
-        (includeAutomations && isAutomationBatch(obj)) ||
+        (includeDispatches && isDispatchBatch(obj)) ||
         (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)
       ) {
         batches.push(obj)
@@ -996,7 +1007,7 @@ export function parseWakeBatches(
 }
 
 export function parseOwnerBatches(lines, { canonicalOnly = false } = {}) {
-  return parseWakeBatches(lines, { canonicalOnly, includeAutomations: false })
+  return parseWakeBatches(lines, { canonicalOnly, includeDispatches: false })
 }
 
 /**
@@ -1310,6 +1321,30 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   }
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
+  if (batch?.type === 'check_job_dispatches') {
+    const job = messages[0]
+    return [
+      {
+        type: 'check_job',
+        check_job_id: job.check_job_id,
+        session_id: sessionId,
+        check_job: job,
+        instruction: checkJobWakeText(job),
+        note: 'A check DevSpec asks you to rule; not a conversation command, task assignment or automation run.',
+      },
+      {
+        type: 'wake',
+        reason: 'check_job',
+        check_job_id: job.check_job_id,
+        session_id: sessionId,
+        count: 1,
+        dispatch_cursor: batch?.next_after_message_id ?? null,
+        inbox: inboxFile ?? null,
+        continuous_poller: true,
+        rearm: 'devspec-remote-wait',
+      },
+    ]
+  }
   if (batch?.type === 'automation_dispatches') {
     const dispatch = messages[0]
     return [
@@ -1589,7 +1624,7 @@ async function main() {
 
     const { lines, newOffset, batches, evidence: readEvidence } = consumeInboxSlice(file, offset, {
       canonicalOnly: true,
-      includeAutomations: true,
+      includeDispatches: true,
       oneCommandTurn: true,
       connectionId,
     })

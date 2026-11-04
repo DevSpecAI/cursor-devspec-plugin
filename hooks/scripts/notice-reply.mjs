@@ -28,7 +28,8 @@
  *   connection (`turnNoticeIds`), every post the model makes in it is about those
  *   notices, so preToolUse stamps their ids on a plain post itself. Anywhere else the
  *   plugin cannot tell which post is about the notice, stamps nothing, and the model
- *   passes the ids it was shown.
+ *   passes the ids it was shown. Check jobs delivered into the turn are recorded
+ *   beside the notices (`checkJobIds`) and change none of this.
  * - A notice-only turn whose model posted no reply ends with one: Stop posts the
  *   turn's final message as a notice reply (`postNoticeTurnReply`).
  *
@@ -50,6 +51,15 @@ export const NOTICE_REPLY_CONTRACT = 'semantics.notice_reply in devspec://produc
 
 /** The wake reason a batch of notices carries (devspec-remote-wait.mjs). */
 export const NOTICE_WAKE_REASON = 'exact_connection_system_notice'
+
+/**
+ * The wake reason a check job carries (devspec-remote-wait.mjs). A check job, like a
+ * notice, is DevSpec asking about a change, not anyone's command: a turn that only
+ * check jobs and notices woke owns no command, so its work is kept out of the room's
+ * trail (`turnOwnsNoCommand`). It is not a notice, so nothing is posted as a notice
+ * reply because of it.
+ */
+export const CHECK_JOB_WAKE_REASON = 'check_job'
 
 /** Wake event types that are not notices: each one makes the turn more than a notice turn. */
 const OTHER_WAKE_TYPES = new Set([
@@ -218,7 +228,13 @@ export function turnWakesPath(connectionId, dir = DEFAULT_DIR) {
   return path.join(dir, `${connectionId}.turn-wakes.json`)
 }
 
-/** The current turn's record: `{ startedAt, noticeIds, otherWake, noticeReplyAt? }`, or null. */
+/** A record's check job ids, as a field only when there are any. */
+function checkJobIdsField(ids) {
+  const list = uniqueIds(ids)
+  return list.length > 0 ? { checkJobIds: list } : {}
+}
+
+/** The current turn's record: `{ startedAt, noticeIds, checkJobIds?, otherWake, noticeReplyAt? }`, or null. */
 export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return null
   try {
@@ -227,6 +243,7 @@ export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
     return {
       startedAt: record.startedAt,
       noticeIds: uniqueIds(record.noticeIds),
+      ...checkJobIdsField(record.checkJobIds),
       otherWake: record.otherWake === true,
       ...(typeof record.noticeReplyAt === 'number' ? { noticeReplyAt: record.noticeReplyAt } : {}),
     }
@@ -244,13 +261,14 @@ function writeTurnWakes(connectionId, record, dir) {
   }
 }
 
-/** Fold a wake into a record: notice ids accumulate, `otherWake` sticks. */
+/** Fold a wake into a record: notice and check job ids accumulate, `otherWake` sticks. */
 export function mergeTurnWake(record, wake) {
   const base = record ?? { startedAt: Date.now(), noticeIds: [], otherWake: false }
   if (!wake) return base
   return {
     ...base,
     noticeIds: uniqueIds([...(base.noticeIds ?? []), ...(wake.noticeIds ?? [])]),
+    ...checkJobIdsField([...(base.checkJobIds ?? []), ...(wake.checkJobIds ?? [])]),
     otherWake: base.otherWake === true || wake.otherWake === true,
   }
 }
@@ -291,6 +309,7 @@ export function recordNoticeReply(connectionId, { dir = DEFAULT_DIR, now = Date.
  */
 export function turnWakeFromEvents(events) {
   const noticeIds = []
+  const checkJobIds = []
   let otherWake = false
   let seen = false
   for (const event of Array.isArray(events) ? events : []) {
@@ -298,10 +317,15 @@ export function turnWakeFromEvents(events) {
     if (event.type === 'system_notice') {
       seen = true
       if (typeof event.notice_id === 'string') noticeIds.push(event.notice_id)
+    } else if (event.type === 'check_job') {
+      seen = true
+      if (typeof event.check_job_id === 'string') checkJobIds.push(event.check_job_id)
     } else if (event.type === 'wake') {
       seen = true
       if (event.reason === NOTICE_WAKE_REASON) {
         if (Array.isArray(event.system_notice_ids)) noticeIds.push(...event.system_notice_ids)
+      } else if (event.reason === CHECK_JOB_WAKE_REASON) {
+        if (typeof event.check_job_id === 'string') checkJobIds.push(event.check_job_id)
       } else {
         otherWake = true
       }
@@ -312,7 +336,9 @@ export function turnWakeFromEvents(events) {
   }
   if (otherWake) return { otherWake: true }
   const ids = uniqueIds(noticeIds)
-  if (ids.length > 0) return { noticeIds: ids }
+  const jobs = checkJobIdsField(checkJobIds)
+  if (ids.length > 0 || jobs.checkJobIds) return { ...(ids.length > 0 ? { noticeIds: ids } : {}), ...jobs }
+  // A wake that names nothing it can be told apart by is treated as a command's.
   return seen ? { otherWake: true } : null
 }
 
@@ -336,13 +362,16 @@ export function turnWakeFromText(text) {
       }
     }
     const type = /"type"\s*:\s*"([a-z_]+)"/.exec(line)?.[1]
+    const checkJobId = /"check_job_id"\s*:\s*"([0-9a-f-]{36})"/i.exec(line)?.[1]
     if (type === 'system_notice') {
       const id = /"notice_id"\s*:\s*"([0-9a-f-]{36})"/i.exec(line)?.[1]
       events.push({ type, notice_id: id })
+    } else if (type === 'check_job') {
+      events.push({ type, check_job_id: checkJobId })
     } else if (type === 'wake') {
       const reason = /"reason"\s*:\s*"([a-z_]+)"/.exec(line)?.[1]
       const listed = /"system_notice_ids"\s*:\s*\[([^\]]*)\]/.exec(line)?.[1] ?? ''
-      events.push({ type, reason, system_notice_ids: listed.match(UUID_IN_TEXT) ?? [] })
+      events.push({ type, reason, system_notice_ids: listed.match(UUID_IN_TEXT) ?? [], check_job_id: checkJobId })
     } else if (OTHER_WAKE_TYPES.has(type)) {
       events.push({ type })
     }
@@ -381,21 +410,48 @@ export function recordPromptWake(connectionId, { fromAPerson = false, text = '',
 export function turnNoticeIds({ record, requestState = null, connectionState = null } = {}) {
   const ids = uniqueIds(record?.noticeIds)
   if (ids.length === 0 || record.otherWake === true) return null
-  if (connectionState?.local_turn) return null
+  return nothingElseOpen(requestState, connectionState) ? ids : null
+}
+
+/** No typed turn and no request open on the connection beside the turn's own wakes. */
+function nothingElseOpen(requestState, connectionState) {
+  if (connectionState?.local_turn) return false
   if (requestState) {
-    if (requestState.current === NO_REQUEST) return null
-    if (requestState.current && requestState.open?.has?.(requestState.current)) return null
+    if (requestState.current === NO_REQUEST) return false
+    if (requestState.current && requestState.open?.has?.(requestState.current)) return false
     for (const id of requestState.joined ?? []) {
-      if (id !== UNSTATED) return null
+      if (id !== UNSTATED) return false
     }
   }
-  return ids
+  return true
+}
+
+/**
+ * Whether the turn owns no command: only DevSpec notices and check jobs woke it, and
+ * nothing else is open on the connection. Its work is then never posted as a trail,
+ * which DevSpec would file under someone's command. The same guards as
+ * `turnNoticeIds`, so a stale record or request only ever makes this false.
+ */
+export function turnOwnsNoCommand({ record, requestState = null, connectionState = null } = {}) {
+  if (!record || record.otherWake === true) return false
+  if (uniqueIds(record.noticeIds).length === 0 && uniqueIds(record.checkJobIds).length === 0) return false
+  return nothingElseOpen(requestState, connectionState)
 }
 
 /** `turnNoticeIds` for a connection, read fresh. */
 export function currentTurnNoticeIds(connectionId, { dir = DEFAULT_DIR, connectionState = null } = {}) {
   if (!connectionId) return null
   return turnNoticeIds({
+    record: readTurnWakes(connectionId, { dir }),
+    requestState: readRequestState(connectionId, { dir }),
+    connectionState,
+  })
+}
+
+/** `turnOwnsNoCommand` for a connection, read fresh. */
+export function currentTurnOwnsNoCommand(connectionId, { dir = DEFAULT_DIR, connectionState = null } = {}) {
+  if (!connectionId) return false
+  return turnOwnsNoCommand({
     record: readTurnWakes(connectionId, { dir }),
     requestState: readRequestState(connectionId, { dir }),
     connectionState,

@@ -28,7 +28,7 @@ import { postTrailFromTranscript } from './post-trail-from-transcript.mjs'
 import { recordProgressFailure } from './progress-diagnostics.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { recordTurnActivity } from './turn-liveness.mjs'
-import { currentTurnNoticeIds } from './notice-reply.mjs'
+import { currentTurnOwnsNoCommand } from './notice-reply.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const DEFAULT_POLL_MS = 800
@@ -189,9 +189,9 @@ async function main() {
       continue
     }
 
-    // A turn woken only by DevSpec notices posts no trail: DevSpec would file it under
-    // someone's command (notice-reply.mjs).
-    if (currentTurnNoticeIds(connectionId, { dir: CONNECTIONS_DIR, connectionState: state })) {
+    // A turn woken only by DevSpec notices and check jobs posts no trail: DevSpec would
+    // file it under someone's command (notice-reply.mjs).
+    if (currentTurnOwnsNoCommand(connectionId, { dir: CONNECTIONS_DIR, connectionState: state })) {
       await sleep(args.pollMs)
       continue
     }

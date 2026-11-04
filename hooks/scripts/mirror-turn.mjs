@@ -377,7 +377,7 @@ export function isHarnessInjection(text) {
     t.includes('Arm wait FIRST as a background Shell') ||
     t.includes('devspec-wake-tail.mjs') ||
     t.includes('devspec-remote-wait') ||
-    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|check_job|question_answer|question_dismissal|system_notice)"/.test(
       t,
     )
   )
@@ -408,7 +408,7 @@ export function promptOrigin(hookInput, text = null) {
     t.includes('<task-notification') ||
     t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') ||
     t.includes('This is an automated background-task event') ||
-    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|question_answer|question_dismissal|system_notice)"/.test(
+    /"type"\s*:\s*"(?:owner_message|automation_run|automation_dispatch|check_job|question_answer|question_dismissal|system_notice)"/.test(
       t,
     )
   ) {
