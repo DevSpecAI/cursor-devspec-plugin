@@ -1,11 +1,14 @@
-// Check jobs on the wake channel (DevSpec item 55d71b0c; this plugin's item 9b6b66d1).
+// Check jobs on the wake channel (DevSpec item 55d71b0c; this plugin's item 9b6b66d1),
+// in the version-2 envelope (DevSpec item 1d89fe56).
 //
 // What could break: a validator that takes a check job could start taking any shape
 // (and an unknown dispatch must still refuse the whole batch); an automation run could
 // stop arriving as before; a check job could be kept twice when the server lists it
 // again on the next poll; the poller could stop saying it reads check jobs (DevSpec
 // then never offers one); and busy could stop being true while the agent works a job,
-// which makes DevSpec drop a job the agent has taken.
+// which makes DevSpec drop a job the agent has taken. Version 2 could also regress: a
+// version-1 job (with high_risk) could be taken again, the three records version 2
+// adds could be refused, or the wake could stop saying what those records are.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -45,7 +48,6 @@ function checkJob(over = {}) {
     check_kind: 'conflict',
     record: { type: 'task', id: RECORD, title: 'Fix the login redirect' },
     entries: 3,
-    high_risk: 1,
     yours: true,
     offered_at: '2026-11-04T03:00:00.000Z',
     delivery_connection_id: FIXTURE_ID.connection,
@@ -86,6 +88,30 @@ describe('wake-channel validator: an automation run or a check job, nothing else
     assert.equal(accept([checkJob({ record: { type: 'task', id: RECORD, title: '' } })]).ok, true)
   })
 
+  it('accepts the three records version 2 adds, each as the out-of-date check it is', () => {
+    for (const type of ['discussion_point', 'goal', 'backlog_scan']) {
+      const job = checkJob({ check_kind: 'staleness', record: { type, id: RECORD, title: 'Pricing page' } })
+      const accepted = accept([fixtureAutomationDispatch(), job])
+      assert.equal(accepted.ok, true, type)
+      assert.deepEqual(accepted.checkJobs, [job], type)
+      // Each is only ever ruled with the out-of-date verdicts.
+      for (const check_kind of ['conflict', 'conflict_decisions', 'duplicate']) {
+        assert.equal(accept([checkJob({ check_kind, record: { type, id: RECORD, title: 'x' } })]).ok, false, `${type} as ${check_kind}`)
+      }
+    }
+  })
+
+  it('takes only the version-2 envelope: a job that still carries high_risk is refused, with its batch', () => {
+    assert.deepEqual(CHECK_JOB_WAKE_KEYS, [
+      'id', 'kind', 'check_job_id', 'check_kind', 'record', 'entries', 'yours', 'offered_at', 'delivery_connection_id',
+    ])
+    const versionOne = checkJob({ high_risk: 1 })
+    const refused = accept([fixtureAutomationDispatch(), versionOne])
+    assert.equal(refused.ok, false)
+    assert.match(refused.error, /check job dispatch/)
+    assert.equal(accept([checkJob({ high_risk: 0 })]).ok, false)
+  })
+
   it('rejects an unknown dispatch shape exactly as before check jobs', () => {
     const taskAssignment = { ...fixtureAutomationDispatch(), kind: 'task_assignment' }
     const refused = accept([taskAssignment])
@@ -114,7 +140,8 @@ describe('wake-channel validator: an automation run or a check job, nothing else
       checkJob({ record: { type: 'task', id: 'not-a-uuid', title: 't' } }),
       checkJob({ entries: -1 }),
       checkJob({ entries: 1.5 }),
-      checkJob({ high_risk: 4 }),
+      checkJob({ record: { type: 'outcome', id: RECORD, title: 't' } }),
+      checkJob({ check_kind: 'staleness', record: { type: 'backlog_scan', id: 'scan-1', title: 't' } }),
       checkJob({ yours: 'true' }),
       checkJob({ offered_at: 'yesterday' }),
     ]
@@ -130,8 +157,8 @@ describe('wake-channel validator: an automation run or a check job, nothing else
 })
 
 describe('check job negotiation, wake and turn', () => {
-  it('every poll says it reads check jobs, version 1', () => {
-    assert.equal(remoteIngressNegotiationArgs().check_job_version, 1)
+  it('every poll says it reads check jobs, version 2', () => {
+    assert.equal(remoteIngressNegotiationArgs().check_job_version, 2)
   })
 
   it('wakes with the one contract line naming the record', () => {
@@ -140,6 +167,25 @@ describe('check job negotiation, wake and turn', () => {
       'A check is waiting on "Fix the login redirect": take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
     )
     assert.match(checkJobWakeText(checkJob({ record: { type: 'memory', id: RECORD, title: ' ' } })), new RegExp(`waiting on memory ${RECORD}:`))
+  })
+
+  it('says what the records version 2 adds are, so the agent knows what it is ruling', () => {
+    const staleness = (type, title) => checkJob({ check_kind: 'staleness', record: { type, id: RECORD, title } })
+    assert.equal(
+      checkJobWakeText(staleness('discussion_point', 'Drop the free tier')),
+      'An out-of-date check on the settled discussion point "Drop the free tier" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+    )
+    assert.equal(
+      checkJobWakeText(staleness('goal', 'Launch in Europe')),
+      'An out-of-date check on the Goal "Launch in Europe" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+    )
+    assert.equal(
+      checkJobWakeText(staleness('backlog_scan', 'Backlog scan, 7 Nov')),
+      'The whole-backlog out-of-date scan "Backlog scan, 7 Nov" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+    )
+    assert.match(checkJobWakeText(staleness('backlog_scan', '')), /^The whole-backlog out-of-date scan is waiting: /)
+    assert.match(checkJobWakeText(staleness('goal', '')), new RegExp(`on the Goal ${RECORD} is waiting:`))
+    assert.match(checkJobWakeText(staleness('discussion_point', ' ')), new RegExp(`settled discussion point ${RECORD} is waiting:`))
   })
 
   it('a kept check job wakes the agent, and Cursor is told to notify on it', () => {
@@ -295,7 +341,7 @@ describe('live poller with check jobs', () => {
       fs.rmSync(markerPath, { force: true })
       const busyAt = polls.findIndex((p) => p.busy === true)
       assert.ok(await until(() => polls.slice(busyAt + 1).some((p) => p.busy === false)), `no busy:false after the turn ended; stderr:\n${stderr}`)
-      assert.ok(polls.every((p) => p.check_job_version === 1), 'every poll negotiates check jobs')
+      assert.ok(polls.every((p) => p.check_job_version === 2), 'every poll negotiates check jobs, version 2')
     } finally {
       child.kill('SIGKILL')
       try { fs.rmSync(resolveSpaceFreeWakeFile(FIXTURE_ID.connection), { force: true }) } catch { /* ignore */ }

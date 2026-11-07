@@ -19,7 +19,7 @@
  *      own cursor and typed claim/record wake, separate from canonical conversation.
  *   5. ACTIVE SESSION PLANS — strict 1.3 all-room inventory carried as advisory
  *      read awareness; it never grants execution or mutation authority.
- *   6. CHECK JOBS — negotiated `check_job_version: 1`; a check DevSpec asks this
+ *   6. CHECK JOBS — negotiated `check_job_version: 2`; a check DevSpec asks this
  *      agent to rule arrives beside automation runs on the dispatch lane, is kept
  *      once per id and wakes with one line (`check_job`), never as a command.
  *
@@ -804,9 +804,10 @@ export const SENDER_STYLE_VERSION = 1
  * person who SENT a command decide how they get answered, rather than whoever
  * owns this connection; `system_notice_version: 2` delivers server_notice and
  * unlinked_commit_item_review wakes; `room_context_version: 1` delivers the
- * 1.6.0 room context for local transcript materialization; `check_job_version: 1`
- * says this poller reads check jobs beside automation runs in `dispatches[]`
- * (remote-poll-acceptance.mjs), and DevSpec offers them only while it is sent.
+ * 1.6.0 room context for local transcript materialization; `check_job_version: 2`
+ * says this poller reads check jobs beside automation runs in `dispatches[]`, in the
+ * version-2 envelope (remote-poll-acceptance.mjs), and DevSpec offers them only while
+ * it is sent.
  */
 export function remoteIngressNegotiationArgs() {
   return {
