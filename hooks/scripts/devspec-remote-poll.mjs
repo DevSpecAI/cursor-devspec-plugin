@@ -795,15 +795,16 @@ export function isDeliverableCommand(msg, connectionId) {
 }
 
 /** The nested ingress ladder. Each tier requires the one below it (item 7c421a20). */
-export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 3
 export const SYSTEM_NOTICE_VERSION = SYSTEM_NOTICE_CHANNEL_VERSION
 export const SENDER_STYLE_VERSION = 1
 
 /**
  * Feature negotiation for canonical ingress. `sender_style_version` makes the
  * person who SENT a command decide how they get answered, rather than whoever
- * owns this connection; `system_notice_version: 2` delivers server_notice and
- * unlinked_commit_item_review wakes; `room_context_version: 1` delivers the
+ * owns this connection; `system_notice_version: 3` delivers server_notice and
+ * unlinked_commit_item_review wakes, each with DevSpec's `audience` label (needs a
+ * person, or for the record); `room_context_version: 1` delivers the
  * 1.6.0 room context for local transcript materialization; `check_job_version: 2`
  * says this poller reads check jobs beside automation runs in `dispatches[]`, in the
  * version-2 envelope (remote-poll-acceptance.mjs), and DevSpec offers them only while

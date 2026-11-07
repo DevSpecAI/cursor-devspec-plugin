@@ -33,6 +33,16 @@
  * - A notice-only turn whose model posted no reply ends with one: Stop posts the
  *   turn's final message as a notice reply (`postNoticeTurnReply`).
  *
+ * Which notices get a reply is DevSpec's label, never the plugin's guess (item
+ * a868f41f; `semantics.notice_audience`). At system_notice_version 3 every notice
+ * carries `audience`: `needs_person` or `for_the_record`. Only notices that need a
+ * person are given a reply call, stamped on a plain post or replied to at Stop; the
+ * turn record keeps the for-the-record ones apart (`forTheRecordIds`), so a turn they
+ * alone woke posts nothing. They still make the turn one that owns no command. A
+ * reply DevSpec refuses because every notice it names is for the record
+ * (`delivery.reason: for_the_record`) is the expected, quiet outcome: nothing is
+ * posted, surfaced or retried another way.
+ *
  * Imports only Node built-ins and sibling modules that do.
  */
 
@@ -48,6 +58,21 @@ const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const DEFAULT_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
 export const NOTICE_REPLY_CONTRACT = 'semantics.notice_reply in devspec://product/remote-ingress-contract'
+export const NOTICE_AUDIENCE_CONTRACT = 'semantics.notice_audience in devspec://product/remote-ingress-contract'
+
+/**
+ * The line a notice labelled for the record ends with, in place of a notice reply:
+ * what the label means for this host, and where the rules are.
+ */
+export const FOR_THE_RECORD_HANDLING =
+  'DevSpec labelled this notice for the record: it gets no notice reply and nothing in the room, ' +
+  'and any housekeeping it asks for on your own work is done quietly. ' +
+  'If a write you make while handling it returns tell_person, tell your person what you changed. ' +
+  `Rules: ${NOTICE_AUDIENCE_CONTRACT}.`
+
+/** The wake line's `notice_reply` when every notice it handed over is for the record. */
+export const FOR_THE_RECORD_WAKE =
+  `No notice reply: every notice in this wake is for the record (${NOTICE_AUDIENCE_CONTRACT}).`
 
 /** The wake reason a batch of notices carries (devspec-remote-wait.mjs). */
 export const NOTICE_WAKE_REASON = 'exact_connection_system_notice'
@@ -234,7 +259,17 @@ function checkJobIdsField(ids) {
   return list.length > 0 ? { checkJobIds: list } : {}
 }
 
-/** The current turn's record: `{ startedAt, noticeIds, checkJobIds?, otherWake, noticeReplyAt? }`, or null. */
+/** A record's for-the-record notice ids, as a field only when there are any. */
+function forTheRecordField(ids) {
+  const list = uniqueIds(ids)
+  return list.length > 0 ? { forTheRecordIds: list } : {}
+}
+
+/**
+ * The current turn's record: `{ startedAt, noticeIds, forTheRecordIds?, checkJobIds?,
+ * otherWake, noticeReplyAt? }`, or null. `noticeIds` holds every notice that woke the
+ * turn; `forTheRecordIds` the ones among them DevSpec labelled for the record.
+ */
 export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return null
   try {
@@ -243,6 +278,7 @@ export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
     return {
       startedAt: record.startedAt,
       noticeIds: uniqueIds(record.noticeIds),
+      ...forTheRecordField(record.forTheRecordIds),
       ...checkJobIdsField(record.checkJobIds),
       otherWake: record.otherWake === true,
       ...(typeof record.noticeReplyAt === 'number' ? { noticeReplyAt: record.noticeReplyAt } : {}),
@@ -261,13 +297,14 @@ function writeTurnWakes(connectionId, record, dir) {
   }
 }
 
-/** Fold a wake into a record: notice and check job ids accumulate, `otherWake` sticks. */
+/** Fold a wake into a record: notice, label and check job ids accumulate, `otherWake` sticks. */
 export function mergeTurnWake(record, wake) {
   const base = record ?? { startedAt: Date.now(), noticeIds: [], otherWake: false }
   if (!wake) return base
   return {
     ...base,
     noticeIds: uniqueIds([...(base.noticeIds ?? []), ...(wake.noticeIds ?? [])]),
+    ...forTheRecordField([...(base.forTheRecordIds ?? []), ...(wake.forTheRecordIds ?? [])]),
     ...checkJobIdsField([...(base.checkJobIds ?? []), ...(wake.checkJobIds ?? [])]),
     otherWake: base.otherWake === true || wake.otherWake === true,
   }
@@ -303,12 +340,13 @@ export function recordNoticeReply(connectionId, { dir = DEFAULT_DIR, now = Date.
 
 /**
  * What a list of wake events (devspec-remote-wait.mjs) brings into a turn: its notice
- * ids, or `otherWake` when anything in it is not a notice. Advisory lines (room
- * context, unread counts) and a connection's end bring nothing. Null when nothing in
- * it is a wake.
+ * ids (and which of them DevSpec labelled for the record), or `otherWake` when
+ * anything in it is not a notice. Advisory lines (room context, unread counts) and a
+ * connection's end bring nothing. Null when nothing in it is a wake.
  */
 export function turnWakeFromEvents(events) {
   const noticeIds = []
+  const forTheRecordIds = []
   const checkJobIds = []
   let otherWake = false
   let seen = false
@@ -316,7 +354,10 @@ export function turnWakeFromEvents(events) {
     if (!event || typeof event !== 'object') continue
     if (event.type === 'system_notice') {
       seen = true
-      if (typeof event.notice_id === 'string') noticeIds.push(event.notice_id)
+      if (typeof event.notice_id === 'string') {
+        noticeIds.push(event.notice_id)
+        if (event.audience === 'for_the_record') forTheRecordIds.push(event.notice_id)
+      }
     } else if (event.type === 'check_job') {
       seen = true
       if (typeof event.check_job_id === 'string') checkJobIds.push(event.check_job_id)
@@ -324,6 +365,7 @@ export function turnWakeFromEvents(events) {
       seen = true
       if (event.reason === NOTICE_WAKE_REASON) {
         if (Array.isArray(event.system_notice_ids)) noticeIds.push(...event.system_notice_ids)
+        if (Array.isArray(event.for_the_record_notice_ids)) forTheRecordIds.push(...event.for_the_record_notice_ids)
       } else if (event.reason === CHECK_JOB_WAKE_REASON) {
         if (typeof event.check_job_id === 'string') checkJobIds.push(event.check_job_id)
       } else {
@@ -337,7 +379,9 @@ export function turnWakeFromEvents(events) {
   if (otherWake) return { otherWake: true }
   const ids = uniqueIds(noticeIds)
   const jobs = checkJobIdsField(checkJobIds)
-  if (ids.length > 0 || jobs.checkJobIds) return { ...(ids.length > 0 ? { noticeIds: ids } : {}), ...jobs }
+  // A label counts only for a notice this wake actually delivered.
+  const labels = forTheRecordField(uniqueIds(forTheRecordIds).filter((id) => ids.includes(id)))
+  if (ids.length > 0 || jobs.checkJobIds) return { ...(ids.length > 0 ? { noticeIds: ids, ...labels } : {}), ...jobs }
   // A wake that names nothing it can be told apart by is treated as a command's.
   return seen ? { otherWake: true } : null
 }
@@ -365,13 +409,21 @@ export function turnWakeFromText(text) {
     const checkJobId = /"check_job_id"\s*:\s*"([0-9a-f-]{36})"/i.exec(line)?.[1]
     if (type === 'system_notice') {
       const id = /"notice_id"\s*:\s*"([0-9a-f-]{36})"/i.exec(line)?.[1]
-      events.push({ type, notice_id: id })
+      const audience = /"audience"\s*:\s*"([a-z_]+)"/.exec(line)?.[1]
+      events.push({ type, notice_id: id, ...(audience ? { audience } : {}) })
     } else if (type === 'check_job') {
       events.push({ type, check_job_id: checkJobId })
     } else if (type === 'wake') {
       const reason = /"reason"\s*:\s*"([a-z_]+)"/.exec(line)?.[1]
       const listed = /"system_notice_ids"\s*:\s*\[([^\]]*)\]/.exec(line)?.[1] ?? ''
-      events.push({ type, reason, system_notice_ids: listed.match(UUID_IN_TEXT) ?? [], check_job_id: checkJobId })
+      const quiet = /"for_the_record_notice_ids"\s*:\s*\[([^\]]*)\]/.exec(line)?.[1] ?? ''
+      events.push({
+        type,
+        reason,
+        system_notice_ids: listed.match(UUID_IN_TEXT) ?? [],
+        for_the_record_notice_ids: quiet.match(UUID_IN_TEXT) ?? [],
+        check_job_id: checkJobId,
+      })
     } else if (OTHER_WAKE_TYPES.has(type)) {
       events.push({ type })
     }
@@ -393,12 +445,25 @@ export function recordPromptWake(connectionId, { fromAPerson = false, text = '',
   if (!connectionId) return null
   const wake = fromAPerson ? { otherWake: true } : turnWakeFromText(text)
   if (midTurn) return recordTurnWake(connectionId, wake ?? { otherWake: true }, { dir })
-  if (wake) return recordTurnWake(connectionId, wake, { dir, newTurn: true })
+  if (wake) return recordTurnWake(connectionId, withKnownLabels(wake, readTurnWakes(connectionId, { dir })), { dir, newTurn: true })
   return readTurnWakes(connectionId, { dir })
 }
 
 /**
- * The notices this turn is about, when that is certain; otherwise null.
+ * A prompt cut short can lose a notice's label. A label is a fact about its notice
+ * id, so one the wait script recorded on delivery is kept for the same notice when
+ * the prompt starts the record again; it never labels a notice the prompt lacks.
+ */
+function withKnownLabels(wake, known) {
+  const ids = uniqueIds(wake?.noticeIds)
+  const knownQuiet = uniqueIds(known?.forTheRecordIds).filter((id) => ids.includes(id))
+  if (knownQuiet.length === 0) return wake
+  return { ...wake, ...forTheRecordField([...(wake.forTheRecordIds ?? []), ...knownQuiet]) }
+}
+
+/**
+ * The notices this turn is about that need a person, when that is certain; otherwise
+ * null.
  *
  * Certain means: the record holds at least one notice and no other wake; no turn typed
  * at the terminal is open (`connectionState.local_turn`); and the request log has no
@@ -406,9 +471,14 @@ export function recordPromptWake(connectionId, { fromAPerson = false, text = '',
  * request joins as "not known" (UNSTATED); the record accounts for those, since every
  * one that is not a notice sets `otherWake`. A stale record or request only ever
  * makes this null, never the other way round.
+ *
+ * Notices DevSpec labelled for the record are left out: nothing is posted about them,
+ * so a plain post is never stamped with them and Stop never replies to them. A turn
+ * that only they woke has none, and so null.
  */
 export function turnNoticeIds({ record, requestState = null, connectionState = null } = {}) {
-  const ids = uniqueIds(record?.noticeIds)
+  const quiet = new Set(uniqueIds(record?.forTheRecordIds))
+  const ids = uniqueIds(record?.noticeIds).filter((id) => !quiet.has(id))
   if (ids.length === 0 || record.otherWake === true) return null
   return nothingElseOpen(requestState, connectionState) ? ids : null
 }
@@ -532,11 +602,27 @@ function hookAssistantText(data) {
 }
 
 /**
+ * Whether DevSpec refused a notice reply because every notice it named is for the
+ * record (`delivery.reason: for_the_record`): nothing was posted and nothing needs to
+ * be. Read from the refusal's own receipt, or from its text when the receipt could
+ * not be parsed.
+ */
+export function isForTheRecordRefusal(error) {
+  const details = error?.details
+  if (details && typeof details === 'object' && details.delivery?.reason === 'for_the_record') return true
+  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  return /"reason"\s*:\s*"for_the_record"/.test(text)
+}
+
+/**
  * Stop: when the turn was woken only by notices and the model posted no reply to
- * them, post its final message as a notice reply. Bound to no command turn, so no
- * trail, no complete_turn and no local-turn flags. Nothing for a turn that errored or
- * was stopped (its last words are not an answer), or for a connection in no room:
- * the person already sees the final message in the terminal.
+ * the ones that need a person, post its final message as a notice reply to them.
+ * Bound to no command turn, so no trail, no complete_turn and no local-turn flags.
+ * Nothing for a turn that errored or was stopped (its last words are not an answer),
+ * for a connection in no room (the person already sees the final message in the
+ * terminal), or for a turn whose notices are all for the record. Should DevSpec still
+ * refuse the reply as for the record, that is the quiet outcome: recorded as handled,
+ * never surfaced or retried.
  *
  * @returns {Promise<string[]|null>} the notice ids replied to, or null
  */
@@ -564,12 +650,18 @@ export async function postNoticeTurnReply({
   if (data.status !== undefined && data.status !== 'completed') return null
   const text = prepare(hookAssistantText(data) ?? lastAssistantText(data.transcript_path))
   if (!text) return null
-  await post({
-    connection_id: connectionId,
-    ...(agentName ? { agent_name: agentName } : {}),
-    message: text,
-    system_notice_ids: ids,
-  })
+  try {
+    await post({
+      connection_id: connectionId,
+      ...(agentName ? { agent_name: agentName } : {}),
+      message: text,
+      system_notice_ids: ids,
+    })
+  } catch (error) {
+    if (!isForTheRecordRefusal(error)) throw error
+    recordNoticeReply(connectionId, { dir })
+    return null
+  }
   recordNoticeReply(connectionId, { dir })
   return ids
 }

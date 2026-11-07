@@ -101,6 +101,24 @@ describe('current Cursor authority and work-acquisition prose', () => {
     }
   })
 
+  // Prose guard for DevSpec item a868f41f: the label, not the agent, decides whether
+  // a notice is talked about in the room, and ruling a check job is never talked
+  // about there. The text points at the served rules rather than restating them.
+  it('points at notice_audience and check_job.room, and never asks for a post about ruling checks', () => {
+    for (const file of ['skills/devspec-remote/SKILL.md', 'rules/devspec.mdc']) {
+      const content = fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+      assert.match(content, /semantics\.notice_audience/, file)
+      assert.match(content, /check_job\.room/, file)
+      assert.match(content, /tell_person/, file)
+      assert.doesNotMatch(content, /post what happened/i, file)
+      const aboutChecks = content.split(/(?<=[.!?|])\s+/).filter((text) => /check job|check_job/i.test(text) && !/\bnever\b/i.test(text))
+      for (const sentence of aboutChecks) {
+        assert.doesNotMatch(sentence, /\b(?:post|tell|report)\b[^.]{0,60}\b(?:rul(?:ed|ing)|verdicts?)\b/i,
+          `${file} asks for a post about ruling a check job: ${sentence.slice(0, 160)}`)
+      }
+    }
+  })
+
   it('keeps interaction policy item-scoped on every work surface', () => {
     for (const file of ['skills/devspec-remote/SKILL.md']) {
       const content = contents.get(file)

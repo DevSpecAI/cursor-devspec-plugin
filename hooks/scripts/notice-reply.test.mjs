@@ -12,7 +12,10 @@
  *   notice, turns string-shaped ids into the array DevSpec takes, always names the
  *   connection, and never gives a notice reply local-turn flags;
  * - a notice reply never completes a turn or answers a command, even with complete_turn;
- * - Stop ends a notice-only turn with a notice reply, and such a turn posts no trail.
+ * - Stop ends a notice-only turn with a notice reply, and such a turn posts no trail;
+ * - a notice DevSpec labels for the record (system_notice_version 3, item a868f41f)
+ *   gets no reply from any of these, and a reply DevSpec refuses as for the record
+ *   is the quiet outcome it is.
  * The hooks run as Cursor runs them: real processes against a stub DevSpec server.
  */
 
@@ -28,13 +31,19 @@ import {
   applyArmTurnSemantics,
   buildOwnerMessageEvents,
   formatSystemNoticeContent,
+  NOTICE_HANDLING,
   parseWakeBatches,
 } from './devspec-remote-wait.mjs'
 import { appendWakeEvents } from './devspec-wake-file.mjs'
 import { handleExplicitReply } from './mark-explicit-reply.mjs'
 import { explicitReplyMarkerPath, turnMarkerPath, writeTurnMarker } from './mirror-turn.mjs'
+import { CursorMcpRefusal } from './mcp-call.mjs'
 import {
   currentTurnNoticeIds,
+  currentTurnOwnsNoCommand,
+  FOR_THE_RECORD_HANDLING,
+  FOR_THE_RECORD_WAKE,
+  isForTheRecordRefusal,
   lastAssistantText,
   noticeReplyCall,
   noticeReplyInstruction,
@@ -51,7 +60,12 @@ import {
 import { projectInput } from './project-input.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
-import { FIXTURE_ID, fixtureServerNotice, fixtureSystemNoticeEnvelope } from './remote-ingress-test-fixtures.mjs'
+import {
+  FIXTURE_ID,
+  fixtureServerNotice,
+  fixtureSystemNoticeEnvelope,
+  fixtureUnlinkedCommitNotice,
+} from './remote-ingress-test-fixtures.mjs'
 import { appendRequestEvent, readRequestState } from './requests.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -76,10 +90,17 @@ const PROJECT = {
 const TURN_ONLY = ['work_trail', 'trail_events', 'command_turn_id', 'reply_to_message_id', 'session_id']
 
 function noticeBatch(...ids) {
+  return labelledBatch(ids.map((id) => [id]))
+}
+
+/** A notice wake as DevSpec sends it at system_notice_version 3: `[id, audience]` pairs. */
+function labelledBatch(pairs) {
+  const ids = pairs.map(([id]) => id)
   const envelope = fixtureSystemNoticeEnvelope({
     wakeKind: 'system_notice',
     commands: [],
-    systemNotices: ids.map((id, i) => fixtureServerNotice({ notice_id: id, summary: `Notice ${i + 1}` })),
+    systemNotices: pairs.map(([id, audience], i) =>
+      fixtureServerNotice({ notice_id: id, summary: `Notice ${i + 1}`, ...(audience ? { audience } : {}) })),
   })
   return {
     type: 'canonical_system_notices',
@@ -520,5 +541,160 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     await run('mirror-turn.mjs', 'user_prompt', { prompt: notificationText(COMMAND_EVENTS, home) })
     await run('trail-turn.mjs', 'postToolUse', toolCall)
     assert.equal(posts()[0]?.args.phase, 'trail')
+  })
+})
+
+// DevSpec labels every notice at system_notice_version 3 (item a868f41f): only the
+// ones that need a person are replied to, by the model or by Stop.
+describe('notices DevSpec labels for the record', () => {
+  const FOR_THE_RECORD_REFUSAL = () => new CursorMcpRefusal(
+    JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.', notice_ids: [NOTICE_B] }),
+    { delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.', notice_ids: [NOTICE_B] },
+  )
+
+  /** A turn started by Cursor's notification of a labelled wake, as the prompt hook records it. */
+  function labelledTurn(pairs) {
+    const text = notificationText(buildOwnerMessageEvents(labelledBatch(pairs)), home)
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+    recordPromptWake(CONN, { text, dir })
+    return text
+  }
+
+  beforeEach(scratchHome)
+
+  it('a notice that needs a person ends with its reply; one for the record ends with no reply and points at the rules', () => {
+    const [needs, quiet, wake] = buildOwnerMessageEvents(labelledBatch([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']]))
+    assert.equal(needs.audience, 'needs_person')
+    assert.ok(needs.notice_reply.includes(`["${NOTICE_A}"]`))
+    assert.ok(needs.content.includes(NOTICE_HANDLING))
+    assert.ok(needs.content.includes(noticeReplyInstruction([NOTICE_A], { connectionId: CONN })))
+
+    assert.equal(quiet.audience, 'for_the_record')
+    assert.equal(quiet.notice_reply, undefined, 'nothing to copy into a post')
+    assert.ok(quiet.content.includes(FOR_THE_RECORD_HANDLING))
+    assert.ok(!quiet.content.includes(NOTICE_HANDLING), 'none of the telling-the-person handling')
+    assert.ok(!quiet.content.includes('system_notice_ids'), 'no reply call')
+    assert.match(FOR_THE_RECORD_HANDLING, /semantics\.notice_audience in devspec:\/\/product\/remote-ingress-contract/)
+    assert.match(FOR_THE_RECORD_HANDLING, /tell_person/)
+    // A cut-short preview still shows the label.
+    const line = JSON.stringify(quiet)
+    assert.ok(line.indexOf('"audience"') < 160)
+
+    assert.deepEqual(wake.system_notice_ids, [NOTICE_A, NOTICE_B])
+    assert.deepEqual(wake.for_the_record_notice_ids, [NOTICE_B])
+    assert.ok(wake.notice_reply.includes(`system_notice_ids: ["${NOTICE_A}"] })`), 'the batch reply names only the notice that needs a person')
+    assert.ok(!wake.notice_reply.includes(NOTICE_B))
+
+    const [, onlyWake] = buildOwnerMessageEvents(labelledBatch([[NOTICE_B, 'for_the_record']]))
+    assert.equal(onlyWake.notice_reply, FOR_THE_RECORD_WAKE)
+    assert.deepEqual(onlyWake.for_the_record_notice_ids, [NOTICE_B])
+  })
+
+  it('an unlinked-commit review and an unreadable kind labelled for the record get no reply either', () => {
+    const unlinked = formatSystemNoticeContent(fixtureUnlinkedCommitNotice({ notice_id: NOTICE_B, audience: 'for_the_record' }), { connectionId: CONN })
+    assert.ok(unlinked.includes(FOR_THE_RECORD_HANDLING))
+    assert.ok(!unlinked.includes('system_notice_ids'))
+    assert.ok(!unlinked.includes(NOTICE_HANDLING))
+    const unreadable = formatSystemNoticeContent(
+      { version: 1, kind: 'future_notice_kind', notice_id: NOTICE_B, contract_uri: 'devspec://product/remote-ingress-contract', audience: 'for_the_record' },
+      { connectionId: CONN },
+    )
+    assert.ok(unreadable.includes(FOR_THE_RECORD_HANDLING))
+    assert.doesNotMatch(unreadable, /Tell the person/)
+    assert.ok(!unreadable.includes('system_notice_ids'))
+  })
+
+  it('the turn record keeps which notices are for the record, from events, from the lines Cursor shows, even cut short', () => {
+    const events = buildOwnerMessageEvents(labelledBatch([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']]))
+    const expected = { noticeIds: [NOTICE_A, NOTICE_B], forTheRecordIds: [NOTICE_B] }
+    assert.deepEqual(turnWakeFromEvents(events), expected)
+    const text = notificationText(events, home)
+    assert.deepEqual(turnWakeFromText(text), expected)
+    const cut = text.split('\n').map((line) => line.slice(0, 160)).join('\n')
+    assert.deepEqual(turnWakeFromText(cut), expected)
+    // A label never names a notice the wake did not deliver.
+    assert.deepEqual(
+      turnWakeFromEvents([{ type: 'wake', reason: 'exact_connection_system_notice', system_notice_ids: [NOTICE_A], for_the_record_notice_ids: [NOTICE_B] }]),
+      { noticeIds: [NOTICE_A] },
+    )
+  })
+
+  it('a prompt that lost a label keeps the one the wait script recorded on delivery', () => {
+    recordTurnWake(CONN, { noticeIds: [NOTICE_B], forTheRecordIds: [NOTICE_B] }, { dir, newTurn: true })
+    // The notification shows the notice without its label (an older line shape, or cut short).
+    recordPromptWake(CONN, { text: `{"type":"system_notice","notice_id":"${NOTICE_B}"}`, dir })
+    assert.deepEqual(readTurnWakes(CONN, { dir }).forTheRecordIds, [NOTICE_B])
+    // A different notice in the next turn is not labelled by the old record.
+    recordPromptWake(CONN, { text: `{"type":"system_notice","notice_id":"${NOTICE_A}"}`, dir })
+    assert.equal(readTurnWakes(CONN, { dir }).forTheRecordIds, undefined)
+  })
+
+  it('a turn only for-the-record notices woke stamps nothing on a post, yet still owns no command', () => {
+    labelledTurn([[NOTICE_B, 'for_the_record']])
+    assert.equal(currentTurnNoticeIds(CONN, { dir }), null)
+    assert.equal(currentTurnOwnsNoCommand(CONN, { dir }), true, 'its work is still kept out of the room\'s trail')
+    // Telling the person what changed in someone else's record (tell_person) is an
+    // ordinary message, which DevSpec would refuse if it named the notice.
+    const sent = prePost({ message: 'I closed Brandon\'s duplicate task while tidying mine.' })
+    assert.equal(sent.system_notice_ids, undefined)
+    assert.equal(readTurnWakes(CONN, { dir }).noticeReplyAt, undefined)
+  })
+
+  it('a turn with both stamps only the notice that needs a person', () => {
+    labelledTurn([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']])
+    assert.deepEqual(currentTurnNoticeIds(CONN, { dir }), [NOTICE_A])
+    assert.deepEqual(prePost({ message: 'This clashes with the release decision.' }).system_notice_ids, [NOTICE_A])
+  })
+
+  it('Stop replies to nothing in a for-the-record turn, and only to what needs a person in a mixed one', async () => {
+    const file = path.join(home, 'agent-transcript.jsonl')
+    fs.writeFileSync(file, `${JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Linked the commit.' }] } })}\n`)
+    const posts = []
+    const stop = () => postNoticeTurnReply({
+      raw: JSON.stringify({ status: 'completed', transcript_path: file }),
+      connectionId: CONN,
+      sessionId: ROOM,
+      dir,
+      post: async (args) => posts.push(args),
+    })
+    labelledTurn([[NOTICE_B, 'for_the_record']])
+    assert.equal(await stop(), null)
+    assert.equal(posts.length, 0)
+
+    scratchHome()
+    labelledTurn([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']])
+    assert.deepEqual(await stop(), [NOTICE_A])
+    assert.deepEqual(posts.map((args) => args.system_notice_ids), [[NOTICE_A]])
+  })
+
+  it('a reply DevSpec refuses as for the record is quiet: no error, no retry, no second reply', async () => {
+    assert.equal(isForTheRecordRefusal(FOR_THE_RECORD_REFUSAL()), true)
+    // Read from the text when the receipt could not be parsed.
+    assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('{"delivery":{"status":"rejected","reason":"for_the_record","retryable":false}}\n{"account_notice":{}}', undefined)), true)
+    assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('Connection not found', { error: 'Connection not found' })), false)
+    assert.equal(isForTheRecordRefusal(new Error('MCP HTTP 500: boom')), false)
+
+    const file = path.join(home, 'agent-transcript.jsonl')
+    fs.writeFileSync(file, `${JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Done.' }] } })}\n`)
+    let calls = 0
+    const stop = (refusal) => postNoticeTurnReply({
+      raw: JSON.stringify({ status: 'completed', transcript_path: file }),
+      connectionId: CONN,
+      sessionId: ROOM,
+      dir,
+      post: async () => { calls++; throw refusal() },
+    })
+    // A notice the plugin saw unlabelled, which DevSpec knows is for the record.
+    noticeTurn(NOTICE_B)
+    assert.equal(await stop(FOR_THE_RECORD_REFUSAL), null)
+    assert.equal(calls, 1, 'never retried')
+    assert.equal(typeof readTurnWakes(CONN, { dir }).noticeReplyAt, 'number', 'handled: nothing more is posted for it')
+    assert.equal(await stop(FOR_THE_RECORD_REFUSAL), null)
+    assert.equal(calls, 1)
+
+    // Any other refusal is still an error for the caller.
+    scratchHome()
+    noticeTurn(NOTICE_A)
+    await assert.rejects(stop(() => new CursorMcpRefusal('Connection not found', { error: 'Connection not found' })), /Connection not found/)
   })
 })
