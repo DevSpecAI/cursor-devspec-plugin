@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   emptyCanonicalContextCarry,
+  isSystemNoticeV1,
   mergeCanonicalContextCarry,
+  noticeAudience,
   normalizeRemoteIngressV1,
   validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
@@ -396,6 +398,28 @@ describe('canonical remote ingress v1', () => {
       validateRemoteIngressEnvelopeV1(noticeWithCommand, ID.connection),
       /system notices cannot accompany/,
     )
+  })
+
+  it('accepts DevSpec\'s audience label on every notice kind (system_notice_version 3), and only a known label', () => {
+    const wake = (notice) => fixtureSystemNoticeEnvelope({ wakeKind: 'system_notice', commands: [], systemNotices: [notice] })
+    for (const audience of ['needs_person', 'for_the_record']) {
+      assert.equal(validateRemoteIngressEnvelopeV1(wake(fixtureServerNotice({ audience })), ID.connection), null, `server_notice ${audience}`)
+      assert.equal(validateRemoteIngressEnvelopeV1(wake(fixtureUnlinkedCommitNotice({ audience })), ID.connection), null, `unlinked ${audience}`)
+      assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience })), true)
+    }
+    // The label is the one key a notice adds; its body version stays 1.
+    assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience: 'needs_person', version: 3 })), false)
+    for (const audience of ['later', '', null, 'NEEDS_PERSON']) {
+      assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience })), false, String(audience))
+      assert.equal(isSystemNoticeV1(fixtureUnlinkedCommitNotice({ audience })), false, String(audience))
+      assert.match(validateRemoteIngressEnvelopeV1(wake(fixtureServerNotice({ audience })), ID.connection), /malformed system notices/)
+    }
+    // Still exact: another new key is refused.
+    assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience: 'for_the_record', ask: 'OK it' })), false)
+    // No label reads as needing a person, the way DevSpec reads one it stored unlabelled.
+    assert.equal(noticeAudience(fixtureServerNotice()), 'needs_person')
+    assert.equal(noticeAudience(fixtureServerNotice({ audience: 'needs_person' })), 'needs_person')
+    assert.equal(noticeAudience(fixtureServerNotice({ audience: 'for_the_record' })), 'for_the_record')
   })
 
   it('accepts active_session_plans on the 1.5 tier without regressing 1.2 strictness', () => {

@@ -1337,9 +1337,9 @@ describe('Cursor dismissal reader source gate before stdout and wake-file', () =
 })
 
 describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
-  it('negotiates system_notice_version: 2 and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
-    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 2)
-    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 2)
+  it('negotiates system_notice_version: 3 (DevSpec\'s label on every notice) and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
+    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 3)
+    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 3)
     assert.match(REMOTE_WAKE_NOTIFY_PATTERN, /system_notice/)
   })
 

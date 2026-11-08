@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.0
+
+Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.
+
+- **More checks come to the agent.** The plugin now takes check jobs in DevSpec's version 2. Besides tasks, decisions, documents and pending versions, a check can now be about a settled discussion point, a Goal, or the whole backlog: when a discussion point settles or a Goal changes, the agent can check which open tasks it leaves out of date, and the Tasks page's out-of-date scan of the whole backlog can come to the agent too. The wake line says which it is. Check jobs no longer carry a high-risk count.
+- **Only what needs you reaches the room.** DevSpec now labels every notice it sends the agent: it needs a person, or it is for the record. The agent replies in the room only to notices that need a person. A notice for the record, such as a pending edit going live or which task its own commit belongs to, gets no reply: any tidying it asks for is done quietly, and a turn woken only by such notices posts nothing. If tidying up ever changes someone else's record, DevSpec says so and the agent tells you what it changed.
+- **Ruling checks stays out of the room.** The agent's instructions now say never to post about ruling a check job. Rulings show on the record and in Review, and anything that needs you arrives afterwards as its own notice.
+
 ## 0.18.2
 
 - When DevSpec's check finds that a task your Cursor agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.

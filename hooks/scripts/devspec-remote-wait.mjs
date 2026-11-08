@@ -61,6 +61,7 @@ import {
   canonicalAttachmentDescriptor,
   isSystemNoticeV1,
   isUnreadableSystemNoticeV1,
+  noticeAudience,
   REMOTE_INGRESS_RESOURCE_URI,
   validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
@@ -91,6 +92,8 @@ import { isDirectRun } from './is-direct-run.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import {
   clearTurnWakes,
+  FOR_THE_RECORD_HANDLING,
+  FOR_THE_RECORD_WAKE,
   noticeReplyCall,
   noticeReplyInstruction,
   recordTurnWake,
@@ -1011,10 +1014,11 @@ export function parseOwnerBatches(lines, { canonicalOnly = false } = {}) {
 }
 
 /**
- * How every readable notice is handled, carried with the notice itself so it
- * costs nothing until one arrives (item 984ca8b4). A notice is about the agent's
- * own work: a finding on it, or what happened to a change that waited on
- * someone. The agent tells its person; it never answers for one.
+ * How a readable notice that needs a person is handled, carried with the notice
+ * itself so it costs nothing until one arrives (item 984ca8b4). A notice is about
+ * the agent's own work: a finding on it, or what happened to a change that waited on
+ * someone. The agent tells its person; it never answers for one. A notice DevSpec
+ * labels for the record carries `FOR_THE_RECORD_HANDLING` instead (notice-reply.mjs).
  */
 export const NOTICE_HANDLING =
   'Handling: the labelled records above are your reading context — never dump their full text into the conversation. ' +
@@ -1025,17 +1029,28 @@ export const NOTICE_HANDLING =
   'Telling the person about the notice in the room is the notice reply below, never an answer to a command.'
 
 /**
- * The model-readable rendering of one notice. Every kind ends with the exact notice
- * reply for its own id (notice-reply.mjs): telling the person about a notice in the
- * room is a reply to that notice, never an answer to a command.
+ * The model-readable rendering of one notice. A notice DevSpec labels as needing a
+ * person ends with the exact notice reply for its own id (notice-reply.mjs): telling
+ * the person about a notice in the room is a reply to that notice, never an answer to
+ * a command. One labelled for the record ends with no reply at all
+ * (`FOR_THE_RECORD_HANDLING`): the label is DevSpec's, never the plugin's guess
+ * (`semantics.notice_audience`), and a notice with no label needs a person.
  */
 export function formatSystemNoticeContent(notice, { connectionId = null } = {}) {
-  const reply = noticeReplyInstruction([notice?.notice_id], { connectionId })
+  const forTheRecord = noticeAudience(notice) === 'for_the_record'
+  const reply = forTheRecord
+    ? FOR_THE_RECORD_HANDLING
+    : noticeReplyInstruction([notice?.notice_id], { connectionId })
+  // The rest of the handling (how to act, and when to tell the person) is for a
+  // notice that needs a person; one for the record is housekeeping, done quietly.
+  const handling = forTheRecord ? [] : [NOTICE_HANDLING]
   if (isUnreadableSystemNoticeV1(notice)) {
     return [
       '[DevSpec System Notice: not readable by this plugin version]',
       `DevSpec sent a notice of a kind this version of the DevSpec plugin cannot read (kind ${notice.kind}, notice ${notice.notice_id}). It may be a finding or an outcome about your own work.`,
-      'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
+      forTheRecord
+        ? 'It is on the record and in the project\'s Review. Do not act on it.'
+        : 'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
       reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice, not a room message or new work authorization.',
@@ -1065,7 +1080,7 @@ export function formatSystemNoticeContent(notice, { connectionId = null } = {}) 
     }
     lines.push(
       '',
-      NOTICE_HANDLING,
+      ...handling,
       reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
@@ -1080,7 +1095,7 @@ export function formatSystemNoticeContent(notice, { connectionId = null } = {}) 
     ...(notice?.prompt ? [`Prompt: ${notice.prompt}`] : []),
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
-    NOTICE_HANDLING,
+    ...handling,
     reply,
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
@@ -1103,15 +1118,21 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
   const pointers = batch?.wake_context ?? null
   const events = []
 
-  // Each notice names the exact reply to it near the start of its line, ahead of the
-  // records, so a cut-short preview still shows it (notice-reply.mjs).
+  // Each notice names DevSpec's label and, when it needs a person, the exact reply to
+  // it near the start of its line, ahead of the records, so a cut-short preview still
+  // shows them (notice-reply.mjs). A notice for the record carries no reply.
+  const replyTo = (notice) =>
+    noticeAudience(notice) === 'for_the_record'
+      ? {}
+      : { notice_reply: noticeReplyCall([notice.notice_id], { connectionId }) }
   for (const notice of notices) {
     if (isUnreadableSystemNoticeV1(notice)) {
       events.push({
         type: 'system_notice',
         kind: notice.kind,
         notice_id: notice.notice_id,
-        notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
+        audience: noticeAudience(notice),
+        ...replyTo(notice),
         readable: false,
         content: formatSystemNoticeContent(notice, { connectionId }),
         session_id: sessionId,
@@ -1128,7 +1149,8 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
       type: 'system_notice',
       kind: notice.kind,
       notice_id: notice.notice_id,
-      notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
+      audience: noticeAudience(notice),
+      ...replyTo(notice),
       ...(notice.kind === 'server_notice'
         ? {
             topic: notice.topic,
@@ -1159,6 +1181,12 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     })
   }
 
+  const forTheRecordIds = notices
+    .filter((notice) => noticeAudience(notice) === 'for_the_record')
+    .map((notice) => notice.notice_id)
+  const needsPersonIds = notices
+    .filter((notice) => noticeAudience(notice) !== 'for_the_record')
+    .map((notice) => notice.notice_id)
   events.push({
     type: 'wake',
     reason: 'exact_connection_system_notice',
@@ -1169,8 +1197,11 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     count: notices.length,
     envelope_id: ingress?.envelope_id ?? null,
     system_notice_ids: notices.map((notice) => notice.notice_id),
-    // One reply can answer every notice this wake handed over, and no others.
-    notice_reply: noticeReplyInstruction(notices.map((notice) => notice.notice_id), { connectionId }),
+    ...(forTheRecordIds.length > 0 ? { for_the_record_notice_ids: forTheRecordIds } : {}),
+    // One reply can answer every notice of this wake that needs a person, and no others.
+    notice_reply: needsPersonIds.length > 0
+      ? noticeReplyInstruction(needsPersonIds, { connectionId })
+      : FOR_THE_RECORD_WAKE,
     inbox: inboxFile ?? null,
     authoritative: false,
     executable: false,

@@ -41,19 +41,31 @@ export function validateAutomationDispatch(dispatch, connectionId) {
  * `check_job_version` on every poll: a connection that never sends it is never
  * offered one, because a validator that only knew automation runs would reject the
  * whole batch, automation runs included.
+ *
+ * Version 2 (DevSpec item 1d89fe56) is the envelope `check_job.envelope` and
+ * `check_job.records` in devspec://product/remote-ingress-contract describe: no
+ * `high_risk`, and three more records, each an out-of-date (`staleness`) check. This
+ * plugin negotiates 2 only, so the server never sends it the version-1 envelope.
  */
-export const CHECK_JOB_VERSION = 1
+export const CHECK_JOB_VERSION = 2
 
-/** The server's CHECK_JOB_WAKE_KEYS: inbox metadata only, never record text. */
+/** The server's version-2 CHECK_JOB_WAKE_KEYS: inbox metadata only, never record text. */
 export const CHECK_JOB_WAKE_KEYS = [
-  'id', 'kind', 'check_job_id', 'check_kind', 'record', 'entries', 'high_risk', 'yours', 'offered_at', 'delivery_connection_id',
+  'id', 'kind', 'check_job_id', 'check_kind', 'record', 'entries', 'yours', 'offered_at', 'delivery_connection_id',
 ]
 export const CHECK_JOB_KINDS = ['conflict', 'conflict_decisions', 'duplicate', 'staleness']
-export const CHECK_JOB_RECORD_TYPES = ['task', 'memory', 'artifact', 'proposal']
+/**
+ * The records a version-2 job may name. The last three are the ones version 2 adds:
+ * a settled discussion point or a Goal whose open-task out-of-date check this is,
+ * and the manual whole-backlog out-of-date scan's own record. Each is only ever a
+ * `staleness` check.
+ */
+export const CHECK_JOB_RECORD_TYPES = ['task', 'memory', 'artifact', 'proposal', 'discussion_point', 'goal', 'backlog_scan']
+const STALENESS_ONLY_RECORD_TYPES = new Set(['discussion_point', 'goal', 'backlog_scan'])
 
 function count(value) { return Number.isSafeInteger(value) && value >= 0 }
 
-/** Strictly accept a check job: exactly the server's envelope, addressed to this connection. */
+/** Strictly accept a check job: exactly the server's version-2 envelope, addressed to this connection. */
 export function validateCheckJobDispatch(dispatch, connectionId) {
   if (!exact(dispatch, CHECK_JOB_WAKE_KEYS) || !exact(dispatch.record, ['type', 'id', 'title'])) {
     return 'malformed check job dispatch'
@@ -62,8 +74,9 @@ export function validateCheckJobDispatch(dispatch, connectionId) {
   if (dispatch.kind !== 'check_job' || !uuid(dispatch.id) || dispatch.check_job_id !== dispatch.id ||
       !CHECK_JOB_KINDS.includes(dispatch.check_kind) ||
       !CHECK_JOB_RECORD_TYPES.includes(dispatch.record.type) || !uuid(dispatch.record.id) ||
+      (STALENESS_ONLY_RECORD_TYPES.has(dispatch.record.type) && dispatch.check_kind !== 'staleness') ||
       typeof dispatch.record.title !== 'string' ||
-      !count(dispatch.entries) || !count(dispatch.high_risk) || dispatch.high_risk > dispatch.entries ||
+      !count(dispatch.entries) ||
       typeof dispatch.yours !== 'boolean' || !datetime(dispatch.offered_at) ||
       dispatch.delivery_connection_id !== connectionId) return 'invalid check job dispatch'
   return null
@@ -417,7 +430,27 @@ function checkJobSubject(job) {
   return title ? `"${title}"` : `${job.record?.type ?? 'record'} ${job.record?.id ?? ''}`.trim()
 }
 
+/**
+ * What the check is on, in words. The records version 2 adds say what they are,
+ * because a title alone ("Pricing page") does not tell a settled discussion point
+ * from a Goal, and the manual scan is a scan of the whole backlog, not of one record.
+ */
+function checkJobTarget(job) {
+  const title = typeof job.record?.title === 'string' ? job.record.title.trim() : ''
+  const named = title ? ` "${title}"` : ''
+  switch (job.record?.type) {
+    case 'discussion_point':
+      return `An out-of-date check on the settled discussion point${named || ` ${job.record.id}`} is waiting`
+    case 'goal':
+      return `An out-of-date check on the Goal${named || ` ${job.record.id}`} is waiting`
+    case 'backlog_scan':
+      return `The whole-backlog out-of-date scan${named} is waiting`
+    default:
+      return `A check is waiting on ${checkJobSubject(job)}`
+  }
+}
+
 /** The one line that wakes the agent for a check job (the frozen contract's wake text). */
 export function checkJobWakeText(job) {
-  return `A check is waiting on ${checkJobSubject(job)}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`
+  return `${checkJobTarget(job)}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`
 }

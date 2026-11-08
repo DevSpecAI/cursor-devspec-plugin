@@ -42,7 +42,7 @@ Remote control and commit tracking run in the background, and Cursor doesn't sha
       "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
         "Authorization": "Bearer dvs_your_token_here",
-        "x-devspec-plugin": "cursor/0.18.2"
+        "x-devspec-plugin": "cursor/0.19.0"
       }
     }
   }
