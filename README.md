@@ -29,7 +29,7 @@ Start `cursor-agent`, type `/plugin`, search the marketplace for **DevSpec**, an
 
 ### 2. Approve DevSpec for the agent
 
-In `cursor-agent`, type `/mcp` and open the DevSpec server (`devspec-cursor`). Choose **Enable** if Cursor asks, then **Login**. Your browser opens DevSpec's approval page for Cursor: sign in to DevSpec if asked and click **Allow**. The agent now has its DevSpec tools. There is no token to create, copy or paste.
+In `cursor-agent`, type `/mcp` and open the DevSpec server (`devspec-cursor`). Choose **Enable** if Cursor asks, then **Login**. Your browser opens DevSpec's approval page for Cursor: sign in to DevSpec if asked and click **Allow**, then restart `cursor-agent` so the agent's DevSpec tools and connection load cleanly.
 
 ### 3. Connect
 

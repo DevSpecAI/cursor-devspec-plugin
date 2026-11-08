@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.1
+
+- **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, the login helper places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Cursor to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
+
 ## 0.20.0
 
 DevSpec for Cursor signs in through your browser. There is no token to create, copy or paste any more.

@@ -290,7 +290,7 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
     }
     try {
       const login = await finishCodeSignIn(mcpUrl, pasted)
-      out(`Signed in to DevSpec (${label})${login.signedInAs ? ` as ${login.signedInAs}` : ''}. Remote control and commit tracking can now use it.`)
+      out(`Signed in to DevSpec (${label})${login.signedInAs ? ` as ${login.signedInAs}` : ''}. Remote control and commit tracking can now use it. Restart Cursor to finish connecting.`)
       return 0
     } catch (err) {
       out(`DevSpec sign-in failed: ${message(err)}`)
@@ -306,9 +306,9 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
       out(`DevSpec sign-in unavailable: ${message(err)}`)
       return 1
     }
-    out(`Sign in to DevSpec (${label}): open this link in a browser, approve Cursor, then copy the code the page shows.\n${url}`)
+    out(`Sign in to DevSpec (${label}): open this link in a browser, approve Cursor, then copy the code the page shows.\n\n${url}`)
     if (!process.stdin.isTTY) {
-      out(`Then run: ${loginCommandFor(mcpUrl)} --paste "<the code>"`)
+      out(`\nThen run: ${loginCommandFor(mcpUrl)} --paste "<the code>"`)
       return 0
     }
     const answer = (await ask('Paste the code from the DevSpec page: ')).trim()
@@ -318,7 +318,7 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
     }
     try {
       const login = await finishCodeSignIn(mcpUrl, answer)
-      out(`Signed in to DevSpec (${label})${login.signedInAs ? ` as ${login.signedInAs}` : ''}. Remote control and commit tracking can now use it.`)
+      out(`Signed in to DevSpec (${label})${login.signedInAs ? ` as ${login.signedInAs}` : ''}. Remote control and commit tracking can now use it. Restart Cursor to finish connecting.`)
       return 0
     } catch (err) {
       out(`DevSpec sign-in failed: ${message(err)}`)
@@ -332,8 +332,8 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
     return 1
   }
   if (started.status !== 'signed_in') {
-    out(`Approve Cursor in your browser to sign in to DevSpec (${label}).${started.url ? ` If it did not open, open this link:\n${started.url}` : ''}\n` +
-      `On a machine your browser cannot reach, run ${loginCommandFor(mcpUrl)} --code instead.`)
+    out(`Approve Cursor in your browser to sign in to DevSpec (${label}).${started.url ? ` If it did not open, open this link:\n\n${started.url}\n` : ''}\n` +
+      `Running Cursor on a remote machine where a browser cannot open locally? Run ${loginCommandFor(mcpUrl)} --code instead.`)
     const done = await waitForBackgroundSignIn(mcpUrl, { since: started.startedAt, timeoutMs: SIGN_IN_WAIT_MS + 30_000 })
     if (done.status !== 'signed_in') {
       out(`DevSpec sign-in did not finish: ${done.status === 'failed' ? done.error : 'nobody approved it in time.'} Run ${loginCommandFor(mcpUrl)} to try again.`)
@@ -341,6 +341,6 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
     }
   }
   const state = loginState(mcpUrl)
-  out(`Signed in to DevSpec (${label})${state.login?.signedInAs ? ` as ${state.login.signedInAs}` : ''}. Remote control and commit tracking can now use it.`)
+  out(`Signed in to DevSpec (${label})${state.login?.signedInAs ? ` as ${state.login.signedInAs}` : ''}. Remote control and commit tracking can now use it. Restart Cursor to finish connecting.`)
   return 0
 }

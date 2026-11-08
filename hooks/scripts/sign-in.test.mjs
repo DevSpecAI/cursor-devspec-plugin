@@ -66,6 +66,10 @@ test('the approval comes back through the browser to this machine, and only with
   const page = await approve(pending.url)
   assert.equal(page.status, 200)
   assert.match(page.text, /Signed in to DevSpec/)
+  assert.match(page.text, /Restart Cursor to finish connecting\./)
+  assert.match(page.text, /color-scheme:light dark/)
+  assert.match(page.text, /@media \(prefers-color-scheme:dark\)/)
+  assert.match(page.text, /logo-icon\.png/)
   const tokens = await pending.done
   assert.match(tokens.accessToken, /^oat_/)
   assert.match(tokens.refreshToken, /^rt_/)
