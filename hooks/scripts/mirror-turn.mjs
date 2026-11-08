@@ -21,7 +21,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
@@ -569,16 +569,13 @@ async function main() {
   const state = loadState(conversationId)
   if (!state) process.exit(0)
 
-  let token = state.token
-  let mcpUrl = state.mcp_url
-  if (!token) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) process.exit(0) // silent — skill still posts instructionally
-
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  // The connection's current credential. When its sign-in has ended, the poller (which
+  // asks DevSpec continuously) stands the connection down and says so plainly; this
+  // hook has nothing to add to that and exits quietly.
+  const credential = connectionCredential(state)
+  if (!credential.ok) process.exit(0)
+  const token = credential.token
+  const mcpUrl = credential.mcp_url
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   const connectionId = state.connection_id

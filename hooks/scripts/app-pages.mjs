@@ -16,7 +16,7 @@
 
 export const DEFAULT_APP_URL = 'https://app.devspec.ai'
 
-/** Personal settings → Agent setup: where a person creates or reveals their key. */
+/** Personal settings → Agent setup: where a person sees and disconnects the tools signed in to DevSpec. */
 export const AGENTS_PAGE_PATH = '/settings/agents'
 
 const APP_BASE_FOR_HOST = new Map([

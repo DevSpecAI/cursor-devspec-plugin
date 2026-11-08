@@ -79,10 +79,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  enumerateCredentialPairs,
+  DEFAULT_MCP_URL,
+  credentialIdentity,
+  credentialStateFields,
+  envTokenNotice,
+  envTokenShadowsLogin,
+  handleCredentialRefusal,
   hostTokenFromEnv,
-  noOwningKeyError,
-  proveCredentialPair,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
 import {
@@ -91,6 +94,7 @@ import {
   LOCAL_ID_OVERRIDE_ENV_VAR,
 } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
@@ -1441,7 +1445,12 @@ export async function registerConnection(opts) {
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
       : null) || hostTokenFromEnv(process.env)
-  const auth = resolveAuth(cwd, { hostToken })
+  let auth = resolveAuth(cwd, { hostToken })
+  // Registering is where remote control starts: with no sign-in for the background
+  // features yet, start the one browser approval for them (item 95a67ee4).
+  if (!auth.ok && !opts.resolveAuth && ['sign_in_required', 'signed_out'].includes(auth.code)) {
+    auth = await (opts.signIn || authForConnect)(cwd, { hostToken })
+  }
   if (!auth.ok || !auth.token || !auth.mcp_url) {
     await emitPhase({
       phase: 'register_connection',
@@ -1451,9 +1460,14 @@ export async function registerConnection(opts) {
       local_id: localId,
       agent,
       mcpUrl: auth.mcp_url || null,
-      reason: auth.error || 'auth_failed',
+      reason: auth.code || auth.error || 'auth_failed',
     })
-    return { ok: false, error: auth.error || 'auth_failed' }
+    return {
+      ok: false,
+      error: auth.error || 'auth_failed',
+      ...(auth.code ? { code: auth.code } : {}),
+      ...(auth.sign_in_url ? { sign_in_url: auth.sign_in_url } : {}),
+    }
   }
 
   try {
@@ -1547,6 +1561,8 @@ export async function registerConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
+    const refused = await handleCredentialRefusal(err, auth)
+    if (refused) return { ok: false, code: refused.code, error: refused.message }
     const choice = choiceFromFailure(err)
     if (choice || projectId) {
       try { blockProjectContext(localId, auth.mcp_url, 'Choose a project explicitly with fast-connect --project <name-or-id>.', opts.projectHome, Boolean(projectId)) } catch {}
@@ -1640,6 +1656,8 @@ export async function attachConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
+    const refused = await handleCredentialRefusal(err, auth)
+    if (refused) return { ok: false, code: refused.code, error: refused.message }
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
@@ -1664,16 +1682,6 @@ export async function attachConnection(opts) {
  *   emitPhase?: typeof emitConnectPhase,
  * }} opts
  */
-async function heartbeatOwnsConnection(pair, connectionId) {
-  await mcpToolsCall({
-    mcpUrl: pair.mcp_url,
-    token: pair.token,
-    name: 'heartbeat_connection',
-    arguments: { connection_id: connectionId, status: 'live' },
-    timeoutMs: 15_000,
-  })
-}
-
 export async function writeConnectionState(opts) {
   const writeStarted = Date.now()
   const connectionId = opts.connectionId
@@ -1686,40 +1694,10 @@ export async function writeConnectionState(opts) {
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
       : null) || hostTokenFromEnv(process.env)
-  let auth
-  let warning_tokens = null
-  if (resolveAuth !== resolveDevspecMcpAuth) {
-    auth = resolveAuth(cwd, { hostToken })
-  } else {
-    const { pairs } = enumerateCredentialPairs(cwd, { hostToken })
-    const proven = await proveCredentialPair(pairs, {
-      connectionId,
-      probe: opts.probe || heartbeatOwnsConnection,
-    })
-    warning_tokens = proven.warning
-    if (proven.pair) {
-      auth = {
-        ok: true,
-        token: proven.pair.token,
-        mcp_url: proven.pair.mcp_url,
-        source: proven.pair.source,
-      }
-    } else {
-      const fallback = resolveAuth(cwd, { hostToken })
-      auth = {
-        ok: false,
-        token: null,
-        mcp_url: fallback.mcp_url,
-        source: fallback.source || fallback.error || null,
-        error:
-          proven.error === 'no_proven_pair'
-            ? noOwningKeyError(pairs)
-            : proven.error === 'unproven'
-              ? 'This machine has more than one DevSpec key; the poller will not start until one is proven to own this connection.'
-              : fallback.error,
-      }
-    }
-  }
+  // One credential: DEVSPEC_MCP_TOKEN, or the plugin's own browser sign-in for its
+  // server. A browser login is recorded by its stable identity, never its token,
+  // which changes daily; every later use takes the current one (item 95a67ee4).
+  const auth = resolveAuth(cwd, { hostToken })
   const prev = readJson(connectionPath(connectionId)) || {}
   const agentName = opts.agent || prev.agent_name || AGENT_NAME
   const localId =
@@ -1741,9 +1719,8 @@ export async function writeConnectionState(opts) {
     owner_pid: ownerPid,
     mcp_url: auth.ok
       ? auth.mcp_url
-      : (auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp'),
-    token: auth.ok ? auth.token : undefined,
-    auth_source: auth.source || auth.error || prev.auth_source || null,
+      : (auth.mcp_url || prev.mcp_url || DEFAULT_MCP_URL),
+    ...credentialStateFields(auth),
     auth_ok: !!auth.ok,
     auth_proven: !!auth.ok,
     cwd,
@@ -1782,15 +1759,17 @@ export async function writeConnectionState(opts) {
     mcp_url: state.mcp_url,
     auth_ok: state.auth_ok,
     auth_source: state.auth_source,
-    token_present: !!state.token,
+    token_present: !!auth.ok,
     local_id: localId,
     bond_path: bond ? localBondPath(agentName, localId) : null,
   }
   if (!state.auth_ok) {
     result.warning = auth.error
     result.error = auth.error || 'auth_failed'
+    if (auth.code) result.code = auth.code
+  } else if (auth.source === 'env' && envTokenShadowsLogin()) {
+    result.warning_env_token = envTokenNotice()
   }
-  if (warning_tokens) result.warning_tokens = warning_tokens
   if (!localId) {
     result.warning_local =
       'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
@@ -1800,8 +1779,8 @@ export async function writeConnectionState(opts) {
   if (wantPoller) {
     // Only THIS connection's poller is touched here — never another's (item 2b840556).
     const reuseRunning =
-      !!prev.token &&
-      prev.token === state.token &&
+      !!credentialIdentity(prev) &&
+      credentialIdentity(prev) === credentialIdentity(state) &&
       (prev.mcp_url || null) === (state.mcp_url || null) &&
       (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
     const poller = ensurePollerForConnection(connectionId, {
@@ -2335,9 +2314,6 @@ async function runCli() {
     })
     if (result.warning_poller) {
       process.stderr.write(`remote-control-state: ensure-poller failed — ${result.warning_poller}\n`)
-    }
-    if (result.warning_tokens) {
-      process.stderr.write(`remote-control-state: ${result.warning_tokens}\n`)
     }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)

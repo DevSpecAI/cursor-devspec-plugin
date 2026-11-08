@@ -7,7 +7,7 @@ description: Connect this Cursor agent to DevSpec as a first-class agent connect
 
 Use the installed Node helper below. Do not add a list-projects preflight to an already-resolving connect. The server ranks remote and folder-pin facts; only an explicit name choice needs discovery. Use the DevSpec tool names actually advertised by Cursor—transport names can be namespaced, so do not invent a prefix.
 
-Once you have resolved `PLUGIN` below, after updating this plugin refresh the existing DevSpec MCP entry with `node "$PLUGIN/scripts/setup-cursor.mjs" --refresh` and restart Cursor so it loads the namespaced tool catalogue and tells DevSpec the plugin version it now runs. This preserves the configured credentials and other servers; it is setup, never a per-project or per-conversation preference.
+After updating this plugin, restart Cursor so it loads the namespaced tool catalogue from the plugin's own MCP entry and tells DevSpec the plugin version it now runs. Nothing in a settings file needs refreshing: Cursor signs the agent's DevSpec tools in itself, and the helpers below sign remote control in themselves.
 
 # DevSpec Remote Control (connection-native)
 
@@ -91,6 +91,20 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "
 ```
 
 Uses Cursor CLI's own `CURSOR_CONVERSATION_ID`. If unavailable, stop rather than minting a substitute for an existing chat; the native `create-chat` command is the source of IDs for fresh chats. Keep `local_id` in working memory; pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass that same id as `--launch-id` on resolve/register/attach/write/wait so local diagnostics (`devspec-debug`, when the person has turned them on) can join the launcher and connect phases.
+
+### Sign-in (the first connect only)
+
+Remote control and commit tracking run in helpers outside Cursor, so they hold their own DevSpec sign-in, approved once in the browser through the same Cursor app. The connect helpers start that approval by themselves and wait up to two minutes for the person to click Allow. You never ask for, read or paste a token. Act on the result's `code`:
+
+| `code` | What to do |
+|---|---|
+| `sign_in_pending` | The browser approval is open but not given yet. Tell the person to approve Cursor on DevSpec's page (give them `sign_in_url`), then run the same connect command again. Do not loop on it yourself. |
+| `sign_in_code_required` | This machine is reached over SSH, so the browser cannot answer it directly. Give the person `sign_in_url`, ask them to click Allow and paste the code the page shows into the chat. Then run the `--paste` command named in `error` with their code, quoted (for example `node "$PLUGIN/scripts/devspec-login.mjs" --paste "<code>"`), and run the connect command again. |
+| `sign_in_failed`, `signed_out`, `sign_in_unavailable` | Show `error` to the person verbatim; it says what happened and how to sign in again. |
+
+If a result carries `warning_env_token`, show it to the person verbatim: `DEVSPEC_MCP_TOKEN` is set, and it overrides their browser sign-in.
+
+When the person asks to sign remote control out of DevSpec, or to see which account it uses, run `node "$PLUGIN/scripts/devspec-login.mjs" --sign-out` or `--status` and relay what it prints.
 
 ### 4. Decide the action, then register the connection
 
@@ -181,9 +195,9 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
 
 **Owner PID (Windows):** prefer omit, or pass `"$PPID"` / parent — the write path self-resolves up to `Cursor.exe` / CLI `agent.exe`. **Never** pass the tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`): those exit when the tool call ends and the poller dies with `owner_gone`. On POSIX, `"$PPID"` remains the correct cheap anchor.
 
-This resolves the MCP token (env `DEVSPEC_MCP_TOKEN` → project `.cursor/mcp.json` → `~/.cursor/mcp.json` → project `.mcp.json`; on HTTP 401/403 it auth-falls-back to the next source), writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
+This uses the plugin's own DevSpec sign-in for the configured server (or `DEVSPEC_MCP_TOKEN` on a machine with no browser), writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
 
-If `auth_ok: false`, print the `warning` and tell the user to fix MCP auth. If the write JSON includes `warning_tokens`, print that text **verbatim** to the user (fingerprints only — never a raw token). If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
+If `auth_ok: false`, show the `warning` to the person verbatim: it says how to sign in. If the write JSON includes `warning_env_token`, show that text **verbatim** too. If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
 
 Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 
@@ -258,6 +272,7 @@ Wait contract:
 | `end_reason: 'ui'` / `ended_from_ui: true` in the state file | A person clicked End on the Agents page | **Stop.** Stay disconnected. |
 | `local_stop` | A person ran the stop command | **Stop.** |
 | owner gone | Your host process died | Stop (nothing to return to). |
+| `end_reason: 'signed_out'` | DevSpec stopped accepting remote control's sign-in (for example, Cursor was disconnected on the Agent setup page) | **Stop.** Tell the person the `message` from the wake (also `end_message` in the state file) verbatim; it says how to sign in again. Do not re-register on your own: signing in again needs the person. |
 | Anything else — any other `end_reason`, or none at all | The server will not vouch that a human did this. A redeploy looks exactly like this. | **Re-register the same bond once** (same `local_id`) and re-arm. Do not stay dead. |
 
 Read `~/.devspec/remote-control/connections/<connection_id>.json` and look at `end_reason` / `ended_from_ui` to tell them apart. Never infer a UI End from silence — that inference is what took every agent offline during a server redeploy on 2026-07-28.

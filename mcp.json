@@ -1,10 +1,13 @@
 {
   "mcpServers": {
     "devspec-cursor": {
-      "url": "${DEVSPEC_API_URL}/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
+      "url": "${DEVSPEC_API_URL:-https://api.devspec.ai}/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
-        "Authorization": "Bearer ${DEVSPEC_MCP_TOKEN}",
-        "x-devspec-plugin": "cursor/0.19.0"
+        "x-devspec-plugin": "cursor/0.20.0"
+      },
+      "auth": {
+        "CLIENT_ID": "${DEVSPEC_CURSOR_CLIENT_ID:-bGf2U1lPyRZDYkzY}",
+        "scopes": ["devspec", "offline_access"]
       }
     }
   }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.0
+
+DevSpec for Cursor signs in through your browser. There is no token to create, copy or paste any more.
+
+- **The agent's DevSpec tools sign in with Cursor's own sign-in.** In `cursor-agent`, type `/mcp`, open DevSpec and choose **Login**: your browser opens DevSpec's approval page for Cursor, and one click on **Allow** gives the agent its tools. The plugin's settings no longer ask for a token.
+- **Remote control and commit tracking ask once more, the first time.** They run in the background, where Cursor can't share its sign-in, so the first `/devspec-remote` opens DevSpec's approval page again, for the same Cursor app, and connects once you click **Allow**. Several things asking at once still open one approval. On a machine your browser can't reach, such as one you work on over SSH, you get a link instead and paste back the code the page shows.
+- **You stay signed in.** Both sign-ins renew themselves until you sign out or disconnect Cursor on DevSpec's Agent setup page. If remote control's sign-in stops working, it stops and tells you why, in DevSpec's own words, and how to sign in again, instead of going quiet.
+- **No second copy of a token in Cursor's settings.** The plugin no longer reads `~/.cursor/mcp.json` or any other tool's settings, and the step that pasted a token there is gone, with the helper that wrote it. If you added a `devspec` entry with a token there for an earlier version, remove it: while it is there, Cursor uses that token instead of signing in.
+- **Pointing at another DevSpec server needs no settings file.** Start `cursor-agent` with `DEVSPEC_API_URL` and `DEVSPEC_CURSOR_CLIENT_ID` set, and both the agent's tools and the background features use that server. Each server keeps its own sign-in, so switching back needs no new approval.
+- **Machines with no browser** still use `DEVSPEC_MCP_TOKEN` for the background features. It takes precedence over a browser sign-in, and the plugin says so, and how to remove it, whenever both are present.
+
 ## 0.19.0
 
 Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.

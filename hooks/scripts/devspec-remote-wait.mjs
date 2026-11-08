@@ -54,7 +54,7 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   canonicalAcceptanceKey,
@@ -190,9 +190,13 @@ export async function notifyWorkingEnded({
 } = {}) {
   if (!connectionId) return { ok: false, reason: 'missing_connection_id' }
 
-  let token = state?.token || null
+  let token = null
   let mcpUrl = state?.mcp_url || null
-  if (!token) {
+  if (state && (state.auth_source === 'login' || state.token || state.mcp_token)) {
+    const credential = connectionCredential(state)
+    token = credential.ok ? credential.token : null
+    mcpUrl = credential.mcp_url || mcpUrl
+  } else {
     try {
       const auth = resolveAuth(state?.cwd || process.cwd())
       token = auth?.token || null
@@ -202,7 +206,6 @@ export async function notifyWorkingEnded({
     }
   }
   if (!token) return { ok: false, reason: 'no_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
 
   try {
     await call({
@@ -632,6 +635,23 @@ function emitStdoutEvent(event) {
 async function emitEnded(event, wakeFile) {
   await emitStdoutEvent(event)
   if (wakeFile) appendWakeEvents(wakeFile, [event])
+}
+
+/**
+ * The poller stood the connection down because its DevSpec sign-in is over. Wake the
+ * agent with the plain sentence it left, so the person hears it and how to sign in
+ * again, rather than the connection just going quiet (item 95a67ee4).
+ */
+async function emitSignedOut(state, connectionId, wakeFile) {
+  await emitEnded({
+    type: 'session_ended',
+    reason: 'signed_out',
+    recoverable: false,
+    connection_id: connectionId,
+    message: typeof state.end_message === 'string' && state.end_message
+      ? state.end_message
+      : 'Remote control stopped because Cursor\'s DevSpec sign-in has ended. Run /devspec-remote to sign in again.',
+  }, wakeFile)
 }
 
 function fileSize(p) {
@@ -1535,6 +1555,7 @@ async function main() {
 
   const state = readState(connectionId)
   if (state && state.enabled === false) {
+    if (state.end_reason === 'signed_out') await emitSignedOut(state, connectionId, args.wakeFile)
     process.stderr.write('devspec-remote-wait: remote control disabled\n')
     process.exit(1)
   }
@@ -1618,6 +1639,7 @@ async function main() {
       process.exit(1)
     }
     if (live && live.enabled === false) {
+      if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }

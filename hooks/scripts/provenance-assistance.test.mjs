@@ -5,6 +5,8 @@ import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
+import { saveLogin } from './auth-store.mjs'
+import { DEFAULT_MCP_URL } from './devspec-server.mjs'
 import {
   MALFORMED_REFERENCE_MESSAGE,
   MULTIPLE_CLAIMS_MESSAGE,
@@ -394,7 +396,7 @@ describe('online reference confirmation', () => {
     })
   })
 
-  it('inherits pin, remote, endpoint, and bearer from a real linked worktree', async () => {
+  it('inherits pin and remote from a real linked worktree, and signs in with the plugin’s own login', async () => {
     const root = tempRoot()
     const home = path.join(root, 'home')
     const main = path.join(root, 'main')
@@ -408,10 +410,19 @@ describe('online reference confirmation', () => {
     execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'linked', linked])
     fs.mkdirSync(path.join(main, '.devspec'))
     fs.writeFileSync(path.join(main, '.devspec', 'project.json'), JSON.stringify({ project_id: PROJECT }))
+    // A pasted token in the repository's Cursor MCP settings is no longer read (item 95a67ee4).
     fs.mkdirSync(path.join(main, '.cursor'))
     fs.writeFileSync(path.join(main, '.cursor', 'mcp.json'), JSON.stringify({
       mcpServers: { devspec: { url: 'https://staging.example/mcp', headers: { Authorization: 'Bearer dvs_main_worktree' } } },
     }))
+    await saveLogin({
+      mcpUrl: DEFAULT_MCP_URL,
+      tokens: { accessToken: 'oat_browser_login', refreshToken: 'rt_browser_login', issuedAt: Date.now(), expiresAt: Date.now() + 86_400_000 },
+      issuer: 'https://clerk.devspec.ai',
+      tokenEndpoint: 'https://clerk.devspec.ai/oauth/token',
+      clientId: 'bGf2U1lPyRZDYkzY',
+      resource: 'https://api.devspec.ai/api/mcp',
+    }, { home })
     let request = null
     const output = await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, linked, tempRoot(), {
       home,
@@ -419,8 +430,8 @@ describe('online reference confirmation', () => {
       onlineCall: async (value) => { request = value; return { online: { status: 'valid' } } },
     })
     assert.equal(output, null)
-    assert.equal(request?.token, 'dvs_main_worktree')
-    assert.equal(request?.mcpUrl, 'https://staging.example/mcp')
+    assert.equal(request?.token, 'oat_browser_login')
+    assert.equal(request?.mcpUrl, DEFAULT_MCP_URL)
     assert.equal(request?.arguments?.pinned_project_id, PROJECT)
     assert.equal(request?.arguments?.git_remote, 'git@github.com:DevSpecAI/worktree-online.git')
   })
