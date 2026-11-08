@@ -111,6 +111,9 @@ describe('current Cursor authority and work-acquisition prose', () => {
       assert.match(content, /check_job\.room/, file)
       assert.match(content, /tell_person/, file)
       assert.doesNotMatch(content, /post what happened/i, file)
+      // Whose duplicate it is, and who is told, are core.resolve-duplicates-on-the-spot's:
+      // a restatement here contradicted the server the moment that rule changed.
+      assert.doesNotMatch(content, /or one they may change|close yours as its duplicate, and tell them/, file)
       const aboutChecks = content.split(/(?<=[.!?|])\s+/).filter((text) => /check job|check_job/i.test(text) && !/\bnever\b/i.test(text))
       for (const sentence of aboutChecks) {
         assert.doesNotMatch(sentence, /\b(?:post|tell|report)\b[^.]{0,60}\b(?:rul(?:ed|ing)|verdicts?)\b/i,
