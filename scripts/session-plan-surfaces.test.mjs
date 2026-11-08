@@ -60,9 +60,9 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.match(readme, /marketplace remove/)
   })
 
-  it('keeps global MCP config generic: no per-conversation secret or giant static schema', () => {
+  it('keeps global MCP config generic: no secret, per-conversation value or giant static schema', () => {
     const serialized = JSON.stringify(mcp)
-    assert.match(serialized, /DEVSPEC_MCP_TOKEN/)
+    assert.doesNotMatch(serialized, /TOKEN|Authorization/)
     assert.doesNotMatch(serialized, /capability|manage_plan|expected_revision|directTools/i)
   })
 
@@ -100,7 +100,7 @@ describe('Cursor shared-session-plan surfaces', () => {
     assert.ok(variables, 'plugin.json declares no variables schema')
     assert.equal(variables.type, 'object')
     assert.ok(variables.properties && typeof variables.properties === 'object')
-    const referenced = [...JSON.stringify(mcp).matchAll(/\$\{([A-Z0-9_]+)\}/g)].map((m) => m[1])
+    const referenced = [...JSON.stringify(mcp).matchAll(/\$\{(?:env:)?([A-Z0-9_]+)(?::-[^}]*)?\}/g)].map((m) => m[1])
     assert.ok(referenced.length > 0, 'mcp.json references no variables — is the placeholder gone?')
     for (const name of referenced) {
       assert.ok(name in variables.properties, `mcp.json references \${${name}} but the manifest does not declare it`)
@@ -113,11 +113,11 @@ describe('Cursor shared-session-plan surfaces', () => {
         assert.ok(allowed.has(key), `variables.${name} uses unsupported schema keyword "${key}"`)
       }
     }
-    // The token is the one the customer must supply; the API URL is our staging override
-    // and must stay optional with the production default — never required, never staging.
-    assert.ok(variables.required.includes('DEVSPEC_MCP_TOKEN'))
-    assert.ok(!variables.required.includes('DEVSPEC_API_URL'))
+    // Nothing is required: Cursor signs in through the browser. The server and its
+    // sign-in app are optional overrides with production defaults, never staging.
+    assert.equal(variables.required, undefined)
     assert.equal(variables.properties.DEVSPEC_API_URL.default, 'https://api.devspec.ai')
+    assert.equal(variables.properties.DEVSPEC_CURSOR_CLIENT_ID.default, 'bGf2U1lPyRZDYkzY')
   })
 
   it('keeps capability-bound helpers discoverable through the normal Remote skill', () => {

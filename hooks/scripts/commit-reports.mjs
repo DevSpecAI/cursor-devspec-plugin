@@ -24,6 +24,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CursorMcpRefusal, isRetryableHttpFailure, mcpToolsCall } from './mcp-call.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import {
   connectionsDir,
@@ -158,11 +159,13 @@ function classifyError(error) {
 
 async function sendOne(item, { home, call }) {
   const state = readPrivateJson(path.join(connectionsDir(home), `${item.connection_id}.json`))
-  if (!state?.token || !state?.mcp_url) return { outcome: 'retry', reason: 'the connection\'s DevSpec key is not available' }
+  // The connection's current credential: a browser login's token changes daily.
+  const credential = state?.mcp_url ? connectionCredential(state, { home }) : null
+  if (!credential?.ok) return { outcome: 'retry', reason: credential?.error || 'the connection\'s DevSpec sign-in is not available' }
   try {
     const result = await call({
-      mcpUrl: state.mcp_url,
-      token: state.token,
+      mcpUrl: credential.mcp_url,
+      token: credential.token,
       connectionCapability: state.connection_capability ?? null,
       name: 'report_commit_provenance',
       arguments: {

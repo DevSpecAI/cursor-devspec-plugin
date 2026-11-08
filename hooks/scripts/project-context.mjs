@@ -42,7 +42,13 @@ export function readProjectContext(conversationId, endpoint = null, home = os.ho
   let data
   try { data = JSON.parse(text) } catch { throw new Error('The saved conversation project is unreadable. Start a fresh Cursor conversation; do not fall back to a folder default.') }
   if (data?.version !== 1 || data.conversation_id !== conversationId || !['selected', 'blocked'].includes(data.status) || typeof data.endpoint !== 'string') throw new Error('Invalid saved conversation project.')
-  if (endpoint && endpointIdentity(endpoint) !== data.endpoint) throw new Error('This conversation was connected to another DevSpec server. Start a fresh conversation.')
+  if (endpoint && endpointIdentity(endpoint) !== data.endpoint) {
+    // Usually the agent's DevSpec tools and remote control were pointed at different
+    // servers: the plugin's Configure variables move only the former (item 95a67ee4).
+    const origin = (value) => { try { return new URL(value).origin } catch { return String(value) } }
+    throw new Error(`This conversation was connected to another DevSpec server (${origin(data.endpoint)}), not ${origin(endpoint)}. ` +
+      'To use one server for both the agent\'s DevSpec tools and remote control, start cursor-agent with DEVSPEC_API_URL and DEVSPEC_CURSOR_CLIENT_ID set for it, then start a fresh conversation.')
+  }
   if (data.status === 'selected' && !candidate(data.project)) throw new Error('Invalid saved project identity.')
   return data
 }

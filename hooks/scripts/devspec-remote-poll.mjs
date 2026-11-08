@@ -69,7 +69,10 @@
  * Usage:
  *   node devspec-remote-poll.mjs --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *
- * Requires token in per-connection state / ~/.devspec/remote-control.json or DEVSPEC_MCP_TOKEN.
+ * Uses the connection's own credential: the plugin's browser sign-in it connected with
+ * (its current token, taken afresh every lap) or the DEVSPEC_MCP_TOKEN it connected with.
+ * When DevSpec refuses that sign-in, the poller stands the connection down and says so
+ * plainly (`end_reason: 'signed_out'`, with the sentence to show), never failing silently.
  */
 
 import fs from 'node:fs'
@@ -77,7 +80,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { distinctTokenPairs, enumerateCredentialPairs, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { connectionCredential, connectionToken, credentialRefusal, handleCredentialRefusal } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { refreshRepositoryRules } from './repository-context.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
@@ -463,8 +466,26 @@ export function disabledStatePatch(reason) {
   }
 }
 
+/** Credential states that mean the connection's sign-in is over until the person signs in again. */
+const SIGNED_OUT_CODES = new Set(['signed_out', 'signed_in_again'])
+
+/**
+ * The connection's sign-in is over (DevSpec refused it, it ended, or the person signed
+ * in as someone else since). Stop, and leave the plain sentence where the wait reads
+ * it: the agent is woken with it and tells the person how to sign in again. Not a UI
+ * End, and not something to re-register on its own: signing in again needs the person.
+ */
+function standDownSignedOut(connectionId, message) {
+  disableLocalState({ connectionId, reason: 'signed_out', message })
+  process.stdout.write(
+    JSON.stringify({ type: 'session_ended', reason: 'signed_out', recoverable: false, connection_id: connectionId, message }) + '\n',
+  )
+  process.stderr.write(`devspec-remote-poll: signed out — ${message}\n`)
+  process.exit(1)
+}
+
 /** Disable THIS connection only — never other remotes on the machine. */
-function disableLocalState({ connectionId, reason }) {
+function disableLocalState({ connectionId, reason, message = null }) {
   clearConnectionCapability(connectionId)
   try {
     const prev = readState(connectionId) || {}
@@ -472,6 +493,7 @@ function disableLocalState({ connectionId, reason }) {
       {
         ...prev,
         ...disabledStatePatch(reason),
+        ...(message ? { end_message: message } : {}),
         connection_id: connectionId || prev.connection_id,
         updated_at: new Date().toISOString(),
       },
@@ -856,7 +878,7 @@ async function deliverOwnerMessages(
   if (sessionId) {
     try {
       const s = readState(connectionId) || {}
-      const token = s.token || s.mcp_token || null
+      const token = connectionToken(s)
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
         await seedWorkTrailForConnection({
@@ -999,7 +1021,7 @@ export async function deliverAutomationDispatches(
   if (sessionId) {
     try {
       const s = readStateFn(connectionId) || {}
-      const token = s.token || s.mcp_token || null
+      const token = connectionToken(s)
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
         await seedFn({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
@@ -1088,29 +1110,22 @@ async function main() {
     process.exit(1)
   }
 
-  let token = state?.token || null
-  let mcpUrl = state?.mcp_url || null
-  if (!token) {
-    const { pairs } = enumerateCredentialPairs(state?.cwd || process.cwd(), {
-      hostToken: hostTokenFromEnv(process.env),
-    })
-    const only = distinctTokenPairs(pairs)
-    if (only.length !== 1) {
-      process.stderr.write(
-        'devspec-remote-poll: no proven token in state. Re-run connect / write — the poller will not guess among multiple DevSpec keys.\n',
-      )
-      process.exit(1)
+  // The connection's own credential. A browser login's token changes daily, so it is
+  // taken afresh at the top of every lap (below); the identity never changes.
+  const firstCredential = connectionCredential(state)
+  if (!firstCredential.ok) {
+    if (SIGNED_OUT_CODES.has(firstCredential.code)) {
+      standDownSignedOut(connectionId, firstCredential.error)
+      return
     }
-    token = only[0].token
-    mcpUrl = only[0].mcp_url
-  }
-  if (!token) {
-    process.stderr.write(
-      'devspec-remote-poll: no token. Run remote-control-state.mjs write after connect, or set DEVSPEC_MCP_TOKEN.\n',
-    )
+    process.stderr.write(`devspec-remote-poll: no DevSpec credential: ${firstCredential.error}\n`)
     process.exit(1)
   }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  let token = firstCredential.token
+  const mcpUrl = firstCredential.mcp_url
+  const credentialSource = firstCredential.source
+  const credentialPrincipal = firstCredential.principal
+  let credentialRefusals = 0
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   // Bond key for the attached-session heartbeat's connection dual-write.
@@ -1924,6 +1939,14 @@ async function main() {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
     }
+    // This lap's token for the same sign-in (renewed when past half its life). A
+    // sign-in that has ended stands the connection down with a plain message.
+    const lapCredential = connectionCredential(liveState || state)
+    if (lapCredential.ok) token = lapCredential.token
+    else if (SIGNED_OUT_CODES.has(lapCredential.code)) {
+      standDownSignedOut(connectionId, lapCredential.error)
+      return
+    }
     // NOTE: local state is read ONLY to observe a local stop (enabled === false).
     // Attachment is NOT adopted from it — the server (now the poll response's
     // session_id, read from the live markers) is the sole authority for which session
@@ -2062,6 +2085,7 @@ async function main() {
         catchUp: needsSeed || drainingCatchUp,
       })
       consecutiveErrors = 0
+      credentialRefusals = 0
       if (sentControlAck && pendingControlAck === sentControlAck) {
         pendingControlAck = null
         patchState({ pending_control_ack: null })
@@ -2079,6 +2103,21 @@ async function main() {
         await offlineAndExit('owner_gone', 1)
         return
       }
+      // DevSpec refused the credential itself. Once may be a token renewed a moment
+      // ago elsewhere; refused again with this lap's token, the sign-in is over.
+      const refusal = credentialRefusal(e, { mcpUrl, source: credentialSource })
+      if (refusal) {
+        credentialRefusals++
+        if (credentialRefusals >= 2) {
+          await handleCredentialRefusal(e, { mcp_url: mcpUrl, source: credentialSource, principal: credentialPrincipal })
+          standDownSignedOut(connectionId, refusal.message)
+          return
+        }
+        process.stderr.write(`devspec-remote-poll: DevSpec refused the credential (${refusal.code}); trying once more with the current one\n`)
+        await sleep(1_000)
+        continue
+      }
+      credentialRefusals = 0
       if (catchUpCursor && isCatchUpCursorRefusal(e)) {
         process.stderr.write('devspec-remote-poll: server refused the catch-up cursor; re-reading the room\n')
         catchUpCursor = null

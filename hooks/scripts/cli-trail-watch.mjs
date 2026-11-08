@@ -22,7 +22,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { postTrailFromTranscript } from './post-trail-from-transcript.mjs'
 import { recordProgressFailure } from './progress-diagnostics.mjs'
@@ -225,14 +225,10 @@ async function main() {
     }
     recordTurnActivity(connectionId, { dir: CONNECTIONS_DIR })
 
-    let token = state.mcp_token || state.token || null
-    let mcpUrl = state.mcp_url || null
-    if (!token) {
-      const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-      token = auth.token
-      mcpUrl = mcpUrl || auth.mcp_url
-    }
-    mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+    // The connection's current credential, taken afresh for every post.
+    const credential = connectionCredential(state)
+    const token = credential.ok ? credential.token : null
+    const mcpUrl = credential.mcp_url
     if (!token) {
       await sleep(args.pollMs)
       continue

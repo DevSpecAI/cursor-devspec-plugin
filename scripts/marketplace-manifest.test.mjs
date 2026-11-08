@@ -19,6 +19,8 @@ import path from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { inflateSync } from 'node:zlib'
+import { PLUGIN_SERVER_NAME, bundledConnection, configuredMcpUrl } from '../hooks/scripts/devspec-server.mjs'
+import { CURSOR_CLIENT_IDS } from '../hooks/scripts/sign-in.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const readJson = (relative) => JSON.parse(fs.readFileSync(path.join(root, relative), 'utf8'))
@@ -231,12 +233,10 @@ describe('one release version everywhere it is written', () => {
   // A release bump touches every file below by hand, and a missed one ships a plugin
   // that names two versions: the Marketplace listing, the version DevSpec is told on
   // each request, and the header the install page asks people to keep can disagree.
-  it('names the manifest version in the marketplace, package, lockfile, server header and install page', () => {
+  it('names the manifest version in the marketplace, package, lockfile and server header', () => {
     const version = plugin.version
     const lock = readJson('package-lock.json')
     const entry = marketplace.plugins.find((p) => p.name === plugin.name)
-    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
-    const readmeHeaders = [...readme.matchAll(/"x-devspec-plugin":\s*"cursor\/([^"]+)"/g)].map((m) => m[1])
     assert.equal(entry?.version, version, 'marketplace.json')
     assert.equal(packageJson.version, version, 'package.json')
     assert.equal(lock.version, version, 'package-lock.json')
@@ -244,7 +244,38 @@ describe('one release version everywhere it is written', () => {
     for (const [name, server] of Object.entries(mcp.mcpServers)) {
       assert.equal(server.headers?.['x-devspec-plugin'], `cursor/${version}`, `mcp.json ${name}`)
     }
-    assert.ok(readmeHeaders.length > 0, 'the install page shows no x-devspec-plugin header to keep')
-    for (const named of readmeHeaders) assert.equal(named, version, 'README.md install step')
+  })
+})
+
+describe("Cursor's own DevSpec connection signs in by itself (item 95a67ee4)", () => {
+  const entry = mcp.mcpServers[PLUGIN_SERVER_NAME]
+  const STAGING_ENV = { DEVSPEC_API_URL: 'https://api.devspecstaging.com', DEVSPEC_CURSOR_CLIENT_ID: CURSOR_CLIENT_IDS['https://apt-hare-75.clerk.accounts.dev'] }
+
+  it('asks for no token anywhere: Cursor signs in with its own app and the DevSpec scopes', () => {
+    assert.deepEqual(Object.keys(mcp.mcpServers), [PLUGIN_SERVER_NAME])
+    assert.deepEqual(Object.keys(entry.headers), ['x-devspec-plugin'], 'no Authorization header to fill in')
+    assert.deepEqual(entry.auth.scopes, ['devspec', 'offline_access'])
+    assert.doesNotMatch(JSON.stringify({ mcp, variables: plugin.variables }), /TOKEN|dvs_|Bearer/)
+    assert.equal(plugin.variables.required, undefined, 'nothing has to be entered at install')
+  })
+
+  it('with nothing set, connects to production with Cursor’s production app', () => {
+    const connection = bundledConnection({})
+    assert.equal(connection.url, 'https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
+    assert.equal(connection.clientId, CURSOR_CLIENT_IDS['https://clerk.devspec.ai'])
+    assert.equal(configuredMcpUrl({}), connection.url, 'the background features use the same server')
+  })
+
+  it('started with the staging variables, Cursor and the background features both use staging and its app', () => {
+    const connection = bundledConnection(STAGING_ENV)
+    assert.equal(connection.url, 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection')
+    assert.equal(connection.clientId, '0gPBpmMnw37junr4')
+    assert.equal(configuredMcpUrl(STAGING_ENV), connection.url)
+  })
+
+  it('offers the production values as the defaults on the Configure variables form', () => {
+    const production = bundledConnection({})
+    assert.equal(`${plugin.variables.properties.DEVSPEC_API_URL.default}/api/mcp`, new URL(production.url).origin + new URL(production.url).pathname)
+    assert.equal(plugin.variables.properties.DEVSPEC_CURSOR_CLIENT_ID.default, production.clientId)
   })
 })

@@ -31,7 +31,7 @@ export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
  * Every MCP request the plugin's own scripts make (poller, wait, mirror-turn,
  * connect, plan/question bridges, trail) goes through here, so this is where they
  * all say which plugin they are. Cursor's own MCP client sends the same header from
- * ~/.cursor/mcp.json, which scripts/setup-cursor.mjs writes (item f6566758).
+ * the plugin's mcp.json, beside its own browser sign-in (items f6566758, 95a67ee4).
  */
 export function mcpRequestHeaders({ token, connectionCapability = null }) {
   return {

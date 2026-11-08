@@ -15,7 +15,7 @@
 import fs from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { readActiveTurnMarker, loadState, resolveHookConversationId } from './mirror-turn.mjs'
 import { handleExplicitReply } from './mark-explicit-reply.mjs'
@@ -131,15 +131,10 @@ export async function runTrailTurn({
     recordTurnActivity(state.connection_id, connectionsDir ? { dir: connectionsDir } : undefined)
   }
 
-  let token = state.mcp_token || state.token || null
-  let mcpUrl = state.mcp_url || null
-  if (!token) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { ok: false, skipped: true, reason: 'no_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  const credential = connectionCredential(state)
+  if (!credential.ok) return { ok: false, skipped: true, reason: credential.code === 'no_state' ? 'no_token' : credential.code }
+  const token = credential.token
+  const mcpUrl = credential.mcp_url
 
   const part = mode === 'seed' ? TRAIL_SEED_TEXT : renderHookTrailPart(mode, data)
   let transcriptText = null

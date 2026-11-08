@@ -223,7 +223,7 @@ async function callWithCapability(bound, { name, args, hostToken, mcpCall, resol
   const auth = resolveAuth(bound.state.cwd || process.cwd(), {
     hostToken: hostToken || hostTokenFromEnv(process.env),
   })
-  if (!auth.ok || !auth.token || !auth.mcp_url) return { ok: false, error: 'DevSpec MCP auth unavailable' }
+  if (!auth.ok || !auth.token || !auth.mcp_url) return { ok: false, error: auth.error || 'DevSpec MCP auth unavailable' }
   try {
     const result = await mcpCall({
       mcpUrl: auth.mcp_url,

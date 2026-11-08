@@ -2,7 +2,7 @@
   "name": "devspec",
   "displayName": "DevSpec",
   "description": "DevSpec for Cursor's command-line agent (cursor-agent). Work your team's DevSpec tasks with its decisions and documents to hand, and steer the agent from DevSpec in your browser or on your phone. The Cursor editor is not supported yet.",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "author": {
     "name": "DevSpec"
   },
@@ -21,20 +21,18 @@
   "variables": {
     "type": "object",
     "properties": {
-      "DEVSPEC_MCP_TOKEN": {
-        "type": "string",
-        "title": "DevSpec token",
-        "description": "Your DevSpec token, which starts with dvs_. Create or reveal it on DevSpec's Agent setup page: https://app.devspec.ai/settings/agents"
-      },
       "DEVSPEC_API_URL": {
         "type": "string",
-        "title": "DevSpec API URL (advanced)",
-        "description": "Which DevSpec service the plugin connects to. Leave it as it is unless DevSpec support asks you to change it.",
+        "title": "DevSpec server (advanced)",
+        "description": "Which DevSpec server the plugin connects to. Leave it as it is unless DevSpec asks you to change it. A value set here moves only the agent's DevSpec tools: to move remote control and commit tracking too, start cursor-agent with DEVSPEC_API_URL and DEVSPEC_CURSOR_CLIENT_ID set in its environment instead.",
         "default": "https://api.devspec.ai"
+      },
+      "DEVSPEC_CURSOR_CLIENT_ID": {
+        "type": "string",
+        "title": "Cursor's DevSpec sign-in app (advanced)",
+        "description": "The DevSpec sign-in app Cursor asks for your approval with. Each DevSpec server has its own, so it changes together with the DevSpec server. Leave it as it is unless DevSpec asks you to change it.",
+        "default": "bGf2U1lPyRZDYkzY"
       }
-    },
-    "required": [
-      "DEVSPEC_MCP_TOKEN"
-    ]
+    }
   }
 }

@@ -56,7 +56,8 @@ export function findNativeCursorCli({ cwd, cursorBin, spawn = spawnAgentSync } =
   throw new Error('Could not find the Cursor CLI. Pass --cursor-bin with its actual executable; do not use another agent’s executable.')
 }
 export async function prepareCursorProject(selector, { cwd = process.cwd(), cursorBin, auth = resolveDevspecMcpAuth(cwd), call = mcpToolsCall, findCli = findNativeCursorCli } = {}) {
-  if (!selector || !auth.ok) throw new Error('Provide --project <name-or-id> and valid DevSpec authentication.')
+  if (!selector) throw new Error('Provide --project <name-or-id>.')
+  if (!auth.ok) throw new Error(auth.error || 'DevSpec sign-in is not available.')
   const listing = await call({ mcpUrl: auth.mcp_url, token: auth.token, name: 'list_projects', arguments: {}, timeoutMs: 30000 })
   const projects = Array.isArray(listing.projects) ? listing.projects.map(candidate) : null
   if (!projects || projects.some(project => !project)) throw new Error('DevSpec did not return valid project choices.')
@@ -83,7 +84,7 @@ async function main() {
   if (action === 'prepare') { console.log(JSON.stringify(await prepareCursorProject(opts.project, { cwd: opts.cwd, cursorBin: opts['cursor-bin'] }))); return }
   const auth = resolveDevspecMcpAuth(opts.cwd)
   if (action === 'list') {
-    if (!auth.ok) throw new Error('Connect your DevSpec account first.')
+    if (!auth.ok) throw new Error(auth.error || 'DevSpec sign-in is not available.')
     console.log(JSON.stringify(await mcpToolsCall({ mcpUrl: auth.mcp_url, token: auth.token, name: 'list_projects', arguments: {}, timeoutMs: 30000 }))); return
   }
   const id = detectLocalId({ 'local-id': opts['local-id'] }).local_id
