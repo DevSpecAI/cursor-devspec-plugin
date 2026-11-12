@@ -3,10 +3,11 @@
 ## 0.20.3
 
 - **Align commit provenance and notice guidance with `unlinked_work` incidents.** Updated `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, and commit-provenance hook comments to point at `devspec://product/implementation-contract` (`commit_provenance_contract`, mechanical unlinked-work accountability with no automatic task creation) and removed retired auto-made task ownership wording.
+- **Passive project incident awareness and incident tools.** `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` validate and materialize `project_incidents` in `.room.json` and on canonical command / automation wakes without waking idle connections, `request-ref.mjs` stamps `report_incident` and `manage_incident`, and `rules/devspec.mdc` plus `skills/devspec-remote/SKILL.md` point to the served `semantics.project_incidents` and `core.respect-incidents-and-escalate-delivery-blockers` contract rules.
 
 ## 0.20.2
 
-- **Passive project incident awareness and incident tools.** `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` validate and materialize `project_incidents` in `.room.json` and on canonical command / automation wakes without waking idle connections, `request-ref.mjs` stamps `report_incident` and `manage_incident`, and `rules/devspec.mdc` plus `skills/devspec-remote/SKILL.md` point to the served `semantics.project_incidents` and `core.respect-incidents-and-escalate-delivery-blockers` contract rules.
+- **Post-action room silence on settled notices.** `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, `NOTICE_HANDLING`, and `noticeReplyInstruction` now align with `semantics.notice_audience` and `semantics.notice_reply` in `devspec://product/remote-ingress-contract`: findings covered by explicit conversation intent are settled quietly in place without posting a room acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`). `isForTheRecordRefusal` also treats settled-housekeeping receipts as quiet outcomes.
 
 ## 0.20.1
 

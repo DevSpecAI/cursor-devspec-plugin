@@ -129,7 +129,7 @@ export function noticeReplyInstruction(ids, { connectionId = null } = {}) {
   const list = idList(ids)
   const subject = list.length === 1 ? 'this notice' : `these ${list.length} notices`
   return (
-    `To tell the person about ${subject} in your room, post a notice reply: ${noticeReplyCall(list, { connectionId })}. ` +
+    `When an unresolved choice, hold, rejection, or block still needs the person on ${subject} in your room after you act, post a notice reply: ${noticeReplyCall(list, { connectionId })}. ` +
     'It is your own message, shown as a reply to the notice and never as an answer to a command: ' +
     'it opens, completes and closes no turn, complete_turn has no effect on it, and a command you are working on still needs its own answer. ' +
     (list.length > 1 ? 'One reply can answer all of these notices; name only the notices it answers. ' : '') +
@@ -609,9 +609,17 @@ function hookAssistantText(data) {
  */
 export function isForTheRecordRefusal(error) {
   const details = error?.details
-  if (details && typeof details === 'object' && details.delivery?.reason === 'for_the_record') return true
+  if (
+    details &&
+    typeof details === 'object' &&
+    (details.delivery?.reason === 'for_the_record' ||
+      details.delivery?.reason === 'settled_housekeeping' ||
+      details.settled_housekeeping === true)
+  ) {
+    return true
+  }
   const text = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-  return /"reason"\s*:\s*"for_the_record"/.test(text)
+  return /"reason"\s*:\s*"(?:for_the_record|settled_housekeeping)"|"settled_housekeeping"\s*:\s*true/.test(text)
 }
 
 /**
