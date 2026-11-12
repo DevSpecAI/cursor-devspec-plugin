@@ -92,6 +92,7 @@ import {
   canonicalContextAcceptanceKey,
   emptyCanonicalContextCarry,
   isActiveSessionPlansProjectionV1,
+  isProjectIncidentsProjectionV1,
   isSessionActivityV1,
   isSessionEventsV1,
   isSessionPollsProjection,
@@ -419,6 +420,7 @@ function appendInbox(
   {
     type = 'owner_messages', nextCursor = null, sessionId = null, context = null,
     ingress = null, acceptanceKey = null, instructionContextFile = null, wakeContext = null,
+    projectIncidents = null,
   } = {},
 ) {
   if (!connectionId || !messages?.length) return { ok: false, duplicate: false }
@@ -432,6 +434,7 @@ function appendInbox(
     ...(context ? { context } : {}),
     ...(ingress ? { ingress } : {}),
     ...(wakeContext ? { wake_context: wakeContext } : {}),
+    ...(isProjectIncidentsProjectionV1(projectIncidents) ? { project_incidents: projectIncidents } : {}),
     // Adapter metadata stays outside the exact-key canonical context schema:
     // older wait processes can ignore it without dropping the command on upgrade.
     ...(instructionContextFile ? {instruction_context_file:instructionContextFile} : {}),
@@ -528,6 +531,7 @@ export function roomChangesSince(res, activity, seen = {}) {
     session_polls: isSessionPollsProjection(res?.session_polls) ? JSON.stringify(res.session_polls) : null,
     still_to_discuss: isStillToDiscussProjectionV1(res?.still_to_discuss) ? JSON.stringify(res.still_to_discuss) : null,
     active_session_plans: isActiveSessionPlansProjectionV1(plans) ? JSON.stringify(plans) : null,
+    project_incidents: isProjectIncidentsProjectionV1(res?.project_incidents) ? JSON.stringify(res.project_incidents) : null,
     session_activity: activity ? JSON.stringify({ items: activity.items, events: activity.events.length }) : null,
   }
   return {
@@ -562,6 +566,7 @@ export function writeRoomState(
   const polls = isSessionPollsProjection(res?.session_polls) ? res.session_polls : null
   const discuss = isStillToDiscussProjectionV1(res?.still_to_discuss) ? res.still_to_discuss : null
   const plans = isActiveSessionPlansProjectionV1(ingress?.active_session_plans) ? ingress.active_session_plans : null
+  const incidents = isProjectIncidentsProjectionV1(res?.project_incidents) ? res.project_incidents : null
   const notices = Array.isArray(ingress?.system_notices) ? ingress.system_notices : null
   const body = {
     advisory: true,
@@ -574,6 +579,7 @@ export function writeRoomState(
     session_polls: polls,
     still_to_discuss: discuss,
     active_session_plans: plans,
+    project_incidents: incidents,
     system_notices: notices ?? [],
     session_activity: activity,
     transcript,
@@ -581,6 +587,7 @@ export function writeRoomState(
       session_polls: polls ? 'present' : 'none_or_unavailable',
       still_to_discuss: discuss ? 'present' : 'none_or_unavailable',
       active_session_plans: plans ? 'present' : ingress ? 'none' : 'not_sent',
+      project_incidents: incidents ? 'present' : 'none_or_unavailable',
       system_notices: notices === null ? 'not_sent' : notices.length > 0 ? 'present' : 'none',
       session_activity: activity ? (activity.list_readable ? 'present' : 'unavailable') : 'not_sent',
       transcript: transcript ? transcript.status : 'not_sent',
@@ -859,11 +866,13 @@ async function deliverOwnerMessages(
   ingress = null,
   instructionContextFile = null,
   wakeContext = null,
+  projectIncidents = null,
 ) {
   // The durable inbox is the wake payload source. Stable turn identity makes replay
   // after an append-before-cursor crash a no-op rather than a second execution.
   const accepted = appendInbox(connectionId, ownerMsgs, {
     type: 'owner_messages', nextCursor, sessionId, context, ingress, instructionContextFile, wakeContext,
+    ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
@@ -1000,6 +1009,7 @@ export async function deliverAutomationDispatches(
     appendInboxFn = appendInbox,
     readStateFn = readState,
     emit = (line) => process.stdout.write(line),
+    projectIncidents = null,
   } = {},
 ) {
   let acceptedCount = 0
@@ -1009,6 +1019,7 @@ export async function deliverAutomationDispatches(
       nextCursor: nextDispatchCursor,
       sessionId,
       acceptanceKey: automationAcceptanceKey(dispatch),
+      ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
     })
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
@@ -1727,6 +1738,9 @@ async function main() {
     const rows = Object.values(envelope.context).flat()
     const nextCarry = mergeCanonicalContextCarry(canonicalCarry, envelope)
     const ingress = { canonical: true, envelope }
+    const projectIncidents = isProjectIncidentsProjectionV1(res?.project_incidents)
+      ? res.project_incidents
+      : null
     let newlyDelivered = false
     let instructionContextFile = null
     let instructionContextDelivered = false
@@ -1788,6 +1802,7 @@ async function main() {
         ingress,
         instructionContextFile,
         wakeContext,
+        projectIncidents,
       )
       if (!delivered.ok) return false
       if (roomChanges) roomAnnounced = roomChanges.seen
@@ -1851,6 +1866,7 @@ async function main() {
       accepted.automations,
       accepted.dispatchCursor,
       sessionId,
+      { projectIncidents },
     )
     if (!automations.ok) return false
     newlyDelivered ||= automations.acceptedCount > 0

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.2
+
+- **Passive project incident awareness and incident tools.** `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` validate and materialize `project_incidents` in `.room.json` and on canonical command / automation wakes without waking idle connections, `request-ref.mjs` stamps `report_incident` and `manage_incident`, and `rules/devspec.mdc` plus `skills/devspec-remote/SKILL.md` point to the served `semantics.project_incidents` and `core.respect-incidents-and-escalate-delivery-blockers` contract rules.
+
 ## 0.20.1
 
 - **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, the login helper places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Cursor to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
