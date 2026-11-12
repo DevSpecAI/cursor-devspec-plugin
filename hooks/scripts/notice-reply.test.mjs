@@ -669,6 +669,24 @@ describe('notices DevSpec labels for the record', () => {
 
   it('a reply DevSpec refuses as for the record is quiet: no error, no retry, no second reply', async () => {
     assert.equal(isForTheRecordRefusal(FOR_THE_RECORD_REFUSAL()), true)
+    assert.equal(
+      isForTheRecordRefusal(
+        new CursorMcpRefusal(
+          JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, settled_housekeeping: true, housekeeping_message_id: 'hk-1' }),
+          { delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, settled_housekeeping: true, housekeeping_message_id: 'hk-1' },
+        ),
+      ),
+      true,
+    )
+    assert.equal(
+      isForTheRecordRefusal(
+        new CursorMcpRefusal(
+          JSON.stringify({ delivery: { status: 'skipped', reason: 'settled_housekeeping' }, settled_housekeeping: true }),
+          { delivery: { status: 'skipped', reason: 'settled_housekeeping' }, settled_housekeeping: true },
+        ),
+      ),
+      true,
+    )
     // Read from the text when the receipt could not be parsed.
     assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('{"delivery":{"status":"rejected","reason":"for_the_record","retryable":false}}\n{"account_notice":{}}', undefined)), true)
     assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('Connection not found', { error: 'Connection not found' })), false)

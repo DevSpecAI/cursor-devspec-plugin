@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.2
+
+- **Post-action room silence on settled notices.** `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, `NOTICE_HANDLING`, and `noticeReplyInstruction` now align with `semantics.notice_audience` and `semantics.notice_reply` in `devspec://product/remote-ingress-contract`: findings covered by explicit conversation intent are settled quietly in place without posting a room acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`). `isForTheRecordRefusal` also treats settled-housekeeping receipts as quiet outcomes.
+
 ## 0.20.1
 
 - **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, the login helper places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Cursor to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.

@@ -3,7 +3,7 @@
     "devspec-cursor": {
       "url": "${DEVSPEC_API_URL:-https://api.devspec.ai}/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
       "headers": {
-        "x-devspec-plugin": "cursor/0.20.1"
+        "x-devspec-plugin": "cursor/0.20.2"
       },
       "auth": {
         "CLIENT_ID": "${DEVSPEC_CURSOR_CLIENT_ID:-bGf2U1lPyRZDYkzY}",
