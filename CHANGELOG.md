@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.3
+
+- **Align commit provenance and notice guidance with `unlinked_work` incidents.** Updated `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, and commit-provenance hook comments to point at `devspec://product/implementation-contract` (`commit_provenance_contract`, mechanical unlinked-work accountability with no automatic task creation) and removed retired auto-made task ownership wording.
+
 ## 0.20.2
 
 - **Passive project incident awareness and incident tools.** `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` validate and materialize `project_incidents` in `.room.json` and on canonical command / automation wakes without waking idle connections, `request-ref.mjs` stamps `report_incident` and `manage_incident`, and `rules/devspec.mdc` plus `skills/devspec-remote/SKILL.md` point to the served `semantics.project_incidents` and `core.respect-incidents-and-escalate-delivery-blockers` contract rules.

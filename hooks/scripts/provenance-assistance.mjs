@@ -5,7 +5,7 @@
  * Cursor's generic preToolUse hook can inspect and update structured Shell
  * input. That is the only enforcement surface used here. File edits are never
  * denied, arbitrary shell is never classified, and every opaque/unsupported
- * commit form fails open to DevSpec ingestion and analyzer recovery.
+ * commit form fails open to DevSpec ingestion and mechanical unlinked-work accountability.
  *
  * While the conversation is connected (outside native Windows), the same hook puts
  * the git stand-in line in front of every Shell command (git-observer.mjs), and the
