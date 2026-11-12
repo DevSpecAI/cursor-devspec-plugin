@@ -59,6 +59,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import {
   canonicalAcceptanceKey,
   canonicalAttachmentDescriptor,
+  isProjectIncidentsProjectionV1,
   isSystemNoticeV1,
   isUnreadableSystemNoticeV1,
   noticeAudience,
@@ -931,7 +932,13 @@ export function consumeInboxSlice(
   }
 }
 
-const ROOM_STATE_SECTIONS = new Set(['session_polls', 'still_to_discuss', 'active_session_plans', 'session_activity'])
+const ROOM_STATE_SECTIONS = new Set([
+  'session_polls',
+  'still_to_discuss',
+  'active_session_plans',
+  'project_incidents',
+  'session_activity',
+])
 
 function validWakeContext(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -1012,15 +1019,21 @@ export function parseWakeBatches(
         continue
       }
       if (isCanonicalOwnerBatch(obj) || isCanonicalSystemNoticeBatch(obj, connectionId)) {
+        const { project_incidents: rawIncidents, ...rest } = obj
         batches.push({
-          ...obj,
+          ...rest,
           ...(obj.wake_context !== undefined ? { wake_context: validWakeContext(obj.wake_context) } : {}),
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
         })
       } else if (
         (includeDispatches && isDispatchBatch(obj)) ||
         (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)
       ) {
-        batches.push(obj)
+        const { project_incidents: rawIncidents, ...rest } = obj
+        batches.push({
+          ...rest,
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
+        })
       }
     } catch {
       /* skip garbage */
@@ -1406,6 +1419,17 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
         instruction: automationRunInstruction(dispatch),
         note: 'Explicit automation dispatch; not a canonical conversation command or task assignment.',
       },
+      ...(isProjectIncidentsProjectionV1(batch?.project_incidents)
+        ? [
+            {
+              type: 'project_incidents',
+              session_id: sessionId,
+              advisory: true,
+              executable: false,
+              ...batch.project_incidents,
+            },
+          ]
+        : []),
       {
         type: 'wake',
         reason: 'automation_dispatch',
@@ -1506,6 +1530,16 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
       advisory: true,
       executable: false,
       ...unread,
+    })
+  }
+
+  if (canonical && messages.length > 0 && isProjectIncidentsProjectionV1(batch?.project_incidents)) {
+    events.push({
+      type: 'project_incidents',
+      session_id: sessionId,
+      advisory: true,
+      executable: false,
+      ...batch.project_incidents,
     })
   }
 

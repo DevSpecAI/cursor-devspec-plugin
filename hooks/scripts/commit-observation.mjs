@@ -4,7 +4,7 @@
  * A summary line or a changed HEAD alone does not prove creation. Require a
  * bounded readable direct invocation, its own pre/post pair, one new commit
  * reflog entry, parent continuity, and unchanged repository/connection binding.
- * Merge/rewrite/background/opaque commands remain ingestion/analyzer territory.
+ * Merge/rewrite/background/opaque commands remain server ingestion and unlinked-work accountability territory.
  * This is same-user operational evidence, not hostile-process attestation.
  *
  * Since item c2a7ab72 this is the fallback: where the git stand-in runs (a connected
