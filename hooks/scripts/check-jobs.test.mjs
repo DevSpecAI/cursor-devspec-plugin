@@ -17,6 +17,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { isPushStreamRequest, refusePushStream } from './fixtures/push-stream.mjs'
 import {
   CHECK_JOB_WAKE_KEYS,
   checkJobAcceptanceKey,
@@ -260,6 +261,8 @@ describe('live poller with check jobs', () => {
     let served = 0
     const job = checkJob()
     const server = http.createServer((req, res) => {
+      // The poller opens DevSpec's push stream as it starts; refused, it holds polls (507705dd).
+      if (isPushStreamRequest(req)) return refusePushStream(res)
       let body = ''
       req.on('data', (chunk) => { body += chunk })
       req.on('end', async () => {

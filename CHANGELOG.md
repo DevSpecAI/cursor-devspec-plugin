@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.21.0
+
+- **A connected Cursor agent that is waiting for work now listens instead of asking.** With remote control on, the plugin keeps one connection open to DevSpec, and DevSpec tells it the moment something arrives for it. While nothing is happening, it no longer asks DevSpec every 25 to 30 seconds whether anything has changed. It checks in once every 45 seconds, so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
+- **Messages still arrive straight away.** When DevSpec pushes something, the plugin fetches it at once. When you start working, or a turn ends, the plugin tells DevSpec within about a second, as before.
+- **Nothing is missed if the open connection drops.** The plugin reconnects. If it cannot, it goes back to asking DevSpec every 25 to 30 seconds, the way earlier versions did.
+- Start a new `cursor-agent` session to pick this up. A session that is already connected keeps the earlier behaviour until it is restarted.
+
 ## 0.20.3
 
 - **Align commit provenance and notice guidance with `unlinked_work` incidents.** Updated `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, and commit-provenance hook comments to point at `devspec://product/implementation-contract` (`commit_provenance_contract`, mechanical unlinked-work accountability with no automatic task creation) and removed retired auto-made task ownership wording.
