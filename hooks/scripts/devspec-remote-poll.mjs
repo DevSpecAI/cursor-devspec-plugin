@@ -171,6 +171,7 @@ import {
 import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
+import { pluginHeaders } from './connection-version.mjs'
 
 export { roomStatePath }
 
@@ -809,6 +810,281 @@ export function resolveServerAttachment(currentSessionId, hb) {
 export function installStopSignalHandlers(proc = process) {
   proc.once('SIGTERM', () => proc.exit(0))
   proc.once('SIGINT', () => proc.exit(0))
+}
+
+// ---------------------------------------------------------------------------
+// SSE Push Channel (parity with Pi push-channel.ts, falls back to poll_connection)
+// ---------------------------------------------------------------------------
+
+export const PUSH_RECONNECT_BACKOFF_MS = [1_000, 4_000, 10_000]
+export const PUSH_HEALTHY_MS = 30_000
+export const PUSH_SAFETY_MS = 45_000
+export const PUSH_LOCAL_CHECK_MS = 1_000
+
+export function createPushGate({
+  safetyMs = PUSH_SAFETY_MS,
+  localCheckMs = PUSH_LOCAL_CHECK_MS,
+} = {}) {
+  let connected = false
+  let wakePending = false
+  let wakeWaiter = null
+
+  const notify = () => {
+    if (wakeWaiter) {
+      const fn = wakeWaiter
+      wakeWaiter = null
+      fn()
+    }
+  }
+
+  return {
+    isConnected: () => connected,
+    hasWakePending: () => wakePending,
+    onEvent(evt) {
+      if (!evt) return
+      if (evt.kind === 'hello') {
+        connected = true
+        return
+      }
+      if (
+        evt.kind === 'wake' ||
+        evt.kind === 'ended' ||
+        evt.kind === 'system_notice' ||
+        evt.kind === 'interaction_event' ||
+        evt.kind === 'question_dismissal_event'
+      ) {
+        wakePending = true
+        notify()
+      }
+    },
+    onDisconnect() {
+      connected = false
+      notify()
+    },
+    consumePollWaitMs(fallbackWaitMs) {
+      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
+      wakePending = false
+      return waitMs
+    },
+    async waitIfIdle({ shouldWakeImmediately } = {}) {
+      if (!connected || wakePending) return
+      if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
+      await new Promise((resolve) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(safetyTimer)
+          clearInterval(localTimer)
+          if (wakeWaiter === finish) wakeWaiter = null
+          resolve()
+        }
+        wakeWaiter = finish
+        const safetyTimer = setTimeout(finish, safetyMs)
+        const localTimer = setInterval(() => {
+          if (!connected || wakePending) {
+            finish()
+            return
+          }
+          if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) {
+            finish()
+          }
+        }, localCheckMs)
+      })
+    },
+  }
+}
+
+export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
+  const effectiveAttempt =
+    openedAtMs !== null && openedAtMs !== undefined && nowMs - openedAtMs >= PUSH_HEALTHY_MS
+      ? 0
+      : attempt
+  if (effectiveAttempt >= PUSH_RECONNECT_BACKOFF_MS.length) {
+    return { delayMs: null, nextAttempt: effectiveAttempt + 1 }
+  }
+  return {
+    delayMs: PUSH_RECONNECT_BACKOFF_MS[effectiveAttempt],
+    nextAttempt: effectiveAttempt + 1,
+  }
+}
+
+export function pushChannelUrl(mcpUrl, connectionId, options = {}) {
+  const base = String(mcpUrl || '').replace(/\/$/, '')
+  const params = new URLSearchParams({
+    connection_id: String(connectionId || ''),
+    system_notice_version: String(options.systemNoticeVersion ?? SYSTEM_NOTICE_CHANNEL_VERSION),
+    interaction_event_version: String(options.interactionEventVersion ?? 1),
+    question_dismissal_event_version: String(options.questionDismissalEventVersion ?? 1),
+    check_job_version: String(options.checkJobVersion ?? CHECK_JOB_VERSION),
+  })
+  return `${base}/connection-stream?${params.toString()}`
+}
+
+export function parseSseFrame(block) {
+  let eventName = 'message'
+  const dataLines = []
+  let sawComment = false
+
+  for (const rawLine of String(block || '').split(/\r?\n/)) {
+    if (!rawLine) continue
+    if (rawLine.startsWith(':')) {
+      sawComment = true
+      continue
+    }
+    const colon = rawLine.indexOf(':')
+    const field = colon === -1 ? rawLine : rawLine.slice(0, colon)
+    let value = colon === -1 ? '' : rawLine.slice(colon + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'event') eventName = value
+    else if (field === 'data') dataLines.push(value)
+  }
+
+  if (dataLines.length === 0 && sawComment) {
+    return { kind: 'comment' }
+  }
+  const data = dataLines.join('\n')
+  if (eventName === 'hello') return { kind: 'hello' }
+  if (eventName === 'wake') return { kind: 'wake' }
+  if (eventName === 'ended') {
+    try {
+      const parsed = data ? JSON.parse(data) : {}
+      return {
+        kind: 'ended',
+        endReason: typeof parsed.end_reason === 'string' ? parsed.end_reason : null,
+      }
+    } catch {
+      return { kind: 'ended', endReason: null }
+    }
+  }
+  if (eventName === 'system_notice') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'system_notice', notice: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'interaction_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'interaction_event', event: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'question_dismissal_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object'
+        ? { kind: 'question_dismissal_event', event: parsed }
+        : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+export function openPushChannel({
+  mcpUrl,
+  token,
+  connectionId,
+  connectionCapability = null,
+  onEvent,
+  onDisconnect,
+  onFallback,
+  fetchImpl = fetch,
+}) {
+  let closed = false
+  let controller = null
+  let reconnectTimer = null
+  let attempt = 0
+
+  const stop = () => {
+    closed = true
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (controller) {
+      controller.abort()
+      controller = null
+    }
+  }
+
+  const scheduleReconnect = (openedAtMs, reason) => {
+    if (closed) return
+    onDisconnect?.(reason)
+    const { delayMs, nextAttempt } = nextPushReconnectDelayMs({ attempt, openedAtMs })
+    attempt = nextAttempt
+    if (delayMs === null) {
+      onFallback?.(`push_reconnect_exhausted:${reason}`)
+      return
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      void connect()
+    }, delayMs)
+  }
+
+  const connect = async () => {
+    if (closed) return
+    controller = new AbortController()
+    let openedAtMs = null
+    try {
+      const cap = typeof connectionCapability === 'function' ? connectionCapability() : connectionCapability
+      const res = await fetchImpl(pushChannelUrl(mcpUrl, connectionId), {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${typeof token === 'function' ? token() : token}`,
+          Accept: 'text/event-stream',
+          ...pluginHeaders(),
+          ...(cap ? { 'x-devspec-connection-capability': cap } : {}),
+        },
+        signal: controller.signal,
+      })
+      const contentType = res.headers?.get?.('content-type') || ''
+      if (!res.ok || !contentType.includes('text/event-stream') || !res.body) {
+        onDisconnect?.(`push_http_${res.status}`)
+        onFallback?.(`push_http_${res.status}`)
+        return
+      }
+      openedAtMs = Date.now()
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!closed) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let sep = buffer.indexOf('\n\n')
+        while (sep !== -1) {
+          const rawFrame = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          const parsed = parseSseFrame(rawFrame)
+          if (parsed && parsed.kind !== 'comment') {
+            onEvent?.(parsed)
+            if (parsed.kind === 'ended') {
+              stop()
+              return
+            }
+          }
+          sep = buffer.indexOf('\n\n')
+        }
+      }
+      if (!closed) {
+        scheduleReconnect(openedAtMs, 'eof')
+      }
+    } catch (err) {
+      if (closed) return
+      const msg = err instanceof Error ? err.message : String(err)
+      scheduleReconnect(openedAtMs, msg)
+    }
+  }
+
+  void connect()
+  return { close: stop }
 }
 
 /**
@@ -1948,8 +2224,80 @@ async function main() {
       state.end_reason !== 'ui',
   )
 
+  function handlePermanentEnd(reason = 'ended_from_ui') {
+    if (shuttingDown) return
+    shuttingDown = true
+    disableLocalState({ connectionId, reason })
+    const disabledState = readState(connectionId) || {
+      ...(readState(connectionId) || state || {}),
+      ...disabledStatePatch(reason),
+    }
+    closeCursorOnEnd({
+      state: disabledState,
+      sawLive,
+      ownerPid: ownerAnchor,
+    })
+    process.stdout.write(
+      JSON.stringify({
+        type: 'session_ended',
+        reason,
+        recoverable: false,
+        connection_id: connectionId,
+        message: 'Remote control was ended. Local poller stopping; do not restart.',
+      }) + '\n',
+    )
+    process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
+    process.exit(1)
+  }
+
+  const pushGate = createPushGate()
+  if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
+    openPushChannel({
+      mcpUrl,
+      token: () => token,
+      connectionId,
+      connectionCapability: () => readConnectionCapability(connectionId),
+      onEvent: (evt) => {
+        pushGate.onEvent(evt)
+        if (evt.kind === 'ended') {
+          if (evt.endReason && PERMANENT_END_REASONS.includes(evt.endReason)) {
+            handlePermanentEnd(evt.endReason)
+          }
+        }
+      },
+      onDisconnect: () => {
+        pushGate.onDisconnect()
+      },
+      onFallback: (reason) => {
+        pushGate.onDisconnect()
+        process.stderr.write(
+          `devspec-remote-poll: SSE push unavailable (${reason}) — using poll_connection\n`,
+        )
+      },
+    })
+  }
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (!needsSeed && !catchUpCursor && !redrainRequested && !pendingInteractionAck && !pendingControlAck) {
+      await pushGate.waitIfIdle({
+        shouldWakeImmediately: () => {
+          const s = readState(connectionId)
+          if (s && s.enabled === false) return true
+          if (ownerAnchor && !ownerAlive(ownerAnchor)) return true
+          const m = readTurnMarker(connectionId)
+          const liveNow = turnIsLive(m, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
+          if (liveNow !== prevTurnActive) return true
+          const nextCont = activeContinuation(s?.interaction_continuation, {
+            connectionId,
+            sessionId,
+          })
+          if (Boolean(nextCont) !== Boolean(interactionContinuation)) return true
+          return false
+        },
+      })
+    }
+
     const liveState = readState(connectionId)
     if (liveState && liveState.enabled === false) {
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
@@ -2094,8 +2442,9 @@ async function main() {
     const drainingCatchUp = Boolean(catchUpCursor)
     const sentControlAck = pendingControlAck
     try {
+      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
       res = await pollOnce({
-        waitMs: tier.waitMs,
+        waitMs: effectiveWaitMs,
         busy: busyArg,
         checkTier: tier.checkTier,
         catchUp: needsSeed || drainingCatchUp,
