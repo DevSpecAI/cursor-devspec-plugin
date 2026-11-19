@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { isPushStreamRequest, refusePushStream } from './fixtures/push-stream.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
@@ -371,6 +372,8 @@ describe('poll acceptance integration seam', () => {
     })
 
     const server = http.createServer((req, res) => {
+      // The poller opens DevSpec's push stream as it starts; refused, it holds polls (507705dd).
+      if (isPushStreamRequest(req)) return refusePushStream(res)
       let body = ''
       req.on('data', (chunk) => { body += chunk })
       req.on('end', async () => {

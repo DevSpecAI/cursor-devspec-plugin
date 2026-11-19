@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isPushStreamRequest, refusePushStream } from './fixtures/push-stream.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   detectLocalId,
@@ -474,6 +475,8 @@ describe('a connect never touches another connection (item 2b840556, parity with
     const dir = path.join(home, '.devspec', 'remote-control', 'connections')
     fs.mkdirSync(dir, { recursive: true })
     const server = http.createServer((request, response) => {
+      // The poller opens DevSpec's push stream as it starts; refused, it holds polls (507705dd).
+      if (isPushStreamRequest(request)) return refusePushStream(response)
       let body = ''
       request.on('data', (chunk) => { body += chunk })
       request.on('end', () => {

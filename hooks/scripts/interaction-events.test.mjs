@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { isPushStreamRequest, refusePushStream } from './fixtures/push-stream.mjs'
 import { spawn } from 'node:child_process'
 import {
   activeContinuation,
@@ -458,6 +459,8 @@ describe('poller round trip', () => {
   async function stubMcp(handler) {
     const requests = []
     const server = http.createServer((request, response) => {
+      // The poller opens DevSpec's push stream as it starts; refused, it holds polls (507705dd).
+      if (isPushStreamRequest(request)) return refusePushStream(response)
       let body = ''
       request.on('data', (chunk) => { body += chunk })
       request.on('end', async () => {
