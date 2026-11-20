@@ -51,6 +51,7 @@ import {
   UNSTATED,
 } from './requests.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
+import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 import { postTurnFailure } from './turn-failure.mjs'
 import { fitRoomMessage } from './room-message.mjs'
@@ -132,6 +133,8 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   } catch {
     /* ignore */
   }
+  // The turn is over, and its end names what it finished (turn-commands.mjs).
+  clearTurnCommands(connectionId, { dir })
 }
 export function readActiveTurnMarker(
   connectionId,
@@ -785,6 +788,8 @@ async function main() {
     // Marker is keyed by connection_id (the poller reads it by connection_id).
     const turnActive = mode === 'user_prompt'
     let stopDecisionAction = null
+    // The room commands that started this turn, read before its end removes the record.
+    const turnCommands = turnActive ? [] : readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
     if (turnActive) writeTurnMarker(connectionId)
     else clearTurnMarker(connectionId)
 
@@ -826,40 +831,67 @@ async function main() {
         // the connection's current attempt now would close THAT one. The window is the
         // follow's poll interval, and the turn the answer starts owns the completion.
         stopDecisionAction = decision.action
-        if (decision.action !== 'hold') {
-          const localAttempt = localTurnToComplete(state.local_turn, sessionId)
+        if (decision.action === 'complete') {
           try {
             await mcpToolsCall({
               mcpUrl,
               token,
-              ...(decision.action === 'complete'
-                ? { connectionCapability }
-                : {}),
+              connectionCapability,
               name: 'report_complete',
-              arguments: decision.action === 'complete'
-                ? {
-                    connection_id: connectionId,
-                    attempt_id: decision.continuation.attempt_id,
-                    reason: 'turn_end',
-                    ...continuationIdentity(decision.continuation),
-                  }
-                : localAttempt
-                  ? { connection_id: connectionId, attempt_id: localAttempt, reason: 'turn_end' }
-                  : { connection_id: connectionId, reason: 'turn_end' },
+              arguments: {
+                connection_id: connectionId,
+                attempt_id: decision.continuation.attempt_id,
+                reason: 'turn_end',
+                ...continuationIdentity(decision.continuation),
+              },
               timeoutMs: 15_000,
             })
-            if (decision.action === 'complete') clearInteractionContinuation(connectionId)
+            clearInteractionContinuation(connectionId)
             logRemoteControlStory({
               phase: 'complete_turn',
               outcome: 'completed',
               connectionId,
               agent: agentName || AGENT_NAME,
               tool: 'mirror-turn.stop',
-              reason: decision.action === 'complete' ? 'exact_interaction_turn_end' : 'turn_end',
+              reason: 'exact_interaction_turn_end',
             })
           } catch {
             /* non-fatal — the poller's marker-driven backstop still runs */
           }
+        } else if (decision.action !== 'hold') {
+          // Each thing the turn finishes, by name (turn-commands.mjs): the room
+          // commands that started it and the terminal turn the owner typed, or, when it
+          // had neither, only an activity no command started. So a command handed over
+          // as the turn ended is never finished by it.
+          const calls = completionArguments({
+            connectionId,
+            commands: turnCommands,
+            localAttemptId: localTurnToComplete(state.local_turn, sessionId),
+            reason: 'turn_end',
+          })
+          let completed = true
+          for (const args of calls) {
+            try {
+              await mcpToolsCall({ mcpUrl, token, name: 'report_complete', arguments: args, timeoutMs: 15_000 })
+            } catch {
+              /* non-fatal — the poller's marker-driven backstop still runs */
+              completed = false
+            }
+          }
+          if (completed) {
+            logRemoteControlStory({
+              phase: 'complete_turn',
+              outcome: 'completed',
+              connectionId,
+              agent: agentName || AGENT_NAME,
+              tool: 'mirror-turn.stop',
+              reason: 'turn_end',
+            })
+          }
+        }
+        if (decision.action !== 'hold') {
+          // The turn is over whether or not its completion landed: never carry the
+          // typed turn into the next one.
           if (state.local_turn) patchOwnState(connectionId, { local_turn: null })
         }
       }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.0
+
+- **A message you send from DevSpec while the agent is busy now shows as started.** Each time the plugin hands your Cursor agent a message from a DevSpec room, it tells DevSpec exactly which message it has started, including one that arrives while the agent is already working on something else. Before, a message sent mid-task could show as never picked up, even though the agent went on to answer it.
+- **A check or an automation run never marks one of your messages as started.** When DevSpec sends the agent a check to rule or an automation run to carry out, the plugin no longer reports picking anything up, so it can no longer mark whichever message you sent last as started. The agent still shows as working while it rules the check or does the run.
+- **When a turn ends, the plugin says which messages it finished.** It names each message the turn started with, or says the turn started with none, so a message that arrives just as a turn ends is never marked finished before the agent has seen it. A message that arrives while the agent is busy is finished by the agent's own answer to it.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.23.0
 
 - **Your Cursor agent now writes a task's reason the way you gave it.** Before, it was told to write its own summary of why a task exists. Now it records the reason you actually gave, in your everyday words, and never one you did not give.

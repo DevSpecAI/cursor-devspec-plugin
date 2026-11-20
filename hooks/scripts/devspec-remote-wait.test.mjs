@@ -13,6 +13,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -734,6 +735,97 @@ describe('notifyWorkingEnded (item cd989606 — immediate report_complete)', () 
     })
     assert.equal(result.ok, true)
     assert.deepEqual(calls, ['heartbeat_connection', 'report_complete'])
+  })
+})
+
+// turn-commands.mjs (item a4391300): the reply re-arm ends the turn the way Stop does,
+// naming what it finishes, never with a report that names nothing.
+describe('notifyWorkingEnded names what the turn finishes', () => {
+  const TURN = '55555555-5555-4555-8555-555555555555'
+  const MESSAGE = '66666666-6666-4666-8666-666666666666'
+  const ROOM = '22222222-2222-4222-8222-222222222222'
+  const TYPED = '44444444-4444-4444-8444-444444444444'
+  const completions = async (opts) => {
+    const calls = []
+    const result = await notifyWorkingEnded({
+      connectionId: 'conn-1',
+      call: async (call) => { calls.push(call) },
+      ...opts,
+      state: { token: 'dvs_test', mcp_url: 'https://example.test/api/mcp', ...opts.state },
+    })
+    return { result, args: calls.filter((call) => call.name === 'report_complete').map((call) => call.arguments) }
+  }
+
+  it('names each room command that started the turn, and the typed turn in the same room', async () => {
+    const { result, args } = await completions({
+      commands: [{ turnId: TURN, messageId: MESSAGE }],
+      state: { session_id: ROOM, local_turn: { attempt_id: TYPED, session_id: ROOM } },
+    })
+    assert.equal(result.ok, true)
+    assert.deepEqual(args, [
+      { connection_id: 'conn-1', command_turn_id: TURN, command_message_id: MESSAGE, reason: 'turn_end' },
+      { connection_id: 'conn-1', attempt_id: TYPED, reason: 'turn_end' },
+    ])
+  })
+
+  it('says a turn that started with neither is unbound', async () => {
+    const { args } = await completions({ state: { session_id: ROOM, local_turn: { attempt_id: TYPED, session_id: 'another-room' } } })
+    assert.deepEqual(args, [{ connection_id: 'conn-1', command_turn_unbound: true, reason: 'turn_end' }])
+  })
+
+  it('a reply re-arm reads what started the turn before it clears it, and names it', async () => {
+    const calls = []
+    const server = http.createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => { body += chunk })
+      request.on('end', () => {
+        const parsed = JSON.parse(body)
+        calls.push({ name: parsed.params?.name, args: parsed.params?.arguments ?? {} })
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { content: [{ type: 'text', text: '{}' }] } }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-after-reply-'))
+    const dir = path.join(home, 'connections')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.json`), JSON.stringify({
+      enabled: true,
+      connection_id: CANONICAL_CONNECTION,
+      session_id: null,
+      token: 'dvs_test',
+      mcp_url: `http://127.0.0.1:${server.address().port}/mcp`,
+      inbox_byte_offset: 0,
+    }))
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.inbox.jsonl`), '')
+    const marker = path.join(dir, `${CANONICAL_CONNECTION}.turn`)
+    const record = path.join(dir, `${CANONICAL_CONNECTION}.turn-commands.json`)
+    fs.writeFileSync(marker, JSON.stringify({ startedAt: Date.now() }))
+    fs.writeFileSync(record, JSON.stringify({ version: 1, commands: [{ turn_id: TURN, message_id: MESSAGE }] }))
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url)),
+      '--connection-id', CANONICAL_CONNECTION, '--pending', '--after-reply',
+      '--owner-pid', String(process.pid), '--poll-ms', '20',
+    ], { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir } })
+    child.stdout.resume()
+    const closed = new Promise((resolve) => child.once('close', resolve))
+    try {
+      const deadline = Date.now() + 10_000
+      while (!calls.some((call) => call.name === 'report_complete') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.deepEqual(
+        calls.filter((call) => call.name === 'report_complete').map((call) => call.args),
+        [{ connection_id: CANONICAL_CONNECTION, command_turn_id: TURN, command_message_id: MESSAGE, reason: 'turn_end' }],
+      )
+      assert.equal(fs.existsSync(marker), false)
+      assert.equal(fs.existsSync(record), false)
+    } finally {
+      child.kill('SIGKILL')
+      await closed
+      await new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) })
+      fs.rmSync(home, { recursive: true, force: true })
+    }
   })
 })
 

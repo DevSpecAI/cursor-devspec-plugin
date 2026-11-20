@@ -169,6 +169,14 @@ import {
   turnIsLive,
 } from './turn-liveness.mjs'
 import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
+import {
+  clearTurnCommands,
+  commandsHandedOver,
+  completionArguments,
+  pickupArguments,
+  recordTurnCommands,
+  turnCommandsPath,
+} from './turn-commands.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -273,6 +281,12 @@ export function handleKeepaliveRejection(errorMessage, connectionId, io = {}) {
     } catch {
       /* ignore */
     }
+    // Nothing is working, so the commands that turn started are already finished.
+    try {
+      rmSync(turnCommandsPath(connectionId, CONNECTIONS_DIR), { force: true })
+    } catch {
+      /* ignore */
+    }
     return { cleared: true }
   }
   return { cleared: false }
@@ -299,6 +313,8 @@ function clearTurnMarker(connectionId) {
   } catch {
     /* non-fatal */
   }
+  // The turn is over, and its end names what it finished (turn-commands.mjs).
+  clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
 }
 
 /**
@@ -740,10 +756,12 @@ export function splitRoomWindow({ commands, ownerAmbient, roomContext, seed = fa
  * busy-heartbeat (syncActivityFromBusy). Driven by the poller's turn marker, so it
  * is host-agnostic (Grok works too — no per-host Stop hook needed).
  *
- *   false → true  = a turn just started (owner-command pickup / local turn) → 'pickup'
+ *   false → true  = a turn just started (room command, check job, run, local turn) → 'pickup'
  *   true  → true  = still working this turn (per heartbeat/loop tick)        → 'keepalive'
  *   true  → false = the turn ended (marker cleared by Stop / wait re-arm)    → 'complete'
  *   false → false = idle, nothing to report                                  → null
+ *
+ * What each verb sends is `activityCalls`: a turn's start sends no pickup of its own.
  *
  * @returns {'pickup'|'keepalive'|'complete'|null}
  */
@@ -771,11 +789,31 @@ export function extraActivityVerbArgs({ stalling, verb } = {}) {
   return { reason: stalling ? 'max_turn_ms' : 'turn_end' }
 }
 
-/** Activity verb → connection-native MCP tool name. */
-const ACTIVITY_VERB_TOOL = {
-  pickup: 'report_pickup',
-  keepalive: 'report_keepalive',
-  complete: 'report_complete',
+/**
+ * The MCP calls one turn transition sends (turn-commands.mjs).
+ *
+ * - pickup: none. A room command is started by name as it is handed over
+ *   (`nameCommandPickups`), into a new turn or a running one alike. Any other turn
+ *   (a check job, an automation run, a prompt typed at the terminal) starts no
+ *   command, and a pickup naming none can start one that is waiting, so its start
+ *   is the busy this poller reports, and a typed turn's is the exact pickup the
+ *   prompt hook sent (local-turn.mjs).
+ * - keepalive: the working attempt, whichever it is.
+ * - complete: the backstop for a turn whose end no Stop hook or reply re-arm
+ *   reported. It names the commands this poller started that turn with
+ *   (`commands`), or says the turn is unbound.
+ *
+ * @returns {{ name: string, arguments: object }[]}
+ */
+export function activityCalls({ verb, connectionId, commands = [], reason = null } = {}) {
+  if (verb === 'keepalive') return [{ name: 'report_keepalive', arguments: { connection_id: connectionId } }]
+  if (verb === 'complete') {
+    return completionArguments({ connectionId, commands, reason }).map((args) => ({
+      name: 'report_complete',
+      arguments: args,
+    }))
+  }
+  return []
 }
 
 /**
@@ -1192,6 +1230,11 @@ async function deliverOwnerMessages(
       continuous: true,
     }) + '\n',
   )
+  // Whether these commands start a turn, or are handed over into one already running
+  // (turn-commands.mjs): read before the marker below makes the turn live.
+  const startsTurn = !turnIsLive(readTurnMarker(connectionId), {
+    activity: readTurnActivity(connectionId, CONNECTIONS_DIR),
+  })
   // Turn start at pickup — poller re-asserts busy while the marker is fresh.
   writeTurnMarker(connectionId)
   // Cursor CLI often never fires mid-turn hooks; start a transcript-tail trail
@@ -1221,7 +1264,7 @@ async function deliverOwnerMessages(
   } catch {
     /* ignore */
   }
-  return { ok: true, duplicate: false }
+  return { ok: true, duplicate: false, commands: commandsHandedOver(acceptedMessages), startsTurn }
 }
 
 export async function deliverSystemNotices(
@@ -1479,49 +1522,82 @@ async function main() {
     })
   }
 
-  // Emit a connection-scoped activity verb DIRECTLY (item 71a8b201). Best-effort:
-  // this is ADDITIVE to the busy-heartbeat above (the server's syncActivityFromBusy
-  // translation stays the safety net during rollout), so a failed verb must NEVER
-  // break the poll loop — log to stderr and move on. attempt_id is omitted; the
-  // server resolves this connection's current attempt (pickup opens one for a
-  // locally-initiated turn; keepalive/complete refresh/close the working attempt).
+  // The room commands this poller started a turn with (turn-commands.mjs), so the
+  // backstop that ends that turn can name them. Commands handed over into a turn
+  // already running are not kept: their own answer finishes them.
+  let turnStartCommands = []
+
+  // Emit a connection-scoped activity verb DIRECTLY (item 71a8b201), as the calls
+  // activityCalls plans. Best-effort: a failed verb must NEVER break the poll loop —
+  // log to stderr and move on.
   //
   // While an exact directed-question attempt is open, the generic verbs are the wrong
-  // writer for it (interactionActivityPlan): pickup/complete would touch an attempt
-  // they do not own, and completing one from outside its claim generation is how a
+  // writer for it (interactionActivityPlan): a completion would touch an attempt it
+  // does not own, and completing one from outside its claim generation is how a
   // Cursor turn was sealed empty while the model was still inside it. Keepalive is
   // translated to the exact form so Working stays truthful.
   async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return { ok: true }
+    // The turn is over however its end is reported: what started it goes with it.
+    const ending = verb === 'complete' ? turnStartCommands : []
+    if (verb === 'complete') {
+      turnStartCommands = []
+      clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    }
     const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
     if (plan.kind === 'suppress') return { ok: true }
     if (plan.kind === 'exact_keepalive') {
       const exactRes = await keepaliveInteractionContinuation()
       return exactRes ?? { ok: true }
     }
-    const name = ACTIVITY_VERB_TOOL[verb]
-    if (!name) return { ok: true }
-    try {
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name,
-        arguments: { connection_id: connectionId, ...extraArgs },
-        timeoutMs: 10_000,
-      })
-      return { ok: true }
-    } catch (e) {
-      process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
-      if (verb === 'keepalive') {
-        const rejection = handleKeepaliveRejection(e.message, connectionId)
-        if (rejection.cleared) {
-          process.stderr.write(
-            `devspec-remote-poll: cleared turn marker on keepalive rejection connection=${connectionId}\n`,
-          )
-          return { ok: false, turnStale: true }
+    let result = { ok: true }
+    for (const call of activityCalls({ verb, connectionId, commands: ending, reason: extraArgs.reason ?? null })) {
+      try {
+        await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${call.name}) failed: ${e.message}\n`)
+        result = { ok: false }
+        if (verb === 'keepalive') {
+          const rejection = handleKeepaliveRejection(e.message, connectionId)
+          if (rejection.cleared) {
+            process.stderr.write(
+              `devspec-remote-poll: cleared turn marker on keepalive rejection connection=${connectionId}\n`,
+            )
+            turnStartCommands = []
+            return { ok: false, turnStale: true }
+          }
         }
       }
-      return { ok: false }
+    }
+    return result
+  }
+
+  /**
+   * Start each room command this poller hands over, by name (turn-commands.mjs), in
+   * the order delivered, whether it starts a turn or joins one already running. The
+   * ones that start a turn are kept for that turn's end. Best-effort: a pickup that
+   * does not land leaves its command waiting, as it was, until its answer.
+   */
+  async function nameCommandPickups(commands, { startsTurn }) {
+    if (!Array.isArray(commands) || commands.length === 0) return
+    if (startsTurn) {
+      turnStartCommands = [...commands]
+      recordTurnCommands(connectionId, commands, { dir: CONNECTIONS_DIR })
+    }
+    for (const command of commands) {
+      try {
+        await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'report_pickup',
+          arguments: pickupArguments(connectionId, command),
+          timeoutMs: 10_000,
+        })
+      } catch (e) {
+        process.stderr.write(
+          `devspec-remote-poll: report_pickup for message ${command.messageId} failed: ${e.message}\n`,
+        )
+      }
     }
   }
 
@@ -2081,6 +2157,8 @@ async function main() {
         projectIncidents,
       )
       if (!delivered.ok) return false
+      // Each command handed over is started by name, mid-turn or not (turn-commands.mjs).
+      if (!delivered.duplicate) await nameCommandPickups(delivered.commands, { startsTurn: delivered.startsTurn })
       if (roomChanges) roomAnnounced = roomChanges.seen
       instructionContextDelivered = Boolean(!delivered.duplicate && instructionContextFile)
       newlyDelivered ||= !delivered.duplicate
@@ -2398,14 +2476,13 @@ async function main() {
       })
     }
 
-    // ADDITIVE (item 71a8b201): emit the connection activity verb DIRECTLY off the
-    // turn-active transition (pickup / keepalive / complete). This is ON TOP of the
-    // busy signal the poll carries — both feed the same server-side activity attempt
-    // idempotently, so leaving the busy path untouched keeps the server's
-    // syncActivityFromBusy translation as the safety net during rollout. One tick =
-    // one keepalive (≈25s while a turn runs, well inside the 5-minute working lease).
-    // Best-effort inside emitActivityVerb — a failed verb never breaks the loop.
-    // Complete always carries a reason: turn_end on a healthy marker clear
+    // Emit the connection activity verb off the turn-active transition (item
+    // 71a8b201), as activityCalls plans it: a turn's start sends nothing of its own
+    // (its room commands were started by name as they were handed over; what the busy
+    // below does is heartbeat_connection's to say), a running turn one keepalive per tick (≈25s, well
+    // inside the 5-minute working lease), and its end a completion naming what it
+    // finished. Best-effort inside emitActivityVerb — a failed verb never breaks the
+    // loop. Complete always carries a reason: turn_end on a healthy marker clear
     // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
     const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
     const verbResult = await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
