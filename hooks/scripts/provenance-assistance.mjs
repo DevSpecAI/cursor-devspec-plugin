@@ -11,6 +11,13 @@
  * the git stand-in line in front of every Shell command (git-observer.mjs), and the
  * stand-in tags or stops commits from git's own arguments; the command-text tagging
  * here then only applies where the stand-in does not.
+ *
+ * Both paths decide alike (item 953ab72e): one claim tags the commit; several stop it
+ * and ask which task it belongs to; none lets it through as written, with a note. A
+ * claim this plugin could not record never lets the next commit be tagged with an older
+ * one: that commit is stopped to ask only when DevSpec confirmed the claim and the
+ * repository is certainly the project's, and otherwise goes through with a note. What a
+ * host may refuse a commit for is the served commit_provenance_contract.
  */
 
 import crypto from 'node:crypto'
@@ -22,13 +29,16 @@ import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
-import { prepareStandIn } from './git-observer.mjs'
+import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
+import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
 
 const FULL_UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 const FULL_PROJECT_ID = new RegExp(`^${FULL_UUID}$`, 'i')
+/** A task as a call names it: its full id or its 8-character short code. */
+const REQUESTED_ITEM = new RegExp(`^(?:${FULL_UUID}|[0-9a-f]{8})$`, 'i')
 const VALID_REFERENCE = new RegExp(`\\[devspec:(${FULL_UUID})\\]`, 'gi')
 const REFERENCE_START = /\[devspec\s*:/gi
 const EDIT_TOOLS = new Set(['write', 'edit', 'applypatch', 'apply_patch', 'delete'])
@@ -45,15 +55,6 @@ export const MALFORMED_REFERENCE_MESSAGE =
 
 export const MULTIPLE_CLAIMS_MESSAGE =
   'DevSpec commit provenance: this Cursor conversation has multiple active DevSpec claims, so the plugin will not guess which reference belongs in the commit. Add a [devspec:<uuid>] reference for each task this commit delivers and retry. Nothing else is blocked.'
-
-// The server refuses a thin task (contract 5.4.0's work_entry_contract), and with
-// exactly one claim this hook appends the reference itself (appendReference), so the
-// agent is asked for the smallest adequate task and a retry, never a tag (item 8f047489).
-export const NO_CLAIM_MESSAGE =
-  'DevSpec commit provenance: this commit has no [devspec:<uuid>] reference and no active DevSpec claim is observed in this project, so it would land unlinked. ' +
-  'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item); ' +
-  'if none covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed (the server refuses a thin one), and claim that. ' +
-  "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you. Nothing else is blocked."
 
 export function unresolvedReferenceMessage(reference) {
   return `DevSpec commit provenance: [devspec:${reference}] is well formed but resolves to no task in this project. ` +
@@ -113,9 +114,43 @@ function emptyState(conversationId) {
   return {
     conversation_id: conversationId,
     active_claims: [],
+    unrecorded_claims: [],
     nudged_projects: [],
     pending_stamps: {},
+    pending_notes: {},
   }
+}
+
+function normalizePendingNotes(rawPending) {
+  if (!rawPending || typeof rawPending !== 'object' || Array.isArray(rawPending)) return {}
+  const normalized = {}
+  for (const [toolUseId, entry] of Object.entries(rawPending)) {
+    const text = cleanString(entry?.text)
+    const at = cleanString(entry?.at)
+    if (text && at) normalized[toolUseId] = { text, at }
+  }
+  return normalized
+}
+
+/**
+ * Claims made in this conversation that could not be recorded (item 953ab72e): the
+ * task as the call named it (`requested`), its full id when known (`task_id`), the
+ * project the call was scoped to when known, whether DevSpec confirmed the claim and
+ * named its task (`confirmed`), and when it was seen.
+ */
+function normalizeUnrecordedClaims(raw) {
+  if (!Array.isArray(raw)) return []
+  return raw.map((entry) => {
+    const requested = cleanString(entry?.requested)
+    const taskId = cleanUuid(entry?.task_id)
+    return {
+      requested: requested && REQUESTED_ITEM.test(requested) ? requested.toLowerCase() : taskId,
+      task_id: taskId,
+      project_id: cleanUuid(entry?.project_id),
+      confirmed: entry?.confirmed === true && Boolean(taskId),
+      observed_at: cleanString(entry?.observed_at),
+    }
+  }).filter((entry) => entry.requested && entry.observed_at)
 }
 
 function normalizePendingStamps(rawPending) {
@@ -143,8 +178,10 @@ export function readConversationState(conversationId, stateRoot = defaultStateRo
           : { id: cleanUuid(claim?.id), project_id: cleanUuid(claim?.project_id), observed_at: cleanString(claim?.observed_at) })
           .filter((claim) => claim.id && claim.project_id && claim.observed_at)
         : [],
+      unrecorded_claims: normalizeUnrecordedClaims(parsed.unrecorded_claims),
       nudged_projects: Array.isArray(parsed.nudged_projects) ? parsed.nudged_projects.filter((id) => typeof id === 'string') : [],
       pending_stamps: normalizePendingStamps(parsed.pending_stamps),
+      pending_notes: normalizePendingNotes(parsed.pending_notes),
     }
   } catch {
     return emptyState(conversationId)
@@ -621,12 +658,30 @@ export async function confirmReferencesOnline(commitMessage, options = {}) {
 
 export const CLAIM_CONFIRM_TIMEOUT_MS = 5_000
 
+/** Whether `id` (a full id) is the task a call named as `requested` (a full id or short code). */
+export function namesTask(requested, id) {
+  if (!requested || !id) return false
+  return requested.length === 8 ? id.startsWith(requested) : requested === id
+}
+
+/** The task object in a get_task answer, also when DevSpec appended a notice block after it. */
+function taskFromAnswer(answer) {
+  if (answer && typeof answer === 'object' && !Array.isArray(answer) && typeof answer.id === 'string') return answer
+  const content = answer?.result?.content
+  return Array.isArray(content) ? parseJsonObject(content.find((block) => block?.type === 'text')?.text) : null
+}
+
 /**
  * Whether this conversation holds the claim on a task, asked of DevSpec: for a claim
- * whose result Cursor did not pass to the hook (item ef54cfcb). It holds it when the task
- * is being worked on under this conversation's id, which project-input.mjs stamps on
- * every claim as local_session_id. Anything less, or no answer, is false: the claim goes
- * unrecorded and a commit without a reference is stopped, as before.
+ * whose result the hook could not read (Cursor withholds a large one, item ef54cfcb),
+ * named by its full id or its short code (item 953ab72e). It holds it when the task is
+ * being worked on under this conversation's id, which project-input.mjs stamps on every
+ * claim as local_session_id.
+ *
+ * `{ status: 'held', id }` with the task's full id; `{ status: 'not_held' }` when DevSpec
+ * returned the task and this conversation does not hold it; `{ status: 'unavailable' }`
+ * for everything else (no sign-in, no answer, a refusal or an answer it cannot read),
+ * which the caller treats as not knowing, never as a claim that did not happen.
  */
 export async function confirmClaimOnline(options = {}) {
   const {
@@ -639,29 +694,38 @@ export async function confirmClaimOnline(options = {}) {
     call = mcpToolsCall,
     resolveAuth = resolveDevspecMcpAuth,
   } = options
-  if (!cleanUuid(taskId) || !cleanUuid(projectId) || !cleanString(conversationId)) return false
+  const unavailable = { status: 'unavailable' }
+  const requested = cleanString(taskId)?.toLowerCase() ?? null
+  if (!requested || !REQUESTED_ITEM.test(requested) || !cleanString(conversationId)) return unavailable
   let auth
   try {
     auth = resolveAuth(cwd, { env })
   } catch {
-    return false
+    return unavailable
   }
-  if (!auth?.ok || !auth.token || !auth.mcp_url) return false
-  let task
+  if (!auth?.ok || !auth.token || !auth.mcp_url) return unavailable
+  const args = { task_id: requested }
+  if (cleanUuid(projectId)) args.project_id = cleanUuid(projectId)
+  let answer
   try {
-    task = await call({
+    answer = await call({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'get_task',
-      arguments: { task_id: taskId, project_id: projectId },
+      arguments: args,
       timeoutMs,
     })
   } catch {
-    return false
+    // No answer, or a refusal (no such task here, or a read that failed): neither says
+    // anything certain about the claim, so neither is taken as one that did not happen.
+    return unavailable
   }
-  return cleanUuid(task?.id) === cleanUuid(taskId) &&
-    task?.agent_activity === 'implementing' &&
-    cleanString(task?.local_session_id) === cleanString(conversationId)
+  const task = taskFromAnswer(answer)
+  const id = cleanUuid(task?.id)
+  if (!id || !namesTask(requested, id)) return unavailable
+  const held = task.agent_activity === 'implementing' &&
+    cleanString(task.local_session_id) === cleanString(conversationId)
+  return held ? { status: 'held', id } : { status: 'not_held' }
 }
 
 /** The single-verdict form: valid, not_found, unavailable or indeterminate. */
@@ -677,8 +741,13 @@ function toolFields(data) {
   return { verb, isDevspec: Boolean(verb) }
 }
 
-function claimedItemId(args) {
-  return cleanUuid(args?.task_id) || cleanUuid(args?.taskId) || cleanUuid(args?.id)
+/** The task as the call named it, its full id or its short code, lower case; or null. */
+function requestedItem(args) {
+  for (const value of [args?.task_id, args?.taskId, args?.id]) {
+    const text = cleanString(value)
+    if (text && REQUESTED_ITEM.test(text)) return text.toLowerCase()
+  }
+  return null
 }
 
 function resultItemValues(result) {
@@ -740,6 +809,17 @@ function hasOuterFailure(result) {
     ['error', 'failure', 'conflict', 'not_claimed', 'unclaimed'].includes(status)
 }
 
+/**
+ * What a DevSpec work call did, read from the hook's copy of it:
+ * - `requested`: the task as the call named it (full id or short code);
+ * - `taskId`: its full id, from the call or, for a short code, from DevSpec's answer;
+ * - `successful`: DevSpec's answer shows the call took effect (for a claim: in a known
+ *   project, so it can be recorded);
+ * - `claimed`: DevSpec's answer says the claim was made and names its task, even where
+ *   the project is not known;
+ * - `refused`: DevSpec's answer says it did not take effect;
+ * - `unreadable`: there is no answer the hook can read (Cursor withholds a large one).
+ */
 export function parseMcpExecution(data) {
   const { verb, isDevspec } = toolFields(data)
   const args = parseJsonObject(data?.tool_input ?? data?.toolInput) || {}
@@ -748,20 +828,24 @@ export function parseMcpExecution(data) {
   // DevSpec's own answer is the first text block. It appends its notices (plugin
   // access, account state) as further blocks, each its own JSON object, so joining the
   // blocks made a successful claim unreadable whenever one rode along (item ef54cfcb).
-  const result = Array.isArray(envelope?.content)
-    ? parseJsonObject(envelope.content.find((block) => block?.type === 'text')?.text)
-    : envelope
-  const requestedId = claimedItemId(args)
+  const firstText = Array.isArray(envelope?.content)
+    ? envelope.content.find((block) => block?.type === 'text')?.text
+    : undefined
+  const result = Array.isArray(envelope?.content) ? parseJsonObject(firstText) : envelope
+  const requested = requestedItem(args)
+  const fullRequested = cleanUuid(requested)
   const requestedProjectValue = cleanString(args?.project_id) // a folder pin is a hint, not an explicit scope
   const requestedProject = cleanUuid(requestedProjectValue)
   // cursor-agent hands this hook an empty text block in place of a large result, which
   // it writes to a file for the model instead: recorded live on 2026.10.22, where every
   // successful claim (about 52 KB) arrived as "" while a short refusal arrived whole.
-  // Nothing about the outcome can be read from it, so the caller asks DevSpec.
-  const withheld = isDevspec && resultPresent && Array.isArray(envelope?.content) && envelope.isError !== true &&
-    !cleanString(envelope.content.find((block) => block?.type === 'text')?.text)
+  // An answer that is no JSON object at all, not marked as an error, is no better.
+  // Nothing about the outcome can be read from either, so the caller asks DevSpec.
+  const unreadable = isDevspec && resultPresent && (envelope === null ||
+    (Array.isArray(envelope.content) && envelope.isError !== true && (!cleanString(firstText) || result === null)))
+  const base = { verb, args, requested, requestedProject, unreadable }
   if (!isDevspec || !resultPresent || hasOuterFailure(envelope) || hasOuterFailure(result)) {
-    return { verb, args, successful: false, taskId: requestedId, projectId: null, withheld, requestedProject }
+    return { ...base, successful: false, claimed: false, refused: isDevspec && resultPresent && !unreadable, taskId: fullRequested, projectId: null }
   }
   const rawProjects = resultProjectValues(result)
   const returnedProjects = rawProjects.map(cleanUuid).filter(Boolean)
@@ -779,9 +863,13 @@ export function parseMcpExecution(data) {
   if (verb === 'claim_work_item') {
     const rawReturned = resultItemValues(result)
     const returned = rawReturned.map(cleanUuid).filter(Boolean)
-    const successful = result.claim_success === true && Boolean(requestedId) && Boolean(projectId) && projectAgrees &&
-      rawReturned.length === returned.length && returned.length > 0 && returned.every((id) => id === requestedId)
-    return { verb, args, successful, taskId: requestedId, projectId }
+    // The task the answer names, which must be the one asked for: the same full id, or
+    // the full id a short code begins (item 953ab72e).
+    const named = rawReturned.length === returned.length && returned.length > 0 &&
+      returned.every((id) => id === returned[0]) && namesTask(requested, returned[0])
+    const claimed = result.claim_success === true && named
+    const successful = claimed && Boolean(projectId) && projectAgrees
+    return { ...base, successful, claimed, refused: false, taskId: named ? returned[0] : fullRequested, projectId }
   }
   const allowedStatuses = {
     record_implementation: new Set(['success', 'ok', 'implemented', 'done']),
@@ -793,7 +881,7 @@ export function parseMcpExecution(data) {
     (verb === 'release_work_item' && result.released === true) ||
     (verb === 'fail_work_item' && result.failed === true) ||
     structuredStatuses(result).some((status) => allowedStatuses.has(status))
-  return { verb, args, successful, taskId: requestedId, projectId }
+  return { ...base, successful, claimed: false, refused: false, taskId: fullRequested, projectId }
 }
 
 function withinObservationWindow(value, now) {
@@ -808,8 +896,94 @@ function prunePending(pending, now = Date.now()) {
   )
 }
 
+function pruneNotes(notes, now = Date.now()) {
+  return Object.fromEntries(
+    Object.entries(normalizePendingNotes(notes))
+      .filter(([, value]) => withinObservationWindow(value?.at, now)),
+  )
+}
+
 function pruneClaims(claims, now = Date.now()) {
   return (claims || []).filter((claim) => claim.id && claim.project_id && withinObservationWindow(claim.observed_at, now))
+}
+
+function pruneUnrecorded(entries, now = Date.now()) {
+  return (entries || []).filter((entry) => entry.requested && withinObservationWindow(entry.observed_at, now))
+}
+
+function readPrunedState(conversationId, stateRoot, nowMs) {
+  const state = readConversationState(conversationId, stateRoot)
+  state.pending_stamps = prunePending(state.pending_stamps, nowMs)
+  state.pending_notes = pruneNotes(state.pending_notes, nowMs)
+  state.active_claims = pruneClaims(state.active_claims, nowMs)
+  state.unrecorded_claims = pruneUnrecorded(state.unrecorded_claims, nowMs)
+  return state
+}
+
+/**
+ * Whether the repository a commit runs in is certainly the project's: a pin names the
+ * project, or its origin is one of the project's repositories as DevSpec listed them at
+ * connect. A project merely chosen for the conversation does not make it so.
+ */
+function repositoryIsProjects(cwd, projectId, pin, conversationId, options = {}) {
+  if (pin?.projectId === projectId) return true
+  const remote = normalizeRemoteKey(gitRemoteOrigin(cwd) ?? '')
+  if (!remote) return false
+  try {
+    return projectRepositoryKeys(conversationId, projectId, { home: options.projectHome ?? options.home }).includes(remote)
+  } catch {
+    return false
+  }
+}
+
+/** Whether an unrecorded claim is the task `id`, or was made naming `requested`. */
+function entryNames(entry, id, requested) {
+  return Boolean((id && (entry.task_id === id || namesTask(entry.requested, id))) || (requested && entry.requested === requested))
+}
+
+/** The one held claim a short code names, or null when it names none or several. */
+function onlyHeldNamed(claims, requested) {
+  const matching = claims.filter((claim) => namesTask(requested, claim.id))
+  return matching.length === 1 ? matching[0].id : null
+}
+
+/**
+ * Keep the conversation's claim record in step with a DevSpec work call (item 953ab72e).
+ * A claim is recorded with its full id and project. One that cannot be (its answer
+ * could not be read and DevSpec could not be asked, or its project is not known) is
+ * kept as unrecorded instead of dropped: while it stands, no commit is tagged with
+ * another claim, because the commit may well be that task's.
+ */
+function applyWorkCall(state, call, answer, nowMs) {
+  const at = new Date(nowMs).toISOString()
+  const forget = (id, requested) => {
+    state.unrecorded_claims = state.unrecorded_claims.filter((entry) => !entryNames(entry, id, requested))
+  }
+  if (call.verb === 'claim_work_item') {
+    const record = (taskId, projectId) => {
+      state.active_claims = [
+        ...state.active_claims.filter((claim) => claim.id !== taskId),
+        { id: taskId, project_id: projectId, observed_at: at },
+      ]
+      forget(taskId, call.requested)
+    }
+    const unrecorded = ({ taskId, projectId, confirmed }) => {
+      forget(taskId, call.requested)
+      state.unrecorded_claims.push({ requested: call.requested, task_id: taskId, project_id: projectId, confirmed, observed_at: at })
+    }
+    if (call.successful) record(call.taskId, call.projectId)
+    else if (call.claimed) unrecorded({ taskId: call.taskId, projectId: null, confirmed: true })
+    else if (answer?.status === 'held') {
+      if (call.requestedProject) record(answer.id, call.requestedProject)
+      else unrecorded({ taskId: answer.id, projectId: null, confirmed: true })
+    } else if (answer?.status === 'not_held') forget(call.taskId, call.requested)
+    else unrecorded({ taskId: call.taskId, projectId: call.requestedProject, confirmed: false })
+    return
+  }
+  if (!call.successful || !TERMINAL_WORK_VERBS.has(call.verb)) return
+  const id = call.taskId ?? onlyHeldNamed(state.active_claims, call.requested)
+  if (id) state.active_claims = state.active_claims.filter((claim) => claim.id !== id)
+  forget(id, call.requested)
 }
 
 export function handleHook(mode, data, options = {}) {
@@ -817,27 +991,27 @@ export function handleHook(mode, data, options = {}) {
   const conversationId = options.conversationId || resolveConversationId(data, env)
   if (!conversationId) return null
   const stateRoot = options.stateRoot || defaultStateRoot(env)
-  const state = readConversationState(conversationId, stateRoot)
   const nowMs = options.nowMs || Date.now()
-  state.pending_stamps = prunePending(state.pending_stamps, nowMs)
-  state.active_claims = pruneClaims(state.active_claims, nowMs)
+  const state = readPrunedState(conversationId, stateRoot, nowMs)
 
   if (mode === 'afterMCPExecution') {
     const call = parseMcpExecution(data)
-    const recordClaim = (projectId) => {
-      state.active_claims = [
-        ...state.active_claims.filter((claim) => claim.id !== call.taskId),
-        { id: call.taskId, project_id: projectId, observed_at: new Date(nowMs).toISOString() },
-      ]
-      writeConversationState(conversationId, state, stateRoot)
+    if (!call.verb) return null
+    const settle = (answer) => {
+      // Read again after any network call, so a record written meanwhile is kept.
+      const current = answer === null ? state : readPrunedState(conversationId, stateRoot, nowMs)
+      applyWorkCall(current, call, answer, nowMs)
+      writeConversationState(conversationId, current, stateRoot)
       return null
     }
-    // A claim whose result Cursor withheld is confirmed with DevSpec, the one place
-    // that knows (item ef54cfcb). Without this every claim in Cursor went unrecorded and
-    // the git stand-in stopped every commit.
-    if (call.verb === 'claim_work_item' && call.withheld && call.taskId && call.requestedProject) {
+    if (call.verb === 'claim_work_item') {
+      // DevSpec said no: nothing was claimed, and nothing is in doubt.
+      if (call.refused || !call.requested) return null
+      if (call.successful || call.claimed) return settle(null)
+      // A claim whose answer the hook could not read is asked of DevSpec, the one place
+      // that knows (items ef54cfcb and 953ab72e), by the id or short code it was made with.
       return confirmClaimOnline({
-        taskId: call.taskId,
+        taskId: call.requested,
         projectId: call.requestedProject,
         conversationId,
         cwd: candidateCwd(data),
@@ -845,15 +1019,10 @@ export function handleHook(mode, data, options = {}) {
         timeoutMs: options.onlineTimeoutMs,
         call: options.onlineCall,
         resolveAuth: options.resolveAuth,
-      }).then((held) => (held ? recordClaim(call.requestedProject) : null)).catch(() => null)
+      }).catch(() => ({ status: 'unavailable' })).then(settle).catch(() => null)
     }
-    if (!call.successful || !call.taskId) return null
-    if (call.verb === 'claim_work_item') return recordClaim(call.projectId)
-    if (TERMINAL_WORK_VERBS.has(call.verb)) {
-      state.active_claims = state.active_claims.filter((claim) => claim.id !== call.taskId)
-    }
-    writeConversationState(conversationId, state, stateRoot)
-    return null
+    if (!call.successful) return null
+    return settle(null)
   }
 
   if (mode === 'preToolUse') {
@@ -869,8 +1038,8 @@ export function handleHook(mode, data, options = {}) {
 
     // While this conversation is connected, every Shell command gets the git stand-in
     // line in front (git-observer.mjs, item c2a7ab72). The stand-in then tags a commit,
-    // or stops one with no reference, from git's own arguments, so the command-text
-    // tagging below is left to Windows and to conversations with no connection. This
+    // stops one, or lets it through with a note, from git's own arguments, so the
+    // command-text path below is left to Windows and to conversations with no connection. This
     // hook is the only one that rewrites a Shell command: Cursor keeps only the last
     // `updated_input` when several hooks return one.
     const standIn = (options.prepareStandIn ?? prepareStandIn)({
@@ -878,6 +1047,7 @@ export function handleHook(mode, data, options = {}) {
       conversationId,
       projectId: selected?.status === 'selected' ? selected.project.id : null,
       claims: state.active_claims,
+      unrecorded: state.unrecorded_claims,
       env,
       home: options.home,
       now: nowMs,
@@ -915,16 +1085,36 @@ export function handleHook(mode, data, options = {}) {
       }).catch(() => withStandIn)
     }
     if (withStandIn) return withStandIn
-    if (eligibleClaims.length === 0) {
-      return { permission: 'deny', user_message: NO_CLAIM_MESSAGE, agent_message: NO_CLAIM_MESSAGE }
+
+    const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
+    // A commit that goes through untagged runs exactly as written, with no permission
+    // given and no rewrite; its note reaches the agent after it ran (postToolUse).
+    const passThrough = (note) => {
+      if (!toolUseId) return { agent_message: note }
+      state.pending_notes[toolUseId] = { text: note, at: new Date(nowMs).toISOString() }
+      writeConversationState(conversationId, state, stateRoot)
+      return null
+    }
+    // Claims made in this conversation that could not be recorded, and may be this
+    // project's (item 953ab72e). The commit is stopped to ask which task it belongs to
+    // only when DevSpec confirmed such a claim and named its task, and the repository is
+    // certainly the project's; otherwise it runs untagged with a note, and never with
+    // the reference of another claim.
+    const unrecorded = state.unrecorded_claims.filter((entry) => !entry.project_id || entry.project_id === projectId)
+    const confirmed = [...new Set(unrecorded.filter((entry) => entry.confirmed && entry.task_id).map((entry) => entry.task_id))]
+    if (confirmed.length > 0 && repositoryIsProjects(parsed.targetCwd, projectId, pin, conversationId, options)) {
+      const message = unrecordedClaimText(eligibleClaims.map((claim) => claim.id), confirmed)
+      return { permission: 'deny', user_message: message, agent_message: message }
     }
     if (eligibleClaims.length > 1) {
       return { permission: 'deny', user_message: MULTIPLE_CLAIMS_MESSAGE, agent_message: MULTIPLE_CLAIMS_MESSAGE }
     }
+    if (unrecorded.length > 0) return passThrough(unrecordedCommitText())
+    // No task claimed: nothing to add, so nothing to stop.
+    if (eligibleClaims.length === 0) return passThrough(unlinkedCommitText())
 
     const taskId = eligibleClaims[0].id
     const updatedCommand = appendReference(parsed, taskId)
-    const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
     if (toolUseId) {
       state.pending_stamps[toolUseId] = { task_id: taskId, at: new Date(nowMs).toISOString() }
       writeConversationState(conversationId, state, stateRoot)
@@ -938,6 +1128,12 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
+    if (toolUseId && state.pending_notes[toolUseId]) {
+      const { text } = state.pending_notes[toolUseId]
+      delete state.pending_notes[toolUseId]
+      writeConversationState(conversationId, state, stateRoot)
+      return { additional_context: text }
+    }
     if (toolUseId && state.pending_stamps[toolUseId]) {
       const item = state.pending_stamps[toolUseId].task_id
       delete state.pending_stamps[toolUseId]
@@ -955,14 +1151,18 @@ export function handleHook(mode, data, options = {}) {
     if (selected?.status === 'blocked') return null
     const projectId = selected?.project?.id ?? pin?.projectId
     if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
+    // A claim made here that could not be recorded is still a claim: no reminder.
+    if (state.unrecorded_claims.some((entry) => !entry.project_id || entry.project_id === projectId)) return null
     state.nudged_projects.push(projectId)
     writeConversationState(conversationId, state, stateRoot)
+    // Work that needs no task commits without one (item 953ab72e), so the advice is
+    // conditional, and a missing claim blocks neither editing nor committing.
     const nudgeMessage =
       `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
-      'Continue working—do not stop or retry, and editing is never blocked. ' +
-      'Before you commit, search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
+      'Continue working—do not stop or retry; a missing claim never blocks editing or committing. ' +
+      'If the work delivers a task, before you commit search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
       'with a real description of the change and the reason it is needed, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
-      'When to create one is the work_entry_contract in devspec://product/implementation-contract.'
+      'When work needs a task is the work_entry_contract in devspec://product/implementation-contract.'
     return {
       additional_context: nudgeMessage,
       agent_message: nudgeMessage,
