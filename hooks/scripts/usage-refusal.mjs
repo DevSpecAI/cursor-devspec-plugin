@@ -95,15 +95,15 @@
  *  - A stop that outlasts its cool-off is reported again only when a later turn is
  *    stopped by it.
  *
- * Imports only private-state.mjs and Node built-ins, so every hook and the poller can
- * load it.
+ * Reads the transcript with transcript-turn-end.mjs, and imports only that,
+ * private-state.mjs and Node built-ins, so every hook and the poller can load it.
  */
 
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { lastTurnEnd } from './transcript-turn-end.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -116,14 +116,6 @@ const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'c
  * turn it stops. The same choice as the Claude Code and Antigravity plugins.
  */
 export const USAGE_REFUSAL_COOL_OFF_MS = 15 * 60 * 1000
-
-/**
- * How much of the transcript's end is read to find its `turn_ended` line. That line is
- * a few hundred bytes and is the final line, but the rows above it can be very large,
- * so this bounds the cost of a read on a file that grows without limit; it cuts no text
- * that is reported. A tail with no `turn_ended` line in it is "no turn end seen".
- */
-const TRANSCRIPT_TAIL_BYTES = 64 * 1024
 
 /**
  * Cursor's own wording for a stop it attributes to the account's usage limit: the start
@@ -175,61 +167,6 @@ export function refusalLiftsAt(text, atMs) {
   }
   const header = /\bretry-after\s*[:=]?\s*(\d+(?:\.\d+)?)\b/i.exec(text)
   if (header) return atMs + Number(header[1]) * 1_000
-  return null
-}
-
-/**
- * The transcript's last turn end, or null when its tail holds none. `key` identifies
- * this turn end (the file, where the line sits and what it says), `final` is whether
- * nothing has been written below it, and `atMs` is the file's modification time.
- */
-export function lastTurnEnd(transcriptPath) {
-  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
-  let buffer
-  let base
-  let atMs
-  try {
-    const fd = fs.openSync(transcriptPath, 'r')
-    try {
-      const { size, mtimeMs } = fs.fstatSync(fd)
-      const length = Math.min(size, TRANSCRIPT_TAIL_BYTES)
-      buffer = Buffer.alloc(length)
-      fs.readSync(fd, buffer, 0, length, size - length)
-      base = size - length
-      atMs = mtimeMs
-    } finally {
-      fs.closeSync(fd)
-    }
-  } catch {
-    return null
-  }
-  let end = buffer.length
-  let final = true
-  while (end > 0) {
-    const newline = buffer.lastIndexOf(0x0a, end - 1)
-    const start = newline + 1
-    // The first line of a tail that starts mid-file is partial: never read it.
-    if (newline < 0 && base > 0) return null
-    const text = buffer.toString('utf8', start, end).trim()
-    end = newline < 0 ? 0 : newline
-    if (!text) continue
-    let row = null
-    try {
-      row = JSON.parse(text)
-    } catch {
-      /* not a row: a line still being written */
-    }
-    if (row?.type === 'turn_ended') {
-      return {
-        key: `${transcriptPath}#${base + start}#${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
-        status: typeof row.status === 'string' ? row.status : null,
-        error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
-        final,
-        atMs,
-      }
-    }
-    final = false
-  }
   return null
 }
 

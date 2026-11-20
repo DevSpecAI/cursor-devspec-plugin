@@ -22,47 +22,17 @@
  * agent-canonical): only a command the turn carries and nobody has answered yet.
  */
 
-import fs from 'node:fs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { fitRoomMessage } from './room-message.mjs'
+import { lastTurnEnd } from './transcript-turn-end.mjs'
 
-// How much of the transcript's end is read to find the turn's turn_ended line. Cursor
-// writes it as the turn's final line, so it sits within the last few hundred bytes;
-// this bound only stops a huge transcript being read whole on every failed turn.
-const TRANSCRIPT_TAIL_BYTES = 256 * 1024
-
-/** Cursor's own error text for the turn that just ended, or null. */
+/**
+ * Cursor's own error text for the turn that just ended, or null: the transcript's last
+ * turn end (transcript-turn-end.mjs), when it is an error.
+ */
 export function lastTurnError(transcriptPath) {
-  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
-  let tail
-  try {
-    const fd = fs.openSync(transcriptPath, 'r')
-    try {
-      const size = fs.fstatSync(fd).size
-      const length = Math.min(size, TRANSCRIPT_TAIL_BYTES)
-      const buffer = Buffer.alloc(length)
-      fs.readSync(fd, buffer, 0, length, size - length)
-      tail = buffer.toString('utf8')
-    } finally {
-      fs.closeSync(fd)
-    }
-  } catch {
-    return null
-  }
-  const lines = tail.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    let entry
-    try {
-      entry = JSON.parse(lines[i])
-    } catch {
-      continue // blank, or the partial first line of the tail
-    }
-    if (entry?.type !== 'turn_ended') continue
-    // Only this turn's end counts: a completed turn_ended means no error was written.
-    if (entry.status !== 'error') return null
-    return typeof entry.error === 'string' && entry.error.trim() ? entry.error.trim() : null
-  }
-  return null
+  const end = lastTurnEnd(transcriptPath)
+  return end?.status === 'error' ? end.error : null
 }
 
 /**
@@ -102,10 +72,12 @@ export function turnFailureMessage(failure, agentName) {
  * Answer the room commands a failed turn carries, once, and mark them answered so the
  * stop's request bookkeeping closes them. Returns the command ids answered; none when
  * the turn completed, was typed at the terminal, or was already answered.
- * `post(args)` posts with post_session_message.
+ * The failure is the stop hook's input (`raw`), or one the caller already read from the
+ * transcript (`failure`, as parseTurnFailure returns it: the poller, when Cursor runs
+ * no stop hook, transcript-turn-end.mjs). `post(args)` posts with post_session_message.
  */
-export async function postTurnFailure({ raw, connectionId, post, dir, agentName }) {
-  const failure = parseTurnFailure(raw)
+export async function postTurnFailure({ raw = null, failure: given = undefined, connectionId, post, dir, agentName }) {
+  const failure = given === undefined ? parseTurnFailure(raw) : given
   if (!failure || !connectionId) return []
   const commands = commandsAnsweredNow(readRequestState(connectionId, { dir }))
   if (commands.length === 0) return []

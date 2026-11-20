@@ -161,23 +161,34 @@ import {
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
 import { openRequest } from './requests.mjs'
-import { attachmentFromPoll } from './local-turn.mjs'
+import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
   NO_SIGN_OF_LIFE_MS,
   readTurnActivity,
   turnActivityPath,
   turnIsLive,
 } from './turn-liveness.mjs'
-import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
 import {
   clearTurnCommands,
   commandsHandedOver,
   completionArguments,
   pickupArguments,
+  readTurnCommands,
   recordTurnCommands,
   turnCommandsPath,
 } from './turn-commands.mjs'
-import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
+import {
+  claimTurnEnd,
+  readTurnBaseline,
+  recordTurnBaseline,
+  releaseTurnEnd,
+  transcriptTurnEnd,
+  turnEndClaimed,
+  turnEndPending,
+} from './transcript-turn-end.mjs'
+import { postTurnFailure } from './turn-failure.mjs'
+import { clearTurnWakes } from './notice-reply.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -253,6 +264,19 @@ function writeTurnMarker(
   const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
   const startedAt = live ? existing.startedAt : Date.now()
   const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
+  // A turn starting now: note how far Cursor's transcript of the conversation had got,
+  // so this turn's end can be told from the end of a turn already running when it
+  // started (transcript-turn-end.mjs). Written before the marker, so a marker never
+  // goes with an older turn's baseline.
+  if (!live) {
+    const conversationId = readState(connectionId)?.local_id || null
+    recordTurnBaseline(connectionId, {
+      turn: startedAt,
+      conversationId,
+      transcriptPath: resolveAgentTranscriptPath(conversationId),
+      dir,
+    })
+  }
   try {
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(
@@ -800,16 +824,18 @@ export function extraActivityVerbArgs({ stalling, verb } = {}) {
  *   is the busy this poller reports, and a typed turn's is the exact pickup the
  *   prompt hook sent (local-turn.mjs).
  * - keepalive: the working attempt, whichever it is.
- * - complete: the backstop for a turn whose end no Stop hook or reply re-arm
- *   reported. It names the commands this poller started that turn with
- *   (`commands`), or says the turn is unbound.
+ * - complete: a turn's end that no Stop hook or reply re-arm reported: one the poller
+ *   noticed in Cursor's transcript (transcript-turn-end.mjs), or the backstop for a
+ *   turn that went quiet. It names the commands this poller started that turn with
+ *   (`commands`) and the terminal turn the owner typed (`localAttemptId`), or says the
+ *   turn is unbound.
  *
  * @returns {{ name: string, arguments: object }[]}
  */
-export function activityCalls({ verb, connectionId, commands = [], reason = null } = {}) {
+export function activityCalls({ verb, connectionId, commands = [], localAttemptId = null, reason = null } = {}) {
   if (verb === 'keepalive') return [{ name: 'report_keepalive', arguments: { connection_id: connectionId } }]
   if (verb === 'complete') {
-    return completionArguments({ connectionId, commands, reason }).map((args) => ({
+    return completionArguments({ connectionId, commands, localAttemptId, reason }).map((args) => ({
       name: 'report_complete',
       arguments: args,
     }))
@@ -1540,7 +1566,7 @@ async function main() {
   async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return { ok: true }
     // The turn is over however its end is reported: what started it goes with it.
-    const ending = verb === 'complete' ? turnStartCommands : []
+    const ending = verb === 'complete' ? (extraArgs.commands ?? turnStartCommands) : []
     if (verb === 'complete') {
       turnStartCommands = []
       clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
@@ -1552,7 +1578,13 @@ async function main() {
       return exactRes ?? { ok: true }
     }
     let result = { ok: true }
-    for (const call of activityCalls({ verb, connectionId, commands: ending, reason: extraArgs.reason ?? null })) {
+    for (const call of activityCalls({
+      verb,
+      connectionId,
+      commands: ending,
+      localAttemptId: extraArgs.localAttemptId ?? null,
+      reason: extraArgs.reason ?? null,
+    })) {
       try {
         await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
       } catch (e) {
@@ -1571,6 +1603,66 @@ async function main() {
       }
     }
     return result
+  }
+
+  /**
+   * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
+   * would have (transcript-turn-end.mjs): a turn that ended in an error or was stopped
+   * is told to the room in Cursor's own words (turn-failure.mjs), the room commands that
+   * started the turn and the turn the owner typed are named as finished, and Working
+   * clears. Only once this poller holds the turn end's claim: when the stop hook holds it,
+   * the stop hook reported it. Returns whether this poller reported it.
+   */
+  async function reportTranscriptTurnEnd(ended) {
+    if (claimTurnEnd(connectionId, ended.identity, { by: 'poller', dir: CONNECTIONS_DIR }) !== 'claimed') return false
+    let delivered = true
+    clearTrailState(connectionId)
+    if (ended.failure && sessionId) {
+      try {
+        await postTurnFailure({
+          failure: ended.failure,
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+      } catch (e) {
+        delivered = false
+        process.stderr.write(`devspec-remote-poll: turn failure post failed: ${e.message}\n`)
+      }
+    }
+    // What woke the ended turn no longer describes the next one (notice-reply.mjs).
+    clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
+    const recorded = readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    const localTurn = readState(connectionId)?.local_turn ?? null
+    const completed = await emitActivityVerb('complete', {
+      reason: 'turn_end',
+      commands: recorded.length > 0 ? recorded : turnStartCommands,
+      localAttemptId: localTurnToComplete(localTurn, sessionId),
+    })
+    if (!completed?.ok) delivered = false
+    clearTurnMarker(connectionId)
+    // The turn is over whether or not its completion landed: never carry the typed turn
+    // into the next one.
+    if (localTurn) patchState({ local_turn: null })
+    prevTurnActive = false
+    // A report that did not reach DevSpec is given back, so a stop hook that runs late
+    // can still report it.
+    if (!delivered) releaseTurnEnd(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: delivered ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_end',
+      reason: ended.status,
+    })
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}) per Cursor's transcript connection=${connectionId}\n`,
+    )
+    return true
   }
 
   /**
@@ -1672,6 +1764,14 @@ async function main() {
   // The transcript this poller last read for a turn end (usage-refusal.mjs), so an
   // unchanged one is not read again every lap.
   const turnEndMemo = {}
+  // Cursor's transcript, read for the end of the turn this poller tracks when no stop
+  // hook reports it (transcript-turn-end.mjs): what each lap last decided, what the
+  // once-a-second local check last looked at, the transcript this lap resolved (for that
+  // check), and the turn the marker tracked when last seen (for the backstop below).
+  const transcriptTurnEndMemo = {}
+  const turnEndProbeMemo = {}
+  let lapTranscriptPath = null
+  let trackedTurnStartedAt = null
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -2375,6 +2475,9 @@ async function main() {
           const m = readTurnMarker(connectionId)
           const liveNow = turnIsLive(m, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
           if (liveNow !== prevTurnActive) return true
+          // Cursor's transcript now ends in a turn end: the lap decides whether it is the
+          // tracked turn's (transcript-turn-end.mjs).
+          if (m && turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, memo: turnEndProbeMemo })) return true
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2434,45 +2537,25 @@ async function main() {
     // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
     let marker = readTurnMarker(connectionId)
     const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
+    lapTranscriptPath = transcriptPath
     // How Cursor ended the conversation's last turn, read whether or not a stop hook
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
     observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
-    const erroredEnd = marker
-      ? erroredTurnEnd({
-          transcriptPath,
-          startedAt: marker.startedAt,
-        })
-      : null
-    if (erroredEnd) {
-      // Cursor ended the turn itself (usage limit, provider error): no Stop hook ran and
-      // the model cannot reply, so say so in the room and close the working attempt now
-      // rather than after the 1h no-sign-of-life backstop (item 45eb0708).
-      if (sessionId) {
-        try {
-          await mcpToolsCall({
-            mcpUrl,
-            token,
-            name: 'post_session_message',
-            arguments: {
-              connection_id: connectionId,
-              message: erroredTurnNotice(erroredEnd),
-              agent_name: agentName,
-              turn_kind: 'agent',
-              phase: 'answer',
-            },
-            timeoutMs: 10_000,
-          })
-        } catch (e) {
-          process.stderr.write(`devspec-remote-poll: errored-turn notice failed: ${e.message}\n`)
-        }
-      }
-      await emitActivityVerb('complete', extraActivityVerbArgs({ stalling: true, verb: 'complete' }))
-      clearTurnMarker(connectionId)
-      prevTurnActive = false
-      marker = null
-      process.stderr.write(`devspec-remote-poll: turn ended with a Cursor error connection=${connectionId}\n`)
+    // Cursor ended the tracked turn and no stop hook has reported it: Cursor runs a
+    // plugin's stop hook only when the person has a hooks file of their own
+    // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
+    if (marker) {
+      const ended = transcriptTurnEnd({
+        connectionId,
+        marker,
+        transcriptPath,
+        dir: CONNECTIONS_DIR,
+        memo: transcriptTurnEndMemo,
+      })
+      if (ended && (await reportTranscriptTurnEnd(ended))) marker = null
     }
+    if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
     let turnActive = turnIsLive(marker, { activity })
@@ -2498,7 +2581,20 @@ async function main() {
     // finished. Best-effort inside emitActivityVerb — a failed verb never breaks the
     // loop. Complete always carries a reason: turn_end on a healthy marker clear
     // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
-    const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    let activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    // The marker went because the stop hook ended the turn, and the stop hook claimed and
+    // reported that turn's end (transcript-turn-end.mjs): there is nothing to add.
+    if (
+      activityVerb === 'complete' &&
+      !marker &&
+      turnEndClaimed(connectionId, readTurnBaseline(connectionId, trackedTurnStartedAt, { dir: CONNECTIONS_DIR }), {
+        dir: CONNECTIONS_DIR,
+      })
+    ) {
+      turnStartCommands = []
+      clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+      activityVerb = null
+    }
     const verbResult = await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
     if (verbResult?.turnStale) {
       turnActive = false

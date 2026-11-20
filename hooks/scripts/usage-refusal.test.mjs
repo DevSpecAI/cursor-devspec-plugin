@@ -21,12 +21,12 @@ import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   USAGE_REFUSAL_COOL_OFF_MS,
   isUsageRefusalText,
-  lastTurnEnd,
   noteUsageRefusalSent,
   observeTurnEnd,
   refusalLiftsAt,
   usageRefusalArgument,
 } from './usage-refusal.mjs'
+import { lastTurnEnd } from './transcript-turn-end.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CONN = FIXTURE_ID.connection
