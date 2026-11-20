@@ -101,12 +101,68 @@
  *
  * ## Reported once
  *
- * Whichever of the stop hook and the poller reports a turn end first claims its
- * identity (`claimTurnEnd`, an exclusive file create in the connection's state folder);
- * the other finds the claim and reports nothing. A claim whose report did not reach
- * DevSpec is given back (`releaseTurnEnd`), so the other can still report it. The
- * poller's backstop for a turn whose marker the stop hook cleared does not report a
- * turn end the stop hook claimed either (`turnEndClaimed`).
+ * Whichever of the stop hook and the poller reports a turn end claims it first
+ * (`claimTurnEnd`, an exclusive file create in the connection's state folder). The claim
+ * is "reporting" until every step has reached DevSpec (the room told, the turn reported
+ * finished, its requests closed), then "reported" (`settleTurnEnd`). A step that did not
+ * land gives the claim back and keeps the turn's marker, so the other path, or the
+ * poller's next try (`nextReportTry`), reports what is left; what already landed is
+ * recorded on the claim (`noteTurnEndTold`, `noteTurnEndCompleted`) and never sent twice.
+ * The other path leaves a claim being reported by a live process alone, and takes over
+ * one given back or one whose owner process has gone.
+ *
+ * ## Every interleaving, and what happens (the tests carry these codes)
+ *
+ * Tracking starts between turns:
+ *  - A1 The command's turn runs and ends; a lap sees it: reported once.
+ *  - A2 It ends in an error or is stopped: told in Cursor's words, reported once.
+ *  - A3 It fails at its start with no user row (the same rows, a new end, the same
+ *    identity as the turn before): reported once; the earlier turn's claim is set aside.
+ *  - A4 Its end is overwritten by the next turn before any lap (a missed lap): the next
+ *    turn end written is reported for the tracked turn, once, later.
+ *  - A5 Cursor summarises the conversation in it (rows level or fewer): reported.
+ *  - A6 A stopped turn's end is written twice as tracking starts: not a new end.
+ *  - A7 The final line is not a turn end Cursor is known to write: nothing; the turn
+ *    ends as it did before (Working until the next command or the backstop).
+ *  - A8 Two command turns in one minute write identical rows: the second is reported.
+ *  - A9 A prompt typed after the command was handed over runs first: its end is
+ *    reported for the tracked turn, as the stop hook would report it.
+ *  - A10 No transcript yet: between turns.
+ *  - A11 Cursor's error is longer than any fixed read: read and quoted whole.
+ * Tracking starts in a turn:
+ *  - B1 The running turn ends and a lap or the watch sees it: not reported; the next
+ *    turn end is the tracked turn's.
+ *  - B2 The running turn ends in an error written after tracking started: reported, as
+ *    Cursor errors were before this existed (the earlier errored-turn report): it may be
+ *    the running turn's own error. An error dated before tracking started is not.
+ *  - B3 The running turn's end is overwritten unseen by a later turn that fails: that
+ *    error is reported (B2's rule), never swallowed.
+ *  - B4 The running turn's end is overwritten unseen by a later turn that runs or is
+ *    stopped: taken for the running turn's end; not reported, as before; never false.
+ *  - B5 Cursor's server resumes the running turn (a user row inside it): its end is
+ *    still the running turn's.
+ * The stop hook (only where the person has a hooks file):
+ *  - C1 A turn that runs: the hook runs before the line exists, reports, clears Working;
+ *    the poller and its backstop add nothing.
+ *  - C2 An error: the hook runs before the poller's lap and reports; the poller adds
+ *    nothing.
+ *  - C3 The poller reports first; the hook runs after: it adds nothing.
+ *  - C4 The hook runs while the poller's post is in flight: it adds nothing.
+ *  - C5 The poller's post fails before the hook runs: the hook reports it.
+ *  - C6 The hook's own post fails: it gives the claim back and keeps the marker; the
+ *    poller reports it from the transcript.
+ *  - C7 The hook's completion fails on a turn that ran: the poller completes it once the
+ *    line is written.
+ *  - C8 An owner process is killed mid-report (a hook past Cursor's timeout, a poller
+ *    restarted): the other path takes its claim over.
+ *  - C9 The poller's post lands but a later step fails, then the hook runs: the hook
+ *    finishes it without telling the room again.
+ * No stop hook:
+ *  - D1 The poller's post fails, with or without a hook running during it: the claim is
+ *    given back, the marker kept, and the poller tries again REPORT_RETRY_MS later: told
+ *    once.
+ *  - D2 Every try fails: after REPORT_ATTEMPTS the poller stops; the turn ends as before.
+ *  - D3 A request close fails: retried the same way, without telling the room again.
  *
  * ## Failing safe
  *
@@ -192,8 +248,8 @@ export function transcriptConversation(transcriptPath) {
  * The transcript's turn end, or null when its final line is not one: Cursor writes
  * `turn_ended` only as the final line and removes it when the next turn starts. The line
  * is read whole whatever its length, so Cursor's error text is never cut here. `key`
- * identifies this line (the file, where the line sits and what it says) and `atMs` is
- * the file's modification time.
+ * identifies this line (the file, where the line sits and what it says), `atMs` is the
+ * file's modification time and `stamp` its size and modification time as read.
  */
 export function lastTurnEnd(transcriptPath) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
@@ -206,9 +262,11 @@ export function lastTurnEnd(transcriptPath) {
   let text
   let lineStart = 0
   let atMs
+  let stamp
   try {
     const { size, mtimeMs } = fs.fstatSync(fd)
     atMs = mtimeMs
+    stamp = fileStampOf({ size, mtimeMs })
     const pieces = []
     let position = size
     let ending = true
@@ -257,6 +315,7 @@ export function lastTurnEnd(transcriptPath) {
     status: typeof row.status === 'string' ? row.status : null,
     error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
     atMs,
+    stamp,
   }
 }
 
@@ -301,7 +360,7 @@ function readWholeOnce(transcriptPath) {
     }
     const after = fs.fstatSync(fd)
     if (offset !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs) return null
-    return { chunks, stamp: fileStampOf(before) }
+    return { chunks, stamp: fileStampOf(before), atMs: before.mtimeMs }
   } catch {
     return null
   } finally {
@@ -316,9 +375,9 @@ function readWholeOnce(transcriptPath) {
 /**
  * Count the transcript's user rows, note the last one and read the final line, from one
  * read of the whole file that did not change while it was read. Returns
- * `{ turns, lastUser, end, stamp }`: `lastUser` is a digest of the last user row (null
- * with none), `end` the final line when it is a turn end, else null, and `stamp` the
- * file's size and modification time as read. `{ missing: true }` when there is no
+ * `{ turns, lastUser, end, stamp, atMs }`: `lastUser` is a digest of the last user row
+ * (null with none), `end` the final line when it is a turn end, else null, `stamp` the
+ * file's size and modification time as read, and `atMs` that modification time. `{ missing: true }` when there is no
  * transcript yet, or null when no clean read could be had.
  */
 export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
@@ -332,7 +391,7 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
     sleepSync(STABLE_READ_GAP_MS)
     if (fileStamp(transcriptPath) !== whole.stamp) continue
     const parsed = scanTranscript(whole.chunks)
-    if (parsed) return { ...parsed, stamp: whole.stamp }
+    if (parsed) return { ...parsed, stamp: whole.stamp, atMs: whole.atMs }
   }
   return null
 }
@@ -486,85 +545,157 @@ function claimFiles(connectionId, dir, { all = false } = {}) {
   }
 }
 
-/**
- * Claim the report of one turn end. 'claimed': this caller reports it. 'taken': the
- * other path already did. 'failed': no claim could be written, so nothing says who
- * reports it. The claim is a file created only if it does not exist yet (a hard link of
- * a complete temporary file), so two processes claiming at once cannot both win. A
- * claim of the same identity made before `after` (the tracked turn's start) was the end
- * of an earlier turn that wrote no user row of its own: it is set aside, by a rename
- * only one process can make, and the claim made again. Earlier claims are removed: only
- * the newest turn end can be claimed again.
- */
-export function claimTurnEnd(connectionId, identity, { by, after = null, dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
-  if (!connectionId || !parseIdentity(identity)) return 'failed'
-  const target = claimPath(connectionId, identity, dir)
-  const temporary = `${target}.tmp-${process.pid}-${now.toString(36)}`
-  let outcome = 'failed'
+/** The version of a claim record; a record of any other shape (an older plugin's) is set aside. */
+const CLAIM_VERSION = 2
+
+function readClaim(file) {
+  const record = readPrivateJson(file)
+  return record?.v === CLAIM_VERSION && typeof record.turn === 'string' ? record : null
+}
+
+/** Whether the process that owns a claim is still running. */
+function ownerAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-    fs.writeFileSync(temporary, `${JSON.stringify({ v: 1, turn: identity, by: by ?? null, at: new Date(now).toISOString() })}\n`, {
-      mode: 0o600,
-    })
-    for (let attempt = 0; attempt < 2 && outcome === 'failed'; attempt++) {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+/**
+ * Claim the report of one turn end. Returns `{ outcome, told, completed }`:
+ *  - 'claimed': this caller reports it. `told` and `completed` say an earlier owner
+ *    whose other steps did not land already told the room or reported the turn
+ *    finished, so neither is sent twice.
+ *  - 'reporting': another live process is reporting it now. Leave it: that owner either
+ *    settles it or gives it back for a retry (settleTurnEnd).
+ *  - 'reported': it has been reported in full.
+ *  - 'failed': no claim could be written, so nothing says who reports it.
+ * The claim is a file created only if it does not exist yet (a hard link of a complete
+ * temporary file), so two processes claiming at once cannot both win. A claim given back,
+ * one whose owner process has gone, one of an older shape, and one made before `after`
+ * (the tracked turn's start: an earlier turn that wrote no user row of its own) is set
+ * aside by a rename only one process can make, and the claim made again. Earlier claims
+ * are removed: only the newest turn end can be claimed again.
+ */
+export function claimTurnEnd(connectionId, identity, { by, after = null, dir = CONNECTIONS_DIR, now = Date.now(), pid = process.pid } = {}) {
+  if (!connectionId || !parseIdentity(identity)) return { outcome: 'failed', told: false, completed: false }
+  const target = claimPath(connectionId, identity, dir)
+  let told = false
+  let completed = false
+  // Each pass either claims, finds the claim held, or sets a dead claim aside: two passes
+  // after setting one aside settle every race between two claimers.
+  for (let pass = 0; pass < 3; pass++) {
+    const temporary = `${target}.tmp-${pid}-${now.toString(36)}-${pass}`
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const record = { v: CLAIM_VERSION, turn: identity, by: by ?? null, pid, at: new Date(now).toISOString(), state: 'reporting', told, completed }
+      fs.writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 })
       try {
         fs.linkSync(temporary, target)
-        outcome = 'claimed'
       } catch (error) {
         if (error?.code !== 'EEXIST') throw error
-        const claimedAt = Date.parse(readPrivateJson(target)?.at ?? '')
-        if (typeof after !== 'number' || !(claimedAt < after) || attempt > 0) {
-          outcome = 'taken'
-          break
+        const existing = readClaim(target)
+        const earlier = typeof after === 'number' && Date.parse(existing?.at ?? '') < after
+        if (existing && !earlier) {
+          if (existing.state === 'reported') return { outcome: 'reported', told: true, completed: true }
+          if (existing.state === 'reporting' && ownerAlive(existing.pid)) {
+            return { outcome: 'reporting', told: Boolean(existing.told), completed: Boolean(existing.completed) }
+          }
+          told = Boolean(existing.told)
+          completed = Boolean(existing.completed)
         }
         try {
-          fs.renameSync(target, `${target}.earlier-${process.pid}-${now.toString(36)}`)
+          fs.renameSync(target, `${target}.aside-${pid}-${now.toString(36)}-${pass}`)
         } catch {
-          /* another process set it aside first: try the link once more */
+          /* another claimer set it aside first: try the link again */
         }
+        continue
+      }
+    } catch {
+      return { outcome: 'failed', told: false, completed: false }
+    } finally {
+      try {
+        fs.rmSync(temporary, { force: true })
+      } catch {
+        /* a stray temporary file claims nothing */
       }
     }
-  } catch {
-    return 'failed'
-  } finally {
-    try {
-      fs.rmSync(temporary, { force: true })
-    } catch {
-      /* a stray temporary file claims nothing */
+    for (const file of claimFiles(connectionId, dir, { all: true })) {
+      if (file === target) continue
+      try {
+        fs.rmSync(file, { force: true })
+      } catch {
+        /* an older claim left behind matches no newer turn end */
+      }
     }
+    return { outcome: 'claimed', told, completed }
   }
-  if (outcome !== 'claimed') return outcome
-  for (const file of claimFiles(connectionId, dir, { all: true })) {
-    if (file === target) continue
-    try {
-      fs.rmSync(file, { force: true })
-    } catch {
-      /* an older claim left behind matches no newer turn end */
-    }
-  }
-  return 'claimed'
+  return { outcome: 'reporting', told, completed }
 }
 
-/** Give back a claim whose report did not reach DevSpec, so the other path can report it. */
-export function releaseTurnEnd(connectionId, identity, { dir = CONNECTIONS_DIR } = {}) {
-  if (!connectionId || !parseIdentity(identity)) return
+/** Rewrite this process's own claim of `identity`, if it still holds it. */
+function updateOwnClaim(connectionId, identity, dir, patch, pid = process.pid) {
+  if (!connectionId || !parseIdentity(identity)) return false
+  const target = claimPath(connectionId, identity, dir)
+  const record = readClaim(target)
+  if (!record || record.pid !== pid || record.turn !== identity) return false
   try {
-    fs.rmSync(claimPath(connectionId, identity, dir), { force: true })
+    writePrivateJson(target, { ...record, ...patch })
+    return true
   } catch {
-    /* a claim that stays only means this turn end is not reported twice */
+    return false
   }
+}
+
+/** The room has been told about this turn end: a later owner does not post it again. */
+export function noteTurnEndTold(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  return updateOwnClaim(connectionId, identity, dir, { told: true }, pid)
+}
+
+/** DevSpec has been told the turn finished: a later owner does not report it again. */
+export function noteTurnEndCompleted(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  return updateOwnClaim(connectionId, identity, dir, { completed: true }, pid)
 }
 
 /**
- * Whether the end of the turn `baseline` was noted for (a turn's readTurnBaseline) has
- * been claimed: a claim in that conversation made after the turn started.
+ * Settle this process's claim: `reported` when every step reached DevSpec, else given
+ * back so the other path, or the poller's next try, reports what is left.
+ */
+export function settleTurnEnd(connectionId, identity, { reported, dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  return updateOwnClaim(connectionId, identity, dir, { state: reported ? 'reported' : 'released' }, pid)
+}
+
+/**
+ * How the poller tries again after a report of its own did not reach DevSpec: at most
+ * REPORT_ATTEMPTS tries, REPORT_RETRY_MS apart. The spacing is the room post's own
+ * 15-second timeout, so a try never overlaps the last; five tries ride out a dropped
+ * connection or a DevSpec restart of about a minute, while a post DevSpec refuses is
+ * not sent on every lap for ever. After the last try the turn ends as it did before
+ * this existed: Working until the next command or the backstop.
+ */
+export const REPORT_ATTEMPTS = 5
+export const REPORT_RETRY_MS = 15_000
+
+/** When the next try is due after `attempts` failed tries, or null when there is none. */
+export function nextReportTry(attempts, failedAtMs) {
+  return attempts >= REPORT_ATTEMPTS ? null : failedAtMs + REPORT_RETRY_MS
+}
+
+/**
+ * Whether the end of the turn `baseline` was noted for (a turn's readTurnBaseline) is
+ * reported or being reported: a claim in that conversation made after the turn started,
+ * reported in full or held by a live owner.
  */
 export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || !baseline) return false
   for (const file of claimFiles(connectionId, dir)) {
-    const record = readPrivateJson(file)
+    const record = readClaim(file)
     const claimed = parseIdentity(record?.turn)
-    if (claimed?.conversation === baseline.conversation && Date.parse(record?.at ?? '') >= baseline.turn) return true
+    if (claimed?.conversation !== baseline.conversation || !(Date.parse(record.at) >= baseline.turn)) continue
+    if (record.state === 'reported' || (record.state === 'reporting' && ownerAlive(record.pid))) return true
   }
   return false
 }
@@ -579,6 +710,23 @@ function fileStamp(transcriptPath) {
   } catch {
     return null
   }
+}
+
+/**
+ * For the poller's watch on the transcript, as Cursor writes it: when tracking started
+ * in a turn and that turn's end is now the final line, note it, so a later turn's end is
+ * told from it even when the later turn overwrites it before the poller's next look. A
+ * read of the final line only, without waiting for the file to keep still: a complete
+ * `turn_ended` final line is a state Cursor really wrote. An error is left to the
+ * poller's look, which reports it (transcriptTurnEnd). Returns whether it noted one.
+ */
+export function observeRunningTurnEnd({ connectionId, marker, transcriptPath, dir = CONNECTIONS_DIR }) {
+  if (!connectionId || typeof marker?.startedAt !== 'number' || !transcriptPath) return false
+  const baseline = readTurnBaseline(connectionId, marker.startedAt, { dir })
+  if (!baseline || baseline.between || baseline.conversation !== transcriptConversation(transcriptPath)) return false
+  const end = lastTurnEnd(transcriptPath)
+  if (!recognisedEnd(end) || end.status === 'error') return false
+  return writeBaseline(connectionId, dir, { ...baseline, between: true, stamp: end.stamp })
 }
 
 /**
@@ -622,13 +770,17 @@ export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = 
   if (!read || read.missing) return null
   memo.decided = seen
   if (!read.end) return null
-  if (!baseline.between) {
+  if (!baseline.between && !(read.end.status === 'error' && read.atMs >= marker.startedAt)) {
     // The turn that was running when tracking started has ended. Never reported; any
     // turn end written after this one is a later turn's.
     writeBaseline(connectionId, dir, { ...baseline, between: true, stamp: read.stamp })
     return null
   }
-  if (read.stamp === baseline.stamp) return null
+  // Between turns: a turn end written since is a later turn's. In a turn, an error
+  // written since tracking started may be the running turn's own end or a later turn's
+  // that overwrote it unseen: it is reported, as Cursor errors were before this existed
+  // (see the header).
+  if (baseline.between && read.stamp === baseline.stamp) return null
   return {
     identity: identityOf(conversation, read),
     status: read.end.status,

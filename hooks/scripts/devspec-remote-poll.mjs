@@ -181,9 +181,13 @@ import {
 import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
 import {
   claimTurnEnd,
+  nextReportTry,
+  noteTurnEndCompleted,
+  noteTurnEndTold,
+  observeRunningTurnEnd,
   readTurnBaseline,
   recordTurnBaseline,
-  releaseTurnEnd,
+  settleTurnEnd,
   transcriptTurnEnd,
   turnEndClaimed,
   turnEndPending,
@@ -1610,11 +1614,16 @@ async function main() {
    * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
    * would have (transcript-turn-end.mjs): a turn that ended in an error or was stopped
    * is told to the room in Cursor's own words (turn-failure.mjs: the unanswered command's
-   * failure reply, or a plain room message when the turn carries none), the room commands
-   * that started the turn and the turn the owner typed are named as finished, Working
-   * clears, and the turn end's request bookkeeping is done (requests.mjs). Only once this
-   * poller holds the turn end's claim: when the stop hook holds it, the stop hook did all
-   * of this. Returns whether this poller reported it.
+   * failure reply, or a room message of its own when the turn carries none), the room
+   * commands that started the turn and the turn the owner typed are named as finished,
+   * the turn end's request bookkeeping is done (requests.mjs), and Working clears.
+   *
+   * Only while this poller holds the turn end's claim. Every step must reach DevSpec for
+   * the claim to be settled as reported and the marker cleared. Otherwise the claim is
+   * given back and the marker kept, so the stop hook or this poller's next try
+   * (nextReportTry) reports what is left, and the room is never told twice. Returns
+   * 'reported'; 'retry' (try again later); 'reported_elsewhere' (the stop hook reported
+   * it in full); or 'reporting_elsewhere' (the stop hook is reporting it now).
    */
   async function reportTranscriptTurnEnd(ended, marker) {
     const claim = claimTurnEnd(connectionId, ended.identity, {
@@ -1622,10 +1631,12 @@ async function main() {
       after: marker.startedAt,
       dir: CONNECTIONS_DIR,
     })
-    if (claim !== 'claimed') return false
+    if (claim.outcome === 'reported') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
     let delivered = true
     clearTrailState(connectionId)
-    if (ended.failure && sessionId) {
+    if (ended.failure && sessionId && !claim.told) {
       try {
         await postTurnFailure({
           failure: ended.failure,
@@ -1638,6 +1649,7 @@ async function main() {
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
+        noteTurnEndTold(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
       } catch (e) {
         delivered = false
         process.stderr.write(`devspec-remote-poll: turn failure post failed: ${e.message}\n`)
@@ -1646,13 +1658,32 @@ async function main() {
     // What woke the ended turn no longer describes the next one (notice-reply.mjs).
     clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
     const recorded = readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    const commands = recorded.length > 0 ? recorded : turnStartCommands
     const localTurn = readState(connectionId)?.local_turn ?? null
-    const completed = await emitActivityVerb('complete', {
-      reason: 'turn_end',
-      commands: recorded.length > 0 ? recorded : turnStartCommands,
-      localAttemptId: localTurnToComplete(localTurn, sessionId),
-    })
-    if (!completed?.ok) delivered = false
+    // What started the turn is kept until the report lands, so a retry names it too; a
+    // completion that already landed is not sent again.
+    if (
+      !claim.completed &&
+      interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind !== 'suppress'
+    ) {
+      let completed = true
+      for (const call of activityCalls({
+        verb: 'complete',
+        connectionId,
+        commands,
+        localAttemptId: localTurnToComplete(localTurn, sessionId),
+        reason: 'turn_end',
+      })) {
+        try {
+          await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
+        } catch (e) {
+          completed = false
+          process.stderr.write(`devspec-remote-poll: turn-end completion failed: ${e.message}\n`)
+        }
+      }
+      if (completed) noteTurnEndCompleted(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      else delivered = false
+    }
     // The same request bookkeeping the stop hook does at a turn's end. The poller has no
     // list of the host's background work, so a request whose launched work has not woken
     // the agent yet stays open. A directed question's answer still on its way keeps the
@@ -1660,7 +1691,7 @@ async function main() {
     const capability = readConnectionCapability(connectionId)
     if (capability) {
       try {
-        await finishTurnRequests({
+        const { failed } = await finishTurnRequests({
           connectionId,
           dir: CONNECTIONS_DIR,
           holdCurrent:
@@ -1678,18 +1709,13 @@ async function main() {
               timeoutMs: 3_000,
             }),
         })
+        if (failed.length > 0) delivered = false
       } catch (e) {
+        delivered = false
         process.stderr.write(`devspec-remote-poll: turn-end request bookkeeping failed: ${e.message}\n`)
       }
     }
-    clearTurnMarker(connectionId)
-    // The turn is over whether or not its completion landed: never carry the typed turn
-    // into the next one.
-    if (localTurn) patchState({ local_turn: null })
-    prevTurnActive = false
-    // A report that did not reach DevSpec is given back, so a stop hook that runs late
-    // can still report it.
-    if (!delivered) releaseTurnEnd(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+    settleTurnEnd(connectionId, ended.identity, { reported: delivered, dir: CONNECTIONS_DIR })
     logRemoteControlStory({
       phase: 'complete_turn',
       outcome: delivered ? 'completed' : 'failed',
@@ -1699,10 +1725,16 @@ async function main() {
       tool: 'transcript_turn_end',
       reason: ended.status,
     })
+    if (!delivered) return 'retry'
+    turnStartCommands = []
+    clearTurnMarker(connectionId)
+    // The turn is over: never carry the typed turn into the next one.
+    if (localTurn) patchState({ local_turn: null })
+    prevTurnActive = false
     process.stderr.write(
       `devspec-remote-poll: turn ended (${ended.status}) per Cursor's transcript connection=${connectionId}\n`,
     )
-    return true
+    return 'reported'
   }
 
   /**
@@ -1810,12 +1842,14 @@ async function main() {
   // check), and the turn the marker tracked when last seen (for the backstop below).
   const transcriptTurnEndMemo = {}
   const turnEndProbeMemo = {}
+  // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
+  // and when the next is due (nextReportTry). Null once due is null: given up.
+  let reportRetry = null
   let lapTranscriptPath = null
   let trackedTurnStartedAt = null
   // A watch on the transcript, so the end of a turn that was already running when the
   // tracked turn started is seen as Cursor writes it, not only at the next look: the
   // next turn rewrites the file without it (transcript-turn-end.mjs).
-  const transcriptWatchMemo = {}
   let transcriptWatch = null
   let watchedTranscriptPath = null
   function watchTranscript(transcriptPath) {
@@ -1833,13 +1867,7 @@ async function main() {
         const watchedMarker = readTurnMarker(connectionId)
         if (!watchedMarker) return
         try {
-          transcriptTurnEnd({
-            connectionId,
-            marker: watchedMarker,
-            transcriptPath,
-            dir: CONNECTIONS_DIR,
-            memo: transcriptWatchMemo,
-          })
+          observeRunningTurnEnd({ connectionId, marker: watchedMarker, transcriptPath, dir: CONNECTIONS_DIR })
         } catch {
           /* the next look decides */
         }
@@ -2558,6 +2586,7 @@ async function main() {
           // Cursor's transcript now ends in a turn end: the lap decides whether it is the
           // tracked turn's (transcript-turn-end.mjs).
           if (m && turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, memo: turnEndProbeMemo })) return true
+          if (m && reportRetry?.dueAt != null && Date.now() >= reportRetry.dueAt) return true
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2627,14 +2656,41 @@ async function main() {
     // plugin's stop hook only when the person has a hooks file of their own
     // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
     if (marker) {
-      const ended = transcriptTurnEnd({
-        connectionId,
-        marker,
-        transcriptPath,
-        dir: CONNECTIONS_DIR,
-        memo: transcriptTurnEndMemo,
-      })
-      if (ended && (await reportTranscriptTurnEnd(ended, marker))) marker = null
+      if (reportRetry && reportRetry.turn !== marker.startedAt) reportRetry = null
+      const retryDue = reportRetry && reportRetry.dueAt !== null && Date.now() >= reportRetry.dueAt
+      // A try that failed is decided afresh when it is due again.
+      if (retryDue) transcriptTurnEndMemo.decided = null
+      const ended =
+        reportRetry && !retryDue
+          ? null
+          : transcriptTurnEnd({
+              connectionId,
+              marker,
+              transcriptPath,
+              dir: CONNECTIONS_DIR,
+              memo: transcriptTurnEndMemo,
+            })
+      if (ended) {
+        const outcome = await reportTranscriptTurnEnd(ended, marker)
+        if (outcome === 'reported') {
+          marker = null
+          reportRetry = null
+        } else if (outcome === 'retry') {
+          const attempts = (reportRetry?.identity === ended.identity ? reportRetry.attempts : 0) + 1
+          reportRetry = { turn: marker.startedAt, identity: ended.identity, attempts, dueAt: nextReportTry(attempts, Date.now()) }
+        } else if (outcome === 'reported_elsewhere') {
+          // The stop hook reported this turn end in full, and ends the turn itself.
+          turnStartCommands = []
+          clearTurnMarker(connectionId)
+          prevTurnActive = false
+          marker = null
+          reportRetry = null
+        } else {
+          // The stop hook is reporting it now: look again next lap. It either settles it
+          // or gives it back, and the marker stays until the report lands.
+          transcriptTurnEndMemo.decided = null
+        }
+      }
     }
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)

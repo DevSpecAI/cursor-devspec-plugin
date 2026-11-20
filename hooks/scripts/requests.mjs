@@ -650,8 +650,9 @@ export function absentLaunches(state, backgroundTasks) {
  * start the log afresh when it may. `backgroundTasks` and `sessionCrons` are the host's
  * lists from the stop hook's input, null where there are none (the poller has none).
  * `holdCurrent` keeps the current request open while an answer to it is still on its
- * way. `call(args)` performs report_request with the connection capability. Returns the
- * ids closed.
+ * way. `call(args)` performs report_request with the connection capability. Returns
+ * `{ closed, failed }`: the ids closed, and those whose close did not reach DevSpec
+ * (they stay open here, so the next turn end tries them again).
  */
 export async function finishTurnRequests({
   connectionId,
@@ -661,9 +662,10 @@ export async function finishTurnRequests({
   sessionCrons = null,
   holdCurrent = false,
 }) {
-  if (!connectionId || typeof call !== 'function') return []
+  if (!connectionId || typeof call !== 'function') return { closed: [], failed: [] }
   const requests = readRequestState(connectionId, { dir })
   const closed = []
+  const failed = []
   if (requests.open.size > 0) {
     const pending = requestsWithWorkPending(requests, { backgroundTasks, sessionCrons })
     const awaitingAnswer = holdCurrent ? requests.current : null
@@ -675,13 +677,14 @@ export async function finishTurnRequests({
     )
     finished.forEach((id, index) => {
       if (results[index]) closed.push(id)
+      else failed.push(id)
     })
   }
   for (const key of absentLaunches(requests, backgroundTasks)) {
     appendRequestEvent(connectionId, { op: 'absent', key }, { dir })
   }
   rotateRequestLog(connectionId, { dir })
-  return closed
+  return { closed, failed }
 }
 
 /**

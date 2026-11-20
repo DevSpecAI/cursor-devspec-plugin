@@ -56,7 +56,13 @@ import { clearTurnCommands, completionArguments, readTurnCommands } from './turn
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 import { postTurnFailure } from './turn-failure.mjs'
 import { hookTranscriptPath, noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
-import { claimTurnEnd, releaseTurnEnd, turnEndIdentity } from './transcript-turn-end.mjs'
+import {
+  claimTurnEnd,
+  noteTurnEndCompleted,
+  noteTurnEndTold,
+  settleTurnEnd,
+  turnEndIdentity,
+} from './transcript-turn-end.mjs'
 import { fitRoomMessage } from './room-message.mjs'
 import { clearTurnWakes, postTellPersonAtStop, recordPromptWake } from './notice-reply.mjs'
 
@@ -753,15 +759,17 @@ async function main() {
 
     // Which turn end this is. When Cursor runs no stop hook, the poller reports a turn's
     // end from Cursor's transcript instead (transcript-turn-end.mjs). Whichever of the
-    // two claims a turn end first reports it, so one the poller already reported is not
-    // reported again here; the rest of this stop's work still runs. A claim whose report
-    // does not reach DevSpec is given back below, so the poller can still report it.
+    // two claims a turn end reports it. When the poller holds it (reporting now, or
+    // reported), this hook reports nothing and leaves the turn's marker to the poller;
+    // the rest of this stop's work still runs. When this hook holds it, the marker is
+    // cleared only once every step has reached DevSpec; otherwise the claim is given
+    // back and the marker kept, so the poller reports what is left.
     if (mode === 'stop' && connectionId) {
       const identity = turnEndIdentity(hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId))
       if (identity) {
         turnEndClaim = {
           identity,
-          outcome: claimTurnEnd(connectionId, identity, {
+          ...claimTurnEnd(connectionId, identity, {
             by: 'stop',
             after: readTurnMarker(connectionId)?.startedAt ?? null,
             dir: CONNECTIONS_DIR,
@@ -769,14 +777,15 @@ async function main() {
         }
       }
     }
-    const turnEndReported = turnEndClaim?.outcome === 'taken'
+    const turnEndReported = turnEndClaim?.outcome === 'reported' || turnEndClaim?.outcome === 'reporting'
+    const turnEndClaimedHere = turnEndClaim?.outcome === 'claimed'
 
     // A turn that errored or was stopped never answered its room command: say so in
     // the room before the turn ends (item 9a850303, turn-failure.mjs). It marks the
     // command answered, so the request bookkeeping below closes it. A turn the room saw
     // working (its marker) that carries no unanswered command is told as a plain room
     // message instead (item 45eb0708).
-    if (mode === 'stop' && connectionId && sessionId && !turnEndReported) {
+    if (mode === 'stop' && connectionId && sessionId && !turnEndReported && !turnEndClaim?.told) {
       try {
         await postTurnFailure({
           raw,
@@ -788,6 +797,7 @@ async function main() {
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
+        if (turnEndClaimedHere) noteTurnEndTold(connectionId, turnEndClaim.identity, { dir: CONNECTIONS_DIR })
       } catch {
         /* non-fatal: the turn still ends below */
         turnEndFailed = true
@@ -837,8 +847,10 @@ async function main() {
     let stopDecisionAction = null
     // The room commands that started this turn, read before its end removes the record.
     const turnCommands = turnActive ? [] : readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    // A turn end this hook holds clears the marker once its report lands (below); one
+    // the poller holds is the poller's to end.
     if (turnActive) writeTurnMarker(connectionId)
-    else clearTurnMarker(connectionId)
+    else if (!turnEndClaimedHere && !turnEndReported) clearTurnMarker(connectionId)
 
     // Busy heartbeat — one connection-native path (attached or sessionless). The
     // server broadcasts agent_status for the attached session, so no session-keyed
@@ -918,7 +930,7 @@ async function main() {
             /* non-fatal — the poller's marker-driven backstop still runs */
             turnEndFailed = true
           }
-        } else if (decision.action !== 'hold' && !turnEndReported) {
+        } else if (decision.action !== 'hold' && !turnEndReported && !turnEndClaim?.completed) {
           // Each thing the turn finishes, by name (turn-commands.mjs): the room
           // commands that started it and the terminal turn the owner typed, or, when it
           // had neither, only an activity no command started. So a command handed over
@@ -939,6 +951,7 @@ async function main() {
             }
           }
           if (completed) {
+            if (turnEndClaimedHere) noteTurnEndCompleted(connectionId, turnEndClaim.identity, { dir: CONNECTIONS_DIR })
             logRemoteControlStory({
               phase: 'complete_turn',
               outcome: 'completed',
@@ -958,13 +971,12 @@ async function main() {
         }
       }
     }
-    turnEndDone = true
 
     // The turn end's request bookkeeping, done by whichever of this hook and the poller
     // reports the turn end (requests.mjs finishTurnRequests): not again here when the
     // poller already did it.
     if (mode === 'stop' && connectionId && connectionCapability && !turnEndReported) {
-      await finishTurnRequests({
+      const { failed } = await finishTurnRequests({
         connectionId,
         call: (args) => callRequest(args, 3_000),
         dir: CONNECTIONS_DIR,
@@ -972,12 +984,16 @@ async function main() {
         sessionCrons: parseSessionCrons(raw),
         holdCurrent: stopDecisionAction === 'hold',
       })
+      if (failed.length > 0) turnEndFailed = true
     }
+    turnEndDone = true
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)
   }
-  if (turnEndClaim?.outcome === 'claimed' && (turnEndFailed || !turnEndDone)) {
-    releaseTurnEnd(connectionId, turnEndClaim.identity, { dir: CONNECTIONS_DIR })
+  if (turnEndClaim?.outcome === 'claimed') {
+    const reported = !turnEndFailed && turnEndDone
+    settleTurnEnd(connectionId, turnEndClaim.identity, { reported, dir: CONNECTIONS_DIR })
+    if (reported) clearTurnMarker(connectionId)
   }
   process.exit(0)
 }
