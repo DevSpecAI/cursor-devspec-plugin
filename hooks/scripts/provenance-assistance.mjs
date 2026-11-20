@@ -1161,8 +1161,8 @@ export function handleHook(mode, data, options = {}) {
       `DevSpec provenance note: this edit already completed in project ${projectId}, and this Cursor conversation has no observed active claim. ` +
       'Continue working—do not stop or retry; a missing claim never blocks editing or committing. ' +
       'If the work delivers a task, before you commit search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
-      'with a real description of the change and the reason it is needed, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
-      'When work needs a task is the work_entry_contract in devspec://product/implementation-contract.'
+      'with a real description of the change and its intent, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
+      'When work needs a task (work_entry_contract) and how to write its intent (core.write-the-persons-intent) are in devspec://product/implementation-contract.'
     return {
       additional_context: nudgeMessage,
       agent_message: nudgeMessage,
