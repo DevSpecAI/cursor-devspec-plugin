@@ -184,10 +184,14 @@ export async function postTurnFailure({
   dir,
   agentName,
   notice = false,
+  requestIds = null,
 }) {
   const failure = given === undefined ? parseTurnFailure(raw) : given
   if (!failure || !connectionId) return []
+  // `requestIds`, when given, are the only commands the turn may answer: the poller's,
+  // for the commands that started a room command's turn (transcript-turn-end.mjs).
   const commands = commandsAnsweredNow(readRequestState(connectionId, { dir }))
+    .filter((id) => !Array.isArray(requestIds) || requestIds.includes(id))
   const message = failureRoomMessage(failure, agentName)
   if (commands.length === 0) {
     if (notice && sessionId) await post(turnFailureNotice({ sessionId, agentName, message }))

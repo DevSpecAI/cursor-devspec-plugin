@@ -1630,6 +1630,18 @@ async function main() {
   }
 
   /**
+   * The request ids of the room commands that started the tracked turn (turn-commands.mjs)
+   * and are still open and unanswered: the commands a room command's turn can be tied to.
+   * One delivered into a turn already running is not among them: Cursor holds its wake.
+   */
+  function startingRequests(state) {
+    const started = new Set(readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }).map((command) => command.messageId))
+    return [...state.open]
+      .filter(([, info]) => info.kind === 'command' && !info.answered && started.has(info.message_id))
+      .map(([id]) => id)
+  }
+
+  /**
    * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
    * would have (transcript-turn-end.mjs). A turn end that is the tracked command's beyond
    * doubt (`ended.attributed`) is reported in full: an error or a stop is told to the
@@ -1647,7 +1659,32 @@ async function main() {
    * (the stop hook is reporting it now).
    */
   async function reportTranscriptTurnEnd(ended, marker) {
-    if (!ended.attributed) return noticeTranscriptTurnEnd(ended, marker)
+    let onlyRequests = null
+    if (!ended.attributed) {
+      // Not the tracked command's beyond doubt: which turn it was, from its first row
+      // (transcript-turn-end.mjs "Every way a turn ends").
+      const state = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
+      const kind = ended.firstRow?.kind ?? 'unknown'
+      if (kind === 'typed') {
+        // A turn typed at the terminal: told, never replied to; the commands waiting
+        // stay open until their own turns run (watched, so those report themselves).
+        return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+      }
+      if (kind === 'command') {
+        // A room command's turn: the commands that started it, still unanswered. One is
+        // answered as the matched turn would be; several get the settle point's reply.
+        // A turn already running at handover was started by none of the tracked ones.
+        const starters = ended.firstRow.beforeHandover ? [] : startingRequests(state)
+        if (starters.length >= 2) return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: starters })
+        if (starters.length === 0 && commandsAnsweredNow(state).length > 0) {
+          // Its own command answered (or none tracked), others waiting: told, not replied to.
+          return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+        }
+        onlyRequests = starters
+      } else {
+        return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: commandsAnsweredNow(state) })
+      }
+    }
     const claim = claimTurnEnd(connectionId, ended.identity, {
       by: 'poller',
       goal: 'report',
@@ -1658,13 +1695,13 @@ async function main() {
     if (claim.outcome === 'reporting' || claim.outcome === 'noticing') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
     // A throw part-way gives the claim back, keeping what landed (reportHoldingClaim).
-    return reportHoldingClaim(connectionId, ended.identity, () => reportClaimedTurnEnd(ended, claim), {
+    return reportHoldingClaim(connectionId, ended.identity, () => reportClaimedTurnEnd(ended, claim, onlyRequests), {
       dir: CONNECTIONS_DIR,
       onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
     })
   }
 
-  async function reportClaimedTurnEnd(ended, claim) {
+  async function reportClaimedTurnEnd(ended, claim, onlyRequests = null) {
     let delivered = true
     clearTrailState(connectionId)
     if (ended.failure && sessionId && !claim.told) {
@@ -1678,6 +1715,7 @@ async function main() {
           // The room saw this turn working: it is told why it ended either way, unless a
           // notice already told it (an upgrade of a noticed turn end).
           notice: !claim.noticed,
+          requestIds: onlyRequests,
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
@@ -1784,7 +1822,7 @@ async function main() {
    * clears without a word, and only while the transcript still ends at this turn end: a
    * turn Cursor has started since owns Working now. Returns as reportTranscriptTurnEnd.
    */
-  async function noticeTranscriptTurnEnd(ended, marker) {
+  async function noticeTranscriptTurnEnd(ended, marker, settleWith = { reply: true, requests: [] }) {
     const claim = claimTurnEnd(connectionId, ended.identity, {
       by: 'poller',
       goal: 'notice',
@@ -1794,13 +1832,13 @@ async function main() {
     if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
     if (claim.outcome === 'reporting') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
-    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim, marker), {
+    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim, marker, settleWith), {
       dir: CONNECTIONS_DIR,
       onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
     })
   }
 
-  async function noticeClaimedTurnEnd(ended, claim, marker) {
+  async function noticeClaimedTurnEnd(ended, claim, marker, settleWith) {
     clearTrailState(connectionId)
     let done = true
     // A stop hook that gave its report back after posting its message told the room already.
@@ -1859,7 +1897,7 @@ async function main() {
     if (!done) return 'retry'
     // Working has cleared. The turn end now settles: the room commands picked up before
     // it are answered once Cursor has stayed idle for SETTLE_MS, or a turn Cursor starts
-    // from a wake is tracked and decides it (transcript-turn-end.mjs "Settling"). The
+    // from a wake is tracked and decides it (transcript-turn-end.mjs "Settling and watching"). The
     // commands the turn started with stay on record for that, and for the stop hook's
     // upgrade, which names them; the backstop does not report them.
     if (sessionId && ended.failure && ended.position) {
@@ -1867,7 +1905,8 @@ async function main() {
         ended,
         conversation: transcriptConversation(lapTranscriptPath),
         turn: marker?.startedAt ?? null,
-        requests: commandsAnsweredNow(readRequestState(connectionId, { dir: CONNECTIONS_DIR })),
+        requests: settleWith.requests,
+        reply: settleWith.reply,
         commands: readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }),
         dir: CONNECTIONS_DIR,
       })
@@ -1883,7 +1922,7 @@ async function main() {
 
   /**
    * The settle point of a turn end the poller could only notice (transcript-turn-end.mjs
-   * "Settling"): Cursor has stayed idle at it for SETTLE_MS, or a command was handed over
+   * "Settling and watching"): Cursor has stayed idle at it for SETTLE_MS, or a command was handed over
    * since. Every room command picked up before it and still unanswered is answered with
    * what is certain (turn-failure.mjs answerUnsettledCommands) and its request closed;
    * Working cleared at the notice. Done as the report level of the turn end's claim, so
@@ -1962,7 +2001,8 @@ async function main() {
     const settle = readSettle(connectionId, { dir: CONNECTIONS_DIR })
     if (!settle) return
     if (marker) {
-      if (settle.resolved || (await resolveSettle(settle))) clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      // A watch only (a typed turn's end) answers nothing: the new command's turn is tracked.
+      if (settle.reply === false || settle.resolved || (await resolveSettle(settle))) clearSettle(connectionId, { dir: CONNECTIONS_DIR })
       return
     }
     const step = settleStep(settle, { transcriptPath })
@@ -2914,7 +2954,7 @@ async function main() {
       }
     }
     // A turn end the poller could only notice settles (transcript-turn-end.mjs
-    // "Settling"): answered at its settle point, or decided by a wake turn Cursor starts.
+    // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
     await lapSettle(marker, transcriptPath)
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)

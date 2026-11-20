@@ -114,18 +114,19 @@
  *
  * Every other turn end that ended in an error or was stopped (tracking started in a
  * turn; a rewritten file; a typed turn; a turn that failed at its start with no user
- * row; a second turn; a summary in the turn; no usable snapshot) gets the notice level:
+ * row; a second turn; a summary in the turn; no usable snapshot) is decided by its
+ * first row ("Which turn it was", below). A room command's turn with one unanswered
+ * command that started it gets the definite reply. Otherwise it gets the notice level:
  * the room is told, in Cursor's words and only what is certain (turn-failure.mjs
  * `turnNoticeMessage`), in a message of its own (`turnFailureNotice`) that answers and
  * closes nothing, and the working attempt is ended without naming a command
  * (turn-commands.mjs `attemptEndArguments`: DevSpec ends the attempt being worked on,
- * never a command still waiting), so Working clears at once. The end then settles
- * (Settling, below): the room commands picked up before it are answered with what is
- * certain once Cursor has been idle SETTLE_MS, unless a turn Cursor starts from a wake
- * decides it first. When the stop hook runs it knows its turn, and adds the report
- * level at once: the command's failure reply and its request closed (the upgrade,
- * below). Every other turn that ran ends as before this existed: Working until the
- * agent's answer, the next command or the backstop.
+ * never a command still waiting), so Working clears at once. The end then settles, or
+ * for a typed turn is only watched ("Settling and watching", below). When the stop hook
+ * runs it knows its turn, and adds the report level at once: the command's failure
+ * reply and its request closed (the upgrade, below). Every other turn that ran ends as
+ * before this existed: Working until the agent's answer, the next command or the
+ * backstop.
  *
  * If Cursor changes the sentence, nothing matches (c) and every error goes to the room
  * as a message of its own: the safe direction. Add a new wording to
@@ -164,24 +165,40 @@
  * and the marker to the poller. The poller never adds the notice level to a turn end the
  * stop hook has reported or is reporting: the stop hook's message told the room.
  *
- * ## Settling
+ * ## Which turn it was, when (a), (b) and (c) do not all hold
  *
- * An unmatched error or stop leaves the poller unsure which room command, if any, the
- * turn was working on, and Cursor may still run the command: a wake that arrives during
- * a turn is held. Measured on CLI 2026.11.19 (2026-11-20; SETTLE_MS): idle -> wake turn
- * 1.78 s; normal end -> held turn 1.46 s; Ctrl+C -> held indefinitely (nothing in 45 s;
- * in a second run nothing in 25 s, then it ran 1.6 s after the person's next typed turn
- * ended). So the notice level is followed by a settle (`startSettle`, `settleStep`):
- *  - While Cursor stays idle at that end, nothing more happens. Once it has been idle
- *    SETTLE_MS (the settle point), every room command picked up before the end and
- *    still unanswered is answered with only what is certain (turn-failure.mjs
- *    `uncertainTurnFailureMessage`): Cursor ended a turn with an error, in its own
- *    words, or was stopped at its terminal, before it answered this, and if Cursor runs
- *    it later its answer will appear here. Their requests close. It never says the
- *    command itself failed or was stopped. A turn did end, so nothing is reported for a
- *    turn that did not end; only which command it was is uncertain, and the reply says
- *    no more. Errors and stops are treated alike (decided 2026-11-20). Matched ends keep
- *    the definite reply.
+ * No id says which room command a turn served, but a turn's first row says what kind of
+ * turn it was (firstRowOf): Cursor's room-command sentence (a room command's turn), a
+ * prompt typed at the terminal (`<user_query>` on lines of its own), or neither, when
+ * no first row is visible (the turn wrote none, A3; Cursor's summary turn; a row this
+ * module does not know; no usable snapshot; the file's first rows changed). The turn's
+ * first row is the latest row that starts a turn since the snapshot, or, when tracking
+ * started inside a turn and none has started since, that turn's.
+ *  - Typed: what the reader before this one did for a typed turn. An error or a stop is
+ *    told (a notice) and Working cleared; no command is replied to or closed. Commands
+ *    waiting to run stay open until their own turn runs and ends, and that turn reports
+ *    itself (the watch below).
+ *  - Room command: the commands that started the tracked turn (turn-commands.mjs) and
+ *    are still unanswered, never one delivered into a turn already running (Cursor
+ *    holds its wake). One: the definite reply, as a matched end. Several: a notice, then
+ *    the settle point's one reply for all of them. None (its own command answered, or a
+ *    turn already running at handover) with others waiting: a notice only, as typed.
+ *  - Unknown: a notice, then the settle point's reply for every unanswered command
+ *    picked up before the end.
+ *
+ * ## Settling and watching
+ *
+ * After a notice the end settles, or for a typed turn is watched (`startSettle`,
+ * `settleStep`). Cursor holds a wake that arrives during a turn. Measured on CLI
+ * 2026.11.19 (2026-11-20; SETTLE_MS): idle -> wake turn 1.78 s; normal end -> held turn
+ * 1.46 s; Ctrl+C -> held indefinitely (nothing in 45 s; in a second run nothing in 25 s,
+ * then it ran 1.6 s after the person's next typed turn ended).
+ *  - The settle point: once Cursor has been idle at the end for SETTLE_MS, the commands
+ *    it may answer get one reply with only what is certain (turn-failure.mjs
+ *    `uncertainTurnFailureMessage`): Cursor ended a turn with an error, in its own words,
+ *    or was stopped at its terminal, before it answered this, and if Cursor runs it later
+ *    its answer will appear here. Their requests close. Errors and stops alike. A watch
+ *    has no settle point.
  *  - A turn Cursor starts from a wake (the room-command sentence) after the end, before
  *    or after the settle point, is tracked as any command's turn, from just before it:
  *    Working shows while it runs and clears when it ends, and its end is reported (it is
@@ -189,7 +206,8 @@
  *  - A typed turn after the end is waited for; the idle clock starts again at its end.
  *    The same end written again (Ctrl+C writes it twice; a held turn that fails at its
  *    very start writes the same line) also starts the clock again.
- *  - A command handed over while an end settles settles it at once, with the same reply.
+ *  - A command handed over while an end settles settles it at once, with the same
+ *    reply; a watch just ends.
  *  - The stop hook's definite report supersedes it: the settle then adds nothing.
  *  - An answer the agent posts later, for a command already answered and closed, still
  *    reaches the room. The plugin stamps no closed request on it (requests.mjs
@@ -201,51 +219,53 @@
  *
  * ## Every way a turn ends (the case table; the tests carry these codes)
  *
- * "Matched" meets (a), (b) and (c); "unmatched" does not. Each cell gives what the room
- * sees, whether the room commands' requests close, and whether Working clears. Every
- * errored or stopped cell ends with a reply, its requests closed and Working cleared;
- * only T11 reports nothing.
- *  T1 Finished (status success).
- *     Matched: the agent's own answer; requests close once answered; Working clears.
- *     Unmatched: as before this existed (nothing reported): Working until the agent's
- *       answer, the next command or the backstop; requests close at a later reported end.
- *  T2 Errored (status error).
- *     Matched: the definite reply in Cursor's words ("couldn't finish this"), or with no
- *       command to answer a message of its own; requests close; Working clears.
- *     Unmatched: a notice at once, in Cursor's words; at the settle point one reply with
- *       what is certain; requests close then; Working clears at once.
- *  T3 Stopped (status aborted, Ctrl+C).
- *     Matched: "was stopped before it finished this"; requests close; Working clears.
- *     Unmatched: as T2, in a stop's words ("was stopped at its terminal"). A command
- *       Cursor held runs after the person's next turn: tracked, Working shows and
- *       clears, its end reported, and the agent's answer reaches the room.
- *  T4 Ctrl+C's end written twice, 3 ms apart: one identity, reported once; unmatched,
- *     the idle clock starts again at each write.
- *  T5 A summary row (Cursor's tool catalog) in the turn: never matched; as unmatched
- *     T1, T2 or T3.
- *  T6 The transcript cannot be read for a while, then can, unchanged: nothing is decided
- *     on a failed read; once read, as the row its end belongs to (A16).
- *  T7 The transcript's first rows changed: never matched; as unmatched T1, T2 or T3.
- *  T8 No usable snapshot of the turn's start (unreadable at handover, then changed):
- *     never matched; an error or a stop written since tracking started is unmatched T2
- *     or T3, a turn that ran unmatched T1.
- *  T9 The stop hook runs (a hooks file of the person's own).
- *     Matched: the hook or the poller reports it, once (C1-C9).
- *     Unmatched: the hook knows its turn: the definite reply and its requests closed,
- *       once (C10, C11); the settle then adds nothing. Without the hook: as T2 or T3.
- *  T10 Two commands picked up (a second delivered into the turn).
- *     Matched: one reply answers every unanswered one; all close; Working clears.
- *     Unmatched: at the settle point one reply answers every one picked up before the
- *       end; all close. A command handed over while it settles settles it at once.
- *  T11 A final line Cursor is not known to write (format not recognised): nothing
- *     reported, as before this existed (A7).
+ * Rows are the turn's first row; columns how it ended. Each cell: what the room sees,
+ * whether the room commands' requests close, and whether Working clears. "Matched"
+ * meets (a), (b) and (c), which needs a room-command first row.
+ *  R1 Room-command first row.
+ *    finished: matched: its commands reported finished, requests close once answered,
+ *      Working clears; otherwise as before this existed (nothing reported).
+ *    errored: matched, or one unanswered command started it: the definite reply in
+ *      Cursor's words, requests close, Working clears. Several started it: a notice and
+ *      Working cleared at once, one reply for all at the settle point, requests close.
+ *      Its own answered (or it ran before handover) and others waiting: a notice and
+ *      Working cleared; the waiting commands stay open until their own turns report.
+ *    stopped: as errored, in a stop's words.
+ *  T1 Typed first row.
+ *    finished: as before this existed: nothing reported.
+ *    errored: a notice in Cursor's words and Working cleared; no reply; commands
+ *      waiting stay open until their own turn runs, is tracked (Working shows) and
+ *      reports itself.
+ *    stopped: as errored, in a stop's words. Measured: after Ctrl+C Cursor holds the
+ *      command's turn until the person's next turn has run; it then runs and reports.
+ *  U1 Unknown first row (none visible).
+ *    finished: as before this existed: nothing reported.
+ *    errored: a notice and Working cleared at once; at the settle point one reply with
+ *      what is certain for every unanswered command picked up before the end; requests
+ *      close. The only cells that use the settle point's reply, besides R1 with several
+ *      commands.
+ *    stopped: as errored, in a stop's words.
+ * Across every row:
+ *  - Ctrl+C writes the end twice, 3 ms apart: one identity, reported once; a settle's
+ *    idle clock starts again at each write.
+ *  - A summary row inside a room command's turn leaves it R1 (unmatched: by its
+ *    starting commands); a summary turn of its own is U1.
+ *  - The transcript unreadable for a while, then readable unchanged: nothing is decided
+ *    on a failed read; once read, as its row (A16).
+ *  - Its first rows changed, or no usable snapshot of the turn's start: U1 (A5, T8).
+ *  - The stop hook runs (a hooks file of the person's own): it knows its turn and
+ *    reports it, once (C1-C12); a settle then adds nothing.
+ *  - Two commands picked up: R1 by the ones that started the turn; U1 one reply for all.
+ *  - A final line Cursor is not known to write (format not recognised): nothing
+ *    reported, as before this existed (A7). The only cell that reports nothing for an
+ *    error or a stop.
  *
  * ## Every interleaving, and what happens (the tests carry these codes)
  *
  * "Attributed" is a turn end that meets (a), (b) and (c) above; "a notice" is the notice
  * level: the room told in Cursor's words in a message of its own, answering and closing
  * nothing, and the working attempt ended without naming a command; the end then settles
- * (Settling).
+ * or is watched ("Settling and watching").
  *
  * Tracking starts between turns:
  *  - A1 The command's turn (its start row the room-command sentence) runs and ends:
@@ -291,8 +311,8 @@
  * Tracking starts in a turn:
  *  - B1 The running turn ends, or a later turn does: never attributed; a turn that ran
  *    ends as before.
- *  - B2 Any of them ends in an error or is stopped (a typed turn already running at
- *    handover among them): a notice, then the settle; never the definite reply.
+ *  - B2 Any of them ends in an error or is stopped: by its first row. A typed turn
+ *    already running at handover: a notice; the command stays open until its own turn.
  *  - B3 An error dated before tracking started: nothing.
  * The stop hook (only where the person has a hooks file; it knows which request its turn
  * served, so it answers as it always has):
@@ -598,7 +618,25 @@ export const RESUMED_TURN_SENTENCE = 'Your previous response was interrupted. Co
 
 const TIMESTAMP = '<timestamp>[^<\\n]*</timestamp>'
 
-/** What a user row's text is: a room command's start row, a bare timestamp, a resume, or other. */
+/**
+ * A prompt typed at the terminal, as Cursor writes it: its timestamp, then the prompt in
+ * a `<user_query>` on lines of its own (CLI 2026.11.19 live; 61 such rows in the real
+ * transcripts, some after a `<manually_attached_skills>` block, so not anchored at the
+ * start). A room command's start row has no line break inside its `<user_query>`.
+ */
+const TYPED_PROMPT = new RegExp(`${TIMESTAMP}\\n<user_query>\\n[\\s\\S]*\\n</user_query>$`)
+
+/**
+ * The row Cursor adds when it summarises the conversation: its tool catalog, no
+ * timestamp and no prompt (CLI 2026.11.19 /summarize, fixtures/cursor-summarize-2026.11.19).
+ */
+const SUMMARY_ROW = /^<available_subagent_types>[\s\S]*<\/dynamic_tool_catalog>$/
+
+/**
+ * What a user row's text is: a room command's start row (`command_turn`), a prompt typed
+ * at the terminal (`typed`), a bare timestamp, Cursor's resume row, Cursor's summary row,
+ * or `other` (none of these: a row this module does not know).
+ */
 function userRowKind(text) {
   for (const sentence of COMMAND_TURN_SENTENCES) {
     if (text === sentence) continue // a start row always carries its timestamp
@@ -607,8 +645,13 @@ function userRowKind(text) {
   }
   if (new RegExp(`^${TIMESTAMP}$`).test(text)) return 'timestamp'
   if (text === RESUMED_TURN_SENTENCE) return 'resumed'
+  if (TYPED_PROMPT.test(text)) return 'typed'
+  if (SUMMARY_ROW.test(text) && !text.includes('<user_query>')) return 'summary'
   return 'other'
 }
+
+/** A row that can start a turn: a room command's, a typed prompt, or a row not known. */
+const startsTurn = (row) => row.kind === 'command_turn' || row.kind === 'typed' || row.kind === 'other'
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -833,12 +876,40 @@ function attributable(baseline, read) {
   if (!baseline.between) return false // (a)
   if (read.size < baseline.kept || digestBytes(read.bytes.subarray(0, baseline.kept)) !== baseline.keptDigest) return false // (b)
   if (read.lastLineStart <= baseline.kept) return false // (b): no row written since
-  // (c): exactly one turn since, started by the room-command sentence.
+  // (c): exactly one turn since, started by the room-command sentence, with only bare
+  // timestamps before it and only Cursor's timestamp and resume rows inside it.
   const since = read.userRows.filter((row) => row.start >= baseline.kept)
-  const starts = since.filter((row) => row.kind !== 'timestamp' && row.kind !== 'resumed')
+  const starts = since.filter(startsTurn)
   if (starts.length !== 1 || starts[0].kind !== 'command_turn') return false
   const firstStart = starts[0].start
-  return since.every((row) => row.start >= firstStart ? row.kind !== 'other' : row.kind === 'timestamp')
+  return since.every((row) =>
+    row.start >= firstStart ? row.kind === 'command_turn' || row.kind === 'timestamp' || row.kind === 'resumed' : row.kind === 'timestamp',
+  )
+}
+
+/**
+ * The first row of the turn a turn end belongs to, from what the file shows: `kind` is
+ * 'command' (Cursor's room-command sentence: a room command's turn), 'typed' (a prompt
+ * typed at the terminal) or 'unknown' (no first row is visible: the turn wrote none,
+ * Cursor's summary turn, a row not known, or the file's position is not known), and
+ * `beforeHandover` says the turn was already running when tracking started. The turn's
+ * first row is the latest row that starts a turn: since the snapshot, or, when tracking
+ * started inside a turn and none has started since, that turn's.
+ */
+function firstRowOf(baseline, read) {
+  const unknown = { kind: 'unknown', beforeHandover: false }
+  if (!baseline) return unknown
+  if (read.size < baseline.kept || digestBytes(read.bytes.subarray(0, baseline.kept)) !== baseline.keptDigest) return unknown
+  const sinceStarts = read.userRows.filter((row) => row.start >= baseline.kept && row.start < read.lastLineStart && startsTurn(row))
+  let row = sinceStarts.at(-1)
+  let beforeHandover = false
+  if (!row && !baseline.between) {
+    row = read.userRows.filter((candidate) => candidate.start < baseline.kept && startsTurn(candidate)).at(-1)
+    beforeHandover = Boolean(row)
+  }
+  if (!row) return unknown
+  const kind = row.kind === 'command_turn' ? 'command' : row.kind === 'typed' ? 'typed' : 'unknown'
+  return { kind, beforeHandover }
 }
 
 const CLAIM_SUFFIX = '.claim'
@@ -1103,7 +1174,7 @@ export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR }
 
 /**
  * How long Cursor must stay idle after a turn end the poller could only notice before
- * the commands picked up before it are answered (the settle point; "Settling" in the
+ * the commands picked up before it are answered (the settle point; "Settling and watching" in the
  * header). Measured on CLI 2026.11.19 (2026-11-20, one run each, a background command
  * standing in for the plugin's wake): Cursor started a background command's turn 1.78 s
  * after the command finished while it was idle (idle -> wake turn), and a turn held while
@@ -1121,12 +1192,13 @@ export function turnSettlePath(connectionId, dir = CONNECTIONS_DIR) {
 
 /**
  * Begin settling a turn end the poller noticed (the notice level): `ended` as
- * transcriptTurnEnd returned it, `requests` the request ids of the unanswered room
- * commands picked up before it (requests.mjs commandsAnsweredNow), `commands` the
- * commands the tracked turn started with (turn-commands.mjs). Returns whether it was
- * written.
+ * transcriptTurnEnd returned it, `requests` the request ids of the room commands the
+ * settle point may answer, `commands` the commands the tracked turn started with
+ * (turn-commands.mjs). `reply` false only watches: no settle point, for a turn whose
+ * first row was typed (waiting commands stay open until their own turns run). Returns
+ * whether it was written.
  */
-export function startSettle(connectionId, { ended, conversation, turn, requests = [], commands = [], now = Date.now(), dir = CONNECTIONS_DIR } = {}) {
+export function startSettle(connectionId, { ended, conversation, turn, requests = [], commands = [], reply = true, now = Date.now(), dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || !ended?.position || !parseIdentity(ended.identity)) return false
   try {
     writePrivateJson(turnSettlePath(connectionId, dir), {
@@ -1137,6 +1209,7 @@ export function startSettle(connectionId, { ended, conversation, turn, requests 
       turn,
       requests,
       commands,
+      reply: reply !== false,
       resolved: false,
       kept: ended.position.kept,
       keptDigest: ended.position.keptDigest,
@@ -1185,16 +1258,14 @@ export function clearSettle(connectionId, { dir = CONNECTIONS_DIR } = {}) {
  */
 function wakeTurnSince(settle, read) {
   if (read.size < settle.kept || digestBytes(read.bytes.subarray(0, settle.kept)) !== settle.keptDigest) return null
-  const since = read.userRows.filter((row) => row.start >= settle.kept)
-  const starts = since.filter((row) => row.kind !== 'timestamp' && row.kind !== 'resumed')
-  const latest = starts.at(-1)
+  const latest = read.userRows.filter((row) => row.start >= settle.kept && startsTurn(row)).at(-1)
   if (!latest || latest.kind !== 'command_turn') return null
   const kept = latest.start
   return { between: true, kept, keptDigest: digestBytes(read.bytes.subarray(0, kept)), stamp: `settle:${settle.idle.stamp}` }
 }
 
 /**
- * What to do next with a settle, from one whole read of the transcript ("Settling" in
+ * What to do next with a settle, from one whole read of the transcript ("Settling and watching" in
  * the header). A read that fails decides nothing.
  *  - `{ action: 'wait' }`
  *  - `{ action: 'track', baseline, startedAt }`: Cursor has started a turn from a
@@ -1218,7 +1289,7 @@ export function settleStep(settle, { transcriptPath, now = Date.now() } = {}) {
   const identity = identityOf(settle.conversation, read)
   if (identity === settle.idle.identity) {
     if (read.stamp !== settle.idle.stamp) return { action: 'restart', stamp: read.stamp }
-    return !settle.resolved && now - settle.idle.since >= SETTLE_MS ? { action: 'resolve' } : { action: 'wait' }
+    return settle.reply !== false && !settle.resolved && now - settle.idle.since >= SETTLE_MS ? { action: 'resolve' } : { action: 'wait' }
   }
   const position = positionOf(read)
   return { action: 'rebase', kept: position.kept, keptDigest: position.keptDigest, idle: { identity, stamp: read.stamp, since: now } }
@@ -1235,7 +1306,7 @@ export function settleDue({ connectionId, transcriptPath, now = Date.now(), dir 
   // Each reason fires once: the clock running out for this idle point, and each change
   // of the file (a turn running changes it often; the lap decides from the next change).
   const clock = `${settle.idle.identity}|${settle.idle.since}`
-  if (!settle.resolved && now - settle.idle.since >= SETTLE_MS && memo.clock !== clock) {
+  if (settle.reply !== false && !settle.resolved && now - settle.idle.since >= SETTLE_MS && memo.clock !== clock) {
     memo.clock = clock
     return true
   }
@@ -1339,6 +1410,7 @@ export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = 
     error: read.end.error,
     failure: turnEndFailure(read.end),
     attributed: isAttributed,
+    firstRow: isAttributed ? { kind: 'command', beforeHandover: false } : firstRowOf(baseline, read),
     position: positionOf(read),
   }
 }
