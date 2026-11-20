@@ -70,6 +70,24 @@ export function turnFailureNotice({ sessionId, agentName, message }) {
   return { session_id: sessionId, agent_name: agentName, message, turn_kind: 'agent', phase: 'answer' }
 }
 
+/**
+ * Tell the room about a failed turn in a message of its own, answering nothing: for a
+ * turn end that cannot be tied to the room command beyond doubt (transcript-turn-end.mjs).
+ * `post(args)` posts with post_session_message.
+ */
+export async function postTurnNotice({ failure, sessionId, agentName, post }) {
+  if (!failure || !sessionId) return false
+  await post(turnFailureNotice({ sessionId, agentName, message: failureRoomMessage(failure, agentName) }))
+  return true
+}
+
+/** The failure in the room's words, quoted whole up to the room's own limit, then cut visibly. */
+function failureRoomMessage(failure, agentName) {
+  return fitRoomMessage(turnFailureMessage(failure, agentName), {
+    whereRest: `The full error is in ${agentName}'s terminal.`,
+  })
+}
+
 /** Quote text as a Markdown block, line by line, so Cursor's words stand apart from ours. */
 function quote(text) {
   return text.split(/\r?\n/).map((line) => `> ${line}`.trimEnd()).join('\n')
@@ -109,10 +127,7 @@ export async function postTurnFailure({
   const failure = given === undefined ? parseTurnFailure(raw) : given
   if (!failure || !connectionId) return []
   const commands = commandsAnsweredNow(readRequestState(connectionId, { dir }))
-  // Cursor's error text is quoted whole; only past the room's own limit is it cut, visibly.
-  const message = fitRoomMessage(turnFailureMessage(failure, agentName), {
-    whereRest: `The full error is in ${agentName}'s terminal.`,
-  })
+  const message = failureRoomMessage(failure, agentName)
   if (commands.length === 0) {
     if (notice && sessionId) await post(turnFailureNotice({ sessionId, agentName, message }))
     return []

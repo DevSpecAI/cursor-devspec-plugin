@@ -184,7 +184,6 @@ import {
   nextReportTry,
   noteTurnEndCompleted,
   noteTurnEndTold,
-  observeRunningTurnEnd,
   readTurnBaseline,
   recordTurnBaseline,
   settleTurnEnd,
@@ -192,7 +191,7 @@ import {
   turnEndClaimed,
   turnEndPending,
 } from './transcript-turn-end.mjs'
-import { postTurnFailure } from './turn-failure.mjs'
+import { postTurnFailure, postTurnNotice } from './turn-failure.mjs'
 import { clearTurnWakes } from './notice-reply.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
@@ -1634,6 +1633,36 @@ async function main() {
     if (claim.outcome === 'reported') return 'reported_elsewhere'
     if (claim.outcome === 'reporting') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
+    if (!ended.attributed) {
+      // Not the tracked command's turn end beyond doubt: tell the room what Cursor said,
+      // in a message of its own that answers nothing; complete nothing, close nothing.
+      clearTrailState(connectionId)
+      let told = true
+      if (ended.failure && sessionId && !claim.told) {
+        try {
+          await postTurnNotice({
+            failure: ended.failure,
+            sessionId,
+            agentName,
+            post: (args) =>
+              mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+          })
+          noteTurnEndTold(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+        } catch (e) {
+          told = false
+          process.stderr.write(`devspec-remote-poll: turn notice failed: ${e.message}\n`)
+        }
+      }
+      settleTurnEnd(connectionId, ended.identity, { reported: told, dir: CONNECTIONS_DIR })
+      if (!told) return 'retry'
+      // Working clears; the commands the turn was started with are not reported finished
+      // (their activity lapses), so the backstop must not report them either.
+      turnStartCommands = []
+      clearTurnMarker(connectionId)
+      prevTurnActive = false
+      process.stderr.write(`devspec-remote-poll: turn ended (${ended.status}), told the room; not tied to a command connection=${connectionId}\n`)
+      return 'reported'
+    }
     let delivered = true
     clearTrailState(connectionId)
     if (ended.failure && sessionId && !claim.told) {
@@ -1847,39 +1876,6 @@ async function main() {
   let reportRetry = null
   let lapTranscriptPath = null
   let trackedTurnStartedAt = null
-  // A watch on the transcript, so the end of a turn that was already running when the
-  // tracked turn started is seen as Cursor writes it, not only at the next look: the
-  // next turn rewrites the file without it (transcript-turn-end.mjs).
-  let transcriptWatch = null
-  let watchedTranscriptPath = null
-  function watchTranscript(transcriptPath) {
-    if (transcriptPath === watchedTranscriptPath) return
-    try {
-      transcriptWatch?.close()
-    } catch {
-      /* already closed */
-    }
-    transcriptWatch = null
-    watchedTranscriptPath = transcriptPath
-    if (!transcriptPath) return
-    try {
-      transcriptWatch = fs.watch(transcriptPath, { persistent: false }, () => {
-        const watchedMarker = readTurnMarker(connectionId)
-        if (!watchedMarker) return
-        try {
-          observeRunningTurnEnd({ connectionId, marker: watchedMarker, transcriptPath, dir: CONNECTIONS_DIR })
-        } catch {
-          /* the next look decides */
-        }
-      })
-      transcriptWatch.on('error', () => {
-        watchedTranscriptPath = null
-      })
-    } catch {
-      // No transcript to watch yet: the next lap tries again.
-      watchedTranscriptPath = null
-    }
-  }
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -2647,7 +2643,6 @@ async function main() {
     let marker = readTurnMarker(connectionId)
     const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
     lapTranscriptPath = transcriptPath
-    watchTranscript(marker ? transcriptPath : null)
     // How Cursor ended the conversation's last turn, read whether or not a stop hook
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
