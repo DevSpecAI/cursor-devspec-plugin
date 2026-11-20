@@ -15,15 +15,18 @@ import { catCall, noteFiles, readCall } from '../../tests/helpers/note-reads.mjs
 import {
   CURSOR_HOOK_CONTEXT_MAX_CHARS,
   CURSOR_HOOK_CONTEXT_SEPARATOR,
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
   hookContextShare,
+  NOTE_PART_BYTES,
   NOTE_PART_CHARS,
   noteParts,
   notePointer,
   noteReadThrough,
   postToolUseOutput,
   readNoteText,
+  splitText,
   writeNote,
   POST_TOOL_CONTEXT_HOOKS,
   POST_TOOL_CONTEXT_SHARE,
@@ -166,5 +169,61 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     // The plugin's own PATH line in front of an exact `cat` is fine.
     const prefixed = ran(`export PATH="/x/stand-in:$PATH" # devspec\ncat ${tilde}`, whole)
     assert.equal(noteReadThrough(prefixed, note.id, { home }), true)
+  })
+
+  /** Every part of note `id` as the real shell prints it, its closing line taken off, joined: bytes, not text. */
+  function catBack(home, id) {
+    const pieces = noteFiles(home, id).map((file) => {
+      const printed = execFileSync('sh', ['-c', `cat ${file.replace(home, '~')}`], { env: { PATH: process.env.PATH, HOME: home } })
+      const text = printed.toString('utf8')
+      assert.ok(text.length < CURSOR_SHELL_OUTPUT_MAX_CHARS, `${file}: ${text.length} characters`)
+      assert.ok(printed.length < CURSOR_SHELL_OUTPUT_MAX_BYTES, `${file}: ${printed.length} bytes`)
+      return printed.subarray(0, printed.lastIndexOf(Buffer.from('\n\n— ')))
+    })
+    return Buffer.concat(pieces)
+  }
+
+  it('never cuts a character in two: every part, read back through the real shell, joins to the note byte for byte', () => {
+    const home = tempHome()
+    const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}'
+    const cases = {
+      // An emoji whose two code units straddle where a plain cut at NOTE_PART_CHARS would fall.
+      emojiAtTheBoundary: `${'a'.repeat(NOTE_PART_CHARS - 1)}\u{1F600}${'b'.repeat(NOTE_PART_CHARS)}`,
+      // ZWJ sequences, skin tones and flags, with no line breaks to cut at.
+      zwjFamilies: `${'x'.repeat(NOTE_PART_CHARS - 5)}${family}\u{1F44D}\u{1F3FD}\u{1F1EC}\u{1F1E7}`.repeat(3),
+      // Letters with stacked combining marks.
+      combiningMarks: 'e\u0301\u0323'.repeat(NOTE_PART_CHARS),
+      // Three bytes a character: the byte rule, not the character rule, decides the parts.
+      cjk: '\u4e2d\u6587\u5b57'.repeat(NOTE_PART_CHARS),
+      // A room entry stored as a note, with an emoji across the old boundary.
+      roomEntry: JSON.stringify({
+        message_id: 'm-1',
+        from: 'Ali Price',
+        text: `${'z'.repeat(NOTE_PART_CHARS - 60)}\u{1F680} shipped`,
+        attachments: Array.from({ length: 300 }, (_, i) => ({ resource_id: `id-${i}`, name: `\u5199\u771f-${i}-\u{1F4F7}.png` })),
+      }, null, 2),
+    }
+    for (const [name, text] of Object.entries(cases)) {
+      const note = writeNote(text, { home })
+      assert.ok(note.parts > 1, `${name} is long enough to be split`)
+      const back = catBack(home, note.id)
+      assert.ok(back.equals(Buffer.from(text, 'utf8')), `${name}: the parts joined are the note, byte for byte`)
+      assert.ok(!back.toString('utf8').includes('\uFFFD'), `${name}: no replacement characters`)
+      assert.equal(readNoteText(note.id, { home }), text, name)
+      for (const file of noteFiles(home, note.id)) {
+        const content = fs.readFileSync(file, 'utf8')
+        const body = content.slice(0, content.lastIndexOf('\n\n— '))
+        assert.ok(body.length <= NOTE_PART_CHARS && Buffer.byteLength(body) <= NOTE_PART_BYTES, `${name}: a part within both budgets`)
+      }
+    }
+  })
+
+  it('cuts at a line end when one falls in the second half of a part, otherwise between whole characters', () => {
+    const lines = Array.from({ length: 3_000 }, (_, i) => `line ${i} \u{1F600} ${'w'.repeat(10)}`).join('\n')
+    for (const piece of splitText(lines).slice(0, -1)) assert.ok(piece.endsWith('\n'), 'each part but the last ends at a line end')
+    const oneLine = '\u{1F600}'.repeat(NOTE_PART_CHARS)
+    const pieces = splitText(oneLine)
+    assert.equal(pieces.join(''), oneLine)
+    for (const piece of pieces) assert.ok(!/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(piece), 'no surrogate pair cut')
   })
 })

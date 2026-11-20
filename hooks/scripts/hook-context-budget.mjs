@@ -30,8 +30,9 @@
  *   ~/.devspec/notes/ named by a short id, and the note says how to read it. That
  *   pointer has a fixed shape and length, well within the smallest share, so it can
  *   always be handed over. A note longer than one Shell page is split into numbered
- *   parts, each short enough to reach the model whole through `cat`
- *   (`NOTE_PART_CHARS`), each closing with the command for the next.
+ *   parts, each short enough to reach the model whole through `cat` under both of
+ *   Cursor's Shell rules (`NOTE_PART_CHARS`, `NOTE_PART_BYTES`), cut only between
+ *   lines or whole characters, each closing with the command for the next.
  * - A note counts as read only on what came back: an exact `cat` of a part that exited
  *   0 with the part's closing line in its output, or Cursor's Read tool reporting the
  *   part's full length. Mentioning a note (`test -e`, `ls`, `grep -l`) is not reading it.
@@ -53,6 +54,7 @@ import path from 'node:path'
 
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
 
+/** In UTF-16 code units: the CLI's hooks carrier compares the joined text's JavaScript `.length`. */
 export const CURSOR_HOOK_CONTEXT_MAX_CHARS = 10_000
 
 /** What Cursor puts between two hooks' answers to one event. */
@@ -86,22 +88,39 @@ export const POST_TOOL_CONTEXT_SHARE = hookContextShare(POST_TOOL_CONTEXT_HOOKS)
 export const SESSION_START_CONTEXT_SHARE = hookContextShare(1)
 
 /**
- * How much of a Shell command's output Cursor hands the model. Measured on
- * cursor-agent 2026.11.05-86047df, 20 November 2026, with two models (Gemini 4
- * Hydrogen and Composer 2.5): 20,000 characters arrived whole; 21,000 arrived as the
- * first 10,000 and the last 10,000 under "Command output (truncated to 20000
- * characters)", with the middle gone.
+ * How much of a Shell command's output Cursor hands the model, in UTF-16 code units
+ * (JavaScript string length). Measured on cursor-agent 2026.11.05-86047df, 20 November
+ * 2026: 20,000 ASCII characters arrived whole and 21,000 arrived as the first 10,000
+ * and the last 10,000 under "Command output (truncated to 20000 characters)", on two
+ * models (Gemini 4 Hydrogen and Composer 2.5). The unit: 10,160 CJK characters
+ * (30,160 bytes) arrived whole, so it is not bytes; lines mixing emoji and ASCII,
+ * 18,288 code points but 21,276 UTF-16 code units, were cut, so it is not code points.
  */
 export const CURSOR_SHELL_OUTPUT_MAX_CHARS = 20_000
 
 /**
+ * The second rule on the same output, in UTF-8 bytes: past it Cursor shows the model
+ * none of the output, only "Command output has been written to: <file> (44.2 KB, 15
+ * lines)". Measured on the same day: 40,000 bytes were shown (cut to 20,000
+ * characters, but not moved to a file), 30,160 bytes of CJK were shown whole, and
+ * 45,240 bytes of CJK and 50,800 bytes of ASCII were moved to a file.
+ */
+export const CURSOR_SHELL_OUTPUT_MAX_BYTES = 40_000
+
+/** Whether `text`, printed by one Shell command, reaches the model whole under both rules. */
+export function fitsShellOutput(text) {
+  return text.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS && Buffer.byteLength(text) <= CURSOR_SHELL_OUTPUT_MAX_BYTES
+}
+
+/**
  * The longest part of a note, so `cat` of one part always reaches the model whole:
- * 2,000 characters under Cursor's Shell ceiling, for the part's closing line and
- * anything the shell itself prints into the same output. Measured on 20 November
- * 2026: `cat` of a 19,012-character file reached the model whole, and the hook saw the
- * whole output with exit code 0.
+ * 2,000 characters under Cursor's Shell ceiling and 4,000 bytes under its move-to-a-file
+ * rule, for the part's closing line and anything the shell itself prints into the same
+ * output. Measured on 20 November 2026: `cat` of a 19,012-character file reached the
+ * model whole, and the hook saw the whole output with exit code 0.
  */
 export const NOTE_PART_CHARS = 18_000
+export const NOTE_PART_BYTES = 36_000
 
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
@@ -130,17 +149,49 @@ function partEnd(id, part, parts) {
     : `— End of DevSpec note ${id}${parts > 1 ? `: part ${parts} of ${parts}` : ''} —`
 }
 
-/** `text` in pieces of at most `size`, cut at a line end where one is near; joined, they are the text. */
-function splitText(text, size) {
+const GRAPHEMES = typeof Intl?.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null
+
+/**
+ * `text` as the units it may be cut between: grapheme clusters (an emoji with its
+ * modifiers or ZWJ sequence, a letter with its combining marks), so no character is
+ * ever cut in two. A cluster too long for a part on its own (no real text has one) is
+ * cut between code points, never inside a surrogate pair.
+ */
+function cuttable(text, maxChars, maxBytes) {
+  const units = GRAPHEMES ? Array.from(GRAPHEMES.segment(text), ({ segment }) => segment) : Array.from(text)
+  return units.flatMap((unit) => (unit.length > maxChars || Buffer.byteLength(unit) > maxBytes ? Array.from(unit) : [unit]))
+}
+
+/**
+ * `text` in pieces of at most `maxChars` UTF-16 code units and `maxBytes` UTF-8 bytes,
+ * the two things Cursor's Shell rules count. A piece ends at a line end when one falls
+ * in its second half, otherwise at a grapheme boundary. Joined, the pieces are the
+ * text, byte for byte.
+ */
+export function splitText(text, maxChars = NOTE_PART_CHARS, maxBytes = NOTE_PART_BYTES) {
   const pieces = []
-  let rest = text
-  while (rest.length > size) {
-    let cut = rest.lastIndexOf('\n', size)
-    if (cut < size / 2) cut = size
-    pieces.push(rest.slice(0, cut))
-    rest = rest.slice(cut)
+  let piece = []
+  let chars = 0
+  let bytes = 0
+  let lineEnd = -1 // how many units of `piece` end with its last line break
+  for (const unit of cuttable(text, maxChars, maxBytes)) {
+    const unitChars = unit.length
+    const unitBytes = Buffer.byteLength(unit)
+    if (piece.length > 0 && (chars + unitChars > maxChars || bytes + unitBytes > maxBytes)) {
+      const cut = lineEnd > 0 && lineEnd >= piece.length / 2 ? lineEnd : piece.length
+      pieces.push(piece.slice(0, cut).join(''))
+      piece = piece.slice(cut)
+      const carried = piece.join('')
+      chars = carried.length
+      bytes = Buffer.byteLength(carried)
+      lineEnd = -1
+    }
+    piece.push(unit)
+    chars += unitChars
+    bytes += unitBytes
+    if (unit.includes('\n')) lineEnd = piece.length
   }
-  pieces.push(rest)
+  pieces.push(piece.join(''))
   return pieces
 }
 
@@ -148,14 +199,14 @@ function splitText(text, size) {
  * Keep `text` whole as a note, readable only by its owner, and return its short id,
  * where it starts, the one command that reads it and how many parts it has. The id is
  * the text's own digest, so the same text is one note. A note longer than one part
- * (`NOTE_PART_CHARS`) is split into numbered parts, each closing with the command for
+ * (`NOTE_PART_CHARS`, `NOTE_PART_BYTES`) is split into numbered parts (`splitText`), each closing with the command for
  * the next, so every part reaches the model whole through Cursor's Shell ceiling. The
  * command names the folder through `~`, so every pointer has the same short length
  * whatever the home folder is called.
  */
 export function writeNote(text, { home = os.homedir() } = {}) {
   const id = createHash('sha256').update(text).digest('hex').slice(0, 16)
-  const pieces = splitText(text, NOTE_PART_CHARS)
+  const pieces = splitText(text)
   const first = partFile(id, 1, home)
   // The same text is the same note: written once, the first part last, so a first
   // part on disk means every part is.

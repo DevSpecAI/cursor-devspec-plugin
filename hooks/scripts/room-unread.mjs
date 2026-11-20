@@ -49,7 +49,7 @@ import { readOwnConnectionState } from './own-connection.mjs'
 import { firingConversation, namespacedVerb } from './project-context.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { transcriptPaths } from './room-transcript.mjs'
-import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitHookContext, postToolUseOutput, writeNote } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_BYTES, CURSOR_SHELL_OUTPUT_MAX_CHARS, fitHookContext, postToolUseOutput, writeNote } from './hook-context-budget.mjs'
 
 export const READ_STATE_VERSION = 1
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
@@ -57,11 +57,12 @@ const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
 
 /**
  * The reader's output arrives as a Shell result, so one read prints no more than Cursor
- * hands the model from one Shell command (`CURSOR_SHELL_OUTPUT_MAX_CHARS`, measured;
+ * hands the model from one Shell command, in characters and in bytes
+ * (`CURSOR_SHELL_OUTPUT_MAX_CHARS`, `CURSOR_SHELL_OUTPUT_MAX_BYTES`, both measured;
  * hook-context-budget.mjs), header included (`readerPageBudget`). A message too long
  * for a page on its own is handed over whole as a note instead, so nothing is ever cut.
  */
-export { CURSOR_SHELL_OUTPUT_MAX_CHARS }
+export { CURSOR_SHELL_OUTPUT_MAX_BYTES, CURSOR_SHELL_OUTPUT_MAX_CHARS }
 
 function connectionsDir(home = os.homedir(), env = process.env) {
   const override =
@@ -518,6 +519,7 @@ export function readPage({
   read,
   selfLabel,
   budget,
+  byteBudget = Infinity,
   writeOverflow,
 }) {
   const { unread, updated } = unreadOf(lines, read)
@@ -528,11 +530,15 @@ export function readPage({
   const printed = []
   const nextRead = { ...read }
   let used = 0
+  let usedBytes = 0
+  // Each printed line ends in a newline, which counts against the page too. Cursor's
+  // Shell rules count characters (UTF-16 code units) and bytes, so both are kept.
+  const fits = (text, chars = 0, bytes = 0) =>
+    chars + text.length + 1 <= budget && bytes + Buffer.byteLength(text) + 1 <= byteBudget
   for (const item of pending) {
     const entry = renderEntry(item, { updated: item.updated, selfLabel })
     let text = JSON.stringify(entry)
-    // Each printed line ends in a newline, which counts against the page too.
-    if (text.length + 1 > budget) {
+    if (!fits(text)) {
       text = JSON.stringify({
         seq: entry.seq,
         message_id: entry.message_id,
@@ -541,11 +547,12 @@ export function readPage({
         read_with: writeOverflow(entry, item.line),
         note: 'Too long for one read: the whole message, as one JSON object, is in a note. Run read_with, and each further part it names.',
       })
-      if (text.length + 1 > budget) throw new Error('room-unread: not even a pointer to this message fits one read')
+      if (!fits(text)) throw new Error('room-unread: not even a pointer to this message fits one read')
     }
-    if (printed.length > 0 && used + text.length + 1 > budget) break
+    if (printed.length > 0 && !fits(text, used, usedBytes)) break
     printed.push(text)
     used += text.length + 1
+    usedBytes += Buffer.byteLength(text) + 1
     nextRead[item.line.message_id] = item.version
   }
   return {
@@ -569,17 +576,21 @@ function readerHeader({ returned, unread, updated, remaining, next }) {
 }
 
 /**
- * How many characters of messages one read may print, so its whole output (the header
- * line, then one line per message, each ending in a newline) fits what Cursor hands
- * the model from one Shell command (`CURSOR_SHELL_OUTPUT_MAX_CHARS`). The header is
+ * How many characters and bytes of messages one read may print, so its whole output
+ * (the header line, then one line per message, each ending in a newline) reaches the
+ * model whole from one Shell command under both of Cursor's rules
+ * (`CURSOR_SHELL_OUTPUT_MAX_CHARS`, `CURSOR_SHELL_OUTPUT_MAX_BYTES`). The header is
  * measured at its longest: every count at `total`, which no count on the page exceeds,
  * and the command for the rest included.
  */
-function readerPageBudget({ total, next, max = CURSOR_SHELL_OUTPUT_MAX_CHARS }) {
+function readerPageBudget({ total, next }) {
   const longest = JSON.stringify(
     readerHeader({ returned: total, unread: total, updated: total, remaining: Math.max(total, 1), next }),
   )
-  return max - (longest.length + 1)
+  return {
+    budget: CURSOR_SHELL_OUTPUT_MAX_CHARS - (longest.length + 1),
+    byteBudget: CURSOR_SHELL_OUTPUT_MAX_BYTES - (Buffer.byteLength(longest) + 1),
+  }
 }
 
 /** One read of the room, as the reader prints it. */
@@ -597,7 +608,7 @@ function readerOutput(room, { scriptPath = SCRIPT_PATH, home = os.homedir() } = 
     lines: copy.lines,
     read,
     selfLabel: copy.selfLabel,
-    budget: readerPageBudget({ total: unread.length + updated.length, next }),
+    ...readerPageBudget({ total: unread.length + updated.length, next }),
     writeOverflow: (entry) => writeNote(JSON.stringify(entry, null, 2), { home }).command,
   })
   const remaining = page.total - page.printed.length

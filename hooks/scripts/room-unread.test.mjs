@@ -19,6 +19,7 @@ import { readNoteText } from './hook-context-budget.mjs'
 import { noteIdIn } from '../../tests/helpers/note-reads.mjs'
 import { projectInput } from './project-input.mjs'
 import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   isRealMessage,
   messageVersion,
@@ -350,6 +351,24 @@ describe('the reader is the only thing that marks a message read', () => {
         break
       }
       assert.match(header.room_messages.next, / read --connection-id /)
+    }
+    assert.deepEqual(seen, lines.map((line) => line.text), 'every message once, oldest first, whole')
+  })
+
+  it("keeps every read under Cursor's byte rule too, so a room in Chinese or emoji is never moved to a file", () => {
+    // 3 bytes a character: 20,000 characters would be 60,000 bytes, which Cursor shows
+    // as "written to a file" instead of the output.
+    const lines = Array.from({ length: 30 }, (_, i) => msg({ text: `${i}:${'\u4e2d\u6587'.repeat(700)}\u{1F600}` }))
+    const room = makeHome(lines)
+    const seen = []
+    for (let reads = 0; reads < 20; reads += 1) {
+      const run = readerRun(room)
+      assert.equal(run.status, 0, run.stderr)
+      assert.ok(run.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `${run.stdout.length} characters`)
+      assert.ok(Buffer.byteLength(run.stdout) <= CURSOR_SHELL_OUTPUT_MAX_BYTES, `${Buffer.byteLength(run.stdout)} bytes`)
+      const [header, ...entries] = parseReader(run.stdout)
+      seen.push(...entries.map((entry) => entry.text))
+      if (header.room_messages.remaining === 0) break
     }
     assert.deepEqual(seen, lines.map((line) => line.text), 'every message once, oldest first, whole')
   })
