@@ -21,6 +21,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gitRoot } from './devspec-scope.mjs'
+import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
 
 const PIN_RELATIVE = path.join('.devspec', 'project.json')
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
@@ -109,11 +110,9 @@ export function checkPinAfterTool(input, deps = {}) {
     if (problem) messages.push(correctionText(file, problem, text))
   }
   if (!messages.length) return null
-  const additionalContext = messages.join(' ')
-  return {
-    additional_context: additionalContext,
-    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext },
-  }
+  return postToolUseOutput(
+    fitHookContext(messages.join(' '), { what: 'What is wrong with the DevSpec pin you just wrote' }),
+  )
 }
 
 async function main() {

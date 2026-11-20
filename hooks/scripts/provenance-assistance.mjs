@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { fitHookContext } from './hook-context-budget.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
@@ -1128,17 +1129,22 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
+    // Each note is fitted to this hook's share of Cursor's ceiling before it is taken
+    // from the state, so one Cursor would drop is never recorded as handed over.
     if (toolUseId && state.pending_notes[toolUseId]) {
-      const { text } = state.pending_notes[toolUseId]
+      const context = fitHookContext(state.pending_notes[toolUseId].text, { what: 'A DevSpec commit note' })
+      if (!context) return null
       delete state.pending_notes[toolUseId]
       writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: text }
+      return { additional_context: context }
     }
     if (toolUseId && state.pending_stamps[toolUseId]) {
       const item = state.pending_stamps[toolUseId].task_id
+      const context = fitHookContext(`DevSpec appended [devspec:${item}] to the commit message that just ran.`, { what: 'A DevSpec commit note' })
+      if (!context) return null
       delete state.pending_stamps[toolUseId]
       writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: `DevSpec appended [devspec:${item}] to the commit message that just ran.` }
+      return { additional_context: context }
     }
 
     const toolName = (cleanString(data?.tool_name) || '').toLowerCase()
@@ -1153,8 +1159,6 @@ export function handleHook(mode, data, options = {}) {
     if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
     // A claim made here that could not be recorded is still a claim: no reminder.
     if (state.unrecorded_claims.some((entry) => !entry.project_id || entry.project_id === projectId)) return null
-    state.nudged_projects.push(projectId)
-    writeConversationState(conversationId, state, stateRoot)
     // Work that needs no task commits without one (item 953ab72e), so the advice is
     // conditional, and a missing claim blocks neither editing nor committing.
     const nudgeMessage =
@@ -1163,10 +1167,11 @@ export function handleHook(mode, data, options = {}) {
       'If the work delivers a task, before you commit search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
       'with a real description of the change and its intent, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
       'When work needs a task (work_entry_contract) and how to write its intent (core.write-the-persons-intent) are in devspec://product/implementation-contract.'
-    return {
-      additional_context: nudgeMessage,
-      agent_message: nudgeMessage,
-    }
+    const context = fitHookContext(nudgeMessage, { what: 'A DevSpec commit note' })
+    if (!context) return null
+    state.nudged_projects.push(projectId)
+    writeConversationState(conversationId, state, stateRoot)
+    return { additional_context: context, agent_message: context }
   }
 
   return null

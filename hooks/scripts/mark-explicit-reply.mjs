@@ -22,6 +22,7 @@
  * `additional_context` on postToolUse.
  */
 
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -46,7 +47,7 @@ import {
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
 import { writePrivateText } from './private-state.mjs'
-import { POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -188,8 +189,9 @@ export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) 
  * `leaveTellPersonNote`), or null when none was left. Only the conversation that holds
  * the connection gets it, never a subagent's tool call. Past this hook's share of
  * Cursor's limit on hook context (hook-context-budget.mjs), the whole note goes to a
- * private file and the agent is told where, so nothing in it is cut or dropped. Exported for tests; `dir` defaults to where the
- * connection's files live.
+ * private file and the agent is told where, so nothing in it is cut or dropped
+ * (`fitHookContext`). A note that is not handed over is put back. Exported for tests;
+ * `dir` defaults to where the connection's files live.
  */
 export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
   let data = {}
@@ -206,25 +208,33 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
   const connectionId = loadState(conversationId)?.connection_id
   if (!connectionId) return null
   const notes = takeTellPersonNotes(connectionId, { dir: connDir })
-  let text = tellPersonNoteText(notes)
+  const text = tellPersonNoteText(notes)
   if (!text) return null
-  if (text.length > POST_TOOL_CONTEXT_SHARE) {
-    const file = path.join(connDir, `${connectionId}.tell-person-note.md`)
-    try {
-      writePrivateText(file, `${text}\n`)
-    } catch (error) {
-      // Not handed over, so not taken: put every note back for the next tool call.
-      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
-      throw error
-    }
-    text =
-      'From the DevSpec plugin: a message your person has not heard is waiting for you, longer than Cursor hands a hook\'s note to you at once. ' +
-      `Read it whole, with the file-reading tool, at ${JSON.stringify(file)}, and do what it says.`
+  // Not handed over, so not taken: every note goes back for the next tool call.
+  const putBack = () => {
+    for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
   }
-  return JSON.stringify({
-    additional_context: text,
-    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text },
-  })
+  let context
+  try {
+    context = fitHookContext(text, {
+      what: 'A message your person has not heard, handed back to you by the DevSpec plugin,',
+      also: 'Do what it says.',
+      spill: (whole) => {
+        const digest = createHash('sha256').update(whole).digest('hex').slice(0, 16)
+        const file = path.join(connDir, `${connectionId}.tell-person-note.${digest}.md`)
+        writePrivateText(file, `${whole}\n`)
+        return file
+      },
+    })
+  } catch (error) {
+    putBack()
+    throw error
+  }
+  if (context === null) {
+    putBack()
+    return null
+  }
+  return JSON.stringify(postToolUseOutput(context))
 }
 
 /** Whether any connection has a note waiting (`leaveTellPersonNote`). */

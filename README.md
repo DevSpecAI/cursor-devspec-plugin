@@ -87,7 +87,7 @@ For transparency and security review, here is what the plugin connects to, runs 
   - while you're connected, put a small `git` stand-in in front of the agent's shell commands, so commits are tagged and reported. The stand-in runs your own git unchanged, and nothing is installed in your repositories or git configuration.
 - **Files on your machine.**
   - `~/.devspec/cursor/auth.json` holds remote control's and commit tracking's sign-in, one per DevSpec server, renewed automatically and readable only by you. Nothing else reads it, and the plugin reads no other tool's sign-in.
-  - `~/.devspec/` also holds each connection's state, the session's recent messages, commit tracking records and logs, readable only by you.
+  - `~/.devspec/` also holds each connection's state, the session's recent messages, commit tracking records and logs, and any note from the plugin too long for Cursor to hand the agent at once (the agent is told where to read it), all readable only by you.
   - `.devspec/project.json` is written in a repository only when you ask `/devspec-project` to remember a default project.
 
 ---

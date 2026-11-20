@@ -6,7 +6,8 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-import { CURSOR_HOOK_CONTEXT_MAX_CHARS, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { fitHookContext, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { writePrivateText } from './private-state.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -163,13 +164,19 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
 }
 
 /**
- * Cursor's supported `additional_context` lane, not a Claude hook response: on
- * sessionStart (`force`, the plugin's only hook there) and after a tool call, where the
- * plugin's other hooks may answer too. Text longer than this hook's share of Cursor's
- * ceiling (hook-context-budget.mjs) is handed over as a file, whole, and the hook says
- * where, so nothing is ever cut or dropped.
+ * What this conversation's project context hook hands over now, or null when there is
+ * nothing new. Cursor's supported `additional_context` lane, not a Claude hook
+ * response: on sessionStart (`force`, the plugin's only hook there) and after a tool
+ * call, where the plugin's other hooks may answer too. Text longer than this hook's
+ * share of Cursor's ceiling is handed over as its file, whole (`fitHookContext`).
+ *
+ * Nothing is recorded here. `delivered()` writes the receipt that keeps a later tool
+ * call from handing the same context over again, and the caller calls it only once the
+ * output has been handed to Cursor. The output always fits the share, so Cursor never
+ * drops it; when nothing fitting can be made there is no output and no receipt, and a
+ * later call tries again.
  */
-export function repositoryContextHook(input, {home=os.homedir(),force=false}={}) {
+export function repositoryContextOutput(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE}={}) {
   const id = firingConversation(input)
   if (!id) return null
   const snapshot = readRepositorySnapshot(id,home)
@@ -178,20 +185,34 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false}={})
   const hash = createHash('sha256').update(text).digest('hex')
   const receipt = `${snapshotFile(id,home)}.delivered`
   if (!force && read(receipt)?.hash === hash) return null
-  let content=text
   // This hook's share of Cursor's own ceiling, not an arbitrary repository-count quota.
-  const hostLimit=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE
-  if(content.length>hostLimit) {
-    const location=JSON.stringify(snapshotTextFile(id,snapshot,home)).replaceAll('<','\\u003c').replaceAll('>','\\u003e')
-    const continuation=`The full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and the complete rules) does not fit in one hook note: Cursor passes on at most ${CURSOR_HOOK_CONTEXT_MAX_CHARS.toLocaleString('en-US')} characters from all of the DevSpec plugin's hooks together. Read it whole now, with the file-reading tool, at ${location}: nothing in that file is cut. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.`
-    const facts=renderRepositorySnapshot(snapshot,{includeRules:false})
-    content=facts.length+continuation.length+2<=hostLimit?`${facts}\n\n${continuation}`:continuation
-  }
-  write(receipt,{hash})
-  return {additional_context:content}
+  // The complete text is already in its immutable snapshot file (storeRepositorySnapshot).
+  const content = fitHookContext(text, {
+    share,
+    home,
+    what: `The full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and the complete rules)`,
+    lead: renderRepositorySnapshot(snapshot,{includeRules:false}),
+    also: 'If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.',
+    spill: (whole) => {
+      const file=snapshotTextFile(id,snapshot,home)
+      if(!fs.existsSync(file)) writePrivateText(file,whole)
+      return file
+    },
+  })
+  if (content===null || content.length>share) return null
+  return { output: {additional_context:content}, delivered: () => write(receipt,{hash}) }
+}
+
+/** `repositoryContextOutput`, recorded as delivered at once: for callers that hand it straight over. */
+export function repositoryContextHook(input, options={}) {
+  const result = repositoryContextOutput(input, options)
+  if (!result) return null
+  result.delivered()
+  return result.output
 }
 
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
-  try { const result=repositoryContextHook(JSON.parse(fs.readFileSync(0,'utf8')),{force:process.argv[2]==='start'});if(result)process.stdout.write(JSON.stringify(result)) }
+  // Handed to Cursor first, recorded as delivered after: a receipt never stands for context that was not handed over.
+  try { const result=repositoryContextOutput(JSON.parse(fs.readFileSync(0,'utf8')),{force:process.argv[2]==='start'});if(result){process.stdout.write(JSON.stringify(result.output));result.delivered()} }
   catch { process.stdout.write(JSON.stringify({additional_context:'DevSpec project repository context is unavailable; no local repository or push readiness was verified.'})) }
 }

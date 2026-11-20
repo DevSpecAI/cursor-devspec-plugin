@@ -354,17 +354,55 @@ describe('the reader is the only thing that marks a message read', () => {
       read: {},
       selfLabel: ME,
       budget: 1_000,
-      writeOverflow: (line) => {
-        stored = line.text
-        return '/tmp/x.txt'
+      writeOverflow: (entry) => {
+        stored = entry
+        return '/tmp/x.json'
       },
     })
-    const entry = JSON.parse(page.printed[0])
-    assert.equal(entry.text, null)
-    assert.equal(entry.text_chars, 5_000)
-    assert.equal(entry.text_file, '/tmp/x.txt')
-    assert.equal(stored, huge)
+    const pointer = JSON.parse(page.printed[0])
+    assert.equal(pointer.entry_file, '/tmp/x.json')
+    assert.equal(pointer.message_id, lines[0].message_id)
+    assert.equal(pointer.text, undefined, 'nothing of the message itself on the page')
+    assert.equal(stored.text, huge, 'the whole message in the file')
+    assert.equal(stored.from, 'Ali Price')
     assert.ok(page.read[lines[0].message_id], 'handed over, so read')
+  })
+
+  it('never marks a message read when it could not be handed over', () => {
+    const lines = [msg({ text: 'z'.repeat(5_000) })]
+    assert.throws(() =>
+      readPage({
+        lines,
+        read: {},
+        selfLabel: ME,
+        budget: 1_000,
+        writeOverflow: () => {
+          throw new Error('disk full')
+        },
+      }),
+    /disk full/)
+  })
+
+  it('hands over a message with a huge attachment list whole, as a file, and keeps the read within Cursor\'s Shell ceiling', () => {
+    const attachments = Array.from({ length: 400 }, (_, i) => ({
+      resource_id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      name: `screenshot-${i}.png`,
+      delivery: 'resource',
+    }))
+    const lines = [msg({ text: 'see the screenshots', attachments }), msg({ text: 'and this' })]
+    const room = makeHome(lines)
+    const first = readerRun(room)
+    assert.equal(first.status, 0, first.stderr)
+    assert.ok(first.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `${first.stdout.length} characters`)
+    const [header, pointer, ...rest] = parseReader(first.stdout)
+    assert.equal(pointer.message_id, lines[0].message_id)
+    const whole = JSON.parse(fs.readFileSync(pointer.entry_file, 'utf8'))
+    assert.equal(whole.text, 'see the screenshots')
+    assert.deepEqual(whole.attachments, attachments, 'every attachment, in the file')
+    assert.equal(fs.statSync(pointer.entry_file).mode & 0o777, 0o600)
+    assert.deepEqual(rest.map((entry) => entry.text), ['and this'])
+    assert.equal(header.room_messages.remaining, 0)
+    assert.match(parseReader(readerRun(room).stdout)[0].note, /Nothing unread/, 'both handed over, so both read')
   })
 })
 

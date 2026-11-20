@@ -49,6 +49,7 @@ import { readOwnConnectionState } from './own-connection.mjs'
 import { firingConversation, namespacedVerb } from './project-context.mjs'
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
 import { transcriptPaths } from './room-transcript.mjs'
+import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
 
 export const READ_STATE_VERSION = 1
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
@@ -90,7 +91,8 @@ export function presentedStatePath(connectionId, sessionId, dir) {
 }
 
 function overflowPath(connectionId, sessionId, messageId, dir) {
-  return path.join(dir, `${connectionId}.${sessionId}.message-${messageId}.txt`)
+  const name = SAFE_ID.test(String(messageId)) ? messageId : createHash('sha256').update(String(messageId)).digest('hex').slice(0, 32)
+  return path.join(dir, `${connectionId}.${sessionId}.message-${name}.json`)
 }
 
 function shellQuote(value) {
@@ -386,15 +388,15 @@ export function postToolNotice({
     savePresented(room, keepPresented(presented, all), fingerprint)
     return null
   }
-  savePresented(room, presentedMapOf(all), fingerprint)
-  const text = noticeText(view.notice)
-  return JSON.stringify({
-    additional_context: text,
-    hookSpecificOutput: {
-      hookEventName: 'PostToolUse',
-      additionalContext: text,
-    },
+  // Within this hook's share of Cursor's ceiling, or as a file the note names, so the
+  // notice is handed over whole before anything is marked as told.
+  const context = fitHookContext(noticeText(view.notice), {
+    home,
+    what: 'The count of room messages you have not read',
   })
+  if (context === null) return null
+  savePresented(room, presentedMapOf(all), fingerprint)
+  return JSON.stringify(postToolUseOutput(context))
 }
 
 /**
@@ -498,8 +500,11 @@ function renderEntry({ line }, { updated, selfLabel }) {
 
 /**
  * One page of unread messages, oldest first, and the read record with exactly those
- * marked. `writeOverflow(line)` stores one message too long for a page on its own and
- * returns where. Exported for tests.
+ * marked. A message whose entry would not fit a page on its own, by its text, its
+ * attachments or anything else about it, is handed over whole as a file:
+ * `writeOverflow(entry, line)` stores the complete entry and returns where, and the
+ * page carries a short pointer to it. A message is marked read only once it is on the
+ * page or in its file; a failed write throws, and nothing is marked. Exported for tests.
  */
 export function readPage({
   lines,
@@ -517,17 +522,19 @@ export function readPage({
   const nextRead = { ...read }
   let used = 0
   for (const item of pending) {
-    let entry = renderEntry(item, { updated: item.updated, selfLabel })
+    const entry = renderEntry(item, { updated: item.updated, selfLabel })
     let text = JSON.stringify(entry)
     // Each printed line ends in a newline, which counts against the page too.
     if (text.length + 1 > budget) {
-      entry = {
-        ...entry,
-        text: null,
-        text_chars: (item.line.text ?? '').length,
-        text_file: writeOverflow(item.line),
-      }
-      text = JSON.stringify(entry)
+      text = JSON.stringify({
+        seq: entry.seq,
+        message_id: entry.message_id,
+        ...(entry.updated ? { updated: true } : {}),
+        entry_chars: text.length,
+        entry_file: writeOverflow(entry, item.line),
+        note: 'Too long for one read: the whole message, as one JSON object, is in entry_file. Read it with the file-reading tool.',
+      })
+      if (text.length + 1 > budget) throw new Error('room-unread: not even a pointer to this message fits one read')
     }
     if (printed.length > 0 && used + text.length + 1 > budget) break
     printed.push(text)
@@ -584,9 +591,9 @@ function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
     read,
     selfLabel: copy.selfLabel,
     budget: readerPageBudget({ total: unread.length + updated.length, next }),
-    writeOverflow: (line) => {
+    writeOverflow: (entry, line) => {
       const file = overflowPath(room.connectionId, room.sessionId, line.message_id, room.dir)
-      writePrivateText(file, line.text ?? '')
+      writePrivateText(file, JSON.stringify(entry, null, 2) + '\n')
       return file
     },
   })

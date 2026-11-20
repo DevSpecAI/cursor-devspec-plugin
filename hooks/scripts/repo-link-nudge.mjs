@@ -32,6 +32,7 @@ import { withoutStandInPrefix } from './git-observer.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
 
 const LOOKUP_TIMEOUT_MS = 8_000
 
@@ -153,15 +154,14 @@ export async function handleBashPost(hookInput, deps = {}) {
   const project = projects.find((p) => p?.id === pinId)
   if (!project) return null
 
-  remember(marker)
-  const additionalContext = nudgeText({ projectName: project.name, remote })
-  return {
-    additional_context: additionalContext,
-    hookSpecificOutput: {
-      hookEventName: 'PostToolUse',
-      additionalContext,
-    },
-  }
+  const output = postToolUseOutput(
+    fitHookContext(nudgeText({ projectName: project.name, remote }), {
+      what: 'A note about linking this repository to its DevSpec project',
+      ...(deps.home ? { home: deps.home } : {}),
+    }),
+  )
+  if (output) remember(marker)
+  return output
 }
 
 async function main() {

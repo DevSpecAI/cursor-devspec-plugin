@@ -14,6 +14,7 @@ import path from 'node:path'
 import { after, describe, it } from 'node:test'
 
 import { handleBashPost, looksRemoteCreating, nudgeText } from './repo-link-nudge.mjs'
+import { POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
 
 const tmp = []
 function tmpDir(prefix) {
@@ -95,6 +96,31 @@ describe('the reminder', () => {
     assert.doesNotMatch(text, /Integrations/)
     assert.ok(text.includes(REMOTE))
     assert.doesNotMatch(text, new RegExp(PROJECT), 'the person needs the name, not our id')
+  })
+
+  it('keeps to its share of Cursor\'s hook ceiling, handing a long one over whole as a file', async () => {
+    const home = tmpDir('devspec-nudge-home-')
+    const name = `Greenfield ${'with a very long name '.repeat(120)}end`
+    const out = await handleBashPost(
+      { conversation_id: 'conv-long', session_id: 'conv-long', cwd: '/x', tool_input: { command: `git remote add origin ${REMOTE}` } },
+      {
+        env: { DEVSPEC_CURSOR_PROVENANCE_STATE_DIR: tmpDir('devspec-nudge-state-') },
+        home,
+        findProjectPin: () => ({ project_id: PROJECT, path: '/x/.devspec/project.json' }),
+        gitRemoteOrigin: () => REMOTE,
+        resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'http://127.0.0.1:1/api/mcp' }),
+        readProject: () => null,
+        call: async () => ({
+          projects: [{ id: PROJECT, name }],
+          remote_match: { normalized: 'github.com/example/greenfield', resolved_project_id: null, candidate_project_ids: [] },
+        }),
+      },
+    )
+    const text = out.additional_context
+    assert.ok(text.length <= POST_TOOL_CONTEXT_SHARE, `${text.length} characters`)
+    const file = JSON.parse(text.match(/at ("[^"]+")/)[1])
+    assert.ok(file.startsWith(home))
+    assert.ok(fs.readFileSync(file, 'utf8').includes(name), 'the whole note, name and all')
   })
 
   it('is said once per conversation, project and remote', async () => {

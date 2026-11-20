@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { selectProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextOutput, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
 import { buildOwnerMessageEvents, parseWakeBatches } from './devspec-remote-wait.mjs'
 import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingress-test-fixtures.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
@@ -101,6 +101,23 @@ test('real host size limit has a complete file continuation, never a lost tail',
  assert.equal(fs.statSync(repositoryContextTextFile('one',home)).mode&0o777,0o600)
  assert.notEqual(repositoryContextTextFile('one',home),oldPath)
  assert.equal(fs.readFileSync(oldPath,'utf8'),oldBytes,'old continuation files retain their snapshot bytes')
+}))
+
+test('context counts as delivered only once handed over, and only when Cursor would pass it on',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ // Made but not yet handed over: nothing is recorded, so the next tool call offers it again.
+ const first=repositoryContextOutput({conversation_id:'one'},{home})
+ assert.ok(first.output.additional_context.length<=POST_TOOL_CONTEXT_SHARE)
+ assert.deepEqual(repositoryContextOutput({conversation_id:'one'},{home}).output,first.output)
+ // Nothing that fits can be made (a share shorter than the pointer to the file): no
+ // output, nothing recorded, and a later call with room for it still delivers.
+ assert.equal(repositoryContextOutput({conversation_id:'one'},{home,share:40}),null)
+ const later=repositoryContextOutput({conversation_id:'one'},{home})
+ assert.ok(later)
+ // Handed over, then recorded: the same context is not offered again.
+ later.delivered()
+ assert.equal(repositoryContextOutput({conversation_id:'one'},{home}),null)
 }))
 
 test('empty, unavailable, malformed and delimiter-bearing inventories remain honest data',()=>setup(home=>{
