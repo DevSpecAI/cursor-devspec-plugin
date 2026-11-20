@@ -340,16 +340,36 @@ function claimsFor(claims, projectId) {
 }
 
 /**
+ * The claims made in this conversation that could not be recorded
+ * (`{ task_id, project_id, confirmed }`, as provenance-assistance.mjs keeps them) and may
+ * be this project's: those in it, and those whose project is not known. Each as
+ * `{ id, confirmed }`, where `confirmed` means DevSpec named the task, so `id` is its full id.
+ */
+function unrecordedFor(unrecorded, projectId) {
+  const out = []
+  for (const entry of Array.isArray(unrecorded) ? unrecorded : []) {
+    if (!entry || typeof entry !== 'object') continue
+    const project = typeof entry.project_id === 'string' ? entry.project_id.toLowerCase() : null
+    if (project && project !== projectId) continue
+    const id = typeof entry.task_id === 'string' && UUID.test(entry.task_id) ? entry.task_id.toLowerCase() : null
+    out.push({ id, confirmed: entry.confirmed === true && id !== null })
+  }
+  return out
+}
+
+/**
  * For one Shell command: the command with the stand-in line in front, or null when
  * the stand-in does not apply (Windows, no live connection bound to this conversation,
  * or the folder could not be set up). Writes the envelope the stand-in reads: the
- * connection and conversation, the project and its repositories, and the tasks
- * claimed in the conversation in that project (`claims`, as `{ id, project_id }`).
+ * connection and conversation, the project and its repositories, the tasks claimed in
+ * the conversation in that project (`claims`, as `{ id, project_id }`), and the claims
+ * made in it that could not be recorded (`unrecorded`, item 953ab72e).
  */
 export function prepareStandIn({
   command,
   conversationId,
   claims = [],
+  unrecorded = [],
   projectId = null,
   env = process.env,
   home = os.homedir(),
@@ -379,6 +399,7 @@ export function prepareStandIn({
       project_id: project,
       repositories: project ? projectRepositoryKeys(conversationId, project, { home }) : [],
       claims: project ? claimsFor(claims, project) : [],
+      unrecorded: project ? unrecordedFor(unrecorded, project) : [],
       created_at: now,
     })
     pruneEnvelopes(envelopes, now)

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.22.0
+
+- **A commit the agent makes with no task claimed now goes through, with a note, instead of being stopped.** Work that needs no task, such as a dependency update or an automation run, commits normally. The note tells the agent the commit carries no task reference, and that if the work does belong to a task, claiming it before the next commit gets the reference added automatically. This holds both while connected and without a connection, including on native Windows.
+- **With several tasks claimed, a commit is still stopped and the agent is asked which task it belongs to.** With exactly one claimed, its reference is still added for the agent.
+- **A commit is never linked to the wrong task when the agent's newest claim could not be read.** Before, if the plugin could not read back a task the agent had just claimed, it could add an older claim's reference to the next commit. Now it never does: when DevSpec has confirmed the newer claim and the repository is certainly the project's, the commit is stopped and the agent is asked which task it belongs to, naming both; otherwise, for example when DevSpec cannot be reached, the commit goes through untagged with a note.
+- **Claiming a task by its short code works like claiming it by its full id.** The plugin now records the claim against the task's full id, so the agent's commits are tagged with it.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.21.0
 
 - **A connected Cursor agent that is waiting for work now listens instead of asking.** With remote control on, the plugin keeps one connection open to DevSpec, and DevSpec tells it the moment something arrives for it. While nothing is happening, it no longer asks DevSpec every 25 to 30 seconds whether anything has changed. It checks in once every 45 seconds, so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
