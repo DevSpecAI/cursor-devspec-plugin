@@ -6,8 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-import { fitHookContext, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
-import { writePrivateText } from './private-state.mjs'
+import { pointToNote, POST_TOOL_CONTEXT_SHARE, readsNote, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -164,55 +163,40 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
 }
 
 /**
- * What this conversation's project context hook hands over now, or null when there is
- * nothing new. Cursor's supported `additional_context` lane, not a Claude hook
- * response: on sessionStart (`force`, the plugin's only hook there) and after a tool
- * call, where the plugin's other hooks may answer too. Text longer than this hook's
- * share of Cursor's ceiling is handed over as its file, whole (`fitHookContext`).
+ * What this conversation's project context hook hands over now, or null. Cursor's
+ * supported `additional_context` lane, not a Claude hook response: on sessionStart
+ * (`force`) and after each tool call.
  *
- * Nothing is recorded here. `delivered()` writes the receipt that keeps a later tool
- * call from handing the same context over again, and the caller calls it only once the
- * output has been handed to Cursor. The output always fits the share, so Cursor never
- * drops it; when nothing fitting can be made there is no output and no receipt, and a
- * later call tries again.
+ * The project's repositories and run-wide rules always go to a note file, with the
+ * same short line saying how to read it (decision 86111641): never inline when small
+ * and a pointer when large. Cursor keeps no record of whether a hook's note reached
+ * the agent, and drops every hook's note on a step when all of them together pass its
+ * ceiling (hook-context-budget.mjs), so printing the line proves nothing. The line
+ * comes back after every step until the agent is seen reading the file (`readsNote`),
+ * and again whenever the context changes. sessionStart offers it even after it was
+ * read, since a new or resumed chat may not hold it.
  */
-export function repositoryContextOutput(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE}={}) {
+export function repositoryContextHook(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE}={}) {
   const id = firingConversation(input)
   if (!id) return null
   const snapshot = readRepositorySnapshot(id,home)
   if (!snapshot) return null
-  const text = renderRepositorySnapshot(snapshot)
-  const hash = createHash('sha256').update(text).digest('hex')
-  const receipt = `${snapshotFile(id,home)}.delivered`
-  if (!force && read(receipt)?.hash === hash) return null
-  // This hook's share of Cursor's own ceiling, not an arbitrary repository-count quota.
-  // The complete text is already in its immutable snapshot file (storeRepositorySnapshot).
-  const content = fitHookContext(text, {
+  const note = writeNote(renderRepositorySnapshot(snapshot),{home})
+  const seenFile = `${snapshotFile(id,home)}.seen`
+  if (readsNote(input,note.id)) {
+    write(seenFile,{note:note.id})
+    return null
+  }
+  if (!force && read(seenFile)?.note === note.id) return null
+  const content = pointToNote(note, {
     share,
-    home,
-    what: `The full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and the complete rules)`,
-    lead: renderRepositorySnapshot(snapshot,{includeRules:false}),
-    also: 'If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.',
-    spill: (whole) => {
-      const file=snapshotTextFile(id,snapshot,home)
-      if(!fs.existsSync(file)) writePrivateText(file,whole)
-      return file
-    },
+    what: `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`,
+    also: 'This line comes back after each step until you have read it. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.',
   })
-  if (content===null || content.length>share) return null
-  return { output: {additional_context:content}, delivered: () => write(receipt,{hash}) }
-}
-
-/** `repositoryContextOutput`, recorded as delivered at once: for callers that hand it straight over. */
-export function repositoryContextHook(input, options={}) {
-  const result = repositoryContextOutput(input, options)
-  if (!result) return null
-  result.delivered()
-  return result.output
+  return content===null ? null : {additional_context:content}
 }
 
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
-  // Handed to Cursor first, recorded as delivered after: a receipt never stands for context that was not handed over.
-  try { const result=repositoryContextOutput(JSON.parse(fs.readFileSync(0,'utf8')),{force:process.argv[2]==='start'});if(result){process.stdout.write(JSON.stringify(result.output));result.delivered()} }
+  try { const result=repositoryContextHook(JSON.parse(fs.readFileSync(0,'utf8')),{force:process.argv[2]==='start'});if(result)process.stdout.write(JSON.stringify(result)) }
   catch { process.stdout.write(JSON.stringify({additional_context:'DevSpec project repository context is unavailable; no local repository or push readiness was verified.'})) }
 }

@@ -87,7 +87,7 @@ For transparency and security review, here is what the plugin connects to, runs 
   - while you're connected, put a small `git` stand-in in front of the agent's shell commands, so commits are tagged and reported. The stand-in runs your own git unchanged, and nothing is installed in your repositories or git configuration.
 - **Files on your machine.**
   - `~/.devspec/cursor/auth.json` holds remote control's and commit tracking's sign-in, one per DevSpec server, renewed automatically and readable only by you. Nothing else reads it, and the plugin reads no other tool's sign-in.
-  - `~/.devspec/` also holds each connection's state, the session's recent messages, commit tracking records and logs, and any note from the plugin too long for Cursor to hand the agent at once (the agent is told where to read it), all readable only by you.
+  - `~/.devspec/` also holds each connection's state, the session's recent messages, commit tracking records and logs, readable only by you. Its `notes/` folder holds what the plugin hands the agent as a file to read: the project's rules for a conversation, a message for you the plugin could not post, and anything too long for Cursor to pass on at once.
   - `.devspec/project.json` is written in a repository only when you ask `/devspec-project` to remember a default project.
 
 ---
@@ -124,6 +124,7 @@ For people working on the plugin or trying a release before it's in the Marketpl
 - **Machines with no browser** (CI, cloud workers). Set `DEVSPEC_MCP_TOKEN` (and `DEVSPEC_MCP_URL` for another server) for the background features. It takes precedence over a browser sign-in, and the plugin says so whenever both are present.
 - **Simulate a customer install.** Add this repository as a plugin marketplace with `cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin`, then install **devspec** from `/plugin`. Adding a marketplace does not install the plugin; installing it from `/plugin` is what loads it. A copy installed this way stays on the version you installed: to move on, run `cursor-agent plugin marketplace remove devspec`, add it again and reinstall. `cursor-agent plugin marketplace update` does not bring a newer version.
 - **Resuming chats.** `cursor-agent --resume` works as usual; the plugin reports Cursor's conversation id to DevSpec as `local_session_id`. A chat without a Cursor conversation id is matched to a DevSpec connection only when exactly one live, attached Cursor connection is in the folder; with several, the plugin refuses rather than guess.
+- **Context the hooks add.** Cursor passes on at most 10,000 characters from all the hooks that answer one step, this plugin's, other plugins' and your own together, and drops all of them when they run over. It keeps no record of what reached the agent: the agent transcript never holds hook context. So each of this plugin's hooks keeps to an equal share and puts anything longer in `~/.devspec/notes/`, and what must reach the agent (the project's rules, a message for you, unread room messages) is offered again after every step until the agent is seen reading it. `hooks/scripts/hook-context-budget.mjs` has the measurements and the details.
 - **Tests.** Run them with `npm test`.
 
 ## License

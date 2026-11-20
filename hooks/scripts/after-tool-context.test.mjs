@@ -153,9 +153,9 @@ function contextOf(stdout) {
   return null
 }
 
-const pointedFile = (context) => {
-  const match = context.match(/at ("[^"]+"): nothing in that file is cut/)
-  return match ? JSON.parse(match[1]) : null
+const pointedNote = (home, context) => {
+  const match = context.match(/cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md/)
+  return match ? { id: match[1], file: path.join(home, '.devspec', 'notes', `${match[1]}.md`) } : null
 }
 
 describe('every after-tool hook, together, at its longest', () => {
@@ -181,12 +181,32 @@ describe('every after-tool hook, together, at its longest', () => {
     assert.ok(joined.length <= CURSOR_HOOK_CONTEXT_MAX_CHARS, `${joined.length} characters together`)
     assert.ok(answers.length <= POST_TOOL_CONTEXT_HOOKS, `${answers.length} hooks answered; the share is counted for ${POST_TOOL_CONTEXT_HOOKS}`)
 
-    // Every seeded note was handed over, each whole in the file its pointer names.
-    const files = answers.map((answer) => pointedFile(answer.context)).filter(Boolean)
-    const whole = files.map((file) => fs.readFileSync(file, 'utf8'))
+    // Every seeded note was handed over, each whole in the note its pointer names.
+    const notes = answers.map((answer) => pointedNote(home, answer.context)).filter(Boolean)
+    const whole = notes.map((note) => fs.readFileSync(note.file, 'utf8'))
     for (const end of ['RULES-END', 'TELL-END', 'NOTE-END', 'Teammate number 600', 'unexpected_key_1999']) {
       assert.ok(whole.some((text) => text.includes(end)), `${end} handed over whole`)
     }
     assert.equal(answers.length, 5, answers.map((answer) => answer.command).join('\n'))
+
+    // Cursor may have dropped all of it (another plugin's hook, or the person's own, can
+    // push the step over the ceiling), and it leaves no record either way. So the next
+    // step offers again what must reach the agent: the rules, the person's message and
+    // the unread room.
+    const again = runHooks(home, { ...input, tool_use_id: 'tool-use-after-tool-2', tool_input: { command: 'ls' } })
+      .map(({ stdout }) => contextOf(stdout))
+      .filter((context) => context !== null)
+    assert.ok(again.some((context) => /project context/.test(context)), 'the rules, again')
+    assert.ok(again.some((context) => /message your person has not heard/.test(context)), "the person's message, again")
+    assert.ok(again.some((context) => /^DevSpec room: 600 messages you have not read yet/.test(context)), 'the unread room, again')
+    assert.ok(again.join(CURSOR_HOOK_CONTEXT_SEPARATOR).length <= CURSOR_HOOK_CONTEXT_MAX_CHARS)
+
+    // Once the agent reads the rules note, that pointer stops; the others stay until read.
+    const rules = notes.find((note) => fs.readFileSync(note.file, 'utf8').includes('RULES-END'))
+    const afterRead = runHooks(home, { ...input, tool_use_id: 'tool-use-after-tool-3', tool_name: 'Read', tool_input: { file_path: rules.file } })
+      .map(({ stdout }) => contextOf(stdout))
+      .filter((context) => context !== null)
+    assert.ok(!afterRead.some((context) => /project context/.test(context)), 'read, so no longer offered')
+    assert.ok(afterRead.some((context) => /message your person has not heard/.test(context)))
   })
 })

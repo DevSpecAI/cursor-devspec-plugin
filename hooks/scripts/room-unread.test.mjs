@@ -154,7 +154,7 @@ describe('what counts is what a person sees, never the row state', () => {
 })
 
 describe('the mid-turn notice (PostToolUse)', () => {
-  it('tells once, as counts, and never carries a body', () => {
+  it('tells as counts, never a body, and reminds after every step until the messages are read', () => {
     const lines = [
       presence(),
       msg({ text: 'please look at the deploy' }),
@@ -184,16 +184,23 @@ describe('the mid-turn notice (PostToolUse)', () => {
       !out.includes('please look at the deploy') && !out.includes('secret plan details'),
       'counts only',
     )
+    // Printed is not delivered (Cursor may have dropped every hook's note on that step),
+    // so until the reader hands the messages over, each step carries a one-line reminder.
+    const reminder = JSON.parse(postTool(room)).additional_context
+    assert.equal(reminder, `DevSpec room: 2 messages you have not read yet. Read them with: ${readCommand(CONN, SCRIPT)}`)
+    assert.equal(JSON.parse(postTool(room)).additional_context, reminder)
+    assert.equal(readerRun(room).status, 0)
+    assert.equal(postTool(room), null, 'read, so nothing more to say')
     assert.equal(postTool(room), null)
   })
 
-  it('stays quiet when the room changed only by my own message, and speaks for the next real one', () => {
+  it('treats my own message as no news, and gives the full count for the next real one', () => {
     const lines = [msg()]
     const room = makeHome(lines)
     assert.ok(postTool(room))
     lines.push(mine())
     writeRoom(room, lines)
-    assert.equal(postTool(room), null)
+    assert.match(JSON.parse(postTool(room)).additional_context, /^DevSpec room: 1 message you have not read yet\./, 'only the reminder')
     lines.push(pi({ text: 'heads-up: I moved the file you are editing' }))
     writeRoom(room, lines)
     const notice = noticeOf(postTool(room))

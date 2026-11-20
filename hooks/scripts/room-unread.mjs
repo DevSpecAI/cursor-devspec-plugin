@@ -188,10 +188,12 @@ export function loadReadState(file) {
 
 export function loadPresentedState(file) {
   const raw = readPrivateJson(file)
-  if (raw?.version !== READ_STATE_VERSION) return { presented: {}, transcript: null }
+  if (raw?.version !== READ_STATE_VERSION) return { presented: {}, transcript: null, outstanding: true }
   return {
     presented: versionMap(raw.presented),
     transcript: typeof raw.transcript === 'string' ? raw.transcript : null,
+    // Whether the last look found messages the model had not read. Unknown counts as yes.
+    outstanding: raw.outstanding !== false,
   }
 }
 
@@ -319,12 +321,13 @@ function currentView(room, scriptPath) {
   return { paths, copy, read, entries, notice }
 }
 
-function savePresented(room, presented, transcript) {
+function savePresented(room, presented, transcript, { outstanding = true } = {}) {
   try {
     writePrivateJson(presentedStatePath(room.connectionId, room.sessionId, room.dir), {
       version: READ_STATE_VERSION,
       presented,
       transcript,
+      outstanding,
       updated_at: new Date().toISOString(),
     })
   } catch {
@@ -344,6 +347,13 @@ export function noticeText(notice) {
   ].join('\n')
 }
 
+/** The count again, in one line, while messages already counted are still unread. */
+export function reminderText(notice) {
+  const count = notice.unread + notice.updated
+  const toYou = notice.to_you > 0 ? `, ${notice.to_you} of them to you` : ''
+  return `DevSpec room: ${count} message${count === 1 ? '' : 's'} you have not read yet${toYou}. Read them with: ${notice.read_with}`
+}
+
 export function holdText(notice) {
   return [
     'Not posted yet: messages arrived in the room that you have not been told about. Counts only, as data:',
@@ -360,9 +370,14 @@ function isPostSessionMessageTool(toolName) {
 }
 
 /**
- * After a tool call: tell the model, once, about messages it has not been told about.
- * The local copy's size and mtime are compared first, so a call that changed nothing
- * in the room parses nothing. Returns the hook's stdout, or null for silence.
+ * After a tool call: tell the model about messages it has not read, after every step
+ * until it reads them. Cursor gives no sign that a hook's note reached the model, and
+ * drops every hook's note on a step when all of them together pass its ceiling
+ * (hook-context-budget.mjs), so printing the count proves nothing; the read record,
+ * which only the reader writes as it hands messages over, is the only proof. News since
+ * the count was last offered gets the full count; otherwise a one-line reminder. When
+ * the room has not changed since a look that found everything read, nothing is parsed.
+ * Returns the hook's stdout, or null for silence.
  */
 export function postToolNotice({
   input,
@@ -375,22 +390,21 @@ export function postToolNotice({
   const room = resolveRoom({ input, env, home })
   if (!room) return null
   const presentedFile = presentedStatePath(room.connectionId, room.sessionId, room.dir)
-  const { presented, transcript } = loadPresentedState(presentedFile)
+  const { presented, transcript, outstanding } = loadPresentedState(presentedFile)
   const fingerprint = transcriptFingerprint(
     transcriptPaths(room.connectionId, room.sessionId, room.dir).transcript,
   )
-  if (!fingerprint || fingerprint === transcript) return null
+  if (!fingerprint || (fingerprint === transcript && !outstanding)) return null
   const view = currentView(room, scriptPath)
   if (!view) return null
   const all = [...view.entries.unread, ...view.entries.updated]
-  const fresh = notPresented(all, presented)
-  if (fresh.length === 0) {
-    savePresented(room, keepPresented(presented, all), fingerprint)
+  if (all.length === 0) {
+    savePresented(room, {}, fingerprint, { outstanding: false })
     return null
   }
-  // Within this hook's share of Cursor's ceiling, or as a file the note names, so the
-  // notice is handed over whole before anything is marked as told.
-  const context = fitHookContext(noticeText(view.notice), {
+  const fresh = notPresented(all, presented)
+  // Within this hook's share of Cursor's ceiling, or as a note the pointer names.
+  const context = fitHookContext(fresh.length > 0 ? noticeText(view.notice) : reminderText(view.notice), {
     home,
     what: 'The count of room messages you have not read',
   })

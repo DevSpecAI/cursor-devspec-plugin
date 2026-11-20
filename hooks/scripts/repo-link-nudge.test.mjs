@@ -118,9 +118,8 @@ describe('the reminder', () => {
     )
     const text = out.additional_context
     assert.ok(text.length <= POST_TOOL_CONTEXT_SHARE, `${text.length} characters`)
-    const file = JSON.parse(text.match(/at ("[^"]+")/)[1])
-    assert.ok(file.startsWith(home))
-    assert.ok(fs.readFileSync(file, 'utf8').includes(name), 'the whole note, name and all')
+    const id = text.match(/cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md/)[1]
+    assert.ok(fs.readFileSync(path.join(home, '.devspec', 'notes', `${id}.md`), 'utf8').includes(name), 'the whole note, name and all')
   })
 
   it('is said once per conversation, project and remote', async () => {
