@@ -51,8 +51,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { NO_REQUEST, UNSTATED, readRequestState } from './requests.mjs'
+import { logRemoteControlStory } from './remote-control-story.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
@@ -69,7 +71,8 @@ export const NOTICE_AUDIENCE_CONTRACT = 'semantics.notice_audience in devspec://
 export const FOR_THE_RECORD_HANDLING =
   'DevSpec labelled this notice for the record: it gets no notice reply and nothing in the room, ' +
   'and any housekeeping it asks for on your own work is done quietly. ' +
-  'If a write you make while handling it returns tell_person, tell your person what you changed. ' +
+  'If a write you make while handling it returns tell_person, tell your person: in a turn that only DevSpec notices or check jobs woke, ' +
+  'put it in your final message, which the plugin posts to the room as your own message; in any other turn, in your next message to them. ' +
   `Rules: ${NOTICE_AUDIENCE_CONTRACT}.`
 
 /** The wake line's `notice_reply` when every notice it handed over is for the record. */
@@ -652,6 +655,121 @@ function hookAssistantText(data) {
 }
 
 /**
+ * The post that tells the person: DevSpec's append-only speech lane
+ * (`assistant_source_id` with `ingest_version: 2`, sent with the connection's own
+ * capability). It lands in the room the connection is attached to now, as the agent's
+ * ordinary message, whether or not a turn is open there; DevSpec refuses it only when
+ * the connection is in no room.
+ *
+ * Neither of the other shapes reaches the room from a turn that owns no command
+ * (item 140a7f68):
+ * - an ordinary connection post joins the turn DevSpec has open for the connection,
+ *   and a wake of notices or check jobs opens none, so it is refused;
+ * - a notice reply (`system_notice_ids`) is refused when every notice it names is for
+ *   the record, is recorded as quiet housekeeping with no message when they were all
+ *   settled (`semantics.notice_reply.only_when_needed`), and a check job has no notice
+ *   to name.
+ * The Pi plugin posts the same call for the same case.
+ */
+export function tellPersonPost({ connectionId, text, agentName = null, sourceId = randomUUID() } = {}) {
+  return {
+    connection_id: connectionId,
+    ingest_version: 2,
+    assistant_source_id: sourceId,
+    message: text,
+    phase: 'answer',
+    complete_turn: false,
+    ...(agentName ? { agent_name: agentName } : {}),
+  }
+}
+
+/** DevSpec's receipt for a post, from the parsed result or its first text block. */
+function postReceipt(result) {
+  if (result && typeof result === 'object' && typeof result.raw === 'string') {
+    try {
+      return JSON.parse(result.raw.split('\n')[0])
+    } catch {
+      return null
+    }
+  }
+  return result && typeof result === 'object' ? result : null
+}
+
+/** Why a post that came back did not store the message, or null when it did. */
+function notStoredReason(result) {
+  const delivery = postReceipt(result)?.delivery
+  if (delivery?.status === 'stored' || delivery?.status === 'idempotently_stored') return null
+  if (delivery?.reason) return `DevSpec did not store it (${delivery.reason}).`
+  return 'DevSpec did not confirm that it stored it.'
+}
+
+// ── A message the plugin could not post, left for the agent's next turn ───────
+
+export const TELL_PERSON_NOTE_SUFFIX = '.tell-person-pending.json'
+
+export function tellPersonNotePath(connectionId, dir = DEFAULT_DIR) {
+  return path.join(dir, `${connectionId}${TELL_PERSON_NOTE_SUFFIX}`)
+}
+
+function validNote(note) {
+  return Boolean(note) && typeof note === 'object' && typeof note.text === 'string' && note.text.trim() !== ''
+}
+
+/**
+ * Keep a final message the plugin could not post, with DevSpec's reason, until the
+ * agent's next turn (`takeTellPersonNotes`). Notes add up; none replaces another.
+ */
+export function leaveTellPersonNote(connectionId, { text, reason = null, dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  if (!connectionId || typeof text !== 'string' || !text.trim()) return false
+  const file = tellPersonNotePath(connectionId, dir)
+  const existing = readPrivateJson(file)
+  const notes = Array.isArray(existing?.notes) ? existing.notes.filter(validNote) : []
+  try {
+    writePrivateJson(file, { notes: [...notes, { at: now, reason, text }] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The notes left for this connection, removed as they are handed over. */
+export function takeTellPersonNotes(connectionId, { dir = DEFAULT_DIR } = {}) {
+  if (!connectionId) return []
+  const file = tellPersonNotePath(connectionId, dir)
+  const record = readPrivateJson(file)
+  const notes = Array.isArray(record?.notes) ? record.notes.filter(validNote) : []
+  if (notes.length === 0) return []
+  try {
+    fs.rmSync(file, { force: true })
+  } catch {
+    /* handed over anyway: a note seen twice is better than one never seen */
+  }
+  return notes
+}
+
+/** What the agent is told at its next turn about notes it was left. */
+export function tellPersonNoteText(notes) {
+  const list = (Array.isArray(notes) ? notes : []).filter(validNote)
+  if (list.length === 0) return null
+  const each = list.map((note, i) => [
+    `${list.length > 1 ? `${i + 1}. ` : ''}Why it was not posted: ${note.reason || 'DevSpec gave no reason.'}`,
+    'Your final message was:',
+    '<final-message>',
+    note.text,
+    '</final-message>',
+  ].join('\n'))
+  return [
+    'From the DevSpec plugin: in a turn that only DevSpec notices or check jobs woke, a DevSpec write you made carried tell_person ' +
+      `(${TELLING_ANYWAY_CONTRACT}) and you did not tell your person yourself. ` +
+      'The plugin tried to post your final message to the room for you and could not, so your person has not heard it.',
+    'Tell them in plain words in your next message to them, or here in the terminal when you are attached to no room.',
+    ...each,
+  ].join('\n\n')
+}
+
+export const TELLING_ANYWAY_CONTRACT = 'semantics.notice_audience.telling_anyway in devspec://product/remote-ingress-contract'
+
+/**
  * Stop, for a turn that owns no command (`turnOwnsNoCommand`: only DevSpec notices and
  * check jobs woke it). Nothing from such a turn reaches the room on the plugin's word:
  * whether a notice is answered there is DevSpec's rule (`semantics.notice_audience`,
@@ -661,42 +779,69 @@ function hookAssistantText(data) {
  * The one exception is DevSpec's `tell_person` mark on a write the turn made
  * (`semantics.notice_audience.telling_anyway`, which has a host that posts mechanically
  * post that run's answer). When the model posted nothing in the room itself (`told`,
- * or a notice reply it made), the turn's final message goes there as the ordinary
- * message the model would have posted: no notice ids (a for-the-record notice cannot
- * take a reply), no trail, no complete_turn and no local-turn flags. Nothing for a turn
- * that errored or was stopped (its last words are not an answer), or for a connection
- * in no room (the person already sees the final message in the terminal).
+ * or a notice reply it made), the turn's final message goes there as the agent's
+ * ordinary message (`tellPersonPost`). Nothing for a turn that errored or was stopped
+ * (its last words are not an answer), or for a connection in no room (the person
+ * already sees the final message in the terminal).
  *
- * @returns {Promise<boolean>} whether the final message was posted
+ * A message that could not be posted is never dropped: the failure is logged, and the
+ * message is left, with DevSpec's reason, for the agent's next turn
+ * (`leaveTellPersonNote`), where it is told to tell its person.
+ *
+ * `post(args, { connectionCapability })` makes the call; it is not made without the
+ * connection's capability, which the post needs.
+ *
+ * @returns {Promise<'posted'|'left_for_next_turn'|null>} null when there was nothing to post
  */
 export async function postTellPersonAtStop({
   raw,
   connectionId,
   sessionId,
   connectionState = null,
+  connectionCapability = null,
   agentName,
   told = false,
   post,
   dir = DEFAULT_DIR,
   prepare = (text) => String(text ?? '').trim() || null,
+  log = logRemoteControlStory,
+  now = Date.now(),
 } = {}) {
-  if (!connectionId || !sessionId || told || typeof post !== 'function') return false
+  if (!connectionId || !sessionId || told || typeof post !== 'function') return null
   const record = readTurnWakes(connectionId, { dir })
-  if (!record?.tellPersonAt || record.noticeReplyAt) return false
-  if (!turnOwnsNoCommand({ record, requestState: readRequestState(connectionId, { dir }), connectionState })) return false
+  if (!record?.tellPersonAt || record.noticeReplyAt) return null
+  if (!turnOwnsNoCommand({ record, requestState: readRequestState(connectionId, { dir }), connectionState })) return null
   let data = {}
   try {
     data = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
   } catch {
     data = {}
   }
-  if (data.status !== undefined && data.status !== 'completed') return false
+  if (data.status !== undefined && data.status !== 'completed') return null
   const text = prepare(hookAssistantText(data) ?? lastAssistantText(data.transcript_path))
-  if (!text) return false
-  await post({
-    connection_id: connectionId,
-    ...(agentName ? { agent_name: agentName } : {}),
-    message: text,
+  if (!text) return null
+  let reason
+  if (!connectionCapability) {
+    reason = 'This computer holds no capability for the connection, which DevSpec needs to post your message outside a turn. Reconnecting remote control gives it one.'
+  } else {
+    try {
+      reason = notStoredReason(await post(tellPersonPost({ connectionId, text, agentName }), { connectionCapability }))
+    } catch (error) {
+      reason = (error instanceof Error ? error.message : String(error ?? '')).trim() || 'The post failed with no reason given.'
+    }
+  }
+  if (!reason) return 'posted'
+  // The reason only, never the message: story lines carry no message bodies.
+  log({
+    phase: 'mirror_post',
+    outcome: 'failed',
+    reason: 'tell_person_not_posted',
+    connectionId,
+    sessionId,
+    agent: agentName,
+    tool: 'post_session_message',
+    data: { error: reason },
   })
-  return true
+  leaveTellPersonNote(connectionId, { text, reason, dir, now })
+  return 'left_for_next_turn'
 }

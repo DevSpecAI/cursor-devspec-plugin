@@ -766,8 +766,9 @@ async function main() {
     // on the plugin's word: when a notice is answered there is DevSpec's rule, and the
     // model posts that reply itself (item 140a7f68). The one exception is a write whose
     // result carried tell_person while the model told nobody: then its final message
-    // goes to the room as an ordinary message (notice-reply.mjs). Then what woke the
-    // turn is forgotten.
+    // goes to the room as the agent's own message, through the speech lane that needs
+    // no open turn; one that cannot be posted is logged and left for the agent's next
+    // turn (notice-reply.mjs). Then what woke the turn is forgotten.
     if (mode === 'stop' && connectionId) {
       try {
         await postTellPersonAtStop({
@@ -775,15 +776,23 @@ async function main() {
           connectionId,
           sessionId,
           connectionState: state,
+          connectionCapability,
           agentName,
           told: hadExplicitReply,
           dir: CONNECTIONS_DIR,
           prepare: prepareAgentMirrorText,
-          post: (args) =>
-            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+          post: (args, { connectionCapability: capability }) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'post_session_message',
+              arguments: args,
+              timeoutMs: 15_000,
+            }),
         })
       } catch {
-        /* non-fatal: the person still has the final message in the terminal */
+        /* a refused post is logged and kept inside; this only guards the turn's end */
       }
       clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
     }

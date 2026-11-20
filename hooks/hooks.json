@@ -117,7 +117,7 @@
       },
       {
         "type": "command",
-        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\" postToolUse",
         "timeout": 15
       },
       {
@@ -190,7 +190,7 @@
       },
       {
         "type": "command",
-        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\"",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mark-explicit-reply.mjs\" afterMCPExecution",
         "timeout": 15
       }
     ],
