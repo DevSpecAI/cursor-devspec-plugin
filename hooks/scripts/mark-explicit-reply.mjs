@@ -214,7 +214,7 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
       writePrivateText(file, `${text}\n`)
     } catch (error) {
       // Not handed over, so not taken: put every note back for the next tool call.
-      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, reason: note.reason, dir: connDir, now: note.at })
+      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
       throw error
     }
     text =

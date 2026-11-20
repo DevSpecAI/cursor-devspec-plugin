@@ -571,13 +571,14 @@ describe('the final message of a notice-only turn', () => {
       recordTellPerson(CONN, { dir })
     }
 
-    // DevSpec refuses it.
+    // DevSpec refuses it, with a structured answer.
     turn()
-    const refusal = new CursorMcpRefusal('Assistant speech delivery rejected; original source was not relabelled.', undefined)
+    const receipt = { delivery: { status: 'rejected', reason: 'not_attached', retryable: false }, error: 'Your connection is not attached to a room.' }
+    const refusal = new CursorMcpRefusal(JSON.stringify(receipt), receipt)
     assert.equal(await stop({ post: async () => { calls++; throw refusal } }), 'left_for_next_turn')
     // DevSpec answers without storing it.
     turn()
-    assert.equal(await stop({ post: async () => { calls++; return { delivery: { status: 'skipped', reason: 'not_attached', retryable: false } } } }), 'left_for_next_turn')
+    assert.equal(await stop({ post: async () => { calls++; return { delivery: { status: 'skipped', reason: 'no_unanswered_dispatch', retryable: false } } } }), 'left_for_next_turn')
     // No capability on this computer: nothing is sent at all.
     turn()
     assert.equal(await stop({ connectionCapability: null, post: async () => { calls++ } }), 'left_for_next_turn')
@@ -589,17 +590,23 @@ describe('the final message of a notice-only turn', () => {
       ['mirror_post', 'failed', 'tell_person_not_posted', CONN],
     ])
     assert.ok(logged.every((event) => !JSON.stringify(event).includes('Closed the duplicate')), 'no message body in the log')
+    // DevSpec's structured answer is kept as it gave it, never flattened into a sentence.
+    assert.deepEqual(logged.map((event) => event.data.refusal.details), [
+      receipt,
+      { delivery: { status: 'skipped', reason: 'no_unanswered_dispatch', retryable: false } },
+      { reason: 'no_connection_capability' },
+    ])
 
-    // Every one is kept, with its reason, and handed over once.
+    // Every one is kept, with its refusal, and handed over once.
     const notes = takeTellPersonNotes(CONN, { dir })
     assert.deepEqual(notes.map((note) => note.text), Array(3).fill('Closed the duplicate task Brandon filed.'))
-    assert.match(notes[0].reason, /Assistant speech delivery rejected/)
-    assert.match(notes[1].reason, /not_attached/)
-    assert.match(notes[2].reason, /capability/)
+    assert.deepEqual(notes.map((note) => note.refusal), logged.map((event) => event.data.refusal))
     assert.deepEqual(takeTellPersonNotes(CONN, { dir }), [])
     const text = tellPersonNoteText(notes)
     assert.match(text, /Tell them in plain words in your next message to them/)
     assert.equal(text.split('Closed the duplicate task Brandon filed.').length - 1, 3)
+    assert.ok(text.includes(JSON.stringify(notes[0].refusal, null, 2)), 'the structured answer, as data')
+    assert.match(text, /"reason": "not_attached"/)
     assert.equal(tellPersonNoteText([]), null)
   })
 
@@ -617,7 +624,7 @@ describe('the final message of a notice-only turn', () => {
       child.stdin.end(JSON.stringify({ conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' } }))
     })
     const long = `Closed these duplicates: ${'a task Brandon filed; '.repeat(800)}done.`
-    leaveTellPersonNote(CONN, { text: long, reason: 'DevSpec did not store it (not_attached).', dir })
+    leaveTellPersonNote(CONN, { text: long, refusal: { message: null, details: { delivery: { status: 'skipped', reason: 'not_attached' } } }, dir })
     const out = JSON.parse(await postToolUse())
     assert.ok(out.additional_context.length < 1_000, 'a pointer, not the note')
     const file = JSON.parse(out.additional_context.match(/at ("[^"]+")/)[1])
@@ -835,7 +842,7 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     assert.equal(failed.phase, 'mirror_post')
     assert.equal(failed.outcome, 'failed')
     assert.equal(failed.connectionId, CONN)
-    assert.match(failed.error, /Assistant speech delivery rejected/)
+    assert.match(failed.refusal.message, /Assistant speech delivery rejected/)
     assert.ok(!stop.stderr.includes(finalText), 'no message body in the log')
 
     // Kept for the next turn: not on an afterMCPExecution, nor for a subagent's call...

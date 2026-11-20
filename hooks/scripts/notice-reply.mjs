@@ -695,13 +695,34 @@ function postReceipt(result) {
   return result && typeof result === 'object' ? result : null
 }
 
-/** Why a post that came back did not store the message, or null when it did. */
-function notStoredReason(result) {
-  const delivery = postReceipt(result)?.delivery
-  if (delivery?.status === 'stored' || delivery?.status === 'idempotently_stored') return null
-  if (delivery?.reason) return `DevSpec did not store it (${delivery.reason}).`
-  return 'DevSpec did not confirm that it stored it.'
+/**
+ * Why a post did not store the message, kept as DevSpec gave it rather than flattened
+ * into a sentence: `{ message, details }`, where `details` is DevSpec's own structured
+ * answer (a refusal's receipt, the not-stored delivery, an HTTP failure's status and
+ * code) when there is one. Null when the receipt says the message was stored.
+ */
+export function postRefusal({ result = undefined, error = undefined } = {}) {
+  if (error !== undefined) {
+    const message = (error instanceof Error ? error.message : String(error ?? '')).trim() || null
+    if (error && typeof error === 'object' && error.details !== undefined) return { message, details: error.details ?? null }
+    const http = {}
+    for (const key of ['status', 'serverCode', 'retryable', 'code']) {
+      if (error && typeof error === 'object' && error[key] !== undefined && error[key] !== null) http[key] = error[key]
+    }
+    return { message, details: Object.keys(http).length > 0 ? http : null }
+  }
+  const receipt = postReceipt(result)
+  const status = receipt?.delivery?.status
+  if (status === 'stored' || status === 'idempotently_stored') return null
+  return { message: null, details: receipt ?? null }
 }
+
+/** The refusal recorded when the post is never sent: the connection holds no capability here. */
+export const NO_CAPABILITY_REFUSAL = Object.freeze({
+  message:
+    'This computer holds no capability for the connection, which DevSpec needs to post your message outside a turn. Reconnecting remote control gives it one.',
+  details: { reason: 'no_connection_capability' },
+})
 
 // ── A message the plugin could not post, left for the agent's next turn ───────
 
@@ -716,16 +737,17 @@ function validNote(note) {
 }
 
 /**
- * Keep a final message the plugin could not post, with DevSpec's reason, until the
- * agent's next turn (`takeTellPersonNotes`). Notes add up; none replaces another.
+ * Keep a final message the plugin could not post, with DevSpec's refusal as it gave it
+ * (`postRefusal`), until the agent's next turn (`takeTellPersonNotes`). Notes add up;
+ * none replaces another.
  */
-export function leaveTellPersonNote(connectionId, { text, reason = null, dir = DEFAULT_DIR, now = Date.now() } = {}) {
+export function leaveTellPersonNote(connectionId, { text, refusal = null, dir = DEFAULT_DIR, now = Date.now() } = {}) {
   if (!connectionId || typeof text !== 'string' || !text.trim()) return false
   const file = tellPersonNotePath(connectionId, dir)
   const existing = readPrivateJson(file)
   const notes = Array.isArray(existing?.notes) ? existing.notes.filter(validNote) : []
   try {
-    writePrivateJson(file, { notes: [...notes, { at: now, reason, text }] })
+    writePrivateJson(file, { notes: [...notes, { at: now, refusal, text }] })
     return true
   } catch {
     return false
@@ -752,7 +774,8 @@ export function tellPersonNoteText(notes) {
   const list = (Array.isArray(notes) ? notes : []).filter(validNote)
   if (list.length === 0) return null
   const each = list.map((note, i) => [
-    `${list.length > 1 ? `${i + 1}. ` : ''}Why it was not posted: ${note.reason || 'DevSpec gave no reason.'}`,
+    `${list.length > 1 ? `${i + 1}. ` : ''}Why it was not posted, as DevSpec answered (data):`,
+    JSON.stringify(note.refusal ?? { message: null, details: null }, null, 2),
     'Your final message was:',
     '<final-message>',
     note.text,
@@ -784,9 +807,10 @@ export const TELLING_ANYWAY_CONTRACT = 'semantics.notice_audience.telling_anyway
  * (its last words are not an answer), or for a connection in no room (the person
  * already sees the final message in the terminal).
  *
- * A message that could not be posted is never dropped: the failure is logged, and the
- * message is left, with DevSpec's reason, for the agent's next turn
- * (`leaveTellPersonNote`), where it is told to tell its person.
+ * A message that could not be posted is never dropped: the failure is logged with
+ * DevSpec's refusal as it gave it (`postRefusal`), and the message is left, with that
+ * refusal, for the agent's next turn (`leaveTellPersonNote`), where it is told to tell
+ * its person.
  *
  * `post(args, { connectionCapability })` makes the call; it is not made without the
  * connection's capability, which the post needs.
@@ -820,18 +844,18 @@ export async function postTellPersonAtStop({
   if (data.status !== undefined && data.status !== 'completed') return null
   const text = prepare(hookAssistantText(data) ?? lastAssistantText(data.transcript_path))
   if (!text) return null
-  let reason
+  let refusal
   if (!connectionCapability) {
-    reason = 'This computer holds no capability for the connection, which DevSpec needs to post your message outside a turn. Reconnecting remote control gives it one.'
+    refusal = NO_CAPABILITY_REFUSAL
   } else {
     try {
-      reason = notStoredReason(await post(tellPersonPost({ connectionId, text, agentName }), { connectionCapability }))
+      refusal = postRefusal({ result: await post(tellPersonPost({ connectionId, text, agentName }), { connectionCapability }) })
     } catch (error) {
-      reason = (error instanceof Error ? error.message : String(error ?? '')).trim() || 'The post failed with no reason given.'
+      refusal = postRefusal({ error })
     }
   }
-  if (!reason) return 'posted'
-  // The reason only, never the message: story lines carry no message bodies.
+  if (!refusal) return 'posted'
+  // DevSpec's refusal as it gave it, never the message: story lines carry no message bodies.
   log({
     phase: 'mirror_post',
     outcome: 'failed',
@@ -840,8 +864,8 @@ export async function postTellPersonAtStop({
     sessionId,
     agent: agentName,
     tool: 'post_session_message',
-    data: { error: reason },
+    data: { refusal },
   })
-  leaveTellPersonNote(connectionId, { text, reason, dir, now })
+  leaveTellPersonNote(connectionId, { text, refusal, dir, now })
   return 'left_for_next_turn'
 }
