@@ -8,6 +8,8 @@
  *             → also seeds phase=trail "Working…" so the live bubble opens immediately
  * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state;
  *               a room command whose turn errored or was stopped is told so (turn-failure.mjs);
+ *               a usage-limit stop rides the heartbeat, and a turn that ran clears it
+ *               (usage-refusal.mjs);
  *               a turn woken only by DevSpec notices whose model posted no reply ends with
  *               its final message as a reply to those notices (notice-reply.mjs)
  *
@@ -25,7 +27,7 @@ import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { detectLocalId } from './remote-control-state.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
-import { clearTrailState } from './work-trail.mjs'
+import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
 import { clearInteractionContinuation } from './remote-control-state.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
@@ -54,6 +56,7 @@ import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-tur
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
 import { postTurnFailure } from './turn-failure.mjs'
+import { hookTranscriptPath, noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { fitRoomMessage } from './room-message.mjs'
 import { clearTurnWakes, postNoticeTurnReply, recordPromptWake } from './notice-reply.mjs'
 
@@ -797,6 +800,16 @@ async function main() {
     // server broadcasts agent_status for the attached session, so no session-keyed
     // heartbeat is needed.
     if (connectionId) {
+      // How Cursor ended this turn: a usage-limit stop is reported on this heartbeat and
+      // every poll after it until it lifts, and a turn that ran clears an earlier one
+      // (usage-refusal.mjs). The poller reads the same turn end too, so a stop hook
+      // Cursor skips loses nothing but this heartbeat's head start.
+      if (mode === 'stop') {
+        observeTurnEnd(connectionId, hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId), {
+          dir: CONNECTIONS_DIR,
+        })
+      }
+      const usageRefusal = usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR })
       await mcpToolsCall({
         mcpUrl,
         token,
@@ -806,9 +819,11 @@ async function main() {
           agent_name: agentName,
           status: 'live',
           busy: turnActive,
+          ...usageRefusal,
         },
         timeoutMs: 15_000,
       })
+      noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
       // End the activity attempt immediately on Stop. The poller also emits
       // report_complete when the marker disappears, but that waits for the next
       // long-poll tick — so Working / dots linger for seconds after the answer has

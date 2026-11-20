@@ -178,6 +178,7 @@ import {
   turnCommandsPath,
 } from './turn-commands.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
 
@@ -1668,6 +1669,9 @@ async function main() {
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null
   let lastTier = null
   let lastBusySent = null
+  // The transcript this poller last read for a turn end (usage-refusal.mjs), so an
+  // unchanged one is not read again every lap.
+  const turnEndMemo = {}
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -1708,6 +1712,9 @@ async function main() {
     const negotiatesInteraction = Object.keys(interactionArgs).length > 0
     const ack = negotiatesInteraction ? pendingInteractionAck : null
     const tierState = readState(connectionId)
+    // Cursor stopping this agent for a usage limit, while it stands, or the clear once a
+    // turn has run since (usage-refusal.mjs, `semantics.check_job.usage_refusal`).
+    const usageRefusal = usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR })
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -1736,6 +1743,7 @@ async function main() {
         ...(checkTier ? { check_tier: checkTier } : {}),
         // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
         ...agentStatsArgs(connectionId),
+        ...usageRefusal,
       },
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
@@ -1749,6 +1757,7 @@ async function main() {
     // queued, and a lost ACK is recovered by the ledger path on redelivery — the
     // answer itself is never the thing that gets lost.
     if (ack && pendingInteractionAck === ack) pendingInteractionAck = null
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
     return response
   }
 
@@ -2424,9 +2433,14 @@ async function main() {
     // Cursor shows (held for this command's own background work, or a tool call /
     // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
     let marker = readTurnMarker(connectionId)
+    const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
+    // How Cursor ended the conversation's last turn, read whether or not a stop hook
+    // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
+    // (usage-refusal.mjs).
+    observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
     const erroredEnd = marker
       ? erroredTurnEnd({
-          transcriptPath: resolveAgentTranscriptPath(liveState?.local_id),
+          transcriptPath,
           startedAt: marker.startedAt,
         })
       : null
