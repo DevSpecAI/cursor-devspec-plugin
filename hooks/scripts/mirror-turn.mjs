@@ -9,8 +9,8 @@
  * stop        → busy/heartbeat + turn marker only (NO assistant text); clears trail state;
  *               a room command whose turn errored or was stopped is told so (turn-failure.mjs);
  *               a turn woken only by DevSpec notices and check jobs posts nothing of its
- *               own, except a write's tell_person mark the model told nobody about
- *               (notice-reply.mjs)
+ *               own, except, as a backstop, a write's tell_person mark the model told
+ *               nobody about (notice-reply.mjs)
  *
  * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
@@ -764,11 +764,12 @@ async function main() {
 
     // A turn woken only by DevSpec notices and check jobs puts nothing into the room
     // on the plugin's word: when a notice is answered there is DevSpec's rule, and the
-    // model posts that reply itself (item 140a7f68). The one exception is a write whose
-    // result carried tell_person while the model told nobody: then its final message
-    // goes to the room as the agent's own message, through the speech lane that needs
-    // no open turn; one that cannot be posted is logged and left for the agent's next
-    // turn (notice-reply.mjs). Then what woke the turn is forgotten.
+    // model posts that reply itself (item 140a7f68). A write whose result carried
+    // tell_person is the model's to tell its person about (its tell-person command); as
+    // a backstop only, when it told nobody, its final message goes to the room as the
+    // agent's own message through the speech lane that needs no open turn, and one that
+    // cannot be posted is logged and left for the agent's next turn (notice-reply.mjs).
+    // Nothing depends on this running. Then what woke the turn is forgotten.
     if (mode === 'stop' && connectionId) {
       try {
         await postTellPersonAtStop({

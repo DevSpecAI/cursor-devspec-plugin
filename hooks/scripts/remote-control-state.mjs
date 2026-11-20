@@ -67,6 +67,8 @@
  *   node remote-control-state.mjs manage-question describe|status
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-question use
  *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs manage-question respond
+ *   node remote-control-state.mjs tell-person describe
+ *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs tell-person
  *     → capability-bound manage_plan / manage_poll / manage_directed_question for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
@@ -1938,6 +1940,32 @@ async function runCli() {
         agent: AGENT_NAME,
         hostToken: hostTokenFromEnv(process.env),
       })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
+  if (cmd === 'tell-person') {
+    const { describeTellPersonBridge, useTellPersonBridge } = await import('./tell-person-bridge.mjs')
+    if (args._[1] === 'describe') {
+      process.stdout.write(JSON.stringify(describeTellPersonBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    if (args._[1] !== undefined) {
+      process.stderr.write('Usage: remote-control-state.mjs tell-person [describe]  (one {"message": "…"} object on stdin)\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write('tell-person requires one JSON object on stdin: {"message": "…"}\n')
+      process.exit(2)
+    }
+    // Identity is host-derived only, as for the other bridges: no --connection-id /
+    // --local-id / --capability escape hatch.
+    const localId = detectLocalId({}, process.env).local_id
+    const result = await useTellPersonBridge(input, { localId, agent: AGENT_NAME })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
   }

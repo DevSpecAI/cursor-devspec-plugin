@@ -40,6 +40,7 @@ import { appendWakeEvents } from './devspec-wake-file.mjs'
 import { handleExplicitReply } from './mark-explicit-reply.mjs'
 import { explicitReplyMarkerPath, turnMarkerPath, writeTurnMarker } from './mirror-turn.mjs'
 import { CursorMcpRefusal } from './mcp-call.mjs'
+import { persistConnectionCapability } from './manage-plan-bridge.mjs'
 import {
   currentTurnNoticeIds,
   currentTurnOwnsNoCommand,
@@ -603,7 +604,7 @@ describe('the final message of a notice-only turn', () => {
     assert.deepEqual(notes.map((note) => note.refusal), logged.map((event) => event.data.refusal))
     assert.deepEqual(takeTellPersonNotes(CONN, { dir }), [])
     const text = tellPersonNoteText(notes)
-    assert.match(text, /Tell them in plain words in your next message to them/)
+    assert.match(text, /tell-person command/)
     assert.equal(text.split('Closed the duplicate task Brandon filed.').length - 1, 3)
     assert.ok(text.includes(JSON.stringify(notes[0].refusal, null, 2)), 'the structured answer, as data')
     assert.match(text, /"reason": "not_attached"/)
@@ -788,7 +789,7 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     assert.equal(posts().length, 0, 'a command\'s turn tells the person in its own answer')
   })
 
-  it('Stop posts the final message as the agent\'s own message when a write carried tell_person, though no turn is open', async () => {
+  it('as a backstop, Stop posts the final message as the agent\'s own message when a write carried tell_person and the agent told nobody', async () => {
     respond = noOpenTurn
     const prompt = notificationText(buildOwnerMessageEvents(labelledBatch([[NOTICE_B, 'for_the_record']])), home)
     await run('mirror-turn.mjs', 'user_prompt', { prompt })
@@ -822,6 +823,45 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     await run('mark-explicit-reply.mjs', 'afterMCPExecution', { mcp_server_name: 'devspec', tool_name: 'devspec__post_session_message', tool_input: own })
     await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf(prompt, 'Told them.') })
     assert.equal(posts().length, 0)
+  })
+
+  it('the agent tells its person itself with tell-person, though no turn is open, and the backstop posts no second copy', async () => {
+    respond = noOpenTurn
+    // The bond and capability the plugin writes on connect, which the command reads.
+    const remoteRoot = path.join(home, '.devspec', 'remote-control')
+    fs.mkdirSync(path.join(remoteRoot, 'local', 'cursor'), { recursive: true })
+    fs.writeFileSync(path.join(remoteRoot, 'local', 'cursor', `${CONVERSATION}.json`), JSON.stringify({
+      connection_id: CONN, local_id: CONVERSATION, agent_name: 'Cursor', session_id: ROOM, status: 'live',
+    }))
+    persistConnectionCapability({ connectionId: CONN, localId: CONVERSATION, capability: CAPABILITY }, { root: remoteRoot })
+
+    const prompt = notificationText(buildOwnerMessageEvents(labelledBatch([[NOTICE_B, 'for_the_record']])), home)
+    await run('mirror-turn.mjs', 'user_prompt', { prompt })
+    await afterWrite(markedResult())
+
+    // The agent's own post, the way the skill has it run the command.
+    const message = 'I closed Brandon\'s duplicate of my task.'
+    const told = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HERE, 'remote-control-state.mjs'), 'tell-person'], {
+        env: { PATH: process.env.PATH, HOME: home, CURSOR_CONVERSATION_ID: CONVERSATION },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      child.stdout.on('data', (d) => { stdout += d })
+      child.on('error', reject)
+      child.on('close', (code) => resolve({ code, stdout }))
+      child.stdin.end(JSON.stringify({ message }))
+    })
+    assert.equal(told.code, 0, told.stdout)
+    assert.equal(JSON.parse(told.stdout).result.delivery.status, 'stored')
+    assert.equal(posts().length, 1)
+    assert.equal(posts()[0].capability, CAPABILITY)
+    assert.equal(posts()[0].args.ingest_version, 2)
+    assert.equal(posts()[0].args.message, message)
+
+    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf(prompt, 'Told them.') })
+    assert.equal(posts().length, 1, 'the backstop saw the person was told')
+    assert.equal(fs.existsSync(tellPersonNotePath(CONN, dir)), false)
   })
 
   it('a refused post is logged and handed to the agent at its next tool call, never dropped', async () => {

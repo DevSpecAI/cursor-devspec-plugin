@@ -12,8 +12,8 @@
  * needs its own answer and keeps showing Working until it gets one.
  *
  * On afterMCPExecution it also notes a DevSpec write whose result carries DevSpec's
- * `tell_person` mark on the turn (`handleTellPersonMark`), so a turn that owns no
- * command still tells the person at Stop when the model did not (notice-reply.mjs).
+ * `tell_person` mark on the turn (`handleTellPersonMark`), for the end-of-turn
+ * backstop that tells the person when the model did not (notice-reply.mjs).
  * When Stop could not post that message, it left it for the agent's next turn; on
  * postToolUse this hook hands it over (`tellPersonNoteHook`).
  *

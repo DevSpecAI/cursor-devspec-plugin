@@ -34,9 +34,10 @@
  *   answered in the room is DevSpec's rule (`semantics.notice_audience`,
  *   `semantics.notice_reply`), and when one is called for the model posts it itself;
  *   what it leaves in the terminal at the end of a turn that owns no command is its
- *   working, not a reply. The one thing Stop posts for such a turn is its final
- *   message, as an ordinary message, after one of its writes carried DevSpec's
- *   `tell_person` mark and the model told nobody itself (`postTellPersonAtStop`).
+ *   working, not a reply. When one of its writes carried DevSpec's `tell_person` mark,
+ *   the model tells its person itself (`tell-person`, tell-person-bridge.mjs); Stop
+ *   posts the final message only as a backstop when it told nobody
+ *   (`postTellPersonAtStop`).
  *
  * Which notices get a reply is DevSpec's label, never the plugin's guess (item
  * a868f41f; `semantics.notice_audience`). At system_notice_version 3 every notice
@@ -71,8 +72,9 @@ export const NOTICE_AUDIENCE_CONTRACT = 'semantics.notice_audience in devspec://
 export const FOR_THE_RECORD_HANDLING =
   'DevSpec labelled this notice for the record: it gets no notice reply and nothing in the room, ' +
   'and any housekeeping it asks for on your own work is done quietly. ' +
-  'If a write you make while handling it returns tell_person, tell your person: in a turn that only DevSpec notices or check jobs woke, ' +
-  'put it in your final message, which the plugin posts to the room as your own message; in any other turn, in your next message to them. ' +
+  'If a write you make while handling it returns tell_person, telling your person is yours to do ' +
+  '(semantics.notice_audience.telling_anyway): in a turn that only DevSpec notices or check jobs woke, post it with the ' +
+  "DevSpec remote skill's tell-person command, which needs no open turn; in any other turn, in your next message to them. " +
   `Rules: ${NOTICE_AUDIENCE_CONTRACT}.`
 
 /** The wake line's `notice_reply` when every notice it handed over is for the record. */
@@ -272,9 +274,11 @@ function forTheRecordField(ids) {
 
 /**
  * The current turn's record: `{ startedAt, noticeIds, forTheRecordIds?, checkJobIds?,
- * otherWake, noticeReplyAt?, tellPersonAt? }`, or null. `noticeIds` holds every notice
- * that woke the turn; `forTheRecordIds` the ones among them DevSpec labelled for the
- * record; `tellPersonAt` when a DevSpec write in the turn carried `tell_person`.
+ * otherWake, noticeReplyAt?, tellPersonAt?, personToldAt? }`, or null. `noticeIds` holds
+ * every notice that woke the turn; `forTheRecordIds` the ones among them DevSpec
+ * labelled for the record; `tellPersonAt` when a DevSpec write in the turn carried
+ * `tell_person`; `personToldAt` when the agent told its person with the `tell-person`
+ * command (tell-person-bridge.mjs).
  */
 export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return null
@@ -289,6 +293,7 @@ export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
       otherWake: record.otherWake === true,
       ...(typeof record.noticeReplyAt === 'number' ? { noticeReplyAt: record.noticeReplyAt } : {}),
       ...(typeof record.tellPersonAt === 'number' ? { tellPersonAt: record.tellPersonAt } : {}),
+      ...(typeof record.personToldAt === 'number' ? { personToldAt: record.personToldAt } : {}),
     }
   } catch {
     return null
@@ -355,6 +360,17 @@ export function recordTellPerson(connectionId, { dir = DEFAULT_DIR, now = Date.n
   if (!record) return false
   if (record.tellPersonAt) return true
   return Boolean(writeTurnWakes(connectionId, { ...record, tellPersonAt: now }, dir))
+}
+
+/**
+ * Note that the agent told its person itself with the `tell-person` command
+ * (tell-person-bridge.mjs), so the end-of-turn backstop posts nothing more. A turn
+ * nothing woke has no record and no backstop to stop.
+ */
+export function recordPersonTold(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  const record = readTurnWakes(connectionId, { dir })
+  if (!record) return false
+  return Boolean(writeTurnWakes(connectionId, { ...record, personToldAt: now }, dir))
 }
 
 /**
@@ -785,7 +801,7 @@ export function tellPersonNoteText(notes) {
     'From the DevSpec plugin: in a turn that only DevSpec notices or check jobs woke, a DevSpec write you made carried tell_person ' +
       `(${TELLING_ANYWAY_CONTRACT}) and you did not tell your person yourself. ` +
       'The plugin tried to post your final message to the room for you and could not, so your person has not heard it.',
-    'Tell them in plain words in your next message to them, or here in the terminal when you are attached to no room.',
+    "Tell them now, in plain words, with the DevSpec remote skill's tell-person command, or here in the terminal when you are attached to no room.",
     ...each,
   ].join('\n\n')
 }
@@ -800,12 +816,14 @@ export const TELLING_ANYWAY_CONTRACT = 'semantics.notice_audience.telling_anyway
  * is called for the model posts it itself (item 140a7f68).
  *
  * The one exception is DevSpec's `tell_person` mark on a write the turn made
- * (`semantics.notice_audience.telling_anyway`, which has a host that posts mechanically
- * post that run's answer). When the model posted nothing in the room itself (`told`,
- * or a notice reply it made), the turn's final message goes there as the agent's
- * ordinary message (`tellPersonPost`). Nothing for a turn that errored or was stopped
- * (its last words are not an answer), or for a connection in no room (the person
- * already sees the final message in the terminal).
+ * (`semantics.notice_audience.telling_anyway`). Telling the person is the agent's job,
+ * done with the `tell-person` command (tell-person-bridge.mjs); this is only a
+ * backstop for a turn whose agent told nobody, and nothing depends on it, since Cursor
+ * does not always run a plugin's end-of-turn hook. When the model posted nothing in
+ * the room itself (`told`, a notice reply it made, or `personToldAt`), the turn's
+ * final message goes there as the agent's ordinary message (`tellPersonPost`). Nothing
+ * for a turn that errored or was stopped (its last words are not an answer), or for a
+ * connection in no room (the person already sees the final message in the terminal).
  *
  * A message that could not be posted is never dropped: the failure is logged with
  * DevSpec's refusal as it gave it (`postRefusal`), and the message is left, with that
@@ -833,7 +851,7 @@ export async function postTellPersonAtStop({
 } = {}) {
   if (!connectionId || !sessionId || told || typeof post !== 'function') return null
   const record = readTurnWakes(connectionId, { dir })
-  if (!record?.tellPersonAt || record.noticeReplyAt) return null
+  if (!record?.tellPersonAt || record.noticeReplyAt || record.personToldAt) return null
   if (!turnOwnsNoCommand({ record, requestState: readRequestState(connectionId, { dir }), connectionState })) return null
   let data = {}
   try {
