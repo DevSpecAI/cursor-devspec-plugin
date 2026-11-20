@@ -26,6 +26,8 @@ import {
 } from './provenance-assistance.mjs'
 import { unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
 import { selectProjectContext } from './project-context.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
 
 const PROJECT = '11111111-2222-3333-4444-555555555555'
 const ITEM_A = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -89,9 +91,20 @@ function observeClaim(stateRoot, item = ITEM_A, conversationId = 'chat-a', nowMs
   ), { stateRoot, nowMs })
 }
 
-/** What postToolUse tells the agent once the Shell call `toolUseId` has run. */
+/**
+ * What postToolUse hands the agent once the Shell call `toolUseId` has run. A commit
+ * note arrives as a pointer to a note, offered until read: this returns the note's
+ * text as `additional_context`, and then reads it the way the agent would, so the next
+ * commit's note starts a delivery of its own.
+ */
 function noteAfter(stateRoot, toolUseId = 'tool-1', conversationId = 'chat-a') {
-  return handleHook('postToolUse', { conversation_id: conversationId, tool_name: 'Shell', tool_use_id: toolUseId }, { stateRoot })
+  const out = handleHook('postToolUse', { conversation_id: conversationId, tool_name: 'Shell', tool_use_id: toolUseId }, { stateRoot, home: stateRoot })
+  const id = noteIdIn(out?.additional_context)
+  if (!id) return out
+  for (const file of noteFiles(stateRoot, id)) {
+    handleHook('postToolUse', catCall(stateRoot, file, { conversation: conversationId }), { stateRoot, home: stateRoot })
+  }
+  return { additional_context: readNoteText(id, { home: stateRoot }) }
 }
 
 function pre(command, cwd, stateRoot, extra = {}) {
@@ -548,6 +561,26 @@ describe('online reference confirmation', () => {
 })
 
 describe('claim observation and commit decisions', () => {
+  it('offers a commit note after every step until the agent has read it whole, never just because it was printed', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-9' }), null)
+    const after = (input) => handleHook('postToolUse', { conversation_id: 'chat-a', ...input }, { stateRoot, home: stateRoot })?.additional_context ?? null
+    const pointer = after({ tool_name: 'Shell', tool_use_id: 'plain-9' })
+    const id = noteIdIn(pointer)
+    assert.ok(id, 'a pointer to the note')
+    assert.equal(readNoteText(id, { home: stateRoot }), unlinkedCommitText())
+    // Cursor may have dropped that step's notes: the next steps offer it again.
+    assert.equal(after({ tool_name: 'Read', tool_input: { file_path: '/x' } }), pointer)
+    assert.equal(after({ tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${id}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }), pointer, 'mentioning it is not reading it')
+    const file = noteFiles(stateRoot, id)[0]
+    const whole = fs.readFileSync(file, 'utf8')
+    const cut = { ...catCall(stateRoot, file, { conversation: 'chat-a' }), tool_output: JSON.stringify({ output: `${whole.slice(0, 40)}\n...\n${whole.slice(-90)}`, exitCode: 0 }) }
+    assert.equal(after(cut), pointer, 'a cut read is not a read')
+    assert.equal(after(catCall(stateRoot, file, { conversation: 'chat-a' })), null, 'read whole: done')
+    assert.equal(after({ tool_name: 'Read', tool_input: { file_path: '/x' } }), null)
+  })
+
   it('accepts a valid reference without any live claim, lets an unreferenced commit with no claim through with a note, and allows offline/non-commit work', async () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()

@@ -23,7 +23,9 @@ import {
   NOTE_PART_CHARS,
   noteParts,
   notePointer,
-  noteReadThrough,
+  deliveryReadThrough,
+  handOver,
+  handOverFile,
   postToolUseOutput,
   readNoteText,
   seal,
@@ -132,16 +134,42 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     assert.equal(readNoteText(note.id, { home }), text)
   })
 
-  it('counts a note read only when every part came back whole, in this conversation', () => {
+  it('counts a delivery read only when every part came back whole, and a new delivery of the same text must be read again', () => {
     const home = tempHome()
     const note = writeNote('x'.repeat(NOTE_PART_CHARS * 2 + 10), { home })
     const [first, second, third] = noteFiles(home, note.id)
     assert.equal(note.parts, 3)
-    assert.equal(noteReadThrough(catCall(home, first), note.id, { home }), false, 'one part of three')
-    assert.equal(noteReadThrough(readCall(second), note.id, { home }), false, 'two of three, by Read')
-    assert.equal(noteReadThrough({ conversation_id: 'two', ...catCall(home, third, { conversation: 'two' }) }, note.id, { home }), false, 'another conversation reading counts for that one')
-    assert.equal(noteReadThrough(catCall(home, third, { tilde: false }), note.id, { home }), true, 'all three, the last by absolute path')
-    assert.equal(noteReadThrough({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }, note.id, { home }), true, 'and stays read')
+    const record = path.join(home, 'delivery.json')
+    const through = (input, generation = 1) => deliveryReadThrough(record, input, { note: note.id, generation }, { home })
+    assert.equal(through(catCall(home, first)), false, 'one part of three')
+    assert.equal(through(readCall(second)), false, 'two of three, by Read')
+    assert.equal(through(catCall(home, third, { tilde: false })), true, 'all three, the last by absolute path')
+    assert.equal(through({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }), true, 'and that delivery stays read')
+    // The same text handed over again is a new delivery: the earlier reads do not count.
+    assert.equal(through({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }, 2), false)
+    for (const file of [first, second]) assert.equal(through(catCall(home, file), 2), false)
+    assert.equal(through(catCall(home, third), 2), true)
+  })
+
+  it('hands over until read, and a message added while one is unread joins it in a new delivery', () => {
+    const home = tempHome()
+    const file = handOverFile('test', 'one', { home })
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const offer = (input, add = null) => handOver(file, input, { add, what: 'A note', home })
+    assert.equal(offer(ls), null, 'nothing waiting')
+    const first = offer(ls, 'first message')
+    assert.match(first, /This line comes back after each step until you have read it\.$/)
+    assert.equal(offer(ls), first, 'offered again until read')
+    const joined = offer(ls, 'second message')
+    const id = /notes\/([0-9a-f]{16})\.md/.exec(joined)[1]
+    assert.equal(readNoteText(id, { home }), 'first message\n\n---\n\nsecond message')
+    assert.equal(offer(catCall(home, noteFiles(home, id)[0])), null, 'read whole: done')
+    assert.equal(offer(ls), null)
+    // The first text again, after it was read inside the joined note: a new delivery, owed again.
+    const again = offer(ls, 'first message')
+    assert.ok(again)
+    assert.equal(offer(ls), again)
+    assert.equal(offer(catCall(home, noteFiles(home, /notes\/([0-9a-f]{16})\.md/.exec(again)[1])[0])), null)
   })
 
   it('never counts a command that only mentions a note, or a read that did not come back whole', () => {
@@ -166,11 +194,11 @@ describe('fitHookContext, the one way a hook hands context over', () => {
       readCall(file, { contentLength: 5 }),
       { conversation_id: 'one', tool_name: 'Grep', tool_input: { path: file }, tool_output: JSON.stringify({ output: whole }) },
     ]) {
-      assert.equal(noteReadThrough(call, note.id, { home }), false, JSON.stringify(call.tool_input))
+      assert.equal(deliveryReadThrough(path.join(home, 'delivery.json'), call, { note: note.id, generation: 1 }, { home }), false, JSON.stringify(call.tool_input))
     }
     // The plugin's own PATH line in front of an exact `cat` is fine.
     const prefixed = ran(`export PATH="/x/stand-in:$PATH" # devspec\ncat ${tilde}`, whole)
-    assert.equal(noteReadThrough(prefixed, note.id, { home }), true)
+    assert.equal(deliveryReadThrough(path.join(home, 'delivery.json'), prefixed, { note: note.id, generation: 1 }, { home }), true)
   })
 
   /** Every part of note `id` as the real shell prints it, its closing line taken off, joined: bytes, not text. */
@@ -292,10 +320,11 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     // What Cursor does to a long output: the first and last part kept, the middle gone.
     const cut = `${whole.slice(0, 3_000)}\n... (output truncated) ...\n${whole.slice(-3_000)}`
     const call = (output) => ({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: `cat ${file.replace(home, '~')}` }, tool_output: JSON.stringify({ output, exitCode: 0 }) })
-    assert.equal(noteReadThrough(call(cut), note.id, { home }), false, 'the closing line survived the cut, but the length and hash do not match')
-    assert.equal(noteReadThrough(call(whole.replace('middle', 'muddle')), note.id, { home }), false, 'a changed body')
-    assert.equal(noteReadThrough(call(`${'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS)}${whole}`), note.id, { home }), false, 'an output over Cursor\'s ceiling was cut for the model')
-    assert.equal(noteReadThrough(call(whole), note.id, { home }), true)
+    const through = (input) => deliveryReadThrough(path.join(home, 'delivery.json'), input, { note: note.id, generation: 1 }, { home })
+    assert.equal(through(call(cut)), false, 'the closing line survived the cut, but the length and hash do not match')
+    assert.equal(through(call(whole.replace('middle', 'muddle'))), false, 'a changed body')
+    assert.equal(through(call(`${'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS)}${whole}`)), false, 'an output over Cursor\'s ceiling was cut for the model')
+    assert.equal(through(call(whole)), true)
   })
 
   it('unseals only a whole body: the seal states its length and hash', () => {

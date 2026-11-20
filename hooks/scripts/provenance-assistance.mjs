@@ -28,7 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
-import { fitHookContext } from './hook-context-budget.mjs'
+import { fitHookContext, handOver, handOverFile } from './hook-context-budget.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
@@ -1129,22 +1129,32 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
-    // Each note is fitted to this hook's share of Cursor's ceiling before it is taken
-    // from the state, so one Cursor would drop is never recorded as handed over.
-    if (toolUseId && state.pending_notes[toolUseId]) {
-      const context = fitHookContext(state.pending_notes[toolUseId].text, { what: 'A DevSpec commit note' })
-      if (!context) return null
+    const home = options.home || os.homedir()
+    // A note about a commit that went untracked must reach the agent, and Cursor gives
+    // no sign that a hook's note did (hook-context-budget.mjs): it is handed over as a
+    // note and offered after every step until the agent has read that delivery whole.
+    const pendingNote = toolUseId ? state.pending_notes[toolUseId] : null
+    const commitNote = handOver(handOverFile('commit', conversationId, { home }), data, {
+      add: pendingNote?.text ?? null,
+      what: 'A DevSpec note about a commit you made',
+      home,
+    })
+    const said = commitNote ? [commitNote] : []
+    let changed = false
+    if (pendingNote) {
       delete state.pending_notes[toolUseId]
-      writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: context }
+      changed = true
     }
+    // Saying that a reference was added is offered once: the commit is right either way.
     if (toolUseId && state.pending_stamps[toolUseId]) {
-      const item = state.pending_stamps[toolUseId].task_id
-      const context = fitHookContext(`DevSpec appended [devspec:${item}] to the commit message that just ran.`, { what: 'A DevSpec commit note' })
-      if (!context) return null
+      said.push(`DevSpec appended [devspec:${state.pending_stamps[toolUseId].task_id}] to the commit message that just ran.`)
       delete state.pending_stamps[toolUseId]
-      writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: context }
+      changed = true
+    }
+    if (changed) writeConversationState(conversationId, state, stateRoot)
+    if (said.length > 0) {
+      const context = fitHookContext(said.join('\n\n'), { what: 'A DevSpec commit note', home })
+      return context ? { additional_context: context } : null
     }
 
     const toolName = (cleanString(data?.tool_name) || '').toLowerCase()

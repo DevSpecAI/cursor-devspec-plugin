@@ -34,18 +34,25 @@
  *   Cursor's Shell rules (`NOTE_PART_CHARS`, `NOTE_PART_BYTES`), cut only between
  *   lines or whole characters, each closing with the command for the next.
  * - A note counts as read only on what came back: an exact `cat` of a part that exited
- *   0 with the part's closing line in its output, or Cursor's Read tool reporting the
- *   part's full length. Mentioning a note (`test -e`, `ls`, `grep -l`) is not reading it.
- * - What must reach the agent (the project's rules and repositories, a message the
- *   person has not heard, room messages it has not read) is never recorded as
- *   delivered because a hook printed it. Rules and the person's message are handed
- *   over as a note file, and the pointer comes back after every step until the agent
- *   is seen reading all of it (`noteReadThrough`); unread room messages are counted after
- *   every step until the agent reads them. A step whose notes Cursor dropped is
+ *   0, whose output (as Cursor gave it to the hook) is within the Shell rules and
+ *   carries the whole part by its seal (length and hash), or Cursor's Read tool
+ *   reporting the part's full length. Mentioning a note (`test -e`, `ls`, `grep -l`) or
+ *   a cut that kept its head and tail is not reading it.
+ * - What must reach the agent is never recorded as delivered because a hook printed
+ *   it. It is handed over as a note, and the pointer comes back after every step until
+ *   the agent is seen reading all of that delivery (`deliveryReadThrough`, `handOver`).
+ *   A read belongs to one delivery, never to the text: rules changed and changed back,
+ *   or a message left again, must be read again. This covers the project's rules and
+ *   repositories; a message the person has not heard; a commit note (a commit that
+ *   went untracked, and what to do about it); a pin problem (the folder is not linked
+ *   to its project until the pin is fixed); and the repository-link nudge (the person
+ *   must link the repository). Unread room messages are counted after every step until
+ *   the reader's output has come back whole. A step whose notes Cursor dropped is
  *   followed by another that offers them again.
- * - One-off hints (a commit note, the edit reminder, a pin problem, the repository-link
- *   nudge) are offered once and not repeated: losing one costs a hint, never the rules,
- *   a person's message or the room, and saying it after every step would cost more.
+ * - Two hints are offered once: the note that a reference was added to a commit (the
+ *   commit is right whether or not the agent hears it), and the edit reminder to claim
+ *   a task (the same advice reaches the agent where it matters, at the commit: in the
+ *   git stand-in's own output, or in the commit note above).
  */
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
@@ -369,26 +376,80 @@ function partReadBy(input, id, parts, home) {
 }
 
 /**
- * Whether the agent in this tool call's conversation has now read every part of note
- * `id`. A part this call handed over whole (`partReadBy`) is recorded for the
- * conversation, privately, beside the note. Seeing the agent read a note is the only
- * sign the plugin has that what it says reached the agent; a hook printing a pointer
- * to it proves nothing (see the notes at the top of this file).
+ * One delivery of a note, and what has come back of it: `{ note, generation, parts }`.
+ * The record belongs to one delivery, never to the note's content: the same text
+ * handed over again (rules changed and changed back, a message left twice) is a new
+ * delivery with nothing read, so a read of an earlier delivery never stands for it.
+ * Returns the record with any part this tool call handed over whole (`partReadBy`)
+ * added, and whether every part of this delivery has now come back whole.
  */
-export function noteReadThrough(input, id, { home = os.homedir() } = {}) {
-  const parts = noteParts(id, { home })
-  if (parts === 0) return false
-  const conversation = String(input?.conversation_id || input?.conversationId || input?.session_id || 'none')
-  const record = path.join(home, NOTES_DIR, `${id}.read-${createHash('sha256').update(conversation).digest('hex').slice(0, 16)}.json`)
-  let read = readPrivateJson(record)?.parts
-  read = Array.isArray(read) ? read.filter((part) => Number.isInteger(part)) : []
-  const part = partReadBy(input, id, parts, home)
-  if (part && !read.includes(part)) {
-    read = [...read, part]
-    writePrivateJson(record, { parts: read })
+export function readThrough(record, input, { home = os.homedir() } = {}) {
+  const parts = noteParts(record?.note, { home })
+  const read = Array.isArray(record?.parts) ? record.parts.filter((part) => Number.isInteger(part)) : []
+  if (parts === 0) return { record: { ...record, parts: read }, done: false }
+  const part = partReadBy(input, record.note, parts, home)
+  const next = part && !read.includes(part) ? [...read, part] : read
+  let done = true
+  for (let each = 1; each <= parts; each += 1) if (!next.includes(each)) done = false
+  return { record: { ...record, parts: next }, done }
+}
+
+/**
+ * The delivery kept at `file` of note `note`, at `generation` (whatever marks this
+ * delivery: a change counter, or the note itself), brought up to date with this tool
+ * call: a different note or generation starts a new delivery with nothing read. Returns
+ * whether this delivery has been read through.
+ */
+export function deliveryReadThrough(file, input, { note, generation }, { home = os.homedir() } = {}) {
+  const kept = readPrivateJson(file)
+  const current = kept?.note === note && kept?.generation === generation ? kept : { note, generation, parts: [] }
+  const { record, done } = readThrough(current, input, { home })
+  if (kept?.note !== record.note || kept?.generation !== record.generation || (kept?.parts?.length ?? 0) !== record.parts.length) {
+    writePrivateJson(file, record)
   }
-  for (let each = 1; each <= parts; each += 1) if (!read.includes(each)) return false
-  return true
+  return done
+}
+
+/** Where a hand-over waiting to be read is kept for one hook (`kind`) and conversation. */
+export function handOverFile(kind, conversation, { home = os.homedir() } = {}) {
+  const key = createHash('sha256').update(String(conversation || 'none')).digest('hex').slice(0, 16)
+  return path.join(home, NOTES_DIR, 'pending', `${kind}-${key}.json`)
+}
+
+/**
+ * Text that must reach the agent, handed over as a note and offered after every step
+ * until that delivery has been read whole, then forgotten. `add` is new text: it joins
+ * an unread delivery in a new note, or starts one; either way a new delivery, with
+ * nothing read. The record lives at `file`. Returns the pointer to offer at this step,
+ * or null when nothing is waiting. A failed write throws, so the caller can keep what it
+ * was adding.
+ */
+export function handOver(file, input, { add = null, what, also = '', share = POST_TOOL_CONTEXT_SHARE, home = os.homedir() } = {}) {
+  let record = readPrivateJson(file)
+  if (record && typeof record.note === 'string') {
+    const { record: updated, done } = readThrough(record, input, { home })
+    if (done) {
+      fs.rmSync(file, { force: true })
+      record = null
+    } else if (updated.parts.length !== (record.parts?.length ?? 0)) {
+      writePrivateJson(file, updated)
+      record = updated
+    }
+  } else {
+    record = null
+  }
+  if (typeof add === 'string' && add.trim()) {
+    const earlier = record ? readNoteText(record.note, { home }) : null
+    const note = writeNote(earlier ? `${earlier}\n\n---\n\n${add}` : add, { home })
+    record = { note: note.id, generation: (record?.generation ?? 0) + 1, parts: [] }
+    writePrivateJson(file, record)
+  }
+  if (!record) return null
+  return pointToNote({ id: record.note, command: noteCommand(record.note) }, {
+    share,
+    what,
+    also: `${also}${also ? ' ' : ''}This line comes back after each step until you have read it.`.trim(),
+  })
 }
 
 /** The shortest way to say a note is waiting: fixed text and a fixed-length command. */

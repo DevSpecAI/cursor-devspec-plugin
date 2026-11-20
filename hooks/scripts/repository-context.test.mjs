@@ -10,7 +10,7 @@ import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingre
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { projectInput } from './project-input.mjs'
 import { POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
-import { catCall, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
+import { catCall, noteFiles, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
 import { readNoteText } from './hook-context-budget.mjs'
 /** The note a context line points at, and its text. */
 function noteIn(home,content){const id=noteIdIn(content);const file=path.join(home,'.devspec','notes',`${id}.md`);return{id,file,text:readNoteText(id,{home})}}
@@ -82,6 +82,31 @@ test('attach and canonical refreshes preserve repos, clear old rules and carry i
  const connection='33333333-3333-4333-8333-333333333333'
  projectInput('after',{conversation_id:'one',mcp_server_name:'devspec',tool_name:'devspec__attach_connection',tool_input:{connection_id:connection},result_json:{content:[{type:'text',text:JSON.stringify({connection_id:connection,project_agent_rules:'Attached rules'})}]}},{home})
  assert.equal(readRepositorySnapshot('one',home).rules.project_agent_rules,'Attached rules')
+}))
+
+test('rules changed and changed back are owed again: A, then B, then A needs a new read of A',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ const readAll=(line)=>{for(const file of noteFiles(home,noteIdIn(line))) assert.equal(repositoryContextHook(catCall(home,file),{home})?.additional_context ?? null, file===noteFiles(home,noteIdIn(line)).at(-1)?null:line)}
+ const rulesA={...registration(),project_agent_rules:'Rules A'}, rulesB={...registration(),project_agent_rules:'Rules B'}
+ storeRepositorySnapshot('one',rulesA,home)
+ const lineA=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ readAll(lineA)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'A read')
+ storeRepositorySnapshot('one',rulesB,home)
+ const lineB=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.notEqual(noteIdIn(lineB),noteIdIn(lineA))
+ readAll(lineB)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'B read')
+ storeRepositorySnapshot('one',rulesA,home)
+ const lineA2=repositoryContextHook({conversation_id:'one'},{home})?.additional_context
+ assert.ok(lineA2,'A again is a new change, owed a new delivery, though A was read before')
+ assert.equal(noteIdIn(lineA2),noteIdIn(lineA),'the same text, the same note')
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}).additional_context,lineA2,'offered until read again')
+ readAll(lineA2)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
+ // Storing the same context again is no change, and owes nothing.
+ storeRepositorySnapshot('one',rulesA,home)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
 }))
 
 test('a small project goes to the note too, with the same short line',()=>setup(home=>{

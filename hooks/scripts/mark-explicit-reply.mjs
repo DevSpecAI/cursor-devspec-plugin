@@ -45,8 +45,7 @@ import {
   tellPersonNoteText,
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
-import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { noteCommand, noteReadThrough, pointToNote, postToolUseOutput, readNoteText, writeNote } from './hook-context-budget.mjs'
+import { handOver, postToolUseOutput } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -197,7 +196,7 @@ function tellPersonUnreadPath(connectionId, dir) {
  * The message is the person's, so it must reach the agent, and Cursor gives no sign
  * that a hook's note did (hook-context-budget.mjs). So it goes whole into a note file,
  * and a short pointer to it comes back after every step until the agent is seen
- * reading all of it (`noteReadThrough`). A message left while an earlier one is still unread
+ * reading all of that delivery (`handOver`). A message left while an earlier one is still unread
  * joins it in one note. If the note cannot be written, the messages are put back for
  * the next step. Exported for tests; `dir` defaults to where the connection's files
  * live.
@@ -216,34 +215,22 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os
   const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
   const connectionId = loadState(conversationId)?.connection_id
   if (!connectionId) return null
-  const unreadFile = tellPersonUnreadPath(connectionId, connDir)
-  let unread = readPrivateJson(unreadFile)?.note ?? null
-  if (unread && noteReadThrough(data, unread, { home })) {
-    fs.rmSync(unreadFile, { force: true })
-    unread = null
-  }
   const notes = takeTellPersonNotes(connectionId, { dir: connDir })
-  const text = tellPersonNoteText(notes)
-  if (text) {
-    // A missing earlier note leaves the new messages to stand on their own.
-    const earlier = unread ? readNoteText(unread, { home }) : null
-    try {
-      unread = writeNote(earlier ? `${earlier}\n\n---\n\n${text}` : text, { home }).id
-      writePrivateJson(unreadFile, { note: unread })
-    } catch (error) {
-      // Not handed over, so not taken: every message goes back for the next step.
-      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
-      throw error
-    }
-  }
-  if (!unread) return null
-  const context = pointToNote(
-    { id: unread, command: noteCommand(unread) },
-    {
+  let context
+  try {
+    // One delivery at a time: new messages join one still unread in a new delivery,
+    // and only a whole read of the current delivery ends it (`handOver`).
+    context = handOver(tellPersonUnreadPath(connectionId, connDir), data, {
+      add: tellPersonNoteText(notes),
       what: 'A message your person has not heard, handed back to you by the DevSpec plugin,',
-      also: 'Do what it says. This line comes back after each step until you have read it.',
-    },
-  )
+      also: 'Do what it says.',
+      home,
+    })
+  } catch (error) {
+    // Not handed over, so not taken: every message goes back for the next step.
+    for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
+    throw error
+  }
   return context === null ? null : JSON.stringify(postToolUseOutput(context))
 }
 

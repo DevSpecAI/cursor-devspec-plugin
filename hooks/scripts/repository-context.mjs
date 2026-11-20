@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-import { noteReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
+import { deliveryReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -110,6 +110,11 @@ export function storeRepositorySnapshot(id, registration, home = os.homedir()) {
   fs.mkdirSync(path.dirname(textFile),{recursive:true,mode:0o700})
   try { fs.writeFileSync(temp,renderRepositorySnapshot(snapshot),{mode:0o600,flag:'wx'});fs.renameSync(temp,textFile) }
   finally {try{fs.unlinkSync(temp)}catch{}}
+  // Each change of what this conversation is handed over is a new generation, even a
+  // change back to an earlier text: the hook owes a new delivery for every one.
+  const unchanged = previous && renderRepositorySnapshot(previous) === renderRepositorySnapshot(snapshot)
+  snapshot.generation = unchanged ? (Number.isInteger(previous.generation) ? previous.generation : 1)
+    : (Number.isInteger(previous?.generation) ? previous.generation : 0) + 1
   write(snapshotFile(id,home),snapshot)
   return snapshot
 }
@@ -149,7 +154,7 @@ export function readRepositorySnapshot(id, home = os.homedir()) {
 
 export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
   if (!snapshot) return ''
-  const {rules: instructions, github_identity, ...facts} = snapshot
+  const {rules: instructions, github_identity, generation: _generation, ...facts} = snapshot
   const github = githubIdentity(github_identity)
   const payload = {
     ...facts,
@@ -172,8 +177,8 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
  * and a pointer when large. Cursor keeps no record of whether a hook's note reached
  * the agent, and drops every hook's note on a step when all of them together pass its
  * ceiling (hook-context-budget.mjs), so printing the line proves nothing. The line
- * comes back after every step until the agent is seen reading all of it (`noteReadThrough`),
- * and again whenever the context changes. sessionStart offers it even after it was
+ * comes back after every step until the agent is seen reading all of it, and again
+ * whenever the context changes, back to an earlier text included (`deliveryReadThrough`). sessionStart offers it even after it was
  * read, since a new or resumed chat may not hold it.
  */
 export function repositoryContextHook(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE}={}) {
@@ -182,7 +187,10 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false,shar
   const snapshot = readRepositorySnapshot(id,home)
   if (!snapshot) return null
   const note = writeNote(renderRepositorySnapshot(snapshot),{home})
-  if (noteReadThrough(input,note.id,{home}) && !force) return null
+  // The delivery is this generation of the context, never its text: rules changed and
+  // changed back are owed again, however often that text was read before.
+  const read = deliveryReadThrough(`${snapshotFile(id,home)}.delivery`, input, {note:note.id, generation:snapshot.generation ?? 1}, {home})
+  if (read && !force) return null
   const content = pointToNote(note, {
     share,
     what: `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`,

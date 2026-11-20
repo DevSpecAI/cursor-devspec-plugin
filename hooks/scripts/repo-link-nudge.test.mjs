@@ -14,7 +14,8 @@ import path from 'node:path'
 import { after, describe, it } from 'node:test'
 
 import { handleBashPost, looksRemoteCreating, nudgeText } from './repo-link-nudge.mjs'
-import { POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
 const tmp = []
 function tmpDir(prefix) {
@@ -41,12 +42,15 @@ async function run({
   },
   sessionId = 'conv-1',
   stateDir = tmpDir('devspec-nudge-state-'),
+  home = tmpDir('devspec-nudge-home-'),
+  input = { conversation_id: sessionId, session_id: sessionId, cwd: '/x', tool_input: { command } },
 } = {}) {
   const calls = []
   const out = await handleBashPost(
-    { conversation_id: sessionId, session_id: sessionId, cwd: '/x', tool_input: { command } },
+    input,
     {
       env: { DEVSPEC_CURSOR_PROVENANCE_STATE_DIR: stateDir },
+      home,
       findProjectPin: () => pin,
       gitRemoteOrigin: () => remote,
       resolveAuth: () => auth,
@@ -58,7 +62,9 @@ async function run({
       },
     },
   )
-  return { out, calls, stateDir }
+  // The reminder arrives as a pointer to a note: its text is the note's.
+  const id = noteIdIn(out?.additional_context)
+  return { out, calls, stateDir, home, text: id ? readNoteText(id, { home }) : null, id }
 }
 
 describe('which commands are worth a look', () => {
@@ -82,13 +88,12 @@ describe('which commands are worth a look', () => {
 
 describe('the reminder', () => {
   it('is said when the new remote does not resolve to the pinned project', async () => {
-    const { out, calls } = await run()
+    const { out, calls, text } = await run()
     assert.equal(calls.length, 1)
     assert.equal(calls[0].name, 'list_projects')
     assert.deepEqual(calls[0].arguments, { git_remote: REMOTE })
-    const text = out?.hookSpecificOutput?.additionalContext
     assert.equal(out?.hookSpecificOutput?.hookEventName, 'PostToolUse')
-    assert.equal(out?.additional_context, text)
+    assert.equal(out?.additional_context, out?.hookSpecificOutput?.additionalContext)
     assert.match(text, /"Greenfield"/)
     // The page moved from Settings → Integrations → Repositories to its own
     // Settings → Repositories; the old route is only a redirect now.
@@ -118,17 +123,20 @@ describe('the reminder', () => {
     )
     const text = out.additional_context
     assert.ok(text.length <= POST_TOOL_CONTEXT_SHARE, `${text.length} characters`)
-    const id = text.match(/cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md/)[1]
-    assert.ok(fs.readFileSync(path.join(home, '.devspec', 'notes', `${id}.md`), 'utf8').includes(name), 'the whole note, name and all')
+    assert.ok(readNoteText(noteIdIn(text), { home }).includes(name), 'the whole note, name and all')
   })
 
-  it('is said once per conversation, project and remote', async () => {
+  it('is found once per conversation, project and remote, and offered after every step until read', async () => {
     const stateDir = tmpDir('devspec-nudge-once-')
-    assert.ok((await run({ stateDir })).out)
-    const again = await run({ stateDir })
-    assert.equal(again.out, null)
+    const home = tmpDir('devspec-nudge-home-')
+    const first = await run({ stateDir, home })
+    assert.ok(first.out)
+    const again = await run({ stateDir, home })
     assert.equal(again.calls.length, 0, 'the second time it does not even ask')
-    assert.ok((await run({ stateDir, sessionId: 'conv-2' })).out, 'a new conversation hears it once too')
+    assert.equal(again.out?.additional_context, first.out.additional_context, 'but it is offered again until read')
+    for (const file of noteFiles(home, first.id)) await run({ stateDir, home, input: catCall(home, file, { conversation: 'conv-1' }) })
+    assert.equal((await run({ stateDir, home })).out, null, 'read whole: done')
+    assert.ok((await run({ stateDir, home, sessionId: 'conv-2' })).out, 'a new conversation hears it too')
   })
 
   it('stays silent when the repository already resolves to the pinned project', async () => {

@@ -193,14 +193,16 @@ describe('every after-tool hook, together, at its longest', () => {
 
     // Cursor may have dropped all of it (another plugin's hook, or the person's own, can
     // push the step over the ceiling), and it leaves no record either way. So the next
-    // step offers again what must reach the agent: the rules, the person's message and
-    // the unread room.
+    // step offers again what must reach the agent: the rules, the person's message, the
+    // unread room, the commit note and the pin problem.
     const again = runHooks(home, { ...input, tool_use_id: 'tool-use-after-tool-2', tool_input: { command: 'ls' } })
       .map(({ stdout }) => contextOf(stdout))
       .filter((context) => context !== null)
     assert.ok(again.some((context) => /project context/.test(context)), 'the rules, again')
     assert.ok(again.some((context) => /message your person has not heard/.test(context)), "the person's message, again")
     assert.ok(again.some((context) => /^DevSpec room: 600 messages you have not read yet/.test(context)), 'the unread room, again')
+    assert.ok(again.some((context) => /note about a commit you made/.test(context)), 'the commit note, again')
+    assert.ok(again.some((context) => /pin you just wrote/.test(context)), 'the pin problem, again')
     assert.ok(again.join(CURSOR_HOOK_CONTEXT_SEPARATOR).length <= CURSOR_HOOK_CONTEXT_MAX_CHARS)
 
     // Once the agent has read every part of the rules note, that pointer stops; the

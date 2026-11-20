@@ -54,7 +54,7 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
   fitsShellOutput,
-  noteReadThrough,
+  readThrough,
   postToolUseOutput,
   seal,
   unseal,
@@ -391,7 +391,8 @@ export function pendingNotesPath(connectionId, sessionId, dir) {
  * last page when the output Cursor gave the hook is within its Shell rules and its seal
  * (`unseal`: length and hash) shows the whole page came back, so a cut that kept the
  * head and the tail does not count; and each message handed over as a note once every
- * part of the note has come back whole (`noteReadThrough`).
+ * part of that delivery of the note has come back whole (`readThrough`): each entry
+ * keeps its own record of the parts read since it was handed over.
  */
 export function confirmHandover(room, input, { home = os.homedir() } = {}) {
   const pageFile = pendingPagePath(room.connectionId, room.sessionId, room.dir)
@@ -409,7 +410,7 @@ export function confirmHandover(room, input, { home = os.homedir() } = {}) {
       Object.assign(read, versionMap(pending.read))
       const known = new Set(waiting.map((entry) => `${entry.message_id}\u0000${entry.version}\u0000${entry.note}`))
       for (const entry of Array.isArray(pending.noted) ? pending.noted : []) {
-        if (!known.has(`${entry.message_id}\u0000${entry.version}\u0000${entry.note}`)) waiting.push(entry)
+        if (!known.has(`${entry.message_id}\u0000${entry.version}\u0000${entry.note}`)) waiting.push({ ...entry, parts: [] })
       }
       fs.rmSync(pageFile, { force: true })
       changed = true
@@ -417,11 +418,13 @@ export function confirmHandover(room, input, { home = os.homedir() } = {}) {
   }
   const still = []
   for (const entry of waiting) {
-    if (noteReadThrough(input, entry.note, { home })) {
+    const { record, done } = readThrough(entry, input, { home })
+    if (done) {
       read[entry.message_id] = entry.version
       changed = true
     } else {
-      still.push(entry)
+      if ((record.parts?.length ?? 0) !== (entry.parts?.length ?? 0)) changed = true
+      still.push(record)
     }
   }
   if (!changed) return

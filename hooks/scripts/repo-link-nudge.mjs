@@ -32,7 +32,7 @@ import { withoutStandInPrefix } from './git-observer.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
-import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
+import { handOver, handOverFile, postToolUseOutput } from './hook-context-budget.mjs'
 
 const LOOKUP_TIMEOUT_MS = 8_000
 
@@ -92,6 +92,30 @@ function defaultReadProject(sessionId, { endpoint = null, home = os.homedir() } 
 export async function handleBashPost(hookInput, deps = {}) {
   // Read the command the agent wrote, not the git stand-in line in front of it.
   const input = withoutStandInPrefix(hookInput).payload
+  const home = deps.home ?? os.homedir()
+  const sessionId =
+    typeof input?.session_id === 'string' && input.session_id
+      ? input.session_id
+      : typeof input?.conversation_id === 'string' && input.conversation_id
+        ? input.conversation_id
+        : typeof input?.conversationId === 'string' && input.conversationId
+          ? input.conversationId
+          : 'no-session'
+  const found = await nudgeFor(input, sessionId, deps)
+  // What the person must do reaches the agent as a note, offered after every step
+  // until the agent has read it whole (hook-context-budget.mjs): Cursor gives no sign
+  // that a hook's note arrived.
+  const context = handOver(handOverFile('repo-link', sessionId, { home }), hookInput, {
+    add: found?.text ?? null,
+    what: 'A note about linking this repository to its DevSpec project',
+    home,
+  })
+  if (found) remember(found.marker)
+  return postToolUseOutput(context)
+}
+
+/** The nudge this tool call calls for, with the marker that says it was said, or null. */
+async function nudgeFor(input, sessionId, deps) {
   const env = deps.env ?? process.env
   const rawInput = input?.tool_input ?? input?.toolInput ?? {}
   const toolInput = typeof rawInput === 'string' ? (() => { try { return JSON.parse(rawInput) } catch { return {} } })() : (rawInput ?? {})
@@ -112,14 +136,6 @@ export async function handleBashPost(hookInput, deps = {}) {
   const remote = (deps.gitRemoteOrigin ?? gitRemoteOrigin)(repoDir)
   if (!remote) return null
 
-  const sessionId =
-    typeof input?.session_id === 'string' && input.session_id
-      ? input.session_id
-      : typeof input?.conversation_id === 'string' && input.conversation_id
-        ? input.conversation_id
-        : typeof input?.conversationId === 'string' && input.conversationId
-          ? input.conversationId
-          : 'no-session'
   const marker = markerPath(sessionId, pinId, remote, env)
   if (alreadySaid(marker)) return null
 
@@ -153,15 +169,7 @@ export async function handleBashPost(hookInput, deps = {}) {
   const projects = Array.isArray(listed?.projects) ? listed.projects : []
   const project = projects.find((p) => p?.id === pinId)
   if (!project) return null
-
-  const output = postToolUseOutput(
-    fitHookContext(nudgeText({ projectName: project.name, remote }), {
-      what: 'A note about linking this repository to its DevSpec project',
-      ...(deps.home ? { home: deps.home } : {}),
-    }),
-  )
-  if (output) remember(marker)
-  return output
+  return { text: nudgeText({ projectName: project.name, remote }), marker }
 }
 
 async function main() {
