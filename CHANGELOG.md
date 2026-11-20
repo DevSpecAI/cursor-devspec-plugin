@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.23.0
+
+- **Your Cursor agent now writes a task's reason the way you gave it.** Before, it was told to write its own summary of why a task exists. Now it records the reason you actually gave, in your everyday words, and never one you did not give.
+- **How it keeps your decisions now follows DevSpec's own rules directly**, rather than the plugin's copy of them, so it stays in step when those rules change. As before, it records a decision only once you confirm it was deliberate and say why.
+- **It suggests a requirement when one comes up, and never saves one without your yes.** When you point out a mistake that keeps coming back across tasks, or state a project-wide "always" or "never" rule, the agent explains what a requirement is and how it differs from a recorded decision, and asks whether you want one.
+- **It works to the decisions, conventions and requirements that come with a task,** and when it hands the work in it records which of your requirements the work was seen to meet.
+- **When something it is about to save overlaps a record you already have, it prefers updating that record** to adding a near-duplicate, and checks your existing documents before writing a new guide or runbook.
+- **What it records is easier to find later:** a record's summary says when to reach for it, and a runbook is linked to the decision it carries out.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.22.2
 
 - **Connecting and disconnecting remote control now always run the newest copy of the plugin you have installed.** Cursor keeps the older copies of a plugin on disk after you update it. Until now, the agent could pick whichever copy it came across first, so after an update it could still start the old version's background helper. It now picks the copy with the highest version, and among copies of the same version, the one that arrived most recently.
