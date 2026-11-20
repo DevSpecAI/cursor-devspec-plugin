@@ -10,6 +10,10 @@
  * A reply to DevSpec notices (notice-reply.mjs) is neither: it answers no command and
  * completes no turn, even when it passes complete_turn, so a command being worked still
  * needs its own answer and keeps showing Working until it gets one.
+ *
+ * On afterMCPExecution it also notes a DevSpec write whose result carries DevSpec's
+ * `tell_person` mark on the turn (`handleTellPersonMark`), so a turn that owns no
+ * command still tells the person at Stop when the model did not (notice-reply.mjs).
  */
 
 import fs from 'node:fs'
@@ -24,7 +28,8 @@ import {
 } from './mirror-turn.mjs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
-import { currentTurnNoticeIds, isNoticeReplyPost } from './notice-reply.mjs'
+import { currentTurnNoticeIds, isNoticeReplyPost, recordTellPerson, resultCarriesTellPerson } from './notice-reply.mjs'
+import { isDevspecServer, namespacedVerb } from './project-context.mjs'
 
 function readStdin() {
   try {
@@ -133,8 +138,41 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
   return true
 }
 
+/** Whether a hook event is a call to one of DevSpec's own tools. */
+function isDevspecToolEvent(data) {
+  if (data?.mcp_server_name !== undefined) return isDevspecServer(data.mcp_server_name)
+  return Boolean(namespacedVerb(data?.tool_name ?? data?.toolName))
+}
+
+/**
+ * Note on the turn that a DevSpec write's result carried DevSpec's `tell_person` mark
+ * (`resultCarriesTellPerson`). Cursor hands the result to afterMCPExecution as
+ * `result_json`; an event without one changes nothing. Exported for tests; `dir`
+ * defaults to where the turn record lives.
+ */
+export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) {
+  let data = {}
+  try {
+    data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
+  } catch {
+    return false
+  }
+  if (!data || typeof data !== 'object' || !isDevspecToolEvent(data)) return false
+  if (!resultCarriesTellPerson(data.result_json ?? data.resultJson)) return false
+  const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
+  const connectionId = loadState(conversationId)?.connection_id
+  if (!connectionId) return false
+  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+  return recordTellPerson(connectionId, { dir: connDir })
+}
+
 async function main() {
   const raw = readStdin()
+  try {
+    handleTellPersonMark(raw)
+  } catch {
+    /* non-fatal: an unnoted mark only leaves telling the person to the model */
+  }
   try {
     await handleExplicitReply(raw)
   } catch {

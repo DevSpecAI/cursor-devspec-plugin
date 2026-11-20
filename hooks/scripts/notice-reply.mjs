@@ -30,18 +30,20 @@
  *   plugin cannot tell which post is about the notice, stamps nothing, and the model
  *   passes the ids it was shown. Check jobs delivered into the turn are recorded
  *   beside the notices (`checkJobIds`) and change none of this.
- * - A notice-only turn whose model posted no reply ends with one: Stop posts the
- *   turn's final message as a notice reply (`postNoticeTurnReply`).
+ * - Stop never posts a reply for the model (item 140a7f68). Whether a notice is
+ *   answered in the room is DevSpec's rule (`semantics.notice_audience`,
+ *   `semantics.notice_reply`), and when one is called for the model posts it itself;
+ *   what it leaves in the terminal at the end of a turn that owns no command is its
+ *   working, not a reply. The one thing Stop posts for such a turn is its final
+ *   message, as an ordinary message, after one of its writes carried DevSpec's
+ *   `tell_person` mark and the model told nobody itself (`postTellPersonAtStop`).
  *
  * Which notices get a reply is DevSpec's label, never the plugin's guess (item
  * a868f41f; `semantics.notice_audience`). At system_notice_version 3 every notice
  * carries `audience`: `needs_person` or `for_the_record`. Only notices that need a
- * person are given a reply call, stamped on a plain post or replied to at Stop; the
- * turn record keeps the for-the-record ones apart (`forTheRecordIds`), so a turn they
- * alone woke posts nothing. They still make the turn one that owns no command. A
- * reply DevSpec refuses because every notice it names is for the record
- * (`delivery.reason: for_the_record`) is the expected, quiet outcome: nothing is
- * posted, surfaced or retried another way.
+ * person are given a reply call or stamped on a plain post; the turn record keeps the
+ * for-the-record ones apart (`forTheRecordIds`). They still make the turn one that
+ * owns no command.
  *
  * Imports only Node built-ins and sibling modules that do.
  */
@@ -267,8 +269,9 @@ function forTheRecordField(ids) {
 
 /**
  * The current turn's record: `{ startedAt, noticeIds, forTheRecordIds?, checkJobIds?,
- * otherWake, noticeReplyAt? }`, or null. `noticeIds` holds every notice that woke the
- * turn; `forTheRecordIds` the ones among them DevSpec labelled for the record.
+ * otherWake, noticeReplyAt?, tellPersonAt? }`, or null. `noticeIds` holds every notice
+ * that woke the turn; `forTheRecordIds` the ones among them DevSpec labelled for the
+ * record; `tellPersonAt` when a DevSpec write in the turn carried `tell_person`.
  */
 export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return null
@@ -282,6 +285,7 @@ export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
       ...checkJobIdsField(record.checkJobIds),
       otherWake: record.otherWake === true,
       ...(typeof record.noticeReplyAt === 'number' ? { noticeReplyAt: record.noticeReplyAt } : {}),
+      ...(typeof record.tellPersonAt === 'number' ? { tellPersonAt: record.tellPersonAt } : {}),
     }
   } catch {
     return null
@@ -331,11 +335,54 @@ export function clearTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   }
 }
 
-/** Note that a reply to the turn's notices went out, so Stop does not post a second. */
+/** Note that the model replied to the turn's notices itself, so Stop posts nothing for it. */
 export function recordNoticeReply(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
   const record = readTurnWakes(connectionId, { dir })
   if (!record) return false
   return Boolean(writeTurnWakes(connectionId, { ...record, noticeReplyAt: now }, dir))
+}
+
+/**
+ * Note that a DevSpec write in the turn carried `tell_person` (`resultCarriesTellPerson`).
+ * Only a turn something woke has a record, and only a turn that owns no command acts on
+ * it (`postTellPersonAtStop`); anywhere else telling the person is the turn's own answer.
+ */
+export function recordTellPerson(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  const record = readTurnWakes(connectionId, { dir })
+  if (!record) return false
+  if (record.tellPersonAt) return true
+  return Boolean(writeTurnWakes(connectionId, { ...record, tellPersonAt: now }, dir))
+}
+
+/**
+ * Whether a DevSpec tool result carries DevSpec's `tell_person` mark: the write changed
+ * a record its requester does not own, or marked a task blocked, and the person the
+ * agent works for must hear about it (`semantics.notice_audience.telling_anyway`).
+ * DevSpec appends the mark to an applied write's result as its own text block,
+ * `{"tell_person":{…}}`. Only that shape counts, so a record whose text merely mentions
+ * the word never does. `result` is the result Cursor hands afterMCPExecution
+ * (`result_json`), as text or as the parsed object.
+ */
+export function resultCarriesTellPerson(result) {
+  let envelope = result
+  if (typeof envelope === 'string') {
+    try {
+      envelope = JSON.parse(envelope)
+    } catch {
+      return false
+    }
+  }
+  if (!envelope || typeof envelope !== 'object' || envelope.isError === true) return false
+  const blocks = Array.isArray(envelope.content) ? envelope.content : []
+  return blocks.some((block) => {
+    if (block?.type !== 'text' || typeof block.text !== 'string' || !block.text.includes('"tell_person"')) return false
+    try {
+      const mark = JSON.parse(block.text)?.tell_person
+      return Boolean(mark) && typeof mark === 'object' && !Array.isArray(mark) && typeof mark.why === 'string'
+    } catch {
+      return false
+    }
+  })
 }
 
 /**
@@ -472,9 +519,9 @@ function withKnownLabels(wake, known) {
  * one that is not a notice sets `otherWake`. A stale record or request only ever
  * makes this null, never the other way round.
  *
- * Notices DevSpec labelled for the record are left out: nothing is posted about them,
- * so a plain post is never stamped with them and Stop never replies to them. A turn
- * that only they woke has none, and so null.
+ * Notices DevSpec labelled for the record are left out: a reply naming them is never
+ * one, so a plain post is never stamped with them. A turn that only they woke has none,
+ * and so null.
  */
 export function turnNoticeIds({ record, requestState = null, connectionState = null } = {}) {
   const quiet = new Set(uniqueIds(record?.forTheRecordIds))
@@ -528,8 +575,11 @@ export function currentTurnOwnsNoCommand(connectionId, { dir = DEFAULT_DIR, conn
   })
 }
 
-// ── Stop: a notice-only turn ends with a notice reply ─────────────────────────
+// ── Stop: a write marked tell_person, which the model told nobody about ───────
 
+// How much of the transcript's end is read for the turn's final message. Cursor writes
+// a turn's rows last, so they sit at the end; this bound only stops a huge transcript
+// being read whole at the end of every turn that needs it.
 const TRANSCRIPT_TAIL_BYTES = 256 * 1024
 
 function textOf(row) {
@@ -602,74 +652,51 @@ function hookAssistantText(data) {
 }
 
 /**
- * Whether DevSpec refused a notice reply because every notice it named is for the
- * record (`delivery.reason: for_the_record`): nothing was posted and nothing needs to
- * be. Read from the refusal's own receipt, or from its text when the receipt could
- * not be parsed.
- */
-export function isForTheRecordRefusal(error) {
-  const details = error?.details
-  if (
-    details &&
-    typeof details === 'object' &&
-    (details.delivery?.reason === 'for_the_record' ||
-      details.delivery?.reason === 'settled_housekeeping' ||
-      details.settled_housekeeping === true)
-  ) {
-    return true
-  }
-  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-  return /"reason"\s*:\s*"(?:for_the_record|settled_housekeeping)"|"settled_housekeeping"\s*:\s*true/.test(text)
-}
-
-/**
- * Stop: when the turn was woken only by notices and the model posted no reply to
- * the ones that need a person, post its final message as a notice reply to them.
- * Bound to no command turn, so no trail, no complete_turn and no local-turn flags.
- * Nothing for a turn that errored or was stopped (its last words are not an answer),
- * for a connection in no room (the person already sees the final message in the
- * terminal), or for a turn whose notices are all for the record. Should DevSpec still
- * refuse the reply as for the record, that is the quiet outcome: recorded as handled,
- * never surfaced or retried.
+ * Stop, for a turn that owns no command (`turnOwnsNoCommand`: only DevSpec notices and
+ * check jobs woke it). Nothing from such a turn reaches the room on the plugin's word:
+ * whether a notice is answered there is DevSpec's rule (`semantics.notice_audience`,
+ * `semantics.notice_reply` in devspec://product/remote-ingress-contract), and when one
+ * is called for the model posts it itself (item 140a7f68).
  *
- * @returns {Promise<string[]|null>} the notice ids replied to, or null
+ * The one exception is DevSpec's `tell_person` mark on a write the turn made
+ * (`semantics.notice_audience.telling_anyway`, which has a host that posts mechanically
+ * post that run's answer). When the model posted nothing in the room itself (`told`,
+ * or a notice reply it made), the turn's final message goes there as the ordinary
+ * message the model would have posted: no notice ids (a for-the-record notice cannot
+ * take a reply), no trail, no complete_turn and no local-turn flags. Nothing for a turn
+ * that errored or was stopped (its last words are not an answer), or for a connection
+ * in no room (the person already sees the final message in the terminal).
+ *
+ * @returns {Promise<boolean>} whether the final message was posted
  */
-export async function postNoticeTurnReply({
+export async function postTellPersonAtStop({
   raw,
   connectionId,
   sessionId,
   connectionState = null,
   agentName,
+  told = false,
   post,
   dir = DEFAULT_DIR,
   prepare = (text) => String(text ?? '').trim() || null,
 } = {}) {
-  if (!connectionId || !sessionId || typeof post !== 'function') return null
+  if (!connectionId || !sessionId || told || typeof post !== 'function') return false
   const record = readTurnWakes(connectionId, { dir })
-  if (!record || record.noticeReplyAt) return null
-  const ids = turnNoticeIds({ record, requestState: readRequestState(connectionId, { dir }), connectionState })
-  if (!ids) return null
+  if (!record?.tellPersonAt || record.noticeReplyAt) return false
+  if (!turnOwnsNoCommand({ record, requestState: readRequestState(connectionId, { dir }), connectionState })) return false
   let data = {}
   try {
     data = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
   } catch {
     data = {}
   }
-  if (data.status !== undefined && data.status !== 'completed') return null
+  if (data.status !== undefined && data.status !== 'completed') return false
   const text = prepare(hookAssistantText(data) ?? lastAssistantText(data.transcript_path))
-  if (!text) return null
-  try {
-    await post({
-      connection_id: connectionId,
-      ...(agentName ? { agent_name: agentName } : {}),
-      message: text,
-      system_notice_ids: ids,
-    })
-  } catch (error) {
-    if (!isForTheRecordRefusal(error)) throw error
-    recordNoticeReply(connectionId, { dir })
-    return null
-  }
-  recordNoticeReply(connectionId, { dir })
-  return ids
+  if (!text) return false
+  await post({
+    connection_id: connectionId,
+    ...(agentName ? { agent_name: agentName } : {}),
+    message: text,
+  })
+  return true
 }

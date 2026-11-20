@@ -12,10 +12,12 @@
  *   notice, turns string-shaped ids into the array DevSpec takes, always names the
  *   connection, and never gives a notice reply local-turn flags;
  * - a notice reply never completes a turn or answers a command, even with complete_turn;
- * - Stop ends a notice-only turn with a notice reply, and such a turn posts no trail;
+ * - Stop never posts the final message of a turn only notices and check jobs woke as a
+ *   reply (item 140a7f68), and such a turn posts no trail; it posts that message, as an
+ *   ordinary message, only when a write in the turn carried DevSpec's tell_person mark
+ *   and the model told nobody itself;
  * - a notice DevSpec labels for the record (system_notice_version 3, item a868f41f)
- *   gets no reply from any of these, and a reply DevSpec refuses as for the record
- *   is the quiet outcome it is.
+ *   gets no reply from any of these.
  * The hooks run as Cursor runs them: real processes against a stub DevSpec server.
  */
 
@@ -37,22 +39,22 @@ import {
 import { appendWakeEvents } from './devspec-wake-file.mjs'
 import { handleExplicitReply } from './mark-explicit-reply.mjs'
 import { explicitReplyMarkerPath, turnMarkerPath, writeTurnMarker } from './mirror-turn.mjs'
-import { CursorMcpRefusal } from './mcp-call.mjs'
 import {
   currentTurnNoticeIds,
   currentTurnOwnsNoCommand,
   FOR_THE_RECORD_HANDLING,
   FOR_THE_RECORD_WAKE,
-  isForTheRecordRefusal,
   lastAssistantText,
   noticeReplyCall,
   noticeReplyInstruction,
   normalizeNoticeIds,
-  postNoticeTurnReply,
+  postTellPersonAtStop,
   readTurnWakes,
   recordNoticeReply,
   recordPromptWake,
+  recordTellPerson,
   recordTurnWake,
+  resultCarriesTellPerson,
   turnWakeFromEvents,
   turnWakeFromText,
   turnWakesPath,
@@ -88,6 +90,32 @@ const PROJECT = {
 
 /** Fields a notice reply never carries: they belong to a turn, and DevSpec refuses them. */
 const TURN_ONLY = ['work_trail', 'trail_events', 'command_turn_id', 'reply_to_message_id', 'session_id']
+
+const OTHER_TASK = 'b2222222-2222-4222-8222-222222222222'
+
+/**
+ * A DevSpec write's result as Cursor hands it to afterMCPExecution (`result_json`):
+ * the write's own answer, then DevSpec's tell_person mark appended as its own block.
+ */
+function markedResult({ why = 'changed_someone_elses_record', isError = false } = {}) {
+  return JSON.stringify({
+    content: [
+      { type: 'text', text: JSON.stringify({ success: true, task: { id: OTHER_TASK, lifecycle: 'dismissed' } }) },
+      {
+        type: 'text',
+        text: JSON.stringify({
+          tell_person: {
+            why,
+            record: { type: 'task', id: OTHER_TASK },
+            owner: 'someone_else',
+            instruction: 'This changed a record that is not the requester\'s own, so tell the person you are working for what you changed.',
+          },
+        }),
+      },
+    ],
+    ...(isError ? { isError: true } : {}),
+  })
+}
 
 function noticeBatch(...ids) {
   return labelledBatch(ids.map((id) => [id]))
@@ -421,10 +449,10 @@ describe('the final message of a notice-only turn', () => {
     assert.equal(lastAssistantText(path.join(home, 'missing.jsonl')), null)
   })
 
-  it('is posted only for a completed notice-only turn in a room, and only once', async () => {
-    const file = transcript([user('wake'), say('Merged; it is on staging.'), { type: 'turn_ended', status: 'completed' }])
+  it('is never posted as a reply, and as an ordinary message only for a tell_person write the model told nobody about', async () => {
+    const file = transcript([user('wake'), say('Closed the duplicate task Brandon filed.'), { type: 'turn_ended', status: 'completed' }])
     const posts = []
-    const stop = (input, extra = {}) => postNoticeTurnReply({
+    const stop = (input = {}, extra = {}) => postTellPersonAtStop({
       raw: JSON.stringify({ status: 'completed', transcript_path: file, ...input }),
       connectionId: CONN,
       sessionId: ROOM,
@@ -434,17 +462,83 @@ describe('the final message of a notice-only turn', () => {
       ...extra,
     })
 
+    // Settled quietly: no write asked the agent to tell anyone.
     noticeTurn(NOTICE_A)
-    assert.equal(await stop({}, { sessionId: null }), null, 'no room: the person already has it in the terminal')
-    assert.equal(await stop({ status: 'aborted' }), null, 'a stopped turn\'s last words are not an answer')
-    commandTurn()
-    assert.equal(await stop({}), null, 'a command turn ends with its own answer')
+    assert.equal(await stop(), false, 'a notice the model left unanswered is not answered for it')
     assert.equal(posts.length, 0)
 
+    recordTellPerson(CONN, { dir })
+    assert.equal(await stop({}, { sessionId: null }), false, 'no room: the person already has it in the terminal')
+    assert.equal(await stop({ status: 'aborted' }), false, 'a stopped turn\'s last words are not an answer')
+    assert.equal(await stop({}, { told: true }), false, 'the model already told the room itself')
+    assert.equal(posts.length, 0)
+
+    assert.equal(await stop(), true)
+    const [told, ...more] = posts
+    assert.equal(more.length, 0)
+    assert.deepEqual(told, { connection_id: CONN, agent_name: 'Cursor', message: 'Closed the duplicate task Brandon filed.' })
+
+    // The model replied to the notice itself: nothing more from Stop.
     scratchHome()
+    posts.length = 0
     noticeTurn(NOTICE_A)
+    recordTellPerson(CONN, { dir })
     recordNoticeReply(CONN, { dir })
-    assert.equal(await stop({}), null, 'the model already replied')
+    assert.equal(await stop(), false)
+
+    // A command's turn tells the person in its own answer.
+    scratchHome()
+    commandTurn()
+    recordTellPerson(CONN, { dir })
+    assert.equal(await stop(), false)
+    assert.equal(posts.length, 0)
+  })
+
+  it('a turn only a check job woke tells the person about a tell_person write, too', async () => {
+    const file = transcript([user('wake'), say('Ruling the check closed another person\'s task.'), { type: 'turn_ended', status: 'completed' }])
+    const posts = []
+    recordTurnWake(CONN, { checkJobIds: [NOTICE_B] }, { dir, newTurn: true })
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+    const stop = () => postTellPersonAtStop({
+      raw: JSON.stringify({ status: 'completed', transcript_path: file }),
+      connectionId: CONN,
+      sessionId: ROOM,
+      dir,
+      post: async (args) => posts.push(args),
+    })
+    assert.equal(await stop(), false)
+    recordTellPerson(CONN, { dir })
+    assert.equal(await stop(), true)
+    assert.equal(posts[0].message, 'Ruling the check closed another person\'s task.')
+    assert.equal(posts[0].system_notice_ids, undefined)
+  })
+})
+
+describe("DevSpec's tell_person mark on a write", () => {
+  beforeEach(scratchHome)
+
+  it('is read only from the block DevSpec appends to an applied write', () => {
+    assert.equal(resultCarriesTellPerson(markedResult()), true)
+    assert.equal(resultCarriesTellPerson(JSON.parse(markedResult({ why: 'task_blocked' }))), true, 'the parsed result too')
+    assert.equal(resultCarriesTellPerson(markedResult({ isError: true })), false, 'a refused write changed nothing')
+    // A record whose own text mentions the word is not the mark.
+    const mention = { content: [{ type: 'text', text: JSON.stringify({ success: true, description: 'Read "tell_person" on a write result.' }) }] }
+    assert.equal(resultCarriesTellPerson(mention), false)
+    assert.equal(resultCarriesTellPerson({ content: [{ type: 'text', text: '{"tell_person":"yes"}' }] }), false)
+    assert.equal(resultCarriesTellPerson(''), false, 'Cursor withholds a large result as empty text')
+    assert.equal(resultCarriesTellPerson(undefined), false)
+  })
+
+  it('is noted on the turn only when a turn something woke is open', () => {
+    assert.equal(recordTellPerson(CONN, { dir }), false, 'no turn record: nothing to note it on')
+    noticeTurn(NOTICE_A)
+    assert.equal(recordTellPerson(CONN, { dir }), true)
+    const first = readTurnWakes(CONN, { dir }).tellPersonAt
+    assert.equal(typeof first, 'number')
+    recordTurnWake(CONN, { noticeIds: [NOTICE_B] }, { dir })
+    assert.equal(readTurnWakes(CONN, { dir }).tellPersonAt, first, 'a notice folded in mid-turn keeps it')
+    recordPromptWake(CONN, { fromAPerson: true, text: 'next thing', dir })
+    assert.equal(readTurnWakes(CONN, { dir }).tellPersonAt, undefined, 'a new turn starts without it')
   })
 })
 
@@ -489,42 +583,80 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
   }
   const posts = () => calls.filter((call) => call.name === 'post_session_message')
 
-  it('Stop posts the final message as one reply to every notice of the wake, bound to no turn', async () => {
-    const prompt = notificationText(buildOwnerMessageEvents(noticeBatch(NOTICE_A, NOTICE_B)), home)
-    await run('mirror-turn.mjs', 'user_prompt', { prompt })
-    assert.deepEqual(readTurnWakes(CONN, { dir }).noticeIds, [NOTICE_A, NOTICE_B])
-
+  /** The agent transcript Stop reads the turn's final message from. */
+  function transcriptOf(prompt, finalText) {
     const file = path.join(home, 'agent-transcript.jsonl')
     fs.writeFileSync(file, [
       { role: 'user', message: { content: [{ type: 'text', text: prompt }] } },
-      { role: 'assistant', message: { content: [{ type: 'text', text: 'Merging.' }, { type: 'tool_use', name: 'Shell', input: {} }] } },
-      { role: 'assistant', message: { content: [{ type: 'text', text: 'Merged; the work is on staging.' }] } },
+      { role: 'assistant', message: { content: [{ type: 'text', text: 'Checking the finding.' }, { type: 'tool_use', name: 'Shell', input: {} }] } },
+      { role: 'assistant', message: { content: [{ type: 'text', text: finalText }] } },
       { type: 'turn_ended', status: 'completed' },
     ].map((row) => JSON.stringify(row)).join('\n') + '\n')
+    return file
+  }
+
+  /** A DevSpec write the model makes, as afterMCPExecution hands it to the hook. */
+  const afterWrite = (result_json) => run('mark-explicit-reply.mjs', 'afterMCPExecution', {
+    hook_event_name: 'afterMCPExecution',
+    mcp_server_name: 'devspec',
+    tool_name: 'devspec__resolve_duplicate',
+    tool_input: JSON.stringify({ action: 'resolve', duplicate: { type: 'task', id: OTHER_TASK } }),
+    result_json,
+  })
+
+  it('Stop posts nothing for a notice turn the model settled without posting: never its terminal notes', async () => {
+    const prompt = notificationText(buildOwnerMessageEvents(noticeBatch(NOTICE_A, NOTICE_B)), home)
+    await run('mirror-turn.mjs', 'user_prompt', { prompt })
+    assert.deepEqual(readTurnWakes(CONN, { dir }).noticeIds, [NOTICE_A, NOTICE_B])
+    // A DevSpec read that carries no mark changes nothing.
+    await afterWrite(JSON.stringify({ content: [{ type: 'text', text: JSON.stringify({ success: true }) }] }))
+
+    const file = transcriptOf(prompt, 'Settled in place from what was agreed; finishing quietly per the notice rules (f7d6a637).')
     await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: file })
 
-    const [reply, ...more] = posts()
-    assert.ok(reply, 'Stop posted the final message')
-    assert.equal(more.length, 0)
-    assert.deepEqual(reply.args.system_notice_ids, [NOTICE_A, NOTICE_B])
-    assert.equal(reply.args.connection_id, CONN)
-    assert.equal(reply.args.message, 'Merged; the work is on staging.')
-    for (const key of [...TURN_ONLY, 'complete_turn', 'local_turn', 'command_turn_unbound', 'phase']) {
-      assert.equal(reply.args[key], undefined, key)
-    }
+    assert.deepEqual(posts(), [], 'the terminal notes of a quiet notice turn never reach the room')
     assert.equal(fs.existsSync(turnWakesPath(CONN, dir)), false, 'the turn is forgotten once it ends')
   })
 
-  it('Stop posts nothing more after the model replied, and nothing for a command turn', async () => {
-    await run('mirror-turn.mjs', 'user_prompt', { prompt: notificationText(buildOwnerMessageEvents(noticeBatch(NOTICE_A)), home) })
-    prePost({ message: 'Merged.' })
-    const file = path.join(home, 'agent-transcript.jsonl')
-    fs.writeFileSync(file, `${JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Posted the reply.' }] } })}\n`)
-    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: file })
+  it('Stop posts no second copy after the model replied to a notice itself, nor anything for a command turn', async () => {
+    const prompt = notificationText(buildOwnerMessageEvents(noticeBatch(NOTICE_A)), home)
+    await run('mirror-turn.mjs', 'user_prompt', { prompt })
+    const reply = prePost({ message: 'This clashes with the release decision: keep it, or change the decision?' })
+    assert.deepEqual(reply.system_notice_ids, [NOTICE_A], 'the model\'s own post is the notice reply')
+    await afterWrite(markedResult())
+    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf(prompt, 'Posted the reply.') })
     assert.equal(posts().length, 0)
 
     await run('mirror-turn.mjs', 'user_prompt', { prompt: notificationText(COMMAND_EVENTS, home) })
-    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: file })
+    await afterWrite(markedResult())
+    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf('Fix the flaky test', 'Fixed.') })
+    assert.equal(posts().length, 0, 'a command\'s turn tells the person in its own answer')
+  })
+
+  it('Stop posts the final message as an ordinary message when a write carried tell_person and the model told nobody', async () => {
+    const prompt = notificationText(buildOwnerMessageEvents(labelledBatch([[NOTICE_B, 'for_the_record']])), home)
+    await run('mirror-turn.mjs', 'user_prompt', { prompt })
+    await afterWrite(markedResult())
+    assert.equal(typeof readTurnWakes(CONN, { dir }).tellPersonAt, 'number', 'the hook noted the mark on the turn')
+
+    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf(prompt, 'I closed Brandon\'s duplicate of my task.') })
+    const [told, ...more] = posts()
+    assert.ok(told, 'Stop told the room')
+    assert.equal(more.length, 0)
+    assert.equal(told.args.connection_id, CONN)
+    assert.equal(told.args.message, 'I closed Brandon\'s duplicate of my task.')
+    for (const key of [...TURN_ONLY, 'system_notice_ids', 'complete_turn', 'local_turn', 'command_turn_unbound', 'phase']) {
+      assert.equal(told.args[key], undefined, key)
+    }
+
+    // The model told the person itself, in an ordinary post: Stop adds nothing.
+    calls = []
+    await run('mirror-turn.mjs', 'user_prompt', { prompt })
+    await afterWrite(markedResult())
+    const own = { connection_id: CONN, message: 'I closed Brandon\'s duplicate of my task.' }
+    assert.equal(prePost(own).system_notice_ids, undefined, 'a for-the-record turn stamps nothing')
+    await run('mark-explicit-reply.mjs', 'afterMCPExecution', { mcp_server_name: 'devspec', tool_name: 'devspec__post_session_message', tool_input: own })
+    await run('mirror-turn.mjs', 'stop', { status: 'completed', transcript_path: transcriptOf(prompt, 'Told them.') })
     assert.equal(posts().length, 0)
   })
 
@@ -545,13 +677,8 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
 })
 
 // DevSpec labels every notice at system_notice_version 3 (item a868f41f): only the
-// ones that need a person are replied to, by the model or by Stop.
+// ones that need a person are given a reply, and the model posts it.
 describe('notices DevSpec labels for the record', () => {
-  const FOR_THE_RECORD_REFUSAL = () => new CursorMcpRefusal(
-    JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.', notice_ids: [NOTICE_B] }),
-    { delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, error: 'Nothing was posted, and nothing needs to be.', notice_ids: [NOTICE_B] },
-  )
-
   /** A turn started by Cursor's notification of a labelled wake, as the prompt hook records it. */
   function labelledTurn(pairs) {
     const text = notificationText(buildOwnerMessageEvents(labelledBatch(pairs)), home)
@@ -646,11 +773,11 @@ describe('notices DevSpec labels for the record', () => {
     assert.deepEqual(prePost({ message: 'This clashes with the release decision.' }).system_notice_ids, [NOTICE_A])
   })
 
-  it('Stop replies to nothing in a for-the-record turn, and only to what needs a person in a mixed one', async () => {
+  it('Stop replies to none of them, in a for-the-record turn or a mixed one', async () => {
     const file = path.join(home, 'agent-transcript.jsonl')
     fs.writeFileSync(file, `${JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Linked the commit.' }] } })}\n`)
     const posts = []
-    const stop = () => postNoticeTurnReply({
+    const stop = () => postTellPersonAtStop({
       raw: JSON.stringify({ status: 'completed', transcript_path: file }),
       connectionId: CONN,
       sessionId: ROOM,
@@ -658,61 +785,11 @@ describe('notices DevSpec labels for the record', () => {
       post: async (args) => posts.push(args),
     })
     labelledTurn([[NOTICE_B, 'for_the_record']])
-    assert.equal(await stop(), null)
-    assert.equal(posts.length, 0)
+    assert.equal(await stop(), false)
 
     scratchHome()
     labelledTurn([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']])
-    assert.deepEqual(await stop(), [NOTICE_A])
-    assert.deepEqual(posts.map((args) => args.system_notice_ids), [[NOTICE_A]])
-  })
-
-  it('a reply DevSpec refuses as for the record is quiet: no error, no retry, no second reply', async () => {
-    assert.equal(isForTheRecordRefusal(FOR_THE_RECORD_REFUSAL()), true)
-    assert.equal(
-      isForTheRecordRefusal(
-        new CursorMcpRefusal(
-          JSON.stringify({ delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, settled_housekeeping: true, housekeeping_message_id: 'hk-1' }),
-          { delivery: { status: 'rejected', reason: 'for_the_record', retryable: false }, settled_housekeeping: true, housekeeping_message_id: 'hk-1' },
-        ),
-      ),
-      true,
-    )
-    assert.equal(
-      isForTheRecordRefusal(
-        new CursorMcpRefusal(
-          JSON.stringify({ delivery: { status: 'skipped', reason: 'settled_housekeeping' }, settled_housekeeping: true }),
-          { delivery: { status: 'skipped', reason: 'settled_housekeeping' }, settled_housekeeping: true },
-        ),
-      ),
-      true,
-    )
-    // Read from the text when the receipt could not be parsed.
-    assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('{"delivery":{"status":"rejected","reason":"for_the_record","retryable":false}}\n{"account_notice":{}}', undefined)), true)
-    assert.equal(isForTheRecordRefusal(new CursorMcpRefusal('Connection not found', { error: 'Connection not found' })), false)
-    assert.equal(isForTheRecordRefusal(new Error('MCP HTTP 500: boom')), false)
-
-    const file = path.join(home, 'agent-transcript.jsonl')
-    fs.writeFileSync(file, `${JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Done.' }] } })}\n`)
-    let calls = 0
-    const stop = (refusal) => postNoticeTurnReply({
-      raw: JSON.stringify({ status: 'completed', transcript_path: file }),
-      connectionId: CONN,
-      sessionId: ROOM,
-      dir,
-      post: async () => { calls++; throw refusal() },
-    })
-    // A notice the plugin saw unlabelled, which DevSpec knows is for the record.
-    noticeTurn(NOTICE_B)
-    assert.equal(await stop(FOR_THE_RECORD_REFUSAL), null)
-    assert.equal(calls, 1, 'never retried')
-    assert.equal(typeof readTurnWakes(CONN, { dir }).noticeReplyAt, 'number', 'handled: nothing more is posted for it')
-    assert.equal(await stop(FOR_THE_RECORD_REFUSAL), null)
-    assert.equal(calls, 1)
-
-    // Any other refusal is still an error for the caller.
-    scratchHome()
-    noticeTurn(NOTICE_A)
-    await assert.rejects(stop(() => new CursorMcpRefusal('Connection not found', { error: 'Connection not found' })), /Connection not found/)
+    assert.equal(await stop(), false, 'the notice that needs a person is the model\'s to answer')
+    assert.equal(posts.length, 0)
   })
 })

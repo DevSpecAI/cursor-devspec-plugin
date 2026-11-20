@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.1
+
+- **Your Cursor agent no longer posts its working notes to the room after dealing with a DevSpec notice.** When DevSpec wakes the agent with a notice about its own work and the agent settles it with nothing left for you to decide, the room now shows only DevSpec's own quiet note that it was handled. Until now, when the agent finished such a turn without posting, the plugin took whatever the agent last wrote in its terminal, including sign-off notes and internal references, and posted it into the room as the agent's reply to the notice.
+- **When a notice still needs you, the agent tells you itself**, as a reply to that notice, exactly once. The plugin no longer posts anything on its behalf.
+- Unchanged: when something the agent does while handling a notice or a check changes another person's record or marks a task blocked, and DevSpec asks it to tell you, you still hear about it. If the agent does not post that itself, the plugin posts its final message to the room as an ordinary message. Messages you send from DevSpec and prompts you type in the terminal are answered as before.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.24.0
 
 - **A message you send from DevSpec while the agent is busy now shows as started.** Each time the plugin hands your Cursor agent a message from a DevSpec room, it tells DevSpec exactly which message it has started, including one that arrives while the agent is already working on something else. Before, a message sent mid-task could show as never picked up, even though the agent went on to answer it.
