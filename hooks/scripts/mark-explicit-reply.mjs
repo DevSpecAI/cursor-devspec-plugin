@@ -46,7 +46,7 @@ import {
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
 import { writePrivateText } from './private-state.mjs'
-import { CURSOR_HOOK_CONTEXT_MAX_CHARS } from './repository-context.mjs'
+import { POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -186,9 +186,9 @@ export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) 
 /**
  * The hook output handing the agent a message Stop could not post (notice-reply.mjs,
  * `leaveTellPersonNote`), or null when none was left. Only the conversation that holds
- * the connection gets it, never a subagent's tool call. Past Cursor's limit on a hook's
- * `additional_context`, the whole note goes to a private file and the agent is told
- * where, so nothing in it is cut. Exported for tests; `dir` defaults to where the
+ * the connection gets it, never a subagent's tool call. Past this hook's share of
+ * Cursor's limit on hook context (hook-context-budget.mjs), the whole note goes to a
+ * private file and the agent is told where, so nothing in it is cut or dropped. Exported for tests; `dir` defaults to where the
  * connection's files live.
  */
 export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
@@ -208,7 +208,7 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
   const notes = takeTellPersonNotes(connectionId, { dir: connDir })
   let text = tellPersonNoteText(notes)
   if (!text) return null
-  if (text.length > CURSOR_HOOK_CONTEXT_MAX_CHARS) {
+  if (text.length > POST_TOOL_CONTEXT_SHARE) {
     const file = path.join(connDir, `${connectionId}.tell-person-note.md`)
     try {
       writePrivateText(file, `${text}\n`)

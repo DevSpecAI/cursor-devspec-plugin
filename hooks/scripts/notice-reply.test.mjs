@@ -76,6 +76,7 @@ import {
   fixtureUnlinkedCommitNotice,
 } from './remote-ingress-test-fixtures.mjs'
 import { appendRequestEvent, readRequestState } from './requests.mjs'
+import { CURSOR_HOOK_CONTEXT_MAX_CHARS, POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CONN = FIXTURE_ID.connection
@@ -611,7 +612,7 @@ describe('the final message of a notice-only turn', () => {
     assert.equal(tellPersonNoteText([]), null)
   })
 
-  it('hands a note too long for one hook over as a file, whole', async () => {
+  it("hands a note longer than this hook's share of Cursor's ceiling over as a file, whole", async () => {
     // The hook as Cursor runs it, in this conversation's home.
     const postToolUse = () => new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [path.join(HERE, 'mark-explicit-reply.mjs'), 'postToolUse'], {
@@ -624,7 +625,11 @@ describe('the final message of a notice-only turn', () => {
       child.on('close', () => resolve(stdout))
       child.stdin.end(JSON.stringify({ conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' } }))
     })
-    const long = `Closed these duplicates: ${'a task Brandon filed; '.repeat(800)}done.`
+    // Longer than this hook's share, though short of Cursor's whole ceiling: the plugin's
+    // other after-tool hooks may answer the same tool call, and Cursor drops the joined
+    // text whole once it is over the ceiling.
+    const long = `Closed these duplicates: ${'a task Brandon filed; '.repeat(150)}done.`
+    assert.ok(long.length > POST_TOOL_CONTEXT_SHARE && long.length < CURSOR_HOOK_CONTEXT_MAX_CHARS)
     leaveTellPersonNote(CONN, { text: long, refusal: { message: null, details: { delivery: { status: 'skipped', reason: 'not_attached' } } }, dir })
     const out = JSON.parse(await postToolUse())
     assert.ok(out.additional_context.length < 1_000, 'a pointer, not the note')

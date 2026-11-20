@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
+import { CURSOR_HOOK_CONTEXT_MAX_CHARS, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -37,11 +38,6 @@ export function withoutOwnerReplyStyle(result) {
   return { ...rest, reply_style: REPLY_STYLE_POINTER }
 }
 
-/**
- * Cursor delivers a hook's `additional_context` only up to 10,000 characters (measured
- * on Cursor CLI). Past it the hook hands over the complete text as a file instead.
- */
-export const CURSOR_HOOK_CONTEXT_MAX_CHARS = 10_000
 const snapshotFile = (id, home) => `${contextFile(id, home)}.repositories`
 function read(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null } }
 function write(file, value) {
@@ -108,7 +104,7 @@ export function storeRepositorySnapshot(id, registration, home = os.homedir()) {
     rules: Object.fromEntries(rules.map(key=>[key,registration.instructions_unchanged && previous?.project_id===selected.project.id
       ? previous.rules?.[key] ?? null : typeof registration[key]==='string'?registration[key]:null])),
   }
-  // Cursor's hook carrier is limited to 10,000 characters. Publish a complete,
+  // Cursor drops hook context past its ceiling (hook-context-budget.mjs). Publish a complete,
   // immutable readable snapshot before updating its index; old pointers keep their bytes.
   const textFile=snapshotTextFile(id,snapshot,home), temp=`${textFile}.${randomUUID()}.tmp`
   fs.mkdirSync(path.dirname(textFile),{recursive:true,mode:0o700})
@@ -166,7 +162,13 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
   return parts.join('\n\n')
 }
 
-/** Cursor's supported postToolUse.additional_context lane, not a Claude hook response. */
+/**
+ * Cursor's supported `additional_context` lane, not a Claude hook response: on
+ * sessionStart (`force`, the plugin's only hook there) and after a tool call, where the
+ * plugin's other hooks may answer too. Text longer than this hook's share of Cursor's
+ * ceiling (hook-context-budget.mjs) is handed over as a file, whole, and the hook says
+ * where, so nothing is ever cut or dropped.
+ */
 export function repositoryContextHook(input, {home=os.homedir(),force=false}={}) {
   const id = firingConversation(input)
   if (!id) return null
@@ -177,11 +179,11 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false}={})
   const receipt = `${snapshotFile(id,home)}.delivered`
   if (!force && read(receipt)?.hash === hash) return null
   let content=text
-  // Cursor's own hook limit, not an arbitrary repository-count quota.
-  const hostLimit=CURSOR_HOOK_CONTEXT_MAX_CHARS
+  // This hook's share of Cursor's own ceiling, not an arbitrary repository-count quota.
+  const hostLimit=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE
   if(content.length>hostLimit) {
     const location=JSON.stringify(snapshotTextFile(id,snapshot,home)).replaceAll('<','\\u003c').replaceAll('>','\\u003e')
-    const continuation=`Full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and complete rules) exceeds Cursor's ${hostLimit}-character hook limit. Complete text is available with the file-reading tool at ${location}. Nothing was truncated in that file. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.`
+    const continuation=`The full project context (${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories and the complete rules) does not fit in one hook note: Cursor passes on at most ${CURSOR_HOOK_CONTEXT_MAX_CHARS.toLocaleString('en-US')} characters from all of the DevSpec plugin's hooks together. Read it whole now, with the file-reading tool, at ${location}: nothing in that file is cut. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.`
     const facts=renderRepositorySnapshot(snapshot,{includeRules:false})
     content=facts.length+continuation.length+2<=hostLimit?`${facts}\n\n${continuation}`:continuation
   }

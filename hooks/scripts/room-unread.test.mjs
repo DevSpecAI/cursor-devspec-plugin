@@ -17,6 +17,7 @@ import { after, describe, it } from 'node:test'
 import { writePrivateJson, writePrivateText } from './private-state.mjs'
 import { projectInput } from './project-input.mjs'
 import {
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
   isRealMessage,
   messageVersion,
   postToolNotice,
@@ -320,6 +321,28 @@ describe('the reader is the only thing that marks a message read', () => {
     })
     assert.equal(JSON.parse(second.printed[0]).text, 'b'.repeat(400))
     assert.equal(second.total, 2)
+  })
+
+  it("never prints more than Cursor hands the model from one Shell command, and pages a big room through whole", () => {
+    // 30 messages of 1,500 characters: more than two of Cursor's 20,000-character
+    // Shell results, so the reader has to page, and a page that ran past it would
+    // lose its middle to Cursor's truncation.
+    const lines = Array.from({ length: 30 }, (_, i) => msg({ text: `${String(i).padStart(2, '0')}:${'w'.repeat(1_497)}` }))
+    const room = makeHome(lines)
+    const seen = []
+    for (let reads = 0; reads < 10; reads += 1) {
+      const run = readerRun(room)
+      assert.equal(run.status, 0, run.stderr)
+      assert.ok(run.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `one read printed ${run.stdout.length} characters`)
+      const [header, ...entries] = parseReader(run.stdout)
+      seen.push(...entries.map((entry) => entry.text))
+      if (header.room_messages.remaining === 0) {
+        assert.equal(header.room_messages.next, null)
+        break
+      }
+      assert.match(header.room_messages.next, / read --connection-id /)
+    }
+    assert.deepEqual(seen, lines.map((line) => line.text), 'every message once, oldest first, whole')
   })
 
   it('hands over a message too long for a page as a file, whole', () => {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.27.0
+
+- **Your Cursor agent now follows DevSpec's own rules for work that has to wait, rather than the plugin's copy of them.** Work waiting for someone's OK, or for its checks, stays on its own branch, and the agent does what DevSpec's message about that wait says. It no longer holds out for an OK when fixing the work is what clears it, and it stays right when DevSpec's rules change.
+- **Keeping work that undoes an earlier decision follows DevSpec's rule too.** When DevSpec turns an answer down, the agent does what DevSpec says to do instead.
+- **Checks go where DevSpec sends them.** The agent no longer assumes every check on its own work comes back to it. When it hands work in while checks on it are still waiting for it, it deals with them as DevSpec asks, and before it rules a check it reads DevSpec's instructions on how, including when to hand the check to a helper agent.
+- **The agent no longer records decisions or writes documents on its own initiative while connected.** It records a decision only once you confirm it was deliberate and say why, and it keeps plans and status notes out of your documents.
+- **Smaller corrections.** A room started with `--new` is shared with your project unless you ask for a private one, and the agent no longer treats sharing as something to avoid. It describes the room updates it actually receives. It links a task to the ticket, issue or error it resolves from another tool. A Dependabot or Renovate update that changes only dependencies is reviewed with DevSpec's dependency review instead of a task. When DevSpec's tools are missing, it tells you to start a new `cursor-agent` session.
+- **Nothing the plugin hands your agent is cut or silently lost.** Cursor passes on at most 10,000 characters from all of the plugin's notes after a step together, and drops all of them when they run over. Each note now keeps to its share and puts anything longer in a file the agent is told to read. Reading the room's unread messages prints no more than Cursor shows the agent from one command (20,000 characters), so a long backlog arrives in whole pages instead of losing its middle.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.25.1
 
 - **Your Cursor agent no longer posts its working notes to the room after dealing with a DevSpec notice.** When DevSpec wakes the agent with a notice about its own work and the agent settles it with nothing left for you to decide, the room now shows only DevSpec's own quiet note that it was handled. Until now, when the agent finished such a turn without posting, the plugin took whatever the agent last wrote in its terminal, including sign-off notes and internal references, and posted it into the room as the agent's reply to the notice.
