@@ -20,7 +20,6 @@ import { FIXTURE_ID } from './remote-ingress-test-fixtures.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   USAGE_REFUSAL_COOL_OFF_MS,
-  USAGE_REFUSAL_MAX_AHEAD_MS,
   isUsageRefusalText,
   lastTurnEnd,
   noteUsageRefusalSent,
@@ -36,14 +35,33 @@ const CONVERSATION = 'cursor-conversation-f8672ca0'
 // What Cursor CLI 2026.10.19 wrote for an account at its usage limit (2026-10-31), and
 // what this machine's transcripts hold up to CLI 2026.11.05.
 const LIMIT = "You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more."
-// Errors Cursor wrote to real transcripts that are not usage stops.
+/** Cursor's usage-limit stop with a time it lifts appended, to exercise reading one. */
+const limitSaying = (when) => `You've hit your usage limit. ${when}`
+// Errors that are not Cursor's usage-limit stop and must never be reported as one.
 const NOT_USAGE = [
+  // Written by Cursor to real transcripts on this machine.
   'WritableIterable is closed',
   'Model unavailable on Free Free includes Grok 4.7, Grok 4.6, and Auto with fixed settings. Switch to an included model to continue.',
   'Named models unavailable Free plans can only use Auto. Switch to Auto or upgrade plans to continue.',
   "This turn's step limit (50) needs an in-process agent loop; the network client cannot send it.",
+  // A retry notice in Cursor's own settings on this machine: Cursor retries, it does not stop.
+  'Rate limited by model provider, retrying\u2026',
+  // A repository service throttling, and a full disk: nothing to do with the agent's usage.
+  'GitHub API rate limit exceeded for 203.0.113.7. Retry after 60 seconds.',
+  'Repository service throttled the request: 429 Too Many Requests (retry-after: 120)',
+  'ENOSPC: no space left on device, write',
+  'Disk quota exceeded',
+  // Generic throttling and quota text with no attribution to the account's usage limit.
+  'Rate limit exceeded. Please try again later.',
+  'You are being rate limited.',
+  'You exceeded your current quota, please check your plan and billing details.',
+  'RESOURCE_EXHAUSTED: quota exceeded for this model',
+  // Usage wording Cursor has not been seen to write, and usage percentages.
+  "You've reached your monthly usage limit.",
   "You've used 92% of your usage limit.",
   "You've reached 100% of your included usage.",
+  // Cursor's words quoted inside another error are not Cursor stopping this agent.
+  "Tool failed: the page said \"You've hit your usage limit\"",
 ]
 
 const user = (text) => ({ role: 'user', message: { content: [{ type: 'text', text }] } })
@@ -65,36 +83,24 @@ function writeTranscript(file, rows, atMs = second()) {
 }
 
 describe('what counts as a usage stop', () => {
-  it("recognises Cursor's usage-limit text and the usage and rate-limit phrasings", () => {
-    for (const text of [
-      LIMIT,
-      "You've reached your monthly usage limit.",
-      "You've hit your free requests limit.",
-      'Rate limit exceeded. Please try again later.',
-      'You are being rate limited.',
-      '429 Too Many Requests',
-      'You exceeded your current quota, please check your plan and billing details.',
-      'RESOURCE_EXHAUSTED: quota exceeded for this model',
-    ]) {
+  it("recognises Cursor's own usage-limit wording, as it wrote it", () => {
+    for (const text of [LIMIT, 'You\u2019ve hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more.']) {
       assert.equal(isUsageRefusalText(text), true, text)
     }
   })
 
-  it('never takes another error, a usage percentage or no text for one', () => {
+  it('never takes a throttle, a full disk, another error, a usage percentage or no text for one', () => {
     for (const text of [...NOT_USAGE, '', null, undefined]) assert.equal(isUsageRefusalText(text), false, String(text))
   })
 
   it('reads the time a stop says it lifts, only when it reads without a guess', () => {
     const at = Date.parse('2026-11-20T12:00:00.000Z')
-    assert.equal(refusalLiftsAt('Usage limit reached. Try again in 2 hours.', at), at + 2 * 3_600_000)
-    assert.equal(refusalLiftsAt('Rate limit exceeded, resets in 3h 20m', at), at + 3 * 3_600_000 + 20 * 60_000)
-    assert.equal(refusalLiftsAt('Too many requests. Retry after 90 seconds', at), at + 90_000)
-    assert.equal(refusalLiftsAt('429 Too Many Requests; retry-after: 30', at), at + 30_000)
-    assert.equal(
-      refusalLiftsAt('Usage limit reached; resets at 2026-11-21T09:00:00Z', at),
-      Date.parse('2026-11-21T09:00:00Z'),
-    )
-    for (const vague of [LIMIT, 'Usage limit reached, resets 3pm', 'Usage limit reached until Dec 1', 'try again later']) {
+    assert.equal(refusalLiftsAt(limitSaying('Try again in 2 hours.'), at), at + 2 * 3_600_000)
+    assert.equal(refusalLiftsAt(limitSaying('It resets in 3h 20m.'), at), at + 3 * 3_600_000 + 20 * 60_000)
+    assert.equal(refusalLiftsAt(limitSaying('Retry after 90 seconds.'), at), at + 90_000)
+    assert.equal(refusalLiftsAt(limitSaying('retry-after: 30'), at), at + 30_000)
+    assert.equal(refusalLiftsAt(limitSaying('It resets at 2026-11-21T09:00:00Z.'), at), Date.parse('2026-11-21T09:00:00Z'))
+    for (const vague of [LIMIT, limitSaying('It resets 3pm.'), limitSaying('It resets on Dec 1.'), limitSaying('Try again later.')]) {
       assert.equal(refusalLiftsAt(vague, at), null, vague)
     }
   })
@@ -156,15 +162,16 @@ describe('what is reported, turn end by turn end', () => {
     assert.deepEqual(argument(at + USAGE_REFUSAL_COOL_OFF_MS + 1), {})
   })
 
-  it('a usage stop that says when it lifts is reported until then, held to seven days', () => {
+  it('a usage stop that says when it lifts is reported until then, however far ahead', () => {
     const at = second()
-    writeTranscript(file, [user('fix the test'), ended('error', 'Usage limit reached. Try again in 2 hours.')], at)
+    writeTranscript(file, [user('fix the test'), ended('error', limitSaying('Try again in 2 hours.'))], at)
     observe(at)
     assert.deepEqual(argument(at), { usage_refused_until: new Date(at + 2 * 3_600_000).toISOString() })
 
-    writeTranscript(file, [user('again'), ended('error', 'Usage limit reached. Try again in 30 days.')], at)
+    // Sent as stated: how far ahead DevSpec keeps it is DevSpec's to decide.
+    writeTranscript(file, [user('again'), ended('error', limitSaying('Try again in 30 days.'))], at)
     observe(at)
-    assert.deepEqual(argument(at), { usage_refused_until: new Date(at + USAGE_REFUSAL_MAX_AHEAD_MS).toISOString() })
+    assert.deepEqual(argument(at), { usage_refused_until: new Date(at + 30 * 86_400_000).toISOString() })
   })
 
   it('a turn that runs clears it: null until a status update carrying it is delivered, then nothing', () => {
@@ -187,7 +194,7 @@ describe('what is reported, turn end by turn end', () => {
     assert.deepEqual(argument(Date.now()), {})
   })
 
-  it('an error that is not a usage stop is not reported, and leaves a standing one as it was', () => {
+  it('a throttle, a full disk or any other error is not reported, and leaves a standing one as it was', () => {
     const at = second()
     for (const error of NOT_USAGE) {
       writeTranscript(file, [user('hi'), ended('error', error)], at)
@@ -291,7 +298,7 @@ const until = async (condition, ms = 10_000) => {
 }
 
 describe('the poller reports it on every poll, with no stop hook running', () => {
-  it('reports a usage stop, repeats it, clears it after a turn that runs, and ignores another error', async () => {
+  it('reports a usage stop, repeats it, clears it after a turn that runs, and ignores a throttle and a full disk', async () => {
     const stub = await stubDevSpec()
     const { home, transcript } = scratchHome(stub.url)
     writeTranscript(transcript, [user('hi'), answer('Hello.'), ended('success')])
@@ -320,10 +327,12 @@ describe('the poller reports it on every poll, with no stop hook running', () =>
       assert.ok(await until(() => polls().length >= cleared + 3))
       assert.deepEqual(carrying(cleared), [], 'the clear is sent until delivered, then nothing')
 
-      const beforeOther = polls().length
-      writeTranscript(transcript, [user('fix the test'), user('one more'), ended('error', 'WritableIterable is closed')])
-      assert.ok(await until(() => polls().length >= beforeOther + 4))
-      assert.deepEqual(carrying(beforeOther), [], 'an error that is not a usage stop is never reported as one')
+      for (const error of ['GitHub API rate limit exceeded for 203.0.113.7. Retry after 60 seconds.', 'ENOSPC: no space left on device, write']) {
+        const beforeOther = polls().length
+        writeTranscript(transcript, [user('fix the test'), user(error), ended('error', error)])
+        assert.ok(await until(() => polls().length >= beforeOther + 4))
+        assert.deepEqual(carrying(beforeOther), [], `never reported as a usage stop: ${error}`)
+      }
     } finally {
       child.kill('SIGKILL')
       await stub.close()
@@ -375,13 +384,19 @@ describe('the stop hook reports it on its own heartbeat when Cursor runs it', ()
     }
   })
 
-  it('an error that is not a usage stop sends nothing', async () => {
+  it('a throttle, a full disk or another error sends nothing', async () => {
     const { transcript, home } = scratchDirs
     try {
-      writeTranscript(transcript, [user('fix the test'), ended('error', 'WritableIterable is closed')])
-      await stop({ status: 'error', transcript_path: transcript })
-      assert.ok(heartbeat(), 'the stop hook sent its heartbeat')
-      assert.equal(Object.hasOwn(heartbeat(), 'usage_refused_until'), false)
+      for (const error of [
+        'Repository service throttled the request: 429 Too Many Requests (retry-after: 120)',
+        'Disk quota exceeded',
+        'WritableIterable is closed',
+      ]) {
+        writeTranscript(transcript, [user('fix the test'), user(error), ended('error', error)])
+        await stop({ status: 'error', transcript_path: transcript })
+        assert.ok(heartbeat(), 'the stop hook sent its heartbeat')
+        assert.equal(Object.hasOwn(heartbeat(), 'usage_refused_until'), false, error)
+      }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

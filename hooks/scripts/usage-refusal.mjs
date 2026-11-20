@@ -30,27 +30,36 @@
  * All of these, or nothing is reported:
  *  - the `turn_ended` line's status is "error". "aborted" is a person stopping the turn
  *    and "success" is a turn that ran;
- *  - its error text says the account hit or exceeded a usage, request, spend or rate
- *    limit or a quota, in one of the phrasings USAGE_REFUSAL_WORDING lists. None of
- *    them reads a usage percentage, which the served parameter rules out. Errors seen in real transcripts that must not count, and do not:
- *    "WritableIterable is closed" (Cursor's own stream error), "Model unavailable on
- *    Free …" and "Named models unavailable …" (the plan lacks that model; another model
- *    runs, so the agent is not refused);
+ *  - its error text begins with Cursor's own usage-limit wording, CURSOR_USAGE_LIMIT,
+ *    and nothing else. That wording is Cursor attributing the stop to the account's
+ *    usage limit, which is what the served `semantics.check_job.usage_refusal` asks to
+ *    be reported. Generic throttling text is not: "too many requests", "rate limit
+ *    exceeded", RESOURCE_EXHAUSTED, "quota exceeded" or a 429 can come from a
+ *    repository service, a tool or the disk ("Disk quota exceeded"), and reporting one
+ *    would keep a capable agent from checks for no reason. Other errors seen in real
+ *    transcripts, also not counted: "WritableIterable is closed" (Cursor's own stream
+ *    error), "Model unavailable on Free …" and "Named models unavailable …" (the plan
+ *    lacks that model; another model runs). Nor is a usage percentage, which the
+ *    served parameter rules out;
  *  - it is the transcript's final line, because that is the only way to date it (below).
  *
- * Failing safe: if Cursor rewords its message so no phrasing matches, usage stops are
- * simply no longer reported and checks keep going to the agent, as they did before
- * this existed. Nothing else is ever reported as a usage stop. When that happens, add
- * the new wording to USAGE_REFUSAL_WORDING with the Cursor version it was seen on.
+ * Failing safe: if Cursor rewords its message, usage stops are simply no longer
+ * reported and checks keep going to the agent, as they did before this existed. Nothing
+ * else is ever reported as a usage stop. When that happens, add the new wording beside
+ * CURSOR_USAGE_LIMIT only once it has been seen in a real transcript, with the Cursor
+ * version it was seen on. A rate-limit stop Cursor words differently is not reported
+ * until then.
  *
  * ## When it lifts
  *
  * The time the stop's text gives, when it gives one in a form that reads without
  * guessing (refusalLiftsAt): "try again in 2 hours", "resets in 3h 20m", "retry after
  * 90 seconds", "retry-after: 30", or "resets at" a full ISO time with its time zone.
- * Cursor's usage-limit text has given none so far, and a time without a zone or date
- * ("resets 3pm", "on Dec 1") is not read, so the usual report is the cool-off. A
- * refusal is held to seven days ahead, the most DevSpec keeps.
+ * That time is sent as stated, however far ahead: how far ahead DevSpec keeps it is
+ * the server's to decide (the served `usage_refused_until` parameter), in one place.
+ * Cursor's usage-limit text has given no time so far, and a time without a zone or date
+ * ("resets 3pm", "on Dec 1") is not read, so the usual report is the cool-off
+ * (USAGE_REFUSAL_COOL_OFF_MS).
  *
  * The line carries no timestamp, so the stop is dated by the transcript's modification
  * time: while the `turn_ended` line is the final line, nothing has been written since
@@ -99,19 +108,14 @@ import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
 /**
- * How long a stop that gave no time of its own is reported for. Long enough that a
- * refused agent is not offered check after check it cannot rule; short enough that an
- * agent whose limit has lifted is not kept from checks for long when no turn runs to
- * clear it. The same choice as the Claude Code and Antigravity plugins.
+ * How long a stop that gave no time of its own is reported for: the "short bounded
+ * cool-off when it gave none" the served `semantics.check_job.usage_refusal` asks for.
+ * Long enough that a refused agent is not offered check after check it cannot rule;
+ * short enough that an agent whose limit has lifted is not kept from checks for long
+ * when no turn runs to clear it. A stop that outlasts it is reported again by the next
+ * turn it stops. The same choice as the Claude Code and Antigravity plugins.
  */
 export const USAGE_REFUSAL_COOL_OFF_MS = 15 * 60 * 1000
-
-/**
- * DevSpec holds a reported time to at most seven days ahead (the served
- * `usage_refused_until` parameter), so a time further out is held here too and what is
- * sent is what DevSpec keeps.
- */
-export const USAGE_REFUSAL_MAX_AHEAD_MS = 7 * 24 * 60 * 60 * 1000
 
 /**
  * How much of the transcript's end is read to find its `turn_ended` line. That line is
@@ -122,36 +126,18 @@ export const USAGE_REFUSAL_MAX_AHEAD_MS = 7 * 24 * 60 * 60 * 1000
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024
 
 /**
- * Cursor's wording for a usage stop. Each pattern names a limit or quota being hit,
- * reached or exceeded; none matches a bare "limit", a percentage or a missing model.
- * Seen: "You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited
- * Tab, and more." (CLI 2026.10.19 through 2026.11.05). The text of Cursor's other usage
- * and rate-limit errors has not been seen, so the rest are the usual phrasings of usage
- * and rate-limit refusals, each still naming a limit or quota being reached.
+ * Cursor's own wording for a stop it attributes to the account's usage limit: the start
+ * of the error text, since what follows it (here a plan upsell) says nothing about the
+ * stop. Seen in real transcripts: "You've hit your usage limit Get Cursor Pro for more
+ * Agent usage, unlimited Tab, and more." (CLI 2026.10.19 on 2026-10-31, and transcripts
+ * written up to CLI 2026.11.05). The same words with a typographic apostrophe are
+ * accepted too. Nothing else counts (see the header).
  */
-const USAGE_REFUSAL_WORDING = [
-  // "You've hit your usage limit", "reached your monthly usage limit",
-  // "hit your free requests limit", "exceeded the rate limit", "hit your spend limit".
-  // Up to three words may qualify the limit ("monthly", "free", "Pro"), enough for the
-  // plan names without reaching into an unrelated sentence.
-  /\b(?:hit|reached|exceeded|used up)\s+(?:your|the)\s+(?:[a-z-]+\s+){0,3}?(?:usage|requests?|rate|spend(?:ing)?)\s+limits?\b/i,
-  // "Usage limit reached", "Rate limit exceeded"
-  /\b(?:usage|requests?|rate|spend(?:ing)?)\s+limits?\s+(?:reached|exceeded|hit)\b/i,
-  // "You are being rate limited"
-  /\brate[- ]limited\b/i,
-  /\btoo many requests\b/i,
-  // "quota exceeded", "quota for this model has been exhausted": the verb within the
-  // same short clause (40 characters, one sentence), so "quota" elsewhere never counts.
-  /\bquota\b[^.\n]{0,40}\b(?:reached|exceeded|exhausted)\b/i,
-  // "You exceeded your current quota"
-  /\bexceeded your (?:current )?quota\b/i,
-  // Google's RESOURCE_EXHAUSTED, as some providers pass it through
-  /\bRESOURCE_EXHAUSTED\b/,
-]
+const CURSOR_USAGE_LIMIT = /^You['’]ve hit your usage limit\b/
 
-/** Whether a stop's error text is a usage stop (see USAGE_REFUSAL_WORDING). */
+/** Whether a stop's error text is Cursor's usage-limit stop (CURSOR_USAGE_LIMIT). */
 export function isUsageRefusalText(text) {
-  return typeof text === 'string' && USAGE_REFUSAL_WORDING.some((pattern) => pattern.test(text))
+  return typeof text === 'string' && CURSOR_USAGE_LIMIT.test(text.trim())
 }
 
 const UNIT_MS = { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1_000 }
@@ -257,8 +243,11 @@ export function turnEndOutcome(turnEnd, nowMs) {
   if (turnEnd.status === 'success') return { succeeded: true }
   if (turnEnd.status !== 'error' || !turnEnd.final || !isUsageRefusalText(turnEnd.error)) return null
   const at = Math.min(turnEnd.atMs, nowMs)
-  const until = refusalLiftsAt(turnEnd.error, at) ?? at + USAGE_REFUSAL_COOL_OFF_MS
-  return { refusedUntilMs: Math.min(until, nowMs + USAGE_REFUSAL_MAX_AHEAD_MS) }
+  const stated = refusalLiftsAt(turnEnd.error, at)
+  // A stated time is sent as stated. Only one past what a date can hold (a garbled
+  // number) is no time at all.
+  const readable = stated !== null && Number.isFinite(new Date(stated).getTime())
+  return { refusedUntilMs: readable ? stated : at + USAGE_REFUSAL_COOL_OFF_MS }
 }
 
 export function usageRefusalPath(connectionId, dir = CONNECTIONS_DIR) {
