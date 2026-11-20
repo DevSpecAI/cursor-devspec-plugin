@@ -151,6 +151,7 @@ import {
   interactionActivityPlan,
   interactionAnswerRecord,
   interactionNegotiationArgs,
+  turnEndInteractionDecision,
   INTERACTION_EVENT_CONTRACT_URI,
   INTERACTION_EVENT_VERSION,
   validateInteractionEvent,
@@ -160,7 +161,7 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
-import { openRequest } from './requests.mjs'
+import { finishTurnRequests, openRequest } from './requests.mjs'
 import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
   NO_SIGN_OF_LIFE_MS,
@@ -1608,10 +1609,12 @@ async function main() {
   /**
    * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
    * would have (transcript-turn-end.mjs): a turn that ended in an error or was stopped
-   * is told to the room in Cursor's own words (turn-failure.mjs), the room commands that
-   * started the turn and the turn the owner typed are named as finished, and Working
-   * clears. Only once this poller holds the turn end's claim: when the stop hook holds it,
-   * the stop hook reported it. Returns whether this poller reported it.
+   * is told to the room in Cursor's own words (turn-failure.mjs: the unanswered command's
+   * failure reply, or a plain room message when the turn carries none), the room commands
+   * that started the turn and the turn the owner typed are named as finished, Working
+   * clears, and the turn end's request bookkeeping is done (requests.mjs). Only once this
+   * poller holds the turn end's claim: when the stop hook holds it, the stop hook did all
+   * of this. Returns whether this poller reported it.
    */
   async function reportTranscriptTurnEnd(ended) {
     if (claimTurnEnd(connectionId, ended.identity, { by: 'poller', dir: CONNECTIONS_DIR }) !== 'claimed') return false
@@ -1624,6 +1627,8 @@ async function main() {
           connectionId,
           dir: CONNECTIONS_DIR,
           agentName,
+          // The room saw this turn working: it is told why it ended either way.
+          notice: true,
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
@@ -1642,6 +1647,35 @@ async function main() {
       localAttemptId: localTurnToComplete(localTurn, sessionId),
     })
     if (!completed?.ok) delivered = false
+    // The same request bookkeeping the stop hook does at a turn's end. The poller has no
+    // list of the host's background work, so a request whose launched work has not woken
+    // the agent yet stays open. A directed question's answer still on its way keeps the
+    // current request open, as at a stop.
+    const capability = readConnectionCapability(connectionId)
+    if (capability) {
+      try {
+        await finishTurnRequests({
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          holdCurrent:
+            turnEndInteractionDecision({
+              continuation: interactionContinuation,
+              wakeFileBytes: wakeFileSizeForConnection(connectionId),
+            }).action === 'hold',
+          call: (args) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'report_request',
+              arguments: args,
+              timeoutMs: 3_000,
+            }),
+        })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: turn-end request bookkeeping failed: ${e.message}\n`)
+      }
+    }
     clearTurnMarker(connectionId)
     // The turn is over whether or not its completion landed: never carry the typed turn
     // into the next one.

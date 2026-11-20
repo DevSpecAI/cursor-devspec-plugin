@@ -20,6 +20,11 @@
  *
  * This is the one case a hook answers a room command (ADR b98a39a9 keeps answers
  * agent-canonical): only a command the turn carries and nobody has answered yet.
+ *
+ * A turn the room saw working that carries no such command (a check job, an
+ * automation run, a prompt typed at the terminal, or a command that was answered before
+ * Cursor stopped) is told the same words as a plain room message instead, never as an
+ * answer (`notice`, item 45eb0708): otherwise Working would clear with no explanation.
  */
 
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
@@ -70,24 +75,40 @@ export function turnFailureMessage(failure, agentName) {
 
 /**
  * Answer the room commands a failed turn carries, once, and mark them answered so the
- * stop's request bookkeeping closes them. Returns the command ids answered; none when
- * the turn completed, was typed at the terminal, or was already answered.
- * The failure is the stop hook's input (`raw`), or one the caller already read from the
- * transcript (`failure`, as parseTurnFailure returns it: the poller, when Cursor runs
- * no stop hook, transcript-turn-end.mjs). `post(args)` posts with post_session_message.
+ * turn end's request bookkeeping closes them. Returns the command ids answered; none
+ * when the turn completed, carried no unanswered command, or was already answered.
+ * With `notice`, a failed turn that carries no unanswered command is told to the room as
+ * a plain message (see the header). The failure is the stop hook's input (`raw`), or one
+ * the caller already read from the transcript (`failure`, as parseTurnFailure returns
+ * it: the poller, when Cursor runs no stop hook, transcript-turn-end.mjs). `post(args)`
+ * posts with post_session_message.
  */
-export async function postTurnFailure({ raw = null, failure: given = undefined, connectionId, post, dir, agentName }) {
+export async function postTurnFailure({
+  raw = null,
+  failure: given = undefined,
+  connectionId,
+  post,
+  dir,
+  agentName,
+  notice = false,
+}) {
   const failure = given === undefined ? parseTurnFailure(raw) : given
   if (!failure || !connectionId) return []
   const commands = commandsAnsweredNow(readRequestState(connectionId, { dir }))
-  if (commands.length === 0) return []
+  // Cursor's error text is quoted whole; only past the room's own limit is it cut, visibly.
+  const message = fitRoomMessage(turnFailureMessage(failure, agentName), {
+    whereRest: `The full error is in ${agentName}'s terminal.`,
+  })
+  if (commands.length === 0) {
+    if (notice) {
+      await post({ connection_id: connectionId, agent_name: agentName, message, turn_kind: 'agent', phase: 'answer' })
+    }
+    return []
+  }
   await post({
     connection_id: connectionId,
     agent_name: agentName,
-    // Cursor's error text is quoted whole; only past the room's own limit is it cut, visibly.
-    message: fitRoomMessage(turnFailureMessage(failure, agentName), {
-      whereRest: `The full error is in ${agentName}'s terminal.`,
-    }),
+    message,
     complete_turn: true,
   })
   for (const id of commands) appendRequestEvent(connectionId, { op: 'answered', id }, { dir })

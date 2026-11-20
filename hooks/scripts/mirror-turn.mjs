@@ -42,17 +42,13 @@ import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { recordRuntimeReport } from './agent-telemetry.mjs'
 import {
-  absentLaunches,
   appendRequestEvent,
-  closeRequest,
+  finishTurnRequests,
   launchForRequest,
   openRequest,
   promptArrival,
   readRequestState,
-  requestFinished,
   requestForLaunch,
-  requestsWithWorkPending,
-  rotateRequestLog,
   UNSTATED,
 } from './requests.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
@@ -770,7 +766,9 @@ async function main() {
 
     // A turn that errored or was stopped never answered its room command: say so in
     // the room before the turn ends (item 9a850303, turn-failure.mjs). It marks the
-    // command answered, so the request bookkeeping below closes it.
+    // command answered, so the request bookkeeping below closes it. A turn the room saw
+    // working (its marker) that carries no unanswered command is told as a plain room
+    // message instead (item 45eb0708).
     if (mode === 'stop' && connectionId && sessionId && !turnEndReported) {
       try {
         await postTurnFailure({
@@ -778,6 +776,7 @@ async function main() {
           connectionId,
           dir: CONNECTIONS_DIR,
           agentName,
+          notice: Boolean(readTurnMarker(connectionId)),
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
@@ -953,33 +952,18 @@ async function main() {
     }
     turnEndDone = true
 
-    if (mode === 'stop' && connectionId && connectionCapability) {
-      const requests = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
-      const backgroundTasks = parseBackgroundTasks(raw)
-      if (requests.open.size > 0) {
-        const pending = requestsWithWorkPending(requests, {
-          backgroundTasks,
-          sessionCrons: parseSessionCrons(raw),
-        })
-        const awaitingAnswer = stopDecisionAction === 'hold' ? requests.current : null
-        const finished = [...requests.open.keys()].filter(
-          (id) => requestFinished(requests, id, pending) && id !== awaitingAnswer,
-        )
-        await Promise.all(
-          finished.map((requestId) =>
-            closeRequest({
-              connectionId,
-              requestId,
-              call: (args) => callRequest(args, 3_000),
-              dir: CONNECTIONS_DIR,
-            }),
-          ),
-        )
-      }
-      for (const key of absentLaunches(requests, backgroundTasks)) {
-        appendRequestEvent(connectionId, { op: 'absent', key }, { dir: CONNECTIONS_DIR })
-      }
-      rotateRequestLog(connectionId, { dir: CONNECTIONS_DIR })
+    // The turn end's request bookkeeping, done by whichever of this hook and the poller
+    // reports the turn end (requests.mjs finishTurnRequests): not again here when the
+    // poller already did it.
+    if (mode === 'stop' && connectionId && connectionCapability && !turnEndReported) {
+      await finishTurnRequests({
+        connectionId,
+        call: (args) => callRequest(args, 3_000),
+        dir: CONNECTIONS_DIR,
+        backgroundTasks: parseBackgroundTasks(raw),
+        sessionCrons: parseSessionCrons(raw),
+        holdCurrent: stopDecisionAction === 'hold',
+      })
     }
   } catch (e) {
     process.stderr.write(`[devspec-remote] ${e instanceof Error ? e.message : String(e)}\n`)

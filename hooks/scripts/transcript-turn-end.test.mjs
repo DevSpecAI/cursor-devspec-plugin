@@ -353,6 +353,8 @@ async function stubDevSpec(sessionId) {
         result = { outcome: 'picked_up' }
       } else if (name === 'report_complete') {
         result = { closed_as: 'done' }
+      } else if (name === 'report_request' && args.action === 'close') {
+        result = { request_id: args.request_id, status: 'closed' }
       }
       response.writeHead(200, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } }))
@@ -369,7 +371,7 @@ async function stubDevSpec(sessionId) {
   }
 }
 
-async function startPoller({ attached = false } = {}) {
+async function startPoller({ attached = false, capability = false } = {}) {
   const sessionId = attached ? SESSION : null
   const stub = await stubDevSpec(sessionId)
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-turn-end-home-'))
@@ -385,6 +387,14 @@ async function startPoller({ attached = false } = {}) {
     mcp_url: stub.url,
     ingress_version: 1,
   }), { mode: 0o600 })
+  if (capability) {
+    // The connection capability register leaves beside the state; request bookkeeping needs it.
+    fs.writeFileSync(path.join(dir, `${CONNECTION}.capability.json`), JSON.stringify({
+      version: 1,
+      connection_id: CONNECTION,
+      capability: 'dvsc_test_capability',
+    }), { mode: 0o600 })
+  }
   // Where Cursor keeps the conversation's transcript; the turn that connected has ended.
   const transcript = path.join(home, '.cursor', 'projects', 'home-dev-app', 'agent-transcripts', CONVERSATION, `${CONVERSATION}.jsonl`)
   const connected = [user('/devspec-remote'), answer('Connected.'), ended('success')]
@@ -404,6 +414,23 @@ async function startPoller({ attached = false } = {}) {
     turnOpen: () => fs.existsSync(marker),
     completions: () => stub.named('report_complete'),
     failurePosts: () => stub.named('post_session_message').filter((args) => args.complete_turn === true),
+    /** Plain room messages telling why a turn ended, not answering any command. */
+    roomNotices: () => stub.named('post_session_message').filter((args) => args.complete_turn !== true && args.phase === 'answer'),
+    requestCloses: () => stub.named('report_request').filter((args) => args.action === 'close'),
+    /** The requests the connection still has open, as its request log says. */
+    openRequests() {
+      const events = fs.readFileSync(path.join(dir, `${CONNECTION}.requests.jsonl`), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      const open = new Set()
+      for (const event of events) {
+        if (event.op === 'open') open.add(event.id)
+        if (event.op === 'close') open.delete(event.id)
+      }
+      return [...open]
+    },
+    /** The agent posting its final answer to the command (mark-explicit-reply.mjs records it). */
+    recordAnswered() {
+      fs.appendFileSync(path.join(dir, `${CONNECTION}.requests.jsonl`), `${JSON.stringify({ op: 'answered', id: REQUEST })}\n`)
+    },
     /** Hand the agent a room command and wait for the poller to start it. */
     async deliver(body = 'ship the release notes') {
       assert.ok(await until(() => stub.polls.length >= 1), `no poll; stderr:\n${stderr}`)
@@ -564,6 +591,27 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
     }
   })
 
+  for (const order of ['the poller first, then the stop hook', 'the stop hook first']) {
+    it(`error on a turn carrying no tracked command: the room is told once, as a plain message (${order})`, async () => {
+      const run = await startPoller({ attached: true })
+      try {
+        await run.deliver()
+        // No request is tracked for the command: nothing tells the plugin who asked.
+        writeTranscript(run.transcript, [...run.connected, WAKE, ended('error', LIMIT)])
+        if (order === 'the stop hook first') await run.stop('error')
+        assert.ok(await until(() => run.completions().length >= 1), `no completion; stderr:\n${run.stderr()}`)
+        if (order !== 'the stop hook first') await run.stop('error')
+        await run.laps()
+        assert.equal(run.roomNotices().length, 1, 'told once')
+        assert.ok(run.roomNotices()[0].message.includes(LIMIT), "in Cursor's words")
+        assert.deepEqual(run.failurePosts(), [], 'not posted as an answer to anything')
+        assert.deepEqual(run.completions(), [finished()])
+      } finally {
+        await run.cleanup()
+      }
+    })
+  }
+
   it('error: Cursor runs the stop hook first, and the poller adds nothing', async () => {
     const run = await startPoller({ attached: true })
     try {
@@ -594,6 +642,59 @@ describe('when Cursor does run the stop hook on a turn that ran', () => {
       writeTranscript(run.transcript, [...run.connected, WAKE, answer('Done.'), ended('success')])
       await run.laps(10)
       assert.deepEqual(run.completions(), [finished()], 'reported once')
+    } finally {
+      await run.cleanup()
+    }
+  })
+})
+
+describe('the request a turn served is closed at its end with no stop hook', () => {
+  it('a command answered by its failure reply', async () => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      await run.deliver()
+      run.recordCommandRequest()
+      writeTranscript(run.transcript, [...run.connected, WAKE, ended('error', LIMIT)])
+      assert.ok(await until(() => run.requestCloses().length >= 1), `no close; stderr:\n${run.stderr()}`)
+      assert.equal(run.failurePosts().length, 1)
+      assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.deepEqual(run.openRequests(), [], 'recorded closed')
+      // Cursor runs the stop hook as well (a person with a hooks file of their own).
+      await run.stop('error')
+      await run.laps()
+      assert.equal(run.requestCloses().length, 1, 'closed once')
+      assert.equal(run.failurePosts().length, 1)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('a command the agent answered itself, in a turn that ran', async () => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      await run.deliver()
+      run.recordCommandRequest()
+      run.recordAnswered()
+      writeTranscript(run.transcript, [...run.connected, WAKE, answer('Done.'), ended('success')])
+      assert.ok(await until(() => run.requestCloses().length >= 1), `no close; stderr:\n${run.stderr()}`)
+      assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.deepEqual(run.openRequests(), [])
+      assert.deepEqual(run.completions(), [finished()])
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('a command not answered yet stays open', async () => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      await run.deliver()
+      run.recordCommandRequest()
+      writeTranscript(run.transcript, [...run.connected, WAKE, answer('Still working on it.'), ended('success')])
+      assert.ok(await until(() => run.completions().length >= 1), `no completion; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.deepEqual(run.requestCloses(), [])
+      assert.deepEqual(run.openRequests(), [REQUEST])
     } finally {
       await run.cleanup()
     }

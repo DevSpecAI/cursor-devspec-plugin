@@ -644,6 +644,47 @@ export function absentLaunches(state, backgroundTasks) {
 }
 
 /**
+ * The request bookkeeping at a turn's end, done once by whichever of the stop hook and
+ * the poller reports that turn end (transcript-turn-end.mjs): close each open request
+ * that is finished (requestFinished), note launches the host's list leaves off, and
+ * start the log afresh when it may. `backgroundTasks` and `sessionCrons` are the host's
+ * lists from the stop hook's input, null where there are none (the poller has none).
+ * `holdCurrent` keeps the current request open while an answer to it is still on its
+ * way. `call(args)` performs report_request with the connection capability. Returns the
+ * ids closed.
+ */
+export async function finishTurnRequests({
+  connectionId,
+  call,
+  dir = DEFAULT_DIR,
+  backgroundTasks = null,
+  sessionCrons = null,
+  holdCurrent = false,
+}) {
+  if (!connectionId || typeof call !== 'function') return []
+  const requests = readRequestState(connectionId, { dir })
+  const closed = []
+  if (requests.open.size > 0) {
+    const pending = requestsWithWorkPending(requests, { backgroundTasks, sessionCrons })
+    const awaitingAnswer = holdCurrent ? requests.current : null
+    const finished = [...requests.open.keys()].filter(
+      (id) => requestFinished(requests, id, pending) && id !== awaitingAnswer,
+    )
+    const results = await Promise.all(
+      finished.map((requestId) => closeRequest({ connectionId, requestId, call, dir })),
+    )
+    finished.forEach((id, index) => {
+      if (results[index]) closed.push(id)
+    })
+  }
+  for (const key of absentLaunches(requests, backgroundTasks)) {
+    appendRequestEvent(connectionId, { op: 'absent', key }, { dir })
+  }
+  rotateRequestLog(connectionId, { dir })
+  return closed
+}
+
+/**
  * Start the log afresh once it has grown and carries no open request. Launches
  * and schedules made for nobody's request are carried over while they may still
  * wake the agent, so their wakes stay positively nobody's.

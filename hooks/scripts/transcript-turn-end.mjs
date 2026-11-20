@@ -24,7 +24,8 @@
  * settings. So the poller, already running while connected, notices the turn's end in
  * the transcript and reports it the way the stop hook would: it tells the room about an
  * error or a stop in Cursor's own words (turn-failure.mjs), names the room commands the
- * turn finished (turn-commands.mjs) and clears Working.
+ * turn finished (turn-commands.mjs), clears Working and closes the requests the turn
+ * finished (requests.mjs).
  *
  * Remove this, the poller's use of it and the claim in mirror-turn.mjs `stop`, once
  * Cursor runs a plugin's `stop` hook with no hooks file of the person's own, in the
@@ -101,9 +102,10 @@
  *    aborted/interrupted manually."}`.
  *  - A turn end is noticed within about a second while DevSpec's push channel is open
  *    (the poller's local check), otherwise at the poller's next poll.
- *  - The request bookkeeping the stop hook does at a turn's end (closing finished
- *    requests, noting background work that is gone) needs what Cursor hands the stop
- *    hook, so it still waits for a stop hook.
+ *  - The poller does the stop hook's request bookkeeping at a turn's end
+ *    (requests.mjs `finishTurnRequests`), but without the host's list of background
+ *    work: a request whose launched work has not woken the agent yet stays open until a
+ *    later turn end closes it.
  *
  * Imports only Node built-ins and private-state.mjs, so every hook and the poller can
  * load it.
