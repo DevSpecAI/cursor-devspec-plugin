@@ -26,7 +26,9 @@ import {
   noteReadThrough,
   postToolUseOutput,
   readNoteText,
+  seal,
   splitText,
+  unseal,
   writeNote,
   POST_TOOL_CONTEXT_HOOKS,
   POST_TOOL_CONTEXT_SHARE,
@@ -82,7 +84,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     const id = pointer.match(/`cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md`/)[1]
     const file = path.join(home, '.devspec', 'notes', `${id}.md`)
     assert.equal(readNoteText(id, { home }), text)
-    assert.ok(fs.readFileSync(file, 'utf8').endsWith(`— End of DevSpec note ${id} —\n`))
+    assert.match(fs.readFileSync(file, 'utf8'), new RegExp(`\\n\\n— End of DevSpec note ${id}: part 1 of 1 · ${text.length} characters · sha256 [0-9a-f]{12} —\\n$`))
     assert.equal(fs.statSync(file).mode & 0o777, 0o600)
     assert.equal(writeNote(text, { home }).id, id, 'the same text is the same note')
   })
@@ -123,7 +125,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
       const printed = execFileSync('sh', ['-c', `cat ${file.replace(home, '~')}`], { env: { PATH: process.env.PATH, HOME: home }, encoding: 'utf8' })
       assert.ok(printed.length < CURSOR_SHELL_OUTPUT_MAX_CHARS, `part ${i + 1} prints ${printed.length} characters`)
       assert.ok(printed.length <= NOTE_PART_CHARS + 200)
-      if (i < files.length - 1) assert.ok(printed.includes(`Read on with \`cat ~/.devspec/notes/${note.id}.${i + 2}.md\``), 'names the next part')
+      if (i < files.length - 1) assert.ok(printed.includes(`read on with \`cat ~/.devspec/notes/${note.id}.${i + 2}.md\``), 'names the next part')
       joinedBack += printed.slice(0, printed.lastIndexOf('\n\n— '))
     })
     assert.equal(joinedBack, text, 'the parts, joined, are the note')
@@ -225,5 +227,82 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     const pieces = splitText(oneLine)
     assert.equal(pieces.join(''), oneLine)
     for (const piece of pieces) assert.ok(!/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(piece), 'no surrogate pair cut')
+  })
+
+  /** A small seeded generator, so the property test is the same run every time. */
+  function generator(seed) {
+    let state = seed >>> 0
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0
+      let t = state
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+  }
+
+  it('always holds both limits and rejoins byte for byte: thousands of random mixes, fixed seed', () => {
+    const random = generator(20261120)
+    const pick = (list) => list[Math.floor(random() * list.length)]
+    const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}'
+    const makers = [
+      () => '\n'.repeat(1 + Math.floor(random() * 3)),
+      () => 'plain words '.repeat(1 + Math.floor(random() * 20)),
+      () => '\u4e2d\u6587'.repeat(1 + Math.floor(random() * 40)),
+      () => '\u{1F600}'.repeat(1 + Math.floor(random() * 20)),
+      () => family.repeat(1 + Math.floor(random() * 5)),
+      () => '\u{1F44D}\u{1F3FD}\u{1F1EC}\u{1F1E7}',
+      // Long runs of combining marks on one letter: one grapheme, often longer than a part.
+      () => `e${'\u0301\u0323'.repeat(1 + Math.floor(random() * 300))}`,
+      () => '\r\n',
+    ]
+    for (let run = 0; run < 3_000; run += 1) {
+      let text = ''
+      const pieces = 1 + Math.floor(random() * 30)
+      for (let i = 0; i < pieces; i += 1) text += pick(makers)()
+      const maxChars = 8 + Math.floor(random() * 400)
+      const maxBytes = 8 + Math.floor(random() * 800)
+      const parts = splitText(text, maxChars, maxBytes)
+      for (const part of parts) {
+        assert.ok(part.length <= maxChars && Buffer.byteLength(part) <= maxBytes, `run ${run}: a part of ${part.length} characters, ${Buffer.byteLength(part)} bytes over ${maxChars}/${maxBytes}`)
+        assert.ok(!/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(part), `run ${run}: no surrogate pair cut`)
+      }
+      assert.ok(Buffer.from(parts.join(''), 'utf8').equals(Buffer.from(text, 'utf8')), `run ${run}: rejoined byte for byte`)
+    }
+  })
+
+  it('holds the limits after a line-end cut that leaves text to carry, at the real part sizes', () => {
+    // A line break, then text carried into the next part, then one grapheme of combining
+    // marks long enough that carried text and grapheme together pass the limit.
+    const text = `${'a'.repeat(NOTE_PART_CHARS - 8_000)}\n${'b'.repeat(5_000)}e${'\u0301'.repeat(NOTE_PART_CHARS - 1_001)}${'c'.repeat(100)}`
+    const parts = splitText(text)
+    for (const part of parts) assert.ok(part.length <= NOTE_PART_CHARS && Buffer.byteLength(part) <= NOTE_PART_BYTES, `${part.length} characters`)
+    assert.equal(parts.join(''), text)
+    const room = JSON.stringify({ text: `${'z'.repeat(NOTE_PART_CHARS - 10)}\n${'y'.repeat(3_000)}${'\u{1F600}'.repeat(9_000)}` })
+    for (const part of splitText(room)) assert.ok(part.length <= NOTE_PART_CHARS && Buffer.byteLength(part) <= NOTE_PART_BYTES, `${part.length} characters`)
+  })
+
+  it('counts a part read only when the whole of it came back: a cut that keeps head and tail does not', () => {
+    const home = tempHome()
+    const note = writeNote(`${'head '.repeat(1_500)}${'middle '.repeat(300)}${'tail '.repeat(1_500)}`, { home })
+    assert.equal(note.parts, 1)
+    const file = noteFiles(home, note.id)[0]
+    const whole = fs.readFileSync(file, 'utf8')
+    assert.ok(whole.length > 2 * 3_000)
+    // What Cursor does to a long output: the first and last part kept, the middle gone.
+    const cut = `${whole.slice(0, 3_000)}\n... (output truncated) ...\n${whole.slice(-3_000)}`
+    const call = (output) => ({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: `cat ${file.replace(home, '~')}` }, tool_output: JSON.stringify({ output, exitCode: 0 }) })
+    assert.equal(noteReadThrough(call(cut), note.id, { home }), false, 'the closing line survived the cut, but the length and hash do not match')
+    assert.equal(noteReadThrough(call(whole.replace('middle', 'muddle')), note.id, { home }), false, 'a changed body')
+    assert.equal(noteReadThrough(call(`${'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS)}${whole}`), note.id, { home }), false, 'an output over Cursor\'s ceiling was cut for the model')
+    assert.equal(noteReadThrough(call(whole), note.id, { home }), true)
+  })
+
+  it('unseals only a whole body: the seal states its length and hash', () => {
+    const sealed = seal('DevSpec room page 0123456789abcdef', 'line one\nline two \u{1F600}')
+    assert.equal(unseal(sealed, 'DevSpec room page 0123456789abcdef'), 'line one\nline two \u{1F600}')
+    assert.equal(unseal(sealed.slice(3), 'DevSpec room page 0123456789abcdef'), null, 'head cut off')
+    assert.equal(unseal(sealed.replace('one', 'won'), 'DevSpec room page 0123456789abcdef'), null, 'changed')
+    assert.equal(unseal(sealed, 'DevSpec room page fedcba9876543210'), null, 'another page')
   })
 })

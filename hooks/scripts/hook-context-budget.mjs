@@ -139,14 +139,47 @@ export function noteCommand(id, part = 1) {
   return `cat ~/.devspec/notes/${partName(id, part)}`
 }
 
+const digest = (text) => createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 12)
+
 /**
- * The line that closes each part: it says which part this is and how to read the next,
- * and the plugin counts a part as read only when the output the agent got carries it.
+ * `body` sealed for handing over through Cursor's Shell: a closing line naming it
+ * (`label`), how many characters it has and a short hash of it, and any `after` text
+ * (such as the command for the next part). The seal is what lets the plugin tell, from
+ * the output Cursor hands back, that the whole of it came back: Cursor keeps the first
+ * and last 10,000 characters of an over-long output, so a closing line alone survives
+ * a cut, but a length and hash do not match a cut body.
  */
-function partEnd(id, part, parts) {
-  return part < parts
-    ? `— DevSpec note ${id}: part ${part} of ${parts}. Read on with \`${noteCommand(id, part + 1)}\` —`
-    : `— End of DevSpec note ${id}${parts > 1 ? `: part ${parts} of ${parts}` : ''} —`
+export function seal(label, body, after = '') {
+  return `${body}\n\n— ${label} · ${body.length} characters · sha256 ${digest(body)}${after ? ` · ${after}` : ''} —\n`
+}
+
+/**
+ * The body sealed under `label` in `output` when the whole of it is there: as many
+ * characters as the seal says, with the hash the seal says; null otherwise (cut,
+ * changed, or not there at all). It looks only at what it is given, so a hook checks
+ * exactly the output Cursor handed it.
+ */
+export function unseal(output, label) {
+  if (typeof output !== 'string') return null
+  const marker = `\n\n— ${label} · `
+  const at = output.lastIndexOf(marker)
+  if (at < 0) return null
+  const tail = /^(\d+) characters · sha256 ([0-9a-f]{12})(?: · [^\n]*)? —(?:\n|$)/.exec(output.slice(at + marker.length))
+  if (!tail) return null
+  const length = Number(tail[1])
+  if (at - length < 0) return null
+  const body = output.slice(at - length, at)
+  return digest(body) === tail[2] ? body : null
+}
+
+/** The label that seals part `part` of note `id`'s `parts`. */
+function partLabel(id, part, parts) {
+  return `${part === parts ? 'End of DevSpec note' : 'DevSpec note'} ${id}: part ${part} of ${parts}`
+}
+
+/** Part `part` of a note as it is kept: the piece, sealed, and the way to the next part. */
+function partContent(id, part, parts, piece) {
+  return seal(partLabel(id, part, parts), piece, part < parts ? `read on with \`${noteCommand(id, part + 1)}\`` : '')
 }
 
 const GRAPHEMES = typeof Intl?.Segmenter === 'function' ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null
@@ -162,28 +195,45 @@ function cuttable(text, maxChars, maxBytes) {
   return units.flatMap((unit) => (unit.length > maxChars || Buffer.byteLength(unit) > maxBytes ? Array.from(unit) : [unit]))
 }
 
+/** Whether `piece` is within both limits. */
+function within(piece, maxChars, maxBytes) {
+  return piece.length <= maxChars && Buffer.byteLength(piece) <= maxBytes
+}
+
 /**
  * `text` in pieces of at most `maxChars` UTF-16 code units and `maxBytes` UTF-8 bytes,
  * the two things Cursor's Shell rules count. A piece ends at a line end when one falls
  * in its second half, otherwise at a grapheme boundary. Joined, the pieces are the
  * text, byte for byte.
+ *
+ * The limits are a post-condition, not something each branch tries to respect: before
+ * a unit joins a piece, pieces are cut off for as long as the piece and the unit
+ * together would pass a limit, and every piece is checked against both on its way out
+ * (a piece that is not within them throws rather than being handed over).
  */
 export function splitText(text, maxChars = NOTE_PART_CHARS, maxBytes = NOTE_PART_BYTES) {
   const pieces = []
+  const emit = (units) => {
+    const piece = units.join('')
+    if (!within(piece, maxChars, maxBytes)) throw new Error(`splitText: a piece of ${piece.length} characters passed its limits`)
+    pieces.push(piece)
+  }
   let piece = []
   let chars = 0
   let bytes = 0
-  let lineEnd = -1 // how many units of `piece` end with its last line break
+  let lineEnd = -1 // how many units of `piece` end with its last line break, or -1
   for (const unit of cuttable(text, maxChars, maxBytes)) {
     const unitChars = unit.length
     const unitBytes = Buffer.byteLength(unit)
-    if (piece.length > 0 && (chars + unitChars > maxChars || bytes + unitBytes > maxBytes)) {
+    while (piece.length > 0 && (chars + unitChars > maxChars || bytes + unitBytes > maxBytes)) {
       const cut = lineEnd > 0 && lineEnd >= piece.length / 2 ? lineEnd : piece.length
-      pieces.push(piece.slice(0, cut).join(''))
+      emit(piece.slice(0, cut))
       piece = piece.slice(cut)
       const carried = piece.join('')
       chars = carried.length
       bytes = Buffer.byteLength(carried)
+      // What is carried follows the last line break, so it holds none: the next pass,
+      // if the unit still does not fit, cuts all of it off.
       lineEnd = -1
     }
     piece.push(unit)
@@ -191,7 +241,7 @@ export function splitText(text, maxChars = NOTE_PART_CHARS, maxBytes = NOTE_PART
     bytes += unitBytes
     if (unit.includes('\n')) lineEnd = piece.length
   }
-  pieces.push(piece.join(''))
+  if (piece.length > 0 || pieces.length === 0) emit(piece)
   return pieces
 }
 
@@ -212,7 +262,7 @@ export function writeNote(text, { home = os.homedir() } = {}) {
   // part on disk means every part is.
   if (!fs.existsSync(first)) {
     for (let part = pieces.length; part >= 1; part -= 1) {
-      writePrivateText(partFile(id, part, home), `${pieces[part - 1]}\n\n${partEnd(id, part, pieces.length)}\n`)
+      writePrivateText(partFile(id, part, home), partContent(id, part, pieces.length, pieces[part - 1]))
     }
   }
   return { id, file: first, command: noteCommand(id), parts: pieces.length }
@@ -227,8 +277,17 @@ export function noteParts(id, { home = os.homedir() } = {}) {
   } catch {
     return 0
   }
-  const of = new RegExp(`— DevSpec note ${id}: part 1 of (\\d+)\\.`).exec(first)
-  return of ? Number(of[1]) : 1
+  const of = new RegExp(`— (?:End of )?DevSpec note ${id}: part 1 of (\\d+) · `).exec(first)
+  return of ? Number(of[1]) : 0
+}
+
+/** The piece part `part` of note `id` holds, checked against its own seal; null when it is missing or damaged. */
+function notePartBody(id, part, parts, home) {
+  try {
+    return unseal(fs.readFileSync(partFile(id, part, home), 'utf8'), partLabel(id, part, parts))
+  } catch {
+    return null
+  }
 }
 
 /** Note `id`'s text, its parts joined back without their closing lines; null when there is none. */
@@ -237,10 +296,9 @@ export function readNoteText(id, { home = os.homedir() } = {}) {
   if (parts === 0) return null
   let text = ''
   for (let part = 1; part <= parts; part += 1) {
-    const content = fs.readFileSync(partFile(id, part, home), 'utf8')
-    const close = `\n\n${partEnd(id, part, parts)}\n`
-    if (!content.endsWith(close)) return null
-    text += content.slice(0, content.length - close.length)
+    const body = notePartBody(id, part, parts, home)
+    if (body === null) return null
+    text += body
   }
   return text
 }
@@ -258,7 +316,9 @@ function parsed(value) {
  * The part of note `id` (of `parts`) this tool call handed the agent whole, or null.
  * Only two things count, and only on what came back, never on what was asked:
  * - a shell command that is exactly `cat` of one part (after the plugin's own PATH
- *   line, if any), that exited 0 and whose output carries that part's closing line;
+ *   line, if any), that exited 0, whose output as Cursor gave it to the hook is within
+ *   Cursor's Shell rules, and whose seal (`unseal`: length and hash) shows the whole
+ *   part came back, so a cut that kept the head and the tail does not count;
  * - Cursor's Read tool on exactly one part's file, which reported reading as many
  *   characters as the part holds (Read gave a 30,012-character file to the model
  *   whole on 20 November 2026, and every part is far shorter).
@@ -286,7 +346,12 @@ function partReadBy(input, id, parts, home) {
     const cat = /^\s*cat\s+(['"]?)([^\s'"|;&<>`]+)\1\s*$/.exec(lines[0])
     const part = partAt(cat ? expand(cat[2]) : null)
     if (!part || output?.exitCode !== 0 || typeof output?.output !== 'string') return null
-    return output.output.includes(partEnd(id, part, parts)) ? part : null
+    // The output as Cursor handed it to the hook must be within both of Cursor's
+    // Shell rules (so the model was shown all of it), and carry the whole part: the
+    // body its seal describes, matching the part on disk.
+    if (!fitsShellOutput(output.output)) return null
+    const body = unseal(output.output, partLabel(id, part, parts))
+    return body !== null && body === notePartBody(id, part, parts, home) ? part : null
   }
   if (tool === 'Read') {
     const part = partAt(expand(toolInput.file_path ?? toolInput.path))
