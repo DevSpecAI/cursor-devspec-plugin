@@ -15,7 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
-import { REQUEST_REF_TOOLS } from './request-ref.mjs'
+import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS } from './request-ref.mjs'
 
 const SELF = fileURLToPath(import.meta.url)
 const ROOT = path.resolve(path.dirname(SELF), '../..')
@@ -302,5 +302,15 @@ describe('the DevSpec writes that record who asked', () => {
     const server = tools.filter((tool) => tool.requestRef).map((tool) => tool.name).sort()
     if (server.length === 0) return t.skip('this server predates request_ref (item 7a4d04fd)')
     assert.deepEqual([...REQUEST_REF_TOOLS].sort(), server)
+  })
+
+  // The command a write serves (provenance_ref) is stamped only on the tools that
+  // take it and no request_ref (stampsCommand), so this list is the server's too:
+  // a tool missing from it would go without the command that says who asked.
+  it('and the tools that take provenance_ref', (t) => {
+    const tools = pairedServer(t, serverToolList)
+    if (!tools) return
+    const server = tools.filter((tool) => tool.params.includes('provenance_ref')).map((tool) => tool.name).sort()
+    assert.deepEqual([...PROVENANCE_REF_TOOLS].sort(), server)
   })
 })

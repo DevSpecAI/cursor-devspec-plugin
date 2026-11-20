@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.22.1
+
+- **DevSpec now records who asked for the requirement, inventory and dependency-review changes your Cursor agent makes.** When the agent records, updates, replaces or retracts a requirement, records, revises or retracts an inventory entry, or records a dependency review, the plugin tells DevSpec which request the change serves, as it already did for tasks, memories and documents. Until now DevSpec had to work these out for itself.
+- **Those changes also wait when one turn carries two people's requests**, until the agent says which one it is working on, like every other change that records who asked, so none is credited to the wrong person.
+- **A change is no longer refused because the command it came from has closed.** On a change that records who asked, the plugin used to send the room command the request came from beside the request itself. DevSpec refused the change once that command had closed, for example when a helper agent was still working after the agent had posted its answer, although the request said exactly who asked. The plugin now sends only the request on those changes, and never a command it remembered from earlier.
+- Unchanged: reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those. There is nothing to set.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.22.0
 
 - **A commit the agent makes with no task claimed now goes through, with a note, instead of being stopped.** Work that needs no task, such as a dependency update or an automation run, commits normally. The note tells the agent the commit carries no task reference, and that if the work does belong to a task, claiming it before the next commit gets the reference added automatically. This holds both while connected and without a connection, including on native Windows.

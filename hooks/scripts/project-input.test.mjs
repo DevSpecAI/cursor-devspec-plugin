@@ -141,7 +141,7 @@ describe('withOwnConnection', () => {
 })
 
 describe('projectInput mechanical stamping', () => {
-  it('stamps project_id, connection_id, provenance_ref, and request_ref while stripping model-supplied request_ref', () => {
+  it('stamps project_id, connection_id and request_ref while stripping model-supplied request_ref', () => {
     selectProjectContext(CONVERSATION, ENDPOINT, PROJECT, 'explicit', home)
     bond(MINE)
     appendRequestEvent(
@@ -173,7 +173,6 @@ describe('projectInput mechanical stamping', () => {
         title: 'filed from room',
         project_id: PROJECT.id,
         connection_id: MINE,
-        provenance_ref: PROV_A,
         request_ref: REQ_A,
       },
     })
@@ -191,6 +190,35 @@ describe('projectInput mechanical stamping', () => {
       { home },
     )
     assert.equal(before, null)
+  })
+
+  it('sends the command only where DevSpec takes no request, and never one the connection remembered from earlier', () => {
+    selectProjectContext(CONVERSATION, ENDPOINT, PROJECT, 'explicit', home)
+    // A connection file left holding an earlier command: nothing may read it as the
+    // command a write serves now, so a write is not refused once that command closed.
+    bond(MINE, { provenance_ref: PROV_B })
+    const pre = (tool, toolInput) =>
+      projectInput('pre', { conversation_id: CONVERSATION, cwd: home, tool_name: `MCP:devspec__${tool}`, tool_input: toolInput }, { home })
+
+    assert.deepEqual(pre('record_requirement', { title: 't' }).updated_input, {
+      title: 't',
+      project_id: PROJECT.id,
+      connection_id: MINE,
+    })
+    assert.equal(pre('claim_work_item', { task_id: REQ_T, agent_branch: 'work/x' }).updated_input.provenance_ref, undefined)
+
+    appendRequestEvent(
+      MINE,
+      { op: 'open', id: REQ_A, kind: 'command', message_id: MSG_A, provenance_ref: PROV_A, requested_by: ALI },
+      { dir },
+    )
+    appendRequestEvent(MINE, { op: 'current', ref: REQ_A }, { dir })
+    const write = pre('record_inventory_entry', { title: 't' }).updated_input
+    assert.equal(write.request_ref, REQ_A)
+    assert.equal(write.provenance_ref, undefined)
+    const claim = pre('claim_work_item', { task_id: REQ_T, agent_branch: 'work/x' }).updated_input
+    assert.equal(claim.provenance_ref, PROV_A)
+    assert.equal(claim.request_ref, undefined)
   })
 
   it('denies beforeMCPExecution when model-supplied request_ref bypassed preToolUse', () => {

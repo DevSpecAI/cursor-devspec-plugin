@@ -130,7 +130,6 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       next = withOwnConnection(namespaced, next, connectionId)
       const stamped = stampRequest(namespaced, next, connectionId, input?.agent_id, {
         ...(home ? { home } : {}),
-        connectionState: connState,
         includeProvenance: true,
       })
       if (stamped.deny) return deny(stamped.deny)
@@ -216,7 +215,6 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
     if (connectionId || Object.hasOwn(args, 'request_ref')) {
       const stamped = stampRequest(verb, args, connectionId, input?.agent_id, {
         ...(home ? { home } : {}),
-        connectionState: connState,
         includeProvenance: true,
       })
       if (stamped.deny) return deny(stamped.deny)
