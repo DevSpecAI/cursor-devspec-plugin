@@ -759,19 +759,25 @@ async function main() {
 
     // Which turn end this is. When Cursor runs no stop hook, the poller reports a turn's
     // end from Cursor's transcript instead (transcript-turn-end.mjs). Whichever of the
-    // two claims a turn end reports it. When the poller holds it (reporting now, or
-    // reported), this hook reports nothing and leaves the turn's marker to the poller;
-    // the rest of this stop's work still runs. When this hook holds it, the marker is
-    // cleared only once every step has reached DevSpec; otherwise the claim is given
-    // back and the marker kept, so the poller reports what is left.
+    // two claims a turn end reports it. When the poller holds its report (reporting now,
+    // or reported), this hook reports nothing and leaves the turn's marker to the poller;
+    // the rest of this stop's work still runs. This hook knows the turn it ends, so it
+    // reports in full a turn end the poller could only notice: one noticed already is
+    // taken over (the upgrade), and one whose notice is being posted now is answered and
+    // closed alongside, the notice left to the poller. When this hook holds the claim,
+    // the marker is cleared only once every step has reached DevSpec; otherwise the claim
+    // is given back and the marker kept, so the poller reports what is left.
     if (mode === 'stop' && connectionId) {
       const identity = turnEndIdentity(hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId))
       if (identity) {
+        const trackedFrom = readTurnMarker(connectionId)?.startedAt ?? null
         turnEndClaim = {
           identity,
+          trackedFrom,
           ...claimTurnEnd(connectionId, identity, {
             by: 'stop',
-            after: readTurnMarker(connectionId)?.startedAt ?? null,
+            goal: 'report',
+            after: trackedFrom,
             dir: CONNECTIONS_DIR,
           }),
         }
@@ -779,12 +785,15 @@ async function main() {
     }
     const turnEndReported = turnEndClaim?.outcome === 'reported' || turnEndClaim?.outcome === 'reporting'
     const turnEndClaimedHere = turnEndClaim?.outcome === 'claimed'
+    // The poller is posting this turn end's notice now: it keeps the claim and the marker.
+    const turnEndNoticing = turnEndClaim?.outcome === 'noticing'
 
     // A turn that errored or was stopped never answered its room command: say so in
     // the room before the turn ends (item 9a850303, turn-failure.mjs). It marks the
     // command answered, so the request bookkeeping below closes it. A turn the room saw
     // working (its marker) that carries no unanswered command is told as a plain room
-    // message instead (item 45eb0708).
+    // message instead (item 45eb0708), unless the poller's notice told it already or is
+    // telling it now.
     if (mode === 'stop' && connectionId && sessionId && !turnEndReported && !turnEndClaim?.told) {
       try {
         await postTurnFailure({
@@ -793,7 +802,7 @@ async function main() {
           sessionId,
           dir: CONNECTIONS_DIR,
           agentName,
-          notice: Boolean(readTurnMarker(connectionId)),
+          notice: Boolean(readTurnMarker(connectionId)) && !turnEndClaim?.noticed && !turnEndNoticing,
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
@@ -848,9 +857,9 @@ async function main() {
     // The room commands that started this turn, read before its end removes the record.
     const turnCommands = turnActive ? [] : readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
     // A turn end this hook holds clears the marker once its report lands (below); one
-    // the poller holds is the poller's to end.
+    // the poller holds, or is noticing, is the poller's to end.
     if (turnActive) writeTurnMarker(connectionId)
-    else if (!turnEndClaimedHere && !turnEndReported) clearTurnMarker(connectionId)
+    else if (!turnEndClaimedHere && !turnEndReported && !turnEndNoticing) clearTurnMarker(connectionId)
 
     // Busy heartbeat — one connection-native path (attached or sessionless). The
     // server broadcasts agent_status for the attached session, so no session-keyed
@@ -993,7 +1002,11 @@ async function main() {
   if (turnEndClaim?.outcome === 'claimed') {
     const reported = !turnEndFailed && turnEndDone
     settleTurnEnd(connectionId, turnEndClaim.identity, { reported, dir: CONNECTIONS_DIR })
-    if (reported) clearTurnMarker(connectionId)
+    // Only the marker of the turn this hook ended: after a notice the poller has cleared
+    // it, and a command handed over since has a marker of its own.
+    if (reported && (readTurnMarker(connectionId)?.startedAt ?? null) === turnEndClaim.trackedFrom) {
+      clearTurnMarker(connectionId)
+    }
   }
   process.exit(0)
 }

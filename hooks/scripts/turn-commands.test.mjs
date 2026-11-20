@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  attemptEndArguments,
   clearTurnCommands,
   commandsHandedOver,
   completionArguments,
@@ -92,6 +93,15 @@ describe('completionArguments', () => {
         assert.equal(identities.filter((key) => key in args).length, 1, JSON.stringify(args))
       }
     }
+  })
+})
+
+describe('attemptEndArguments', () => {
+  it('ends the working attempt with the connection and the reason alone: no command, attempt or unbound flag', () => {
+    // report_complete with only connection_id ends the newest attempt being worked on and
+    // never a delivered command still waiting (DevSpecV2 59acf1bfe, PR #1391).
+    assert.deepEqual(attemptEndArguments({ connectionId: CONNECTION, reason: 'turn_end' }), { connection_id: CONNECTION, reason: 'turn_end' })
+    assert.deepEqual(attemptEndArguments({ connectionId: CONNECTION }), { connection_id: CONNECTION })
   })
 })
 

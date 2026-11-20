@@ -74,6 +74,14 @@
  *  - The `turn_ended` line carries no id and no time.
  *  - A turn stopped with Ctrl+C has its `turn_ended` written twice, identical, 3 ms
  *    apart.
+ *  - When Cursor summarises the conversation (`/summarize`; and on its own as the context
+ *    fills) the file keeps every row it had, byte for byte, and gains one user row of
+ *    Cursor's own: its tool catalog (`<available_subagent_types>…</dynamic_tool_catalog>`,
+ *    no timestamp, no prompt). Measured on CLI 2026.11.19 with `/summarize` (copies in
+ *    fixtures/cursor-summarize-2026.11.19); the bundle's writer replays the summarised
+ *    messages from Cursor's summary archive ahead of the rest, leaving out any it cannot
+ *    load. No summary is in the 63 real transcripts, so one inside a turn is not
+ *    measured.
  *
  * ## Which turn a turn end belongs to
  *
@@ -91,22 +99,29 @@
  * **the tracked command's turn end** only when all three hold:
  *  - (a) Cursor was between turns when tracking started;
  *  - (b) its position: the rows noted at handover are still the file's first bytes,
- *    unchanged, and the turn end sits after rows written since. A file that shrank or was
- *    rewritten (a summary, a restore) fails this;
+ *    unchanged, and the turn end sits after rows written since. A summary keeps them
+ *    (above), so it passes; a file that shrank or changed (a restore, summarised rows
+ *    Cursor could not load) fails;
  *  - (c) the rows written since start with exactly one turn, and that turn's start row is
  *    the room-command sentence (COMMAND_TURN_SENTENCES, in exactly the form above); bare
  *    timestamp rows and Cursor's resume rows inside it are allowed, any other user row
- *    (a typed prompt, a second notification) fails it.
+ *    (a typed prompt, a second notification, Cursor's summary row) fails it. A summary
+ *    inside the command's turn cannot be told from a summary turn run straight after it,
+ *    whose end replaced the command's (A4), so a turn holding one stays uncertain.
  * Then, as the stop hook would: a turn that ran names the commands that started it as
  * finished and clears Working; an error or a stop answers the tracked command in
  * Cursor's own words (turn-failure.mjs) and closes its request.
  *
  * Every other turn end that ended in an error or was stopped (tracking started in a
  * turn; a rewritten file; a typed turn; a turn that failed at its start with no user
- * row; a second turn) is told to the room in Cursor's words as a message of its own
- * (`turnFailureNotice`), which answers and closes nothing; Working clears. Every other
- * turn that ran ends as before this existed: Working until the agent's answer, the next
- * command or the backstop.
+ * row; a second turn; a summary in the turn) gets the notice level: the room is told in
+ * Cursor's words in a message of its own (`turnFailureNotice`), which answers and closes
+ * nothing, and the working attempt is ended without naming a command
+ * (turn-commands.mjs `attemptEndArguments`: DevSpec ends the attempt being worked on,
+ * never a command still waiting), so Working clears at once. When the stop hook runs it
+ * knows its turn, and adds the report level: the command's failure reply and its request
+ * closed (the upgrade, below). Every other turn that ran ends as before this existed:
+ * Working until the agent's answer, the next command or the backstop.
  *
  * If Cursor changes the sentence, nothing matches (c) and every error goes to the room
  * as a message of its own: the safe direction. Add a new wording to
@@ -120,22 +135,36 @@
  * exists for a turn that ran, after it for an error or a stop. A claim made before the
  * tracked turn started does not count against it (`claimTurnEnd` `after`).
  *
- * ## Reported once
+ * ## Reported once, at two levels
  *
  * Whichever of the stop hook and the poller reports a turn end claims it first
- * (`claimTurnEnd`, an exclusive file create in the connection's state folder). The claim
- * is "reporting" until every step has reached DevSpec (the room told, the turn reported
- * finished, its requests closed), then "reported" (`settleTurnEnd`). A step that did not
- * land gives the claim back and keeps the turn's marker, so the other path, or the
- * poller's next try (`nextReportTry`), reports what is left; what already landed is
- * recorded on the claim (`noteTurnEndTold`, `noteTurnEndCompleted`) and never sent twice.
- * The other path leaves a claim being reported by a live process alone, and takes over
- * one given back or one whose owner process has gone.
+ * (`claimTurnEnd`, an exclusive file create in the connection's state folder), for one of
+ * two levels:
+ *  - the report level (the stop hook always; the poller when attributed): the room told
+ *    (the command's failure reply, or a notice when the turn answers none), the turn
+ *    reported finished by name, its requests closed. Settled "reported".
+ *  - the notice level (the poller, when not attributed): the room told in a notice of its
+ *    own and the working attempt ended without a name. Settled "noticed".
+ * A claim is "reporting" until its level's steps have all reached DevSpec. A step that
+ * did not land gives the claim back and keeps the turn's marker, so the other path, or
+ * the poller's next try (`nextReportTry`), does what is left; what already landed is
+ * recorded on the claim (`noteTurnEndTold`, `noteTurnEndNoticed`, `noteTurnEndCompleted`,
+ * `noteTurnEndAttemptEnded`) and never sent twice, at either level. The other path leaves
+ * a claim a live process is working on alone, and takes over one given back or one whose
+ * owner process has gone.
+ *
+ * The stop hook knows the turn it ends, so it can always add the report level: it takes
+ * a "noticed" claim over (the upgrade) and answers the command and closes its request
+ * without a second notice; and when it finds the poller posting a notice right now, it
+ * answers and closes alongside, never posting a notice of its own, and leaves the claim
+ * and the marker to the poller. The poller never adds the notice level to a turn end the
+ * stop hook has reported or is reporting: the stop hook's message told the room.
  *
  * ## Every interleaving, and what happens (the tests carry these codes)
  *
- * "Attributed" is a turn end that meets (a), (b) and (c) above; "a notice" is the room
- * told in Cursor's words in a message of its own, answering and closing nothing.
+ * "Attributed" is a turn end that meets (a), (b) and (c) above; "a notice" is the notice
+ * level: the room told in Cursor's words in a message of its own, answering and closing
+ * nothing, and the working attempt ended without naming a command.
  *
  * Tracking starts between turns:
  *  - A1 The command's turn (its start row the room-command sentence) runs and ends:
@@ -147,7 +176,7 @@
  *  - A4 The command's turn end is overwritten by the next turn before any lap: the rows
  *    since hold two turns, so it is not attributed; an error is a notice, a turn that ran
  *    ends as before.
- *  - A5 Cursor summarises or rewrites the conversation (fewer or different first rows):
+ *  - A5 The first rows change (a restore; summarised rows Cursor could not load):
  *    position unknown, not attributed; an error is a notice.
  *  - A6 A stopped turn's end is written twice as tracking starts: not a new end.
  *  - A7 The final line is not a turn end Cursor is known to write: nothing.
@@ -161,6 +190,13 @@
  *  - A12 An older transcript restored, with its old modification time: never counted.
  *  - A13 Cursor changes the room-command sentence: nothing matches; an error is a
  *    notice, a turn that ran ends as before.
+ *  - A14 Cursor summarises the conversation: the position holds (real fixture). A command
+ *    handed over after the summary is attributed as any other; a turn holding the summary
+ *    row (one inside the command's turn, or one run between handover and it) is not: an
+ *    error is a notice, a turn that ran ends as before.
+ *  - A15 Cursor starts another turn before the notice's attempt end is sent: the
+ *    transcript no longer ends at that turn end, so no attempt is ended; the new turn
+ *    owns Working.
  * Tracking starts in a turn:
  *  - B1 The running turn ends, or a later turn does: never attributed; a turn that ran
  *    ends as before.
@@ -184,12 +220,23 @@
  *    restarted): the other path takes its claim over.
  *  - C9 The poller's post lands but a later step fails, then the hook runs: the hook
  *    finishes it without telling the room again.
+ *  - C10 The poller noticed a turn end it could not attribute (a notice, the attempt
+ *    ended), then the hook runs: it takes the noticed claim over and answers the command
+ *    and closes its request, once; the notice is not repeated.
+ *  - C11 The hook runs while the poller's notice is in flight: it answers the command and
+ *    closes its request alongside, posting no notice; the poller's notice lands, or is
+ *    tried again (D1): one notice, one answer.
+ *  - C12 The hook told the room, then gave its report back, on a turn end the poller
+ *    cannot attribute: the poller ends the attempt if the hook did not, without telling
+ *    the room again.
  * No stop hook:
  *  - D1 The poller's post fails, with or without a hook running during it: the claim is
  *    given back, the marker kept, and the poller tries again REPORT_RETRY_MS later: told
  *    once.
  *  - D2 Every try fails: after REPORT_ATTEMPTS the poller stops; the turn ends as before.
  *  - D3 A request close fails: retried the same way, without telling the room again.
+ *  - D4 The notice lands but ending the attempt fails: retried the same way, without a
+ *    second notice.
  *
  * ## Failing safe
  *
@@ -208,6 +255,12 @@
  *    request DevSpec has open for the connection is the one answered.
  *  - A turn that ran after tracking started in a turn, or after a rewrite, ends as
  *    before: Working until the agent's answer, the next command or the backstop.
+ *  - An error in a turn the poller could only notice is the command's answer only when
+ *    the stop hook runs (C10). An upgrade whose post is refused is not tried again: the
+ *    poller ended the turn after its notice, and the room has the notice.
+ *  - The notice level ends the attempt being worked on, which is the tracked command's
+ *    unless a turn started since holds one (A15 keeps that case out): DevSpec closes
+ *    that attempt's own command with it, but never answers it.
  *  - A headless (`-p`) run killed by a signal writes no `turn_ended` line, so its end
  *    is not noticed (CLI 2026.11.19). Stopping a turn in the terminal with Ctrl+C does
  *    write one: `{"type":"turn_ended","status":"aborted","error":"User
@@ -639,11 +692,30 @@ function claimFiles(connectionId, dir, { all = false } = {}) {
 }
 
 /** The version of a claim record; a record of any other shape (an older plugin's) is set aside. */
-const CLAIM_VERSION = 2
+const CLAIM_VERSION = 3
+
+/**
+ * What a claim's owner is doing (see "Reported once" in the header): `report`, the full
+ * report of a turn end that is the tracked command's beyond doubt (the stop hook always,
+ * the poller when attributed); `notice`, the room told in a message of its own and the
+ * working attempt ended, for a turn end the poller cannot tie to the command.
+ */
+const CLAIM_GOALS = new Set(['report', 'notice'])
+
+/** What already reached DevSpec for a turn end, carried from one owner to the next. */
+function progressOf(record) {
+  return {
+    told: Boolean(record?.told),
+    noticed: Boolean(record?.noticed),
+    completed: Boolean(record?.completed),
+    ended: Boolean(record?.ended),
+  }
+}
 
 function readClaim(file) {
   const record = readPrivateJson(file)
-  return record?.v === CLAIM_VERSION && typeof record.turn === 'string' ? record : null
+  if (record?.v !== CLAIM_VERSION || typeof record.turn !== 'string' || !CLAIM_GOALS.has(record.goal)) return null
+  return record
 }
 
 /** Whether the process that owns a claim is still running. */
@@ -658,12 +730,22 @@ function ownerAlive(pid) {
 }
 
 /**
- * Claim the report of one turn end. Returns `{ outcome, told, completed }`:
- *  - 'claimed': this caller reports it. `told` and `completed` say an earlier owner
- *    whose other steps did not land already told the room or reported the turn
- *    finished, so neither is sent twice.
- *  - 'reporting': another live process is reporting it now. Leave it: that owner either
+ * Claim one turn end, to report it in full (`goal` 'report') or only to tell the room and
+ * end the working attempt (`goal` 'notice'). Returns `{ outcome, told, noticed,
+ * completed, ended }`:
+ *  - 'claimed': this caller does it. The progress fields say what an earlier owner
+ *    already got to DevSpec, so none of it is sent twice: `told` the report's room
+ *    message (the failure reply, or its notice when the turn answers no command),
+ *    `noticed` a notice of the notice level, `completed` the turn reported finished by
+ *    name, `ended` the working attempt ended without a name.
+ *  - 'reporting': another live process is doing it now. Leave it: that owner either
  *    settles it or gives it back for a retry (settleTurnEnd).
+ *  - 'noticing' (to a `report` caller only): another live process is posting the notice
+ *    for it now. The caller answers and closes alongside it, never posting a notice of
+ *    its own, and leaves the claim to that owner.
+ *  - 'noticed' (to a `notice` caller only): the room was told and the attempt ended. A
+ *    `report` caller takes a noticed claim over instead, to answer the command and close
+ *    its request: the upgrade.
  *  - 'reported': it has been reported in full.
  *  - 'failed': no claim could be written, so nothing says who reports it.
  * The claim is a file created only if it does not exist yet (a hard link of a complete
@@ -673,18 +755,22 @@ function ownerAlive(pid) {
  * aside by a rename only one process can make, and the claim made again. Earlier claims
  * are removed: only the newest turn end can be claimed again.
  */
-export function claimTurnEnd(connectionId, identity, { by, after = null, dir = CONNECTIONS_DIR, now = Date.now(), pid = process.pid } = {}) {
-  if (!connectionId || !parseIdentity(identity)) return { outcome: 'failed', told: false, completed: false }
+export function claimTurnEnd(
+  connectionId,
+  identity,
+  { by, goal = 'report', after = null, dir = CONNECTIONS_DIR, now = Date.now(), pid = process.pid } = {},
+) {
+  const none = progressOf(null)
+  if (!connectionId || !parseIdentity(identity) || !CLAIM_GOALS.has(goal)) return { outcome: 'failed', ...none }
   const target = claimPath(connectionId, identity, dir)
-  let told = false
-  let completed = false
+  let progress = none
   // Each pass either claims, finds the claim held, or sets a dead claim aside: two passes
   // after setting one aside settle every race between two claimers.
   for (let pass = 0; pass < 3; pass++) {
     const temporary = `${target}.tmp-${pid}-${now.toString(36)}-${pass}`
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const record = { v: CLAIM_VERSION, turn: identity, by: by ?? null, pid, at: new Date(now).toISOString(), state: 'reporting', told, completed }
+      const record = { v: CLAIM_VERSION, turn: identity, by: by ?? null, goal, pid, at: new Date(now).toISOString(), state: 'reporting', ...progress }
       fs.writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 })
       try {
         fs.linkSync(temporary, target)
@@ -693,12 +779,14 @@ export function claimTurnEnd(connectionId, identity, { by, after = null, dir = C
         const existing = readClaim(target)
         const earlier = typeof after === 'number' && Date.parse(existing?.at ?? '') < after
         if (existing && !earlier) {
-          if (existing.state === 'reported') return { outcome: 'reported', told: true, completed: true }
+          const held = progressOf(existing)
+          if (existing.state === 'reported') return { outcome: 'reported', ...held }
+          if (existing.state === 'noticed' && goal === 'notice') return { outcome: 'noticed', ...held }
           if (existing.state === 'reporting' && ownerAlive(existing.pid)) {
-            return { outcome: 'reporting', told: Boolean(existing.told), completed: Boolean(existing.completed) }
+            const noticing = existing.goal === 'notice' && goal === 'report'
+            return { outcome: noticing ? 'noticing' : 'reporting', ...held }
           }
-          told = Boolean(existing.told)
-          completed = Boolean(existing.completed)
+          progress = held
         }
         try {
           fs.renameSync(target, `${target}.aside-${pid}-${now.toString(36)}-${pass}`)
@@ -708,7 +796,7 @@ export function claimTurnEnd(connectionId, identity, { by, after = null, dir = C
         continue
       }
     } catch {
-      return { outcome: 'failed', told: false, completed: false }
+      return { outcome: 'failed', ...none }
     } finally {
       try {
         fs.rmSync(temporary, { force: true })
@@ -724,9 +812,9 @@ export function claimTurnEnd(connectionId, identity, { by, after = null, dir = C
         /* an older claim left behind matches no newer turn end */
       }
     }
-    return { outcome: 'claimed', told, completed }
+    return { outcome: 'claimed', ...progress }
   }
-  return { outcome: 'reporting', told, completed }
+  return { outcome: 'reporting', ...progress }
 }
 
 /** Rewrite this process's own claim of `identity`, if it still holds it. */
@@ -743,22 +831,37 @@ function updateOwnClaim(connectionId, identity, dir, patch, pid = process.pid) {
   }
 }
 
-/** The room has been told about this turn end: a later owner does not post it again. */
+/**
+ * The report's room message for this turn end has been posted (the failure reply, or the
+ * notice for a turn that answers no command): a later owner does not post it again.
+ */
 export function noteTurnEndTold(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
   return updateOwnClaim(connectionId, identity, dir, { told: true }, pid)
 }
 
-/** DevSpec has been told the turn finished: a later owner does not report it again. */
+/** The notice level's message has been posted: no later owner posts a notice again. */
+export function noteTurnEndNoticed(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  return updateOwnClaim(connectionId, identity, dir, { noticed: true }, pid)
+}
+
+/** DevSpec has been told the turn finished, by name: a later owner does not report it again. */
 export function noteTurnEndCompleted(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
   return updateOwnClaim(connectionId, identity, dir, { completed: true }, pid)
 }
 
+/** The working attempt has been ended without a name: the notice level does not end it again. */
+export function noteTurnEndAttemptEnded(connectionId, identity, { dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  return updateOwnClaim(connectionId, identity, dir, { ended: true }, pid)
+}
+
 /**
- * Settle this process's claim: `reported` when every step reached DevSpec, else given
- * back so the other path, or the poller's next try, reports what is left.
+ * Settle this process's claim: `reported` when every step of a report reached DevSpec,
+ * `noticed` when the notice level's steps did, else given back so the other path, or the
+ * poller's next try, does what is left.
  */
-export function settleTurnEnd(connectionId, identity, { reported, dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
-  return updateOwnClaim(connectionId, identity, dir, { state: reported ? 'reported' : 'released' }, pid)
+export function settleTurnEnd(connectionId, identity, { reported = false, noticed = false, dir = CONNECTIONS_DIR, pid = process.pid } = {}) {
+  const state = reported ? 'reported' : noticed ? 'noticed' : 'released'
+  return updateOwnClaim(connectionId, identity, dir, { state }, pid)
 }
 
 /**
@@ -780,7 +883,7 @@ export function nextReportTry(attempts, failedAtMs) {
 /**
  * Whether the end of the turn `baseline` was noted for (a turn's readTurnBaseline) is
  * reported or being reported: a claim in that conversation made after the turn started,
- * reported in full or held by a live owner.
+ * reported in full, noticed (its working attempt was ended), or held by a live owner.
  */
 export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || !baseline) return false
@@ -788,7 +891,8 @@ export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR }
     const record = readClaim(file)
     const claimed = parseIdentity(record?.turn)
     if (claimed?.conversation !== baseline.conversation || !(Date.parse(record.at) >= baseline.turn)) continue
-    if (record.state === 'reported' || (record.state === 'reporting' && ownerAlive(record.pid))) return true
+    if (record.state === 'reported' || record.state === 'noticed') return true
+    if (record.state === 'reporting' && ownerAlive(record.pid)) return true
   }
   return false
 }

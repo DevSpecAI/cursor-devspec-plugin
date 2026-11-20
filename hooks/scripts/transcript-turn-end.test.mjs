@@ -32,7 +32,9 @@ import {
   claimTurnEnd,
   lastTurnEnd,
   nextReportTry,
+  noteTurnEndAttemptEnded,
   noteTurnEndCompleted,
+  noteTurnEndNoticed,
   noteTurnEndTold,
   readTranscriptTurns,
   readTurnBaseline,
@@ -69,6 +71,18 @@ const identity = (turns, row) => `${CONVERSATION}#${turns}#${rowDigest(row)}`
 // Cursor's error text when it is longer than the 64 KiB the transcript used to be read
 // back by, and still well inside the room's 100,000-character message.
 const LONG_ERROR = `Provider returned an error: ${'request context too large; '.repeat(2_700)}end of error.`
+// What a claim says already reached DevSpec (claimTurnEnd).
+const progress = (done = {}) => ({ told: false, noticed: false, completed: false, ended: false, ...done })
+// Real transcripts from CLI 2026.11.19 (2026-11-20, a throwaway conversation): two typed
+// turns, then `/summarize`, then a third typed turn, each copied as Cursor left it.
+const SUMMARY_FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'cursor-summarize-2026.11.19')
+const summaryFixture = (name) => fs.readFileSync(path.join(SUMMARY_FIXTURES, name))
+// The user row Cursor added when it summarised that conversation (its tool catalog).
+const SUMMARY_ROW = (() => {
+  const kept = (bytes) => bytes.subarray(0, bytes.lastIndexOf(0x0a, bytes.length - 2) + 1)
+  const before = kept(summaryFixture('1-before-summary.jsonl'))
+  return JSON.parse(kept(summaryFixture('2-summary-turn-ended.jsonl')).subarray(before.length).toString())
+})()
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const until = async (condition, ms = 10_000) => {
@@ -313,6 +327,45 @@ describe('which turn a turn end belongs to', () => {
     assert.equal(decide(dir, transcript), null)
   }))
 
+  it('A14 (real transcripts, CLI 2026.11.19 /summarize): a summary keeps the rows noted at handover first, so the position holds; a turn holding the row Cursor adds is only told', () => inScratch((dir, transcript) => {
+    const before = summaryFixture('1-before-summary.jsonl')
+    const summarised = summaryFixture('2-summary-turn-ended.jsonl')
+    const next = summaryFixture('3-next-turn-ended.jsonl')
+    // All but the final turn_ended line: the rows Cursor keeps when the next turn starts.
+    const keptOf = (bytes) => bytes.subarray(0, bytes.lastIndexOf(0x0a, bytes.length - 2) + 1)
+    assert.match(before.subarray(keptOf(before).length).toString(), /"turn_ended"/)
+    // Cursor rewrote nothing it had written: each file starts with the one before's rows.
+    assert.ok(summarised.subarray(0, keptOf(before).length).equals(keptOf(before)), 'the summary kept the rows before it')
+    assert.ok(next.subarray(0, keptOf(summarised).length).equals(keptOf(summarised)), 'the turn after it kept them too')
+    // The one row the summary added: Cursor's own, its tool catalog, no prompt of anyone's.
+    const summaryRow = keptOf(summarised).subarray(keptOf(before).length)
+    assert.match(summaryRow.toString(), /^\{"role":"user".*<available_subagent_types>.*<\/dynamic_tool_catalog>"\}\]\}\}\n$/s)
+    const write = (...parts) => fs.writeFileSync(transcript, Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(`${JSON.stringify(part)}\n`)))))
+
+    fs.mkdirSync(path.dirname(transcript), { recursive: true })
+    write(before)
+    track(dir, transcript)
+    write(summarised)
+    assert.equal(decide(dir, transcript), null, 'the summary\'s own turn ran, and it was nobody\'s command')
+    // The command's turn after a summary, or a summary inside the command's turn: the
+    // position holds, but the turn holds a row that is neither the command's sentence nor
+    // Cursor's resume row, and a summary inside the command's turn cannot be told from a
+    // summary turn that ran after it (A4). Only told.
+    write(keptOf(summarised), WAKE, ended('error', LIMIT))
+    assert.equal(decide(dir, transcript)?.attributed, false, 'a summary between handover and the command\'s turn')
+    write(keptOf(before), WAKE, answer('Looking.'), summaryRow, ended('error', LIMIT))
+    assert.equal(decide(dir, transcript)?.attributed, false, 'a summary inside the command\'s turn')
+    write(keptOf(before), WAKE, ended('error', LIMIT))
+    assert.equal(decide(dir, transcript)?.attributed, true, 'the same turn with no summary row in it is the command\'s')
+
+    // A command handed over after a summary: its turn is the command's as any other.
+    const after = { startedAt: 2_000 }
+    write(summarised)
+    track(dir, transcript, after)
+    write(keptOf(summarised), WAKE, ended('error', LIMIT))
+    assert.equal(decide(dir, transcript, after)?.attributed, true)
+  }))
+
   it('B1/B2 (DevSpec\'s fixture): tracking started while a typed turn ran: its error is only told, never the command\'s answer; a run ends as before', () => inScratch((dir, transcript) => {
     const running = [...connectedRows, typed, answer('Looking.')]
     writeTranscript(transcript, running)
@@ -350,8 +403,8 @@ describe('claiming a turn end', () => {
     const { dir } = scratch()
     try {
       const first = identity(2, WAKE)
-      assert.deepEqual(claimTurnEnd(CONNECTION, first, { by: 'stop', dir }), { outcome: 'claimed', told: false, completed: false })
-      assert.deepEqual(claimTurnEnd(CONNECTION, first, { by: 'poller', dir }), { outcome: 'reporting', told: false, completed: false }, 'its owner (this process) is alive')
+      assert.deepEqual(claimTurnEnd(CONNECTION, first, { by: 'stop', dir }), { outcome: 'claimed', ...progress() })
+      assert.deepEqual(claimTurnEnd(CONNECTION, first, { by: 'poller', dir }), { outcome: 'reporting', ...progress() }, 'its owner (this process) is alive')
       assert.equal(noteTurnEndTold(CONNECTION, first, { dir }), true)
       assert.equal(settleTurnEnd(CONNECTION, first, { reported: true, dir }), true)
       assert.equal(claimTurnEnd(CONNECTION, first, { by: 'poller', dir }).outcome, 'reported')
@@ -372,10 +425,10 @@ describe('claiming a turn end', () => {
       claimTurnEnd(CONNECTION, same, { by: 'poller', dir })
       noteTurnEndTold(CONNECTION, same, { dir })
       settleTurnEnd(CONNECTION, same, { reported: false, dir })
-      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'stop', dir }), { outcome: 'claimed', told: true, completed: false }, 'the room is not told twice')
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'stop', dir }), { outcome: 'claimed', ...progress({ told: true }) }, 'the room is not told twice')
       noteTurnEndCompleted(CONNECTION, same, { dir })
       settleTurnEnd(CONNECTION, same, { reported: false, dir })
-      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }), { outcome: 'claimed', told: true, completed: true }, 'nor the turn reported finished twice')
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }), { outcome: 'claimed', ...progress({ told: true, completed: true }) }, 'nor the turn reported finished twice')
       assert.equal(fs.readdirSync(dir).filter((name) => name.includes('.turn-end.')).length, 1)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -390,7 +443,7 @@ describe('claiming a turn end', () => {
       const gone = spawn(process.execPath, ['-e', ''])
       await new Promise((resolve) => gone.on('exit', resolve))
       assert.equal(claimTurnEnd(CONNECTION, same, { by: 'stop', dir, pid: gone.pid }).outcome, 'claimed')
-      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }), { outcome: 'claimed', told: false, completed: false })
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }), { outcome: 'claimed', ...progress() })
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -404,7 +457,7 @@ describe('claiming a turn end', () => {
       assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', dir, now: earlier }).outcome, 'claimed')
       settleTurnEnd(CONNECTION, same, { reported: true, dir })
       const trackedFrom = Date.now() - 1_000
-      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', after: trackedFrom, dir }), { outcome: 'claimed', told: false, completed: false }, 'the earlier claim was an earlier turn')
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', after: trackedFrom, dir }), { outcome: 'claimed', ...progress() }, 'the earlier claim was an earlier turn')
       assert.equal(claimTurnEnd(CONNECTION, same, { by: 'stop', after: trackedFrom, dir }).outcome, 'reporting', 'and this one is being reported')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -417,8 +470,13 @@ describe('claiming a turn end', () => {
       const same = identity(2, WAKE)
       claimTurnEnd(CONNECTION, same, { by: 'poller', dir })
       const file = fs.readdirSync(dir).find((name) => name.endsWith('.claim'))
-      fs.writeFileSync(path.join(dir, file), JSON.stringify({ v: 1, turn: same, by: 'stop', at: new Date().toISOString() }))
-      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }).outcome, 'claimed')
+      for (const older of [
+        { v: 1, turn: same, by: 'stop', at: new Date().toISOString() },
+        { v: 2, turn: same, by: 'stop', pid: process.pid, at: new Date().toISOString(), state: 'reporting', told: false, completed: false },
+      ]) {
+        fs.writeFileSync(path.join(dir, file), JSON.stringify(older))
+        assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }).outcome, 'claimed', `v${older.v}`)
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -434,12 +492,68 @@ describe('claiming a turn end', () => {
       assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), true, 'being reported by a live owner')
       settleTurnEnd(CONNECTION, same, { reported: false, dir })
       assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), false, 'given back: the backstop still reports it')
+      claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir })
+      settleTurnEnd(CONNECTION, same, { noticed: true, dir })
+      assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), true, 'noticed: its working attempt was ended')
       claimTurnEnd(CONNECTION, same, { by: 'stop', dir })
       settleTurnEnd(CONNECTION, same, { reported: true, dir })
       assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), true)
       assert.equal(turnEndClaimed(CONNECTION, { ...baseline, turn: Date.now() + 60_000 }, { dir }), false, 'claimed before the turn started')
       assert.equal(turnEndClaimed(CONNECTION, { ...baseline, conversation: 'another' }, { dir }), false)
       assert.equal(turnEndClaimed(CONNECTION, null, { dir }), false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('C10: a notice, then the stop hook\'s report takes it over (the upgrade) without a second notice', () => {
+    const { dir } = scratch()
+    try {
+      const same = identity(2, WAKE)
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }), { outcome: 'claimed', ...progress() })
+      noteTurnEndNoticed(CONNECTION, same, { dir })
+      noteTurnEndAttemptEnded(CONNECTION, same, { dir })
+      settleTurnEnd(CONNECTION, same, { noticed: true, dir })
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }), { outcome: 'noticed', ...progress({ noticed: true, ended: true }) }, 'nothing left at the notice level')
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'stop', goal: 'report', dir }), { outcome: 'claimed', ...progress({ noticed: true, ended: true }) }, 'the stop hook answers and closes; the notice is not repeated')
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }).outcome, 'reporting', 'while it does')
+      noteTurnEndTold(CONNECTION, same, { dir })
+      settleTurnEnd(CONNECTION, same, { reported: true, dir })
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }).outcome, 'reported')
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'stop', goal: 'report', dir }).outcome, 'reported')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('C11: a notice being posted by a live process: the stop hook answers alongside it; the notice level waits for a report being made', () => {
+    const { dir } = scratch()
+    try {
+      const same = identity(2, WAKE)
+      claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir })
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'stop', goal: 'report', dir }).outcome, 'noticing')
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }).outcome, 'reporting')
+      const other = identity(3, user('next'))
+      claimTurnEnd(CONNECTION, other, { by: 'stop', goal: 'report', dir })
+      assert.equal(claimTurnEnd(CONNECTION, other, { by: 'poller', goal: 'notice', dir }).outcome, 'reporting', 'the stop hook\'s report tells the room itself')
+      assert.equal(claimTurnEnd(CONNECTION, other, { by: 'poller', goal: 'report', dir }).outcome, 'reporting')
+      assert.equal(claimTurnEnd(CONNECTION, other, { by: 'poller', goal: 'whatever', dir }).outcome, 'failed')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('C12: a report given back after telling the room: the notice level only ends what is left', () => {
+    const { dir } = scratch()
+    try {
+      const same = identity(2, WAKE)
+      claimTurnEnd(CONNECTION, same, { by: 'stop', goal: 'report', dir })
+      noteTurnEndTold(CONNECTION, same, { dir })
+      settleTurnEnd(CONNECTION, same, { reported: false, dir })
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }), { outcome: 'claimed', ...progress({ told: true }) }, 'no notice: the room was told')
+      noteTurnEndAttemptEnded(CONNECTION, same, { dir })
+      settleTurnEnd(CONNECTION, same, { noticed: false, dir })
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }), { outcome: 'claimed', ...progress({ told: true, ended: true }) }, 'nor the attempt ended twice')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -592,6 +706,8 @@ async function startPoller({ attached = false, capability = false } = {}) {
     failurePostsSent: () => stub.named('post_session_message').filter((args) => args.complete_turn === true),
     /** Room messages telling why a turn ended, posted by session alone so they answer nothing. */
     roomNotices: () => stub.landed('post_session_message').filter((args) => !args.connection_id && args.session_id),
+    /** Every such message DevSpec was sent, whether or not it has landed yet. */
+    noticesSent: () => stub.named('post_session_message').filter((args) => !args.connection_id && args.session_id),
     requestCloses: () => stub.landed('report_request').filter((args) => args.action === 'close'),
     /** The requests the connection still has open, as its request log says. */
     openRequests() {
@@ -654,6 +770,8 @@ async function startPoller({ attached = false, capability = false } = {}) {
 }
 
 const finished = (reason = 'turn_end', command = COMMAND) => ({ connection_id: CONNECTION, command_turn_id: command.turnId, command_message_id: command.messageId, reason })
+// The working attempt ended without saying which command finished (turn-commands.mjs attemptEndArguments).
+const attemptEnded = { connection_id: CONNECTION, reason: 'turn_end' }
 
 describe('the poller reports a turn end from the transcript when no stop hook runs', () => {
   it('A1: a turn that ran: the command it started is finished within seconds and Working clears', async () => {
@@ -682,7 +800,7 @@ describe('the poller reports a turn end from the transcript when no stop hook ru
     }
   })
 
-  it('B1/B2/A7 (DevSpec\'s fixture): a typed turn already running at handover: its error is only told; the command is never answered nor its request closed', async () => {
+  it('B1/B2/A7 (DevSpec\'s fixture): a typed turn already running at handover: its error is only told and the working attempt ended; the command is never answered nor its request closed', async () => {
     const run = await startPoller({ attached: true, capability: true })
     try {
       // A prompt typed at the terminal is running when the command arrives.
@@ -705,7 +823,7 @@ describe('the poller reports a turn end from the transcript when no stop hook ru
       await run.laps()
       assert.ok(run.roomNotices()[0].message.includes(LIMIT), "in Cursor's words")
       assert.deepEqual(run.failurePostsSent(), [], 'never an answer to the command')
-      assert.deepEqual(run.completions(), [], 'nor the command reported finished')
+      assert.deepEqual(run.completions(), [attemptEnded], 'the working attempt ended at once, naming no command')
       assert.deepEqual(run.requestCloses(), [], 'nor its request closed')
       assert.deepEqual(run.openRequests(), [REQUEST])
       assert.ok(!fs.readFileSync(path.join(run.dir, `${CONNECTION}.requests.jsonl`), 'utf8').includes('"answered"'), 'nor marked answered')
@@ -740,23 +858,38 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
     })
   }
 
-  it('A5/C3: an error after Cursor rewrote the conversation shorter is only told, once, whoever sees it', async () => {
-    const run = await startPoller({ attached: true })
-    try {
-      writeTranscript(run.transcript, [user('one'), answer('1'), user('two'), answer('2'), ...run.connected])
-      await run.deliver()
-      run.recordCommandRequest()
-      writeTranscript(run.transcript, [answer('Summary of the conversation so far.'), WAKE, ended('error', LIMIT)])
-      assert.ok(await until(() => run.roomNotices().length >= 1), `the room was not told; stderr:\n${run.stderr()}`)
-      await run.stop('error')
-      await run.laps()
-      assert.equal(run.roomNotices().length, 1, 'once')
-      assert.deepEqual(run.failurePostsSent(), [], 'position unknown: never the command\'s answer')
-      assert.deepEqual(run.completions(), [])
-    } finally {
-      await run.cleanup()
-    }
-  })
+  for (const [code, what, rows] of [
+    ['A14/C10 (DevSpec\'s finding)', 'Cursor summarised the conversation during the command', (connected) => [...connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)]],
+    ['A5/C10', 'Cursor rewrote the conversation shorter', () => [answer('Summary of the conversation so far.'), WAKE, ended('error', LIMIT)]],
+  ]) {
+    it(`${code}: an error after ${what}: a notice and the working attempt ended at once; the stop hook then answers the command and closes its request, without a second notice`, async () => {
+      const run = await startPoller({ attached: true, capability: true })
+      try {
+        await run.deliver()
+        run.recordCommandRequest()
+        writeTranscript(run.transcript, rows(run.connected))
+        assert.ok(await until(() => run.completions().length >= 1), `the attempt was not ended; stderr:\n${run.stderr()}`)
+        assert.equal(run.roomNotices().length, 1, 'the room is told')
+        assert.ok(run.roomNotices()[0].message.includes(LIMIT), "in Cursor's words")
+        assert.deepEqual(run.completions(), [attemptEnded], 'the attempt ended, naming no command')
+        assert.deepEqual(run.failurePostsSent(), [], 'not certain: never the command\'s answer')
+        assert.deepEqual(run.requestCloses(), [], 'nor its request closed')
+        assert.equal(run.turnOpen(), false, 'Working clears')
+
+        // Cursor runs the stop hook (a person with a hooks file of their own): it knows its turn.
+        await run.stop('error')
+        await run.laps()
+        assert.equal(run.roomNotices().length, 1, 'the notice is not repeated')
+        assert.equal(run.failurePostsSent().length, 1, 'the command answered once')
+        assert.ok(run.failurePosts()[0].message.includes(LIMIT))
+        assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST], 'its request closed once')
+        assert.deepEqual(run.openRequests(), [])
+        assert.deepEqual(run.completions(), [attemptEnded, finished()])
+      } finally {
+        await run.cleanup()
+      }
+    })
+  }
 
   it('A11: an error longer than 64 KiB is quoted whole in the room', async () => {
     const run = await startPoller({ attached: true })
@@ -796,7 +929,7 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
     })
   }
 
-  it('A1/A3/C3: a second command whose turn fails at its very start, with no user row: told once, never answered', async () => {
+  it('A1/A3/C10: a second command whose turn fails at its very start, with no user row: told once and its attempt ended; the stop hook after it adds no message', async () => {
     const run = await startPoller({ attached: true })
     try {
       await run.deliver()
@@ -807,10 +940,13 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
       await run.deliver('and the changelog', SECOND_COMMAND, 2)
       // Cursor refuses the command's turn before writing its prompt: the same rows, a new end.
       writeTranscript(run.transcript, [...ran, ended('error', LIMIT)])
-      assert.ok(await until(() => run.roomNotices().length >= 1), `the room was not told; stderr:\n${run.stderr()}`)
+      assert.ok(await until(() => run.completions().length >= 2), `the attempt was not ended; stderr:\n${run.stderr()}`)
+      assert.deepEqual(run.completions(), [finished(), attemptEnded], 'the first command by name, whose turn was its own; then the attempt, naming nothing')
       await run.stop('error')
       await run.laps()
-      assert.deepEqual(run.completions(), [finished()], 'only the first command, whose turn was its own')
+      // The stop hook knows the turn it ended was the second command's, and finishes it by name.
+      assert.deepEqual(run.completions(), [finished(), attemptEnded, finished('turn_end', SECOND_COMMAND)])
+      assert.deepEqual(run.failurePostsSent(), [], 'no request tracked: nothing to answer')
       assert.equal(run.roomNotices().length, 1, 'told once, in a message of its own')
       assert.ok(run.roomNotices()[0].message.includes(LIMIT))
       assert.equal(run.turnOpen(), false)
@@ -1056,6 +1192,96 @@ describe('the stop hook and the poller around a report that is in flight, fails 
       assert.equal(run.failurePosts().length, 1)
       assert.deepEqual(run.completions(), [finished()])
       assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  for (const tracked of [true, false]) {
+    it(`C11: the stop hook runs while the poller's notice is in flight: ${tracked ? 'it answers the command and closes its request alongside; one notice, one answer' : 'with no command to answer, it posts no notice of its own; one notice'}`, async () => {
+      const run = await startPoller({ attached: true, capability: true })
+      try {
+        await run.deliver()
+        if (tracked) run.recordCommandRequest()
+        run.stub.hold('post_session_message', 2_500)
+        writeTranscript(run.transcript, [...run.connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)])
+        assert.ok(await until(() => run.noticesSent().length >= 1), `no notice; stderr:\n${run.stderr()}`)
+        await run.stop('error')
+        assert.equal(run.turnOpen(), true, 'the stop hook leaves the turn to the poller posting its notice')
+        assert.ok(await until(() => run.completions().some((args) => !args.command_turn_id)), `the attempt was not ended; stderr:\n${run.stderr()}`)
+        await run.laps()
+        assert.equal(run.noticesSent().length, 1, 'one notice, the poller\'s')
+        assert.equal(run.failurePostsSent().length, tracked ? 1 : 0, 'the stop hook answers what it can')
+        assert.deepEqual(run.requestCloses().map((args) => args.request_id), tracked ? [REQUEST] : [])
+        assert.deepEqual(run.completions(), [finished(), attemptEnded])
+        assert.equal(run.turnOpen(), false)
+      } finally {
+        await run.cleanup()
+      }
+    })
+  }
+
+  it('C2: on a turn end the poller cannot attribute, the stop hook first: it answers and closes, and the poller adds no notice', async () => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      await run.deliver()
+      run.recordCommandRequest()
+      // Keep the poller inside one long poll, so the stop hook claims the turn end first.
+      const pollCalls = () => run.stub.calls.filter((call) => call.name === 'poll_connection').length
+      run.stub.hold('poll_connection', 4_000)
+      const polled = pollCalls()
+      assert.ok(await until(() => pollCalls() > polled), 'the held poll began')
+      writeTranscript(run.transcript, [...run.connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)])
+      await run.stop('error')
+      assert.equal(run.failurePosts().length, 1, 'the stop hook answered')
+      await sleep(4_000)
+      await run.laps()
+      assert.deepEqual(run.noticesSent(), [], 'the stop hook\'s answer told the room')
+      assert.equal(run.failurePostsSent().length, 1)
+      assert.deepEqual(run.completions(), [finished()])
+      assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it(`D4: the notice lands but ending the working attempt is refused: tried again ${REPORT_RETRY_MS / 1000} s later, and the room is told once`, async () => {
+    const run = await startPoller({ attached: true })
+    try {
+      await run.deliver()
+      run.stub.fail('report_complete')
+      writeTranscript(run.transcript, [...run.connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)])
+      assert.ok(await until(() => run.stub.named('report_complete').length >= 1), `no attempt end; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.equal(run.roomNotices().length, 1)
+      assert.equal(run.turnOpen(), true, 'kept until the attempt is ended')
+      assert.ok(await until(() => run.completions().length >= 1, REPORT_RETRY_MS + 10_000), `no retry; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.equal(run.roomNotices().length, 1, 'told once')
+      assert.deepEqual(run.stub.named('report_complete'), [attemptEnded, attemptEnded], 'the refused end and its retry')
+      assert.deepEqual(run.completions(), [attemptEnded])
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('A15: a turn Cursor started after the error owns Working: the notice ends no attempt', async () => {
+    const run = await startPoller({ attached: true })
+    try {
+      await run.deliver()
+      // The notice's post is held; by the time it lands, Cursor has started the next turn.
+      run.stub.hold('post_session_message', 1_500)
+      const errored = [...run.connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)]
+      writeTranscript(run.transcript, errored)
+      assert.ok(await until(() => run.noticesSent().length >= 1), `no notice; stderr:\n${run.stderr()}`)
+      writeTranscript(run.transcript, [...errored.slice(0, -1), user('<timestamp>Friday, Nov 20, 2026, 9:30 PM (UTC)</timestamp>\n<user_query>\ntry again\n</user_query>')])
+      await sleep(2_000)
+      await run.laps()
+      assert.equal(run.roomNotices().length, 1, 'the room is told')
+      assert.deepEqual(run.stub.named('report_complete'), [], 'no attempt ended under the new turn')
       assert.equal(run.turnOpen(), false)
     } finally {
       await run.cleanup()

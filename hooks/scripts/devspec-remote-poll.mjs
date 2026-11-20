@@ -170,6 +170,7 @@ import {
   turnIsLive,
 } from './turn-liveness.mjs'
 import {
+  attemptEndArguments,
   clearTurnCommands,
   commandsHandedOver,
   completionArguments,
@@ -182,13 +183,16 @@ import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
 import {
   claimTurnEnd,
   nextReportTry,
+  noteTurnEndAttemptEnded,
   noteTurnEndCompleted,
+  noteTurnEndNoticed,
   noteTurnEndTold,
   readTurnBaseline,
   recordTurnBaseline,
   settleTurnEnd,
   transcriptTurnEnd,
   turnEndClaimed,
+  turnEndIdentity,
   turnEndPending,
 } from './transcript-turn-end.mjs'
 import { postTurnFailure, postTurnNotice } from './turn-failure.mjs'
@@ -330,7 +334,7 @@ export function shouldForceCompleteAndInject({ hasNewOwnerCommands, marker, nowM
   return Boolean(hasNewOwnerCommands && isTurnMarkerStale(marker, nowMs))
 }
 
-function clearTurnMarker(connectionId) {
+function clearTurnMarker(connectionId, { keepCommands = false } = {}) {
   if (!connectionId) return
   try {
     fs.rmSync(turnMarkerPath(connectionId), { force: true })
@@ -342,8 +346,10 @@ function clearTurnMarker(connectionId) {
   } catch {
     /* non-fatal */
   }
-  // The turn is over, and its end names what it finished (turn-commands.mjs).
-  clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+  // The turn is over, and its end names what it finished (turn-commands.mjs). After only
+  // a notice, the stop hook may still name them (keepCommands); the next turn's start
+  // replaces the record.
+  if (!keepCommands) clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
 }
 
 /**
@@ -1611,58 +1617,32 @@ async function main() {
 
   /**
    * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
-   * would have (transcript-turn-end.mjs): a turn that ended in an error or was stopped
-   * is told to the room in Cursor's own words (turn-failure.mjs: the unanswered command's
-   * failure reply, or a room message of its own when the turn carries none), the room
-   * commands that started the turn and the turn the owner typed are named as finished,
-   * the turn end's request bookkeeping is done (requests.mjs), and Working clears.
+   * would have (transcript-turn-end.mjs). A turn end that is the tracked command's beyond
+   * doubt (`ended.attributed`) is reported in full: an error or a stop is told to the
+   * room in Cursor's own words (turn-failure.mjs: the unanswered command's failure reply,
+   * or a room message of its own when the turn carries none), the room commands that
+   * started the turn and the turn the owner typed are named as finished, the turn end's
+   * request bookkeeping is done (requests.mjs), and Working clears. Any other error or
+   * stop gets the notice level only (noticeTranscriptTurnEnd).
    *
    * Only while this poller holds the turn end's claim. Every step must reach DevSpec for
-   * the claim to be settled as reported and the marker cleared. Otherwise the claim is
-   * given back and the marker kept, so the stop hook or this poller's next try
-   * (nextReportTry) reports what is left, and the room is never told twice. Returns
-   * 'reported'; 'retry' (try again later); 'reported_elsewhere' (the stop hook reported
-   * it in full); or 'reporting_elsewhere' (the stop hook is reporting it now).
+   * the claim to be settled and the marker cleared. Otherwise the claim is given back and
+   * the marker kept, so the stop hook or this poller's next try (nextReportTry) does what
+   * is left, and nothing is sent twice. Returns 'reported'; 'retry' (try again later);
+   * 'reported_elsewhere' (the stop hook reported it in full); or 'reporting_elsewhere'
+   * (the stop hook is reporting it now).
    */
   async function reportTranscriptTurnEnd(ended, marker) {
+    if (!ended.attributed) return noticeTranscriptTurnEnd(ended, marker)
     const claim = claimTurnEnd(connectionId, ended.identity, {
       by: 'poller',
+      goal: 'report',
       after: marker.startedAt,
       dir: CONNECTIONS_DIR,
     })
     if (claim.outcome === 'reported') return 'reported_elsewhere'
-    if (claim.outcome === 'reporting') return 'reporting_elsewhere'
+    if (claim.outcome === 'reporting' || claim.outcome === 'noticing') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
-    if (!ended.attributed) {
-      // Not the tracked command's turn end beyond doubt: tell the room what Cursor said,
-      // in a message of its own that answers nothing; complete nothing, close nothing.
-      clearTrailState(connectionId)
-      let told = true
-      if (ended.failure && sessionId && !claim.told) {
-        try {
-          await postTurnNotice({
-            failure: ended.failure,
-            sessionId,
-            agentName,
-            post: (args) =>
-              mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
-          })
-          noteTurnEndTold(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
-        } catch (e) {
-          told = false
-          process.stderr.write(`devspec-remote-poll: turn notice failed: ${e.message}\n`)
-        }
-      }
-      settleTurnEnd(connectionId, ended.identity, { reported: told, dir: CONNECTIONS_DIR })
-      if (!told) return 'retry'
-      // Working clears; the commands the turn was started with are not reported finished
-      // (their activity lapses), so the backstop must not report them either.
-      turnStartCommands = []
-      clearTurnMarker(connectionId)
-      prevTurnActive = false
-      process.stderr.write(`devspec-remote-poll: turn ended (${ended.status}), told the room; not tied to a command connection=${connectionId}\n`)
-      return 'reported'
-    }
     let delivered = true
     clearTrailState(connectionId)
     if (ended.failure && sessionId && !claim.told) {
@@ -1673,8 +1653,9 @@ async function main() {
           sessionId,
           dir: CONNECTIONS_DIR,
           agentName,
-          // The room saw this turn working: it is told why it ended either way.
-          notice: true,
+          // The room saw this turn working: it is told why it ended either way, unless a
+          // notice already told it (an upgrade of a noticed turn end).
+          notice: !claim.noticed,
           post: (args) =>
             mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
         })
@@ -1762,6 +1743,92 @@ async function main() {
     prevTurnActive = false
     process.stderr.write(
       `devspec-remote-poll: turn ended (${ended.status}) per Cursor's transcript connection=${connectionId}\n`,
+    )
+    return 'reported'
+  }
+
+  /**
+   * The notice level, for an error or a stop the poller cannot tie to the tracked
+   * command beyond doubt (transcript-turn-end.mjs): the room is told in Cursor's words in
+   * a message of its own, which answers nothing (turn-failure.mjs postTurnNotice), and
+   * the working attempt is ended without saying which command finished
+   * (turn-commands.mjs attemptEndArguments), so Working clears now instead of lapsing.
+   * No command is answered and no request closed: that is the report level, which the
+   * stop hook adds when it runs, since it knows its turn (the upgrade), without a second
+   * notice.
+   *
+   * Nothing is sent when the stop hook has reported the turn end or is reporting it (the
+   * claim). The attempt is ended only once the room has been told, so Working never
+   * clears without a word, and only while the transcript still ends at this turn end: a
+   * turn Cursor has started since owns Working now. Returns as reportTranscriptTurnEnd.
+   */
+  async function noticeTranscriptTurnEnd(ended, marker) {
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      goal: 'notice',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
+    clearTrailState(connectionId)
+    let done = true
+    // A stop hook that gave its report back after posting its message told the room already.
+    if (ended.failure && sessionId && !claim.told && !claim.noticed) {
+      try {
+        await postTurnNotice({
+          failure: ended.failure,
+          sessionId,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+        noteTurnEndNoticed(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      } catch (e) {
+        done = false
+        process.stderr.write(`devspec-remote-poll: turn notice failed: ${e.message}\n`)
+      }
+    }
+    if (done && !claim.completed && !claim.ended) {
+      // An exact directed-question attempt is the one a generic end must not touch
+      // (interactionActivityPlan).
+      const suppressed =
+        interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind === 'suppress'
+      if (!suppressed && turnEndIdentity(lapTranscriptPath) === ended.identity) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'report_complete',
+            arguments: attemptEndArguments({ connectionId, reason: 'turn_end' }),
+            timeoutMs: 10_000,
+          })
+        } catch (e) {
+          done = false
+          process.stderr.write(`devspec-remote-poll: ending the working attempt failed: ${e.message}\n`)
+        }
+      }
+      if (done) noteTurnEndAttemptEnded(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+    }
+    settleTurnEnd(connectionId, ended.identity, { noticed: done, dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: done ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_notice',
+      reason: ended.status,
+    })
+    if (!done) return 'retry'
+    // Working has cleared. The commands the turn was started with stay on record for the
+    // stop hook's upgrade, which names them; the backstop does not report them.
+    turnStartCommands = []
+    clearTurnMarker(connectionId, { keepCommands: true })
+    prevTurnActive = false
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}), told the room and ended the working attempt; not tied to a command connection=${connectionId}\n`,
     )
     return 'reported'
   }
