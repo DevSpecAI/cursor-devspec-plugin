@@ -389,7 +389,7 @@ describe('mirror-turn opens and closes the owner terminal turn (item b59a201c)',
     })
   })
 
-  it('without a recorded attachment the turn is left as before, and Stop keeps the connection-scoped completion', async () => {
+  it('without a recorded attachment the turn is left as before, and Stop finishes only an activity no command started', async () => {
     seed({ speech_attachment_id: null, attached_at: null })
     await run('user_prompt', { prompt: 'file an item', origin: TYPED })
     assert.equal(calls.some((call) => call.name === 'report_pickup'), false)
@@ -397,7 +397,32 @@ describe('mirror-turn opens and closes the owner terminal turn (item b59a201c)',
     await run('stop', { last_assistant_message: 'Done.' })
     assert.deepEqual(calls.find((call) => call.name === 'report_complete').args, {
       connection_id: CONNECTION,
+      command_turn_unbound: true,
       reason: 'turn_end',
     })
+  })
+
+  // turn-commands.mjs (item a4391300): the poller records the room commands a turn
+  // starts with; Stop names each of them, and the typed turn beside them.
+  it('Stop names the room commands that started the turn, and the typed turn, one report each', async () => {
+    seed()
+    await run('user_prompt', { prompt: 'and tidy the changelog', origin: TYPED })
+    const typed = calls.find((call) => call.name === 'report_pickup').args.attempt_id
+    const TURN = '55555555-5555-4555-8555-555555555555'
+    const MESSAGE = '66666666-6666-4666-8666-666666666666'
+    const record = path.join(connections, `${CONNECTION}.turn-commands.json`)
+    fs.writeFileSync(record, JSON.stringify({ version: 1, commands: [{ turn_id: TURN, message_id: MESSAGE }] }))
+
+    calls = []
+    await run('stop', { last_assistant_message: 'Done.' })
+    assert.deepEqual(
+      calls.filter((call) => call.name === 'report_complete').map((call) => call.args),
+      [
+        { connection_id: CONNECTION, command_turn_id: TURN, command_message_id: MESSAGE, reason: 'turn_end' },
+        { connection_id: CONNECTION, attempt_id: typed, reason: 'turn_end' },
+      ],
+    )
+    assert.equal(fs.existsSync(record), false, 'the turn\'s end removes the record of what started it')
+    assert.equal(stored().local_turn, null)
   })
 })

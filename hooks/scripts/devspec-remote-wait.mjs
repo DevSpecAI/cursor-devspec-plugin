@@ -103,6 +103,8 @@ import {
 import { wakeNotice } from './room-unread.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
+import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
+import { localTurnToComplete } from './local-turn.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -119,8 +121,10 @@ const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
 /**
  * Remove the connection turn marker, so the continuous poller stops re-asserting
- * busy. Pair with `notifyWorkingEnded` so Working/dots clear immediately — the
- * poller's own `report_complete` only runs on its next long-poll tick (~25–30s).
+ * busy, with the record of the room commands that started the turn
+ * (turn-commands.mjs). Pair with `notifyWorkingEnded` so Working/dots clear
+ * immediately — the poller's own `report_complete` only runs on its next long-poll
+ * tick (~25–30s).
  */
 export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
@@ -134,6 +138,7 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   } catch {
     /* ignore */
   }
+  clearTurnCommands(connectionId, { dir })
 }
 
 /**
@@ -180,12 +185,17 @@ export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR)
  * never fires Stop for remote turns, so `--after-reply` must do this itself
  * (item cd989606). Idempotent if Stop already completed the attempt.
  *
- * @param {{ connectionId: string, state?: object|null, call?: typeof mcpToolsCall, resolveAuth?: typeof resolveDevspecMcpAuth }} opts
+ * Like Stop, it names what the turn finishes (turn-commands.mjs): `commands`, the room
+ * commands that started the turn, and the terminal turn the owner typed, or, with
+ * neither, says the turn is unbound.
+ *
+ * @param {{ connectionId: string, state?: object|null, commands?: { turnId: string, messageId: string }[], call?: typeof mcpToolsCall, resolveAuth?: typeof resolveDevspecMcpAuth }} opts
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function notifyWorkingEnded({
   connectionId,
   state = null,
+  commands = [],
   call = mcpToolsCall,
   resolveAuth = resolveDevspecMcpAuth,
 } = {}) {
@@ -225,21 +235,21 @@ export async function notifyWorkingEnded({
     /* non-fatal — report_complete is the durable clear */
   }
 
-  try {
-    await call({
-      mcpUrl,
-      token,
-      name: 'report_complete',
-      arguments: { connection_id: connectionId, reason: 'turn_end' },
-      timeoutMs: 15_000,
-    })
-    return { ok: true }
-  } catch (e) {
-    return {
-      ok: false,
-      reason: e instanceof Error ? e.message : String(e),
+  const calls = completionArguments({
+    connectionId,
+    commands,
+    localAttemptId: localTurnToComplete(state?.local_turn, state?.session_id ?? null),
+    reason: 'turn_end',
+  })
+  let failure = null
+  for (const args of calls) {
+    try {
+      await call({ mcpUrl, token, name: 'report_complete', arguments: args, timeoutMs: 15_000 })
+    } catch (e) {
+      failure ??= e instanceof Error ? e.message : String(e)
     }
   }
+  return failure ? { ok: false, reason: failure } : { ok: true }
 }
 
 function parseArgs(argv) {
@@ -1621,8 +1631,11 @@ async function main() {
   // ends Working; plain --pending keeps the turn marker (see armEndsTurn).
   // Marker clear + immediate report_complete (mirror-turn stop parity) — do not
   // wait for the poller's next long-poll tick or dots linger ~30s (cd989606).
+  // The room commands that started the turn this arm ends, read before it removes
+  // the record of them (turn-commands.mjs).
+  const endedTurnCommands = armEndsTurn(args) ? readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }) : []
   if (applyArmTurnSemantics(connectionId, args)) {
-    const ended = await notifyWorkingEnded({ connectionId, state })
+    const ended = await notifyWorkingEnded({ connectionId, state, commands: endedTurnCommands })
     if (!ended.ok && ended.reason && ended.reason !== 'no_token') {
       process.stderr.write(
         `devspec-remote-wait: notifyWorkingEnded soft-fail: ${ended.reason}\n`,
