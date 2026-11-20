@@ -162,10 +162,10 @@ describe('check job negotiation, wake and turn', () => {
     assert.equal(remoteIngressNegotiationArgs().check_job_version, 2)
   })
 
-  it('wakes with the one contract line naming the record', () => {
+  it('wakes with one line naming the record and pointing at how DevSpec says to rule it', () => {
     assert.equal(
       checkJobWakeText(checkJob()),
-      'A check is waiting on "Fix the login redirect": take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+      'A check is waiting on "Fix the login redirect": before you take it, read semantics.check_job.helpers in devspec://product/remote-ingress-contract (claim_check_job repeats it as `helpers`) and rule it as that says, then carry on.',
     )
     assert.match(checkJobWakeText(checkJob({ record: { type: 'memory', id: RECORD, title: ' ' } })), new RegExp(`waiting on memory ${RECORD}:`))
   })
@@ -174,15 +174,15 @@ describe('check job negotiation, wake and turn', () => {
     const staleness = (type, title) => checkJob({ check_kind: 'staleness', record: { type, id: RECORD, title } })
     assert.equal(
       checkJobWakeText(staleness('discussion_point', 'Drop the free tier')),
-      'An out-of-date check on the settled discussion point "Drop the free tier" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+      'An out-of-date check on the settled discussion point "Drop the free tier" is waiting: before you take it, read semantics.check_job.helpers in devspec://product/remote-ingress-contract (claim_check_job repeats it as `helpers`) and rule it as that says, then carry on.',
     )
     assert.equal(
       checkJobWakeText(staleness('goal', 'Launch in Europe')),
-      'An out-of-date check on the Goal "Launch in Europe" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+      'An out-of-date check on the Goal "Launch in Europe" is waiting: before you take it, read semantics.check_job.helpers in devspec://product/remote-ingress-contract (claim_check_job repeats it as `helpers`) and rule it as that says, then carry on.',
     )
     assert.equal(
       checkJobWakeText(staleness('backlog_scan', 'Backlog scan, 7 Nov')),
-      'The whole-backlog out-of-date scan "Backlog scan, 7 Nov" is waiting: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.',
+      'The whole-backlog out-of-date scan "Backlog scan, 7 Nov" is waiting: before you take it, read semantics.check_job.helpers in devspec://product/remote-ingress-contract (claim_check_job repeats it as `helpers`) and rule it as that says, then carry on.',
     )
     assert.match(checkJobWakeText(staleness('backlog_scan', '')), /^The whole-backlog out-of-date scan is waiting: /)
     assert.match(checkJobWakeText(staleness('goal', '')), new RegExp(`on the Goal ${RECORD} is waiting:`))

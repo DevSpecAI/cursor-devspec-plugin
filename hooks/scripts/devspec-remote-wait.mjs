@@ -1065,11 +1065,9 @@ export function parseOwnerBatches(lines, { canonicalOnly = false } = {}) {
  */
 export const NOTICE_HANDLING =
   'Handling: the labelled records above are your reading context — never dump their full text into the conversation. ' +
-  'Act only within the allowed outcomes and tools, based on who asked for the work (remember a teammate can drive someone else\'s agent, so the requester\'s authority is what counts), their authority, and whether this finding is already understood or new information (semantics.notice_audience and semantics.notice_reply in devspec://product/remote-ingress-contract): ' +
-  '(1) If it is a descriptive staleness flag and the change the requester asked for clearly makes that detail out of date, update or retire it straight away without asking permission — stay quiet in the room once settled unless their role queued a proposal (queued_for_review), an unresolved choice remains, or a write carries tell_person. ' +
-  '(2) If it is a decision conflict or duplicate and the requester has authority to settle it and has already clearly asked to proceed despite the earlier record, act for them straight away without a redundant confirmation and finish quietly without posting a room acknowledgment. ' +
-  '(3) Post a room notice reply only when an unresolved choice, hold, rejection, or block still needs a person after you act — explaining what clashes and why in plain words (plus who it waits on when they cannot give the OK) and recommending the practical options. ' +
-  'Telling the person about the notice in the room is the notice reply below, never an answer to a command.'
+  'Act within the allowed outcomes and tools above, for the person who asked for the work and with their authority (authority_contract.requester_rule and authority_contract.acting_rule in devspec://product/implementation-contract). ' +
+  'What settles a clash with a decision, convention or requirement, or a duplicate, and whose OK it otherwise waits for, is the served contract\'s to say, not yours (authority_contract.reversal_rule, core.waiting-work-stays-on-its-branch and core.resolve-duplicates-on-the-spot): follow what each write returns, and when an answer is refused, the refusal says what to do instead. ' +
+  'Whether you settle it quietly or your person still needs to hear from you is semantics.notice_audience and semantics.notice_reply in devspec://product/remote-ingress-contract.'
 
 /**
  * The model-readable rendering of one notice. A notice DevSpec labels as needing a

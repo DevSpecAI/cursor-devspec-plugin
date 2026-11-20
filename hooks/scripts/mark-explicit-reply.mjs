@@ -45,8 +45,7 @@ import {
   tellPersonNoteText,
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
-import { writePrivateText } from './private-state.mjs'
-import { CURSOR_HOOK_CONTEXT_MAX_CHARS } from './repository-context.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -185,13 +184,18 @@ export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) 
 
 /**
  * The hook output handing the agent a message Stop could not post (notice-reply.mjs,
- * `leaveTellPersonNote`), or null when none was left. Only the conversation that holds
- * the connection gets it, never a subagent's tool call. Past Cursor's limit on a hook's
- * `additional_context`, the whole note goes to a private file and the agent is told
- * where, so nothing in it is cut. Exported for tests; `dir` defaults to where the
- * connection's files live.
+ * `leaveTellPersonNote`), or null when there is none. Only the conversation that holds
+ * the connection gets it, never a subagent's tool call.
+ *
+ * The message is the person's, so it must reach the agent, and Cursor gives no sign
+ * that a hook's note did (hook-context-budget.mjs). So it goes whole into a note file,
+ * and a short pointer to it comes back after every step until the agent is seen
+ * reading all of that delivery (`handOver`). A message left while an earlier one is still unread
+ * joins it in one note. If the note cannot be written, the messages are put back for
+ * the next step. Exported for tests; `dir` defaults to where the connection's files
+ * live.
  */
-export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
+export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os.homedir() } = {}) {
   let data = {}
   try {
     data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
@@ -199,41 +203,42 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
     return null
   }
   if (!data || typeof data !== 'object' || data.agent_id) return null
-  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
-  // This runs after every tool call: one directory read settles that nothing is waiting.
-  if (!anyTellPersonNote(connDir)) return null
+  const connDir = dir ?? path.join(home, '.devspec', 'remote-control', 'connections')
+  // This runs after every tool call: two directory reads settle that nothing is waiting.
+  if (!anyTellPersonNote(connDir, home)) return null
   const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
   const connectionId = loadState(conversationId)?.connection_id
   if (!connectionId) return null
   const notes = takeTellPersonNotes(connectionId, { dir: connDir })
-  let text = tellPersonNoteText(notes)
-  if (!text) return null
-  if (text.length > CURSOR_HOOK_CONTEXT_MAX_CHARS) {
-    const file = path.join(connDir, `${connectionId}.tell-person-note.md`)
-    try {
-      writePrivateText(file, `${text}\n`)
-    } catch (error) {
-      // Not handed over, so not taken: put every note back for the next tool call.
-      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
-      throw error
-    }
-    text =
-      'From the DevSpec plugin: a message your person has not heard is waiting for you, longer than Cursor hands a hook\'s note to you at once. ' +
-      `Read it whole, with the file-reading tool, at ${JSON.stringify(file)}, and do what it says.`
+  let context
+  try {
+    // One delivery at a time: new messages join one still unread in a new delivery,
+    // and only a whole read of the current delivery ends it (`handOver`).
+    context = handOver(handOverPrefix('tell', connectionId), data, {
+      add: tellPersonNoteText(notes),
+      what: 'A message your person has not heard, handed back to you by the DevSpec plugin,',
+      also: 'Do what it says.',
+      home,
+    })
+  } catch (error) {
+    // Not handed over, so not taken: every message goes back for the next step.
+    for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
+    throw error
   }
-  return JSON.stringify({
-    additional_context: text,
-    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text },
-  })
+  return context === null ? null : JSON.stringify(postToolUseOutput(context))
 }
 
-/** Whether any connection has a note waiting (`leaveTellPersonNote`). */
-function anyTellPersonNote(connDir) {
-  try {
-    return fs.readdirSync(connDir).some((name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX))
-  } catch {
-    return false
+/** Whether any connection has a message waiting (`leaveTellPersonNote`) or handed over and not yet read. */
+function anyTellPersonNote(connDir, home) {
+  const any = (dir, test) => {
+    try {
+      return fs.readdirSync(dir).some(test)
+    } catch {
+      return false
+    }
   }
+  return any(connDir, (name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX)) ||
+    any(path.join(home, '.devspec', 'notes', 'pending'), (name) => name.startsWith('tell-'))
 }
 
 const MODE = process.argv[2] ?? null

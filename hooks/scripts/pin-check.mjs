@@ -21,6 +21,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gitRoot } from './devspec-scope.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 
 const PIN_RELATIVE = path.join('.devspec', 'project.json')
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
@@ -95,10 +96,14 @@ export function correctionText(file, problem, text) {
   )
 }
 
+/** The tools that can write a pin: a shell command, or one of Cursor's file-writing tools. */
+const WRITING_TOOLS = /^(Bash|Shell|bash|shell|Write|Edit|MultiEdit|ApplyPatch|apply_patch)$/
+
 export function checkPinAfterTool(input, deps = {}) {
   const read = deps.readFile ?? ((file) => fs.readFileSync(file, 'utf8'))
   const messages = []
-  for (const file of candidatePins(input, deps)) {
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : typeof input?.toolName === 'string' ? input.toolName : ''
+  for (const file of WRITING_TOOLS.test(tool) ? candidatePins(input, deps) : []) {
     let text
     try {
       text = read(file)
@@ -108,12 +113,17 @@ export function checkPinAfterTool(input, deps = {}) {
     const problem = pinProblem(text)
     if (problem) messages.push(correctionText(file, problem, text))
   }
-  if (!messages.length) return null
-  const additionalContext = messages.join(' ')
-  return {
-    additional_context: additionalContext,
-    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext },
-  }
+  // Until the pin is fixed the folder is not linked to its project, so this must reach
+  // the agent: handed over as a note and offered after every step until the agent has
+  // read it whole (hook-context-budget.mjs).
+  const conversation = input?.conversation_id || input?.conversationId || input?.session_id || null
+  return postToolUseOutput(
+    handOver(handOverPrefix('pin', conversation), input, {
+      add: messages.length ? messages.join(' ') : null,
+      what: 'What is wrong with the DevSpec pin you just wrote',
+      home: deps.home,
+    }),
+  )
 }
 
 async function main() {

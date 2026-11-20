@@ -94,20 +94,12 @@
       },
       {
         "type": "command",
-        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *remote*|*'repo create'*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\" ;; esac; exit 0",
-        "matcher": "^(Bash|Shell)$",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); run=; case \"$input\" in *remote*|*'repo create'*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/repo-link-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\"; fi; exit 0",
         "timeout": 10
       },
       {
         "type": "command",
-        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
-        "matcher": "^(Bash|Shell)$",
-        "timeout": 10
-      },
-      {
-        "type": "command",
-        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); case \"$input\" in *project.json*) printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\" ;; esac; exit 0",
-        "matcher": "^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$",
+        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); run=; case \"$input\" in *project.json*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/pin-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\"; fi; exit 0",
         "timeout": 10
       },
       {
@@ -223,6 +215,13 @@
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/trail-turn.mjs\" afterAgentThought",
         "timeout": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\" compact",
+        "timeout": 5
       }
     ]
   }

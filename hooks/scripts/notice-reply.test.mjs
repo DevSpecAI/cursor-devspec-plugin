@@ -76,6 +76,8 @@ import {
   fixtureUnlinkedCommitNotice,
 } from './remote-ingress-test-fixtures.mjs'
 import { appendRequestEvent, readRequestState } from './requests.mjs'
+import { CURSOR_HOOK_CONTEXT_MAX_CHARS, POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
+import { catCall, noteFiles, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CONN = FIXTURE_ID.connection
@@ -611,8 +613,7 @@ describe('the final message of a notice-only turn', () => {
     assert.equal(tellPersonNoteText([]), null)
   })
 
-  it('hands a note too long for one hook over as a file, whole', async () => {
-    // The hook as Cursor runs it, in this conversation's home.
+  it('puts the message back when its hand-over cannot be written, and hands it over once it can', { skip: process.getuid?.() === 0 && 'root writes anywhere' }, async () => {
     const postToolUse = () => new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [path.join(HERE, 'mark-explicit-reply.mjs'), 'postToolUse'], {
         env: { PATH: process.env.PATH, HOME: home, CURSOR_CONVERSATION_ID: CONVERSATION },
@@ -624,14 +625,57 @@ describe('the final message of a notice-only turn', () => {
       child.on('close', () => resolve(stdout))
       child.stdin.end(JSON.stringify({ conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' } }))
     })
-    const long = `Closed these duplicates: ${'a task Brandon filed; '.repeat(800)}done.`
+    leaveTellPersonNote(CONN, { text: 'Reopened the task Brandon closed.', dir })
+    const notes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notes, { recursive: true })
+    fs.chmodSync(notes, 0o500)
+    try {
+      assert.equal(await postToolUse(), '', 'nothing could be written, so nothing is offered')
+    } finally {
+      fs.chmodSync(notes, 0o700)
+    }
+    assert.equal(fs.existsSync(tellPersonNotePath(CONN, dir)), true, 'the message was put back')
+    const out = JSON.parse(await postToolUse()).additional_context
+    assert.match(readNoteText(noteIdIn(out), { home }), /Reopened the task Brandon closed\./)
+  })
+
+  it('hands the message over whole in a note, offered after every step until the agent reads it', async () => {
+    // The hook as Cursor runs it, in this conversation's home.
+    const postToolUse = (call = { tool_name: 'Shell', tool_input: { command: 'ls' } }) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HERE, 'mark-explicit-reply.mjs'), 'postToolUse'], {
+        env: { PATH: process.env.PATH, HOME: home, CURSOR_CONVERSATION_ID: CONVERSATION },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      child.stdout.on('data', (d) => { stdout += d })
+      child.on('error', reject)
+      child.on('close', () => resolve(stdout))
+      child.stdin.end(JSON.stringify({ ...call, conversation_id: CONVERSATION }))
+    })
+    // Longer than this hook's share of Cursor's ceiling, which other hooks on the same
+    // step share: a note Cursor dropped would leave no trace.
+    const long = `Closed these duplicates: ${'a task Brandon filed; '.repeat(150)}done.`
+    assert.ok(long.length > POST_TOOL_CONTEXT_SHARE && long.length < CURSOR_HOOK_CONTEXT_MAX_CHARS)
     leaveTellPersonNote(CONN, { text: long, refusal: { message: null, details: { delivery: { status: 'skipped', reason: 'not_attached' } } }, dir })
     const out = JSON.parse(await postToolUse())
-    assert.ok(out.additional_context.length < 1_000, 'a pointer, not the note')
-    const file = JSON.parse(out.additional_context.match(/at ("[^"]+")/)[1])
-    assert.ok(fs.readFileSync(file, 'utf8').includes(long), 'the whole message is in the file')
+    assert.ok(out.additional_context.length <= POST_TOOL_CONTEXT_SHARE, 'a pointer, not the message')
+    const id = noteIdIn(out.additional_context)
+    const file = path.join(home, '.devspec', 'notes', `${id}.md`)
+    assert.ok(readNoteText(id, { home }).includes(long), 'the whole message is in the note')
     assert.equal(fs.statSync(file).mode & 0o777, 0o600)
-    assert.equal(await postToolUse(), '', 'handed over once')
+
+    // Printed but not seen read: offered again, since Cursor may have dropped it.
+    assert.equal(JSON.parse(await postToolUse()).additional_context, out.additional_context)
+    // A second message while the first is unread joins it in one note.
+    leaveTellPersonNote(CONN, { text: 'Also reopened the task Brandon closed.', dir })
+    const joined = noteIdIn(JSON.parse(await postToolUse()).additional_context)
+    const both = readNoteText(joined, { home })
+    assert.ok(both.includes(long) && both.includes('Also reopened the task Brandon closed.'))
+    // Only mentioning the note is not reading it.
+    assert.ok(await postToolUse({ tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${joined}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }))
+    // Read whole, by Cursor's Read tool: no more pointers.
+    assert.equal(await postToolUse(readCall(noteFiles(home, joined)[0])), '')
+    assert.equal(await postToolUse(), '')
   })
 })
 
@@ -891,14 +935,19 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', { ...toolCall, agent_id: 'sub-1' })).stdout, '')
     assert.equal(fs.existsSync(tellPersonNotePath(CONN, dir)), true)
 
-    // ...and handed over at the conversation's next tool call, once.
+    // ...and handed over at the conversation's next tool call, as a note it is offered until it reads.
     const next = await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)
     const out = JSON.parse(next.stdout)
     assert.equal(out.hookSpecificOutput.additionalContext, out.additional_context)
-    assert.ok(out.additional_context.includes(finalText), 'the message the person has not heard')
-    assert.match(out.additional_context, /Assistant speech delivery rejected/, 'and why it was not posted')
-    assert.match(out.additional_context, /semantics\.notice_audience\.telling_anyway/)
-    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout, '', 'handed over once')
+    const id = noteIdIn(out.additional_context)
+    const note = readNoteText(id, { home })
+    assert.ok(note.includes(finalText), 'the message the person has not heard')
+    assert.match(note, /Assistant speech delivery rejected/, 'and why it was not posted')
+    assert.match(note, /semantics\.notice_audience\.telling_anyway/)
+    assert.equal(JSON.parse((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout).additional_context, out.additional_context, 'offered again until read')
+    const { conversation_id: _, ...cat } = catCall(home, noteFiles(home, id)[0])
+    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', cat)).stdout, '', 'read whole by `cat`, so done')
+    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout, '')
   })
 
   it('a notice-only turn posts no trail, which DevSpec would file under someone\'s command', async () => {
