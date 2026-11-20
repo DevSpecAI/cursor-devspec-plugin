@@ -1,11 +1,19 @@
 # Changelog
 
-## 0.24.1
+## 0.25.1
 
 - **Your Cursor agent no longer posts its working notes to the room after dealing with a DevSpec notice.** When DevSpec wakes the agent with a notice about its own work and the agent settles it with nothing left for you to decide, the room now shows only DevSpec's own quiet note that it was handled. Until now, when the agent finished such a turn without posting, the plugin took whatever the agent last wrote in its terminal, including sign-off notes and internal references, and posted it into the room as the agent's reply to the notice.
 - **When a notice still needs you, the agent tells you itself**, as a reply to that notice, exactly once. The plugin no longer posts anything on its behalf.
 - **You still hear when the agent changes someone else's work while handling a notice or a check.** When something it does then changes another person's record or marks a task blocked, DevSpec asks the agent to tell you, and the agent now does so with its own message in the room, even when it was woken only by the notice or check. If it does not, the plugin posts the agent's final message for it where Cursor runs the plugin's end-of-turn step; and if DevSpec cannot take that message, it is handed back to the agent at its next step rather than lost.
 - Messages you send from DevSpec and prompts you type in the terminal are answered as before.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.25.0
+
+- **When Cursor stops your connected agent because you've hit a usage limit, DevSpec now knows.** The plugin tells DevSpec as soon as it sees Cursor's usage-limit message, so DevSpec can send that agent's checks to another agent instead of leaving them waiting on one that cannot run. If Cursor says when the limit lifts, DevSpec is told that time; otherwise it is told for 15 minutes from the stop, and again each time Cursor stops the agent.
+- **The agent is offered checks again after its next turn that runs normally.**
+- **Only Cursor's own usage-limit message counts.** Any other error, such as a service throttling requests, a full disk, a dropped connection, a model your plan doesn't include, or you stopping the turn yourself, is never reported as a usage limit. If Cursor changes the wording of that message, the plugin stops reporting usage limits rather than guessing.
+- This works whether or not Cursor runs the plugin's end-of-turn step, because the plugin also reads how each turn ended from the conversation itself.
 - Start a new `cursor-agent` session to pick this up.
 
 ## 0.24.0
