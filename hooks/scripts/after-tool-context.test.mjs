@@ -22,7 +22,9 @@ import {
   POST_TOOL_CONTEXT_HOOKS,
   POST_TOOL_CONTEXT_SHARE,
 } from './hook-context-budget.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
 import { leaveTellPersonNote } from './notice-reply.mjs'
+import { noteFiles, readCall } from '../../tests/helpers/note-reads.mjs'
 import { writePrivateJson, writePrivateText } from './private-state.mjs'
 import { contextFile, selectProjectContext } from './project-context.mjs'
 
@@ -183,7 +185,7 @@ describe('every after-tool hook, together, at its longest', () => {
 
     // Every seeded note was handed over, each whole in the note its pointer names.
     const notes = answers.map((answer) => pointedNote(home, answer.context)).filter(Boolean)
-    const whole = notes.map((note) => fs.readFileSync(note.file, 'utf8'))
+    const whole = notes.map((note) => readNoteText(note.id, { home }))
     for (const end of ['RULES-END', 'TELL-END', 'NOTE-END', 'Teammate number 600', 'unexpected_key_1999']) {
       assert.ok(whole.some((text) => text.includes(end)), `${end} handed over whole`)
     }
@@ -201,11 +203,18 @@ describe('every after-tool hook, together, at its longest', () => {
     assert.ok(again.some((context) => /^DevSpec room: 600 messages you have not read yet/.test(context)), 'the unread room, again')
     assert.ok(again.join(CURSOR_HOOK_CONTEXT_SEPARATOR).length <= CURSOR_HOOK_CONTEXT_MAX_CHARS)
 
-    // Once the agent reads the rules note, that pointer stops; the others stay until read.
-    const rules = notes.find((note) => fs.readFileSync(note.file, 'utf8').includes('RULES-END'))
-    const afterRead = runHooks(home, { ...input, tool_use_id: 'tool-use-after-tool-3', tool_name: 'Read', tool_input: { file_path: rules.file } })
-      .map(({ stdout }) => contextOf(stdout))
-      .filter((context) => context !== null)
+    // Once the agent has read every part of the rules note, that pointer stops; the
+    // others stay until read.
+    const rules = notes.find((note) => readNoteText(note.id, { home }).includes('RULES-END'))
+    const parts = noteFiles(home, rules.id)
+    assert.ok(parts.length > 1, 'the rules are longer than one Shell page, so they come in parts')
+    let afterRead = []
+    parts.forEach((file, i) => {
+      afterRead = runHooks(home, { ...input, ...readCall(file, { conversation: CONVERSATION }), tool_use_id: `tool-use-read-${i}` })
+        .map(({ stdout }) => contextOf(stdout))
+        .filter((context) => context !== null)
+      if (i < parts.length - 1) assert.ok(afterRead.some((context) => /project context/.test(context)), 'not every part read yet')
+    })
     assert.ok(!afterRead.some((context) => /project context/.test(context)), 'read, so no longer offered')
     assert.ok(afterRead.some((context) => /message your person has not heard/.test(context)))
   })

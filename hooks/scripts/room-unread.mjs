@@ -47,25 +47,21 @@ import { fileURLToPath } from 'node:url'
 import { CONVERSATION_ID_ENV_VARS, LOCAL_ID_OVERRIDE_ENV_VAR } from './agent-identity.mjs'
 import { readOwnConnectionState } from './own-connection.mjs'
 import { firingConversation, namespacedVerb } from './project-context.mjs'
-import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
+import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { transcriptPaths } from './room-transcript.mjs'
-import { fitHookContext, postToolUseOutput } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitHookContext, postToolUseOutput, writeNote } from './hook-context-budget.mjs'
 
 export const READ_STATE_VERSION = 1
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
 
 /**
- * How much of a Shell command's output Cursor hands the model. Measured on
- * cursor-agent 2026.11.05-86047df, 20 November 2026, with two models (Gemini 4
- * Hydrogen and Composer 2.5): 20,000 characters arrived whole; 21,000 arrived as the
- * first 10,000 and the last 10,000 under "Command output (truncated to 20000
- * characters)", with the middle gone. The reader's output arrives as a Shell result,
- * so one read prints no more than this, header included (`readerPageBudget`). A
- * message too long for a page on its own is handed over as a file instead, whole, so
- * nothing is ever cut.
+ * The reader's output arrives as a Shell result, so one read prints no more than Cursor
+ * hands the model from one Shell command (`CURSOR_SHELL_OUTPUT_MAX_CHARS`, measured;
+ * hook-context-budget.mjs), header included (`readerPageBudget`). A message too long
+ * for a page on its own is handed over whole as a note instead, so nothing is ever cut.
  */
-export const CURSOR_SHELL_OUTPUT_MAX_CHARS = 20_000
+export { CURSOR_SHELL_OUTPUT_MAX_CHARS }
 
 function connectionsDir(home = os.homedir(), env = process.env) {
   const override =
@@ -88,11 +84,6 @@ export function readStatePath(connectionId, sessionId, dir) {
 /** What the model has been told about by a notice or a hold, and the copy it was judged on. */
 export function presentedStatePath(connectionId, sessionId, dir) {
   return path.join(dir, `${connectionId}.${sessionId}.presented.json`)
-}
-
-function overflowPath(connectionId, sessionId, messageId, dir) {
-  const name = SAFE_ID.test(String(messageId)) ? messageId : createHash('sha256').update(String(messageId)).digest('hex').slice(0, 32)
-  return path.join(dir, `${connectionId}.${sessionId}.message-${name}.json`)
 }
 
 function shellQuote(value) {
@@ -515,9 +506,11 @@ function renderEntry({ line }, { updated, selfLabel }) {
 /**
  * One page of unread messages, oldest first, and the read record with exactly those
  * marked. A message whose entry would not fit a page on its own, by its text, its
- * attachments or anything else about it, is handed over whole as a file:
- * `writeOverflow(entry, line)` stores the complete entry and returns where, and the
- * page carries a short pointer to it. A message is marked read only once it is on the
+ * attachments or anything else about it, is handed over whole as a note:
+ * `writeOverflow(entry, line)` keeps the complete entry and returns the command that
+ * reads it, and the page carries a short pointer to it. The note is named by its own
+ * content, so a pointer always returns what it was issued for, even after the message
+ * changes. A message is marked read only once it is on the
  * page or in its file; a failed write throws, and nothing is marked. Exported for tests.
  */
 export function readPage({
@@ -545,8 +538,8 @@ export function readPage({
         message_id: entry.message_id,
         ...(entry.updated ? { updated: true } : {}),
         entry_chars: text.length,
-        entry_file: writeOverflow(entry, item.line),
-        note: 'Too long for one read: the whole message, as one JSON object, is in entry_file. Read it with the file-reading tool.',
+        read_with: writeOverflow(entry, item.line),
+        note: 'Too long for one read: the whole message, as one JSON object, is in a note. Run read_with, and each further part it names.',
       })
       if (text.length + 1 > budget) throw new Error('room-unread: not even a pointer to this message fits one read')
     }
@@ -590,7 +583,7 @@ function readerPageBudget({ total, next, max = CURSOR_SHELL_OUTPUT_MAX_CHARS }) 
 }
 
 /** One read of the room, as the reader prints it. */
-function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
+function readerOutput(room, { scriptPath = SCRIPT_PATH, home = os.homedir() } = {}) {
   const paths = transcriptPaths(room.connectionId, room.sessionId, room.dir)
   const copy = readTranscript(paths)
   if (!copy) {
@@ -605,11 +598,7 @@ function readerOutput(room, { scriptPath = SCRIPT_PATH } = {}) {
     read,
     selfLabel: copy.selfLabel,
     budget: readerPageBudget({ total: unread.length + updated.length, next }),
-    writeOverflow: (entry, line) => {
-      const file = overflowPath(room.connectionId, room.sessionId, line.message_id, room.dir)
-      writePrivateText(file, JSON.stringify(entry, null, 2) + '\n')
-      return file
-    },
+    writeOverflow: (entry) => writeNote(JSON.stringify(entry, null, 2), { home }).command,
   })
   const remaining = page.total - page.printed.length
   const header = readerHeader({

@@ -9,14 +9,21 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, describe, it } from 'node:test'
 
+import { execFileSync } from 'node:child_process'
+
+import { catCall, noteFiles, readCall } from '../../tests/helpers/note-reads.mjs'
 import {
   CURSOR_HOOK_CONTEXT_MAX_CHARS,
   CURSOR_HOOK_CONTEXT_SEPARATOR,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
   hookContextShare,
+  NOTE_PART_CHARS,
+  noteParts,
   notePointer,
+  noteReadThrough,
   postToolUseOutput,
-  readsNote,
+  readNoteText,
   writeNote,
   POST_TOOL_CONTEXT_HOOKS,
   POST_TOOL_CONTEXT_SHARE,
@@ -71,7 +78,8 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     assert.ok(pointer.startsWith('The short part.\n\nA long note is waiting for you whole in a file'))
     const id = pointer.match(/`cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md`/)[1]
     const file = path.join(home, '.devspec', 'notes', `${id}.md`)
-    assert.equal(fs.readFileSync(file, 'utf8'), text)
+    assert.equal(readNoteText(id, { home }), text)
+    assert.ok(fs.readFileSync(file, 'utf8').endsWith(`— End of DevSpec note ${id} —\n`))
     assert.equal(fs.statSync(file).mode & 0o777, 0o600)
     assert.equal(writeNote(text, { home }).id, id, 'the same text is the same note')
   })
@@ -92,19 +100,71 @@ describe('fitHookContext, the one way a hook hands context over', () => {
   it('falls back to a fixed short notice when the pointer does not fit, and to nothing only below that', () => {
     const home = tempHome()
     const text = 'x'.repeat(500)
-    const notice = fitHookContext(text, { home, share: 120 })
-    assert.match(notice, /^DevSpec has more context waiting for you: run `cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md` and read it whole\.$/)
+    const notice = fitHookContext(text, { home, share: 150 })
+    assert.match(notice, /^DevSpec has more context waiting for you: run `cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md`, and every further part it names\.$/)
     assert.equal(fitHookContext(text, { home, share: 40 }), null)
   })
 
-  it('knows a tool call that read a note, by Read or by a shell command, and nothing else', () => {
-    const id = '0123456789abcdef'
-    assert.equal(readsNote({ tool_name: 'Read', tool_input: { file_path: `/home/me/.devspec/notes/${id}.md` } }, id), true)
-    assert.equal(readsNote({ tool_name: 'Read', tool_input: { file_path: `~/.devspec/notes/${id}.md` } }, id), true)
-    assert.equal(readsNote({ tool_name: 'Shell', tool_input: { command: `cat ~/.devspec/notes/${id}.md` } }, id), true)
-    assert.equal(readsNote({ tool_name: 'Shell', tool_input: { command: 'ls ~/.devspec/notes' } }, id), false)
-    assert.equal(readsNote({ tool_name: 'Read', tool_input: { file_path: `/home/me/.devspec/notes/${id}.md.bak` } }, id), false)
-    assert.equal(readsNote({ tool_name: 'Write', tool_input: { file_path: '/tmp/x' } }, id), false)
-    assert.equal(readsNote({ tool_name: 'Read', tool_input: { file_path: '/x/.devspec/notes/../../etc/passwd' } }, '../../etc'), false)
+  it("splits a note over Cursor's Shell ceiling into parts that each reach the model whole, and chain to the next", () => {
+    const home = tempHome()
+    const text = Array.from({ length: 900 }, (_, i) => `rule ${i}: ${'keep it whole '.repeat(4)}`).join('\n') + '\nLAST-LINE'
+    assert.ok(text.length > 2 * CURSOR_SHELL_OUTPUT_MAX_CHARS, `${text.length} characters`)
+    const note = writeNote(text, { home })
+    assert.equal(note.parts, noteParts(note.id, { home }))
+    assert.ok(note.parts >= 3)
+    const files = noteFiles(home, note.id)
+    assert.equal(files.length, note.parts)
+    let joinedBack = ''
+    files.forEach((file, i) => {
+      // What the agent's `cat` of this part prints, as the shell prints it.
+      const printed = execFileSync('sh', ['-c', `cat ${file.replace(home, '~')}`], { env: { PATH: process.env.PATH, HOME: home }, encoding: 'utf8' })
+      assert.ok(printed.length < CURSOR_SHELL_OUTPUT_MAX_CHARS, `part ${i + 1} prints ${printed.length} characters`)
+      assert.ok(printed.length <= NOTE_PART_CHARS + 200)
+      if (i < files.length - 1) assert.ok(printed.includes(`Read on with \`cat ~/.devspec/notes/${note.id}.${i + 2}.md\``), 'names the next part')
+      joinedBack += printed.slice(0, printed.lastIndexOf('\n\n— '))
+    })
+    assert.equal(joinedBack, text, 'the parts, joined, are the note')
+    assert.equal(readNoteText(note.id, { home }), text)
+  })
+
+  it('counts a note read only when every part came back whole, in this conversation', () => {
+    const home = tempHome()
+    const note = writeNote('x'.repeat(NOTE_PART_CHARS * 2 + 10), { home })
+    const [first, second, third] = noteFiles(home, note.id)
+    assert.equal(note.parts, 3)
+    assert.equal(noteReadThrough(catCall(home, first), note.id, { home }), false, 'one part of three')
+    assert.equal(noteReadThrough(readCall(second), note.id, { home }), false, 'two of three, by Read')
+    assert.equal(noteReadThrough({ conversation_id: 'two', ...catCall(home, third, { conversation: 'two' }) }, note.id, { home }), false, 'another conversation reading counts for that one')
+    assert.equal(noteReadThrough(catCall(home, third, { tilde: false }), note.id, { home }), true, 'all three, the last by absolute path')
+    assert.equal(noteReadThrough({ conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }, note.id, { home }), true, 'and stays read')
+  })
+
+  it('never counts a command that only mentions a note, or a read that did not come back whole', () => {
+    const home = tempHome()
+    const note = writeNote('the person asked you to tell them something', { home })
+    const file = noteFiles(home, note.id)[0]
+    const tilde = file.replace(home, '~')
+    const ran = (command, output = '', exitCode = 0) => ({
+      conversation_id: 'one', tool_name: 'Shell', tool_input: { command }, tool_output: JSON.stringify({ output, exitCode }),
+    })
+    const whole = fs.readFileSync(file, 'utf8')
+    for (const call of [
+      ran(`test -e ${tilde}`),
+      ran(`ls ${tilde}`, `${file}\n`),
+      ran(`grep -l person ${tilde}`, `${file}\n`),
+      ran(`stat ${tilde}`, 'File: ...'),
+      ran(`cat ${tilde} | head -1`, whole.split('\n')[0]),
+      ran(`cat ${tilde} > /dev/null`),
+      ran(`cat ${tilde}`, whole.slice(0, 20), 0),
+      ran(`cat ${tilde}`, whole, 1),
+      ran(`cat ${tilde}.bak`, whole),
+      readCall(file, { contentLength: 5 }),
+      { conversation_id: 'one', tool_name: 'Grep', tool_input: { path: file }, tool_output: JSON.stringify({ output: whole }) },
+    ]) {
+      assert.equal(noteReadThrough(call, note.id, { home }), false, JSON.stringify(call.tool_input))
+    }
+    // The plugin's own PATH line in front of an exact `cat` is fine.
+    const prefixed = ran(`export PATH="/x/stand-in:$PATH" # devspec\ncat ${tilde}`, whole)
+    assert.equal(noteReadThrough(prefixed, note.id, { home }), true)
   })
 })

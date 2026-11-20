@@ -29,12 +29,17 @@
  *   plugin's own notes never drop each other; anything longer goes whole to a file in
  *   ~/.devspec/notes/ named by a short id, and the note says how to read it. That
  *   pointer has a fixed shape and length, well within the smallest share, so it can
- *   always be handed over.
+ *   always be handed over. A note longer than one Shell page is split into numbered
+ *   parts, each short enough to reach the model whole through `cat`
+ *   (`NOTE_PART_CHARS`), each closing with the command for the next.
+ * - A note counts as read only on what came back: an exact `cat` of a part that exited
+ *   0 with the part's closing line in its output, or Cursor's Read tool reporting the
+ *   part's full length. Mentioning a note (`test -e`, `ls`, `grep -l`) is not reading it.
  * - What must reach the agent (the project's rules and repositories, a message the
  *   person has not heard, room messages it has not read) is never recorded as
  *   delivered because a hook printed it. Rules and the person's message are handed
  *   over as a note file, and the pointer comes back after every step until the agent
- *   is seen reading that file (`readsNote`); unread room messages are counted after
+ *   is seen reading all of it (`noteReadThrough`); unread room messages are counted after
  *   every step until the agent reads them. A step whose notes Cursor dropped is
  *   followed by another that offers them again.
  * - One-off hints (a commit note, the edit reminder, a pin problem, the repository-link
@@ -46,7 +51,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { writePrivateText } from './private-state.mjs'
+import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
 
 export const CURSOR_HOOK_CONTEXT_MAX_CHARS = 10_000
 
@@ -80,56 +85,199 @@ export const POST_TOOL_CONTEXT_SHARE = hookContextShare(POST_TOOL_CONTEXT_HOOKS)
 /** sessionStart has one plugin hook (repository-context.mjs start), so it has the whole ceiling. */
 export const SESSION_START_CONTEXT_SHARE = hookContextShare(1)
 
+/**
+ * How much of a Shell command's output Cursor hands the model. Measured on
+ * cursor-agent 2026.11.05-86047df, 20 November 2026, with two models (Gemini 4
+ * Hydrogen and Composer 2.5): 20,000 characters arrived whole; 21,000 arrived as the
+ * first 10,000 and the last 10,000 under "Command output (truncated to 20000
+ * characters)", with the middle gone.
+ */
+export const CURSOR_SHELL_OUTPUT_MAX_CHARS = 20_000
+
+/**
+ * The longest part of a note, so `cat` of one part always reaches the model whole:
+ * 2,000 characters under Cursor's Shell ceiling, for the part's closing line and
+ * anything the shell itself prints into the same output. Measured on 20 November
+ * 2026: `cat` of a 19,012-character file reached the model whole, and the hook saw the
+ * whole output with exit code 0.
+ */
+export const NOTE_PART_CHARS = 18_000
+
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
 const NOTE_ID = /^[0-9a-f]{16}$/
 
+function partName(id, part) {
+  return part === 1 ? `${id}.md` : `${id}.${part}.md`
+}
+
+function partFile(id, part, home) {
+  return path.join(home, NOTES_DIR, partName(id, part))
+}
+
+/** The command that prints part `part` of note `id` (the first part is the note's own name). */
+export function noteCommand(id, part = 1) {
+  return `cat ~/.devspec/notes/${partName(id, part)}`
+}
+
+/**
+ * The line that closes each part: it says which part this is and how to read the next,
+ * and the plugin counts a part as read only when the output the agent got carries it.
+ */
+function partEnd(id, part, parts) {
+  return part < parts
+    ? `— DevSpec note ${id}: part ${part} of ${parts}. Read on with \`${noteCommand(id, part + 1)}\` —`
+    : `— End of DevSpec note ${id}${parts > 1 ? `: part ${parts} of ${parts}` : ''} —`
+}
+
+/** `text` in pieces of at most `size`, cut at a line end where one is near; joined, they are the text. */
+function splitText(text, size) {
+  const pieces = []
+  let rest = text
+  while (rest.length > size) {
+    let cut = rest.lastIndexOf('\n', size)
+    if (cut < size / 2) cut = size
+    pieces.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
+  }
+  pieces.push(rest)
+  return pieces
+}
+
 /**
  * Keep `text` whole as a note, readable only by its owner, and return its short id,
- * where it is and the one command that reads it. The id is the text's own digest, so
- * the same text is one note. The command names the folder through `~`, so every
- * pointer has the same short length whatever the home folder is called.
+ * where it starts, the one command that reads it and how many parts it has. The id is
+ * the text's own digest, so the same text is one note. A note longer than one part
+ * (`NOTE_PART_CHARS`) is split into numbered parts, each closing with the command for
+ * the next, so every part reaches the model whole through Cursor's Shell ceiling. The
+ * command names the folder through `~`, so every pointer has the same short length
+ * whatever the home folder is called.
  */
 export function writeNote(text, { home = os.homedir() } = {}) {
   const id = createHash('sha256').update(text).digest('hex').slice(0, 16)
-  const file = path.join(home, NOTES_DIR, `${id}.md`)
-  // The same text is the same note: written once, then left as it is.
-  if (!fs.existsSync(file)) writePrivateText(file, text)
-  return { id, file, command: noteCommand(id) }
+  const pieces = splitText(text, NOTE_PART_CHARS)
+  const first = partFile(id, 1, home)
+  // The same text is the same note: written once, the first part last, so a first
+  // part on disk means every part is.
+  if (!fs.existsSync(first)) {
+    for (let part = pieces.length; part >= 1; part -= 1) {
+      writePrivateText(partFile(id, part, home), `${pieces[part - 1]}\n\n${partEnd(id, part, pieces.length)}\n`)
+    }
+  }
+  return { id, file: first, command: noteCommand(id), parts: pieces.length }
 }
 
-/** The command that prints note `id`. */
-export function noteCommand(id) {
-  return `cat ~/.devspec/notes/${id}.md`
+/** How many parts note `id` has, from its first part's closing line; 0 when there is no such note. */
+export function noteParts(id, { home = os.homedir() } = {}) {
+  if (!NOTE_ID.test(String(id ?? ''))) return 0
+  let first
+  try {
+    first = fs.readFileSync(partFile(id, 1, home), 'utf8')
+  } catch {
+    return 0
+  }
+  const of = new RegExp(`— DevSpec note ${id}: part 1 of (\\d+)\\.`).exec(first)
+  return of ? Number(of[1]) : 1
+}
+
+/** Note `id`'s text, its parts joined back without their closing lines; null when there is none. */
+export function readNoteText(id, { home = os.homedir() } = {}) {
+  const parts = noteParts(id, { home })
+  if (parts === 0) return null
+  let text = ''
+  for (let part = 1; part <= parts; part += 1) {
+    const content = fs.readFileSync(partFile(id, part, home), 'utf8')
+    const close = `\n\n${partEnd(id, part, parts)}\n`
+    if (!content.endsWith(close)) return null
+    text += content.slice(0, content.length - close.length)
+  }
+  return text
+}
+
+function parsed(value) {
+  if (typeof value !== 'string') return value ?? null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
 }
 
 /**
- * Whether this tool call read note `id`: Cursor's Read tool on its file, or a shell
- * command that names it (the pointer's own `cat`, or any other). Seeing the agent
- * read a note is the only sign the plugin has that what it says reached the agent.
+ * The part of note `id` (of `parts`) this tool call handed the agent whole, or null.
+ * Only two things count, and only on what came back, never on what was asked:
+ * - a shell command that is exactly `cat` of one part (after the plugin's own PATH
+ *   line, if any), that exited 0 and whose output carries that part's closing line;
+ * - Cursor's Read tool on exactly one part's file, which reported reading as many
+ *   characters as the part holds (Read gave a 30,012-character file to the model
+ *   whole on 20 November 2026, and every part is far shorter).
+ * Anything else that mentions a note (`test -e`, `ls`, `grep -l`, a `cat` piped on,
+ * a failed or cut-short read) is not a read.
  */
-export function readsNote(input, id) {
-  if (!NOTE_ID.test(String(id ?? ''))) return false
-  const tail = `.devspec/notes/${id}.md`
+function partReadBy(input, id, parts, home) {
   const tool = String(input?.tool_name ?? input?.toolName ?? '')
-  let toolInput = input?.tool_input ?? input?.toolInput ?? {}
-  if (typeof toolInput === 'string') {
-    try {
-      toolInput = JSON.parse(toolInput)
-    } catch {
-      toolInput = { command: toolInput }
-    }
+  const toolInput = parsed(input?.tool_input ?? input?.toolInput) ?? {}
+  const output = parsed(input?.tool_output ?? input?.toolOutput) ?? {}
+  const expand = (value) => {
+    const raw = String(value ?? '').trim()
+    const home_ = raw.replace(/^(~|\$HOME|\$\{HOME\})(?=\/)/, home)
+    return path.isAbsolute(home_) ? path.normalize(home_) : null
   }
-  const values = [toolInput?.file_path, toolInput?.filePath, toolInput?.path, toolInput?.target_file, toolInput?.command, toolInput?.cmd]
-    .filter((value) => typeof value === 'string')
-    .map((value) => value.replaceAll('\\', '/'))
-  if (/^(Shell|Bash|shell|bash)$/.test(tool)) return values.some((value) => value.includes(tail))
-  return values.some((value) => value.endsWith(tail))
+  const partAt = (file) => {
+    if (!file) return null
+    for (let part = 1; part <= parts; part += 1) if (file === partFile(id, part, home)) return part
+    return null
+  }
+  if (/^(Shell|Bash|shell|bash)$/.test(tool)) {
+    const lines = String(toolInput.command ?? toolInput.cmd ?? '').split('\n')
+    if (lines.length > 1 && lines[0].startsWith('export PATH=')) lines.shift()
+    if (lines.length !== 1) return null
+    const cat = /^\s*cat\s+(['"]?)([^\s'"|;&<>`]+)\1\s*$/.exec(lines[0])
+    const part = partAt(cat ? expand(cat[2]) : null)
+    if (!part || output?.exitCode !== 0 || typeof output?.output !== 'string') return null
+    return output.output.includes(partEnd(id, part, parts)) ? part : null
+  }
+  if (tool === 'Read') {
+    const part = partAt(expand(toolInput.file_path ?? toolInput.path))
+    if (!part) return null
+    let content
+    try {
+      content = fs.readFileSync(partFile(id, part, home), 'utf8')
+    } catch {
+      return null
+    }
+    const length = Number(output?.content_length)
+    return length === content.length || length === Buffer.byteLength(content) ? part : null
+  }
+  return null
+}
+
+/**
+ * Whether the agent in this tool call's conversation has now read every part of note
+ * `id`. A part this call handed over whole (`partReadBy`) is recorded for the
+ * conversation, privately, beside the note. Seeing the agent read a note is the only
+ * sign the plugin has that what it says reached the agent; a hook printing a pointer
+ * to it proves nothing (see the notes at the top of this file).
+ */
+export function noteReadThrough(input, id, { home = os.homedir() } = {}) {
+  const parts = noteParts(id, { home })
+  if (parts === 0) return false
+  const conversation = String(input?.conversation_id || input?.conversationId || input?.session_id || 'none')
+  const record = path.join(home, NOTES_DIR, `${id}.read-${createHash('sha256').update(conversation).digest('hex').slice(0, 16)}.json`)
+  let read = readPrivateJson(record)?.parts
+  read = Array.isArray(read) ? read.filter((part) => Number.isInteger(part)) : []
+  const part = partReadBy(input, id, parts, home)
+  if (part && !read.includes(part)) {
+    read = [...read, part]
+    writePrivateJson(record, { parts: read })
+  }
+  for (let each = 1; each <= parts; each += 1) if (!read.includes(each)) return false
+  return true
 }
 
 /** The shortest way to say a note is waiting: fixed text and a fixed-length command. */
 export function noteNotice(note) {
-  return `DevSpec has more context waiting for you: run \`${note.command}\` and read it whole.`
+  return `DevSpec has more context waiting for you: run \`${note.command}\`, and every further part it names.`
 }
 
 /**
@@ -140,7 +288,7 @@ export function notePointer(note, { what = 'A note from the DevSpec plugin', als
   return (
     `${what} is waiting for you whole in a file, because Cursor passes on at most ` +
     `${CURSOR_HOOK_CONTEXT_MAX_CHARS.toLocaleString('en-US')} characters from all the hooks answering one step together. ` +
-    `Read it now: \`${note.command}\`.` +
+    `Read it now: \`${note.command}\`, and every further part it names.` +
     (also ? ` ${also}` : '')
   )
 }

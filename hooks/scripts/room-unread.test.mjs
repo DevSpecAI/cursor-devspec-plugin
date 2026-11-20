@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
 
 import { writePrivateJson, writePrivateText } from './private-state.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
+import { noteIdIn } from '../../tests/helpers/note-reads.mjs'
 import { projectInput } from './project-input.mjs'
 import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
@@ -363,11 +365,11 @@ describe('the reader is the only thing that marks a message read', () => {
       budget: 1_000,
       writeOverflow: (entry) => {
         stored = entry
-        return '/tmp/x.json'
+        return 'cat ~/.devspec/notes/0123456789abcdef.md'
       },
     })
     const pointer = JSON.parse(page.printed[0])
-    assert.equal(pointer.entry_file, '/tmp/x.json')
+    assert.equal(pointer.read_with, 'cat ~/.devspec/notes/0123456789abcdef.md')
     assert.equal(pointer.message_id, lines[0].message_id)
     assert.equal(pointer.text, undefined, 'nothing of the message itself on the page')
     assert.equal(stored.text, huge, 'the whole message in the file')
@@ -390,7 +392,7 @@ describe('the reader is the only thing that marks a message read', () => {
     /disk full/)
   })
 
-  it('hands over a message with a huge attachment list whole, as a file, and keeps the read within Cursor\'s Shell ceiling', () => {
+  it('hands over a message with a huge attachment list whole, as a note, and keeps the read within Cursor\'s Shell ceiling', () => {
     const attachments = Array.from({ length: 400 }, (_, i) => ({
       resource_id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
       name: `screenshot-${i}.png`,
@@ -403,13 +405,31 @@ describe('the reader is the only thing that marks a message read', () => {
     assert.ok(first.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `${first.stdout.length} characters`)
     const [header, pointer, ...rest] = parseReader(first.stdout)
     assert.equal(pointer.message_id, lines[0].message_id)
-    const whole = JSON.parse(fs.readFileSync(pointer.entry_file, 'utf8'))
+    // Over a Shell page itself, so the note is in parts the agent reads one by one.
+    const whole = JSON.parse(readNoteText(noteIdIn(pointer.read_with), { home: room.home }))
     assert.equal(whole.text, 'see the screenshots')
-    assert.deepEqual(whole.attachments, attachments, 'every attachment, in the file')
-    assert.equal(fs.statSync(pointer.entry_file).mode & 0o777, 0o600)
+    assert.deepEqual(whole.attachments, attachments, 'every attachment, in the note')
     assert.deepEqual(rest.map((entry) => entry.text), ['and this'])
     assert.equal(header.room_messages.remaining, 0)
     assert.match(parseReader(readerRun(room).stdout)[0].note, /Nothing unread/, 'both handed over, so both read')
+  })
+
+  it('keeps what an earlier pointer was issued for when the message changes', () => {
+    const attachments = (label) => Array.from({ length: 300 }, (_, i) => ({ resource_id: `id-${i}`, name: `${label}-${i}.png`, delivery: 'resource' }))
+    const lines = [msg({ text: 'first version', attachments: attachments('before') })]
+    const room = makeHome(lines)
+    const firstPointer = parseReader(readerRun(room).stdout)[1]
+    lines[0] = { ...lines[0], text: 'second version', attachments: attachments('after') }
+    writeRoom(room, lines)
+    const [header, secondPointer] = parseReader(readerRun(room).stdout)
+    assert.equal(header.room_messages.updated, 1)
+    assert.equal(secondPointer.updated, true)
+    assert.notEqual(secondPointer.read_with, firstPointer.read_with, 'a new version is a new note')
+    const earlier = JSON.parse(readNoteText(noteIdIn(firstPointer.read_with), { home: room.home }))
+    const later = JSON.parse(readNoteText(noteIdIn(secondPointer.read_with), { home: room.home }))
+    assert.equal(earlier.text, 'first version')
+    assert.equal(earlier.attachments[0].name, 'before-0.png', 'the earlier reference still returns what it was issued for')
+    assert.equal(later.text, 'second version')
   })
 })
 

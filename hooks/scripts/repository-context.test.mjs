@@ -10,10 +10,10 @@ import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingre
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { projectInput } from './project-input.mjs'
 import { POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { catCall, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
 /** The note a context line points at, and its text. */
-function noteIn(home,content){const id=content.match(/cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md/)[1];const file=path.join(home,'.devspec','notes',`${id}.md`);return{id,file,text:fs.readFileSync(file,'utf8')}}
-/** A tool call that reads note `id`, as Cursor's Read tool reports it. */
-const reading=(id,conversation='one')=>({conversation_id:conversation,tool_name:'Read',tool_input:{file_path:`/somewhere/.devspec/notes/${id}.md`}})
+function noteIn(home,content){const id=noteIdIn(content);const file=path.join(home,'.devspec','notes',`${id}.md`);return{id,file,text:readNoteText(id,{home})}}
 const A={id:'11111111-1111-4111-8111-111111111111',name:'A'},B={id:'22222222-2222-4222-8222-222222222222',name:'B'}
 const endpoint='https://fixture.invalid/api/mcp'
 function setup(fn){const home=fs.mkdtempSync(path.join(os.tmpdir(),'cursor-repository-context-'));try{fn(home)}finally{fs.rmSync(home,{recursive:true,force:true})}}
@@ -32,8 +32,10 @@ test('full facts and rules always go to a note, offered after every step until t
  assert.equal(fs.statSync(note.file).mode&0o777,0o600)
  // Printed is not delivered: Cursor may have dropped it, so the next step offers it again.
  assert.equal(repositoryContextHook({conversation_id:'one',tool_name:'Shell',tool_input:{command:'ls'}},{home}).additional_context,line)
- // The agent reading the note is what ends it, by Cursor's Read tool or a shell command.
- assert.equal(repositoryContextHook(reading(note.id),{home}),null)
+ // A command that only mentions the note is not a read.
+ assert.ok(repositoryContextHook({conversation_id:'one',tool_name:'Shell',tool_input:{command:`test -e ~/.devspec/notes/${note.id}.md`},tool_output:JSON.stringify({output:'',exitCode:0})},{home}))
+ // The agent reading the note whole is what ends it, by Cursor's Read tool or `cat`.
+ assert.equal(repositoryContextHook(readCall(note.file),{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'other'},{home}),null)
  // A new or resumed chat is offered it again at its start.
@@ -45,7 +47,7 @@ test('full facts and rules always go to a note, offered after every step until t
  const changed=repositoryContextHook({conversation_id:'one'},{home}).additional_context
  assert.notEqual(noteIn(home,changed).id,note.id)
  assert.match(noteIn(home,changed).text,/Changed project rules/)
- assert.equal(repositoryContextHook({conversation_id:'one',tool_name:'Shell',tool_input:{command:`cat ~/.devspec/notes/${noteIn(home,changed).id}.md`}},{home}),null)
+ assert.equal(repositoryContextHook(catCall(home,noteIn(home,changed).file),{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
 }))
 
@@ -106,7 +108,7 @@ test('very long rules and 1,000 repositories are in the note whole, and the line
  assert.ok(line.length<=POST_TOOL_CONTEXT_SHARE);assert.match(line,/1000 repositories/)
  const second=noteIn(home,line)
  assert.match(second.text,/org\/repo-999/);assert.match(second.text,/RULE-END/)
- assert.equal(fs.readFileSync(first.file,'utf8'),first.text,'an earlier note keeps its bytes')
+ assert.equal(readNoteText(first.id,{home}),first.text,'an earlier note keeps its text')
  // The run-wide rules file the wake hands over keeps the whole text as well.
  assert.match(fs.readFileSync(repositoryContextTextFile('one',home),'utf8'),/org\/repo-999/)
 }))
@@ -116,8 +118,8 @@ test('when not even the short line fits, nothing is offered and nothing is recor
  storeRepositorySnapshot('one',registration(),home)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home,share:40}),null)
  // The full pointer does not fit a smaller share, the fixed short notice does.
- const notice=repositoryContextHook({conversation_id:'one'},{home,share:120}).additional_context
- assert.match(notice,/^DevSpec has more context waiting for you: run `cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md` and read it whole\.$/)
+ const notice=repositoryContextHook({conversation_id:'one'},{home,share:150}).additional_context
+ assert.match(notice,/^DevSpec has more context waiting for you: run `cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md`, and every further part it names\.$/)
  assert.ok(repositoryContextHook({conversation_id:'one'},{home}))
 }))
 

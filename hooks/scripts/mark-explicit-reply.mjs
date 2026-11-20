@@ -46,7 +46,7 @@ import {
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { noteCommand, pointToNote, postToolUseOutput, readsNote, writeNote } from './hook-context-budget.mjs'
+import { noteCommand, noteReadThrough, pointToNote, postToolUseOutput, readNoteText, writeNote } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -197,7 +197,7 @@ function tellPersonUnreadPath(connectionId, dir) {
  * The message is the person's, so it must reach the agent, and Cursor gives no sign
  * that a hook's note did (hook-context-budget.mjs). So it goes whole into a note file,
  * and a short pointer to it comes back after every step until the agent is seen
- * reading that file (`readsNote`). A message left while an earlier one is still unread
+ * reading all of it (`noteReadThrough`). A message left while an earlier one is still unread
  * joins it in one note. If the note cannot be written, the messages are put back for
  * the next step. Exported for tests; `dir` defaults to where the connection's files
  * live.
@@ -218,19 +218,15 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os
   if (!connectionId) return null
   const unreadFile = tellPersonUnreadPath(connectionId, connDir)
   let unread = readPrivateJson(unreadFile)?.note ?? null
-  if (unread && readsNote(data, unread)) {
+  if (unread && noteReadThrough(data, unread, { home })) {
     fs.rmSync(unreadFile, { force: true })
     unread = null
   }
   const notes = takeTellPersonNotes(connectionId, { dir: connDir })
   const text = tellPersonNoteText(notes)
   if (text) {
-    let earlier = null
-    try {
-      earlier = unread ? fs.readFileSync(path.join(home, '.devspec', 'notes', `${unread}.md`), 'utf8') : null
-    } catch {
-      /* the earlier note is gone: the new messages stand on their own */
-    }
+    // A missing earlier note leaves the new messages to stand on their own.
+    const earlier = unread ? readNoteText(unread, { home }) : null
     try {
       unread = writeNote(earlier ? `${earlier}\n\n---\n\n${text}` : text, { home }).id
       writePrivateJson(unreadFile, { note: unread })

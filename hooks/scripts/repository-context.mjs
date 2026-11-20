@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-import { pointToNote, POST_TOOL_CONTEXT_SHARE, readsNote, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
+import { noteReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -172,7 +172,7 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
  * and a pointer when large. Cursor keeps no record of whether a hook's note reached
  * the agent, and drops every hook's note on a step when all of them together pass its
  * ceiling (hook-context-budget.mjs), so printing the line proves nothing. The line
- * comes back after every step until the agent is seen reading the file (`readsNote`),
+ * comes back after every step until the agent is seen reading all of it (`noteReadThrough`),
  * and again whenever the context changes. sessionStart offers it even after it was
  * read, since a new or resumed chat may not hold it.
  */
@@ -182,12 +182,7 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false,shar
   const snapshot = readRepositorySnapshot(id,home)
   if (!snapshot) return null
   const note = writeNote(renderRepositorySnapshot(snapshot),{home})
-  const seenFile = `${snapshotFile(id,home)}.seen`
-  if (readsNote(input,note.id)) {
-    write(seenFile,{note:note.id})
-    return null
-  }
-  if (!force && read(seenFile)?.note === note.id) return null
+  if (noteReadThrough(input,note.id,{home}) && !force) return null
   const content = pointToNote(note, {
     share,
     what: `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`,
