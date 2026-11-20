@@ -23,8 +23,13 @@
  *
  * A turn the room saw working that carries no such command (a check job, an
  * automation run, a prompt typed at the terminal, or a command that was answered before
- * Cursor stopped) is told the same words as a plain room message instead, never as an
- * answer (`notice`, item 45eb0708): otherwise Working would clear with no explanation.
+ * Cursor stopped) is told the same words as a room message of its own (`notice`, item
+ * 45eb0708): otherwise Working would clear with no explanation. It is posted to the room
+ * by `session_id`, without `connection_id`, which `post_session_message` documents as a
+ * post tied to no turn: it joins no command's turn and answers nothing (DevSpec
+ * 59acf1bfe). A connection post would join the connection's current turn, or, with none
+ * open, be bound to the last command's attempt even after that was answered, and the
+ * assistant-speech lane is annotated with the open turn and quotes the current command.
  */
 
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
@@ -57,6 +62,14 @@ export function parseTurnFailure(raw) {
   return { status: 'error', text: lastTurnError(data.transcript_path) }
 }
 
+/**
+ * The room message for a failed turn that answers no command: by `session_id` alone, so
+ * DevSpec ties it to no turn (see the header).
+ */
+export function turnFailureNotice({ sessionId, agentName, message }) {
+  return { session_id: sessionId, agent_name: agentName, message, turn_kind: 'agent', phase: 'answer' }
+}
+
 /** Quote text as a Markdown block, line by line, so Cursor's words stand apart from ours. */
 function quote(text) {
   return text.split(/\r?\n/).map((line) => `> ${line}`.trimEnd()).join('\n')
@@ -77,8 +90,8 @@ export function turnFailureMessage(failure, agentName) {
  * Answer the room commands a failed turn carries, once, and mark them answered so the
  * turn end's request bookkeeping closes them. Returns the command ids answered; none
  * when the turn completed, carried no unanswered command, or was already answered.
- * With `notice`, a failed turn that carries no unanswered command is told to the room as
- * a plain message (see the header). The failure is the stop hook's input (`raw`), or one
+ * With `notice` and the room's `sessionId`, a failed turn that carries no unanswered
+ * command is told to the room in a message of its own (turnFailureNotice). The failure is the stop hook's input (`raw`), or one
  * the caller already read from the transcript (`failure`, as parseTurnFailure returns
  * it: the poller, when Cursor runs no stop hook, transcript-turn-end.mjs). `post(args)`
  * posts with post_session_message.
@@ -87,6 +100,7 @@ export async function postTurnFailure({
   raw = null,
   failure: given = undefined,
   connectionId,
+  sessionId = null,
   post,
   dir,
   agentName,
@@ -100,9 +114,7 @@ export async function postTurnFailure({
     whereRest: `The full error is in ${agentName}'s terminal.`,
   })
   if (commands.length === 0) {
-    if (notice) {
-      await post({ connection_id: connectionId, agent_name: agentName, message, turn_kind: 'agent', phase: 'answer' })
-    }
+    if (notice && sessionId) await post(turnFailureNotice({ sessionId, agentName, message }))
     return []
   }
   await post({

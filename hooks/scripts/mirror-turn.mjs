@@ -759,7 +759,14 @@ async function main() {
     if (mode === 'stop' && connectionId) {
       const identity = turnEndIdentity(hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId))
       if (identity) {
-        turnEndClaim = { identity, outcome: claimTurnEnd(connectionId, identity, { by: 'stop', dir: CONNECTIONS_DIR }) }
+        turnEndClaim = {
+          identity,
+          outcome: claimTurnEnd(connectionId, identity, {
+            by: 'stop',
+            after: readTurnMarker(connectionId)?.startedAt ?? null,
+            dir: CONNECTIONS_DIR,
+          }),
+        }
       }
     }
     const turnEndReported = turnEndClaim?.outcome === 'taken'
@@ -774,6 +781,7 @@ async function main() {
         await postTurnFailure({
           raw,
           connectionId,
+          sessionId,
           dir: CONNECTIONS_DIR,
           agentName,
           notice: Boolean(readTurnMarker(connectionId)),

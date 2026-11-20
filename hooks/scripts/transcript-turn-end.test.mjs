@@ -56,6 +56,8 @@ const tool = (name, input) => ({ role: 'assistant', message: { content: [{ type:
 const ended = (status, error) => ({ type: 'turn_ended', status, ...(error ? { error } : {}) })
 // A turn Cursor starts when a background task's output arrives, as the wake for a room command does.
 const WAKE = user('<timestamp>Friday, Nov 20, 2026, 7:00 PM (UTC)</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed).</user_query>')
+// What Cursor's server adds inside a turn when it resumes one (10 seen in real transcripts).
+const RESUMED = user('Your previous response was interrupted. Continue from where you left off.')
 // How a turn end names the user row that started its turn.
 const rowDigest = (row) => crypto.createHash('sha256').update(JSON.stringify(row)).digest('hex').slice(0, 16)
 const identity = (turns, row) => `${CONVERSATION}#${turns}#${rowDigest(row)}`
@@ -87,11 +89,13 @@ describe('reading the transcript', () => {
     try {
       // A tool input holding a user-role object is the assistant's row, not a user row.
       writeTranscript(transcript, [user('fix the test'), tool('Write', { messages: [{ role: 'user', text: 'x' }] }), WAKE, answer('Done.'), ended('error', LIMIT)])
-      assert.deepEqual(readTranscriptTurns(transcript), { turns: 2, lastUser: rowDigest(WAKE), end: { status: 'error', error: LIMIT } })
+      const read = readTranscriptTurns(transcript)
+      assert.deepEqual({ turns: read.turns, lastUser: read.lastUser, end: read.end }, { turns: 2, lastUser: rowDigest(WAKE), end: { status: 'error', error: LIMIT } })
+      assert.match(read.stamp, /^\d+:\d+(\.\d+)?$/)
       assert.equal(turnEndIdentity(transcript), identity(2, WAKE))
 
       writeTranscript(transcript, [user('fix the test'), answer('Working on it.')])
-      assert.deepEqual(readTranscriptTurns(transcript), { turns: 1, lastUser: rowDigest(user('fix the test')), end: null }, 'a turn still running has no end')
+      assert.equal(readTranscriptTurns(transcript).end, null, 'a turn still running has no end')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -116,48 +120,121 @@ describe('reading the transcript', () => {
 describe('which turn a turn end belongs to', () => {
   const marker = { startedAt: 1_000 }
   const decide = (dir, transcript) => transcriptTurnEnd({ connectionId: CONNECTION, marker, transcriptPath: transcript, dir })
+  const track = (dir, transcript) =>
+    recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
+  const connected = [user('/devspec-remote'), answer('Connected.'), ended('success')]
 
-  it('reports the end of the turn that started after the baseline: a run, an error, a stop', () => {
+  it('a room command\'s turn, started by its wake, that ends in an error', () => {
     const { dir, transcript } = scratch()
     try {
-      writeTranscript(transcript, [user('connect'), answer('Connected.'), ended('success')])
-      assert.equal(recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir }), true)
-      assert.deepEqual(readTurnBaseline(CONNECTION, marker.startedAt, { dir }), {
-        turn: marker.startedAt,
-        conversation: CONVERSATION,
-        turns: 1,
-        lastUser: rowDigest(user('connect')),
-      })
+      writeTranscript(transcript, connected)
+      assert.equal(track(dir, transcript), true)
+      const baseline = readTurnBaseline(CONNECTION, marker.startedAt, { dir })
+      assert.deepEqual({ ...baseline, stamp: typeof baseline.stamp }, { turn: marker.startedAt, conversation: CONVERSATION, between: true, stamp: 'string' })
       assert.equal(decide(dir, transcript), null, 'the turn before it is not its end')
 
-      writeTranscript(transcript, [user('connect'), answer('Connected.'), WAKE, answer('Reading the command.')])
+      writeTranscript(transcript, [user('/devspec-remote'), answer('Connected.'), WAKE, answer('Reading the command.')])
       assert.equal(decide(dir, transcript), null, 'still running')
 
-      writeTranscript(transcript, [user('connect'), answer('Connected.'), WAKE, answer('Done.'), ended('success')])
-      assert.deepEqual(decide(dir, transcript), { identity: identity(2, WAKE), status: 'success', error: null, failure: null })
+      writeTranscript(transcript, [user('/devspec-remote'), answer('Connected.'), WAKE, ended('error', LIMIT)])
+      assert.deepEqual(decide(dir, transcript), { identity: identity(2, WAKE), status: 'error', error: LIMIT, failure: { status: 'error', text: LIMIT } })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 
-      writeTranscript(transcript, [user('connect'), answer('Connected.'), WAKE, ended('error', LIMIT)])
-      assert.deepEqual(decide(dir, transcript).failure, { status: 'error', text: LIMIT }, "Cursor's own words")
-
-      writeTranscript(transcript, [user('connect'), answer('Connected.'), WAKE, ended('aborted', 'User aborted request.')])
+  it('a turn a person started by typing, and one stopped', () => {
+    const { dir, transcript } = scratch()
+    try {
+      writeTranscript(transcript, connected)
+      track(dir, transcript)
+      const typed = user('<timestamp>Friday, Nov 20, 2026, 7:59 PM (UTC)</timestamp>\n<user_query>\nfix the test\n</user_query>')
+      writeTranscript(transcript, [...connected.slice(0, 2), typed, answer('Done.'), ended('success')])
+      assert.deepEqual(decide(dir, transcript), { identity: identity(2, typed), status: 'success', error: null, failure: null })
+      writeTranscript(transcript, [...connected.slice(0, 2), typed, ended('aborted', 'User aborted/interrupted manually.')])
       assert.deepEqual(decide(dir, transcript).failure, { status: 'aborted', text: null })
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('never takes the end of a turn already running when the tracked turn started for its end', () => {
+  it('a turn that fails at its very start, writing no user row of its own', () => {
+    const { dir, transcript } = scratch()
+    try {
+      // The previous turn ran; the command's turn is refused before Cursor writes its
+      // prompt, so the file is rewritten with the same rows and a new turn end.
+      const ran = [user('/devspec-remote'), answer('Connected.'), WAKE, answer('Done.')]
+      writeTranscript(transcript, [...ran, ended('success')])
+      track(dir, transcript)
+      writeTranscript(transcript, [...ran, ended('error', LIMIT)])
+      assert.deepEqual(decide(dir, transcript), { identity: identity(2, WAKE), status: 'error', error: LIMIT, failure: { status: 'error', text: LIMIT } })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('two room-command turns in the same minute, whose user rows are the same', () => {
+    const { dir, transcript } = scratch()
+    try {
+      const first = [user('/devspec-remote'), answer('Connected.'), WAKE, answer('Done.')]
+      writeTranscript(transcript, [...first, ended('success')])
+      track(dir, transcript)
+      writeTranscript(transcript, [...first, WAKE, ended('error', LIMIT)])
+      assert.equal(decide(dir, transcript)?.identity, identity(3, WAKE))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('never reports the end of a turn already running when tracking started, resumed or not', () => {
     const { dir, transcript } = scratch()
     try {
       // A prompt typed at the terminal (or the turn that connected) is running when the
-      // room command arrives; Cursor writes that turn's end afterwards.
-      writeTranscript(transcript, [user('typed at the terminal'), answer('Looking.')])
-      recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
-      writeTranscript(transcript, [user('typed at the terminal'), answer('Looking.'), answer('Here it is.'), ended('success')])
-      assert.equal(decide(dir, transcript), null)
+      // room command arrives. Cursor's server resumes it once, adding a user row.
+      const running = [user('typed at the terminal'), answer('Looking.')]
+      writeTranscript(transcript, running)
+      track(dir, transcript)
+      assert.equal(readTurnBaseline(CONNECTION, marker.startedAt, { dir }).between, false)
+      writeTranscript(transcript, [...running, RESUMED, answer('Here it is.'), ended('error', 'WritableIterable is closed')])
+      assert.equal(decide(dir, transcript), null, 'the running turn\'s own end')
+      assert.equal(readTurnBaseline(CONNECTION, marker.startedAt, { dir }).between, true, 'from now on, between turns')
 
-      writeTranscript(transcript, [user('typed at the terminal'), answer('Looking.'), answer('Here it is.'), WAKE, answer('Done.'), ended('success')])
-      assert.equal(decide(dir, transcript)?.identity, identity(2, WAKE))
+      writeTranscript(transcript, [...running, RESUMED, answer('Here it is.'), WAKE, answer('Done.'), ended('success')])
+      assert.equal(decide(dir, transcript)?.identity, identity(3, WAKE))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('takes the first turn end after a running turn for that turn\'s, even when the next turn had already begun: missed, never false', () => {
+    const { dir, transcript } = scratch()
+    try {
+      writeTranscript(transcript, [user('typed at the terminal'), answer('Looking.')])
+      track(dir, transcript)
+      // The running turn's end was overwritten by the next turn before it was seen.
+      writeTranscript(transcript, [user('typed at the terminal'), answer('Here it is.'), WAKE, ended('success')])
+      assert.equal(decide(dir, transcript), null)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('never takes a stopped turn\'s end, written twice as tracking starts, for a later turn\'s', async () => {
+    const { dir, transcript } = scratch()
+    try {
+      // Cursor writes a stopped turn's end twice, 3 ms apart (CLI 2026.11.19). Rewrite it
+      // every few milliseconds while tracking starts: the baseline is only taken from a
+      // file that has kept still, so it is the file as it ends up.
+      const stopped = [user('typed at the terminal'), answer('Looking.'), ended('aborted', 'User aborted/interrupted manually.')]
+      writeTranscript(transcript, stopped)
+      const writer = spawn(process.execPath, ['-e', `
+        const fs = require('node:fs'); const end = Date.now() + 120
+        const text = fs.readFileSync(process.argv[1]); const tick = () => { fs.writeFileSync(process.argv[1], text); if (Date.now() < end) setTimeout(tick, 3) }; tick()
+      `, transcript])
+      await sleep(10)
+      assert.equal(track(dir, transcript), true)
+      await new Promise((resolve) => writer.on('exit', resolve))
+      assert.equal(decide(dir, transcript), null)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -167,7 +244,7 @@ describe('which turn a turn end belongs to', () => {
     const { dir, transcript } = scratch()
     try {
       writeTranscript(transcript, [user('connect'), ended('success')])
-      recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
+      track(dir, transcript)
       const head = [user('connect'), WAKE, answer('Done.')]
       for (const last of [
         ended('completed'), // the stop hook's word, never the transcript's
@@ -194,7 +271,7 @@ describe('which turn a turn end belongs to', () => {
     }
   })
 
-  it('counts a conversation with no transcript yet as having no turns', () => {
+  it('counts a conversation with no transcript yet as between turns', () => {
     const { dir, transcript } = scratch()
     try {
       assert.equal(recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: null, dir }), true)
@@ -208,37 +285,14 @@ describe('which turn a turn end belongs to', () => {
   it('reports the turn after Cursor summarises the conversation, though its user rows stayed level or fell', () => {
     const { dir, transcript } = scratch()
     try {
-      const before = [user('one'), answer('1'), user('two'), answer('2'), user('three'), answer('3'), ended('success')]
-      writeTranscript(transcript, before)
-      recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
+      writeTranscript(transcript, [user('one'), answer('1'), user('two'), answer('2'), user('three'), answer('3'), ended('success')])
+      track(dir, transcript)
       // Rewritten shorter during the command's turn: two user rows where there were three.
       writeTranscript(transcript, [user('three'), answer('Summary of the conversation so far.'), WAKE, ended('error', LIMIT)])
-      assert.deepEqual(decide(dir, transcript), {
-        identity: identity(2, WAKE),
-        status: 'error',
-        error: LIMIT,
-        failure: { status: 'error', text: LIMIT },
-      })
+      assert.equal(decide(dir, transcript)?.identity, identity(2, WAKE))
       // The same number of user rows as before.
       writeTranscript(transcript, [user('two'), user('three'), answer('Summary.'), WAKE, ended('error', LIMIT)])
       assert.equal(decide(dir, transcript)?.identity, identity(3, WAKE))
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('never takes an ended turn written again, after tracking started, for a new turn end', () => {
-    const { dir, transcript } = scratch()
-    try {
-      // A person stopped a turn typed at the terminal; Cursor writes its end again after
-      // a room command has been handed over.
-      const stopped = [user('typed at the terminal'), answer('Looking.'), ended('aborted', 'User aborted/interrupted manually.')]
-      writeTranscript(transcript, stopped)
-      recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
-      const later = Date.now() / 1000 + 5
-      writeTranscript(transcript, stopped)
-      fs.utimesSync(transcript, later, later)
-      assert.equal(decide(dir, transcript), null)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -249,7 +303,7 @@ describe('which turn a turn end belongs to', () => {
     try {
       assert.ok(Buffer.byteLength(LONG_ERROR) > 64 * 1024)
       writeTranscript(transcript, [user('connect'), ended('success')])
-      recordTurnBaseline(CONNECTION, { turn: marker.startedAt, conversationId: CONVERSATION, transcriptPath: transcript, dir })
+      track(dir, transcript)
       writeTranscript(transcript, [user('connect'), answer('x'.repeat(200 * 1024)), WAKE, ended('error', LONG_ERROR)])
       assert.equal(lastTurnEnd(transcript).error, LONG_ERROR)
       assert.equal(lastTurnError(transcript), LONG_ERROR, 'the stop hook reads it whole too')
@@ -279,25 +333,47 @@ describe('claiming a turn end', () => {
     const { dir } = scratch()
     try {
       const first = identity(2, WAKE)
-      const started = Date.now() - 1_000
       assert.equal(claimTurnEnd(CONNECTION, first, { by: 'stop', dir }), 'claimed')
       assert.equal(claimTurnEnd(CONNECTION, first, { by: 'poller', dir }), 'taken')
       assert.equal(claimTurnEnd(CONNECTION, first, { by: 'stop', dir }), 'taken')
       releaseTurnEnd(CONNECTION, first, { dir })
       assert.equal(claimTurnEnd(CONNECTION, first, { by: 'poller', dir }), 'claimed')
 
-      const baseline = { turn: started, conversation: CONVERSATION, turns: 1, lastUser: rowDigest(user('connect')) }
-      assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), true)
-      assert.equal(turnEndClaimed(CONNECTION, { ...baseline, lastUser: rowDigest(WAKE) }, { dir }), false, 'the turn the baseline was taken in')
-      assert.equal(turnEndClaimed(CONNECTION, { ...baseline, turn: Date.now() + 60_000 }, { dir }), false, 'claimed before the turn started')
-      assert.equal(turnEndClaimed(CONNECTION, { ...baseline, conversation: 'another' }, { dir }), false)
-      assert.equal(turnEndClaimed(CONNECTION, null, { dir }), false)
-
       assert.equal(claimTurnEnd(CONNECTION, identity(3, user('next')), { by: 'poller', dir }), 'claimed')
-      const claims = fs.readdirSync(dir).filter((name) => name.endsWith('.claim'))
+      const claims = fs.readdirSync(dir).filter((name) => name.includes('.turn-end.'))
       assert.equal(claims.length, 1, 'an older claim goes when a newer turn end is claimed')
       assert.equal(claimTurnEnd(CONNECTION, 'not an identity', { dir }), 'failed')
       assert.equal(claimTurnEnd(CONNECTION, `${CONVERSATION}#2`, { dir }), 'failed', 'an identity without its turn')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a turn that wrote no user row of its own is claimable though the turn before it had the same identity', () => {
+    const { dir } = scratch()
+    try {
+      const same = identity(2, WAKE)
+      const earlier = Date.now() - 60_000
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', dir, now: earlier }), 'claimed')
+      const trackedFrom = Date.now() - 1_000
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', after: trackedFrom, dir }), 'claimed', 'the earlier claim was an earlier turn')
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'stop', after: trackedFrom, dir }), 'taken', 'and this one is now reported')
+      assert.equal(fs.readdirSync(dir).filter((name) => name.includes('.turn-end.')).length, 1)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a turn\'s end counts as claimed only by a claim made after the turn started', () => {
+    const { dir } = scratch()
+    try {
+      const started = Date.now() - 1_000
+      claimTurnEnd(CONNECTION, identity(2, WAKE), { by: 'stop', dir })
+      const baseline = { turn: started, conversation: CONVERSATION, between: true, stamp: '1:1' }
+      assert.equal(turnEndClaimed(CONNECTION, baseline, { dir }), true)
+      assert.equal(turnEndClaimed(CONNECTION, { ...baseline, turn: Date.now() + 60_000 }, { dir }), false, 'claimed before the turn started')
+      assert.equal(turnEndClaimed(CONNECTION, { ...baseline, conversation: 'another' }, { dir }), false)
+      assert.equal(turnEndClaimed(CONNECTION, null, { dir }), false)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -307,18 +383,25 @@ describe('claiming a turn end', () => {
 // ---------------------------------------------------------------------------------
 // The real poller and the real stop hook.
 
-function commandPoll(body, sessionId) {
+const SECOND_COMMAND = { turnId: fixtureUuid(702), messageId: fixtureUuid(802) }
+
+function commandPoll(body, sessionId, command = COMMAND, sequence = 1) {
   const base = fixtureCommand(body)
   return {
     status: 'live',
     session_id: sessionId,
     changed: true,
-    cursor: COMMAND.messageId,
-    cursor_v2: 'after:command-1',
+    cursor: command.messageId,
+    cursor_v2: `after:command-${sequence}`,
     dispatch_cursor: 'dispatch-0',
     ingress: fixtureEnvelope({
-      envelopeId: fixtureUuid(501),
-      commands: [{ ...base, message_id: COMMAND.messageId, order: fixtureOrder(1, COMMAND.messageId), delivery: { ...base.delivery, turn_id: COMMAND.turnId } }],
+      envelopeId: fixtureUuid(500 + sequence),
+      commands: [{
+        ...base,
+        message_id: command.messageId,
+        order: fixtureOrder(sequence, command.messageId),
+        delivery: { ...base.delivery, turn_id: command.turnId, provenance_ref: fixtureUuid(600 + sequence), primary_provenance_ref: fixtureUuid(600 + sequence) },
+      }],
     }),
     dispatches: [],
   }
@@ -414,8 +497,8 @@ async function startPoller({ attached = false, capability = false } = {}) {
     turnOpen: () => fs.existsSync(marker),
     completions: () => stub.named('report_complete'),
     failurePosts: () => stub.named('post_session_message').filter((args) => args.complete_turn === true),
-    /** Plain room messages telling why a turn ended, not answering any command. */
-    roomNotices: () => stub.named('post_session_message').filter((args) => args.complete_turn !== true && args.phase === 'answer'),
+    /** Room messages telling why a turn ended, posted by session alone so they answer nothing. */
+    roomNotices: () => stub.named('post_session_message').filter((args) => !args.connection_id && args.session_id),
     requestCloses: () => stub.named('report_request').filter((args) => args.action === 'close'),
     /** The requests the connection still has open, as its request log says. */
     openRequests() {
@@ -432,10 +515,11 @@ async function startPoller({ attached = false, capability = false } = {}) {
       fs.appendFileSync(path.join(dir, `${CONNECTION}.requests.jsonl`), `${JSON.stringify({ op: 'answered', id: REQUEST })}\n`)
     },
     /** Hand the agent a room command and wait for the poller to start it. */
-    async deliver(body = 'ship the release notes') {
+    async deliver(body = 'ship the release notes', command = COMMAND, sequence = 1) {
       assert.ok(await until(() => stub.polls.length >= 1), `no poll; stderr:\n${stderr}`)
-      stub.serve(commandPoll(body, sessionId))
-      assert.ok(await until(() => stub.named('report_pickup').length >= 1 && fs.existsSync(marker)), `no pickup; stderr:\n${stderr}`)
+      const pickups = stub.named('report_pickup').length
+      stub.serve(commandPoll(body, sessionId, command, sequence))
+      assert.ok(await until(() => stub.named('report_pickup').length > pickups && fs.existsSync(marker)), `no pickup; stderr:\n${stderr}`)
       const polled = stub.polls.length
       assert.ok(await until(() => stub.polls.slice(polled).some((poll) => poll.busy === true)), 'the turn reports busy')
     },
@@ -476,7 +560,7 @@ async function startPoller({ attached = false, capability = false } = {}) {
   }
 }
 
-const finished = (reason = 'turn_end') => ({ connection_id: CONNECTION, command_turn_id: COMMAND.turnId, command_message_id: COMMAND.messageId, reason })
+const finished = (reason = 'turn_end', command = COMMAND) => ({ connection_id: CONNECTION, command_turn_id: command.turnId, command_message_id: command.messageId, reason })
 
 describe('the poller reports a turn end from the transcript when no stop hook runs', () => {
   it('a turn that ran: the command it started is finished within seconds and Working clears', async () => {
@@ -604,6 +688,7 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
         await run.laps()
         assert.equal(run.roomNotices().length, 1, 'told once')
         assert.ok(run.roomNotices()[0].message.includes(LIMIT), "in Cursor's words")
+        assert.deepEqual(Object.keys(run.roomNotices()[0]).sort(), ['agent_name', 'message', 'phase', 'session_id', 'turn_kind'], 'tied to no turn')
         assert.deepEqual(run.failurePosts(), [], 'not posted as an answer to anything')
         assert.deepEqual(run.completions(), [finished()])
       } finally {
@@ -611,6 +696,28 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
       }
     })
   }
+
+  it('a second command whose turn fails at its very start, with no user row of its own: reported once', async () => {
+    const run = await startPoller({ attached: true })
+    try {
+      await run.deliver()
+      const ran = [...run.connected.slice(0, 2), WAKE, answer('Done.')]
+      writeTranscript(run.transcript, [...ran, ended('success')])
+      assert.ok(await until(() => run.completions().length >= 1), `no first completion; stderr:\n${run.stderr()}`)
+
+      await run.deliver('and the changelog', SECOND_COMMAND, 2)
+      // Cursor refuses the command's turn before writing its prompt: the same rows, a new end.
+      writeTranscript(run.transcript, [...ran, ended('error', LIMIT)])
+      assert.ok(await until(() => run.completions().length >= 2), `no second completion; stderr:\n${run.stderr()}`)
+      await run.stop('error')
+      await run.laps()
+      assert.deepEqual(run.completions(), [finished(), finished('turn_end', SECOND_COMMAND)])
+      assert.equal(run.roomNotices().length, 1, 'told once, in a message of its own')
+      assert.ok(run.roomNotices()[0].message.includes(LIMIT))
+    } finally {
+      await run.cleanup()
+    }
+  })
 
   it('error: Cursor runs the stop hook first, and the poller adds nothing', async () => {
     const run = await startPoller({ attached: true })

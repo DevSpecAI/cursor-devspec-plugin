@@ -150,4 +150,54 @@ describe('answering the room command', () => {
       }
     }
   })
+
+  it('with notice, tells the room of a failed turn that answers no command in a post of its own, tied to no turn', async () => {
+    const SESSION = '22222222-2222-4222-8222-222222222222'
+    const cases = [
+      { what: 'no command tracked', setup: () => {} },
+      { what: 'an answered command', setup: (dir) => withCommand(dir, [{ op: 'answered', id: COMMAND }]) },
+      {
+        what: 'a typed prompt',
+        setup: (dir) => {
+          appendRequestEvent(CONN, { op: 'open', id: COMMAND, kind: 'typed_prompt' }, { dir })
+          appendRequestEvent(CONN, { op: 'current', ref: COMMAND }, { dir })
+        },
+      },
+    ]
+    for (const { what, setup } of cases) {
+      const dir = scratch()
+      try {
+        setup(dir)
+        const posts = []
+        const answered = await postTurnFailure({
+          failure: { status: 'error', text: LIMIT }, connectionId: CONN, sessionId: SESSION, dir, agentName: 'Cursor',
+          notice: true, post: async (args) => posts.push(args),
+        })
+        assert.deepEqual(answered, [], what)
+        // By session_id alone: post_session_message ties such a post to no turn, so it
+        // can never become a command's answer (DevSpec 59acf1bfe).
+        assert.deepEqual(Object.keys(posts[0]).sort(), ['agent_name', 'message', 'phase', 'session_id', 'turn_kind'], what)
+        assert.equal(posts[0].session_id, SESSION)
+        assert.equal(posts[0].phase, 'answer')
+        assert.ok(posts[0].message.includes(`> ${LIMIT}`), what)
+        assert.equal(posts.length, 1, what)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  })
+
+  it('with notice but no room, posts nothing', async () => {
+    const dir = scratch()
+    try {
+      const posts = []
+      await postTurnFailure({
+        failure: { status: 'aborted', text: null }, connectionId: CONN, sessionId: null, dir, agentName: 'Cursor',
+        notice: true, post: async (args) => posts.push(args),
+      })
+      assert.equal(posts.length, 0)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })

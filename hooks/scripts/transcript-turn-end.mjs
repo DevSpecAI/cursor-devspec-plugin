@@ -38,39 +38,66 @@
  * The transcript is `~/.cursor/projects/<project>/agent-transcripts/<conversation>/
  * <conversation>.jsonl`: one JSON row per line, `{"role":"user"|"assistant","message":…}`.
  * When a turn ends Cursor writes `{"type":"turn_ended","status":"success"|"error"|
- * "aborted"}` (with `"error":"…"` for an error) as the final line, and when the next
- * turn starts it rewrites the file without that line. Every turn starts with a user
- * row, including one woken by a background task's output ("<user_query>Briefly inform
- * the user about the task result…"). Read from the CLI 2026.11.05 bundle's transcript
- * writer, and seen in every transcript on the measuring machine written by CLI
- * 2026.09.18 to 2026.11.05.
+ * "aborted"}` (with `"error":"…"`) as the final line, and when the next turn starts it
+ * rewrites the whole file in place (truncating it first) without that line. In an
+ * interactive turn that succeeds, Cursor runs the stop hook *before* it writes the
+ * line; for an error or a stop, after it. Read from the CLI 2026.11.05 and 2026.11.19
+ * bundles. The transcript is not an official Cursor interface.
  *
- * In an interactive turn that succeeds, Cursor runs the stop hook *before* it writes
- * the line; for an error or a stop, after it (CLI 2026.11.05 bundle). The line has no
- * timestamp and no turn id. The transcript is not an official Cursor interface.
+ * What a turn looks like, measured on 2026-11-20 (CLI 2026.11.19 live, every write
+ * logged; and the 63 real transcripts on the measuring machine, CLI 2026.09.18 to
+ * 2026.11.05):
+ *  - A turn started by a prompt starts with a user row
+ *    `<timestamp>Friday, Nov 20, 2026, 7:59 PM (UTC)</timestamp> <user_query>…`.
+ *  - A turn started by a background command's output, which is how a room command's
+ *    wake reaches the agent, also starts with a user row, of Cursor's own wording:
+ *    `<timestamp>…</timestamp> <user_query>Briefly inform the user about the task result
+ *    and perform any follow-up actions (if needed)…</user_query>` (25 seen). The time is
+ *    to the minute, so two such turns in the same minute write byte-identical rows (seen).
+ *  - Cursor's server adds user rows inside a turn when it resumes one: "Your previous
+ *    response was interrupted. Continue from where you left off." (10 seen, up to three
+ *    identical in a row; the text is not in the CLI, so it is the server's).
+ *  - A turn that fails or is stopped at its very start writes `turn_ended` and no user
+ *    row: four transcripts are that one line ("Model unavailable on Free…" twice, "User
+ *    aborted/interrupted manually." twice).
+ *  - The `turn_ended` line carries no id and no time.
+ *  - A turn stopped with Ctrl+C has its `turn_ended` written twice, identical, 3 ms
+ *    apart.
+ *
+ * So the user rows cannot say which turn a turn end belongs to: they repeat, appear
+ * inside a turn, and are missing from a turn that failed at its start. The writing of a
+ * `turn_ended` line can.
  *
  * ## Which turn a turn end belongs to
  *
- * A turn is told apart by the user row that started it: every turn starts with one, and
- * Cursor stamps each with the time it was sent, so the last user row in the transcript
- * names the turn that is running or has just ended. A turn end's identity is
+ * The poller reports a turn end only for the turn it is tracking (the turn marker,
+ * written as it hands a room command over), and it notes where the transcript was at
+ * that moment (`recordTurnBaseline`):
+ *  - **Between turns** (the final line is a `turn_ended`, or there is no transcript
+ *    yet): Cursor writes the next `turn_ended` only when a turn that started after this
+ *    ends, so any `turn_ended` written after tracking started (the file has changed
+ *    since) is the end of a later turn: a prompt, a room command's wake, a resumed turn,
+ *    a turn that failed at its start, or one during which Cursor summarised the
+ *    conversation. The only rewrite of an ended turn's line (a stop, 3 ms apart) cannot
+ *    fall on both sides of the baseline, because the baseline counts only a file that
+ *    kept still for 25 ms (STABLE_READ_GAP_MS).
+ *  - **In a turn** (the turn that connected, a prompt typed at the terminal, a turn
+ *    whose stop hook is still running): the first `turn_ended` written after tracking
+ *    started is that running turn's own end. It is never reported; it becomes the new
+ *    starting point, and the rule above applies from there. The poller watches the
+ *    file so it sees that end as Cursor writes it.
+ *
+ * A turn the poller did not start (a prompt typed at the terminal, which Cursor's
+ * skipped `beforeSubmitPrompt` would have tracked) has no baseline and is never
+ * reported here.
+ *
+ * A turn end's identity, which the stop hook and the poller both claim, is
  * `<conversation>#<number of user rows>#<digest of the last user row>`
  * (`turnEndIdentity`). The stop hook can work it out even when it runs before the
- * `turn_ended` line exists, because nothing is written between the stop hook and the line
- * but the line itself.
- *
- * The poller reports a turn end only for the turn it is tracking (the turn marker), and
- * only when the transcript's last user row is not the one it had when that turn started
- * (`recordTurnBaseline`, written by the poller as it starts the turn). That keeps out
- * the end of a turn already running when a room command arrived, which Cursor writes
- * after the poller has started tracking the command's turn: the turn that connected, a
- * prompt typed at the terminal, or a turn whose stop hook is still running. It also
- * keeps out Cursor writing an ended turn's line again. It does not depend on the number
- * of user rows growing: when Cursor summarises a long conversation it rewrites the
- * transcript, and the number can stay the same or fall, but the turn's own user row is
- * still the last one. A turn the poller did not start (a prompt typed at the terminal,
- * which Cursor's skipped `beforeSubmitPrompt` would have tracked) has no baseline and is
- * never reported here.
+ * `turn_ended` line exists, because nothing is written between the stop hook and the
+ * line but the line itself. A turn that wrote no user row of its own has the same
+ * identity as the turn before it, so a claim made before the tracked turn started does
+ * not count against it (`claimTurnEnd` `after`).
  *
  * ## Reported once
  *
@@ -94,8 +121,12 @@
  *
  * ## Known limits
  *
- *  - A turn that writes no user row of its own (none has been seen) looks like the turn
- *    before it, so its end is not noticed.
+ *  - If the turn running when tracking started ends and the next turn rewrites the file
+ *    before the poller sees that end, the next turn's end is taken for the running
+ *    one's and not reported: a missed report, never a false one.
+ *  - A prompt typed at the terminal after a room command was handed over, but before
+ *    Cursor started the command's turn, ends first; its end is reported as the end of
+ *    the tracked turn, as the stop hook would report it.
  *  - A headless (`-p`) run killed by a signal writes no `turn_ended` line, so its end
  *    is not noticed (CLI 2026.11.19, 2026-11-20). Stopping a turn in the terminal with
  *    Ctrl+C does write one: `{"type":"turn_ended","status":"aborted","error":"User
@@ -285,9 +316,10 @@ function readWholeOnce(transcriptPath) {
 /**
  * Count the transcript's user rows, note the last one and read the final line, from one
  * read of the whole file that did not change while it was read. Returns
- * `{ turns, lastUser, end }`: `lastUser` is a digest of the last user row (null with
- * none), `end` the final line when it is a turn end, else null. `{ missing: true }` when
- * there is no transcript yet, or null when no clean read could be had.
+ * `{ turns, lastUser, end, stamp }`: `lastUser` is a digest of the last user row (null
+ * with none), `end` the final line when it is a turn end, else null, and `stamp` the
+ * file's size and modification time as read. `{ missing: true }` when there is no
+ * transcript yet, or null when no clean read could be had.
  */
 export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
@@ -300,7 +332,7 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
     sleepSync(STABLE_READ_GAP_MS)
     if (fileStamp(transcriptPath) !== whole.stamp) continue
     const parsed = scanTranscript(whole.chunks)
-    if (parsed) return parsed
+    if (parsed) return { ...parsed, stamp: whole.stamp }
   }
   return null
 }
@@ -394,11 +426,11 @@ export function turnBaselinePath(connectionId, dir = CONNECTIONS_DIR) {
 
 /**
  * Note where the conversation's transcript was as the poller starts tracking a turn
- * (`turn`, the turn marker's `startedAt`): its last user row, so that turn's end can be
- * told from the end of one already running or already ended. With no transcript yet the
- * conversation has no user row. A transcript that cannot be read cleanly leaves no
- * baseline, and that turn's end is then not reported from the transcript. Returns
- * whether one was written.
+ * (`turn`, the turn marker's `startedAt`): whether Cursor was between turns, and the
+ * file as it stood, so that turn's end can be told from the end of one already running
+ * or already ended (see the header). With no transcript yet the conversation is between
+ * turns. A transcript that cannot be read cleanly leaves no baseline, and that turn's
+ * end is then not reported from the transcript. Returns whether one was written.
  */
 export function recordTurnBaseline(connectionId, { turn, conversationId, transcriptPath = null, dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || typeof turn !== 'number') return false
@@ -406,14 +438,20 @@ export function recordTurnBaseline(connectionId, { turn, conversationId, transcr
   if (!conversation || (conversationId && conversation !== conversationId)) return false
   const read = transcriptPath ? readTranscriptTurns(transcriptPath) : { missing: true }
   if (!read) return false
+  return writeBaseline(connectionId, dir, {
+    turn,
+    conversation,
+    between: read.missing ? true : Boolean(read.end),
+    stamp: read.missing ? MISSING_STAMP : read.stamp,
+  })
+}
+
+/** The stamp of a transcript that did not exist yet: any later file differs from it. */
+const MISSING_STAMP = 'missing'
+
+function writeBaseline(connectionId, dir, { turn, conversation, between, stamp }) {
   try {
-    writePrivateJson(turnBaselinePath(connectionId, dir), {
-      v: 2,
-      turn,
-      conversation,
-      turns: read.missing ? 0 : read.turns,
-      lastUser: read.missing ? null : read.lastUser,
-    })
+    writePrivateJson(turnBaselinePath(connectionId, dir), { v: 3, turn, conversation, between, stamp })
     return true
   } catch {
     return false
@@ -424,15 +462,9 @@ export function recordTurnBaseline(connectionId, { turn, conversationId, transcr
 export function readTurnBaseline(connectionId, turn, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || typeof turn !== 'number') return null
   const value = readPrivateJson(turnBaselinePath(connectionId, dir))
-  if (value?.v !== 2 || value.turn !== turn || typeof value.conversation !== 'string') return null
-  if (!Number.isInteger(value.turns) || value.turns < 0) return null
-  if (value.lastUser !== null && !/^[0-9a-f]{16}$/.test(value.lastUser ?? '')) return null
-  return { turn, conversation: value.conversation, turns: value.turns, lastUser: value.lastUser }
-}
-
-/** Whether a turn end belongs to the turn `baseline` was noted for: a later turn in that conversation. */
-function laterTurn(baseline, conversation, lastUser) {
-  return conversation === baseline.conversation && lastUser !== null && lastUser !== baseline.lastUser
+  if (value?.v !== 3 || value.turn !== turn || typeof value.conversation !== 'string') return null
+  if (typeof value.between !== 'boolean' || typeof value.stamp !== 'string' || !value.stamp) return null
+  return { turn, conversation: value.conversation, between: value.between, stamp: value.stamp }
 }
 
 const CLAIM_SUFFIX = '.claim'
@@ -443,11 +475,11 @@ function claimPath(connectionId, identity, dir) {
   return path.join(dir, `${claimPrefix(connectionId)}${digest}${CLAIM_SUFFIX}`)
 }
 
-function claimFiles(connectionId, dir) {
+function claimFiles(connectionId, dir, { all = false } = {}) {
   try {
     return fs
       .readdirSync(dir)
-      .filter((name) => name.startsWith(claimPrefix(connectionId)) && name.endsWith(CLAIM_SUFFIX))
+      .filter((name) => name.startsWith(claimPrefix(connectionId)) && (all || name.endsWith(CLAIM_SUFFIX)))
       .map((name) => path.join(dir, name))
   } catch {
     return []
@@ -458,23 +490,39 @@ function claimFiles(connectionId, dir) {
  * Claim the report of one turn end. 'claimed': this caller reports it. 'taken': the
  * other path already did. 'failed': no claim could be written, so nothing says who
  * reports it. The claim is a file created only if it does not exist yet (a hard link of
- * a complete temporary file), so two processes claiming at once cannot both win.
- * Earlier claims are removed: only the newest turn end can be claimed again.
+ * a complete temporary file), so two processes claiming at once cannot both win. A
+ * claim of the same identity made before `after` (the tracked turn's start) was the end
+ * of an earlier turn that wrote no user row of its own: it is set aside, by a rename
+ * only one process can make, and the claim made again. Earlier claims are removed: only
+ * the newest turn end can be claimed again.
  */
-export function claimTurnEnd(connectionId, identity, { by, dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
+export function claimTurnEnd(connectionId, identity, { by, after = null, dir = CONNECTIONS_DIR, now = Date.now() } = {}) {
   if (!connectionId || !parseIdentity(identity)) return 'failed'
   const target = claimPath(connectionId, identity, dir)
   const temporary = `${target}.tmp-${process.pid}-${now.toString(36)}`
+  let outcome = 'failed'
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     fs.writeFileSync(temporary, `${JSON.stringify({ v: 1, turn: identity, by: by ?? null, at: new Date(now).toISOString() })}\n`, {
       mode: 0o600,
     })
-    try {
-      fs.linkSync(temporary, target)
-    } catch (error) {
-      if (error?.code === 'EEXIST') return 'taken'
-      throw error
+    for (let attempt = 0; attempt < 2 && outcome === 'failed'; attempt++) {
+      try {
+        fs.linkSync(temporary, target)
+        outcome = 'claimed'
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
+        const claimedAt = Date.parse(readPrivateJson(target)?.at ?? '')
+        if (typeof after !== 'number' || !(claimedAt < after) || attempt > 0) {
+          outcome = 'taken'
+          break
+        }
+        try {
+          fs.renameSync(target, `${target}.earlier-${process.pid}-${now.toString(36)}`)
+        } catch {
+          /* another process set it aside first: try the link once more */
+        }
+      }
     }
   } catch {
     return 'failed'
@@ -485,7 +533,8 @@ export function claimTurnEnd(connectionId, identity, { by, dir = CONNECTIONS_DIR
       /* a stray temporary file claims nothing */
     }
   }
-  for (const file of claimFiles(connectionId, dir)) {
+  if (outcome !== 'claimed') return outcome
+  for (const file of claimFiles(connectionId, dir, { all: true })) {
     if (file === target) continue
     try {
       fs.rmSync(file, { force: true })
@@ -508,16 +557,14 @@ export function releaseTurnEnd(connectionId, identity, { dir = CONNECTIONS_DIR }
 
 /**
  * Whether the end of the turn `baseline` was noted for (a turn's readTurnBaseline) has
- * been claimed, after that turn started: whoever claimed it reported it.
+ * been claimed: a claim in that conversation made after the turn started.
  */
 export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || !baseline) return false
   for (const file of claimFiles(connectionId, dir)) {
     const record = readPrivateJson(file)
     const claimed = parseIdentity(record?.turn)
-    const at = Date.parse(record?.at ?? '')
-    if (!claimed || !(at >= baseline.turn)) continue
-    if (laterTurn(baseline, claimed.conversation, claimed.lastUser)) return true
+    if (claimed?.conversation === baseline.conversation && Date.parse(record?.at ?? '') >= baseline.turn) return true
   }
   return false
 }
@@ -574,7 +621,14 @@ export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = 
   // Caught mid-write: decided on a later look, never from this one.
   if (!read || read.missing) return null
   memo.decided = seen
-  if (!read.end || !laterTurn(baseline, conversation, read.lastUser)) return null
+  if (!read.end) return null
+  if (!baseline.between) {
+    // The turn that was running when tracking started has ended. Never reported; any
+    // turn end written after this one is a later turn's.
+    writeBaseline(connectionId, dir, { ...baseline, between: true, stamp: read.stamp })
+    return null
+  }
+  if (read.stamp === baseline.stamp) return null
   return {
     identity: identityOf(conversation, read),
     status: read.end.status,

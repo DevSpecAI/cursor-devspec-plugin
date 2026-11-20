@@ -1616,8 +1616,13 @@ async function main() {
    * poller holds the turn end's claim: when the stop hook holds it, the stop hook did all
    * of this. Returns whether this poller reported it.
    */
-  async function reportTranscriptTurnEnd(ended) {
-    if (claimTurnEnd(connectionId, ended.identity, { by: 'poller', dir: CONNECTIONS_DIR }) !== 'claimed') return false
+  async function reportTranscriptTurnEnd(ended, marker) {
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim !== 'claimed') return false
     let delivered = true
     clearTrailState(connectionId)
     if (ended.failure && sessionId) {
@@ -1625,6 +1630,7 @@ async function main() {
         await postTurnFailure({
           failure: ended.failure,
           connectionId,
+          sessionId,
           dir: CONNECTIONS_DIR,
           agentName,
           // The room saw this turn working: it is told why it ended either way.
@@ -1806,6 +1812,46 @@ async function main() {
   const turnEndProbeMemo = {}
   let lapTranscriptPath = null
   let trackedTurnStartedAt = null
+  // A watch on the transcript, so the end of a turn that was already running when the
+  // tracked turn started is seen as Cursor writes it, not only at the next look: the
+  // next turn rewrites the file without it (transcript-turn-end.mjs).
+  const transcriptWatchMemo = {}
+  let transcriptWatch = null
+  let watchedTranscriptPath = null
+  function watchTranscript(transcriptPath) {
+    if (transcriptPath === watchedTranscriptPath) return
+    try {
+      transcriptWatch?.close()
+    } catch {
+      /* already closed */
+    }
+    transcriptWatch = null
+    watchedTranscriptPath = transcriptPath
+    if (!transcriptPath) return
+    try {
+      transcriptWatch = fs.watch(transcriptPath, { persistent: false }, () => {
+        const watchedMarker = readTurnMarker(connectionId)
+        if (!watchedMarker) return
+        try {
+          transcriptTurnEnd({
+            connectionId,
+            marker: watchedMarker,
+            transcriptPath,
+            dir: CONNECTIONS_DIR,
+            memo: transcriptWatchMemo,
+          })
+        } catch {
+          /* the next look decides */
+        }
+      })
+      transcriptWatch.on('error', () => {
+        watchedTranscriptPath = null
+      })
+    } catch {
+      // No transcript to watch yet: the next lap tries again.
+      watchedTranscriptPath = null
+    }
+  }
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -2572,6 +2618,7 @@ async function main() {
     let marker = readTurnMarker(connectionId)
     const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
     lapTranscriptPath = transcriptPath
+    watchTranscript(marker ? transcriptPath : null)
     // How Cursor ended the conversation's last turn, read whether or not a stop hook
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
@@ -2587,7 +2634,7 @@ async function main() {
         dir: CONNECTIONS_DIR,
         memo: transcriptTurnEndMemo,
       })
-      if (ended && (await reportTranscriptTurnEnd(ended))) marker = null
+      if (ended && (await reportTranscriptTurnEnd(ended, marker))) marker = null
     }
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
