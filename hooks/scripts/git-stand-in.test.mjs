@@ -26,6 +26,9 @@ import {
   normalizeRemoteKey,
   parseCommitArgs,
   tagSubject,
+  unlinkedCommitText,
+  unrecordedClaimText,
+  unrecordedCommitText,
 } from './git-stand-in.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
@@ -91,12 +94,13 @@ function makeRepo({ origin = PROJECT_ORIGIN, pin = null } = {}) {
   return repo
 }
 
-function prepared(home, command, claims = [TASK_A]) {
+function prepared(home, command, claims = [TASK_A], unrecorded = []) {
   const result = prepareStandIn({
     command,
     conversationId: CONVERSATION,
     projectId: PROJECT,
     claims: claims.map((id) => ({ id, project_id: PROJECT })),
+    unrecorded,
     home,
   })
   assert.ok(result, 'the stand-in line applies')
@@ -270,22 +274,28 @@ describe('commits in the connected project\'s repositories', () => {
     }])
   })
 
-  it('stops an untagged commit before git runs when no task is claimed, and the repository is unchanged', async () => {
+  it('lets an untagged commit through exactly as written when no task is claimed, with a note, and reports it', async () => {
     const home = connectedHome()
     const repo = makeRepo()
     fs.writeFileSync(path.join(repo, 'c.txt'), 'c\n')
     git(repo, 'add', 'c.txt')
-    const head = git(repo, 'rev-parse', 'HEAD')
-    const index = git(repo, 'diff', '--cached', '--name-only')
-    const result = inShell(prepared(home, 'git commit -q -m "Unclaimed"', []), { cwd: repo, home })
-    assert.equal(result.status, 1)
-    assert.match(result.stderr, /DevSpec stopped this commit before git ran, so nothing was changed/)
-    assert.match(result.stderr, /claim_work_item/)
-    assert.match(result.stderr, /create_task/)
-    assert.match(result.stderr, /retry the same commit: its \[devspec:<id>\] reference is added for you/)
-    assert.equal(git(repo, 'rev-parse', 'HEAD'), head)
-    assert.equal(git(repo, 'diff', '--cached', '--name-only'), index)
-    assert.equal((await report(home)).calls.length, 0)
+    const result = inShell(prepared(home, "git commit -q -m 'Bump a dependency\n\nNo task needed.'", []), { cwd: repo, home })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(git(repo, 'log', '-1', '--format=%B'), 'Bump a dependency\n\nNo task needed.')
+    assert.equal(result.stderr, `${unlinkedCommitText()}\n`)
+    assert.equal((await report(home)).calls.length, 1)
+    // A message read from standard input reaches git byte for byte.
+    const piped = inShell(prepared(home, "git commit -q --allow-empty -F - <<'MSG'\nFrom stdin\n\n  kept as written\nMSG", []), { cwd: repo, home })
+    assert.equal(piped.status, 0, piped.stderr)
+    assert.equal(git(repo, 'log', '-1', '--format=%B'), 'From stdin\n\n  kept as written')
+  })
+
+  it('a note is only for a commit git made: a failed one says nothing of DevSpec', () => {
+    const home = connectedHome()
+    const repo = makeRepo()
+    const result = inShell(prepared(home, 'git commit -q -m "Nothing staged"', []), { cwd: repo, home })
+    assert.notEqual(result.status, 0)
+    assert.doesNotMatch(result.stderr, /DevSpec/)
   })
 
   it('stops an untagged commit when several tasks are claimed, and names their references', () => {
@@ -297,6 +307,40 @@ describe('commits in the connected project\'s repositories', () => {
     assert.match(result.stderr, /2 tasks are claimed/)
     assert.match(result.stderr, new RegExp(`claimed: \\[devspec:${TASK_A}\\], \\[devspec:${TASK_B}\\]`))
     assert.equal(git(repo, 'rev-parse', 'HEAD'), head)
+  })
+
+  it('never tags with an older claim while a newer one could not be recorded: untagged, with a note, when DevSpec could not confirm it', async () => {
+    const home = connectedHome()
+    const repo = makeRepo()
+    const result = inShell(prepared(home, 'git commit -q --allow-empty -m "After an unread claim"', [TASK_A], [
+      { task_id: null, project_id: PROJECT, confirmed: false },
+    ]), { cwd: repo, home })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(git(repo, 'log', '-1', '--format=%s'), 'After an unread claim')
+    assert.equal(result.stderr, `${unrecordedCommitText()}\n`)
+    assert.equal((await report(home)).calls.length, 1)
+  })
+
+  it('stops the commit and names both claims when DevSpec confirmed the one it could not record', () => {
+    const home = connectedHome()
+    const repo = makeRepo()
+    const head = git(repo, 'rev-parse', 'HEAD')
+    const result = inShell(prepared(home, 'git commit -q --allow-empty -m "Which one"', [TASK_A], [
+      { task_id: TASK_B, project_id: null, confirmed: true },
+    ]), { cwd: repo, home })
+    assert.equal(result.status, 1)
+    assert.equal(result.stderr, `${unrecordedClaimText([TASK_A], [TASK_B])}\n`)
+    assert.equal(git(repo, 'rev-parse', 'HEAD'), head)
+  })
+
+  it('an unrecorded claim known to be another project\'s does not change this project\'s commits', () => {
+    const home = connectedHome()
+    const repo = makeRepo()
+    const result = inShell(prepared(home, 'git commit -q --allow-empty -m "Mine"', [TASK_A], [
+      { task_id: TASK_B, project_id: '99999999-9999-4999-8999-999999999999', confirmed: true },
+    ]), { cwd: repo, home })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(git(repo, 'log', '-1', '--format=%s'), `Mine [devspec:${TASK_A}]`)
   })
 
   it('runs an existing reference, an amend and a reused message exactly as asked, and still reports them', async () => {
@@ -349,7 +393,12 @@ describe('everything else is left alone', () => {
     assert.equal(unclaimed.stderr, '')
     const claimed = inShell(prepared(home, 'git commit -q --allow-empty -m "Elsewhere again"'), { cwd: repo, home })
     assert.equal(claimed.status, 0, claimed.stderr)
-    assert.equal(git(repo, 'log', '-2', '--format=%s'), 'Elsewhere again\nElsewhere')
+    const unrecorded = inShell(prepared(home, 'git commit -q --allow-empty -m "Elsewhere once more"', [TASK_A], [
+      { task_id: TASK_B, project_id: null, confirmed: true },
+    ]), { cwd: repo, home })
+    assert.equal(unrecorded.status, 0, unrecorded.stderr)
+    assert.equal(unrecorded.stderr, '')
+    assert.equal(git(repo, 'log', '-3', '--format=%s'), 'Elsewhere once more\nElsewhere again\nElsewhere')
     // Git is not even asked to describe what it did: an alias that prints git's own
     // environment shows no trace request there, where in the project's repository it does.
     const gitEnv = (cwd) => inShell(prepared(home, "git -c alias.showenv='!env' showenv | grep -c '^GIT_TRACE2_EVENT=' || true"), { cwd, home }).stdout.trim()
@@ -528,6 +577,30 @@ describe('the plugin\'s other hooks', () => {
       tool_input: { command: 'git commit -m "x [devspec:short]"' },
     }, { stateRoot: tempDir(), home, projectHome: home, pinOptions: { home } })
     assert.equal(malformed.permission, 'deny')
+  })
+
+  it('a claim Cursor withheld while DevSpec was unreachable reaches the stand-in: the next commit is not tagged with the older claim', async () => {
+    const home = connectedHome()
+    const repo = makeRepo()
+    const stateRoot = tempDir()
+    const hookOptions = { stateRoot, home, projectHome: home, pinOptions: { home } }
+    const claim = (taskId, resultJson, extra = {}) => handleHook('afterMCPExecution', {
+      conversation_id: CONVERSATION, tool_name: 'devspec__claim_work_item',
+      tool_input: JSON.stringify({ task_id: taskId, project_id: PROJECT }), result_json: JSON.stringify(resultJson),
+    }, { ...hookOptions, ...extra })
+    await claim(TASK_A, { content: [{ type: 'text', text: JSON.stringify({ id: TASK_A, claim_success: true }) }], isError: false })
+    await claim(TASK_B, { content: [{ type: 'text', text: '' }], isError: false }, {
+      resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: ENDPOINT }),
+      onlineCall: async () => { throw new Error('offline') },
+    })
+    const output = handleHook('preToolUse', {
+      conversation_id: CONVERSATION, tool_name: 'Shell', tool_use_id: 'tool-1', cwd: repo,
+      tool_input: { command: 'git commit -q --allow-empty -m "Next commit"' },
+    }, hookOptions)
+    const result = inShell(output.updated_input.command, { cwd: repo, home })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(git(repo, 'log', '-1', '--format=%s'), 'Next commit')
+    assert.equal(result.stderr, `${unrecordedCommitText()}\n`)
   })
 
   it('the older command-text observation stands down for a command the stand-in ran', async () => {

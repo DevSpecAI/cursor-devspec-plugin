@@ -1,11 +1,19 @@
 # Changelog
 
-## 0.22.0
+## 0.22.1
 
 - **DevSpec now records who asked for the requirement, inventory and dependency-review changes your Cursor agent makes.** When the agent records, updates, replaces or retracts a requirement, records, revises or retracts an inventory entry, or records a dependency review, the plugin tells DevSpec which request the change serves, as it already did for tasks, memories and documents. Until now DevSpec had to work these out for itself.
 - **Those changes also wait when one turn carries two people's requests**, until the agent says which one it is working on, like every other change that records who asked, so none is credited to the wrong person.
 - **A change is no longer refused because the command it came from has closed.** On a change that records who asked, the plugin used to send the room command the request came from beside the request itself. DevSpec refused the change once that command had closed, for example when a helper agent was still working after the agent had posted its answer, although the request said exactly who asked. The plugin now sends only the request on those changes, and never a command it remembered from earlier.
 - Unchanged: reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those. There is nothing to set.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.22.0
+
+- **A commit the agent makes with no task claimed now goes through, with a note, instead of being stopped.** Work that needs no task, such as a dependency update or an automation run, commits normally. The note tells the agent the commit carries no task reference, and that if the work does belong to a task, claiming it before the next commit gets the reference added automatically. This holds both while connected and without a connection, including on native Windows.
+- **With several tasks claimed, a commit is still stopped and the agent is asked which task it belongs to.** With exactly one claimed, its reference is still added for the agent.
+- **A commit is never linked to the wrong task when the agent's newest claim could not be read.** Before, if the plugin could not read back a task the agent had just claimed, it could add an older claim's reference to the next commit. Now it never does: when DevSpec has confirmed the newer claim and the repository is certainly the project's, the commit is stopped and the agent is asked which task it belongs to, naming both; otherwise, for example when DevSpec cannot be reached, the commit goes through untagged with a note.
+- **Claiming a task by its short code works like claiming it by its full id.** The plugin now records the claim against the task's full id, so the agent's commits are tagged with it.
 - Start a new `cursor-agent` session to pick this up.
 
 ## 0.21.0
