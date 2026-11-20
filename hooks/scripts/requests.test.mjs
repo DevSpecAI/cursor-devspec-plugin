@@ -249,6 +249,14 @@ describe('when a write must say whose request it serves', () => {
     assert.equal(provenanceRefForWrite(named), DELIVERY_B)
   })
 
+  it('an answer written after the command was answered and closed at a settle point carries no closed request (transcript-turn-end.mjs Settling)', () => {
+    // The agent answers a command Cursor held, after the plugin answered it uncertainly
+    // and closed it: the write is left unstamped, for DevSpec to bind to the last command.
+    const state = reduceRequestLog(log(openA, { op: 'current', ref: A }, { op: 'answered', id: A }, { op: 'close', id: A }))
+    assert.equal(requestRefForWrite(state), null)
+    assert.equal(provenanceRefForWrite(state), null)
+  })
+
   it('a person at the terminal and the same person in a room are recorded differently', () => {
     const state = reduceRequestLog(log(openT, openA, { op: 'current', ref: T }, { op: 'joined', id: A }))
     assert.deepEqual(turnAmbiguity(state).map((entry) => entry.kind), ['typed_prompt', 'command'])

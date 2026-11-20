@@ -161,7 +161,7 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
-import { finishTurnRequests, openRequest } from './requests.mjs'
+import { commandsAnsweredNow, finishTurnRequests, openRequest, readRequestState } from './requests.mjs'
 import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
   NO_SIGN_OF_LIFE_MS,
@@ -182,21 +182,29 @@ import {
 import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
 import {
   claimTurnEnd,
+  clearSettle,
   nextReportTry,
   noteTurnEndAttemptEnded,
   noteTurnEndCompleted,
   noteTurnEndNoticed,
   noteTurnEndTold,
+  readSettle,
   readTurnBaseline,
   recordTurnBaseline,
   reportHoldingClaim,
+  settleDue,
+  settleStep,
   settleTurnEnd,
+  startSettle,
+  transcriptConversation,
   transcriptTurnEnd,
   turnEndClaimed,
   turnEndIdentity,
   turnEndPending,
+  updateSettle,
+  writeTurnBaseline,
 } from './transcript-turn-end.mjs'
-import { postTurnFailure, postTurnNotice } from './turn-failure.mjs'
+import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
 import { clearTurnWakes } from './notice-reply.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
@@ -266,25 +274,30 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  */
 function writeTurnMarker(
   connectionId,
-  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR } = {},
+  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR, startedAt: trackedFrom = null, baseline = null } = {},
 ) {
   if (!connectionId) return
   const existing = readTurnMarker(connectionId, dir)
   const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
-  const startedAt = live ? existing.startedAt : Date.now()
+  const startedAt = live ? existing.startedAt : (trackedFrom ?? Date.now())
   const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
   // A turn starting now: note how far Cursor's transcript of the conversation had got,
   // so this turn's end can be told from the end of a turn already running when it
   // started (transcript-turn-end.mjs). Written before the marker, so a marker never
-  // goes with an older turn's baseline.
+  // goes with an older turn's baseline. A turn a settle hands over (`baseline`) was
+  // noted from just before it started.
   if (!live) {
     const conversationId = readState(connectionId)?.local_id || null
-    recordTurnBaseline(connectionId, {
-      turn: startedAt,
-      conversationId,
-      transcriptPath: resolveAgentTranscriptPath(conversationId),
-      dir,
-    })
+    const transcriptPath = resolveAgentTranscriptPath(conversationId)
+    if (baseline) {
+      writeTurnBaseline(
+        connectionId,
+        { turn: startedAt, conversation: transcriptConversation(transcriptPath) ?? conversationId, baseline },
+        { dir },
+      )
+    } else {
+      recordTurnBaseline(connectionId, { turn: startedAt, conversationId, transcriptPath, dir })
+    }
   }
   try {
     fs.mkdirSync(dir, { recursive: true })
@@ -1781,13 +1794,13 @@ async function main() {
     if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
     if (claim.outcome === 'reporting') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
-    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim), {
+    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim, marker), {
       dir: CONNECTIONS_DIR,
       onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
     })
   }
 
-  async function noticeClaimedTurnEnd(ended, claim) {
+  async function noticeClaimedTurnEnd(ended, claim, marker) {
     clearTrailState(connectionId)
     let done = true
     // A stop hook that gave its report back after posting its message told the room already.
@@ -1844,8 +1857,21 @@ async function main() {
       reason: ended.status,
     })
     if (!done) return 'retry'
-    // Working has cleared. The commands the turn was started with stay on record for the
-    // stop hook's upgrade, which names them; the backstop does not report them.
+    // Working has cleared. The turn end now settles: the room commands picked up before
+    // it are answered once Cursor has stayed idle for SETTLE_MS, or a turn Cursor starts
+    // from a wake is tracked and decides it (transcript-turn-end.mjs "Settling"). The
+    // commands the turn started with stay on record for that, and for the stop hook's
+    // upgrade, which names them; the backstop does not report them.
+    if (sessionId && ended.failure && ended.position) {
+      startSettle(connectionId, {
+        ended,
+        conversation: transcriptConversation(lapTranscriptPath),
+        turn: marker?.startedAt ?? null,
+        requests: commandsAnsweredNow(readRequestState(connectionId, { dir: CONNECTIONS_DIR })),
+        commands: readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }),
+        dir: CONNECTIONS_DIR,
+      })
+    }
     turnStartCommands = []
     clearTurnMarker(connectionId, { keepCommands: true })
     prevTurnActive = false
@@ -1853,6 +1879,107 @@ async function main() {
       `devspec-remote-poll: turn ended (${ended.status}), told the room and ended the working attempt; not tied to a command connection=${connectionId}\n`,
     )
     return 'reported'
+  }
+
+  /**
+   * The settle point of a turn end the poller could only notice (transcript-turn-end.mjs
+   * "Settling"): Cursor has stayed idle at it for SETTLE_MS, or a command was handed over
+   * since. Every room command picked up before it and still unanswered is answered with
+   * what is certain (turn-failure.mjs answerUnsettledCommands) and its request closed;
+   * Working cleared at the notice. Done as the report level of the turn end's claim, so
+   * a stop hook that answered it already, or is answering it, adds nothing here. Returns
+   * true once settled (or answered elsewhere), false to try again later.
+   */
+  async function resolveSettle(settle) {
+    const claim = claimTurnEnd(connectionId, settle.identity, { by: 'poller', goal: 'report', dir: CONNECTIONS_DIR })
+    if (claim.outcome === 'reported') return true
+    if (claim.outcome !== 'claimed') return false
+    const outcome = await reportHoldingClaim(
+      connectionId,
+      settle.identity,
+      async () => {
+        let delivered = true
+        if (!claim.told && sessionId) {
+          try {
+            await answerUnsettledCommands({
+              failure: settle.failure,
+              requestIds: settle.requests ?? [],
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              agentName,
+              post: (args) =>
+                mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+            })
+            noteTurnEndTold(connectionId, settle.identity, { dir: CONNECTIONS_DIR })
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end reply failed: ${e.message}\n`)
+          }
+        }
+        const capability = readConnectionCapability(connectionId)
+        if (delivered && capability) {
+          try {
+            const { failed } = await finishTurnRequests({
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              call: (args) =>
+                mcpToolsCall({
+                  mcpUrl,
+                  token,
+                  connectionCapability: capability,
+                  name: 'report_request',
+                  arguments: args,
+                  timeoutMs: 3_000,
+                }),
+            })
+            if (failed.length > 0) delivered = false
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end request bookkeeping failed: ${e.message}\n`)
+          }
+        }
+        settleTurnEnd(connectionId, settle.identity, { reported: delivered, dir: CONNECTIONS_DIR })
+        return delivered ? 'reported' : 'retry'
+      },
+      {
+        dir: CONNECTIONS_DIR,
+        onError: (e) => process.stderr.write(`devspec-remote-poll: settling failed part-way: ${e?.message ?? e}\n`),
+      },
+    )
+    if (outcome === 'reported') {
+      process.stderr.write(`devspec-remote-poll: turn end settled; unanswered commands answered connection=${connectionId}\n`)
+    }
+    return outcome === 'reported'
+  }
+
+  /**
+   * One lap's look at a settle under way (transcript-turn-end.mjs settleStep). A
+   * command handed over since (a marker) settles it at once: the commands picked up
+   * before the turn end are answered, and the new command's turn is tracked as any
+   * other.
+   */
+  async function lapSettle(marker, transcriptPath) {
+    const settle = readSettle(connectionId, { dir: CONNECTIONS_DIR })
+    if (!settle) return
+    if (marker) {
+      if (settle.resolved || (await resolveSettle(settle))) clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      return
+    }
+    const step = settleStep(settle, { transcriptPath })
+    if (step.action === 'track') {
+      // Cursor started a turn from a wake since: track it as any command's turn, so
+      // Working shows while it runs and its end is reported (and decides the settle).
+      recordTurnCommands(connectionId, settle.commands ?? [], { dir: CONNECTIONS_DIR })
+      writeTurnMarker(connectionId, { remoteTurn: true, startedAt: step.startedAt, baseline: step.baseline })
+      clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      process.stderr.write(`devspec-remote-poll: a wake turn started after a noticed turn end; tracking it connection=${connectionId}\n`)
+    } else if (step.action === 'restart') {
+      updateSettle(connectionId, { idle: { ...settle.idle, stamp: step.stamp, since: Date.now() } }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'rebase') {
+      updateSettle(connectionId, { kept: step.kept, keptDigest: step.keptDigest, idle: step.idle }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'resolve') {
+      if (await resolveSettle(settle)) updateSettle(connectionId, { resolved: true }, { dir: CONNECTIONS_DIR })
+    }
   }
 
   /**
@@ -1960,6 +2087,7 @@ async function main() {
   // check), and the turn the marker tracked when last seen (for the backstop below).
   const transcriptTurnEndMemo = {}
   const turnEndProbeMemo = {}
+  const settleProbeMemo = {}
   // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
   // and when the next is due (nextReportTry). Null once due is null: given up.
   let reportRetry = null
@@ -2677,6 +2805,10 @@ async function main() {
             return true
           }
           if (m && reportRetry?.dueAt != null && Date.now() >= reportRetry.dueAt) return true
+          // A noticed turn end settling: its clock ran out, or Cursor wrote since.
+          if (!m && settleDue({ connectionId, transcriptPath: lapTranscriptPath, dir: CONNECTIONS_DIR, memo: settleProbeMemo })) {
+            return true
+          }
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2781,6 +2913,9 @@ async function main() {
         }
       }
     }
+    // A turn end the poller could only notice settles (transcript-turn-end.mjs
+    // "Settling"): answered at its settle point, or decided by a wake turn Cursor starts.
+    await lapSettle(marker, transcriptPath)
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0

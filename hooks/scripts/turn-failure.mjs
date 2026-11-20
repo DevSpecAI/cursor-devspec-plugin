@@ -73,12 +73,29 @@ export function turnFailureNotice({ sessionId, agentName, message }) {
 /**
  * Tell the room about a failed turn in a message of its own, answering nothing: for a
  * turn end that cannot be tied to the room command beyond doubt (transcript-turn-end.mjs).
- * `post(args)` posts with post_session_message.
+ * It says only what is certain (turnNoticeMessage); the commands are answered at the
+ * settle point. `post(args)` posts with post_session_message.
  */
 export async function postTurnNotice({ failure, sessionId, agentName, post }) {
   if (!failure || !sessionId) return false
-  await post(turnFailureNotice({ sessionId, agentName, message: failureRoomMessage(failure, agentName) }))
+  const message = fitRoomMessage(turnNoticeMessage(failure, agentName), {
+    whereRest: `The full error is in ${agentName}'s terminal.`,
+  })
+  await post(turnFailureNotice({ sessionId, agentName, message }))
   return true
+}
+
+/**
+ * The notice for a turn end not tied to a command beyond doubt: that a turn ended in an
+ * error, in Cursor's own words, or was stopped at the terminal. Nothing about which
+ * message it was working on, nor to send one again: Cursor may still run it.
+ */
+export function turnNoticeMessage(failure, agentName) {
+  if (failure.status === 'aborted') return `${agentName} was stopped at its terminal.`
+  const lead = failure.text
+    ? `${agentName} ended a turn with an error. It said:\n\n${quote(failure.text)}`
+    : `${agentName} ended a turn with an error; its terminal shows what went wrong.`
+  return `${lead}\n\nAnything it asks you to do happens in ${agentName} on the computer it's running on.`
 }
 
 /** The failure in the room's words, quoted whole up to the room's own limit, then cut visibly. */
@@ -91,6 +108,50 @@ function failureRoomMessage(failure, agentName) {
 /** Quote text as a Markdown block, line by line, so Cursor's words stand apart from ours. */
 function quote(text) {
   return text.split(/\r?\n/).map((line) => `> ${line}`.trimEnd()).join('\n')
+}
+
+/**
+ * What a room command is told when the turn that ended cannot be tied to it beyond
+ * doubt (transcript-turn-end.mjs, the settle point): only what is certain. A turn ended,
+ * in an error (in Cursor's own words) or stopped at the terminal, before the command was
+ * answered, and if Cursor runs the command later its answer still reaches the room. It
+ * never says the command itself failed or was stopped: Cursor may hold it and run it
+ * after the person's next turn (measured after Ctrl+C).
+ */
+export function uncertainTurnFailureMessage(failure, agentName) {
+  const later = `If ${agentName} runs it later, its answer will appear here.`
+  if (failure.status === 'aborted') {
+    return `${agentName} was stopped at its terminal before it answered this. ${later}`
+  }
+  const lead = failure.text
+    ? `${agentName} ended a turn with an error before it answered this. It said:\n\n${quote(failure.text)}`
+    : `${agentName} ended a turn with an error before it answered this; its terminal shows what went wrong.`
+  return `${lead}\n\nAnything it asks you to do happens in ${agentName} on the computer it's running on. ${later}`
+}
+
+/**
+ * Answer the room commands a settled turn end left unanswered (`requestIds`, the ones
+ * picked up before it), once, with uncertainTurnFailureMessage, and mark them answered
+ * so the turn end's request bookkeeping closes them. Posted with the connection, as a
+ * failure reply is: DevSpec binds it to the connection's last command even once that
+ * turn has closed. Returns the request ids answered; none when every one was already
+ * answered or closed (nothing is posted then).
+ */
+export async function answerUnsettledCommands({ failure, requestIds = [], connectionId, post, dir, agentName }) {
+  if (!failure || !connectionId) return []
+  const state = readRequestState(connectionId, { dir })
+  const ids = [...new Set(requestIds)].filter((id) => state.open.get(id)?.kind === 'command' && !state.open.get(id)?.answered)
+  if (ids.length === 0) return []
+  await post({
+    connection_id: connectionId,
+    agent_name: agentName,
+    message: fitRoomMessage(uncertainTurnFailureMessage(failure, agentName), {
+      whereRest: `The full error is in ${agentName}'s terminal.`,
+    }),
+    complete_turn: true,
+  })
+  for (const id of ids) appendRequestEvent(connectionId, { op: 'answered', id }, { dir })
+  return ids
 }
 
 /** What the room is told. */
