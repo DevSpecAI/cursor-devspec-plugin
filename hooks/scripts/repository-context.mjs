@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
 import { deliveryReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
+import { cursorProcessOf, processStartTime } from './close-on-end.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -178,19 +179,29 @@ export function renderRepositorySnapshot(snapshot, {includeRules=true}={}) {
  * the agent, and drops every hook's note on a step when all of them together pass its
  * ceiling (hook-context-budget.mjs), so printing the line proves nothing. The line
  * comes back after every step until the agent is seen reading all of it, and again
- * whenever the context changes, back to an earlier text included (`deliveryReadThrough`). sessionStart offers it even after it was
- * read, since a new or resumed chat may not hold it.
+ * whenever the context changes (back to an earlier text included), in a new or resumed
+ * chat, and after a compaction (`deliveryReadThrough`, `beginRulesDelivery`).
  */
-export function repositoryContextHook(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE}={}) {
+export function repositoryContextHook(input, {home=os.homedir(),force=false,share=force?SESSION_START_CONTEXT_SHARE:POST_TOOL_CONTEXT_SHARE,host=hostSession}={}) {
   const id = firingConversation(input)
   if (!id) return null
   const snapshot = readRepositorySnapshot(id,home)
   if (!snapshot) return null
+  // A session start (a new or resumed chat) begins a new delivery: the chat may not
+  // hold the rules any more, whatever was read before.
+  if (force) beginRulesDelivery(id,home)
   const note = writeNote(renderRepositorySnapshot(snapshot),{home})
-  // The delivery is this generation of the context, never its text: rules changed and
-  // changed back are owed again, however often that text was read before.
-  const read = deliveryReadThrough(`${snapshotFile(id,home)}.delivery`, input, {note:note.id, generation:snapshot.generation ?? 1}, {home})
-  if (read && !force) return null
+  // The delivery is this change of the context (generation), in this session (epoch:
+  // session starts and compactions; host: the Cursor process, so a resume that Cursor
+  // runs no sessionStart for still begins one), never its text: rules changed and
+  // changed back, a resumed chat, a compacted one, are all owed a whole read again.
+  const key = {
+    note: note.id,
+    generation: snapshot.generation ?? 1,
+    epoch: read(sessionFile(id,home))?.epoch ?? 0,
+    host: typeof host === 'function' ? host() : host ?? null,
+  }
+  if (deliveryReadThrough(`${snapshotFile(id,home)}.delivery`, input, key, {home})) return null
   const content = pointToNote(note, {
     share,
     what: `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`,
@@ -199,7 +210,38 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false,shar
   return content===null ? null : {additional_context:content}
 }
 
+/** Where this conversation's session count is kept: one more for each session start and compaction. */
+const sessionFile = (id, home) => `${snapshotFile(id,home)}.session`
+
+/** Begin a new delivery of the rules for conversation `id`: a session start, a resume or a compaction. */
+export function beginRulesDelivery(id, home = os.homedir()) {
+  if (!id) return null
+  const epoch = (Number.isInteger(read(sessionFile(id,home))?.epoch) ? read(sessionFile(id,home)).epoch : 0) + 1
+  write(sessionFile(id,home),{epoch})
+  return epoch
+}
+
+/**
+ * The Cursor process this hook runs under, as `pid:start time`: a new process is a new
+ * or resumed chat. Null where it cannot be told (Windows), where session starts and
+ * compactions still begin new deliveries.
+ */
+export function hostSession() {
+  try {
+    const pid = cursorProcessOf(process.pid)
+    return pid ? `${pid}:${processStartTime(pid) ?? ''}` : null
+  } catch {
+    return null
+  }
+}
+
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+  // preCompact: the summary that replaces the conversation may not keep the rules, so a
+  // new delivery begins. Cursor reads nothing from this hook's output.
+  if (process.argv[2]==='compact') {
+    try { beginRulesDelivery(firingConversation(JSON.parse(fs.readFileSync(0,'utf8')))) } catch {}
+    process.exit(0)
+  }
   try { const result=repositoryContextHook(JSON.parse(fs.readFileSync(0,'utf8')),{force:process.argv[2]==='start'});if(result)process.stdout.write(JSON.stringify(result)) }
   catch { process.stdout.write(JSON.stringify({additional_context:'DevSpec project repository context is unavailable; no local repository or push readiness was verified.'})) }
 }

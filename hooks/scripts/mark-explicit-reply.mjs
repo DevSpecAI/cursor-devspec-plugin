@@ -45,7 +45,7 @@ import {
   tellPersonNoteText,
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
-import { handOver, postToolUseOutput } from './hook-context-budget.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 
 function readStdin() {
   try {
@@ -182,12 +182,6 @@ export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) 
   return recordTellPerson(connectionId, { dir: connDir })
 }
 
-/** The note a message the person has not heard was handed over in, until the agent reads it. */
-const TELL_PERSON_UNREAD_SUFFIX = '.tell-person-unread.json'
-function tellPersonUnreadPath(connectionId, dir) {
-  return path.join(dir, `${connectionId}${TELL_PERSON_UNREAD_SUFFIX}`)
-}
-
 /**
  * The hook output handing the agent a message Stop could not post (notice-reply.mjs,
  * `leaveTellPersonNote`), or null when there is none. Only the conversation that holds
@@ -210,8 +204,8 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os
   }
   if (!data || typeof data !== 'object' || data.agent_id) return null
   const connDir = dir ?? path.join(home, '.devspec', 'remote-control', 'connections')
-  // This runs after every tool call: one directory read settles that nothing is waiting.
-  if (!anyTellPersonNote(connDir)) return null
+  // This runs after every tool call: two directory reads settle that nothing is waiting.
+  if (!anyTellPersonNote(connDir, home)) return null
   const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
   const connectionId = loadState(conversationId)?.connection_id
   if (!connectionId) return null
@@ -220,7 +214,7 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os
   try {
     // One delivery at a time: new messages join one still unread in a new delivery,
     // and only a whole read of the current delivery ends it (`handOver`).
-    context = handOver(tellPersonUnreadPath(connectionId, connDir), data, {
+    context = handOver(handOverPrefix('tell', connectionId), data, {
       add: tellPersonNoteText(notes),
       what: 'A message your person has not heard, handed back to you by the DevSpec plugin,',
       also: 'Do what it says.',
@@ -234,13 +228,17 @@ export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os
   return context === null ? null : JSON.stringify(postToolUseOutput(context))
 }
 
-/** Whether any connection has a note waiting (`leaveTellPersonNote`). */
-function anyTellPersonNote(connDir) {
-  try {
-    return fs.readdirSync(connDir).some((name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX) || name.endsWith(TELL_PERSON_UNREAD_SUFFIX))
-  } catch {
-    return false
+/** Whether any connection has a message waiting (`leaveTellPersonNote`) or handed over and not yet read. */
+function anyTellPersonNote(connDir, home) {
+  const any = (dir, test) => {
+    try {
+      return fs.readdirSync(dir).some(test)
+    } catch {
+      return false
+    }
   }
+  return any(connDir, (name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX)) ||
+    any(path.join(home, '.devspec', 'notes', 'pending'), (name) => name.startsWith('tell-'))
 }
 
 const MODE = process.argv[2] ?? null

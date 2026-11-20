@@ -32,7 +32,7 @@ import { withoutStandInPrefix } from './git-observer.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
-import { handOver, handOverFile, postToolUseOutput } from './hook-context-budget.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 
 const LOOKUP_TIMEOUT_MS = 8_000
 
@@ -105,7 +105,7 @@ export async function handleBashPost(hookInput, deps = {}) {
   // What the person must do reaches the agent as a note, offered after every step
   // until the agent has read it whole (hook-context-budget.mjs): Cursor gives no sign
   // that a hook's note arrived.
-  const context = handOver(handOverFile('repo-link', sessionId, { home }), hookInput, {
+  const context = handOver(handOverPrefix('repo-link', sessionId), hookInput, {
     add: found?.text ?? null,
     what: 'A note about linking this repository to its DevSpec project',
     home,

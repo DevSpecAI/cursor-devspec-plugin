@@ -4,7 +4,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { selectProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { beginRulesDelivery, storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { buildOwnerMessageEvents, parseWakeBatches } from './devspec-remote-wait.mjs'
 import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingress-test-fixtures.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
@@ -38,10 +40,12 @@ test('full facts and rules always go to a note, offered after every step until t
  assert.equal(repositoryContextHook(readCall(note.file),{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'other'},{home}),null)
- // A new or resumed chat is offered it again at its start.
+ // A new or resumed chat begins a new delivery at its start: owed until read again.
  assert.equal(repositoryContextHook({conversation_id:'one'},{home,force:true}).additional_context,line)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}).additional_context,line,'the session start\'s pointer may have been dropped')
+ assert.equal(repositoryContextHook(readCall(note.file),{home}),null)
  storeRepositorySnapshot('one',{...reg,instructions_unchanged:true,project_agent_rules:undefined,owner_agent_rules:undefined},home)
- assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'the same context, already read')
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'the same context, already read in this session')
  // Changed context is a new note, offered until read in turn.
  storeRepositorySnapshot('one',{...reg,project_agent_rules:'Changed project rules'},home)
  const changed=repositoryContextHook({conversation_id:'one'},{home}).additional_context
@@ -107,6 +111,37 @@ test('rules changed and changed back are owed again: A, then B, then A needs a n
  // Storing the same context again is no change, and owes nothing.
  storeRepositorySnapshot('one',rulesA,home)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
+}))
+
+test('a resumed chat (a new Cursor process) and a compaction each begin a new delivery, owed until read in it',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ const run=(host,input={conversation_id:'one'})=>repositoryContextHook(input,{home,host})?.additional_context ?? null
+ const line=run('111:aaa')
+ const readAll=(host)=>{for(const file of noteFiles(home,noteIdIn(line))) run(host,catCall(home,file))}
+ readAll('111:aaa')
+ assert.equal(run('111:aaa'),null,'read in this process')
+ // `cursor-agent --resume` is a new process, whether or not Cursor runs sessionStart for it.
+ assert.equal(run('222:bbb'),line,'a resumed chat is owed the rules again')
+ assert.equal(run('222:bbb'),line,'until it reads them')
+ readAll('222:bbb')
+ assert.equal(run('222:bbb'),null)
+ // preCompact: the summary may not keep the rules.
+ beginRulesDelivery('one',home)
+ assert.equal(run('222:bbb'),line,'owed again after a compaction')
+ readAll('222:bbb')
+ assert.equal(run('222:bbb'),null)
+}))
+
+test('the preCompact hook, run as Cursor runs it, begins a new delivery',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ const line=repositoryContextHook({conversation_id:'one'},{home,host:'h'}).additional_context
+ for(const file of noteFiles(home,noteIdIn(line))) repositoryContextHook(catCall(home,file),{home,host:'h'})
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,host:'h'}),null)
+ const hooks=JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),'..','hooks.json'),'utf8')).hooks.preCompact
+ for(const entry of hooks) execFileSync('sh',['-c',entry.command],{input:JSON.stringify({conversation_id:'one',trigger:'auto'}),env:{PATH:process.env.PATH,HOME:home,CLAUDE_PLUGIN_ROOT:path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')}})
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,host:'h'})?.additional_context,line)
 }))
 
 test('a small project goes to the note too, with the same short line',()=>setup(home=>{

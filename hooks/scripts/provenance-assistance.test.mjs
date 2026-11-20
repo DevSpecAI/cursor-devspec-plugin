@@ -561,6 +561,35 @@ describe('online reference confirmation', () => {
 })
 
 describe('claim observation and commit decisions', () => {
+  it('takes in a commit note whose own command never reported back, however much later the next step comes', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    // The commit ran, but its command failed afterwards: Cursor sends postToolUseFailure,
+    // never this call's postToolUse.
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'failed-1' }), null)
+    const later = Date.now() + 3 * 24 * 60 * 60 * 1000
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Read', tool_use_id: 'other-2', tool_input: { file_path: '/x' } }, { stateRoot, home: stateRoot, nowMs: later })
+    const id = noteIdIn(out?.additional_context)
+    assert.ok(id, 'offered at the next step, three days on')
+    assert.equal(readNoteText(id, { home: stateRoot }), unlinkedCommitText())
+  })
+
+  it('keeps a commit note in the state when its hand-over cannot be written, and hands it over once it can', { skip: process.getuid?.() === 0 && 'root writes anywhere' }, () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-7' }), null)
+    const notes = path.join(stateRoot, '.devspec', 'notes')
+    fs.mkdirSync(notes, { recursive: true })
+    fs.chmodSync(notes, 0o500)
+    try {
+      assert.throws(() => handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Shell', tool_use_id: 'plain-7' }, { stateRoot, home: stateRoot }))
+    } finally {
+      fs.chmodSync(notes, 0o700)
+    }
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Read', tool_use_id: 'next-1', tool_input: { file_path: '/x' } }, { stateRoot, home: stateRoot })
+    assert.equal(readNoteText(noteIdIn(out?.additional_context), { home: stateRoot }), unlinkedCommitText(), 'still waiting, and handed over now')
+  })
+
   it('offers a commit note after every step until the agent has read it whole, never just because it was printed', () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()

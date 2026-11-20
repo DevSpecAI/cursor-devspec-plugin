@@ -25,7 +25,7 @@ import {
   notePointer,
   deliveryReadThrough,
   handOver,
-  handOverFile,
+  handOverPrefix,
   postToolUseOutput,
   readNoteText,
   seal,
@@ -153,7 +153,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
 
   it('hands over until read, and a message added while one is unread joins it in a new delivery', () => {
     const home = tempHome()
-    const file = handOverFile('test', 'one', { home })
+    const file = handOverPrefix('test', 'one')
     const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
     const offer = (input, add = null) => handOver(file, input, { add, what: 'A note', home })
     assert.equal(offer(ls), null, 'nothing waiting')
@@ -333,5 +333,139 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     assert.equal(unseal(sealed.slice(3), 'DevSpec room page 0123456789abcdef'), null, 'head cut off')
     assert.equal(unseal(sealed.replace('one', 'won'), 'DevSpec room page 0123456789abcdef'), null, 'changed')
     assert.equal(unseal(sealed, 'DevSpec room page fedcba9876543210'), null, 'another page')
+  })
+
+  /** Every delivery file waiting under a prefix, and the note each names. */
+  const pendingNotes = (home, prefix) => {
+    const dir = path.join(home, '.devspec', 'notes', 'pending')
+    try {
+      return fs.readdirSync(dir).filter((name) => name.startsWith(prefix)).map((name) => /([0-9a-f]{16})\.json$/.exec(name)[1])
+    } catch {
+      return []
+    }
+  }
+  const asRoot = typeof process.getuid === 'function' && process.getuid() === 0
+
+  it('never drops or replaces a waiting note because part of it cannot be read; says so, and how to retry', { skip: asRoot && 'root reads any file' }, () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const offer = (input, add = null) => handOver(prefix, input, { add, what: 'A note', home })
+    const first = offer(ls, `first ${'x'.repeat(NOTE_PART_CHARS)} first-end`)
+    const firstId = /notes\/([0-9a-f]{16})\.md/.exec(first)[1]
+    const [, part2] = noteFiles(home, firstId)
+    fs.chmodSync(part2, 0o000)
+    try {
+      const both = offer(ls, 'second message')
+      // Not joined (the first could not be read back), and not replaced: both wait.
+      assert.deepEqual(pendingNotes(home, prefix).length, 2)
+      assert.ok(both.includes(`cat ~/.devspec/notes/${firstId}.md`), 'the first is still offered')
+      assert.match(both, new RegExp(`Part 2 of it could not be read back just now; retry with \`cat ~/\\.devspec/notes/${firstId}\\.2\\.md\``))
+      assert.ok(pendingNotes(home, prefix).some((id) => id !== firstId && readNoteText(id, { home }) === 'second message'))
+    } finally {
+      fs.chmodSync(part2, 0o600)
+    }
+    for (const file of noteFiles(home, firstId)) offer(catCall(home, file))
+    assert.equal(pendingNotes(home, prefix).length, 1, 'the first, read whole, is done; the second still waits')
+    assert.match(offer(ls), /This line comes back/)
+  })
+
+  it('still offers a delivery whose record cannot be read, by the note its name gives', () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const first = handOver(prefix, ls, { add: 'a message', what: 'A note', home })
+    const id = /notes\/([0-9a-f]{16})\.md/.exec(first)[1]
+    fs.writeFileSync(path.join(home, '.devspec', 'notes', 'pending', `${prefix}${id}.json`), '{ not json')
+    assert.equal(handOver(prefix, ls, { what: 'A note', home }), first)
+    assert.equal(handOver(prefix, catCall(home, noteFiles(home, id)[0]), { what: 'A note', home }), null, 'and a whole read still ends it')
+  })
+
+  it('offers every waiting note when they do not all fit: short notices and a count of the rest, none dropped', () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const dir = path.join(home, '.devspec', 'notes', 'pending')
+    fs.mkdirSync(dir, { recursive: true })
+    const ids = Array.from({ length: 30 }, (_, i) => writeNote(`message ${i}`, { home }).id)
+    ids.forEach((id, i) => fs.writeFileSync(path.join(dir, `${prefix}${id}.json`), JSON.stringify({ note: id, generation: i + 1, parts: [] })))
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const offered = handOver(prefix, ls, { what: 'A note', home })
+    assert.ok(offered.length <= POST_TOOL_CONTEXT_SHARE, `${offered.length} characters`)
+    const shown = ids.filter((id) => offered.includes(id))
+    assert.ok(shown.length > 0 && shown.length < ids.length)
+    assert.match(offered, new RegExp(`${ids.length - shown.length} more DevSpec notes are waiting`))
+    // Reading the ones shown brings the rest forward; nothing is lost on the way.
+    for (const id of shown) handOver(prefix, catCall(home, noteFiles(home, id)[0]), { what: 'A note', home })
+    const next = handOver(prefix, ls, { what: 'A note', home })
+    assert.ok(ids.filter((id) => !shown.includes(id)).every((id) => pendingNotes(home, prefix).includes(id)))
+    assert.ok(ids.filter((id) => !shown.includes(id)).some((id) => next.includes(id)))
+  })
+
+  it('loses nothing over a long random run of adds, reads, cut reads, unreadable parts and broken records', { skip: asRoot && 'root reads any file' }, () => {
+    const random = generator(424242)
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const offer = (input, add = null) => handOver(prefix, input, { add, what: 'A note', home })
+    const undelivered = new Set()
+    const locked = new Set()
+    for (let step = 0; step < 300; step += 1) {
+      const roll = random()
+      const waiting = pendingNotes(home, prefix)
+      if (roll < 0.35) {
+        const text = `message-${step} ${'y'.repeat(Math.floor(random() * 2 * NOTE_PART_CHARS))}`
+        undelivered.add(`message-${step} `)
+        offer(ls, text)
+      } else if (roll < 0.6 && waiting.length) {
+        // A whole read of one waiting delivery, part by part.
+        const id = waiting[Math.floor(random() * waiting.length)]
+        const files = noteFiles(home, id)
+        if (files.some((file) => locked.has(file))) continue
+        const text = readNoteText(id, { home })
+        files.forEach((file) => offer(catCall(home, file)))
+        if (!pendingNotes(home, prefix).includes(id)) for (const marker of undelivered) if (text.includes(marker)) undelivered.delete(marker)
+      } else if (roll < 0.7 && waiting.length) {
+        // A read Cursor cut: head and tail kept.
+        const file = noteFiles(home, waiting[0])[0]
+        if (locked.has(file)) continue
+        const whole = fs.readFileSync(file, 'utf8')
+        offer({ ...catCall(home, file), tool_output: JSON.stringify({ output: `${whole.slice(0, 50)}\n...\n${whole.slice(-150)}`, exitCode: 0 }) })
+      } else if (roll < 0.85 && waiting.length) {
+        // A part that cannot be read for a while.
+        const files = noteFiles(home, waiting[Math.floor(random() * waiting.length)])
+        const file = files[Math.floor(random() * files.length)]
+        if (locked.has(file)) { fs.chmodSync(file, 0o600); locked.delete(file) } else { fs.chmodSync(file, 0o000); locked.add(file) }
+      } else if (waiting.length) {
+        // A delivery record broken on disk.
+        fs.writeFileSync(path.join(home, '.devspec', 'notes', 'pending', `${prefix}${waiting[0]}.json`), 'broken')
+      }
+      // The invariant: whatever was handed over and not yet read whole is still in a waiting note.
+      for (const file of locked) fs.chmodSync(file, 0o600)
+      const kept = pendingNotes(home, prefix).map((id) => readNoteText(id, { home }) ?? '').join('\n')
+      for (const file of locked) fs.chmodSync(file, 0o000)
+      for (const marker of undelivered) assert.ok(kept.includes(marker), `step ${step}: ${marker} was lost`)
+    }
+    for (const file of locked) fs.chmodSync(file, 0o600)
+  })
+
+  it('loses nothing when hooks for parallel tool calls add to the same hand-over at once', async () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const module = new URL('./hook-context-budget.mjs', import.meta.url).href
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    handOver(prefix, ls, { add: 'already waiting', what: 'A note', home })
+    const { spawn } = await import('node:child_process')
+    const add = (text) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', `
+        const { handOver } = await import(${JSON.stringify(module)})
+        handOver(${JSON.stringify(prefix)}, ${JSON.stringify(ls)}, { add: ${JSON.stringify(text)}, what: 'A note', home: ${JSON.stringify(home)} })
+      `], { stdio: 'ignore' })
+      child.on('error', reject)
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))))
+    })
+    const texts = Array.from({ length: 12 }, (_, i) => `parallel message ${i}`)
+    await Promise.all(texts.map(add))
+    const kept = pendingNotes(home, prefix).map((id) => readNoteText(id, { home })).join('\n')
+    for (const text of ['already waiting', ...texts]) assert.ok(kept.includes(text), `${text} was lost`)
   })
 })

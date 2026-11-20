@@ -613,6 +613,32 @@ describe('the final message of a notice-only turn', () => {
     assert.equal(tellPersonNoteText([]), null)
   })
 
+  it('puts the message back when its hand-over cannot be written, and hands it over once it can', { skip: process.getuid?.() === 0 && 'root writes anywhere' }, async () => {
+    const postToolUse = () => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(HERE, 'mark-explicit-reply.mjs'), 'postToolUse'], {
+        env: { PATH: process.env.PATH, HOME: home, CURSOR_CONVERSATION_ID: CONVERSATION },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      child.stdout.on('data', (d) => { stdout += d })
+      child.on('error', reject)
+      child.on('close', () => resolve(stdout))
+      child.stdin.end(JSON.stringify({ conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' } }))
+    })
+    leaveTellPersonNote(CONN, { text: 'Reopened the task Brandon closed.', dir })
+    const notes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notes, { recursive: true })
+    fs.chmodSync(notes, 0o500)
+    try {
+      assert.equal(await postToolUse(), '', 'nothing could be written, so nothing is offered')
+    } finally {
+      fs.chmodSync(notes, 0o700)
+    }
+    assert.equal(fs.existsSync(tellPersonNotePath(CONN, dir)), true, 'the message was put back')
+    const out = JSON.parse(await postToolUse()).additional_context
+    assert.match(readNoteText(noteIdIn(out), { home }), /Reopened the task Brandon closed\./)
+  })
+
   it('hands the message over whole in a note, offered after every step until the agent reads it', async () => {
     // The hook as Cursor runs it, in this conversation's home.
     const postToolUse = (call = { tool_name: 'Shell', tool_input: { command: 'ls' } }) => new Promise((resolve, reject) => {

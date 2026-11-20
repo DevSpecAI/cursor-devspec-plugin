@@ -28,7 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
-import { fitHookContext, handOver, handOverFile } from './hook-context-budget.mjs'
+import { fitHookContext, handOver, handOverPrefix } from './hook-context-budget.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
@@ -897,13 +897,6 @@ function prunePending(pending, now = Date.now()) {
   )
 }
 
-function pruneNotes(notes, now = Date.now()) {
-  return Object.fromEntries(
-    Object.entries(normalizePendingNotes(notes))
-      .filter(([, value]) => withinObservationWindow(value?.at, now)),
-  )
-}
-
 function pruneClaims(claims, now = Date.now()) {
   return (claims || []).filter((claim) => claim.id && claim.project_id && withinObservationWindow(claim.observed_at, now))
 }
@@ -915,7 +908,9 @@ function pruneUnrecorded(entries, now = Date.now()) {
 function readPrunedState(conversationId, stateRoot, nowMs) {
   const state = readConversationState(conversationId, stateRoot)
   state.pending_stamps = prunePending(state.pending_stamps, nowMs)
-  state.pending_notes = pruneNotes(state.pending_notes, nowMs)
+  // Commit notes are never pruned by age: one is removed only once it is in a hand-over
+  // (postToolUse), which in turn is cleared only by a whole read.
+  state.pending_notes = normalizePendingNotes(state.pending_notes)
   state.active_claims = pruneClaims(state.active_claims, nowMs)
   state.unrecorded_claims = pruneUnrecorded(state.unrecorded_claims, nowMs)
   return state
@@ -1133,16 +1128,20 @@ export function handleHook(mode, data, options = {}) {
     // A note about a commit that went untracked must reach the agent, and Cursor gives
     // no sign that a hook's note did (hook-context-budget.mjs): it is handed over as a
     // note and offered after every step until the agent has read that delivery whole.
-    const pendingNote = toolUseId ? state.pending_notes[toolUseId] : null
-    const commitNote = handOver(handOverFile('commit', conversationId, { home }), data, {
-      add: pendingNote?.text ?? null,
+    // Every commit note still waiting is taken in, not only this call's: a commit whose
+    // command failed after committing never gets its own postToolUse, and its note must
+    // still arrive. Each is removed from the state only once it is in a hand-over.
+    const pendingIds = Object.keys(state.pending_notes)
+      .sort((a, b) => String(state.pending_notes[a].at).localeCompare(String(state.pending_notes[b].at)))
+    const commitNote = handOver(handOverPrefix('commit', conversationId), data, {
+      add: pendingIds.length ? pendingIds.map((id) => state.pending_notes[id].text).join('\n\n---\n\n') : null,
       what: 'A DevSpec note about a commit you made',
       home,
     })
     const said = commitNote ? [commitNote] : []
     let changed = false
-    if (pendingNote) {
-      delete state.pending_notes[toolUseId]
+    for (const id of pendingIds) {
+      delete state.pending_notes[id]
       changed = true
     }
     // Saying that a reference was added is offered once: the commit is right either way.

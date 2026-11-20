@@ -53,6 +53,84 @@
  *   commit is right whether or not the agent hears it), and the edit reminder to claim
  *   a task (the same advice reaches the agent where it matters, at the commit: in the
  *   git stand-in's own output, or in the commit note above).
+ *
+ * THE INVARIANT, and every path that could break it. Pending content is cleared only by
+ * a proven whole read (`readThrough`: every part, by its seal, in the current delivery).
+ * Each path below either keeps to it or only ever errs towards offering again; each has
+ * a test (named in brackets, in the test file beside the module).
+ *
+ * Kinds of content:
+ *  1. Rules and repositories (repository-context.mjs): a delivery is keyed by the
+ *     note, the change generation, the session count and the Cursor process; the
+ *     pointer is offered until that key's delivery is read whole. [rules always go to
+ *     a note…; A, then B, then A…]
+ *  2. A message the person has not heard (mark-explicit-reply.mjs): taken from its
+ *     queue only into a hand-over, and put back if the hand-over cannot be written.
+ *     [hands the message over whole in a note…]
+ *  3. A commit note (provenance-assistance.mjs): kept in the state, never pruned by
+ *     age, until it is in a hand-over; every waiting note is taken in, not only the
+ *     current call's, so one whose command failed after committing still arrives.
+ *     [offers a commit note after every step…; takes in a commit note whose own command
+ *     never reported back…]
+ *  4. A pin problem (pin-check.mjs) and 5. the repository-link reminder
+ *     (repo-link-nudge.mjs): hand-overs; their hooks run while one waits. A link
+ *     reminder is marked as said only once it is in a hand-over. [offers it after
+ *     every step…; is found once per conversation…; the hooks.json filters…]
+ *  6. Room messages (room-unread.mjs): read only when the reader's page came back
+ *     whole, or, for one kept as a note, when every part of that note did; the read
+ *     record, not the pending files, is the truth, so losing a pending file only means
+ *     the reader shows a message again. [marks nothing read when what came back is not
+ *     the whole page…; hands over a message with a huge attachment list…]
+ *
+ * Receipts and read records:
+ *  7. A read counts for one delivery only: the same text handed over again starts
+ *     with nothing read. [counts a delivery read only when every part came back whole…]
+ *  8. A record that cannot be read starts its delivery again, never ends it; a
+ *     hand-over whose record is broken is still offered, by the note its file name
+ *     gives. [still offers a delivery whose record cannot be read]
+ *  9. A cut read (Cursor kept head and tail), a changed body, a failed command, an
+ *     output over the Shell rules, or a command that only mentions a note never counts.
+ *     [never counts a command that only mentions a note…; counts a part read only when
+ *     the whole of it came back…]
+ *
+ * Sessions:
+ * 10. Session start (a new or resumed chat): a new rules delivery. [full facts and
+ *     rules…: the session start's pointer]
+ * 11. Resume without sessionStart (an installed plugin's sessionStart did not run in
+ *     terminal sessions, 20 Nov): a new Cursor process is a new rules delivery
+ *     (`hostSession`; not available on Windows, where 10 and 12 still apply). [a
+ *     resumed chat…]
+ * 12. Compaction: the preCompact hook begins a new rules delivery. [the preCompact
+ *     hook, run as Cursor runs it…]
+ * 13. New chat: a new conversation, with deliveries of its own; what waits for an
+ *     earlier chat stays waiting there, offered when that chat runs again. A helper
+ *     agent's tool calls are its own conversation, so its reads never count for its
+ *     parent. Rules are owed again per session because they are standing instructions;
+ *     messages, notes and room messages are owed once, until read once.
+ *
+ * Failures:
+ * 14. A part that cannot be read back: nothing is joined, replaced or dropped; the new
+ *     text becomes its own delivery and the pointer says which part failed and how to
+ *     retry. [never drops or replaces a waiting note because part of it cannot be read]
+ * 15. A write that fails: nothing is marked; the content stays at its source (a
+ *     message is put back, a commit note stays in the state, a link reminder is not
+ *     marked as said; a pin problem is raised again when the pin is next written).
+ *     [keeps a commit note in the state when its hand-over cannot be written…; puts the
+ *     message back when its hand-over cannot be written…]
+ * 16. More waiting than fits a hook's share: short notices and a count of the rest,
+ *     all offered again next step; none dropped. [offers every waiting note when they
+ *     do not all fit…]
+ * 17. Any mix of the above over time. [loses nothing over a long random run…]
+ *
+ * Concurrency:
+ * 18. Hooks for parallel tool calls can update the same records. Notes are written once
+ *     and never changed (named by their own content); every record is replaced whole,
+ *     atomically; a joined hand-over is written before the one it replaces is removed.
+ *     So a lost update can only lose read progress (the note is offered again), or
+ *     leave content offered twice, never remove content that was not read. A page the
+ *     reader printed twice in parallel confirms only the last one; the other's
+ *     messages are shown again. [loses nothing when hooks for parallel tool calls add
+ *     to the same hand-over at once; loses nothing over a long random run…]
  */
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
@@ -395,61 +473,136 @@ export function readThrough(record, input, { home = os.homedir() } = {}) {
 }
 
 /**
- * The delivery kept at `file` of note `note`, at `generation` (whatever marks this
- * delivery: a change counter, or the note itself), brought up to date with this tool
- * call: a different note or generation starts a new delivery with nothing read. Returns
- * whether this delivery has been read through.
+ * The delivery kept at `file`, identified by `key` (its note and whatever else marks
+ * this delivery: a change counter, the session, the host process), brought up to date
+ * with this tool call. A key that differs in anything starts a new delivery with
+ * nothing read. Returns whether this delivery has been read through. A record that
+ * cannot be read starts the delivery again (more reading, never less).
  */
-export function deliveryReadThrough(file, input, { note, generation }, { home = os.homedir() } = {}) {
+export function deliveryReadThrough(file, input, key, { home = os.homedir() } = {}) {
   const kept = readPrivateJson(file)
-  const current = kept?.note === note && kept?.generation === generation ? kept : { note, generation, parts: [] }
+  const same = kept && Object.entries(key).every(([field, value]) => kept[field] === value)
+  const current = same ? kept : { ...key, parts: [] }
   const { record, done } = readThrough(current, input, { home })
-  if (kept?.note !== record.note || kept?.generation !== record.generation || (kept?.parts?.length ?? 0) !== record.parts.length) {
-    writePrivateJson(file, record)
-  }
+  if (!same || (kept?.parts?.length ?? 0) !== record.parts.length) writePrivateJson(file, record)
   return done
 }
 
-/** Where a hand-over waiting to be read is kept for one hook (`kind`) and conversation. */
-export function handOverFile(kind, conversation, { home = os.homedir() } = {}) {
-  const key = createHash('sha256').update(String(conversation || 'none')).digest('hex').slice(0, 16)
-  return path.join(home, NOTES_DIR, 'pending', `${kind}-${key}.json`)
+const PENDING_DIR = path.join(NOTES_DIR, 'pending')
+
+/** The file-name prefix of one hook's (`kind`) hand-overs for one conversation. */
+export function handOverPrefix(kind, conversation) {
+  return `${kind}-${createHash('sha256').update(String(conversation || 'none')).digest('hex').slice(0, 16)}-`
+}
+
+/** The deliveries waiting under `prefix`, oldest first; a record that cannot be read is still a delivery of the note its name gives. */
+function pendingDeliveries(prefix, home) {
+  const dir = path.join(home, PENDING_DIR)
+  let names
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+  const deliveries = []
+  for (const name of names) {
+    const match = name.startsWith(prefix) ? /-([0-9a-f]{16})\.json$/.exec(name) : null
+    if (!match || name.slice(prefix.length).length !== match[0].length - 1) continue
+    const file = path.join(dir, name)
+    const kept = readPrivateJson(file)
+    deliveries.push({
+      file,
+      record: {
+        note: match[1],
+        generation: Number.isInteger(kept?.generation) ? kept.generation : 0,
+        parts: Array.isArray(kept?.parts) ? kept.parts : [],
+        at: typeof kept?.at === 'string' ? kept.at : '',
+      },
+    })
+  }
+  return deliveries.sort((a, b) => a.record.generation - b.record.generation || a.record.at.localeCompare(b.record.at))
+}
+
+/** Which parts of note `id` cannot be read back from disk just now. */
+function unreadableParts(id, home) {
+  const parts = noteParts(id, { home })
+  if (parts === 0) return [1]
+  const missing = []
+  for (let part = 1; part <= parts; part += 1) if (notePartBody(id, part, parts, home) === null) missing.push(part)
+  return missing
 }
 
 /**
- * Text that must reach the agent, handed over as a note and offered after every step
- * until that delivery has been read whole, then forgotten. `add` is new text: it joins
- * an unread delivery in a new note, or starts one; either way a new delivery, with
- * nothing read. The record lives at `file`. Returns the pointer to offer at this step,
- * or null when nothing is waiting. A failed write throws, so the caller can keep what it
- * was adding.
+ * Text that must reach the agent in one conversation, handed over as a note and
+ * offered after every step until that delivery has been read whole. Each delivery is
+ * its own file under ~/.devspec/notes/pending, named by `prefix` and its note, and only
+ * a proven whole read of it removes it (`readThrough`); nothing else does.
+ *
+ * `add` is new text. It joins the newest unread delivery in a new note when that one's
+ * text can be read back, and the old delivery is removed only once the joined one is
+ * written. When it cannot be read back, nothing is joined or replaced: the new text is
+ * a delivery of its own, and both wait. A failed write throws, so the caller can keep
+ * what it was adding.
+ *
+ * Returns what to offer at this step, or null when nothing is waiting: a pointer to
+ * each waiting delivery, saying when part of one could not be read back and how to
+ * retry. When they do not all fit `share`, shorter notices, and a count of the rest,
+ * which come back at the next step.
  */
-export function handOver(file, input, { add = null, what, also = '', share = POST_TOOL_CONTEXT_SHARE, home = os.homedir() } = {}) {
-  let record = readPrivateJson(file)
-  if (record && typeof record.note === 'string') {
-    const { record: updated, done } = readThrough(record, input, { home })
+export function handOver(prefix, input, { add = null, what, also = '', share = POST_TOOL_CONTEXT_SHARE, home = os.homedir() } = {}) {
+  let waiting = []
+  for (const delivery of pendingDeliveries(prefix, home)) {
+    const { record, done } = readThrough(delivery.record, input, { home })
     if (done) {
-      fs.rmSync(file, { force: true })
-      record = null
-    } else if (updated.parts.length !== (record.parts?.length ?? 0)) {
-      writePrivateJson(file, updated)
-      record = updated
+      fs.rmSync(delivery.file, { force: true })
+      continue
     }
-  } else {
-    record = null
+    if (record.parts.length !== delivery.record.parts.length) writePrivateJson(delivery.file, record)
+    waiting.push({ file: delivery.file, record })
   }
   if (typeof add === 'string' && add.trim()) {
-    const earlier = record ? readNoteText(record.note, { home }) : null
-    const note = writeNote(earlier ? `${earlier}\n\n---\n\n${add}` : add, { home })
-    record = { note: note.id, generation: (record?.generation ?? 0) + 1, parts: [] }
+    const newest = waiting.at(-1)
+    const earlier = newest ? readNoteText(newest.record.note, { home }) : null
+    const note = writeNote(earlier !== null ? `${earlier}\n\n---\n\n${add}` : add, { home })
+    const record = {
+      note: note.id,
+      generation: Math.max(0, ...waiting.map((each) => each.record.generation)) + 1,
+      parts: [],
+      at: new Date().toISOString(),
+    }
+    const file = path.join(home, PENDING_DIR, `${prefix}${note.id}.json`)
     writePrivateJson(file, record)
+    if (earlier !== null && newest.file !== file) {
+      fs.rmSync(newest.file, { force: true })
+      waiting = waiting.slice(0, -1)
+    }
+    waiting = [...waiting.filter((each) => each.file !== file), { file, record }]
   }
-  if (!record) return null
-  return pointToNote({ id: record.note, command: noteCommand(record.note) }, {
-    share,
-    what,
-    also: `${also}${also ? ' ' : ''}This line comes back after each step until you have read it.`.trim(),
+  if (waiting.length === 0) return null
+  const again = 'This line comes back after each step until you have read it.'
+  const pointers = waiting.map(({ record }) => {
+    const note = { id: record.note, command: noteCommand(record.note) }
+    const missing = unreadableParts(record.note, home)
+    const retry = missing.length
+      ? `Part ${missing.join(', ')} of it could not be read back just now; retry with ${missing.map((part) => `\`${noteCommand(record.note, part)}\``).join(', ')}.`
+      : ''
+    return { note, retry, text: pointToNote(note, { share, what, also: [also, retry, again].filter(Boolean).join(' ') }) }
   })
+  const full = pointers.map((each) => each.text).join('\n\n')
+  if (pointers.every((each) => each.text !== null) && full.length <= share) return full
+  // Too many to describe in full: the short notice for each, as many as fit, and a
+  // count of the rest. Nothing is dropped: every one is offered again next step.
+  const notices = []
+  for (const each of pointers) {
+    const line = `${noteNotice(each.note)}${each.retry ? ` ${each.retry}` : ''}`
+    const rest = pointers.length - notices.length - 1
+    const tail = rest > 0 ? `\n${rest} more DevSpec note${rest === 1 ? ' is' : 's are'} waiting; they come back at the next step.` : ''
+    if ([...notices, line].join('\n').length + tail.length > share) break
+    notices.push(line)
+  }
+  const rest = pointers.length - notices.length
+  if (notices.length === 0) return null
+  return `${notices.join('\n')}${rest > 0 ? `\n${rest} more DevSpec note${rest === 1 ? ' is' : 's are'} waiting; they come back at the next step.` : ''}`
 }
 
 /** The shortest way to say a note is waiting: fixed text and a fixed-length command. */

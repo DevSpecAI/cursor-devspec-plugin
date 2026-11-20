@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gitRoot } from './devspec-scope.mjs'
-import { handOver, handOverFile, postToolUseOutput } from './hook-context-budget.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 
 const PIN_RELATIVE = path.join('.devspec', 'project.json')
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
@@ -118,7 +118,7 @@ export function checkPinAfterTool(input, deps = {}) {
   // read it whole (hook-context-budget.mjs).
   const conversation = input?.conversation_id || input?.conversationId || input?.session_id || null
   return postToolUseOutput(
-    handOver(handOverFile('pin', conversation, { home: deps.home }), input, {
+    handOver(handOverPrefix('pin', conversation), input, {
       add: messages.length ? messages.join(' ') : null,
       what: 'What is wrong with the DevSpec pin you just wrote',
       home: deps.home,
