@@ -28,7 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
-import { fitHookContext, handOver, handOverPrefix } from './hook-context-budget.mjs'
+import { fitHookContext, handOver, handOverPrefix, POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
@@ -1133,9 +1133,16 @@ export function handleHook(mode, data, options = {}) {
     // still arrive. Each is removed from the state only once it is in a hand-over.
     const pendingIds = Object.keys(state.pending_notes)
       .sort((a, b) => String(state.pending_notes[a].at).localeCompare(String(state.pending_notes[b].at)))
+    // Saying that a reference was added is offered once: the commit is right either way.
+    // It is one short line of fixed shape, and the hand-over keeps to what is left of
+    // the share, so the two always fit together.
+    const stamp = toolUseId && state.pending_stamps[toolUseId]
+      ? `DevSpec appended [devspec:${state.pending_stamps[toolUseId].task_id}] to the commit message that just ran.`
+      : null
     const commitNote = handOver(handOverPrefix('commit', conversationId), data, {
       add: pendingIds.length ? pendingIds.map((id) => state.pending_notes[id].text).join('\n\n---\n\n') : null,
       what: 'A DevSpec note about a commit you made',
+      share: stamp ? POST_TOOL_CONTEXT_SHARE - stamp.length - 2 : POST_TOOL_CONTEXT_SHARE,
       home,
     })
     const said = commitNote ? [commitNote] : []
@@ -1144,9 +1151,8 @@ export function handleHook(mode, data, options = {}) {
       delete state.pending_notes[id]
       changed = true
     }
-    // Saying that a reference was added is offered once: the commit is right either way.
-    if (toolUseId && state.pending_stamps[toolUseId]) {
-      said.push(`DevSpec appended [devspec:${state.pending_stamps[toolUseId].task_id}] to the commit message that just ran.`)
+    if (stamp) {
+      said.push(stamp)
       delete state.pending_stamps[toolUseId]
       changed = true
     }

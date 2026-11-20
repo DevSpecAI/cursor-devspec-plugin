@@ -18,7 +18,13 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
+  fitsShellOutput,
+  handOverLineMax,
   hookContextShare,
+  noteCommand,
+  noteNotice,
+  noteStatusCommand,
+  noteStatusText,
   NOTE_PART_BYTES,
   NOTE_PART_CHARS,
   noteParts,
@@ -158,7 +164,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     const offer = (input, add = null) => handOver(file, input, { add, what: 'A note', home })
     assert.equal(offer(ls), null, 'nothing waiting')
     const first = offer(ls, 'first message')
-    assert.match(first, /This line comes back after each step until you have read it\.$/)
+    assert.match(first, /\n\n1 DevSpec note is waiting for you; it comes back after each step until you have read it whole\.$/)
     assert.equal(offer(ls), first, 'offered again until read')
     const joined = offer(ls, 'second message')
     const id = /notes\/([0-9a-f]{16})\.md/.exec(joined)[1]
@@ -360,14 +366,19 @@ describe('fitHookContext, the one way a hook hands context over', () => {
       // Not joined (the first could not be read back), and not replaced: both wait.
       assert.deepEqual(pendingNotes(home, prefix).length, 2)
       assert.ok(both.includes(`cat ~/.devspec/notes/${firstId}.md`), 'the first is still offered')
-      assert.match(both, new RegExp(`Part 2 of it could not be read back just now; retry with \`cat ~/\\.devspec/notes/${firstId}\\.2\\.md\``))
+      // The pointer only says that some parts could not be read; the details are in the status file.
+      assert.ok(both.includes(`Some parts of it could not be read back just now; see \`cat ~/.devspec/notes/${firstId}.status.md\`.`))
+      const status = fs.readFileSync(path.join(home, '.devspec', 'notes', `${firstId}.status.md`), 'utf8')
+      assert.match(status, /1 of its 2 parts could not be read back from disk just now \(part 2\)/)
+      assert.ok(status.includes(`Part 1 is \`cat ~/.devspec/notes/${firstId}.md\`, and part N is \`cat ~/.devspec/notes/${firstId}.N.md\``))
       assert.ok(pendingNotes(home, prefix).some((id) => id !== firstId && readNoteText(id, { home }) === 'second message'))
     } finally {
       fs.chmodSync(part2, 0o600)
     }
     for (const file of noteFiles(home, firstId)) offer(catCall(home, file))
     assert.equal(pendingNotes(home, prefix).length, 1, 'the first, read whole, is done; the second still waits')
-    assert.match(offer(ls), /This line comes back/)
+    assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes', `${firstId}.status.md`)), false, 'its status went with it')
+    assert.match(offer(ls), /1 DevSpec note is waiting for you; it comes back/)
   })
 
   it('still offers a delivery whose record cannot be read, by the note its name gives', () => {
@@ -393,12 +404,103 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     assert.ok(offered.length <= POST_TOOL_CONTEXT_SHARE, `${offered.length} characters`)
     const shown = ids.filter((id) => offered.includes(id))
     assert.ok(shown.length > 0 && shown.length < ids.length)
-    assert.match(offered, new RegExp(`${ids.length - shown.length} more DevSpec notes are waiting`))
+    assert.match(offered, new RegExp(`\\n${ids.length} DevSpec notes are waiting for you \\(${ids.length - shown.length} not listed here\\); they come back after each step until you have read each one whole\\.$`))
     // Reading the ones shown brings the rest forward; nothing is lost on the way.
     for (const id of shown) handOver(prefix, catCall(home, noteFiles(home, id)[0]), { what: 'A note', home })
     const next = handOver(prefix, ls, { what: 'A note', home })
     assert.ok(ids.filter((id) => !shown.includes(id)).every((id) => pendingNotes(home, prefix).includes(id)))
     assert.ok(ids.filter((id) => !shown.includes(id)).some((id) => next.includes(id)))
+  })
+
+  it('with eight waiting, several with many unreadable parts, every step still brings the count, as many fixed-size pointers as fit, and the readable notes first', () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const dir = path.join(home, '.devspec', 'notes', 'pending')
+    fs.mkdirSync(dir, { recursive: true })
+    // Oldest first, an unreadable one oldest of all. Each unreadable one is a 60-part
+    // note with 50 parts gone: listed in the hook's output, as before, its retry
+    // commands alone were longer than the hook's share, and nothing at all came out.
+    const plan = ['broken', 'readable', 'broken', 'broken', 'readable', 'broken', 'readable', 'readable']
+    const long = (i) => Array.from({ length: 60 * 18 }, (_, line) => `${i}:${line} ${'z'.repeat(990)}`).join('\n')
+    const notes = plan.map((kind, i) => {
+      const note = writeNote(kind === 'readable' ? `readable message ${i}` : long(i), { home })
+      if (kind === 'broken') {
+        assert.equal(note.parts, 60)
+        for (const file of noteFiles(home, note.id).slice(1, 51)) fs.rmSync(file)
+      }
+      fs.writeFileSync(path.join(dir, `${prefix}${note.id}.json`), JSON.stringify({ note: note.id, generation: i + 1, parts: [], at: `2026-11-20T00:00:0${i}Z` }))
+      return { kind, id: note.id }
+    })
+    const readable = notes.filter((note) => note.kind === 'readable')
+    const broken = notes.filter((note) => note.kind === 'broken')
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const lineMax = handOverLineMax({ what: 'A note', total: 8 })
+    const readableLine = noteNotice({ command: noteCommand(readable[0].id) }).length
+    const brokenLine = `${noteNotice({ command: noteCommand(broken[0].id) })} Some parts of it could not be read back just now; see \`${noteStatusCommand(broken[0].id)}\`.`.length
+    const countLine = (shown) => new RegExp(`(^|\\n)8 DevSpec notes are waiting for you${shown < 8 ? ` \\(${8 - shown} not listed here\\)` : ''}; they come back after each step until you have read each one whole\\.$`)
+    for (const share of [POST_TOOL_CONTEXT_SHARE, 1_000, 600, 300, 140]) {
+      for (let step = 0; step < 3; step += 1) {
+        const offered = handOver(prefix, ls, { what: 'A note', share, home })
+        assert.ok(offered, `share ${share}: something always comes out`)
+        assert.ok(offered.length <= share, `share ${share}: ${offered.length} characters`)
+        const lines = offered.split('\n').filter(Boolean)
+        for (const line of lines) assert.ok(line.length <= lineMax, `share ${share}: a ${line.length}-character line, over ${lineMax}`)
+        const listed = notes
+          .filter((note) => offered.includes(noteCommand(note.id)))
+          .sort((a, b) => offered.indexOf(noteCommand(a.id)) - offered.indexOf(noteCommand(b.id)))
+        assert.match(offered, countLine(listed.length), `share ${share}: the count line ends every step`)
+        // Readable notes are offered before any unreadable one.
+        assert.deepEqual(listed.map((note) => note.kind), plan.slice().sort((a, b) => (a === b ? 0 : a === 'readable' ? -1 : 1)).slice(0, listed.length))
+        if (listed.length < 8) {
+          // As many as fit: the next one in line would not have.
+          const used = lines.slice(0, -1).reduce((sum, line) => sum + line.length + 1, 0)
+          const next = listed.length < readable.length ? readableLine : brokenLine
+          assert.ok(used + next + 1 + lines.at(-1).length > share, `share ${share}: ${listed.length} listed, but another would have fitted`)
+        }
+        if (share >= 1_000) assert.ok(readable.every((note) => offered.includes(noteCommand(note.id))), `share ${share}: every readable note is offered`)
+      }
+    }
+    // An unreadable note's details are in its status file, which fits one Shell page.
+    const status = fs.readFileSync(path.join(home, '.devspec', 'notes', `${broken[0].id}.status.md`), 'utf8')
+    assert.ok(fitsShellOutput(status))
+    assert.match(status, /50 of its 60 parts could not be read back from disk just now \(parts 2-51\)/)
+    // The readable ones read, the unreadable ones come forward, still counted and still waiting.
+    for (const note of readable) handOver(prefix, catCall(home, noteFiles(home, note.id)[0]), { what: 'A note', home })
+    const after = handOver(prefix, ls, { what: 'A note', home })
+    assert.ok(broken.every((note) => after.includes(noteCommand(note.id)) && after.includes(noteStatusCommand(note.id))))
+    assert.match(after, /\n\n4 DevSpec notes are waiting for you; they come back after each step until you have read each one whole\.$/)
+    assert.deepEqual(pendingNotes(home, prefix).sort(), broken.map((note) => note.id).sort())
+  })
+
+  it("keeps an unreadable note's status to one Shell page, however many parts are damaged", () => {
+    const id = '0123456789abcdef'
+    assert.match(noteStatusText(id, 12, [2, 3, 4, 7, 9, 10]), /6 of its 12 parts could not be read back from disk just now \(parts 2-4, 7, 9-10\)/)
+    assert.match(noteStatusText(id, 0, [1]), /its first part could not be read back from disk just now, so how many parts it has is not known yet/)
+    const every = Array.from({ length: 9_000 }, (_, i) => i + 1).filter((part) => part % 2 === 0)
+    const status = noteStatusText(id, 9_000, every)
+    assert.ok(fitsShellOutput(status), `${status.length} characters`)
+    assert.match(status, /4500 of its 9000 parts could not be read back from disk just now \(too many to list here: the first is part 2 and the last part 9000\)/)
+    assert.ok(status.includes(`part N is \`cat ~/.devspec/notes/${id}.N.md\``))
+  })
+
+  it('still says, in a line of the same fixed size, that parts could not be read when even the status cannot be written', { skip: asRoot && 'root writes anywhere' }, () => {
+    const home = tempHome()
+    const prefix = handOverPrefix('test', 'one')
+    const ls = { conversation_id: 'one', tool_name: 'Shell', tool_input: { command: 'ls' } }
+    const first = handOver(prefix, ls, { add: `start ${'x'.repeat(NOTE_PART_CHARS)} end`, what: 'A note', home })
+    const id = /notes\/([0-9a-f]{16})\.md/.exec(first)[1]
+    fs.rmSync(noteFiles(home, id)[1])
+    const notes = path.join(home, '.devspec', 'notes')
+    fs.chmodSync(notes, 0o500)
+    try {
+      const offered = handOver(prefix, ls, { what: 'A note', home })
+      assert.ok(offered.includes(`\`cat ~/.devspec/notes/${id}.md\``))
+      assert.ok(offered.includes('Some parts of it could not be read back just now, nor its status written; it comes back at the next step.'))
+      for (const line of offered.split('\n')) assert.ok(line.length <= handOverLineMax({ what: 'A note' }))
+    } finally {
+      fs.chmodSync(notes, 0o700)
+    }
+    assert.ok(handOver(prefix, ls, { what: 'A note', home }).includes(noteStatusCommand(id)), 'and points at the status once it can be written')
   })
 
   it('loses nothing over a long random run of adds, reads, cut reads, unreadable parts and broken records', { skip: asRoot && 'root reads any file' }, () => {

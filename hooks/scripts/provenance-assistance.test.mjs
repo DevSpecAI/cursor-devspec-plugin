@@ -27,7 +27,7 @@ import {
 import { unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
-import { readNoteText } from './hook-context-budget.mjs'
+import { POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
 
 const PROJECT = '11111111-2222-3333-4444-555555555555'
 const ITEM_A = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -667,6 +667,19 @@ describe('claim observation and commit decisions', () => {
     }, { stateRoot, pinOptions: { home, repoRoot: repo } })
     assert.match(reported?.additional_context || '', new RegExp(`appended \\[devspec:${ITEM_A}\\]`))
     assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'], undefined)
+  })
+
+  it('says a reference was added beside a waiting commit note, both within the share and the note pointed at directly', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'first'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-3' }), null)
+    observeClaim(stateRoot)
+    assert.equal(pre("git commit -m 'second'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'stamp-3' })?.permission, 'allow')
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Shell', tool_use_id: 'stamp-3', cwd: repo }, { stateRoot, home: stateRoot })
+    const context = out?.additional_context || ''
+    assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE, `${context.length} characters`)
+    assert.match(context, new RegExp(`\\nDevSpec appended \\[devspec:${ITEM_A}\\] to the commit message that just ran\\.$`))
+    assert.equal(readNoteText(noteIdIn(context), { home: stateRoot }), unlinkedCommitText(), 'the commit note itself, not a note wrapping its pointer')
   })
 
   it('resets pre-cutover transient pending_stamps entries without deleting active_claims or nudged_projects', () => {

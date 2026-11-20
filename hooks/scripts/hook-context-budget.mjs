@@ -110,16 +110,26 @@
  *
  * Failures:
  * 14. A part that cannot be read back: nothing is joined, replaced or dropped; the new
- *     text becomes its own delivery and the pointer says which part failed and how to
- *     retry. [never drops or replaces a waiting note because part of it cannot be read]
+ *     text becomes its own delivery. The pointer gains one fixed-length sentence naming
+ *     the note's status file, which says which parts failed and how to retry; the
+ *     details never go in the hook's output, so they cannot make it too long. The
+ *     status itself fits one Shell page; one that cannot be written leaves a fixed
+ *     sentence saying so, and the note comes back next step. [never drops or replaces
+ *     a waiting note because part of it cannot be read; keeps an unreadable note's
+ *     status to one Shell page…; still says, in a line of the same fixed size…]
  * 15. A write that fails: nothing is marked; the content stays at its source (a
  *     message is put back, a commit note stays in the state, a link reminder is not
  *     marked as said; a pin problem is raised again when the pin is next written).
  *     [keeps a commit note in the state when its hand-over cannot be written…; puts the
  *     message back when its hand-over cannot be written…]
- * 16. More waiting than fits a hook's share: short notices and a count of the rest,
- *     all offered again next step; none dropped. [offers every waiting note when they
- *     do not all fit…]
+ * 16. More waiting than fits a hook's share: every line of a hand-over has a fixed
+ *     largest size whatever the notes hold (`handOverLineMax`); room for the count line
+ *     is kept before any pointer is laid out, so it always arrives; readable deliveries
+ *     are listed before ones with unreadable parts, so those never crowd out the rest;
+ *     short notices stand for each when not all pointers fit, and the count line says
+ *     how many are not listed. All are offered again next step; none dropped. [offers
+ *     every waiting note when they do not all fit…; with eight waiting, several with
+ *     many unreadable parts, every step still brings the count…]
  * 17. Any mix of the above over time. [loses nothing over a long random run…]
  *
  * Concurrency:
@@ -523,13 +533,80 @@ function pendingDeliveries(prefix, home) {
   return deliveries.sort((a, b) => a.record.generation - b.record.generation || a.record.at.localeCompare(b.record.at))
 }
 
-/** Which parts of note `id` cannot be read back from disk just now. */
+/** How many parts note `id` has, and which of them cannot be read back from disk just now. */
 function unreadableParts(id, home) {
   const parts = noteParts(id, { home })
-  if (parts === 0) return [1]
+  if (parts === 0) return { parts, missing: [1] }
   const missing = []
   for (let part = 1; part <= parts; part += 1) if (notePartBody(id, part, parts, home) === null) missing.push(part)
-  return missing
+  return { parts, missing }
+}
+
+/** The status file of note `id`: which of its parts could not be read back, and how to retry. */
+export function noteStatusCommand(id) {
+  return `cat ~/.devspec/notes/${id}.status.md`
+}
+
+function noteStatusFile(id, home) {
+  return path.join(home, NOTES_DIR, `${id}.status.md`)
+}
+
+/** `[1, 2, 3, 7, 9, 10]` as `1-3, 7, 9-10`. */
+function partRanges(list) {
+  const ranges = []
+  for (const part of list) {
+    const last = ranges.at(-1)
+    if (last && part === last[1] + 1) last[1] = part
+    else ranges.push([part, part])
+  }
+  return ranges.map(([from, to]) => (from === to ? `${from}` : `${from}-${to}`)).join(', ')
+}
+
+/**
+ * What note `id`'s status file says when `missing` of its `parts` cannot be read back:
+ * which parts, and the command for each, so the pointer itself only ever says that
+ * some could not, in a line of fixed length. The list of parts is given whole while
+ * the status still fits one Shell page (`fitsShellOutput`); for a note with thousands
+ * of damaged parts it gives how many, and the first and the last, and says the rest
+ * are too many to list.
+ */
+export function noteStatusText(id, parts, missing) {
+  const retry =
+    `Part 1 is \`${noteCommand(id)}\`` + (parts > 1 ? `, and part N is \`${noteCommand(id, 'N')}\`, with N the part's number` : '')
+  const status = (which) =>
+    (parts > 0
+      ? `DevSpec note ${id}: ${missing.length} of its ${parts} parts could not be read back from disk just now (${which}).\n`
+      : `DevSpec note ${id}: its first part could not be read back from disk just now, so how many parts it has is not known yet.\n`) +
+    `Retry each one: ${retry}.\n` +
+    'The plugin offers this note again after each step until every part of it has been read whole. ' +
+    'If a part still cannot be read, tell the person that a DevSpec note could not be read, and give them its id.\n'
+  const text = status(`part${missing.length === 1 ? '' : 's'} ${partRanges(missing)}`)
+  return fitsShellOutput(text) ? text : status(`too many to list here: the first is part ${missing[0]} and the last part ${missing.at(-1)}`)
+}
+
+/**
+ * Keeps note `id`'s status file (`noteStatusText`) beside it while any part cannot be
+ * read back: written only when it changes, removed once every part can be read again.
+ * Returns whether the status file is there to read.
+ */
+function writeNoteStatus(id, { parts, missing }, home) {
+  const file = noteStatusFile(id, home)
+  if (missing.length === 0) {
+    fs.rmSync(file, { force: true })
+    return false
+  }
+  const text = noteStatusText(id, parts, missing)
+  try {
+    if (fs.readFileSync(file, 'utf8') === text) return true
+  } catch {
+    // not written yet, or unreadable: write it
+  }
+  try {
+    writePrivateText(file, text)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -544,10 +621,16 @@ function unreadableParts(id, home) {
  * a delivery of its own, and both wait. A failed write throws, so the caller can keep
  * what it was adding.
  *
- * Returns what to offer at this step, or null when nothing is waiting: a pointer to
- * each waiting delivery, saying when part of one could not be read back and how to
- * retry. When they do not all fit `share`, shorter notices, and a count of the rest,
- * which come back at the next step.
+ * Returns what to offer at this step, or null when nothing is waiting. Every line of
+ * it has a fixed largest size, whatever the notes hold (`handOverLineMax`): a pointer
+ * is fixed text, the caller's fixed `what` and `also`, and a fixed-length command; a
+ * delivery with parts that cannot be read back adds one fixed-length sentence pointing
+ * at that note's status file (`noteStatusCommand`), which holds the details. Room for
+ * the count line is kept before any pointer is laid out, so the count of waiting notes
+ * always arrives. Readable deliveries are offered before ones with unreadable parts,
+ * oldest first within each, so a note that cannot be read never crowds out one that
+ * can. When not every pointer fits `share`, the short notice stands for each, as many
+ * as fit, and the count line says how many are not listed; all come back next step.
  */
 export function handOver(prefix, input, { add = null, what, also = '', share = POST_TOOL_CONTEXT_SHARE, home = os.homedir() } = {}) {
   let waiting = []
@@ -555,6 +638,7 @@ export function handOver(prefix, input, { add = null, what, also = '', share = P
     const { record, done } = readThrough(delivery.record, input, { home })
     if (done) {
       fs.rmSync(delivery.file, { force: true })
+      fs.rmSync(noteStatusFile(record.note, home), { force: true })
       continue
     }
     if (record.parts.length !== delivery.record.parts.length) writePrivateJson(delivery.file, record)
@@ -579,30 +663,66 @@ export function handOver(prefix, input, { add = null, what, also = '', share = P
     waiting = [...waiting.filter((each) => each.file !== file), { file, record }]
   }
   if (waiting.length === 0) return null
-  const again = 'This line comes back after each step until you have read it.'
-  const pointers = waiting.map(({ record }) => {
+  const offers = waiting.map(({ record }) => {
     const note = { id: record.note, command: noteCommand(record.note) }
-    const missing = unreadableParts(record.note, home)
-    const retry = missing.length
-      ? `Part ${missing.join(', ')} of it could not be read back just now; retry with ${missing.map((part) => `\`${noteCommand(record.note, part)}\``).join(', ')}.`
-      : ''
-    return { note, retry, text: pointToNote(note, { share, what, also: [also, retry, again].filter(Boolean).join(' ') }) }
+    const status = unreadableParts(record.note, home)
+    const unreadable = status.missing.length > 0
+    return { note, unreadable, said: unreadableSentence(note.id, unreadable, writeNoteStatus(note.id, status, home)) }
   })
-  const full = pointers.map((each) => each.text).join('\n\n')
-  if (pointers.every((each) => each.text !== null) && full.length <= share) return full
-  // Too many to describe in full: the short notice for each, as many as fit, and a
-  // count of the rest. Nothing is dropped: every one is offered again next step.
-  const notices = []
-  for (const each of pointers) {
-    const line = `${noteNotice(each.note)}${each.retry ? ` ${each.retry}` : ''}`
-    const rest = pointers.length - notices.length - 1
-    const tail = rest > 0 ? `\n${rest} more DevSpec note${rest === 1 ? ' is' : 's are'} waiting; they come back at the next step.` : ''
-    if ([...notices, line].join('\n').length + tail.length > share) break
-    notices.push(line)
+  // Readable first, so one that cannot be read never crowds out one that can.
+  const order = [...offers.filter((each) => !each.unreadable), ...offers.filter((each) => each.unreadable)]
+  const total = order.length
+  // The count line's room is kept first: it is the one line that always arrives.
+  const room = share - countLine(total, 0).length
+  if (room < 0) return null
+  const full = order.map((each) => notePointer(each.note, { what, also: [also, each.said].filter(Boolean).join(' ') }))
+  if (full.join('\n\n').length + 2 <= room) return `${full.join('\n\n')}\n\n${countLine(total, total)}`
+  const lines = []
+  let used = 0
+  for (const each of order) {
+    const line = [noteNotice(each.note), each.said].filter(Boolean).join(' ')
+    if (used + line.length + 1 > room) break
+    lines.push(line)
+    used += line.length + 1
   }
-  const rest = pointers.length - notices.length
-  if (notices.length === 0) return null
-  return `${notices.join('\n')}${rest > 0 ? `\n${rest} more DevSpec note${rest === 1 ? ' is' : 's are'} waiting; they come back at the next step.` : ''}`
+  return [...lines, countLine(total, lines.length)].join('\n')
+}
+
+/**
+ * The fixed-length sentence a pointer carries when part of its note cannot be read
+ * back: it names the note's status file, or, when even that could not be written,
+ * says the note comes back at the next step.
+ */
+function unreadableSentence(id, unreadable, statusWritten) {
+  if (!unreadable) return ''
+  return statusWritten
+    ? `Some parts of it could not be read back just now; see \`${noteStatusCommand(id)}\`.`
+    : 'Some parts of it could not be read back just now, nor its status written; it comes back at the next step.'
+}
+
+/** The line that always ends a hand-over: how many notes wait, how many are not listed above, and that they come back. */
+function countLine(total, shown) {
+  const one = total === 1
+  const unlisted = total - shown
+  return (
+    `${total} DevSpec note${one ? ' is' : 's are'} waiting for you` +
+    (unlisted > 0 ? ` (${unlisted} not listed here)` : '') +
+    `; ${one ? 'it comes' : 'they come'} back after each step until you have read ${one ? 'it' : 'each one'} whole.`
+  )
+}
+
+/**
+ * The longest line `handOver` can emit for a caller's fixed `what` and `also`, for
+ * `total` waiting notes: no note's content changes it.
+ */
+export function handOverLineMax({ what, also = '', total = 1 } = {}) {
+  const note = { id: '0'.repeat(16), command: noteCommand('0'.repeat(16)) }
+  const said = [unreadableSentence(note.id, true, true), unreadableSentence(note.id, true, false)]
+  return Math.max(
+    countLine(total, 0).length,
+    ...said.map((each) => notePointer(note, { what, also: [also, each].filter(Boolean).join(' ') }).length),
+    ...said.map((each) => `${noteNotice(note)} ${each}`.length),
+  )
 }
 
 /** The shortest way to say a note is waiting: fixed text and a fixed-length command. */
