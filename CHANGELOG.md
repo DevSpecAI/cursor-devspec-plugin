@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.22.0
+
+- **DevSpec now records who asked for the requirement, inventory and dependency-review changes your Cursor agent makes.** When the agent records, updates, replaces or retracts a requirement, records, revises or retracts an inventory entry, or records a dependency review, the plugin tells DevSpec which request the change serves, as it already did for tasks, memories and documents. Until now DevSpec had to work these out for itself.
+- **Those changes also wait when one turn carries two people's requests**, until the agent says which one it is working on, like every other change that records who asked, so none is credited to the wrong person.
+- **A change is no longer refused because the command it came from has closed.** On a change that records who asked, the plugin used to send the room command the request came from beside the request itself. DevSpec refused the change once that command had closed, for example when a helper agent was still working after the agent had posted its answer, although the request said exactly who asked. The plugin now sends only the request on those changes, and never a command it remembered from earlier.
+- Unchanged: reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those. There is nothing to set.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.21.0
 
 - **A connected Cursor agent that is waiting for work now listens instead of asking.** With remote control on, the plugin keeps one connection open to DevSpec, and DevSpec tells it the moment something arrives for it. While nothing is happening, it no longer asks DevSpec every 25 to 30 seconds whether anything has changed. It checks in once every 45 seconds, so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
