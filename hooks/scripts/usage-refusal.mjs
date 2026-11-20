@@ -69,7 +69,10 @@
  * ## Where it is noticed
  *
  * The poller reads the conversation's transcript every lap (when it has changed) and
- * records each turn end once, in `<connection>.usage-refusal.json`. That does not depend
+ * records each turn end once, in `<connection>.usage-refusal.json`. A transcript counts
+ * as read only once its final line was read and the record read and written: a read or
+ * a write that fails is tried again on the next lap, never skipped as already seen
+ * (requirement 3ea2b201). That does not depend
  * on Cursor running the stop hook, which Cursor skips on some of its own errors
  * (commit 2792b5b, "WritableIterable is closed") and may not run for a plugin at all on
  * some CLI versions (task 659a015f). When Cursor does run the stop hook, it records the
@@ -102,8 +105,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { lastTurnEnd } from './transcript-turn-end.mjs'
+import { STATE_ABSENT, STATE_OK, readPrivateJsonResult, writePrivateJson } from './private-state.mjs'
+import { readLastTurnEnd } from './transcript-turn-end.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -198,7 +201,21 @@ export function usageRefusalPath(connectionId, dir = CONNECTIONS_DIR) {
  * nothing to say.
  */
 function readRecord(connectionId, dir) {
-  const value = readPrivateJson(usageRefusalPath(connectionId, dir))
+  return readRecordResult(connectionId, dir).record
+}
+
+/**
+ * The record, and whether it could be read: `readable` is false when a record is there
+ * but could not be read, so a caller about to replace it must not (it would drop a
+ * standing refusal it could not see).
+ */
+function readRecordResult(connectionId, dir) {
+  const stored = readPrivateJsonResult(usageRefusalPath(connectionId, dir))
+  if (stored.status !== STATE_OK) return { readable: stored.status === STATE_ABSENT, record: { v: 1, seen: null } }
+  return { readable: true, record: recordOf(stored.value) }
+}
+
+function recordOf(value) {
   if (!value || value.v !== 1) return { v: 1, seen: null }
   const record = { v: 1, seen: typeof value.seen === 'string' ? value.seen : null }
   if (value.until === null) record.until = null
@@ -206,11 +223,13 @@ function readRecord(connectionId, dir) {
   return record
 }
 
+/** Whether the record was written. One that was not is read again (observeTurnEnd). */
 function writeRecord(connectionId, dir, record) {
   try {
     writePrivateJson(usageRefusalPath(connectionId, dir), record)
+    return true
   } catch {
-    /* the report is best effort: an unrecorded stop is simply not reported */
+    return false
   }
 }
 
@@ -218,12 +237,14 @@ function writeRecord(connectionId, dir, record) {
  * Record what the transcript's last turn end means, once per turn end. A usage stop
  * whose time is ahead stands; a turn that ran clears a refusal that still stands; any
  * other end leaves the record as it was. `memo` (any object the caller keeps) skips
- * re-reading a transcript that has not changed since the last call.
+ * re-reading a transcript that has not changed since the last call; a transcript counts
+ * as read only once its final line was read and the record was read and, where needed,
+ * written, so a read or a write that failed is tried again on the next call.
  */
 export function observeTurnEnd(connectionId, transcriptPath, { dir = CONNECTIONS_DIR, nowMs = Date.now(), memo = null } = {}) {
   if (!connectionId || !transcriptPath) return
+  let stamp = null
   if (memo) {
-    let stamp
     try {
       const { size, mtimeMs } = fs.statSync(transcriptPath)
       stamp = `${transcriptPath}:${size}:${mtimeMs}`
@@ -231,12 +252,17 @@ export function observeTurnEnd(connectionId, transcriptPath, { dir = CONNECTIONS
       return
     }
     if (memo.stamp === stamp) return
-    memo.stamp = stamp
   }
-  const turnEnd = lastTurnEnd(transcriptPath)
-  if (!turnEnd) return
-  const record = readRecord(connectionId, dir)
-  if (record.seen === turnEnd.key) return
+  const done = () => {
+    if (memo) memo.stamp = stamp
+  }
+  const last = readLastTurnEnd(transcriptPath)
+  if (!last.read) return
+  const turnEnd = last.end
+  if (!turnEnd) return done()
+  const { readable, record } = readRecordResult(connectionId, dir)
+  if (!readable) return
+  if (record.seen === turnEnd.key) return done()
   const outcome = turnEndOutcome(turnEnd, nowMs)
   const next = { v: 1, seen: turnEnd.key }
   if (outcome?.refusedUntilMs > nowMs) {
@@ -246,7 +272,7 @@ export function observeTurnEnd(connectionId, transcriptPath, { dir = CONNECTIONS
   } else if ('until' in record) {
     next.until = record.until
   }
-  writeRecord(connectionId, dir, next)
+  if (writeRecord(connectionId, dir, next)) done()
 }
 
 /**

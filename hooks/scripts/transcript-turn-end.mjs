@@ -196,7 +196,17 @@
  *    error is a notice, a turn that ran ends as before.
  *  - A15 Cursor starts another turn before the notice's attempt end is sent: the
  *    transcript no longer ends at that turn end, so no attempt is ended; the new turn
- *    owns Working.
+ *    owns Working. A read that fails at that point is not taken for a new turn: the
+ *    step is tried again (D1).
+ *  - A16 A read of the transcript fails (it cannot be opened or read, changes while it
+ *    is read, or its final line does not parse), then a later read of the same,
+ *    unchanged file succeeds: the failed read marked nothing as checked, so the later
+ *    one reports the turn end, once. The same holds for the once-a-second check and
+ *    the usage-limit reader (usage-refusal.mjs).
+ *  - A17 The snapshot at handover cannot be read: a pending snapshot keeps the file's
+ *    size and time, and is taken on a later look while the file still has them (the
+ *    same file, so the same snapshot); the turn's end is then reported as any other.
+ *    Once the file has changed it is never taken, and that turn ends as before.
  * Tracking starts in a turn:
  *  - B1 The running turn ends, or a later turn does: never attributed; a turn that ran
  *    ends as before.
@@ -237,6 +247,10 @@
  *  - D3 A request close fails: retried the same way, without telling the room again.
  *  - D4 The notice lands but ending the attempt fails: retried the same way, without a
  *    second notice.
+ *  - D5 A report throws part-way: the claim is given back with what already landed, and
+ *    the next try does the rest (reportHoldingClaim). A claim file that exists but
+ *    cannot be read is never set aside: its progress is unknown, so the poller tries
+ *    again later.
  *
  * ## Failing safe
  *
@@ -247,6 +261,15 @@
  * that read is retried, never used). With no baseline, an unreadable transcript, a line
  * it does not recognise or a sentence it does not know, nothing is attributed; the
  * plugin never answers a command it cannot tie to the turn end beyond doubt.
+ *
+ * Nothing is recorded as checked on a read that did not complete (requirement 3ea2b201:
+ * state advances only for work actually done). The per-lap and once-a-second checks
+ * remember a transcript's size and time only after its final line was read and, for the
+ * lap, only when there is nothing to report; a turn end handed to the caller is
+ * remembered by its report (the claim), which records each step only once it reached
+ * DevSpec and settles only when all have. A failed read, a parse error, a snapshot that
+ * could not be taken, an unreadable claim, and a throw part-way through a report all
+ * leave things where they were, so the next look reads again (A16, A17, D5).
  *
  * ## Known limits
  *
@@ -280,7 +303,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { STATE_ABSENT, STATE_OK, readPrivateJson, readPrivateJsonResult, writePrivateJson } from './private-state.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -323,19 +346,33 @@ export function transcriptConversation(transcriptPath) {
 }
 
 /**
- * The transcript's turn end, or null when its final line is not one: Cursor writes
- * `turn_ended` only as the final line and removes it when the next turn starts. The line
- * is read whole whatever its length, so Cursor's error text is never cut here. `key`
- * identifies this line (the file, where the line sits and what it says), `atMs` is the
- * file's modification time and `stamp` its size and modification time as read.
+ * The transcript's turn end, or null when its final line is not one or it could not be
+ * read (readLastTurnEnd tells the two apart): Cursor writes `turn_ended` only as the
+ * final line and removes it when the next turn starts. The line is read whole whatever
+ * its length, so Cursor's error text is never cut here. `key` identifies this line (the
+ * file, where the line sits and what it says), `atMs` is the file's modification time
+ * and `stamp` its size and modification time as read.
  */
 export function lastTurnEnd(transcriptPath) {
-  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
+  return readLastTurnEnd(transcriptPath).end
+}
+
+/**
+ * Read the transcript's final line: `{ read: true, end }`, `end` the turn end or null
+ * when the final line is not one (or there is no transcript), or `{ read: false, end:
+ * null }` when no whole, unchanged final line could be read (the file could not be
+ * opened or read, changed while it was read, or its final line does not parse yet). A
+ * caller that remembers what it has checked records a file as checked only after a read
+ * that says `read: true`: a failed read is read again (see "Failing safe").
+ */
+export function readLastTurnEnd(transcriptPath) {
+  const failed = { read: false, end: null }
+  if (typeof transcriptPath !== 'string' || !transcriptPath) return { read: true, end: null }
   let fd
   try {
     fd = fs.openSync(transcriptPath, 'r')
-  } catch {
-    return null
+  } catch (error) {
+    return error?.code === 'ENOENT' ? { read: true, end: null } : failed
   }
   let text
   let lineStart = 0
@@ -371,8 +408,10 @@ export function lastTurnEnd(transcriptPath) {
       lineStart = position
     }
     text = Buffer.concat(pieces).toString('utf8').trim()
+    // Rewritten while it was read: what was read may be a piece of either version.
+    if (fileStampOf(fs.fstatSync(fd)) !== stamp) return failed
   } catch {
-    return null
+    return failed
   } finally {
     try {
       fs.closeSync(fd)
@@ -380,20 +419,23 @@ export function lastTurnEnd(transcriptPath) {
       /* nothing to release */
     }
   }
-  if (!text) return null
+  if (!text) return { read: true, end: null }
   let row = null
   try {
     row = JSON.parse(text)
   } catch {
-    return null // a line still being written
+    return failed // a line still being written
   }
-  if (row?.type !== 'turn_ended') return null
+  if (row?.type !== 'turn_ended') return { read: true, end: null }
   return {
-    key: `${transcriptPath}#${lineStart}#${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
-    status: typeof row.status === 'string' ? row.status : null,
-    error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
-    atMs,
-    stamp,
+    read: true,
+    end: {
+      key: `${transcriptPath}#${lineStart}#${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
+      status: typeof row.status === 'string' ? row.status : null,
+      error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
+      atMs,
+      stamp,
+    },
   }
 }
 
@@ -611,32 +653,73 @@ export function turnBaselinePath(connectionId, dir = CONNECTIONS_DIR) {
  * turn marker's `startedAt`): whether Cursor was between turns, how many bytes it keeps
  * when the next turn starts (`kept`: all of it, or all but a final `turn_ended` line)
  * and their digest, and its stamp. With no transcript yet the conversation is between
- * turns with nothing kept. A transcript that cannot be read cleanly leaves no baseline,
- * and that turn's end is then not reported from the transcript. Returns whether one was
- * written.
+ * turns with nothing kept. Returns whether that snapshot was written.
+ *
+ * A transcript that cannot be read cleanly now leaves a pending snapshot instead: the
+ * file's stamp as handover found it. completeTurnBaseline takes the snapshot on a later
+ * look, but only while the file still has that stamp, so it is the snapshot handover
+ * would have taken. Once the file has changed it never is, and that turn's end is not
+ * reported from the transcript (as before this existed).
  */
 export function recordTurnBaseline(connectionId, { turn, conversationId, transcriptPath = null, dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || typeof turn !== 'number') return false
   const conversation = transcriptPath ? transcriptConversation(transcriptPath) : conversationId
   if (!conversation || (conversationId && conversation !== conversationId)) return false
+  const expect = transcriptPath ? fileStamp(transcriptPath) : null
   const read = transcriptPath ? readTranscriptTurns(transcriptPath) : { missing: true }
-  if (!read) return false
+  if (!read) {
+    writeBaseline(connectionId, dir, { v: 4, turn, conversation, pending: true, transcriptPath, expect })
+    return false
+  }
+  return writeBaseline(connectionId, dir, snapshotOf(turn, conversation, read))
+}
+
+function snapshotOf(turn, conversation, read) {
   const between = read.missing ? true : Boolean(read.end)
   const kept = read.missing ? 0 : between ? read.lastLineStart : read.size
+  return {
+    v: 4,
+    turn,
+    conversation,
+    between,
+    kept,
+    keptDigest: read.missing ? digest('') : digestBytes(read.bytes.subarray(0, kept)),
+    stamp: read.missing ? MISSING_STAMP : read.stamp,
+  }
+}
+
+function writeBaseline(connectionId, dir, value) {
   try {
-    writePrivateJson(turnBaselinePath(connectionId, dir), {
-      v: 4,
-      turn,
-      conversation,
-      between,
-      kept,
-      keptDigest: read.missing ? digest('') : digestBytes(read.bytes.subarray(0, kept)),
-      stamp: read.missing ? MISSING_STAMP : read.stamp,
-    })
+    writePrivateJson(turnBaselinePath(connectionId, dir), value)
     return true
   } catch {
     return false
   }
+}
+
+/**
+ * Take a snapshot handover could not read (recordTurnBaseline), now, if the transcript
+ * still has the stamp handover found: then it is the same file, and the snapshot the
+ * same. Returns 'complete' (a snapshot exists for `turn`), 'pending' (not taken yet: the
+ * read failed again, or the baseline could not be read; try again later), or 'none' (no
+ * snapshot for `turn`, and none will be taken: the file has changed, or there never was
+ * one).
+ */
+export function completeTurnBaseline(connectionId, turn, { dir = CONNECTIONS_DIR } = {}) {
+  if (!connectionId || typeof turn !== 'number') return 'none'
+  const stored = readPrivateJsonResult(turnBaselinePath(connectionId, dir))
+  if (stored.status === STATE_ABSENT) return 'none'
+  if (stored.status !== STATE_OK) return 'pending'
+  const value = stored.value
+  if (value?.v !== 4 || value.turn !== turn) return 'none'
+  if (!value.pending) return 'complete'
+  const { transcriptPath, expect, conversation } = value
+  if (typeof transcriptPath !== 'string' || typeof expect !== 'string' || typeof conversation !== 'string') return 'none'
+  if (fileStamp(transcriptPath) !== expect) return 'none'
+  const read = readTranscriptTurns(transcriptPath)
+  if (!read) return 'pending'
+  if (read.missing || read.stamp !== expect) return 'none'
+  return writeBaseline(connectionId, dir, snapshotOf(turn, conversation, read)) ? 'complete' : 'pending'
 }
 
 /** The stamp of a transcript that did not exist yet: any later file differs from it. */
@@ -712,10 +795,23 @@ function progressOf(record) {
   }
 }
 
+/**
+ * A claim record: `record` null when there is none or it is of an older shape (set
+ * aside), and `unreadable` when a file is there but could not be read, so what it
+ * records is unknown.
+ */
+function readClaimResult(file) {
+  const stored = readPrivateJsonResult(file)
+  if (stored.status !== STATE_OK) return { unreadable: stored.status !== STATE_ABSENT, record: null }
+  const record = stored.value
+  if (record?.v !== CLAIM_VERSION || typeof record.turn !== 'string' || !CLAIM_GOALS.has(record.goal)) {
+    return { unreadable: false, record: null }
+  }
+  return { unreadable: false, record }
+}
+
 function readClaim(file) {
-  const record = readPrivateJson(file)
-  if (record?.v !== CLAIM_VERSION || typeof record.turn !== 'string' || !CLAIM_GOALS.has(record.goal)) return null
-  return record
+  return readClaimResult(file).record
 }
 
 /** Whether the process that owns a claim is still running. */
@@ -776,7 +872,9 @@ export function claimTurnEnd(
         fs.linkSync(temporary, target)
       } catch (error) {
         if (error?.code !== 'EEXIST') throw error
-        const existing = readClaim(target)
+        const { unreadable, record: existing } = readClaimResult(target)
+        // Its progress is unknown, so it is never set aside: the caller tries again later.
+        if (unreadable) return { outcome: 'failed', ...none }
         const earlier = typeof after === 'number' && Date.parse(existing?.at ?? '') < after
         if (existing && !earlier) {
           const held = progressOf(existing)
@@ -865,6 +963,26 @@ export function settleTurnEnd(connectionId, identity, { reported = false, notice
 }
 
 /**
+ * Run `report` (an async function) while this process holds the claim of `identity`. If
+ * it throws part-way, the claim is given back, keeping the progress already recorded, so
+ * the next try, or the other path, does what is left; `onError` hears why. Returns what
+ * `report` returns, or 'retry' after a throw.
+ */
+export async function reportHoldingClaim(connectionId, identity, report, { dir = CONNECTIONS_DIR, pid = process.pid, onError = null } = {}) {
+  try {
+    return await report()
+  } catch (error) {
+    settleTurnEnd(connectionId, identity, { dir, pid })
+    try {
+      onError?.(error)
+    } catch {
+      /* hearing why is best effort */
+    }
+    return 'retry'
+  }
+}
+
+/**
  * How the poller tries again after a report of its own did not reach DevSpec: at most
  * REPORT_ATTEMPTS tries, REPORT_RETRY_MS apart. The spacing is the room post's own
  * 15-second timeout, so a try never overlaps the last; five tries ride out a dropped
@@ -912,16 +1030,24 @@ function fileStamp(transcriptPath) {
 /**
  * Cheap check, for the poller's once-a-second local check: whether the transcript of a
  * tracked turn has changed to end in a turn end since this was last asked. True once per
- * change; the poller's lap then decides with transcriptTurnEnd.
+ * change; the poller's lap then decides with transcriptTurnEnd. A change is counted as
+ * looked at only once its final line was read: after a failed read it is read again on
+ * the next check. It also takes a snapshot handover could not read, while it still can
+ * (completeTurnBaseline).
  */
-export function turnEndPending({ marker, transcriptPath, memo = {} }) {
+export function turnEndPending({ marker, transcriptPath, dir = CONNECTIONS_DIR, connectionId = null, memo = {} }) {
   if (typeof marker?.startedAt !== 'number' || !transcriptPath) return false
+  if (connectionId && memo.baseline !== marker.startedAt) {
+    if (completeTurnBaseline(connectionId, marker.startedAt, { dir }) !== 'pending') memo.baseline = marker.startedAt
+  }
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return false
   const seen = `${marker.startedAt}|${transcriptPath}|${stamp}`
   if (memo.probed === seen) return false
+  const last = readLastTurnEnd(transcriptPath)
+  if (!last.read) return false
   memo.probed = seen
-  return recognisedEnd(lastTurnEnd(transcriptPath))
+  return recognisedEnd(last.end)
 }
 
 /**
@@ -931,35 +1057,43 @@ export function turnEndPending({ marker, transcriptPath, memo = {} }) {
  * tracked command's turn end beyond doubt; when false the caller only tells the room
  * about an error or a stop. `memo` (any object the caller keeps) skips a transcript that
  * has not changed since it was last decided.
+ *
+ * A transcript is recorded as decided only once it was read whole and the answer is
+ * that there is nothing to report. A read that failed, a baseline that could not be
+ * read, and a turn end handed back to the caller are not recorded, so the next look
+ * decides again: the caller's report decides when that turn end is done.
  */
 export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = CONNECTIONS_DIR, memo = {} }) {
   if (!connectionId || typeof marker?.startedAt !== 'number' || !transcriptPath) return null
+  completeTurnBaseline(connectionId, marker.startedAt, { dir })
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return null
   const seen = `${marker.startedAt}|${transcriptPath}|${stamp}`
   if (memo.decided === seen) return null
-  if (!recognisedEnd(lastTurnEnd(transcriptPath))) {
+  const last = readLastTurnEnd(transcriptPath)
+  if (!last.read) return null
+  const decided = () => {
     memo.decided = seen
     return null
   }
+  if (!recognisedEnd(last.end)) return decided()
   const conversation = transcriptConversation(transcriptPath)
   const baseline = readTurnBaseline(connectionId, marker.startedAt, { dir })
-  if (!baseline || baseline.conversation !== conversation) {
-    memo.decided = seen
-    return null
-  }
+  // No snapshot (yet): nothing to decide against. Not recorded, so a snapshot completed
+  // later, or one that can be read again, is used.
+  if (!baseline) return null
+  if (baseline.conversation !== conversation) return decided()
   const read = readTranscriptTurns(transcriptPath)
-  // Caught mid-write: decided on a later look, never from this one.
+  // Caught mid-write or unreadable: decided on a later look, never from this one.
   if (!read || read.missing) return null
-  memo.decided = seen
-  if (!read.end) return null
+  if (!read.end) return decided()
   // Written since tracking started: the file changed since, and was last written after
   // the marker. A transcript put back with its old modification time is neither.
-  if (read.stamp === baseline.stamp || read.atMs < marker.startedAt) return null
+  if (read.stamp === baseline.stamp || read.atMs < marker.startedAt) return decided()
   const isAttributed = attributable(baseline, read)
   // A turn that ran is reported only when it is the tracked command's; otherwise it
   // ends as before this existed.
-  if (!isAttributed && read.end.status === 'success') return null
+  if (!isAttributed && read.end.status === 'success') return decided()
   return {
     identity: identityOf(conversation, read),
     status: read.end.status,

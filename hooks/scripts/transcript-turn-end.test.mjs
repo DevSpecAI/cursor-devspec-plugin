@@ -30,15 +30,18 @@ import {
   REPORT_ATTEMPTS,
   REPORT_RETRY_MS,
   claimTurnEnd,
+  completeTurnBaseline,
   lastTurnEnd,
   nextReportTry,
   noteTurnEndAttemptEnded,
   noteTurnEndCompleted,
   noteTurnEndNoticed,
   noteTurnEndTold,
+  readLastTurnEnd,
   readTranscriptTurns,
   readTurnBaseline,
   recordTurnBaseline,
+  reportHoldingClaim,
   settleTurnEnd,
   transcriptTurnEnd,
   turnEndClaimed,
@@ -95,6 +98,27 @@ const until = async (condition, ms = 10_000) => {
 function writeTranscript(file, rows) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, rows.map((row) => (typeof row === 'string' ? row : JSON.stringify(row))).join('\n') + '\n')
+}
+
+/**
+ * Make a file unreadable to this process, as a read that fails: false where permissions
+ * do not stop this process reading (root), and the file is put back as it was.
+ * Changing a file's permissions leaves its size and modification time as they were.
+ */
+function makeUnreadable(file) {
+  fs.chmodSync(file, 0o000)
+  try {
+    fs.closeSync(fs.openSync(file, 'r'))
+  } catch {
+    return true
+  }
+  fs.chmodSync(file, 0o600)
+  return false
+}
+const ROOT_READS = 'permissions do not stop this process reading files (root)'
+const stampOf = (file) => {
+  const { size, mtimeMs } = fs.statSync(file)
+  return `${size}:${mtimeMs}`
 }
 
 function scratch() {
@@ -366,6 +390,72 @@ describe('which turn a turn end belongs to', () => {
     assert.equal(decide(dir, transcript, after)?.attributed, true)
   }))
 
+  it('A16 (requirement 3ea2b201): a read that fails marks nothing as checked: the same file, unchanged, read again reports its end', (t) => {
+    const { dir, transcript } = scratch()
+    try {
+      writeTranscript(transcript, connected)
+      track(dir, transcript)
+      writeTranscript(transcript, [...connectedRows, WAKE, ended('error', LIMIT)])
+      const before = stampOf(transcript)
+      const memo = {}
+      const probe = {}
+      const look = () => transcriptTurnEnd({ connectionId: CONNECTION, marker, transcriptPath: transcript, dir, memo })
+      if (!makeUnreadable(transcript)) return t.skip(ROOT_READS)
+      try {
+        assert.deepEqual(readLastTurnEnd(transcript), { read: false, end: null })
+        assert.equal(turnEndPending({ marker, transcriptPath: transcript, memo: probe }), false)
+        assert.equal(look(), null)
+        assert.equal(look(), null)
+      } finally {
+        fs.chmodSync(transcript, 0o600)
+      }
+      assert.equal(stampOf(transcript), before, 'the same size and time')
+      assert.equal(turnEndPending({ marker, transcriptPath: transcript, memo: probe }), true, 'the once-a-second check reads it again')
+      assert.equal(look()?.attributed, true, 'the lap reads it again')
+      assert.equal(turnEndPending({ marker, transcriptPath: transcript, memo: probe }), false, 'and then it is checked')
+
+      // A final line that does not parse yet is not a read either.
+      fs.writeFileSync(transcript, `${JSON.stringify(WAKE)}\n{"type":"turn_ended","sta\n`)
+      assert.deepEqual(readLastTurnEnd(transcript), { read: false, end: null })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('A17: a snapshot handover could not read is taken later from the same, unchanged file, and never once the file has changed', (t) => {
+    const { dir, transcript } = scratch()
+    try {
+      writeTranscript(transcript, connected)
+      if (!makeUnreadable(transcript)) return t.skip(ROOT_READS)
+      try {
+        assert.equal(track(dir, transcript), false, 'no snapshot yet, only a pending one')
+        assert.equal(readTurnBaseline(CONNECTION, marker.startedAt, { dir }), null)
+        assert.equal(completeTurnBaseline(CONNECTION, marker.startedAt, { dir }), 'pending', 'still unreadable')
+      } finally {
+        fs.chmodSync(transcript, 0o600)
+      }
+      assert.equal(completeTurnBaseline(CONNECTION, marker.startedAt, { dir }), 'complete')
+      assert.equal(readTurnBaseline(CONNECTION, marker.startedAt, { dir }).between, true)
+      writeTranscript(transcript, [...connectedRows, WAKE, ended('error', LIMIT)])
+      assert.equal(decide(dir, transcript)?.attributed, true, 'its turn end is reported as any other')
+
+      const later = { startedAt: 5_000 }
+      writeTranscript(transcript, connected)
+      makeUnreadable(transcript)
+      try {
+        assert.equal(track(dir, transcript, later), false)
+      } finally {
+        fs.chmodSync(transcript, 0o600)
+      }
+      writeTranscript(transcript, [...connectedRows, WAKE, answer('Working.')])
+      assert.equal(completeTurnBaseline(CONNECTION, later.startedAt, { dir }), 'none', 'the file changed first: never taken')
+      writeTranscript(transcript, [...connectedRows, WAKE, ended('error', LIMIT)])
+      assert.equal(decide(dir, transcript, later), null, 'that turn ends as before')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('B1/B2 (DevSpec\'s fixture): tracking started while a typed turn ran: its error is only told, never the command\'s answer; a run ends as before', () => inScratch((dir, transcript) => {
     const running = [...connectedRows, typed, answer('Looking.')]
     writeTranscript(transcript, running)
@@ -554,6 +644,30 @@ describe('claiming a turn end', () => {
       noteTurnEndAttemptEnded(CONNECTION, same, { dir })
       settleTurnEnd(CONNECTION, same, { noticed: false, dir })
       assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'poller', goal: 'notice', dir }), { outcome: 'claimed', ...progress({ told: true, ended: true }) }, 'nor the attempt ended twice')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('D5: a report that throws part-way gives the claim back with what landed; a claim that cannot be read is never set aside', async () => {
+    const { dir } = scratch()
+    try {
+      const same = identity(2, WAKE)
+      claimTurnEnd(CONNECTION, same, { by: 'poller', dir })
+      noteTurnEndTold(CONNECTION, same, { dir })
+      const heard = []
+      const outcome = await reportHoldingClaim(CONNECTION, same, async () => {
+        throw new Error('part-way')
+      }, { dir, onError: (error) => heard.push(error.message) })
+      assert.equal(outcome, 'retry')
+      assert.deepEqual(heard, ['part-way'])
+      assert.deepEqual(claimTurnEnd(CONNECTION, same, { by: 'stop', dir }), { outcome: 'claimed', ...progress({ told: true }) }, 'given back, the room not told twice')
+      assert.equal(await reportHoldingClaim(CONNECTION, same, async () => 'reported', { dir }), 'reported')
+
+      const file = path.join(dir, fs.readdirSync(dir).find((name) => name.endsWith('.claim')))
+      fs.writeFileSync(file, '{"v":3,"turn":')
+      assert.equal(claimTurnEnd(CONNECTION, same, { by: 'poller', dir }).outcome, 'failed', 'its progress is unknown')
+      assert.equal(fs.readFileSync(file, 'utf8'), '{"v":3,"turn":', 'left where it was')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -789,7 +903,7 @@ describe('the poller reports a turn end from the transcript when no stop hook ru
       const completedAt = run.stub.calls.find((call) => call.name === 'report_complete').at
       assert.ok(completedAt - endedAt < 5_000, `reported ${completedAt - endedAt} ms after the turn ended`)
       assert.deepEqual(run.completions(), [finished()])
-      assert.equal(run.turnOpen(), false, 'Working is no longer asserted')
+      assert.ok(await until(() => !run.turnOpen()), 'Working is no longer asserted')
       const after = run.stub.polls.length
       assert.ok(await until(() => run.stub.polls.slice(after - 1).some((poll) => poll.busy === false)), 'busy:false reaches DevSpec')
       await run.laps()
@@ -874,7 +988,8 @@ describe('an error or a stop is told to the room in Cursor\'s words, once, whoev
         assert.deepEqual(run.completions(), [attemptEnded], 'the attempt ended, naming no command')
         assert.deepEqual(run.failurePostsSent(), [], 'not certain: never the command\'s answer')
         assert.deepEqual(run.requestCloses(), [], 'nor its request closed')
-        assert.equal(run.turnOpen(), false, 'Working clears')
+        // The end is seen by DevSpec before the poller has its answer and clears the marker.
+        assert.ok(await until(() => !run.turnOpen()), 'Working clears')
 
         // Cursor runs the stop hook (a person with a hooks file of their own): it knows its turn.
         await run.stop('error')
@@ -1284,6 +1399,84 @@ describe('the stop hook and the poller around a report that is in flight, fails 
       assert.deepEqual(run.stub.named('report_complete'), [], 'no attempt ended under the new turn')
       assert.equal(run.turnOpen(), false)
     } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('A16 (requirement 3ea2b201): the transcript cannot be read when its turn end is written, then can, unchanged: the error is answered once', async (t) => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      await run.deliver()
+      run.recordCommandRequest()
+      // Put in place already unreadable, so no read can succeed before it is readable.
+      const staged = `${run.transcript}.staged`
+      writeTranscript(staged, [...run.connected.slice(0, 2), WAKE, ended('error', LIMIT)])
+      if (!makeUnreadable(staged)) return t.skip(ROOT_READS)
+      fs.renameSync(staged, run.transcript)
+      const before = stampOf(run.transcript)
+      await sleep(2_500)
+      await run.laps()
+      assert.deepEqual(run.failurePostsSent(), [], 'nothing told while it cannot be read')
+      assert.equal(run.turnOpen(), true)
+      fs.chmodSync(run.transcript, 0o600)
+      assert.equal(stampOf(run.transcript), before, 'the same file, unchanged')
+      assert.ok(await until(() => run.failurePosts().length >= 1), `not reported once readable; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.equal(run.failurePostsSent().length, 1, 'told once')
+      assert.ok(run.failurePosts()[0].message.includes(LIMIT))
+      assert.deepEqual(run.completions(), [finished()])
+      assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      try { fs.chmodSync(run.transcript, 0o600) } catch { /* already readable */ }
+      await run.cleanup()
+    }
+  })
+
+  it('A17: the snapshot at handover cannot be read, then can, unchanged: the command\'s error is answered as any other', async (t) => {
+    const run = await startPoller({ attached: true, capability: true })
+    try {
+      if (!makeUnreadable(run.transcript)) return t.skip(ROOT_READS)
+      await run.deliver()
+      run.recordCommandRequest()
+      const baseline = () => JSON.parse(fs.readFileSync(path.join(run.dir, `${CONNECTION}.turn-baseline.json`), 'utf8'))
+      assert.equal(baseline().pending, true, 'handover could not read it')
+      fs.chmodSync(run.transcript, 0o600)
+      assert.ok(await until(() => !baseline().pending), `the snapshot was not taken; stderr:\n${run.stderr()}`)
+      assert.equal(baseline().between, true)
+      writeTranscript(run.transcript, [...run.connected.slice(0, 2), WAKE, ended('error', LIMIT)])
+      assert.ok(await until(() => run.failurePosts().length >= 1), `not reported; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.equal(run.failurePostsSent().length, 1, 'answered once')
+      assert.deepEqual(run.completions(), [finished()])
+      assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      try { fs.chmodSync(run.transcript, 0o600) } catch { /* already readable */ }
+      await run.cleanup()
+    }
+  })
+
+  it('A15/A16: the transcript cannot be read just before the notice\'s attempt end: tried again later, never taken for a newer turn', async (t) => {
+    const run = await startPoller({ attached: true })
+    try {
+      await run.deliver()
+      run.stub.hold('post_session_message', 1_500)
+      writeTranscript(run.transcript, [...run.connected.slice(0, 2), WAKE, answer('Looking.'), SUMMARY_ROW, ended('error', LIMIT)])
+      assert.ok(await until(() => run.noticesSent().length >= 1), `no notice; stderr:\n${run.stderr()}`)
+      // While the notice is in flight, the transcript becomes unreadable, unchanged.
+      if (!makeUnreadable(run.transcript)) return t.skip(ROOT_READS)
+      await sleep(2_500)
+      assert.deepEqual(run.stub.named('report_complete'), [], 'not ended while it cannot be read')
+      assert.equal(run.turnOpen(), true, 'kept for the next try')
+      fs.chmodSync(run.transcript, 0o600)
+      assert.ok(await until(() => run.completions().length >= 1, REPORT_RETRY_MS + 10_000), `never ended; stderr:\n${run.stderr()}`)
+      await run.laps()
+      assert.deepEqual(run.completions(), [attemptEnded])
+      assert.equal(run.noticesSent().length, 1, 'told once')
+      assert.equal(run.turnOpen(), false)
+    } finally {
+      try { fs.chmodSync(run.transcript, 0o600) } catch { /* already readable */ }
       await run.cleanup()
     }
   })

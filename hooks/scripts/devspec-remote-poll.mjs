@@ -189,6 +189,7 @@ import {
   noteTurnEndTold,
   readTurnBaseline,
   recordTurnBaseline,
+  reportHoldingClaim,
   settleTurnEnd,
   transcriptTurnEnd,
   turnEndClaimed,
@@ -1643,6 +1644,14 @@ async function main() {
     if (claim.outcome === 'reported') return 'reported_elsewhere'
     if (claim.outcome === 'reporting' || claim.outcome === 'noticing') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
+    // A throw part-way gives the claim back, keeping what landed (reportHoldingClaim).
+    return reportHoldingClaim(connectionId, ended.identity, () => reportClaimedTurnEnd(ended, claim), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function reportClaimedTurnEnd(ended, claim) {
     let delivered = true
     clearTrailState(connectionId)
     if (ended.failure && sessionId && !claim.told) {
@@ -1772,6 +1781,13 @@ async function main() {
     if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
     if (claim.outcome === 'reporting') return 'reporting_elsewhere'
     if (claim.outcome !== 'claimed') return 'retry'
+    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function noticeClaimedTurnEnd(ended, claim) {
     clearTrailState(connectionId)
     let done = true
     // A stop hook that gave its report back after posting its message told the room already.
@@ -1795,7 +1811,13 @@ async function main() {
       // (interactionActivityPlan).
       const suppressed =
         interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind === 'suppress'
-      if (!suppressed && turnEndIdentity(lapTranscriptPath) === ended.identity) {
+      // Read again: a newer turn has replaced this end, or the read failed and the step
+      // is tried again later (never taken for a newer turn).
+      const now = suppressed ? null : turnEndIdentity(lapTranscriptPath)
+      if (!suppressed && now === null) {
+        done = false
+        process.stderr.write('devspec-remote-poll: transcript unreadable before ending the working attempt; trying again\n')
+      } else if (!suppressed && now === ended.identity) {
         try {
           await mcpToolsCall({
             mcpUrl,
@@ -2648,7 +2670,12 @@ async function main() {
           if (liveNow !== prevTurnActive) return true
           // Cursor's transcript now ends in a turn end: the lap decides whether it is the
           // tracked turn's (transcript-turn-end.mjs).
-          if (m && turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, memo: turnEndProbeMemo })) return true
+          if (
+            m &&
+            turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, connectionId, dir: CONNECTIONS_DIR, memo: turnEndProbeMemo })
+          ) {
+            return true
+          }
           if (m && reportRetry?.dueAt != null && Date.now() >= reportRetry.dueAt) return true
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
