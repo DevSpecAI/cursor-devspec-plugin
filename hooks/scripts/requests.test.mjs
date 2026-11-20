@@ -31,7 +31,7 @@ import {
   setCurrentRequest,
   turnAmbiguity,
 } from './requests.mjs'
-import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest } from './request-ref.mjs'
+import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS, stampRequest, stampsCommand } from './request-ref.mjs'
 import { launchGuard } from './launch-guard.mjs'
 import { markCommandsAnswered } from './mark-explicit-reply.mjs'
 
@@ -379,16 +379,82 @@ describe('stamping a DevSpec write', () => {
     return home
   }
 
-  it('stamps the request and provenance the turn serves, and nothing when nothing is known', () => {
+  it('stamps the request the turn serves, and nothing when nothing is known', () => {
     const home = homeWith(openA, { op: 'current', ref: A })
     assert.deepEqual(stampRequest('record_memory', { title: 'x' }, CONN, null, { home }), {
       args: { title: 'x', request_ref: A },
     })
-    assert.deepEqual(stampRequest('create_task', { title: 'x' }, CONN, null, { home, includeProvenance: true }), {
-      args: { title: 'x', provenance_ref: DELIVERY_A, request_ref: A },
-    })
     assert.deepEqual(stampRequest('record_memory', { title: 'x' }, CONN, null, { home: homeWith() }), {
       args: { title: 'x' },
+    })
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home: homeWith(), includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+  })
+
+  it('sends a write that takes the request only that request, never its command beside it', () => {
+    const home = homeWith(openA, { op: 'current', ref: A })
+    for (const name of REQUEST_REF_TOOLS) {
+      assert.equal(stampsCommand(name), false, name)
+      assert.deepEqual(stampRequest(name, { x: 1 }, CONN, null, { home, includeProvenance: true }), {
+        args: { x: 1, request_ref: A },
+      }, name)
+    }
+  })
+
+  it('stamps the command only on the tools that take it and no request', () => {
+    const home = homeWith(openA, { op: 'current', ref: A })
+    const commandOnly = [...PROVENANCE_REF_TOOLS].filter((name) => !REQUEST_REF_TOOLS.has(name))
+    assert.ok(commandOnly.includes('claim_work_item'), 'the set is broken, not empty')
+    for (const name of commandOnly) {
+      assert.equal(stampsCommand(name), true, name)
+      // report_request is the connection's own call and is never stamped (below).
+      if (name === 'report_request') continue
+      assert.deepEqual(stampRequest(name, { x: 1 }, CONN, null, { home, includeProvenance: true }), {
+        args: { x: 1, provenance_ref: DELIVERY_A },
+      }, name)
+    }
+    assert.equal(stampsCommand('get_task'), false)
+  })
+
+  it('still names the request after its command was answered, while the work it started runs on', () => {
+    // The agent posted its final answer, which closes the command on DevSpec, and a
+    // subagent the command launched is still working. Its writes keep naming the
+    // request; the closed command must not go with them.
+    const home = homeWith(
+      openA,
+      { op: 'current', ref: A },
+      { op: 'launch', key: 'helper', kind: 'subagent', notifies: true, request: A, also: [] },
+      { op: 'answered', id: A },
+    )
+    for (const name of ['record_requirement', 'record_inventory_entry', 'record_dependency_review', 'record_implementation']) {
+      assert.deepEqual(stampRequest(name, { x: 1 }, CONN, 'helper', { home, includeProvenance: true }), {
+        args: { x: 1, request_ref: A },
+      }, name)
+    }
+  })
+
+  it('never stamps a command remembered from earlier: only the one the request it serves came from', () => {
+    // A request typed at the terminal has no command; one the turn no longer
+    // serves (closed) has none to give.
+    const typed = homeWith(openT, { op: 'current', ref: T })
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home: typed, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    const closed = homeWith(openA, { op: 'current', ref: A }, { op: 'close', id: A })
+    assert.deepEqual(stampRequest('reserve_work_items', {}, CONN, null, { home: closed, includeProvenance: true }), { args: {} })
+    assert.deepEqual(stampRequest('update_requirement', { x: 1 }, CONN, null, { home: closed, includeProvenance: true }), {
+      args: { x: 1 },
+    })
+  })
+
+  it('passes through a command or claim the agent names itself', () => {
+    const home = homeWith(openA, openB, { op: 'current', ref: A })
+    assert.deepEqual(stampRequest('update_task', { provenance_ref: DELIVERY_B }, CONN, null, { home, includeProvenance: true }), {
+      args: { provenance_ref: DELIVERY_B, request_ref: A },
+    })
+    assert.deepEqual(stampRequest('claim_work_item', { provenance_ref: DELIVERY_B }, CONN, null, { home, includeProvenance: true }), {
+      args: { provenance_ref: DELIVERY_B },
     })
   })
 
@@ -416,6 +482,14 @@ describe('stamping a DevSpec write', () => {
     assert.match(refused.deny, new RegExp(`requests\\.mjs" serve --connection-id ${CONN}`))
     assert.match(refused.deny, new RegExp(`--message-id ${MSG_A}`))
     assert.match(refused.deny, new RegExp(`--message-id ${MSG_B}`))
+  })
+
+  it('holds every write that takes the request, and the command-only ones, while the turn is undecided', () => {
+    const home = homeWith(openA, openB, { op: 'current', ref: A }, { op: 'joined', id: B })
+    for (const name of PROVENANCE_REF_TOOLS) {
+      if (name === 'report_request') continue
+      assert.ok(stampRequest(name, {}, CONN, null, { home, includeProvenance: true }).deny, name)
+    }
   })
 
   it('never refuses a read, or a write that already cites its work or command', () => {

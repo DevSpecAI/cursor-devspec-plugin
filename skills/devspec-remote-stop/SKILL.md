@@ -12,12 +12,14 @@ Cleanly disconnect **this** conversation's connection so the **Agents page** dro
 Use the **installed Cursor DevSpec plugin** scripts only.
 
 1. Use the installed Cursor plugin location supplied by the host when available; verify its helper belongs to this plugin.
-2. Otherwise find it under `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`), taking the most recently modified match:
+2. Otherwise ask the plugin for its newest installed copy under `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`), exactly as `devspec-remote` does — older copies can stay on disk beside the current one, and any copy of `plugin-root.mjs` prints the newest:
 
    ```bash
-   HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
-   PLUGIN=${HIT%/hooks/scripts/remote-control-state.mjs}
+   FINDER=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/plugin-root.mjs' 2>/dev/null | head -1)
+   PLUGIN=$([ -n "$FINDER" ] && node "$FINDER")
    ```
+
+   If `PLUGIN` is empty, no installed copy was found: tell the person so in plain words (with the message it printed, if any) and stop. Never run a helper with an empty `PLUGIN`.
 3. **Never** call `remote-control-state.mjs` from `~/.claude/plugins/**` or marketplace caches.
 4. Quote `"$PLUGIN"` in every shell command.
 

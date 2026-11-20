@@ -31,14 +31,14 @@ An optional standalone launcher starts Cursor normally; it does not authenticate
 All poller / state scripts come from the **installed Cursor DevSpec plugin** — never from Claude Code or another agent's plugin cache.
 
 1. Use the installed Cursor plugin location supplied by the host when available; verify the helper below belongs to that plugin.
-2. Otherwise find it under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). An installed copy lives in a folder named after its commit (for example `plugins/cache/devspec/devspec/<commit-sha>/`), a local one at `plugins/local/<name>/`:
+2. Otherwise ask the plugin for its newest installed copy under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). An installed copy lives in a folder named after its commit (for example `plugins/cache/devspec/devspec/<commit-sha>/`), a local one at `plugins/local/<name>/`, and older commits can stay on disk beside the current one. `plugin-root.mjs` prints the newest copy's folder (highest plugin version, then most recently modified); any copy of it gives the same answer, because it checks every copy:
 
    ```bash
-   HIT=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/remote-control-state.mjs' 2>/dev/null | head -1)
-   PLUGIN=${HIT%/hooks/scripts/remote-control-state.mjs}
+   FINDER=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/plugin-root.mjs' 2>/dev/null | head -1)
+   PLUGIN=$([ -n "$FINDER" ] && node "$FINDER")
    ```
 
-   If more than one matches, take the most recently modified: an install is keyed by commit, so older commits can stay on disk beside the current one.
+   If `PLUGIN` is empty, no installed copy was found: tell the person so in plain words (with the message it printed, if any), say that reinstalling the DevSpec plugin in Cursor fixes it, and stop. Never run a helper with an empty `PLUGIN`.
 3. Confirm `PLUGIN/hooks/scripts/remote-control-state.mjs` exists before running anything.
 4. **Never** use scripts under `~/.claude/plugins/**` or any other agent's plugin folder, even one named `devspec`: those lack Cursor's auth-smoke + `ensure-poller` path and cause slow/broken attaches.
 5. Always **quote** `"$PLUGIN"` in shell commands (Windows usernames often contain spaces).
@@ -74,6 +74,7 @@ Never rejoin/attach a session because it shared a repo/cwd or another agent stop
 - `--private` → only with `--new`: the new session is private, so only the person connecting can open it. Alone or with `--session` it does nothing, and `fast-connect` refuses it — say so rather than dropping it.
 - bare → register a sessionless connection.
 - `--title="…"` → used for `--new` only, as the new session's title.
+- `--name="…"` → this agent's name on the Agents page in place of a minted codename. Pass it to `fast-connect` or `register` as `--codename "…"`.
 
 ### 2. Resolve project
 
