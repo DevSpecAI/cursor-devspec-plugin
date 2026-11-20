@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { fitHookContext, handOver, handOverPrefix, POST_TOOL_CONTEXT_SHARE } from './hook-context-budget.mjs'
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
@@ -896,13 +897,6 @@ function prunePending(pending, now = Date.now()) {
   )
 }
 
-function pruneNotes(notes, now = Date.now()) {
-  return Object.fromEntries(
-    Object.entries(normalizePendingNotes(notes))
-      .filter(([, value]) => withinObservationWindow(value?.at, now)),
-  )
-}
-
 function pruneClaims(claims, now = Date.now()) {
   return (claims || []).filter((claim) => claim.id && claim.project_id && withinObservationWindow(claim.observed_at, now))
 }
@@ -914,7 +908,9 @@ function pruneUnrecorded(entries, now = Date.now()) {
 function readPrunedState(conversationId, stateRoot, nowMs) {
   const state = readConversationState(conversationId, stateRoot)
   state.pending_stamps = prunePending(state.pending_stamps, nowMs)
-  state.pending_notes = pruneNotes(state.pending_notes, nowMs)
+  // Commit notes are never pruned by age: one is removed only once it is in a hand-over
+  // (postToolUse), which in turn is cleared only by a whole read.
+  state.pending_notes = normalizePendingNotes(state.pending_notes)
   state.active_claims = pruneClaims(state.active_claims, nowMs)
   state.unrecorded_claims = pruneUnrecorded(state.unrecorded_claims, nowMs)
   return state
@@ -1128,17 +1124,42 @@ export function handleHook(mode, data, options = {}) {
 
   if (mode === 'postToolUse') {
     const toolUseId = cleanString(data?.tool_use_id) || cleanString(data?.toolUseId)
-    if (toolUseId && state.pending_notes[toolUseId]) {
-      const { text } = state.pending_notes[toolUseId]
-      delete state.pending_notes[toolUseId]
-      writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: text }
+    const home = options.home || os.homedir()
+    // A note about a commit that went untracked must reach the agent, and Cursor gives
+    // no sign that a hook's note did (hook-context-budget.mjs): it is handed over as a
+    // note and offered after every step until the agent has read that delivery whole.
+    // Every commit note still waiting is taken in, not only this call's: a commit whose
+    // command failed after committing never gets its own postToolUse, and its note must
+    // still arrive. Each is removed from the state only once it is in a hand-over.
+    const pendingIds = Object.keys(state.pending_notes)
+      .sort((a, b) => String(state.pending_notes[a].at).localeCompare(String(state.pending_notes[b].at)))
+    // Saying that a reference was added is offered once: the commit is right either way.
+    // It is one short line of fixed shape, and the hand-over keeps to what is left of
+    // the share, so the two always fit together.
+    const stamp = toolUseId && state.pending_stamps[toolUseId]
+      ? `DevSpec appended [devspec:${state.pending_stamps[toolUseId].task_id}] to the commit message that just ran.`
+      : null
+    const commitNote = handOver(handOverPrefix('commit', conversationId), data, {
+      add: pendingIds.length ? pendingIds.map((id) => state.pending_notes[id].text).join('\n\n---\n\n') : null,
+      what: 'A DevSpec note about a commit you made',
+      share: stamp ? POST_TOOL_CONTEXT_SHARE - stamp.length - 2 : POST_TOOL_CONTEXT_SHARE,
+      home,
+    })
+    const said = commitNote ? [commitNote] : []
+    let changed = false
+    for (const id of pendingIds) {
+      delete state.pending_notes[id]
+      changed = true
     }
-    if (toolUseId && state.pending_stamps[toolUseId]) {
-      const item = state.pending_stamps[toolUseId].task_id
+    if (stamp) {
+      said.push(stamp)
       delete state.pending_stamps[toolUseId]
-      writeConversationState(conversationId, state, stateRoot)
-      return { additional_context: `DevSpec appended [devspec:${item}] to the commit message that just ran.` }
+      changed = true
+    }
+    if (changed) writeConversationState(conversationId, state, stateRoot)
+    if (said.length > 0) {
+      const context = fitHookContext(said.join('\n\n'), { what: 'A DevSpec commit note', home })
+      return context ? { additional_context: context } : null
     }
 
     const toolName = (cleanString(data?.tool_name) || '').toLowerCase()
@@ -1153,8 +1174,6 @@ export function handleHook(mode, data, options = {}) {
     if (!projectId || state.active_claims.some((claim) => claim.project_id === projectId) || state.nudged_projects.includes(projectId)) return null
     // A claim made here that could not be recorded is still a claim: no reminder.
     if (state.unrecorded_claims.some((entry) => !entry.project_id || entry.project_id === projectId)) return null
-    state.nudged_projects.push(projectId)
-    writeConversationState(conversationId, state, stateRoot)
     // Work that needs no task commits without one (item 953ab72e), so the advice is
     // conditional, and a missing claim blocks neither editing nor committing.
     const nudgeMessage =
@@ -1163,10 +1182,11 @@ export function handleHook(mode, data, options = {}) {
       'If the work delivers a task, before you commit search_tasks for the task this work belongs to and claim it (claim_work_item); if none covers it, create_task for the smallest adequate task, ' +
       'with a real description of the change and its intent, and claim that. Then commit as usual: the [devspec:<id>] reference is added to the commit message for you. ' +
       'When work needs a task (work_entry_contract) and how to write its intent (core.write-the-persons-intent) are in devspec://product/implementation-contract.'
-    return {
-      additional_context: nudgeMessage,
-      agent_message: nudgeMessage,
-    }
+    const context = fitHookContext(nudgeMessage, { what: 'A DevSpec commit note' })
+    if (!context) return null
+    state.nudged_projects.push(projectId)
+    writeConversationState(conversationId, state, stateRoot)
+    return { additional_context: context, agent_message: context }
   }
 
   return null

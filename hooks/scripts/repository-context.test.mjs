@@ -4,29 +4,54 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { selectProjectContext } from './project-context.mjs'
-import { storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { beginRulesDelivery, storeRepositorySnapshot, readRepositorySnapshot, renderRepositorySnapshot, repositoryContextHook, repositoryContextTextFile, refreshRepositoryRules } from './repository-context.mjs'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { buildOwnerMessageEvents, parseWakeBatches } from './devspec-remote-wait.mjs'
 import { fixtureEnvelope, emptyFixtureContext, FIXTURE_ID } from './remote-ingress-test-fixtures.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { projectInput } from './project-input.mjs'
+import { POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE } from './hook-context-budget.mjs'
+import { catCall, noteFiles, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
+/** The note a context line points at, and its text. */
+function noteIn(home,content){const id=noteIdIn(content);const file=path.join(home,'.devspec','notes',`${id}.md`);return{id,file,text:readNoteText(id,{home})}}
 const A={id:'11111111-1111-4111-8111-111111111111',name:'A'},B={id:'22222222-2222-4222-8222-222222222222',name:'B'}
 const endpoint='https://fixture.invalid/api/mcp'
 function setup(fn){const home=fs.mkdtempSync(path.join(os.tmpdir(),'cursor-repository-context-'));try{fn(home)}finally{fs.rmSync(home,{recursive:true,force:true})}}
 function registration(project=A){return{project_id:project.id,repository_context:{version:1,project_id:project.id,status:'available',repositories:Array.from({length:25},(_,i)=>({id:`r${i}`,full_name:`${project.name}/repo-${i}`,provider:'github',git_url:`https://example.test/${project.name}/repo-${i}.git`,target_branch:'staging',default_branch:'main'}))},project_agent_rules:'Full project rules',owner_agent_rules:'Full machine rules'}}
 
-test('full facts and rules delivered through native post-tool context, with no count cap',()=>setup(home=>{
+test('full facts and rules always go to a note, offered after every step until the agent reads it',()=>setup(home=>{
  selectProjectContext('one',endpoint,A,'explicit',home)
  const reg=registration();storeRepositorySnapshot('one',reg,home)
  const snapshot=readRepositorySnapshot('one',home)
  assert.deepEqual(snapshot.repository_context.repositories,reg.repository_context.repositories)
- const response=repositoryContextHook({conversation_id:'one'},{home})
- assert.match(response.additional_context,/A\/repo-24/)
- assert.match(response.additional_context,/Full project rules/)
- assert.match(response.additional_context,/Full machine rules/)
+ const line=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.ok(line.length<=POST_TOOL_CONTEXT_SHARE,`${line.length} characters`)
+ assert.match(line,/25 repositories/)
+ const note=noteIn(home,line)
+ assert.match(note.text,/A\/repo-24/);assert.match(note.text,/Full project rules/);assert.match(note.text,/Full machine rules/)
+ assert.equal(fs.statSync(note.file).mode&0o777,0o600)
+ // Printed is not delivered: Cursor may have dropped it, so the next step offers it again.
+ assert.equal(repositoryContextHook({conversation_id:'one',tool_name:'Shell',tool_input:{command:'ls'}},{home}).additional_context,line)
+ // A command that only mentions the note is not a read.
+ assert.ok(repositoryContextHook({conversation_id:'one',tool_name:'Shell',tool_input:{command:`test -e ~/.devspec/notes/${note.id}.md`},tool_output:JSON.stringify({output:'',exitCode:0})},{home}))
+ // The agent reading the note whole is what ends it, by Cursor's Read tool or `cat`.
+ assert.equal(repositoryContextHook(readCall(note.file),{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
- assert.match(repositoryContextHook({conversation_id:'one'},{home,force:true}).additional_context,/A\/repo-24/)
  assert.equal(repositoryContextHook({conversation_id:'other'},{home}),null)
+ // A new or resumed chat begins a new delivery at its start: owed until read again.
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,force:true}).additional_context,line)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}).additional_context,line,'the session start\'s pointer may have been dropped')
+ assert.equal(repositoryContextHook(readCall(note.file),{home}),null)
  storeRepositorySnapshot('one',{...reg,instructions_unchanged:true,project_agent_rules:undefined,owner_agent_rules:undefined},home)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'the same context, already read in this session')
+ // Changed context is a new note, offered until read in turn.
+ storeRepositorySnapshot('one',{...reg,project_agent_rules:'Changed project rules'},home)
+ const changed=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.notEqual(noteIn(home,changed).id,note.id)
+ assert.match(noteIn(home,changed).text,/Changed project rules/)
+ assert.equal(repositoryContextHook(catCall(home,noteIn(home,changed).file),{home}),null)
  assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
 }))
 
@@ -34,7 +59,7 @@ test('fresh conversations never consume another project inventory or rules',()=>
  selectProjectContext('one',endpoint,A,'explicit',home);selectProjectContext('two',endpoint,B,'explicit',home)
  storeRepositorySnapshot('one',registration(A),home);storeRepositorySnapshot('two',registration(B),home)
  assert.throws(()=>storeRepositorySnapshot('one',registration(B),home),/does not belong/)
- const text=repositoryContextHook({conversation_id:'two'},{home}).additional_context
+ const text=noteIn(home,repositoryContextHook({conversation_id:'two'},{home,force:true}).additional_context).text
  assert.match(text,/B\/repo-24/);assert.doesNotMatch(text,/A\/repo/)
 }))
 
@@ -63,24 +88,99 @@ test('attach and canonical refreshes preserve repos, clear old rules and carry i
  assert.equal(readRepositorySnapshot('one',home).rules.project_agent_rules,'Attached rules')
 }))
 
-test('real host size limit has a complete file continuation, never a lost tail',()=>setup(home=>{
+test('rules changed and changed back are owed again: A, then B, then A needs a new read of A',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ const readAll=(line)=>{for(const file of noteFiles(home,noteIdIn(line))) assert.equal(repositoryContextHook(catCall(home,file),{home})?.additional_context ?? null, file===noteFiles(home,noteIdIn(line)).at(-1)?null:line)}
+ const rulesA={...registration(),project_agent_rules:'Rules A'}, rulesB={...registration(),project_agent_rules:'Rules B'}
+ storeRepositorySnapshot('one',rulesA,home)
+ const lineA=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ readAll(lineA)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'A read')
+ storeRepositorySnapshot('one',rulesB,home)
+ const lineB=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.notEqual(noteIdIn(lineB),noteIdIn(lineA))
+ readAll(lineB)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null,'B read')
+ storeRepositorySnapshot('one',rulesA,home)
+ const lineA2=repositoryContextHook({conversation_id:'one'},{home})?.additional_context
+ assert.ok(lineA2,'A again is a new change, owed a new delivery, though A was read before')
+ assert.equal(noteIdIn(lineA2),noteIdIn(lineA),'the same text, the same note')
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}).additional_context,lineA2,'offered until read again')
+ readAll(lineA2)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
+ // Storing the same context again is no change, and owes nothing.
+ storeRepositorySnapshot('one',rulesA,home)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home}),null)
+}))
+
+test('a resumed chat (a new Cursor process) and a compaction each begin a new delivery, owed until read in it',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ const run=(host,input={conversation_id:'one'})=>repositoryContextHook(input,{home,host})?.additional_context ?? null
+ const line=run('111:aaa')
+ const readAll=(host)=>{for(const file of noteFiles(home,noteIdIn(line))) run(host,catCall(home,file))}
+ readAll('111:aaa')
+ assert.equal(run('111:aaa'),null,'read in this process')
+ // `cursor-agent --resume` is a new process, whether or not Cursor runs sessionStart for it.
+ assert.equal(run('222:bbb'),line,'a resumed chat is owed the rules again')
+ assert.equal(run('222:bbb'),line,'until it reads them')
+ readAll('222:bbb')
+ assert.equal(run('222:bbb'),null)
+ // preCompact: the summary may not keep the rules.
+ beginRulesDelivery('one',home)
+ assert.equal(run('222:bbb'),line,'owed again after a compaction')
+ readAll('222:bbb')
+ assert.equal(run('222:bbb'),null)
+}))
+
+test('the preCompact hook, run as Cursor runs it, begins a new delivery',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ const line=repositoryContextHook({conversation_id:'one'},{home,host:'h'}).additional_context
+ for(const file of noteFiles(home,noteIdIn(line))) repositoryContextHook(catCall(home,file),{home,host:'h'})
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,host:'h'}),null)
+ const hooks=JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),'..','hooks.json'),'utf8')).hooks.preCompact
+ for(const entry of hooks) execFileSync('sh',['-c',entry.command],{input:JSON.stringify({conversation_id:'one',trigger:'auto'}),env:{PATH:process.env.PATH,HOME:home,CLAUDE_PLUGIN_ROOT:path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')}})
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,host:'h'})?.additional_context,line)
+}))
+
+test('a small project goes to the note too, with the same short line',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ const reg=registration();reg.repository_context.repositories=reg.repository_context.repositories.slice(0,2)
+ storeRepositorySnapshot('one',reg,home)
+ const line=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.doesNotMatch(line,/Full project rules/,'never inline when small')
+ assert.match(noteIn(home,line).text,/A\/repo-1/)
+}))
+
+test('very long rules and 1,000 repositories are in the note whole, and the line stays short',()=>setup(home=>{
  selectProjectContext('one',endpoint,A,'explicit',home)
  const reg=registration();reg.project_agent_rules='full-rule-'.repeat(2500)+'RULE-END'
  storeRepositorySnapshot('one',reg,home)
- let content=repositoryContextHook({conversation_id:'one'},{home}).additional_context
- assert.ok(content.length<=10000);assert.match(content,/A\/repo-24/);assert.match(content,/10000-character hook limit/)
- const oldPath=repositoryContextTextFile('one',home)
- let full=fs.readFileSync(oldPath,'utf8')
- const oldBytes=full
- assert.match(full,/RULE-END/)
+ let line=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.ok(line.length<=POST_TOOL_CONTEXT_SHARE)
+ const first=noteIn(home,line)
+ assert.match(first.text,/RULE-END/)
+ assert.ok(repositoryContextHook({conversation_id:'one'},{home,force:true}).additional_context.length<=SESSION_START_CONTEXT_SHARE)
  reg.repository_context.repositories=Array.from({length:1000},(_,i)=>({...reg.repository_context.repositories[0],id:`repo-${i}`,full_name:`org/repo-${i}`}))
  storeRepositorySnapshot('one',reg,home)
- content=repositoryContextHook({conversation_id:'one'},{home}).additional_context
- assert.ok(content.length<=10000);assert.match(content,/1000 repositories/)
- full=fs.readFileSync(repositoryContextTextFile('one',home),'utf8');assert.match(full,/org\/repo-999/);assert.match(full,/RULE-END/)
- assert.equal(fs.statSync(repositoryContextTextFile('one',home)).mode&0o777,0o600)
- assert.notEqual(repositoryContextTextFile('one',home),oldPath)
- assert.equal(fs.readFileSync(oldPath,'utf8'),oldBytes,'old continuation files retain their snapshot bytes')
+ line=repositoryContextHook({conversation_id:'one'},{home}).additional_context
+ assert.ok(line.length<=POST_TOOL_CONTEXT_SHARE);assert.match(line,/1000 repositories/)
+ const second=noteIn(home,line)
+ assert.match(second.text,/org\/repo-999/);assert.match(second.text,/RULE-END/)
+ assert.equal(readNoteText(first.id,{home}),first.text,'an earlier note keeps its text')
+ // The run-wide rules file the wake hands over keeps the whole text as well.
+ assert.match(fs.readFileSync(repositoryContextTextFile('one',home),'utf8'),/org\/repo-999/)
+}))
+
+test('when not even the short line fits, nothing is offered and nothing is recorded, so a later step offers it',()=>setup(home=>{
+ selectProjectContext('one',endpoint,A,'explicit',home)
+ storeRepositorySnapshot('one',registration(),home)
+ assert.equal(repositoryContextHook({conversation_id:'one'},{home,share:40}),null)
+ // The full pointer does not fit a smaller share, the fixed short notice does.
+ const notice=repositoryContextHook({conversation_id:'one'},{home,share:150}).additional_context
+ assert.match(notice,/^DevSpec has more context waiting for you: run `cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md`, and every further part it names\.$/)
+ assert.ok(repositoryContextHook({conversation_id:'one'},{home}))
 }))
 
 test('empty, unavailable, malformed and delimiter-bearing inventories remain honest data',()=>setup(home=>{

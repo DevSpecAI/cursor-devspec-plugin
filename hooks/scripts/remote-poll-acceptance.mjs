@@ -450,7 +450,19 @@ function checkJobTarget(job) {
   }
 }
 
-/** The one line that wakes the agent for a check job (the frozen contract's wake text). */
+/**
+ * Where DevSpec says how a check job is taken and ruled, and whether in a helper agent.
+ * Pointed at, never restated: the words are the server's, and every claim_check_job
+ * reply carries the same ones as `helpers`.
+ */
+export const CHECK_JOB_HELPERS_RULE = 'semantics.check_job.helpers in devspec://product/remote-ingress-contract'
+
+/**
+ * The one line that wakes the agent for a check job. It says what is waiting and
+ * where the instruction for ruling it is, before the agent takes it: that instruction
+ * decides who takes it, so an agent that claimed first would already hold the entries
+ * it keeps out of the agent's own conversation.
+ */
 export function checkJobWakeText(job) {
-  return `${checkJobTarget(job)}: take it with claim_check_job, rule every entry with record_check_rulings, then carry on.`
+  return `${checkJobTarget(job)}: before you take it, read ${CHECK_JOB_HELPERS_RULE} (claim_check_job repeats it as \`helpers\`) and rule it as that says, then carry on.`
 }
