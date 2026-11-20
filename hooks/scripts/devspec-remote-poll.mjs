@@ -151,6 +151,7 @@ import {
   interactionActivityPlan,
   interactionAnswerRecord,
   interactionNegotiationArgs,
+  turnEndInteractionDecision,
   INTERACTION_EVENT_CONTRACT_URI,
   INTERACTION_EVENT_VERSION,
   validateInteractionEvent,
@@ -160,24 +161,51 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
-import { openRequest } from './requests.mjs'
-import { attachmentFromPoll } from './local-turn.mjs'
+import { commandsAnsweredNow, finishTurnRequests, openRequest, readRequestState } from './requests.mjs'
+import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
   NO_SIGN_OF_LIFE_MS,
   readTurnActivity,
   turnActivityPath,
   turnIsLive,
 } from './turn-liveness.mjs'
-import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
 import {
+  attemptEndArguments,
   clearTurnCommands,
   commandsHandedOver,
   completionArguments,
   pickupArguments,
+  readTurnCommands,
   recordTurnCommands,
   turnCommandsPath,
 } from './turn-commands.mjs'
-import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
+import {
+  claimTurnEnd,
+  clearSettle,
+  nextReportTry,
+  noteTurnEndAttemptEnded,
+  noteTurnEndCompleted,
+  noteTurnEndNoticed,
+  noteTurnEndTold,
+  readSettle,
+  readTurnBaseline,
+  recordTurnBaseline,
+  reportHoldingClaim,
+  settleDue,
+  settleStep,
+  settleTurnEnd,
+  startSettle,
+  transcriptConversation,
+  transcriptTurnEnd,
+  turnEndClaimed,
+  turnEndIdentity,
+  turnEndPending,
+  updateSettle,
+  writeTurnBaseline,
+} from './transcript-turn-end.mjs'
+import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
+import { clearTurnWakes } from './notice-reply.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -246,13 +274,31 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  */
 function writeTurnMarker(
   connectionId,
-  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR } = {},
+  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR, startedAt: trackedFrom = null, baseline = null } = {},
 ) {
   if (!connectionId) return
   const existing = readTurnMarker(connectionId, dir)
   const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
-  const startedAt = live ? existing.startedAt : Date.now()
+  const startedAt = live ? existing.startedAt : (trackedFrom ?? Date.now())
   const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
+  // A turn starting now: note how far Cursor's transcript of the conversation had got,
+  // so this turn's end can be told from the end of a turn already running when it
+  // started (transcript-turn-end.mjs). Written before the marker, so a marker never
+  // goes with an older turn's baseline. A turn a settle hands over (`baseline`) was
+  // noted from just before it started.
+  if (!live) {
+    const conversationId = readState(connectionId)?.local_id || null
+    const transcriptPath = resolveAgentTranscriptPath(conversationId)
+    if (baseline) {
+      writeTurnBaseline(
+        connectionId,
+        { turn: startedAt, conversation: transcriptConversation(transcriptPath) ?? conversationId, baseline },
+        { dir },
+      )
+    } else {
+      recordTurnBaseline(connectionId, { turn: startedAt, conversationId, transcriptPath, dir })
+    }
+  }
   try {
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(
@@ -302,7 +348,7 @@ export function shouldForceCompleteAndInject({ hasNewOwnerCommands, marker, nowM
   return Boolean(hasNewOwnerCommands && isTurnMarkerStale(marker, nowMs))
 }
 
-function clearTurnMarker(connectionId) {
+function clearTurnMarker(connectionId, { keepCommands = false } = {}) {
   if (!connectionId) return
   try {
     fs.rmSync(turnMarkerPath(connectionId), { force: true })
@@ -314,8 +360,10 @@ function clearTurnMarker(connectionId) {
   } catch {
     /* non-fatal */
   }
-  // The turn is over, and its end names what it finished (turn-commands.mjs).
-  clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+  // The turn is over, and its end names what it finished (turn-commands.mjs). After only
+  // a notice, the stop hook may still name them (keepCommands); the next turn's start
+  // replaces the record.
+  if (!keepCommands) clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
 }
 
 /**
@@ -800,16 +848,18 @@ export function extraActivityVerbArgs({ stalling, verb } = {}) {
  *   is the busy this poller reports, and a typed turn's is the exact pickup the
  *   prompt hook sent (local-turn.mjs).
  * - keepalive: the working attempt, whichever it is.
- * - complete: the backstop for a turn whose end no Stop hook or reply re-arm
- *   reported. It names the commands this poller started that turn with
- *   (`commands`), or says the turn is unbound.
+ * - complete: a turn's end that no Stop hook or reply re-arm reported: one the poller
+ *   noticed in Cursor's transcript (transcript-turn-end.mjs), or the backstop for a
+ *   turn that went quiet. It names the commands this poller started that turn with
+ *   (`commands`) and the terminal turn the owner typed (`localAttemptId`), or says the
+ *   turn is unbound.
  *
  * @returns {{ name: string, arguments: object }[]}
  */
-export function activityCalls({ verb, connectionId, commands = [], reason = null } = {}) {
+export function activityCalls({ verb, connectionId, commands = [], localAttemptId = null, reason = null } = {}) {
   if (verb === 'keepalive') return [{ name: 'report_keepalive', arguments: { connection_id: connectionId } }]
   if (verb === 'complete') {
-    return completionArguments({ connectionId, commands, reason }).map((args) => ({
+    return completionArguments({ connectionId, commands, localAttemptId, reason }).map((args) => ({
       name: 'report_complete',
       arguments: args,
     }))
@@ -1540,7 +1590,7 @@ async function main() {
   async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return { ok: true }
     // The turn is over however its end is reported: what started it goes with it.
-    const ending = verb === 'complete' ? turnStartCommands : []
+    const ending = verb === 'complete' ? (extraArgs.commands ?? turnStartCommands) : []
     if (verb === 'complete') {
       turnStartCommands = []
       clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
@@ -1552,7 +1602,13 @@ async function main() {
       return exactRes ?? { ok: true }
     }
     let result = { ok: true }
-    for (const call of activityCalls({ verb, connectionId, commands: ending, reason: extraArgs.reason ?? null })) {
+    for (const call of activityCalls({
+      verb,
+      connectionId,
+      commands: ending,
+      localAttemptId: extraArgs.localAttemptId ?? null,
+      reason: extraArgs.reason ?? null,
+    })) {
       try {
         await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
       } catch (e) {
@@ -1571,6 +1627,399 @@ async function main() {
       }
     }
     return result
+  }
+
+  /**
+   * The request ids of the room commands that started the tracked turn (turn-commands.mjs)
+   * and are still open and unanswered: the commands a room command's turn can be tied to.
+   * One delivered into a turn already running is not among them: Cursor holds its wake.
+   */
+  function startingRequests(state) {
+    const started = new Set(readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }).map((command) => command.messageId))
+    return [...state.open]
+      .filter(([, info]) => info.kind === 'command' && !info.answered && started.has(info.message_id))
+      .map(([id]) => id)
+  }
+
+  /**
+   * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
+   * would have (transcript-turn-end.mjs). A turn end that is the tracked command's beyond
+   * doubt (`ended.attributed`) is reported in full: an error or a stop is told to the
+   * room in Cursor's own words (turn-failure.mjs: the unanswered command's failure reply,
+   * or a room message of its own when the turn carries none), the room commands that
+   * started the turn and the turn the owner typed are named as finished, the turn end's
+   * request bookkeeping is done (requests.mjs), and Working clears. Any other error or
+   * stop gets the notice level only (noticeTranscriptTurnEnd).
+   *
+   * Only while this poller holds the turn end's claim. Every step must reach DevSpec for
+   * the claim to be settled and the marker cleared. Otherwise the claim is given back and
+   * the marker kept, so the stop hook or this poller's next try (nextReportTry) does what
+   * is left, and nothing is sent twice. Returns 'reported'; 'retry' (try again later);
+   * 'reported_elsewhere' (the stop hook reported it in full); or 'reporting_elsewhere'
+   * (the stop hook is reporting it now).
+   */
+  async function reportTranscriptTurnEnd(ended, marker) {
+    let onlyRequests = null
+    if (!ended.attributed) {
+      // Not the tracked command's beyond doubt: which turn it was, from its first row
+      // (transcript-turn-end.mjs "Every way a turn ends").
+      const state = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
+      const kind = ended.firstRow?.kind ?? 'unknown'
+      if (kind === 'typed') {
+        // A turn typed at the terminal: told, never replied to; the commands waiting
+        // stay open until their own turns run (watched, so those report themselves).
+        return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+      }
+      if (kind === 'command') {
+        // A room command's turn: the commands that started it, still unanswered. One is
+        // answered as the matched turn would be; several get the settle point's reply.
+        // A turn already running at handover was started by none of the tracked ones.
+        const starters = ended.firstRow.beforeHandover ? [] : startingRequests(state)
+        if (starters.length >= 2) return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: starters })
+        if (starters.length === 0 && commandsAnsweredNow(state).length > 0) {
+          // Its own command answered (or none tracked), others waiting: told, not replied to.
+          return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+        }
+        onlyRequests = starters
+      } else {
+        return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: commandsAnsweredNow(state) })
+      }
+    }
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      goal: 'report',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim.outcome === 'reported') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting' || claim.outcome === 'noticing') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
+    // A throw part-way gives the claim back, keeping what landed (reportHoldingClaim).
+    return reportHoldingClaim(connectionId, ended.identity, () => reportClaimedTurnEnd(ended, claim, onlyRequests), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function reportClaimedTurnEnd(ended, claim, onlyRequests = null) {
+    let delivered = true
+    clearTrailState(connectionId)
+    if (ended.failure && sessionId && !claim.told) {
+      try {
+        await postTurnFailure({
+          failure: ended.failure,
+          connectionId,
+          sessionId,
+          dir: CONNECTIONS_DIR,
+          agentName,
+          // The room saw this turn working: it is told why it ended either way, unless a
+          // notice already told it (an upgrade of a noticed turn end).
+          notice: !claim.noticed,
+          requestIds: onlyRequests,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+        noteTurnEndTold(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      } catch (e) {
+        delivered = false
+        process.stderr.write(`devspec-remote-poll: turn failure post failed: ${e.message}\n`)
+      }
+    }
+    // What woke the ended turn no longer describes the next one (notice-reply.mjs).
+    clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
+    const recorded = readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    const commands = recorded.length > 0 ? recorded : turnStartCommands
+    const localTurn = readState(connectionId)?.local_turn ?? null
+    // What started the turn is kept until the report lands, so a retry names it too; a
+    // completion that already landed is not sent again.
+    if (
+      !claim.completed &&
+      interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind !== 'suppress'
+    ) {
+      let completed = true
+      for (const call of activityCalls({
+        verb: 'complete',
+        connectionId,
+        commands,
+        localAttemptId: localTurnToComplete(localTurn, sessionId),
+        reason: 'turn_end',
+      })) {
+        try {
+          await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
+        } catch (e) {
+          completed = false
+          process.stderr.write(`devspec-remote-poll: turn-end completion failed: ${e.message}\n`)
+        }
+      }
+      if (completed) noteTurnEndCompleted(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      else delivered = false
+    }
+    // The same request bookkeeping the stop hook does at a turn's end. The poller has no
+    // list of the host's background work, so a request whose launched work has not woken
+    // the agent yet stays open. A directed question's answer still on its way keeps the
+    // current request open, as at a stop.
+    const capability = readConnectionCapability(connectionId)
+    if (capability) {
+      try {
+        const { failed } = await finishTurnRequests({
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          holdCurrent:
+            turnEndInteractionDecision({
+              continuation: interactionContinuation,
+              wakeFileBytes: wakeFileSizeForConnection(connectionId),
+            }).action === 'hold',
+          call: (args) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'report_request',
+              arguments: args,
+              timeoutMs: 3_000,
+            }),
+        })
+        if (failed.length > 0) delivered = false
+      } catch (e) {
+        delivered = false
+        process.stderr.write(`devspec-remote-poll: turn-end request bookkeeping failed: ${e.message}\n`)
+      }
+    }
+    settleTurnEnd(connectionId, ended.identity, { reported: delivered, dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: delivered ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_end',
+      reason: ended.status,
+    })
+    if (!delivered) return 'retry'
+    turnStartCommands = []
+    clearTurnMarker(connectionId)
+    // The turn is over: never carry the typed turn into the next one.
+    if (localTurn) patchState({ local_turn: null })
+    prevTurnActive = false
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}) per Cursor's transcript connection=${connectionId}\n`,
+    )
+    return 'reported'
+  }
+
+  /**
+   * The notice level, for an error or a stop the poller cannot tie to the tracked
+   * command beyond doubt (transcript-turn-end.mjs): the room is told in Cursor's words in
+   * a message of its own, which answers nothing (turn-failure.mjs postTurnNotice), and
+   * the working attempt is ended without saying which command finished
+   * (turn-commands.mjs attemptEndArguments), so Working clears now instead of lapsing.
+   * No command is answered and no request closed: that is the report level, which the
+   * stop hook adds when it runs, since it knows its turn (the upgrade), without a second
+   * notice.
+   *
+   * Nothing is sent when the stop hook has reported the turn end or is reporting it (the
+   * claim). The attempt is ended only once the room has been told, so Working never
+   * clears without a word, and only while the transcript still ends at this turn end: a
+   * turn Cursor has started since owns Working now. Returns as reportTranscriptTurnEnd.
+   */
+  async function noticeTranscriptTurnEnd(ended, marker, settleWith = { reply: true, requests: [] }) {
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      goal: 'notice',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
+    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim, marker, settleWith), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function noticeClaimedTurnEnd(ended, claim, marker, settleWith) {
+    clearTrailState(connectionId)
+    let done = true
+    // A stop hook that gave its report back after posting its message told the room already.
+    if (ended.failure && sessionId && !claim.told && !claim.noticed) {
+      try {
+        await postTurnNotice({
+          failure: ended.failure,
+          sessionId,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+        noteTurnEndNoticed(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      } catch (e) {
+        done = false
+        process.stderr.write(`devspec-remote-poll: turn notice failed: ${e.message}\n`)
+      }
+    }
+    if (done && !claim.completed && !claim.ended) {
+      // An exact directed-question attempt is the one a generic end must not touch
+      // (interactionActivityPlan).
+      const suppressed =
+        interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind === 'suppress'
+      // Read again: a newer turn has replaced this end, or the read failed and the step
+      // is tried again later (never taken for a newer turn).
+      const now = suppressed ? null : turnEndIdentity(lapTranscriptPath)
+      if (!suppressed && now === null) {
+        done = false
+        process.stderr.write('devspec-remote-poll: transcript unreadable before ending the working attempt; trying again\n')
+      } else if (!suppressed && now === ended.identity) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'report_complete',
+            arguments: attemptEndArguments({ connectionId, reason: 'turn_end' }),
+            timeoutMs: 10_000,
+          })
+        } catch (e) {
+          done = false
+          process.stderr.write(`devspec-remote-poll: ending the working attempt failed: ${e.message}\n`)
+        }
+      }
+      if (done) noteTurnEndAttemptEnded(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+    }
+    settleTurnEnd(connectionId, ended.identity, { noticed: done, dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: done ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_notice',
+      reason: ended.status,
+    })
+    if (!done) return 'retry'
+    // Working has cleared. The turn end now settles: the room commands picked up before
+    // it are answered once Cursor has stayed idle for SETTLE_MS, or a turn Cursor starts
+    // from a wake is tracked and decides it (transcript-turn-end.mjs "Settling and watching"). The
+    // commands the turn started with stay on record for that, and for the stop hook's
+    // upgrade, which names them; the backstop does not report them.
+    if (sessionId && ended.failure && ended.position) {
+      startSettle(connectionId, {
+        ended,
+        conversation: transcriptConversation(lapTranscriptPath),
+        turn: marker?.startedAt ?? null,
+        requests: settleWith.requests,
+        reply: settleWith.reply,
+        commands: readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }),
+        dir: CONNECTIONS_DIR,
+      })
+    }
+    turnStartCommands = []
+    clearTurnMarker(connectionId, { keepCommands: true })
+    prevTurnActive = false
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}), told the room and ended the working attempt; not tied to a command connection=${connectionId}\n`,
+    )
+    return 'reported'
+  }
+
+  /**
+   * The settle point of a turn end the poller could only notice (transcript-turn-end.mjs
+   * "Settling and watching"): Cursor has stayed idle at it for SETTLE_MS, or a command was handed over
+   * since. Every room command picked up before it and still unanswered is answered with
+   * what is certain (turn-failure.mjs answerUnsettledCommands) and its request closed;
+   * Working cleared at the notice. Done as the report level of the turn end's claim, so
+   * a stop hook that answered it already, or is answering it, adds nothing here. Returns
+   * true once settled (or answered elsewhere), false to try again later.
+   */
+  async function resolveSettle(settle) {
+    const claim = claimTurnEnd(connectionId, settle.identity, { by: 'poller', goal: 'report', dir: CONNECTIONS_DIR })
+    if (claim.outcome === 'reported') return true
+    if (claim.outcome !== 'claimed') return false
+    const outcome = await reportHoldingClaim(
+      connectionId,
+      settle.identity,
+      async () => {
+        let delivered = true
+        if (!claim.told && sessionId) {
+          try {
+            await answerUnsettledCommands({
+              failure: settle.failure,
+              requestIds: settle.requests ?? [],
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              agentName,
+              post: (args) =>
+                mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+            })
+            noteTurnEndTold(connectionId, settle.identity, { dir: CONNECTIONS_DIR })
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end reply failed: ${e.message}\n`)
+          }
+        }
+        const capability = readConnectionCapability(connectionId)
+        if (delivered && capability) {
+          try {
+            const { failed } = await finishTurnRequests({
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              call: (args) =>
+                mcpToolsCall({
+                  mcpUrl,
+                  token,
+                  connectionCapability: capability,
+                  name: 'report_request',
+                  arguments: args,
+                  timeoutMs: 3_000,
+                }),
+            })
+            if (failed.length > 0) delivered = false
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end request bookkeeping failed: ${e.message}\n`)
+          }
+        }
+        settleTurnEnd(connectionId, settle.identity, { reported: delivered, dir: CONNECTIONS_DIR })
+        return delivered ? 'reported' : 'retry'
+      },
+      {
+        dir: CONNECTIONS_DIR,
+        onError: (e) => process.stderr.write(`devspec-remote-poll: settling failed part-way: ${e?.message ?? e}\n`),
+      },
+    )
+    if (outcome === 'reported') {
+      process.stderr.write(`devspec-remote-poll: turn end settled; unanswered commands answered connection=${connectionId}\n`)
+    }
+    return outcome === 'reported'
+  }
+
+  /**
+   * One lap's look at a settle under way (transcript-turn-end.mjs settleStep). A
+   * command handed over since (a marker) settles it at once: the commands picked up
+   * before the turn end are answered, and the new command's turn is tracked as any
+   * other.
+   */
+  async function lapSettle(marker, transcriptPath) {
+    const settle = readSettle(connectionId, { dir: CONNECTIONS_DIR })
+    if (!settle) return
+    if (marker) {
+      // A watch only (a typed turn's end) answers nothing: the new command's turn is tracked.
+      if (settle.reply === false || settle.resolved || (await resolveSettle(settle))) clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      return
+    }
+    const step = settleStep(settle, { transcriptPath })
+    if (step.action === 'track') {
+      // Cursor started a turn from a wake since: track it as any command's turn, so
+      // Working shows while it runs and its end is reported (and decides the settle).
+      recordTurnCommands(connectionId, settle.commands ?? [], { dir: CONNECTIONS_DIR })
+      writeTurnMarker(connectionId, { remoteTurn: true, startedAt: step.startedAt, baseline: step.baseline })
+      clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      process.stderr.write(`devspec-remote-poll: a wake turn started after a noticed turn end; tracking it connection=${connectionId}\n`)
+    } else if (step.action === 'restart') {
+      updateSettle(connectionId, { idle: { ...settle.idle, stamp: step.stamp, since: Date.now() } }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'rebase') {
+      updateSettle(connectionId, { kept: step.kept, keptDigest: step.keptDigest, idle: step.idle }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'resolve') {
+      if (await resolveSettle(settle)) updateSettle(connectionId, { resolved: true }, { dir: CONNECTIONS_DIR })
+    }
   }
 
   /**
@@ -1672,6 +2121,18 @@ async function main() {
   // The transcript this poller last read for a turn end (usage-refusal.mjs), so an
   // unchanged one is not read again every lap.
   const turnEndMemo = {}
+  // Cursor's transcript, read for the end of the turn this poller tracks when no stop
+  // hook reports it (transcript-turn-end.mjs): what each lap last decided, what the
+  // once-a-second local check last looked at, the transcript this lap resolved (for that
+  // check), and the turn the marker tracked when last seen (for the backstop below).
+  const transcriptTurnEndMemo = {}
+  const turnEndProbeMemo = {}
+  const settleProbeMemo = {}
+  // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
+  // and when the next is due (nextReportTry). Null once due is null: given up.
+  let reportRetry = null
+  let lapTranscriptPath = null
+  let trackedTurnStartedAt = null
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -2375,6 +2836,19 @@ async function main() {
           const m = readTurnMarker(connectionId)
           const liveNow = turnIsLive(m, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
           if (liveNow !== prevTurnActive) return true
+          // Cursor's transcript now ends in a turn end: the lap decides whether it is the
+          // tracked turn's (transcript-turn-end.mjs).
+          if (
+            m &&
+            turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, connectionId, dir: CONNECTIONS_DIR, memo: turnEndProbeMemo })
+          ) {
+            return true
+          }
+          if (m && reportRetry?.dueAt != null && Date.now() >= reportRetry.dueAt) return true
+          // A noticed turn end settling: its clock ran out, or Cursor wrote since.
+          if (!m && settleDue({ connectionId, transcriptPath: lapTranscriptPath, dir: CONNECTIONS_DIR, memo: settleProbeMemo })) {
+            return true
+          }
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2434,45 +2908,55 @@ async function main() {
     // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
     let marker = readTurnMarker(connectionId)
     const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
+    lapTranscriptPath = transcriptPath
     // How Cursor ended the conversation's last turn, read whether or not a stop hook
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
     observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
-    const erroredEnd = marker
-      ? erroredTurnEnd({
-          transcriptPath,
-          startedAt: marker.startedAt,
-        })
-      : null
-    if (erroredEnd) {
-      // Cursor ended the turn itself (usage limit, provider error): no Stop hook ran and
-      // the model cannot reply, so say so in the room and close the working attempt now
-      // rather than after the 1h no-sign-of-life backstop (item 45eb0708).
-      if (sessionId) {
-        try {
-          await mcpToolsCall({
-            mcpUrl,
-            token,
-            name: 'post_session_message',
-            arguments: {
-              connection_id: connectionId,
-              message: erroredTurnNotice(erroredEnd),
-              agent_name: agentName,
-              turn_kind: 'agent',
-              phase: 'answer',
-            },
-            timeoutMs: 10_000,
-          })
-        } catch (e) {
-          process.stderr.write(`devspec-remote-poll: errored-turn notice failed: ${e.message}\n`)
+    // Cursor ended the tracked turn and no stop hook has reported it: Cursor runs a
+    // plugin's stop hook only when the person has a hooks file of their own
+    // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
+    if (marker) {
+      if (reportRetry && reportRetry.turn !== marker.startedAt) reportRetry = null
+      const retryDue = reportRetry && reportRetry.dueAt !== null && Date.now() >= reportRetry.dueAt
+      // A try that failed is decided afresh when it is due again.
+      if (retryDue) transcriptTurnEndMemo.decided = null
+      const ended =
+        reportRetry && !retryDue
+          ? null
+          : transcriptTurnEnd({
+              connectionId,
+              marker,
+              transcriptPath,
+              dir: CONNECTIONS_DIR,
+              memo: transcriptTurnEndMemo,
+            })
+      if (ended) {
+        const outcome = await reportTranscriptTurnEnd(ended, marker)
+        if (outcome === 'reported') {
+          marker = null
+          reportRetry = null
+        } else if (outcome === 'retry') {
+          const attempts = (reportRetry?.identity === ended.identity ? reportRetry.attempts : 0) + 1
+          reportRetry = { turn: marker.startedAt, identity: ended.identity, attempts, dueAt: nextReportTry(attempts, Date.now()) }
+        } else if (outcome === 'reported_elsewhere') {
+          // The stop hook reported this turn end in full, and ends the turn itself.
+          turnStartCommands = []
+          clearTurnMarker(connectionId)
+          prevTurnActive = false
+          marker = null
+          reportRetry = null
+        } else {
+          // The stop hook is reporting it now: look again next lap. It either settles it
+          // or gives it back, and the marker stays until the report lands.
+          transcriptTurnEndMemo.decided = null
         }
       }
-      await emitActivityVerb('complete', extraActivityVerbArgs({ stalling: true, verb: 'complete' }))
-      clearTurnMarker(connectionId)
-      prevTurnActive = false
-      marker = null
-      process.stderr.write(`devspec-remote-poll: turn ended with a Cursor error connection=${connectionId}\n`)
     }
+    // A turn end the poller could only notice settles (transcript-turn-end.mjs
+    // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
+    await lapSettle(marker, transcriptPath)
+    if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
     let turnActive = turnIsLive(marker, { activity })
@@ -2498,7 +2982,20 @@ async function main() {
     // finished. Best-effort inside emitActivityVerb — a failed verb never breaks the
     // loop. Complete always carries a reason: turn_end on a healthy marker clear
     // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
-    const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    let activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    // The marker went because the stop hook ended the turn, and the stop hook claimed and
+    // reported that turn's end (transcript-turn-end.mjs): there is nothing to add.
+    if (
+      activityVerb === 'complete' &&
+      !marker &&
+      turnEndClaimed(connectionId, readTurnBaseline(connectionId, trackedTurnStartedAt, { dir: CONNECTIONS_DIR }), {
+        dir: CONNECTIONS_DIR,
+      })
+    ) {
+      turnStartCommands = []
+      clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+      activityVerb = null
+    }
     const verbResult = await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
     if (verbResult?.turnStale) {
       turnActive = false

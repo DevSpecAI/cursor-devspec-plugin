@@ -1,0 +1,5 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Nov 20, 2026, 9:20 PM (UTC)</timestamp>\n<user_query>\nReply with the single word ONE.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ONE"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Nov 20, 2026, 9:21 PM (UTC)</timestamp>\n<user_query>\nReply with the single word TWO.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"TWO"}]}}
+{"type":"turn_ended","status":"success"}

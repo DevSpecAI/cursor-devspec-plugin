@@ -2,8 +2,9 @@
  * The room commands this plugin starts, named to DevSpec at both ends of a turn.
  *
  * DevSpec starts a delivered room command only when the host names it, and a
- * turn-finished report that names nothing does not finish a command (what each form
- * does is in the descriptions of `report_pickup` and `report_complete`). So:
+ * turn-finished report that names nothing ends only the attempt being worked on, never
+ * a command still waiting (what each form does is in the descriptions of
+ * `report_pickup` and `report_complete`). So:
  *
  * - **Every command the plugin hands the agent is started by name**, as it is handed
  *   over, whether or not a turn is already running: `report_pickup` with the
@@ -17,6 +18,14 @@
  * - **The end of a turn names what it finishes** (`completionArguments`): the
  *   commands that started the turn, the terminal turn the owner typed, or, when it
  *   had neither, `command_turn_unbound`.
+ * - **One end names nothing, on purpose** (`attemptEndArguments`): a turn that ended
+ *   in an error the poller cannot tie to a command beyond doubt
+ *   (transcript-turn-end.mjs). It must not say which command finished, yet the working
+ *   attempt must not be left to lapse. `report_complete` with only `connection_id`
+ *   ends the newest attempt being worked on, closes only that attempt's own command,
+ *   never a delivered command that has not been picked up, and changes nothing when
+ *   nothing is being worked on (its description at DevSpecV2 59acf1bfe; PR #1391,
+ *   migration 1680, item f908710b).
  *
  * Which commands a turn's end names: the ones that started it. The poller records
  * them here when its delivery starts a turn, in `<connection>.turn-commands.json`,
@@ -128,6 +137,14 @@ export function pickupArguments(connectionId, command) {
  * turn the owner typed. A turn that had neither says it is unbound. Never empty, so a
  * caller cannot fall back to a report that names nothing.
  */
+/**
+ * `report_complete`'s arguments for ending the working attempt without saying which
+ * command finished (see the header): the connection and the reason, and no identity.
+ */
+export function attemptEndArguments({ connectionId, reason }) {
+  return { connection_id: connectionId, ...(reason ? { reason } : {}) }
+}
+
 export function completionArguments({ connectionId, commands = [], localAttemptId = null, reason }) {
   const withReason = (identity) => ({ connection_id: connectionId, ...identity, ...(reason ? { reason } : {}) })
   const calls = unique(commands).map((command) =>

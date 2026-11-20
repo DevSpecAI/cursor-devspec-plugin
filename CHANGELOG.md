@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.28.0
+
+- **The room stops showing your Cursor agent as Working once it has finished.** Cursor's command-line agent currently skips the plugin's end-of-turn step unless you have a Cursor hooks file of your own, which most people don't. Until now that left the room showing the agent as Working for up to an hour after it had answered. The plugin now notices the end of each turn in the conversation Cursor keeps on your machine, and tells DevSpec within a few seconds which of your messages the turn finished.
+- **When a turn ends in an error, or someone stops it, the room is told.** It quotes Cursor's own message, such as a usage limit, so you can see from your phone why the agent didn't finish, even though Cursor skipped the end-of-turn step. When the turn that ended was one you typed in the terminal, the room is told straight away and stops showing the agent as Working. Your messages from the room that are still waiting are left as they are. Cursor runs a waiting message once you send your next prompt, and when it does, the room shows Working again until the agent has answered. When the turn was working on one of your messages, that message gets the reply. When the plugin can't see which kind of turn it was, for example when Cursor stopped before writing anything, it tells the room straight away. If Cursor then stays idle for 15 seconds, it replies to each waiting message, saying only what is certain: that Cursor stopped or hit an error before answering, and that if Cursor runs the message later, its answer will still appear here. If you have a Cursor hooks file of your own, Cursor's end-of-turn step replies straight away instead.
+- **Each turn's end is reported once.** If you do have a Cursor hooks file of your own, or once Cursor fixes this on its side, the end-of-turn step and the plugin's own check never both report the same turn. If DevSpec can't be reached just then, the plugin tries again shortly, without telling the room twice. If the conversation can't be read for a moment, the plugin reads it again rather than missing that turn.
+- **Nothing in your Cursor settings is changed.** If Cursor changes how it records a conversation, the plugin stops noticing turn ends rather than guessing, and the room behaves as it did before this release. It never reports a turn as finished while it is still running.
+- Prompts you type in the terminal still aren't shown in the room; that waits for Cursor's fix.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.27.0
 
 - **Your Cursor agent now follows DevSpec's own rules for work that has to wait, rather than the plugin's copy of them.** Work waiting for someone's OK, or for its checks, stays on its own branch, and the agent does what DevSpec's message about that wait says. It no longer holds out for an OK when fixing the work is what clears it, and it stays right when DevSpec's rules change.

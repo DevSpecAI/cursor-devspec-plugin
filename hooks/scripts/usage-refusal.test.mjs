@@ -21,12 +21,12 @@ import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   USAGE_REFUSAL_COOL_OFF_MS,
   isUsageRefusalText,
-  lastTurnEnd,
   noteUsageRefusalSent,
   observeTurnEnd,
   refusalLiftsAt,
   usageRefusalArgument,
 } from './usage-refusal.mjs'
+import { lastTurnEnd } from './transcript-turn-end.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CONN = FIXTURE_ID.connection
@@ -107,7 +107,7 @@ describe('what counts as a usage stop', () => {
 })
 
 describe('reading the turn end from the transcript', () => {
-  it('finds the last turn_ended line, says whether it is final, and dates it by the file', () => {
+  it('finds the turn_ended line only while it is the final line, and dates it by the file', () => {
     const dir = scratch()
     try {
       const file = path.join(dir, 't.jsonl')
@@ -116,18 +116,17 @@ describe('reading the turn end from the transcript', () => {
       const end = lastTurnEnd(file)
       assert.equal(end.status, 'error')
       assert.equal(end.error, LIMIT)
-      assert.equal(end.final, true)
       assert.equal(end.atMs, at)
 
       writeTranscript(file, [user('hi'), ended('error', LIMIT), user('again')], at)
-      assert.equal(lastTurnEnd(file).final, false, 'a prompt written below it')
+      assert.equal(lastTurnEnd(file), null, 'a prompt written below it: no longer the last turn end')
       assert.equal(lastTurnEnd(path.join(dir, 'missing.jsonl')), null)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('never reads the partial first line of a long transcript as a turn end', () => {
+  it('never takes a turn end above a long final row for the last one', () => {
     const dir = scratch()
     try {
       const file = path.join(dir, 't.jsonl')
@@ -223,6 +222,41 @@ describe('what is reported, turn end by turn end', () => {
     writeTranscript(file, [user('hi'), ended('error', LIMIT)], Date.now() - USAGE_REFUSAL_COOL_OFF_MS - 60_000)
     observe(Date.now())
     assert.deepEqual(argument(Date.now()), {}, 'its cool-off ended before it was seen')
+  })
+
+  it('A16 (requirement 3ea2b201): a transcript it could not read is read again though unchanged, and a record it could not read is never replaced', (t) => {
+    const at = second()
+    writeTranscript(file, [user('fix the test'), ended('error', LIMIT)], at)
+    const memo = {}
+    const observeRemembering = (nowMs) => observeTurnEnd(CONN, file, { dir, nowMs, memo })
+    fs.chmodSync(file, 0o000)
+    try {
+      fs.closeSync(fs.openSync(file, 'r'))
+      fs.chmodSync(file, 0o600)
+      return t.skip('permissions do not stop this process reading files (root)')
+    } catch {
+      /* unreadable, as intended */
+    }
+    try {
+      observeRemembering(at)
+      assert.deepEqual(argument(at), {}, 'nothing read, nothing recorded')
+    } finally {
+      fs.chmodSync(file, 0o600)
+    }
+    assert.equal(fs.statSync(file).mtimeMs, at, 'the same file, unchanged')
+    observeRemembering(at)
+    assert.equal(typeof argument(at).usage_refused_until, 'string', 'read again and recorded')
+
+    // A record that cannot be read is not replaced, which would drop the refusal in it.
+    const record = path.join(dir, `${CONN}.usage-refusal.json`)
+    const standing = fs.readFileSync(record, 'utf8')
+    fs.writeFileSync(record, '{"v":1,')
+    writeTranscript(file, [user('fix the test'), answer('Done.'), ended('success')], at + 1_000)
+    observeRemembering(at + 1_000)
+    assert.equal(fs.readFileSync(record, 'utf8'), '{"v":1,', 'left as it was')
+    fs.writeFileSync(record, standing)
+    observeRemembering(at + 1_000)
+    assert.deepEqual(argument(at + 1_000), { usage_refused_until: null }, 'read again once the record can be: the turn that ran clears it')
   })
 
   it('a clear delivered after a newer stop was recorded never erases the stop', () => {
