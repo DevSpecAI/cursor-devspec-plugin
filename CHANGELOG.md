@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.2
+
+- **Connecting and disconnecting remote control now always run the newest copy of the plugin you have installed.** Cursor keeps the older copies of a plugin on disk after you update it. Until now, the agent could pick whichever copy it came across first, so after an update it could still start the old version's background helper. It now picks the copy with the highest version, and among copies of the same version, the one that arrived most recently.
+- **When no installed copy can be found, the agent tells you so** and asks you to reinstall the plugin, instead of carrying on and failing with a confusing error.
+- **You can name the agent when you connect it.** `--name "…"` gives this agent the name you choose on the Agents page instead of a made-up one. The agent now recognises it alongside the other connect options.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.22.1
 
 - **DevSpec now records who asked for the requirement, inventory and dependency-review changes your Cursor agent makes.** When the agent records, updates, replaces or retracts a requirement, records, revises or retracts an inventory entry, or records a dependency review, the plugin tells DevSpec which request the change serves, as it already did for tasks, memories and documents. Until now DevSpec had to work these out for itself.
