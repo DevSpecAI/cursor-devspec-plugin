@@ -135,8 +135,8 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       if (stamped.deny) return deny(stamped.deny)
       next = stamped.args
 
-      // A notice reply is outside every turn: it takes no local-turn flags, and a
-      // later Stop must not post the turn's final words as a second reply.
+      // A notice reply is outside every turn: it takes no local-turn flags, and Stop
+      // knows the model spoke in the room itself (notice-reply.mjs, postTellPersonAtStop).
       if (noticeReply && connectionId) recordNoticeReply(connectionId, { dir: connDir })
 
       if (

@@ -10,8 +10,9 @@
  *               a room command whose turn errored or was stopped is told so (turn-failure.mjs);
  *               a usage-limit stop rides the heartbeat, and a turn that ran clears it
  *               (usage-refusal.mjs);
- *               a turn woken only by DevSpec notices whose model posted no reply ends with
- *               its final message as a reply to those notices (notice-reply.mjs)
+ *               a turn woken only by DevSpec notices and check jobs posts nothing of its
+ *               own, except, as a backstop, a write's tell_person mark the model told
+ *               nobody about (notice-reply.mjs)
  *
  * Mid-turn trail growth lives in trail-turn.mjs (tool/shell/file/MCP hooks).
  * Answers are agent-canonical: skills call post_session_message({ connection_id }).
@@ -58,7 +59,7 @@ import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.
 import { postTurnFailure } from './turn-failure.mjs'
 import { hookTranscriptPath, noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { fitRoomMessage } from './room-message.mjs'
-import { clearTurnWakes, postNoticeTurnReply, recordPromptWake } from './notice-reply.mjs'
+import { clearTurnWakes, postTellPersonAtStop, recordPromptWake } from './notice-reply.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -643,8 +644,9 @@ async function main() {
   // Consume any explicit-reply marker so it cannot bleed into a later turn.
   // Agent answers are skill-posted (ADR b98a39a9); Stop no longer mirrors full
   // assistant text as a primary path — dual writers caused wrong-voice dupes
-  // and silent misses when bonding failed.
-  if (mode === 'stop') consumeExplicitReplyMarker(connectionId)
+  // and silent misses when bonding failed. Whether the model posted itself is kept
+  // for the one Stop post that remains (notice-reply.mjs, postTellPersonAtStop).
+  const hadExplicitReply = mode === 'stop' ? consumeExplicitReplyMarker(connectionId) : false
 
   // Skip turn marker, work trail seed, local prompt mirroring, and busy assertion
   // when user_prompt has no genuine user text or is harness injection (prevents transient dot flicker).
@@ -763,25 +765,38 @@ async function main() {
       }
     }
 
-    // A turn woken only by DevSpec notices, whose model posted no reply to them, ends
-    // with its final message as a reply to those notices: bound to no command turn,
-    // so it never answers or closes anyone's command (notice-reply.mjs). Then what
-    // woke the turn is forgotten.
+    // A turn woken only by DevSpec notices and check jobs puts nothing into the room
+    // on the plugin's word: when a notice is answered there is DevSpec's rule, and the
+    // model posts that reply itself (item 140a7f68). A write whose result carried
+    // tell_person is the model's to tell its person about (its tell-person command); as
+    // a backstop only, when it told nobody, its final message goes to the room as the
+    // agent's own message through the speech lane that needs no open turn, and one that
+    // cannot be posted is logged and left for the agent's next turn (notice-reply.mjs).
+    // Nothing depends on this running. Then what woke the turn is forgotten.
     if (mode === 'stop' && connectionId) {
       try {
-        await postNoticeTurnReply({
+        await postTellPersonAtStop({
           raw,
           connectionId,
           sessionId,
           connectionState: state,
+          connectionCapability,
           agentName,
+          told: hadExplicitReply,
           dir: CONNECTIONS_DIR,
           prepare: prepareAgentMirrorText,
-          post: (args) =>
-            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+          post: (args, { connectionCapability: capability }) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'post_session_message',
+              arguments: args,
+              timeoutMs: 15_000,
+            }),
         })
       } catch {
-        /* non-fatal: the person still has the final message in the terminal */
+        /* a refused post is logged and kept inside; this only guards the turn's end */
       }
       clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
     }

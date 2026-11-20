@@ -30,18 +30,21 @@
  *   plugin cannot tell which post is about the notice, stamps nothing, and the model
  *   passes the ids it was shown. Check jobs delivered into the turn are recorded
  *   beside the notices (`checkJobIds`) and change none of this.
- * - A notice-only turn whose model posted no reply ends with one: Stop posts the
- *   turn's final message as a notice reply (`postNoticeTurnReply`).
+ * - Stop never posts a reply for the model (item 140a7f68). Whether a notice is
+ *   answered in the room is DevSpec's rule (`semantics.notice_audience`,
+ *   `semantics.notice_reply`), and when one is called for the model posts it itself;
+ *   what it leaves in the terminal at the end of a turn that owns no command is its
+ *   working, not a reply. When one of its writes carried DevSpec's `tell_person` mark,
+ *   the model tells its person itself (`tell-person`, tell-person-bridge.mjs); Stop
+ *   posts the final message only as a backstop when it told nobody
+ *   (`postTellPersonAtStop`).
  *
  * Which notices get a reply is DevSpec's label, never the plugin's guess (item
  * a868f41f; `semantics.notice_audience`). At system_notice_version 3 every notice
  * carries `audience`: `needs_person` or `for_the_record`. Only notices that need a
- * person are given a reply call, stamped on a plain post or replied to at Stop; the
- * turn record keeps the for-the-record ones apart (`forTheRecordIds`), so a turn they
- * alone woke posts nothing. They still make the turn one that owns no command. A
- * reply DevSpec refuses because every notice it names is for the record
- * (`delivery.reason: for_the_record`) is the expected, quiet outcome: nothing is
- * posted, surfaced or retried another way.
+ * person are given a reply call or stamped on a plain post; the turn record keeps the
+ * for-the-record ones apart (`forTheRecordIds`). They still make the turn one that
+ * owns no command.
  *
  * Imports only Node built-ins and sibling modules that do.
  */
@@ -49,8 +52,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { NO_REQUEST, UNSTATED, readRequestState } from './requests.mjs'
+import { logRemoteControlStory } from './remote-control-story.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
@@ -67,7 +72,9 @@ export const NOTICE_AUDIENCE_CONTRACT = 'semantics.notice_audience in devspec://
 export const FOR_THE_RECORD_HANDLING =
   'DevSpec labelled this notice for the record: it gets no notice reply and nothing in the room, ' +
   'and any housekeeping it asks for on your own work is done quietly. ' +
-  'If a write you make while handling it returns tell_person, tell your person what you changed. ' +
+  'If a write you make while handling it returns tell_person, telling your person is yours to do ' +
+  '(semantics.notice_audience.telling_anyway): in a turn that only DevSpec notices or check jobs woke, post it with the ' +
+  "DevSpec remote skill's tell-person command, which needs no open turn; in any other turn, in your next message to them. " +
   `Rules: ${NOTICE_AUDIENCE_CONTRACT}.`
 
 /** The wake line's `notice_reply` when every notice it handed over is for the record. */
@@ -267,8 +274,11 @@ function forTheRecordField(ids) {
 
 /**
  * The current turn's record: `{ startedAt, noticeIds, forTheRecordIds?, checkJobIds?,
- * otherWake, noticeReplyAt? }`, or null. `noticeIds` holds every notice that woke the
- * turn; `forTheRecordIds` the ones among them DevSpec labelled for the record.
+ * otherWake, noticeReplyAt?, tellPersonAt?, personToldAt? }`, or null. `noticeIds` holds
+ * every notice that woke the turn; `forTheRecordIds` the ones among them DevSpec
+ * labelled for the record; `tellPersonAt` when a DevSpec write in the turn carried
+ * `tell_person`; `personToldAt` when the agent told its person with the `tell-person`
+ * command (tell-person-bridge.mjs).
  */
 export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return null
@@ -282,6 +292,8 @@ export function readTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
       ...checkJobIdsField(record.checkJobIds),
       otherWake: record.otherWake === true,
       ...(typeof record.noticeReplyAt === 'number' ? { noticeReplyAt: record.noticeReplyAt } : {}),
+      ...(typeof record.tellPersonAt === 'number' ? { tellPersonAt: record.tellPersonAt } : {}),
+      ...(typeof record.personToldAt === 'number' ? { personToldAt: record.personToldAt } : {}),
     }
   } catch {
     return null
@@ -331,11 +343,65 @@ export function clearTurnWakes(connectionId, { dir = DEFAULT_DIR } = {}) {
   }
 }
 
-/** Note that a reply to the turn's notices went out, so Stop does not post a second. */
+/** Note that the model replied to the turn's notices itself, so Stop posts nothing for it. */
 export function recordNoticeReply(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
   const record = readTurnWakes(connectionId, { dir })
   if (!record) return false
   return Boolean(writeTurnWakes(connectionId, { ...record, noticeReplyAt: now }, dir))
+}
+
+/**
+ * Note that a DevSpec write in the turn carried `tell_person` (`resultCarriesTellPerson`).
+ * Only a turn something woke has a record, and only a turn that owns no command acts on
+ * it (`postTellPersonAtStop`); anywhere else telling the person is the turn's own answer.
+ */
+export function recordTellPerson(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  const record = readTurnWakes(connectionId, { dir })
+  if (!record) return false
+  if (record.tellPersonAt) return true
+  return Boolean(writeTurnWakes(connectionId, { ...record, tellPersonAt: now }, dir))
+}
+
+/**
+ * Note that the agent told its person itself with the `tell-person` command
+ * (tell-person-bridge.mjs), so the end-of-turn backstop posts nothing more. A turn
+ * nothing woke has no record and no backstop to stop.
+ */
+export function recordPersonTold(connectionId, { dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  const record = readTurnWakes(connectionId, { dir })
+  if (!record) return false
+  return Boolean(writeTurnWakes(connectionId, { ...record, personToldAt: now }, dir))
+}
+
+/**
+ * Whether a DevSpec tool result carries DevSpec's `tell_person` mark: the write changed
+ * a record its requester does not own, or marked a task blocked, and the person the
+ * agent works for must hear about it (`semantics.notice_audience.telling_anyway`).
+ * DevSpec appends the mark to an applied write's result as its own text block,
+ * `{"tell_person":{…}}`. Only that shape counts, so a record whose text merely mentions
+ * the word never does. `result` is the result Cursor hands afterMCPExecution
+ * (`result_json`), as text or as the parsed object.
+ */
+export function resultCarriesTellPerson(result) {
+  let envelope = result
+  if (typeof envelope === 'string') {
+    try {
+      envelope = JSON.parse(envelope)
+    } catch {
+      return false
+    }
+  }
+  if (!envelope || typeof envelope !== 'object' || envelope.isError === true) return false
+  const blocks = Array.isArray(envelope.content) ? envelope.content : []
+  return blocks.some((block) => {
+    if (block?.type !== 'text' || typeof block.text !== 'string' || !block.text.includes('"tell_person"')) return false
+    try {
+      const mark = JSON.parse(block.text)?.tell_person
+      return Boolean(mark) && typeof mark === 'object' && !Array.isArray(mark) && typeof mark.why === 'string'
+    } catch {
+      return false
+    }
+  })
 }
 
 /**
@@ -472,9 +538,9 @@ function withKnownLabels(wake, known) {
  * one that is not a notice sets `otherWake`. A stale record or request only ever
  * makes this null, never the other way round.
  *
- * Notices DevSpec labelled for the record are left out: nothing is posted about them,
- * so a plain post is never stamped with them and Stop never replies to them. A turn
- * that only they woke has none, and so null.
+ * Notices DevSpec labelled for the record are left out: a reply naming them is never
+ * one, so a plain post is never stamped with them. A turn that only they woke has none,
+ * and so null.
  */
 export function turnNoticeIds({ record, requestState = null, connectionState = null } = {}) {
   const quiet = new Set(uniqueIds(record?.forTheRecordIds))
@@ -528,8 +594,11 @@ export function currentTurnOwnsNoCommand(connectionId, { dir = DEFAULT_DIR, conn
   })
 }
 
-// ── Stop: a notice-only turn ends with a notice reply ─────────────────────────
+// ── Stop: a write marked tell_person, which the model told nobody about ───────
 
+// How much of the transcript's end is read for the turn's final message. Cursor writes
+// a turn's rows last, so they sit at the end; this bound only stops a huge transcript
+// being read whole at the end of every turn that needs it.
 const TRANSCRIPT_TAIL_BYTES = 256 * 1024
 
 function textOf(row) {
@@ -602,53 +671,188 @@ function hookAssistantText(data) {
 }
 
 /**
- * Whether DevSpec refused a notice reply because every notice it named is for the
- * record (`delivery.reason: for_the_record`): nothing was posted and nothing needs to
- * be. Read from the refusal's own receipt, or from its text when the receipt could
- * not be parsed.
+ * The post that tells the person: DevSpec's append-only speech lane
+ * (`assistant_source_id` with `ingest_version: 2`, sent with the connection's own
+ * capability). It lands in the room the connection is attached to now, as the agent's
+ * ordinary message, whether or not a turn is open there; DevSpec refuses it only when
+ * the connection is in no room.
+ *
+ * Neither of the other shapes reaches the room from a turn that owns no command
+ * (item 140a7f68):
+ * - an ordinary connection post joins the turn DevSpec has open for the connection,
+ *   and a wake of notices or check jobs opens none, so it is refused;
+ * - a notice reply (`system_notice_ids`) is refused when every notice it names is for
+ *   the record, is recorded as quiet housekeeping with no message when they were all
+ *   settled (`semantics.notice_reply.only_when_needed`), and a check job has no notice
+ *   to name.
+ * The Pi plugin posts the same call for the same case.
  */
-export function isForTheRecordRefusal(error) {
-  const details = error?.details
-  if (
-    details &&
-    typeof details === 'object' &&
-    (details.delivery?.reason === 'for_the_record' ||
-      details.delivery?.reason === 'settled_housekeeping' ||
-      details.settled_housekeeping === true)
-  ) {
-    return true
+export function tellPersonPost({ connectionId, text, agentName = null, sourceId = randomUUID() } = {}) {
+  return {
+    connection_id: connectionId,
+    ingest_version: 2,
+    assistant_source_id: sourceId,
+    message: text,
+    phase: 'answer',
+    complete_turn: false,
+    ...(agentName ? { agent_name: agentName } : {}),
   }
-  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-  return /"reason"\s*:\s*"(?:for_the_record|settled_housekeeping)"|"settled_housekeeping"\s*:\s*true/.test(text)
+}
+
+/** DevSpec's receipt for a post, from the parsed result or its first text block. */
+function postReceipt(result) {
+  if (result && typeof result === 'object' && typeof result.raw === 'string') {
+    try {
+      return JSON.parse(result.raw.split('\n')[0])
+    } catch {
+      return null
+    }
+  }
+  return result && typeof result === 'object' ? result : null
 }
 
 /**
- * Stop: when the turn was woken only by notices and the model posted no reply to
- * the ones that need a person, post its final message as a notice reply to them.
- * Bound to no command turn, so no trail, no complete_turn and no local-turn flags.
- * Nothing for a turn that errored or was stopped (its last words are not an answer),
- * for a connection in no room (the person already sees the final message in the
- * terminal), or for a turn whose notices are all for the record. Should DevSpec still
- * refuse the reply as for the record, that is the quiet outcome: recorded as handled,
- * never surfaced or retried.
- *
- * @returns {Promise<string[]|null>} the notice ids replied to, or null
+ * Why a post did not store the message, kept as DevSpec gave it rather than flattened
+ * into a sentence: `{ message, details }`, where `details` is DevSpec's own structured
+ * answer (a refusal's receipt, the not-stored delivery, an HTTP failure's status and
+ * code) when there is one. Null when the receipt says the message was stored.
  */
-export async function postNoticeTurnReply({
+export function postRefusal({ result = undefined, error = undefined } = {}) {
+  if (error !== undefined) {
+    const message = (error instanceof Error ? error.message : String(error ?? '')).trim() || null
+    if (error && typeof error === 'object' && error.details !== undefined) return { message, details: error.details ?? null }
+    const http = {}
+    for (const key of ['status', 'serverCode', 'retryable', 'code']) {
+      if (error && typeof error === 'object' && error[key] !== undefined && error[key] !== null) http[key] = error[key]
+    }
+    return { message, details: Object.keys(http).length > 0 ? http : null }
+  }
+  const receipt = postReceipt(result)
+  const status = receipt?.delivery?.status
+  if (status === 'stored' || status === 'idempotently_stored') return null
+  return { message: null, details: receipt ?? null }
+}
+
+/** The refusal recorded when the post is never sent: the connection holds no capability here. */
+export const NO_CAPABILITY_REFUSAL = Object.freeze({
+  message:
+    'This computer holds no capability for the connection, which DevSpec needs to post your message outside a turn. Reconnecting remote control gives it one.',
+  details: { reason: 'no_connection_capability' },
+})
+
+// ── A message the plugin could not post, left for the agent's next turn ───────
+
+export const TELL_PERSON_NOTE_SUFFIX = '.tell-person-pending.json'
+
+export function tellPersonNotePath(connectionId, dir = DEFAULT_DIR) {
+  return path.join(dir, `${connectionId}${TELL_PERSON_NOTE_SUFFIX}`)
+}
+
+function validNote(note) {
+  return Boolean(note) && typeof note === 'object' && typeof note.text === 'string' && note.text.trim() !== ''
+}
+
+/**
+ * Keep a final message the plugin could not post, with DevSpec's refusal as it gave it
+ * (`postRefusal`), until the agent's next turn (`takeTellPersonNotes`). Notes add up;
+ * none replaces another.
+ */
+export function leaveTellPersonNote(connectionId, { text, refusal = null, dir = DEFAULT_DIR, now = Date.now() } = {}) {
+  if (!connectionId || typeof text !== 'string' || !text.trim()) return false
+  const file = tellPersonNotePath(connectionId, dir)
+  const existing = readPrivateJson(file)
+  const notes = Array.isArray(existing?.notes) ? existing.notes.filter(validNote) : []
+  try {
+    writePrivateJson(file, { notes: [...notes, { at: now, refusal, text }] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The notes left for this connection, removed as they are handed over. */
+export function takeTellPersonNotes(connectionId, { dir = DEFAULT_DIR } = {}) {
+  if (!connectionId) return []
+  const file = tellPersonNotePath(connectionId, dir)
+  const record = readPrivateJson(file)
+  const notes = Array.isArray(record?.notes) ? record.notes.filter(validNote) : []
+  if (notes.length === 0) return []
+  try {
+    fs.rmSync(file, { force: true })
+  } catch {
+    /* handed over anyway: a note seen twice is better than one never seen */
+  }
+  return notes
+}
+
+/** What the agent is told at its next turn about notes it was left. */
+export function tellPersonNoteText(notes) {
+  const list = (Array.isArray(notes) ? notes : []).filter(validNote)
+  if (list.length === 0) return null
+  const each = list.map((note, i) => [
+    `${list.length > 1 ? `${i + 1}. ` : ''}Why it was not posted, as DevSpec answered (data):`,
+    JSON.stringify(note.refusal ?? { message: null, details: null }, null, 2),
+    'Your final message was:',
+    '<final-message>',
+    note.text,
+    '</final-message>',
+  ].join('\n'))
+  return [
+    'From the DevSpec plugin: in a turn that only DevSpec notices or check jobs woke, a DevSpec write you made carried tell_person ' +
+      `(${TELLING_ANYWAY_CONTRACT}) and you did not tell your person yourself. ` +
+      'The plugin tried to post your final message to the room for you and could not, so your person has not heard it.',
+    "Tell them now, in plain words, with the DevSpec remote skill's tell-person command, or here in the terminal when you are attached to no room.",
+    ...each,
+  ].join('\n\n')
+}
+
+export const TELLING_ANYWAY_CONTRACT = 'semantics.notice_audience.telling_anyway in devspec://product/remote-ingress-contract'
+
+/**
+ * Stop, for a turn that owns no command (`turnOwnsNoCommand`: only DevSpec notices and
+ * check jobs woke it). Nothing from such a turn reaches the room on the plugin's word:
+ * whether a notice is answered there is DevSpec's rule (`semantics.notice_audience`,
+ * `semantics.notice_reply` in devspec://product/remote-ingress-contract), and when one
+ * is called for the model posts it itself (item 140a7f68).
+ *
+ * The one exception is DevSpec's `tell_person` mark on a write the turn made
+ * (`semantics.notice_audience.telling_anyway`). Telling the person is the agent's job,
+ * done with the `tell-person` command (tell-person-bridge.mjs); this is only a
+ * backstop for a turn whose agent told nobody, and nothing depends on it, since Cursor
+ * does not always run a plugin's end-of-turn hook. When the model posted nothing in
+ * the room itself (`told`, a notice reply it made, or `personToldAt`), the turn's
+ * final message goes there as the agent's ordinary message (`tellPersonPost`). Nothing
+ * for a turn that errored or was stopped (its last words are not an answer), or for a
+ * connection in no room (the person already sees the final message in the terminal).
+ *
+ * A message that could not be posted is never dropped: the failure is logged with
+ * DevSpec's refusal as it gave it (`postRefusal`), and the message is left, with that
+ * refusal, for the agent's next turn (`leaveTellPersonNote`), where it is told to tell
+ * its person.
+ *
+ * `post(args, { connectionCapability })` makes the call; it is not made without the
+ * connection's capability, which the post needs.
+ *
+ * @returns {Promise<'posted'|'left_for_next_turn'|null>} null when there was nothing to post
+ */
+export async function postTellPersonAtStop({
   raw,
   connectionId,
   sessionId,
   connectionState = null,
+  connectionCapability = null,
   agentName,
+  told = false,
   post,
   dir = DEFAULT_DIR,
   prepare = (text) => String(text ?? '').trim() || null,
+  log = logRemoteControlStory,
+  now = Date.now(),
 } = {}) {
-  if (!connectionId || !sessionId || typeof post !== 'function') return null
+  if (!connectionId || !sessionId || told || typeof post !== 'function') return null
   const record = readTurnWakes(connectionId, { dir })
-  if (!record || record.noticeReplyAt) return null
-  const ids = turnNoticeIds({ record, requestState: readRequestState(connectionId, { dir }), connectionState })
-  if (!ids) return null
+  if (!record?.tellPersonAt || record.noticeReplyAt || record.personToldAt) return null
+  if (!turnOwnsNoCommand({ record, requestState: readRequestState(connectionId, { dir }), connectionState })) return null
   let data = {}
   try {
     data = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw || {}
@@ -658,18 +862,28 @@ export async function postNoticeTurnReply({
   if (data.status !== undefined && data.status !== 'completed') return null
   const text = prepare(hookAssistantText(data) ?? lastAssistantText(data.transcript_path))
   if (!text) return null
-  try {
-    await post({
-      connection_id: connectionId,
-      ...(agentName ? { agent_name: agentName } : {}),
-      message: text,
-      system_notice_ids: ids,
-    })
-  } catch (error) {
-    if (!isForTheRecordRefusal(error)) throw error
-    recordNoticeReply(connectionId, { dir })
-    return null
+  let refusal
+  if (!connectionCapability) {
+    refusal = NO_CAPABILITY_REFUSAL
+  } else {
+    try {
+      refusal = postRefusal({ result: await post(tellPersonPost({ connectionId, text, agentName }), { connectionCapability }) })
+    } catch (error) {
+      refusal = postRefusal({ error })
+    }
   }
-  recordNoticeReply(connectionId, { dir })
-  return ids
+  if (!refusal) return 'posted'
+  // DevSpec's refusal as it gave it, never the message: story lines carry no message bodies.
+  log({
+    phase: 'mirror_post',
+    outcome: 'failed',
+    reason: 'tell_person_not_posted',
+    connectionId,
+    sessionId,
+    agent: agentName,
+    tool: 'post_session_message',
+    data: { refusal },
+  })
+  leaveTellPersonNote(connectionId, { text, refusal, dir, now })
+  return 'left_for_next_turn'
 }

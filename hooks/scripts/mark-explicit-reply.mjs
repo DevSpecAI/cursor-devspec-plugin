@@ -10,6 +10,16 @@
  * A reply to DevSpec notices (notice-reply.mjs) is neither: it answers no command and
  * completes no turn, even when it passes complete_turn, so a command being worked still
  * needs its own answer and keeps showing Working until it gets one.
+ *
+ * On afterMCPExecution it also notes a DevSpec write whose result carries DevSpec's
+ * `tell_person` mark on the turn (`handleTellPersonMark`), for the end-of-turn
+ * backstop that tells the person when the model did not (notice-reply.mjs).
+ * When Stop could not post that message, it left it for the agent's next turn; on
+ * postToolUse this hook hands it over (`tellPersonNoteHook`).
+ *
+ * Run as `mark-explicit-reply.mjs <postToolUse|afterMCPExecution>`: the event decides
+ * whether a left note may be handed over, since Cursor delivers a hook's
+ * `additional_context` on postToolUse.
  */
 
 import fs from 'node:fs'
@@ -24,7 +34,19 @@ import {
 } from './mirror-turn.mjs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
-import { currentTurnNoticeIds, isNoticeReplyPost } from './notice-reply.mjs'
+import {
+  currentTurnNoticeIds,
+  isNoticeReplyPost,
+  leaveTellPersonNote,
+  recordTellPerson,
+  resultCarriesTellPerson,
+  takeTellPersonNotes,
+  TELL_PERSON_NOTE_SUFFIX,
+  tellPersonNoteText,
+} from './notice-reply.mjs'
+import { isDevspecServer, namespacedVerb } from './project-context.mjs'
+import { writePrivateText } from './private-state.mjs'
+import { CURSOR_HOOK_CONTEXT_MAX_CHARS } from './repository-context.mjs'
 
 function readStdin() {
   try {
@@ -133,13 +155,110 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
   return true
 }
 
+/** Whether a hook event is a call to one of DevSpec's own tools. */
+function isDevspecToolEvent(data) {
+  if (data?.mcp_server_name !== undefined) return isDevspecServer(data.mcp_server_name)
+  return Boolean(namespacedVerb(data?.tool_name ?? data?.toolName))
+}
+
+/**
+ * Note on the turn that a DevSpec write's result carried DevSpec's `tell_person` mark
+ * (`resultCarriesTellPerson`). Cursor hands the result to afterMCPExecution as
+ * `result_json`; an event without one changes nothing. Exported for tests; `dir`
+ * defaults to where the turn record lives.
+ */
+export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) {
+  let data = {}
+  try {
+    data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
+  } catch {
+    return false
+  }
+  if (!data || typeof data !== 'object' || !isDevspecToolEvent(data)) return false
+  if (!resultCarriesTellPerson(data.result_json ?? data.resultJson)) return false
+  const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
+  const connectionId = loadState(conversationId)?.connection_id
+  if (!connectionId) return false
+  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+  return recordTellPerson(connectionId, { dir: connDir })
+}
+
+/**
+ * The hook output handing the agent a message Stop could not post (notice-reply.mjs,
+ * `leaveTellPersonNote`), or null when none was left. Only the conversation that holds
+ * the connection gets it, never a subagent's tool call. Past Cursor's limit on a hook's
+ * `additional_context`, the whole note goes to a private file and the agent is told
+ * where, so nothing in it is cut. Exported for tests; `dir` defaults to where the
+ * connection's files live.
+ */
+export function tellPersonNoteHook(rawInput, env = process.env, { dir } = {}) {
+  let data = {}
+  try {
+    data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
+  } catch {
+    return null
+  }
+  if (!data || typeof data !== 'object' || data.agent_id) return null
+  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+  // This runs after every tool call: one directory read settles that nothing is waiting.
+  if (!anyTellPersonNote(connDir)) return null
+  const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
+  const connectionId = loadState(conversationId)?.connection_id
+  if (!connectionId) return null
+  const notes = takeTellPersonNotes(connectionId, { dir: connDir })
+  let text = tellPersonNoteText(notes)
+  if (!text) return null
+  if (text.length > CURSOR_HOOK_CONTEXT_MAX_CHARS) {
+    const file = path.join(connDir, `${connectionId}.tell-person-note.md`)
+    try {
+      writePrivateText(file, `${text}\n`)
+    } catch (error) {
+      // Not handed over, so not taken: put every note back for the next tool call.
+      for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
+      throw error
+    }
+    text =
+      'From the DevSpec plugin: a message your person has not heard is waiting for you, longer than Cursor hands a hook\'s note to you at once. ' +
+      `Read it whole, with the file-reading tool, at ${JSON.stringify(file)}, and do what it says.`
+  }
+  return JSON.stringify({
+    additional_context: text,
+    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text },
+  })
+}
+
+/** Whether any connection has a note waiting (`leaveTellPersonNote`). */
+function anyTellPersonNote(connDir) {
+  try {
+    return fs.readdirSync(connDir).some((name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX))
+  } catch {
+    return false
+  }
+}
+
+const MODE = process.argv[2] ?? null
+
 async function main() {
   const raw = readStdin()
+  let output = null
+  try {
+    handleTellPersonMark(raw)
+  } catch {
+    /* non-fatal: an unnoted mark only leaves telling the person to the model */
+  }
   try {
     await handleExplicitReply(raw)
   } catch {
     /* non-fatal */
   }
+  if (MODE === 'postToolUse') {
+    try {
+      output = tellPersonNoteHook(raw)
+    } catch {
+      /* the note stays where it was left, for the next tool call */
+    }
+  }
+  if (output) process.stdout.write(output)
   process.exit(0)
 }
 
