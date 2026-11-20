@@ -178,7 +178,8 @@ export function refusalLiftsAt(text, atMs) {
 export function turnEndOutcome(turnEnd, nowMs) {
   if (!turnEnd) return null
   if (turnEnd.status === 'success') return { succeeded: true }
-  if (turnEnd.status !== 'error' || !turnEnd.final || !isUsageRefusalText(turnEnd.error)) return null
+  // lastTurnEnd returns only a final line: the only one that can be dated (see the header).
+  if (turnEnd.status !== 'error' || !isUsageRefusalText(turnEnd.error)) return null
   const at = Math.min(turnEnd.atMs, nowMs)
   const stated = refusalLiftsAt(turnEnd.error, at)
   // A stated time is sent as stated. Only one past what a date can hold (a garbled

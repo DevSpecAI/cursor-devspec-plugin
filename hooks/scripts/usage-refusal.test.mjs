@@ -107,7 +107,7 @@ describe('what counts as a usage stop', () => {
 })
 
 describe('reading the turn end from the transcript', () => {
-  it('finds the last turn_ended line, says whether it is final, and dates it by the file', () => {
+  it('finds the turn_ended line only while it is the final line, and dates it by the file', () => {
     const dir = scratch()
     try {
       const file = path.join(dir, 't.jsonl')
@@ -116,18 +116,17 @@ describe('reading the turn end from the transcript', () => {
       const end = lastTurnEnd(file)
       assert.equal(end.status, 'error')
       assert.equal(end.error, LIMIT)
-      assert.equal(end.final, true)
       assert.equal(end.atMs, at)
 
       writeTranscript(file, [user('hi'), ended('error', LIMIT), user('again')], at)
-      assert.equal(lastTurnEnd(file).final, false, 'a prompt written below it')
+      assert.equal(lastTurnEnd(file), null, 'a prompt written below it: no longer the last turn end')
       assert.equal(lastTurnEnd(path.join(dir, 'missing.jsonl')), null)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('never reads the partial first line of a long transcript as a turn end', () => {
+  it('never takes a turn end above a long final row for the last one', () => {
     const dir = scratch()
     try {
       const file = path.join(dir, 't.jsonl')

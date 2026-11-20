@@ -50,19 +50,26 @@
  *
  * ## Which turn a turn end belongs to
  *
- * A turn end's identity is its conversation and the number of user rows above it, the
- * turn's place in the conversation: `<conversation>#<turns>` (`turnEndIdentity`). The
- * stop hook can work it out even when it runs before the line exists, because no user
- * row is written between the stop hook and the line.
+ * A turn is told apart by the user row that started it: every turn starts with one, and
+ * Cursor stamps each with the time it was sent, so the last user row in the transcript
+ * names the turn that is running or has just ended. A turn end's identity is
+ * `<conversation>#<number of user rows>#<digest of the last user row>`
+ * (`turnEndIdentity`). The stop hook can work it out even when it runs before the
+ * `turn_ended` line exists, because nothing is written between the stop hook and the line
+ * but the line itself.
  *
  * The poller reports a turn end only for the turn it is tracking (the turn marker), and
- * only when the transcript has more user rows than it had when that turn started
+ * only when the transcript's last user row is not the one it had when that turn started
  * (`recordTurnBaseline`, written by the poller as it starts the turn). That keeps out
  * the end of a turn already running when a room command arrived, which Cursor writes
- * after the poller has started tracking the command's turn: the turn that connected,
- * a prompt typed at the terminal, or a turn whose stop hook is still running. A turn the
- * poller did not start (a prompt typed at the terminal, which Cursor's skipped
- * `beforeSubmitPrompt` would have tracked) has no baseline and is never reported here.
+ * after the poller has started tracking the command's turn: the turn that connected, a
+ * prompt typed at the terminal, or a turn whose stop hook is still running. It also
+ * keeps out Cursor writing an ended turn's line again. It does not depend on the number
+ * of user rows growing: when Cursor summarises a long conversation it rewrites the
+ * transcript, and the number can stay the same or fall, but the turn's own user row is
+ * still the last one. A turn the poller did not start (a prompt typed at the terminal,
+ * which Cursor's skipped `beforeSubmitPrompt` would have tracked) has no baseline and is
+ * never reported here.
  *
  * ## Reported once
  *
@@ -76,7 +83,7 @@
  * ## Failing safe
  *
  * Only a complete final line whose `type` is "turn_ended" and whose status is one of
- * the three above is a turn end, and only from a read of the whole transcript that did
+ * the three above is a turn end, read whole whatever its length (`lastTurnEnd`), and only from a read of the whole transcript that did
  * not change while it was read (Cursor rewrites the file in place, so a read can catch
  * it half written: that read is retried, never used). With no baseline, an unreadable
  * transcript or a line it does not recognise, nothing is reported, and the turn ends as
@@ -86,8 +93,8 @@
  *
  * ## Known limits
  *
- *  - A turn during which Cursor summarises the conversation can leave fewer user rows
- *    than it started with; its end is not noticed.
+ *  - A turn that writes no user row of its own (none has been seen) looks like the turn
+ *    before it, so its end is not noticed.
  *  - A headless (`-p`) run killed by a signal writes no `turn_ended` line, so its end
  *    is not noticed (CLI 2026.11.19, 2026-11-20). Stopping a turn in the terminal with
  *    Ctrl+C does write one: `{"type":"turn_ended","status":"aborted","error":"User
@@ -114,12 +121,13 @@ const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'c
 const TURN_END_STATUSES = new Set(['success', 'error', 'aborted'])
 
 /**
- * How much of the transcript's end is read to find its last `turn_ended` line. That line
- * is a few hundred bytes and is the final line, but the rows above it can be very large,
- * so this bounds the cost of a read on a file that grows without limit; it cuts no text
- * that is reported. A tail with no `turn_ended` line in it is "no turn end seen".
+ * The transcript's final line is read backwards in pieces this size until the newline
+ * before it, so a line of any length is read whole and only that line is read: a step,
+ * not a limit. Cursor's own transcript writer leaves out any row over 5 MB ("Oversize
+ * transcript blob omitted", CLI 2026.11.05), so the final line stays a few megabytes at
+ * most.
  */
-const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+const LINE_READ_CHUNK_BYTES = 64 * 1024
 
 /** A whole-transcript read goes in pieces this size, so a long transcript is never held at once. */
 const READ_CHUNK_BYTES = 1024 * 1024
@@ -148,63 +156,80 @@ export function transcriptConversation(transcriptPath) {
 }
 
 /**
- * The transcript's last turn end, or null when its tail holds none. `key` identifies
- * this turn end's line (the file, where the line sits and what it says), `final` is
- * whether nothing has been written below it, and `atMs` is the file's modification time.
+ * The transcript's turn end, or null when its final line is not one: Cursor writes
+ * `turn_ended` only as the final line and removes it when the next turn starts. The line
+ * is read whole whatever its length, so Cursor's error text is never cut here. `key`
+ * identifies this line (the file, where the line sits and what it says) and `atMs` is
+ * the file's modification time.
  */
 export function lastTurnEnd(transcriptPath) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
-  let buffer
-  let base
-  let atMs
+  let fd
   try {
-    const fd = fs.openSync(transcriptPath, 'r')
-    try {
-      const { size, mtimeMs } = fs.fstatSync(fd)
-      const length = Math.min(size, TRANSCRIPT_TAIL_BYTES)
-      buffer = Buffer.alloc(length)
-      fs.readSync(fd, buffer, 0, length, size - length)
-      base = size - length
-      atMs = mtimeMs
-    } finally {
-      fs.closeSync(fd)
-    }
+    fd = fs.openSync(transcriptPath, 'r')
   } catch {
     return null
   }
-  let end = buffer.length
-  let final = true
-  while (end > 0) {
-    const newline = buffer.lastIndexOf(0x0a, end - 1)
-    const start = newline + 1
-    // The first line of a tail that starts mid-file is partial: never read it.
-    if (newline < 0 && base > 0) return null
-    const text = buffer.toString('utf8', start, end).trim()
-    end = newline < 0 ? 0 : newline
-    if (!text) continue
-    let row = null
-    try {
-      row = JSON.parse(text)
-    } catch {
-      /* not a row: a line still being written */
-    }
-    if (row?.type === 'turn_ended') {
-      return {
-        key: `${transcriptPath}#${base + start}#${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
-        status: typeof row.status === 'string' ? row.status : null,
-        error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
-        final,
-        atMs,
+  let text
+  let lineStart = 0
+  let atMs
+  try {
+    const { size, mtimeMs } = fs.fstatSync(fd)
+    atMs = mtimeMs
+    const pieces = []
+    let position = size
+    let ending = true
+    while (position > 0) {
+      const length = Math.min(LINE_READ_CHUNK_BYTES, position)
+      position -= length
+      let piece = Buffer.alloc(length)
+      fs.readSync(fd, piece, 0, length, position)
+      if (ending) {
+        // The newline that ends the final line is not part of it.
+        let end = piece.length
+        while (end > 0 && (piece[end - 1] === 0x0a || piece[end - 1] === 0x0d)) end -= 1
+        piece = piece.subarray(0, end)
+        if (end === 0) continue
+        ending = false
       }
+      const newline = piece.lastIndexOf(0x0a)
+      if (newline >= 0) {
+        pieces.unshift(piece.subarray(newline + 1))
+        lineStart = position + newline + 1
+        break
+      }
+      pieces.unshift(piece)
+      lineStart = position
     }
-    final = false
+    text = Buffer.concat(pieces).toString('utf8').trim()
+  } catch {
+    return null
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } catch {
+      /* nothing to release */
+    }
   }
-  return null
+  if (!text) return null
+  let row = null
+  try {
+    row = JSON.parse(text)
+  } catch {
+    return null // a line still being written
+  }
+  if (row?.type !== 'turn_ended') return null
+  return {
+    key: `${transcriptPath}#${lineStart}#${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
+    status: typeof row.status === 'string' ? row.status : null,
+    error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
+    atMs,
+  }
 }
 
 /** Whether a turn end from lastTurnEnd is one this module recognises (see the header). */
-function recognisedFinalEnd(end) {
-  return Boolean(end?.final && TURN_END_STATUSES.has(end.status))
+function recognisedEnd(end) {
+  return Boolean(end && TURN_END_STATUSES.has(end.status))
 }
 
 /**
@@ -256,10 +281,11 @@ function readWholeOnce(transcriptPath) {
 }
 
 /**
- * Count the transcript's user rows and read its final line, from one read of the whole
- * file that did not change while it was read. Returns `{ turns, end }` (`end` is the
- * final line when it is a turn end, else null), `{ missing: true }` when there is no
- * transcript yet, or null when no clean read could be had.
+ * Count the transcript's user rows, note the last one and read the final line, from one
+ * read of the whole file that did not change while it was read. Returns
+ * `{ turns, lastUser, end }`: `lastUser` is a digest of the last user row (null with
+ * none), `end` the final line when it is a turn end, else null. `{ missing: true }` when
+ * there is no transcript yet, or null when no clean read could be had.
  */
 export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
@@ -285,6 +311,7 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
  */
 function scanTranscript(chunks) {
   let turns = 0
+  let lastUser = null
   let last = null
   let carry = Buffer.alloc(0)
   const take = (line) => {
@@ -293,7 +320,10 @@ function scanTranscript(chunks) {
     last = text
     if (text.includes('"role":"user"')) {
       try {
-        if (JSON.parse(text)?.role === 'user') turns += 1
+        if (JSON.parse(text)?.role === 'user') {
+          turns += 1
+          lastUser = digest(text)
+        }
       } catch {
         /* not a whole row */
       }
@@ -327,7 +357,11 @@ function scanTranscript(chunks) {
       }
     }
   }
-  return { turns, end }
+  return { turns, lastUser, end }
+}
+
+function digest(text) {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)
 }
 
 /**
@@ -340,12 +374,16 @@ export function turnEndIdentity(transcriptPath) {
   if (!conversation) return null
   const read = readTranscriptTurns(transcriptPath)
   if (!read || read.missing) return null
-  return `${conversation}#${read.turns}`
+  return identityOf(conversation, read)
+}
+
+function identityOf(conversation, read) {
+  return `${conversation}#${read.turns}#${read.lastUser ?? 'none'}`
 }
 
 function parseIdentity(identity) {
-  const match = /^(.+)#(\d+)$/.exec(String(identity ?? ''))
-  return match ? { conversation: match[1], turns: Number(match[2]) } : null
+  const match = /^(.+)#(\d+)#([0-9a-f]{16}|none)$/.exec(String(identity ?? ''))
+  return match ? { conversation: match[1], turns: Number(match[2]), lastUser: match[3] === 'none' ? null : match[3] } : null
 }
 
 export function turnBaselinePath(connectionId, dir = CONNECTIONS_DIR) {
@@ -353,11 +391,12 @@ export function turnBaselinePath(connectionId, dir = CONNECTIONS_DIR) {
 }
 
 /**
- * Note how far the conversation's transcript had got as the poller starts tracking a
- * turn (`turn`, the turn marker's `startedAt`), so that turn's end can be told from the
- * end of one already running. With no transcript yet the conversation has no turns. A
- * transcript that cannot be read cleanly leaves no baseline, and that turn's end is then
- * not reported from the transcript. Returns whether one was written.
+ * Note where the conversation's transcript was as the poller starts tracking a turn
+ * (`turn`, the turn marker's `startedAt`): its last user row, so that turn's end can be
+ * told from the end of one already running or already ended. With no transcript yet the
+ * conversation has no user row. A transcript that cannot be read cleanly leaves no
+ * baseline, and that turn's end is then not reported from the transcript. Returns
+ * whether one was written.
  */
 export function recordTurnBaseline(connectionId, { turn, conversationId, transcriptPath = null, dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || typeof turn !== 'number') return false
@@ -367,10 +406,11 @@ export function recordTurnBaseline(connectionId, { turn, conversationId, transcr
   if (!read) return false
   try {
     writePrivateJson(turnBaselinePath(connectionId, dir), {
-      v: 1,
+      v: 2,
       turn,
       conversation,
       turns: read.missing ? 0 : read.turns,
+      lastUser: read.missing ? null : read.lastUser,
     })
     return true
   } catch {
@@ -382,9 +422,15 @@ export function recordTurnBaseline(connectionId, { turn, conversationId, transcr
 export function readTurnBaseline(connectionId, turn, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || typeof turn !== 'number') return null
   const value = readPrivateJson(turnBaselinePath(connectionId, dir))
-  if (value?.v !== 1 || value.turn !== turn || typeof value.conversation !== 'string') return null
+  if (value?.v !== 2 || value.turn !== turn || typeof value.conversation !== 'string') return null
   if (!Number.isInteger(value.turns) || value.turns < 0) return null
-  return { conversation: value.conversation, turns: value.turns }
+  if (value.lastUser !== null && !/^[0-9a-f]{16}$/.test(value.lastUser ?? '')) return null
+  return { turn, conversation: value.conversation, turns: value.turns, lastUser: value.lastUser }
+}
+
+/** Whether a turn end belongs to the turn `baseline` was noted for: a later turn in that conversation. */
+function laterTurn(baseline, conversation, lastUser) {
+  return conversation === baseline.conversation && lastUser !== null && lastUser !== baseline.lastUser
 }
 
 const CLAIM_SUFFIX = '.claim'
@@ -459,14 +505,17 @@ export function releaseTurnEnd(connectionId, identity, { dir = CONNECTIONS_DIR }
 }
 
 /**
- * Whether a turn end later than `baseline` (a turn's readTurnBaseline) has been claimed:
- * that turn's end was reported by whoever claimed it.
+ * Whether the end of the turn `baseline` was noted for (a turn's readTurnBaseline) has
+ * been claimed, after that turn started: whoever claimed it reported it.
  */
 export function turnEndClaimed(connectionId, baseline, { dir = CONNECTIONS_DIR } = {}) {
   if (!connectionId || !baseline) return false
   for (const file of claimFiles(connectionId, dir)) {
-    const claimed = parseIdentity(readPrivateJson(file)?.turn)
-    if (claimed && claimed.conversation === baseline.conversation && claimed.turns > baseline.turns) return true
+    const record = readPrivateJson(file)
+    const claimed = parseIdentity(record?.turn)
+    const at = Date.parse(record?.at ?? '')
+    if (!claimed || !(at >= baseline.turn)) continue
+    if (laterTurn(baseline, claimed.conversation, claimed.lastUser)) return true
   }
   return false
 }
@@ -495,7 +544,7 @@ export function turnEndPending({ marker, transcriptPath, memo = {} }) {
   const seen = `${marker.startedAt}|${transcriptPath}|${stamp}`
   if (memo.probed === seen) return false
   memo.probed = seen
-  return recognisedFinalEnd(lastTurnEnd(transcriptPath))
+  return recognisedEnd(lastTurnEnd(transcriptPath))
 }
 
 /**
@@ -509,7 +558,7 @@ export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = 
   if (!stamp) return null
   const seen = `${marker.startedAt}|${transcriptPath}|${stamp}`
   if (memo.decided === seen) return null
-  if (!recognisedFinalEnd(lastTurnEnd(transcriptPath))) {
+  if (!recognisedEnd(lastTurnEnd(transcriptPath))) {
     memo.decided = seen
     return null
   }
@@ -523,9 +572,9 @@ export function transcriptTurnEnd({ connectionId, marker, transcriptPath, dir = 
   // Caught mid-write: decided on a later look, never from this one.
   if (!read || read.missing) return null
   memo.decided = seen
-  if (!read.end || read.turns <= baseline.turns) return null
+  if (!read.end || !laterTurn(baseline, conversation, read.lastUser)) return null
   return {
-    identity: `${conversation}#${read.turns}`,
+    identity: identityOf(conversation, read),
     status: read.end.status,
     error: read.end.error,
     failure: turnEndFailure(read.end),
