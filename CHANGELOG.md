@@ -1,10 +1,18 @@
 # Changelog
 
-## 0.29.0
+## 0.30.0
 
 - **Messages you send your Cursor agent from a DevSpec room now arrive with what your project has already decided.** For each message you send from a room, and each automation run, DevSpec looks up the project's records that bear on it (requirements, decisions, conventions, documents, plans and past work) and the agent receives them together with your message, before it starts. It is the same recall the other DevSpec agents get. A record the agent has already been shown in the conversation is not repeated until someone changes it, and after Cursor compacts the conversation it can be shown again.
 - **Nothing is cut, your message least of all.** The records always go to a file the agent is pointed to, right after your message, and they count as seen only once the agent has read that file. Your message itself arrives whole whenever Cursor can show it whole; only a message too long for that goes, with its records, into one file the agent is told to read before it does anything, so a long message is no longer cut in the middle. If that file can't be saved on your computer, the message waits and the plugin keeps trying, and the room is told once that the agent hasn't received it yet; a message short enough to show whole is never held up this way, and arrives with a line saying its records come next time. If DevSpec can't look the records up within a few seconds, your message is delivered without them.
 - Prompts you type in the terminal don't get this yet. Cursor skips the plugin's step before a typed prompt unless you have a Cursor hooks file of your own, which Cursor is tracking as a bug; typed prompts will get it once Cursor fixes that. Checks DevSpec asks the agent to rule, and DevSpec's notices about the agent's work, don't get it either.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.29.0
+
+- **Your Cursor agent now hears about checks and problems with its own work while it is still working, not only once it has finished.** When DevSpec asks the agent to rule a check, or tells it something about its own work (a conflict with a decision, a held change, a failed check), the agent gets it after the step it is on finishes, never in the middle of one. Everything that arrived meanwhile comes together, so the agent deals with all of it in one pause and then carries on with what you asked. Until now it ran on to the end of its task first, however long that took.
+- **Nothing reaches the agent twice, and nothing is lost.** The agent reads what arrived from a short file the plugin points it to, and the plugin keeps pointing until the agent has read all of it. Anything it hasn't read by the time it stops, for example because it finished without another step, reaches it once it stops, as a short message pointing it to the same file, and keeps coming back until the agent has read it. A check that DevSpec has already settled in the meantime is dropped instead of being handed over.
+- **If remote control ends while something is still waiting**, the plugin lets its copy go. DevSpec keeps the check and the notice, and you still see them in the project's Review.
+- **Helper agents are left alone.** When your agent hands part of its work to a helper agent, the helper doesn't receive any of this; your agent gets it at its own next step.
 - Start a new `cursor-agent` session to pick this up.
 
 ## 0.28.0

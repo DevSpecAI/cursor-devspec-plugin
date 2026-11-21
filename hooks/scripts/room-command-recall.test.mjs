@@ -42,6 +42,7 @@ import { resolveSpaceFreeWakeFile, wakeLines, wakesWaitingEvent } from './devspe
 import { nextOutput } from './devspec-wake-tail.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { RECALL_IN_NEXT_WAKE, RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
+import { withoutEndedConnectionWakes } from './step-delivery.mjs'
 import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -539,6 +540,62 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     }
     return fs.readFileSync(wakeFile, 'utf8')
   }
+
+  it('a frozen wake for a connection that ended is skipped, never printed: the wait checks the connection under the steps lock every end takes', async () => {
+    const run = await startPoller()
+    const dir = path.join(run.home, '.devspec', 'remote-control', 'connections')
+    const lock = path.join(dir, `${CONNECTION}.steps.lock`)
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      run.stub.serve(commandPoll(2, bodyFor(19_950), { turn_recall: mediumRecall(14) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      const first = run.startWait()
+      assert.equal(await Promise.race([first.exited, sleep(10_000).then(() => 'timeout')]), 0, first.stderr())
+      assert.equal(first.events().at(-1).type, RECALL_IN_NEXT_WAKE.type)
+      assert.ok(run.state().wake_batch_progress, 'the pointer wake is frozen for the re-arm')
+
+      // The connection is live when the re-arm starts; an end lands while it waits for the lock.
+      fs.writeFileSync(lock, String(process.pid))
+      const second = run.startWait()
+      assert.ok(await until(() => fs.readdirSync(dir).some((name) => name.startsWith(`${CONNECTION}.steps.lock.`))), 'the re-arm never reached the lock')
+      run.patchState({ enabled: false, end_reason: 'local_stop' })
+      fs.rmSync(lock)
+      assert.equal(await Promise.race([second.exited, sleep(10_000).then(() => 'timeout')]), 1, second.stderr())
+      assert.equal(second.stdout(), '', 'nothing printed')
+      assert.match(second.stderr(), /skipped 1 waiting wake\(s\): the connection has ended; never printed/)
+    } finally {
+      fs.rmSync(lock, { force: true })
+      await run.cleanup()
+    }
+  })
+
+  it('the wake reader skips a recall\'s own wake once its connection has ended; the command\'s wake still prints', async () => {
+    const run = await startPoller()
+    const dir = path.join(run.home, '.devspec', 'remote-control', 'connections')
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      run.stub.serve(commandPoll(2, bodyFor(19_870), { turn_recall: mediumRecall(15) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      const wakeFile = path.join(run.home, 'wake.jsonl')
+      const file = await followOnce(run, wakeFile, (text) => text.includes('"for"'))
+      const first = nextOutput(file)
+      const second = nextOutput(file.slice(first.length))
+      const own = JSON.parse(second.split('\n')[0])
+      assert.equal(own.type, 'turn_recall')
+      assert.equal(own.connection_id, CONNECTION, 'the recall\'s own wake names its connection')
+      assert.equal(withoutEndedConnectionWakes(file, { dir, write: () => assert.fail('nothing skipped while live') }), file)
+
+      run.patchState({ enabled: false, end_reason: 'local_stop' })
+      const skipped = []
+      assert.equal(withoutEndedConnectionWakes(file, { dir, write: (line) => skipped.push(line) }), first)
+      assert.equal(skipped.length, 1)
+      assert.match(skipped[0], new RegExp(`skipped a turn_recall wake for connection ${CONNECTION}, which has ended \\(recall for ${own.for}\\); never printed`))
+    } finally {
+      await run.cleanup()
+    }
+  })
 
   it('one continuation for both printers: the manual wait prints the command, then the background listener prints only the pointer wake, never the command again', async () => {
     const run = await startPoller()

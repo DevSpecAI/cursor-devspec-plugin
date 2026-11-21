@@ -18,6 +18,7 @@ import path from 'node:path'
 import { ensureWakeFile, splitWakes } from './devspec-wake-file.mjs'
 import { wakesForOneOutput } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
+import { withoutEndedConnectionWakes } from './step-delivery.mjs'
 
 const POLL_MS = 250
 
@@ -77,7 +78,10 @@ async function main() {
       const output = nextOutput(buf.toString('utf8'), { settled })
       if (output) {
         offset += Buffer.byteLength(output)
-        process.stdout.write(output)
+        // Never a held_for_step wake, or a recall's own wake, for a connection that has
+        // ended (step-delivery.mjs).
+        const printed = withoutEndedConnectionWakes(output)
+        if (printed) process.stdout.write(printed)
       }
     } finally {
       fs.closeSync(fd)

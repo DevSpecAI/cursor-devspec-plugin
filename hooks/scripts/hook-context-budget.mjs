@@ -45,8 +45,11 @@
  *   or a message left again, must be read again. This covers the project's rules and
  *   repositories; a message the person has not heard; a commit note (a commit that
  *   went untracked, and what to do about it); a pin problem (the folder is not linked
- *   to its project until the pin is fixed); and the repository-link nudge (the person
- *   must link the repository). Unread room messages are counted after every step until
+ *   to its project until the pin is fixed); the repository-link nudge (the person
+ *   must link the repository); and the check jobs and notices DevSpec sent while the
+ *   agent was working (step-delivery.mjs keeps its own delivery record; between turns
+ *   the idle wake points at the same kind of note, and an item stays until its note
+ *   is read whole). Unread room messages are counted after every step until
  *   the reader's output has come back whole. A step whose notes Cursor dropped is
  *   followed by another that offers them again.
  * - Two hints are offered once: the note that a reference was added to a commit (the
@@ -161,11 +164,16 @@ export const CURSOR_HOOK_CONTEXT_SEPARATOR = '\n\n---\n\n'
  * project and repository context (repository-context.mjs), the commit note
  * (provenance-assistance.mjs), the repository-link nudge (repo-link-nudge.mjs), the
  * pin check (pin-check.mjs: its two entries match different tools, so one answers),
- * a message the person has not heard (mark-explicit-reply.mjs) and the room's
- * unread count (room-unread.mjs). Each hands its context over through
- * `fitHookContext`; adding another means counting it here.
+ * a message the person has not heard (mark-explicit-reply.mjs), the room's unread
+ * count (room-unread.mjs) and what DevSpec sent the agent while it was working
+ * (step-delivery.mjs). Each hands its context over through this module, within its
+ * share; adding another means counting it here. The plugin's other postToolUse hooks
+ * add none and are not counted: the recall-note read watcher (turn-recall.mjs
+ * `post-tool`, which only observes), the work trail and timing (mirror-turn.mjs,
+ * turn-tool-timing.mjs, trail-turn.mjs), the commit observers (commit-observation.mjs,
+ * commit-reports.mjs) and turn liveness (turn-liveness.mjs).
  */
-export const POST_TOOL_CONTEXT_HOOKS = 6
+export const POST_TOOL_CONTEXT_HOOKS = 7
 
 /**
  * One hook's share when `hooks` of the plugin's hooks can answer the same event: an

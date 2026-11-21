@@ -437,8 +437,8 @@ const READ_CHUNK_BYTES = 1024 * 1024
  * is tried again, up to STABLE_READ_ATTEMPTS times, so a hook or a poller lap waits at
  * most about half a second.
  */
-const STABLE_READ_ATTEMPTS = 8
-const STABLE_READ_GAP_MS = 25
+export const STABLE_READ_ATTEMPTS = 8
+export const STABLE_READ_GAP_MS = 25
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)

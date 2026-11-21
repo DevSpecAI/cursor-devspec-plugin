@@ -304,7 +304,8 @@ function commandRef(events) {
  * - `'pointer'`: the command inline, with a short pointer to its recall's note after it;
  * - `'separate'`: the command does not fit with the pointer, but its wake fits ending
  *   with the one-line `RECALL_IN_NEXT_WAKE`: the command's wake as it is plus that
- *   line, then a pointer-only wake naming the command (`for`);
+ *   line, then a pointer-only wake naming the command (`for`) and, given
+ *   `connectionId`, its connection (`connection_id`);
  * - `'whole'`: otherwise: one sealed note holding the command and its recall, behind a
  *   single `wake_in_note` line saying so (`RECALL_WHOLE_NOTE`). The window where a
  *   command fits on its own but takes this route is the length of that one line plus
@@ -319,7 +320,7 @@ function commandRef(events) {
  * write in order, the command's wake, the pointer's own wake if any, the whole-wake note
  * if any, the wake it stands for, and the route the recall took.
  */
-export function recallWakeOut(base, recall, { home = os.homedir() } = {}) {
+export function recallWakeOut(base, recall, { home = os.homedir(), connectionId = null } = {}) {
   const events = Array.isArray(base) ? base : []
   const result = (wakes, extra) => ({ wakes, events: wakes[0], recallWake: wakes[1] ?? null, note: null, full: wakes[0], ...extra })
   const fits = (wake) => fitsShellOutput(wakeLines(wake))
@@ -342,6 +343,9 @@ export function recallWakeOut(base, recall, { home = os.homedir() } = {}) {
     return out.error ? { held: out.error } : result([out.events], { note: out.note, full: whole, recall: 'whole' })
   }
   const ref = commandRef(events)
+  // A wake of its own names its connection too, so the wake reader can skip it once the
+  // connection has ended (step-delivery.mjs `withoutEndedConnectionWakes`).
+  const own = typeof connectionId === 'string' && connectionId ? { connection_id: connectionId } : {}
   let note
   try {
     note = writeNote(deliverable.formatted_block, { home })
@@ -349,11 +353,11 @@ export function recallWakeOut(base, recall, { home = os.homedir() } = {}) {
     const line = { type: 'turn_recall', note: RECALL_UNSAVED_NOTE }
     return fits(place(line))
       ? result([place(line)], { recall: 'unsaved' })
-      : result([marked, [{ type: 'turn_recall', for: ref, note: RECALL_UNSAVED_NOTE }]], { recall: 'unsaved' })
+      : result([marked, [{ type: 'turn_recall', for: ref, ...own, note: RECALL_UNSAVED_NOTE }]], { recall: 'unsaved' })
   }
   const beside = place({ type: 'turn_recall', read: note.command, note: RECALL_POINTER_NOTE })
   if (fits(beside)) return result([beside], { recall: 'pointer' })
-  return result([marked, [{ type: 'turn_recall', for: ref, read: note.command, note: RECALL_OWN_WAKE_NOTE }]], { recall: 'separate' })
+  return result([marked, [{ type: 'turn_recall', for: ref, ...own, read: note.command, note: RECALL_OWN_WAKE_NOTE }]], { recall: 'separate' })
 }
 
 /** The note a wake points its recall to, or null when the recall went inline or not at all. */
