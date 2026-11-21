@@ -229,7 +229,7 @@ async function startPoller({ beforeStart } = {}) {
 const AFTER_TOOL_RECALL = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'hooks.json'), 'utf8')).hooks.postToolUse
   .find((entry) => entry.command.includes('turn-recall.mjs'))
 
-/** The plugin's postToolUse hook for recall notes, run as hooks.json has Cursor run it: what it answered, or null. */
+/** The plugin's postToolUse hook that counts recall-note reads, run as hooks.json has Cursor run it. It only observes. */
 function runAfterTool(home, input) {
   const run = spawnSync('sh', ['-c', AFTER_TOOL_RECALL.command], {
     input: JSON.stringify(input),
@@ -237,10 +237,8 @@ function runAfterTool(home, input) {
     encoding: 'utf8',
   })
   assert.equal(run.status, 0, run.stderr)
-  return run.stdout ? JSON.parse(run.stdout).additional_context : null
+  assert.equal(run.stdout, '')
 }
-
-const toolCall = (command = 'git status') => ({ conversation_id: CHAT, tool_name: 'Shell', tool_input: { command }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) })
 
 describe('a command sent from a DevSpec room gets its project recall', () => {
   it('asks for it on every poll, hands it over right after the command, and leaves out what the conversation was shown', async () => {
@@ -344,7 +342,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
   }
   const mediumRecall = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, i) => `- [MEMORY · decision] **Decision ${i}** — the settings page keeps its redirect (get_memory({ id: "${i}" }))`).join('\n')}` })
 
-  it('near Cursor\'s limit (19,990 characters with the command alone): the command arrives byte for byte, the recall\'s pointer arrives at the first tool call, and its records count as shown once the note is read', async () => {
+  it('near Cursor\'s limit (19,990 characters with the command alone): the wake is one short line pointing at a note that holds the command byte for byte and its recall, and the records count as shown once it is read', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -352,19 +350,17 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       const tight = bodyFor(19_990)
       run.stub.serve(commandPoll(2, tight, { turn_recall: mediumRecall(9) }))
       assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
-      const tightWake = await run.nextWake()
-      assert.ok(wakeLines(tightWake).length <= 19_991 && wakeLines(tightWake).length > 19_900, String(wakeLines(tightWake).length))
-      assert.equal(tightWake.some((e) => e.type === 'turn_recall'), false, 'not even the short pointer fits beside it')
-      const command = tightWake.find((e) => e.type === 'owner_message')
-      assert.equal(command.body, tight)
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
-
-      // The agent's first tool call in the turn: the pointer, naming the command.
-      const context = runAfterTool(run.home, toolCall())
-      assert.ok(context.includes(`room command ${command.message_id}`), context)
-      const id = /cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(context)[1]
-      assert.equal(readNoteText(id, { home: run.home }), mediumRecall(9).formatted_block)
-      assert.equal(runAfterTool(run.home, toolCall('ls')), null, 'handed over once')
+      const wakeOut = await run.nextWake()
+      assert.equal(wakeOut.length, 1)
+      assert.equal(wakeOut[0].type, 'wake_in_note')
+      assert.deepEqual(wakeOut[0].carries, ['owner_message', 'turn_recall', 'wake'])
+      assert.ok(fitsShellOutput(wakeLines(wakeOut)))
+      const id = /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(wakeOut[0].read)[1]
+      const inNote = readNoteText(id, { home: run.home }).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(inNote.map((e) => e.type), ['owner_message', 'turn_recall', 'wake'])
+      assert.equal(inNote[0].body, tight, 'the command, byte for byte')
+      assert.equal(inNote[1].block, mediumRecall(9).formatted_block, 'and its recall')
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'not shown until the note is read')
       for (const file of noteFiles(run.home, id)) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(9)])
 
@@ -378,31 +374,29 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.match(carried.read, /^cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md$/)
       assert.ok(fitsShellOutput(wakeLines(roomyWake)))
       assert.equal(roomyWake.find((e) => e.type === 'owner_message').body, roomy)
-      assert.equal(runAfterTool(run.home, toolCall()), null, 'a pointer the wake carried is not given again')
     } finally {
       await run.cleanup()
     }
   })
 
-  it('near the limit with no tool call in the turn: the records stay unshown and come back with the next command', async () => {
+  it('two near-limit commands in a row: two wakes, each pointing at its own note, both whole and readable', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      run.stub.serve(commandPoll(2, bodyFor(19_990), { turn_recall: mediumRecall(11) }))
-      assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
-      assert.equal((await run.nextWake()).some((e) => e.type === 'turn_recall'), false)
-      // The turn ends without a tool call. The next poll still asks for that record.
-      const before = run.stub.polls.length
-      assert.ok(await until(() => run.stub.polls.length > before + 1))
-      assert.equal(run.stub.polls.at(-1).seen_recall_versions, undefined)
-      // The next command offers it again, with room this time.
-      run.stub.serve(commandPoll(3, 'And keep the return path when it redirects', { turn_recall: recall(11) }))
-      assert.ok(await until(() => run.records().length === 3), `no command kept; stderr:\n${run.stderr()}`)
-      const next = await run.nextWake()
-      assert.equal(next.find((e) => e.type === 'turn_recall').block, recall(11).formatted_block)
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(11)])
-      assert.equal(runAfterTool(run.home, toolCall()), null, 'the earlier pointer is not handed over late')
+      const first = bodyFor(19_990)
+      const second = bodyFor(19_990).replaceAll('a', 'b')
+      run.stub.serve(commandPoll(2, first, { turn_recall: mediumRecall(11) }))
+      run.stub.serve(commandPoll(3, second, { turn_recall: mediumRecall(12) }))
+      assert.ok(await until(() => run.records().length === 3), `not kept; stderr:\n${run.stderr()}`)
+      const wakes = [await run.nextWake(), await run.nextWake()]
+      const ids = wakes.map((w) => /notes\/([0-9a-f]{16})\.md$/.exec(w[0].read)[1])
+      assert.notEqual(ids[0], ids[1])
+      const bodies = ids.map((id) => JSON.parse(readNoteText(id, { home: run.home }).split('\n')[0]).body)
+      assert.deepEqual(bodies, [first, second])
+      for (const file of noteFiles(run.home, ids[1])) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
+      for (const file of noteFiles(run.home, ids[0])) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(12), key(11)])
     } finally {
       await run.cleanup()
     }

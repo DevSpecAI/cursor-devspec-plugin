@@ -161,12 +161,11 @@ export const CURSOR_HOOK_CONTEXT_SEPARATOR = '\n\n---\n\n'
  * project and repository context (repository-context.mjs), the commit note
  * (provenance-assistance.mjs), the repository-link nudge (repo-link-nudge.mjs), the
  * pin check (pin-check.mjs: its two entries match different tools, so one answers),
- * a message the person has not heard (mark-explicit-reply.mjs), the room's
- * unread count (room-unread.mjs) and a room command's recall that had no room in its
- * wake (turn-recall.mjs). Each hands its context over through `fitHookContext`;
- * adding another means counting it here.
+ * a message the person has not heard (mark-explicit-reply.mjs) and the room's
+ * unread count (room-unread.mjs). Each hands its context over through
+ * `fitHookContext`; adding another means counting it here.
  */
-export const POST_TOOL_CONTEXT_HOOKS = 7
+export const POST_TOOL_CONTEXT_HOOKS = 6
 
 /**
  * One hook's share when `hooks` of the plugin's hooks can answer the same event: an
@@ -850,4 +849,31 @@ export function wakesForOneOutput(wakes) {
     count += 1
   }
   return { count, text }
+}
+
+/** What a wake kept whole in a note says about itself: one fixed sentence. */
+export const WAKE_IN_NOTE =
+  "This wake is longer than Cursor shows whole, so all of it is in a file: read it, and every further part it names, before you act on anything in it."
+
+/**
+ * One wake as it goes out (`wakeLines`), never longer than Cursor shows from one
+ * output (`fitsShellOutput`): `events` themselves when they fit; otherwise the whole
+ * wake kept whole and sealed in one note (`writeNote`, in parts that each reach the
+ * agent whole), and in its place a single short line that says so, names what the wake
+ * carries (`carries`: its events' types, which the reader's notification pattern
+ * matches) and gives the command that reads it. Each wake has its own note, named by
+ * its own content. Returns `{ events, note }`, `note` null when the wake went out as it
+ * was. A note that cannot be written leaves `events` as they were, as before this rule.
+ */
+export function wakeWithin(events, { home = os.homedir() } = {}) {
+  const text = wakeLines(events)
+  if (fitsShellOutput(text)) return { events, note: null }
+  let note
+  try {
+    note = writeNote(text, { home })
+  } catch {
+    return { events, note: null }
+  }
+  const carries = [...new Set(events.map((event) => String(event?.type ?? '')).filter(Boolean))]
+  return { events: [{ type: 'wake_in_note', carries, read: note.command, note: WAKE_IN_NOTE }], note }
 }

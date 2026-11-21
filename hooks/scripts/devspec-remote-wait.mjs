@@ -101,7 +101,7 @@ import {
   turnWakeFromEvents,
 } from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
-import { recallConversation, settleRecallHandover, withTurnRecall } from './turn-recall.mjs'
+import { recallConversation, recallWakeOut, settleRecallHandover, withTurnRecall } from './turn-recall.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
@@ -1390,9 +1390,9 @@ export function materialiseAttachments(message, opts = {}) {
  */
 export function buildOwnerMessageEvents(batch, opts = {}) {
   // A command or an automation run brings the project recall DevSpec attached to it,
-  // after the command and whole, inline or as a pointer to a note, when the whole wake
-  // still fits; otherwise it follows at the agent's next step (turn-recall.mjs).
-  // Nothing else carries one.
+  // after the command and whole: inline, or as a pointer to a note, when the whole wake
+  // still fits; otherwise inline, and the whole wake goes out in one note
+  // (turn-recall.mjs). Nothing else carries one.
   return withTurnRecall(commandWakeEvents(batch, opts), batch?.turn_recall, opts.home ? { home: opts.home } : {})
 }
 
@@ -1751,7 +1751,7 @@ async function main() {
         }
         // A directed-question answer is its own event type — it wakes, but it is never
         // a command, so it never goes through the owner-message builder.
-        const events = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
+        const built = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
           ? buildInteractionAnswerEvents(batch, { inboxFile: file })
           : buildOwnerMessageEvents(batch, {
             inboxFile: file,
@@ -1769,6 +1769,10 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
+        // What goes out: the wake as built when Cursor shows it whole, otherwise the whole
+        // wake kept in one sealed note with a short line in its place (turn-recall.mjs).
+        const out = recallWakeOut(built)
+        const events = out.events
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
@@ -1796,12 +1800,11 @@ async function main() {
         recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
-        recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
-        // The recall this wake carried counts as shown now if it went inline, or once
-        // the agent has read its note whole; one with no room in the wake is handed over
-        // at the agent's next step. Until shown, the next command's recall can offer
-        // those records again (turn-recall.mjs).
-        settleRecallHandover(recallConversation(readState(connectionId), connectionId), events, batch)
+        recordTurnWake(connectionId, turnWakeFromEvents(built), { dir: CONNECTIONS_DIR })
+        // The recall this wake carried counts as shown now if it went inline, or once the
+        // agent has read its note (its own, or the whole wake's) whole; until then the
+        // next command's recall can offer those records again (turn-recall.mjs).
+        settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

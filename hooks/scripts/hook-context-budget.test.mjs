@@ -20,6 +20,8 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
   fitIntoWake,
+  wakeWithin,
+  WAKE_IN_NOTE,
   fitsShellOutput,
   handOverLineMax,
   hookContextShare,
@@ -106,10 +108,9 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     const a = fitHookContext(text, { home: shortHome, what: 'A note' })
     const b = fitHookContext(text, { home: longHome, what: 'A note' })
     assert.equal(a, b, 'the pointer names the note through ~, never the home folder')
-    // A pointer with a longer description and addition than any the plugin gives
-    // (repository-context.mjs has the longest, about 110 and 190 characters) is well
-    // inside the smallest share.
-    const longest = notePointer(writeNote(text, { home: shortHome }), { what: 'w'.repeat(160), also: 'a'.repeat(240) })
+    // The longest pointer the plugin gives (its longest description and addition) is
+    // well inside the smallest share.
+    const longest = notePointer(writeNote(text, { home: shortHome }), { what: 'w'.repeat(200), also: 'a'.repeat(300) })
     assert.ok(longest.length < POST_TOOL_CONTEXT_SHARE / 2, `${longest.length} characters`)
   })
 
@@ -471,7 +472,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     for (const note of readable) handOver(prefix, catCall(home, noteFiles(home, note.id)[0]), { what: 'A note', home })
     const after = handOver(prefix, ls, { what: 'A note', home })
     assert.ok(broken.every((note) => after.includes(noteCommand(note.id)) && after.includes(noteStatusCommand(note.id))))
-    assert.match(after, /\n4 DevSpec notes are waiting for you; they come back after each step until you have read each one whole\.$/)
+    assert.match(after, /\n\n4 DevSpec notes are waiting for you; they come back after each step until you have read each one whole\.$/)
     assert.deepEqual(pendingNotes(home, prefix).sort(), broken.map((note) => note.id).sort())
   })
 
@@ -638,6 +639,37 @@ describe('fitIntoWake, the one place a wake is sized against Cursor\'s rules on 
       assert.equal(result.route, 'note', 'inline would pass 40,000 bytes')
       assert.equal(result.events.at(-1).type, 'extra')
       assert.ok(fitsShellOutput(wakeLines(result.events)))
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('wakeWithin, one wake as it goes out', () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wake-within-'))
+
+  it('leaves a wake that fits as it is, and keeps one that does not whole in one note, with one short line in its place', () => {
+    const home = tmp()
+    try {
+      const small = [{ type: 'owner_message', body: 'hello' }, { type: 'wake' }]
+      assert.deepEqual(wakeWithin(small, { home }), { events: small, note: null })
+      const big = [{ type: 'owner_message', body: 'x'.repeat(30_000) }, { type: 'turn_recall', block: 'records' }, { type: 'wake' }]
+      const out = wakeWithin(big, { home })
+      assert.deepEqual(out.events, [{ type: 'wake_in_note', carries: ['owner_message', 'turn_recall', 'wake'], read: noteCommand(out.note.id), note: WAKE_IN_NOTE }])
+      assert.ok(fitsShellOutput(wakeLines(out.events)))
+      assert.equal(readNoteText(out.note.id, { home }), wakeLines(big), 'the whole wake, exactly as it would have been written')
+      assert.ok(noteFiles(home, out.note.id).length > 1, 'in parts that each reach the agent whole')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves the wake as it was when the note cannot be written', () => {
+    const home = tmp()
+    try {
+      fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
+      const big = [{ type: 'owner_message', body: 'x'.repeat(30_000) }, { type: 'wake' }]
+      assert.deepEqual(wakeWithin(big, { home }), { events: big, note: null })
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
