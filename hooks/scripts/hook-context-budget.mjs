@@ -161,11 +161,12 @@ export const CURSOR_HOOK_CONTEXT_SEPARATOR = '\n\n---\n\n'
  * project and repository context (repository-context.mjs), the commit note
  * (provenance-assistance.mjs), the repository-link nudge (repo-link-nudge.mjs), the
  * pin check (pin-check.mjs: its two entries match different tools, so one answers),
- * a message the person has not heard (mark-explicit-reply.mjs) and the room's
- * unread count (room-unread.mjs). Each hands its context over through
- * `fitHookContext`; adding another means counting it here.
+ * a message the person has not heard (mark-explicit-reply.mjs), the room's
+ * unread count (room-unread.mjs) and a room command's recall that had no room in its
+ * wake (turn-recall.mjs). Each hands its context over through `fitHookContext`;
+ * adding another means counting it here.
  */
-export const POST_TOOL_CONTEXT_HOOKS = 6
+export const POST_TOOL_CONTEXT_HOOKS = 7
 
 /**
  * One hook's share when `hooks` of the plugin's hooks can answer the same event: an
@@ -827,4 +828,26 @@ export function fitIntoWake(events, { text, inline, pointer, at = events.length,
   }
   const pointed = place(pointer(note))
   return fits(pointed) ? { events: pointed, route: 'note', note } : none
+}
+
+/**
+ * fitIntoWake's companion for the reader that prints the wake file
+ * (devspec-wake-tail.mjs): of `wakes` (whole wakes waiting to be printed, oldest first,
+ * each as `wakeLines` wrote it), how many go out together in one output. As many whole
+ * wakes as still fit Cursor's rules on one output together (`fitsShellOutput`), never
+ * part of one; the rest wait for the next output. The first always goes, so a single
+ * wake over the rules on its own is printed as it always was (fitIntoWake never makes
+ * one so; only a command too long on its own is).
+ * @param {string[]} wakes
+ * @returns {{ count: number, text: string }}
+ */
+export function wakesForOneOutput(wakes) {
+  let count = 0
+  let text = ''
+  for (const wake of wakes) {
+    if (count > 0 && !fitsShellOutput(text + wake)) break
+    text += wake
+    count += 1
+  }
+  return { count, text }
 }

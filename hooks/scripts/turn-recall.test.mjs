@@ -13,15 +13,18 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 
-import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { fitsShellOutput, POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
 import { wakeLines } from './devspec-wake-file.mjs'
 import {
   deliverableRecall,
   forgetShown,
   recallConversation,
   recallPollArguments,
+  nextStepRecallLine,
   noteRecallReads,
   RECALL_INLINE_NOTE,
+  RECALL_POINTER_NOTE,
+  recallAfterTool,
   rememberShown,
   SEEN_STORE,
   seenRecallKeys,
@@ -215,12 +218,11 @@ describe('a wake that carries the recall', () => {
   it('puts it right after the command, ahead of the room notes and the wake line, when the whole wake still reaches the agent whole', () => {
     const home = tempHome()
     try {
-      const events = withTurnRecall(wake(), recall(), { home, sessionId: 's1' })
+      const events = withTurnRecall(wake(), recall(), { home })
       assert.deepEqual(events.map((event) => event.type), ['owner_message', 'turn_recall', 'room_unread', 'wake'])
       const carried = events[1]
       assert.equal(carried.block, recall().formatted_block)
-      assert.equal(carried.executable, false)
-      assert.equal(carried.session_id, 's1')
+      assert.equal(carried.note, RECALL_INLINE_NOTE)
       assert.ok(fitsShellOutput(wakeLines(events)))
       assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes')), false)
     } finally {
@@ -270,12 +272,12 @@ describe('a wake that carries the recall', () => {
       const lines = Array.from({ length: 400 }, (_, n) => `- [REQUIREMENT] **Requirement ${n}** — ${'governs the change; '.repeat(4)}(get_requirement({ id: "${n}" }))`)
       const block = `== PROACTIVE PROJECT RECALL ==\n${lines.join('\n')}`
       assert.ok(block.length > 40_000)
-      const events = withTurnRecall(wake(), recall({ block }), { home, sessionId: 's1' })
+      const events = withTurnRecall(wake(), recall({ block }), { home })
       const carried = events.find((event) => event.type === 'turn_recall')
       assert.equal(carried.block, undefined)
       assert.match(carried.read, /^cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md$/)
-      assert.ok(carried.parts > 1)
-      assert.ok(carried.note.includes(carried.read))
+      assert.ok(noteFiles(home, noteIdIn(carried.read)).length > 1, 'in parts that each reach the agent whole')
+      assert.equal(carried.note, RECALL_POINTER_NOTE)
       const id = /notes\/([0-9a-f]{16})\.md/.exec(carried.read)[1]
       assert.equal(readNoteText(id, { home }), block)
       assert.ok(fitsShellOutput(wakeLines(events)))
@@ -357,7 +359,7 @@ const largeRecall = () => recall({
 })
 
 describe('a command wake near Cursor\'s limit', () => {
-  it('measured at the boundary: a 19,990-character command wake that fits gets no recall rather than a 20,431-character one, and the command is byte for byte as it was', () => {
+  it('measured at the boundary: a 19,990-character command wake has no room for even the short pointer, so the wake carries no recall and the command is byte for byte as it was', () => {
     const home = tempHome()
     try {
       const command = wakeOfLength(19_990)
@@ -366,7 +368,7 @@ describe('a command wake near Cursor\'s limit', () => {
         const events = withTurnRecall(command, each, { home })
         assert.equal(wakeLines(events), wakeLines(command), 'no recall, inline or pointer, fits beside this command')
       }
-      // Nothing was written for a pointer that could not be given.
+      // Nothing was written for a pointer that could not be given in the wake.
       assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes')), false)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
@@ -391,7 +393,7 @@ describe('a command wake near Cursor\'s limit', () => {
           }
           // Inline whenever inline fits; never a pointer when inline would have fitted.
           if (carried?.block === undefined) {
-            const inline = { type: 'turn_recall', session_id: null, executable: false, note: RECALL_INLINE_NOTE, block: each.formatted_block }
+            const inline = { type: 'turn_recall', note: RECALL_INLINE_NOTE, block: each.formatted_block }
             assert.equal(fitsShellOutput(wakeLines([command[0], inline, ...command.slice(1)])), false, `inline would have fitted at ${chars}`)
           }
         }
@@ -432,7 +434,7 @@ describe('what counts as shown', () => {
       encoding: 'utf8',
     })
     assert.equal(run.status, 0, run.stderr)
-    assert.equal(run.stdout, '', 'it only observes: it adds nothing to what Cursor passes on')
+    return run.stdout
   }
 
   it('an inline recall, once its wake is written', () => {
@@ -441,8 +443,8 @@ describe('what counts as shown', () => {
       const batch = { turn_recall: recall({ keys: [key(1), key(2)] }) }
       assert.equal(settleRecallHandover('chat-1', withTurnRecall(wake(), batch.turn_recall, { home }), batch, { home }), 'shown')
       assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(1), key(2)])
-      // A wake that carried no recall shows nothing.
-      assert.equal(settleRecallHandover('chat-2', wake(), batch, { home }), 'none')
+      // A wake with no command to recall for (a check job, a notice) settles nothing.
+      assert.equal(settleRecallHandover('chat-2', [{ type: 'check_job' }, { type: 'wake' }], batch, { home }), 'none')
       assert.deepEqual(seenRecallKeys('chat-2', { home }), [])
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
@@ -473,6 +475,87 @@ describe('what counts as shown', () => {
       runAfterTool(home, catCall(home, files.at(-1), { conversation: 'chat-1' }))
       assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(3), key(4)])
       assert.deepEqual(fs.readdirSync(path.join(home, '.devspec', 'recall', 'cursor', 'pending')), [])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('a recall with no room in its wake: its pointer arrives at the agent\'s first tool call, once, and its records count as shown once the note is read', () => {
+    const home = tempHome()
+    try {
+      const command = wakeOfLength(19_990)
+      const batch = { turn_recall: { ...mediumRecall(), seen_keys: [key(6), key(7)] } }
+      const events = withTurnRecall(command, batch.turn_recall, { home })
+      assert.equal(wakeLines(events), wakeLines(command))
+      assert.equal(settleRecallHandover('chat-1', events, batch, { home }), 'next_step')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
+
+      // The first tool call of the turn hands the pointer over, within the hook's share.
+      const first = JSON.parse(runAfterTool(home, { conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'git status' }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }))
+      const context = first.additional_context
+      assert.equal(first.hookSpecificOutput.additionalContext, context)
+      assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE)
+      assert.match(context, /room command m1/)
+      const id = noteIdIn(context)
+      assert.equal(readNoteText(id, { home }), batch.turn_recall.formatted_block, 'the note it points to was written, whole')
+      // Given once; later steps add nothing.
+      assert.equal(runAfterTool(home, { conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }), '')
+
+      for (const file of noteFiles(home, id)) runAfterTool(home, catCall(home, file, { conversation: 'chat-1' }))
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(6), key(7)])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('a turn that makes no tool call never sees it: its records stay unshown, and the next command\'s recall takes its place', () => {
+    const home = tempHome()
+    try {
+      const tight = { turn_recall: { ...mediumRecall(), seen_keys: [key(6)] } }
+      assert.equal(settleRecallHandover('chat-1', withTurnRecall(wakeOfLength(19_990), tight.turn_recall, { home }), tight, { home }), 'next_step')
+      assert.deepEqual(recallPollArguments('chat-1', { home }), { turn_recall_version: 1 }, 'the next poll does not leave them out')
+      // The next command has room: its recall, offering the same record again, goes inline.
+      const next = { turn_recall: recall({ keys: [key(6), key(8)] }) }
+      assert.equal(settleRecallHandover('chat-1', withTurnRecall(wake(), next.turn_recall, { home }), next, { home }), 'shown')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(6), key(8)])
+      // The pointer from the earlier command is not handed over late.
+      assert.equal(recallAfterTool({ conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '{}' }, { home }), null)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('never hands over a pointer to a note that was not written, or is gone', () => {
+    const home = tempHome()
+    try {
+      // The note cannot be written: nothing waits, nothing is pointed at, nothing shown.
+      fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
+      const batch = { turn_recall: { ...mediumRecall(), seen_keys: [key(9)] } }
+      assert.equal(settleRecallHandover('chat-1', withTurnRecall(wakeOfLength(19_990), batch.turn_recall, { home }), batch, { home }), 'none')
+      fs.rmSync(path.join(home, '.devspec'), { force: true })
+      assert.equal(recallAfterTool({ conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '{}' }, { home }), null)
+
+      // Written, then removed before the agent's next step: no pointer, and it stops waiting.
+      assert.equal(settleRecallHandover('chat-1', withTurnRecall(wakeOfLength(19_990), batch.turn_recall, { home }), batch, { home }), 'next_step')
+      fs.rmSync(path.join(home, '.devspec', 'notes'), { recursive: true, force: true })
+      assert.equal(recallAfterTool({ conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '{}' }, { home }), null)
+      assert.deepEqual(fs.readdirSync(path.join(home, '.devspec', 'recall', 'cursor', 'pending')), [])
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps its next-step pointer within its share of the hook ceiling: one waits per conversation at most', () => {
+    const home = tempHome()
+    try {
+      const huge = (n) => ({ turn_recall: recall({ block: `== PROACTIVE PROJECT RECALL ==\nrecord ${n} ${'x'.repeat(60_000)}`, keys: [key(100 + n)] }) })
+      for (const n of [1, 2, 3]) assert.equal(settleRecallHandover('chat-1', withTurnRecall(wakeOfLength(19_990), huge(n).turn_recall, { home }), huge(n), { home }), 'next_step')
+      const context = recallAfterTool({ conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '{}' }, { home })
+      assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE)
+      assert.equal(context.match(/cat ~\/\.devspec\/notes\//g).length, 1, 'only the newest command\'s recall: the earlier ones were taken over by it')
+      assert.match(readNoteText(noteIdIn(context), { home }), /record 3/)
+      assert.ok(nextStepRecallLine('automation run 00000000-0000-4000-8000-000000000000', '0'.repeat(16)).length <= POST_TOOL_CONTEXT_SHARE)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

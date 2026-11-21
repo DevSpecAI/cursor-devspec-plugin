@@ -1390,12 +1390,10 @@ export function materialiseAttachments(message, opts = {}) {
  */
 export function buildOwnerMessageEvents(batch, opts = {}) {
   // A command or an automation run brings the project recall DevSpec attached to it,
-  // after the command and whole, inline or in a note (turn-recall.mjs). Nothing else
-  // carries one.
-  return withTurnRecall(commandWakeEvents(batch, opts), batch?.turn_recall, {
-    ...(opts.home ? { home: opts.home } : {}),
-    sessionId: batch?.session_id ?? null,
-  })
+  // after the command and whole, inline or as a pointer to a note, when the whole wake
+  // still fits; otherwise it follows at the agent's next step (turn-recall.mjs).
+  // Nothing else carries one.
+  return withTurnRecall(commandWakeEvents(batch, opts), batch?.turn_recall, opts.home ? { home: opts.home } : {})
 }
 
 function commandWakeEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
@@ -1800,8 +1798,9 @@ async function main() {
         // other than a notice woke it (notice-reply.mjs).
         recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
         // The recall this wake carried counts as shown now if it went inline, or once
-        // the agent has read its note whole; until then the next command's recall can
-        // offer those records again (turn-recall.mjs).
+        // the agent has read its note whole; one with no room in the wake is handed over
+        // at the agent's next step. Until shown, the next command's recall can offer
+        // those records again (turn-recall.mjs).
         settleRecallHandover(recallConversation(readState(connectionId), connectionId), events, batch)
         if (args.follow) {
           process.stderr.write(

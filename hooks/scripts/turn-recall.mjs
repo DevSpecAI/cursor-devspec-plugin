@@ -23,27 +23,34 @@
  * (devspec-remote-wait.mjs), so the agent receives both together. DevSpec recalls
  * nothing for a check job, a notice or an idle poll, so they carry none.
  *
- * Nothing is cut, the command least of all. The plugin's one wake sizer
- * (`fitIntoWake`, hook-context-budget.mjs) holds the whole wake to Cursor's rules on
- * one command's output (`fitsShellOutput`: past 20,000 characters Cursor keeps the
- * first and last 10,000, and past 40,000 bytes it shows a file path instead). The
- * recall goes into the wake itself only while the whole wake, command and recall
- * together, still fits. Otherwise it is kept whole as a note in ~/.devspec/notes/
- * (`writeNote`, in parts that each reach the model whole) and the wake carries only a
- * pointer to it, when the whole wake with that pointer still fits.
- * When not even the pointer fits, this wake carries no recall: the recall is advisory,
- * and the command goes exactly as it would have without it (a command too long on its
- * own is handled as it always was).
+ * Nothing is cut, the command least of all, and no recall is dropped unsaid. The
+ * plugin's one wake sizer (`fitIntoWake`, hook-context-budget.mjs) holds the whole
+ * wake to Cursor's rules on one command's output (`fitsShellOutput`: past 20,000
+ * characters Cursor keeps the first and last 10,000, and past 40,000 bytes it shows a
+ * file path instead). The recall goes into the wake itself only while the whole wake,
+ * command and recall together, still fits. Otherwise it is kept whole as a note in
+ * ~/.devspec/notes/ (`writeNote`, in parts that each reach the model whole) and the
+ * wake carries only a short pointer to it, when the whole wake with that pointer still
+ * fits. When not even the pointer fits, the command goes exactly as it would have
+ * without recall (a command too long on its own is handled as it always was), and the
+ * pointer is handed to the agent at its next tool call instead, by the plugin's
+ * postToolUse hook within its share of Cursor's ceiling on hook context
+ * (`recallAfterTool`). A turn that makes no tool call never sees it; its records stay
+ * unshown and the next command's recall offers them again. The reader that prints the
+ * wake file hands Cursor whole wakes only, as many as fit one output together
+ * (`wakesForOneOutput`, devspec-wake-tail.mjs), so wakes that each fit are never
+ * joined past the rules either.
  *
  * What counts as shown (`settleRecallHandover`): a recall that went inline, once its
- * wake has been written; a recall in a note, only once the agent has read every part
- * of that note whole, by the same proof every other note of the plugin is counted read
- * with (`readThrough`, hook-context-budget.mjs). The plugin's postToolUse hook runs this
- * file with `post-tool` while a note is waiting to be read (`noteRecallReads`). Until
- * then its records stay unshown, so the next command's recall can offer them again. A
- * command whose wake never went out leaves nothing remembered either. A compaction
- * forgets what was shown before it (the preCompact hook runs this file with `compact`),
- * because the summary that replaces the conversation may not keep it.
+ * wake has been written; a recall in a note, wherever its pointer was given, only once
+ * the agent has read every part of that note whole, by the same proof every other note
+ * of the plugin is counted read with (`readThrough`, hook-context-budget.mjs). The
+ * plugin's postToolUse hook runs this file with `post-tool` while a note is waiting
+ * (`noteRecallReads`). Until then its records stay unshown, so the next command's
+ * recall can offer them again. A command whose wake never went out leaves nothing
+ * remembered either. A compaction forgets what was shown before it (the preCompact
+ * hook runs this file with `compact`), because the summary that replaces the
+ * conversation may not keep it.
  *
  * Never in the way. DevSpec runs the recall within the time budget every plugin's
  * recall shares (DevSpecV2 packages/core/src/recall/budget.ts: the server gives up
@@ -104,7 +111,16 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { fitIntoWake, readThrough } from './hook-context-budget.mjs'
+import {
+  fitHookContext,
+  fitIntoWake,
+  noteCommand,
+  noteParts,
+  POST_TOOL_CONTEXT_SHARE,
+  postToolUseOutput,
+  readThrough,
+  writeNote,
+} from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateText } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
@@ -260,35 +276,32 @@ const COMMAND_EVENTS = new Set(['owner_message', 'automation_dispatch'])
 /** What the wake says beside a recall it carries. */
 export const RECALL_INLINE_NOTE = 'Project records DevSpec recalled for the command above, as DevSpec wrote them.'
 
-/** What the wake says when the recall is in a note: a fixed sentence and a fixed-length command. */
-export function recallPointer(note) {
-  return (
-    "DevSpec's recall for the command above (project records that bear on it) is waiting for you whole in a file, " +
-    "because with it this wake would be longer than Cursor shows from one command's output. " +
-    `Read it before you act on the command: \`${note.command}\`, and every further part it names.`
-  )
-}
+/**
+ * What the wake says when the recall is in a note: as short as it can be and still
+ * say what the file is and what to do, so it fits beside as long a command as possible.
+ */
+export const RECALL_POINTER_NOTE = 'DevSpec recall for the command above: run `read`, and each part it names, before acting.'
 
 /**
  * `events`, one wake's events in the order they are written, with the batch's recall
  * after its last command, sized with the whole wake by the plugin's one wake sizer
  * (`fitIntoWake`, hook-context-budget.mjs): inline when the whole wake with it still
- * reaches the model whole; otherwise a pointer to a note that keeps it whole, when the
- * whole wake with the pointer still does; otherwise no recall at all, since it is
- * advisory and never shortens or pushes out the command. `events` unchanged too when
- * there is no recall, no command to follow, or a note that cannot be written.
+ * reaches the model whole; otherwise a short pointer to a note that keeps it whole,
+ * when the whole wake with the pointer still does; otherwise the wake carries none,
+ * so the command is never shortened or pushed out by it, and `settleRecallHandover`
+ * hands the pointer over at the agent's next step instead. `events` unchanged too
+ * when there is no recall, no command to follow, or a note that cannot be written.
  */
-export function withTurnRecall(events, recall, { home = os.homedir(), sessionId = null } = {}) {
+export function withTurnRecall(events, recall, { home = os.homedir() } = {}) {
   const deliverable = deliverableRecall(recall)
   if (!deliverable || !Array.isArray(events)) return events
   const at = events.findLastIndex((event) => COMMAND_EVENTS.has(event?.type)) + 1
   if (at === 0) return events
-  const base = { type: 'turn_recall', session_id: sessionId, executable: false }
   return fitIntoWake(events, {
     at,
     text: deliverable.formatted_block,
-    inline: (block) => ({ ...base, note: RECALL_INLINE_NOTE, block }),
-    pointer: (note) => ({ ...base, note: recallPointer(note), read: note.command, parts: note.parts }),
+    inline: (block) => ({ type: 'turn_recall', note: RECALL_INLINE_NOTE, block }),
+    pointer: (note) => ({ type: 'turn_recall', read: note.command, note: RECALL_POINTER_NOTE }),
     home,
   }).events
 }
@@ -297,6 +310,17 @@ export function withTurnRecall(events, recall, { home = os.homedir(), sessionId 
 function recallNoteOf(events) {
   const event = Array.isArray(events) ? events.find((each) => each?.type === 'turn_recall') : null
   return /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(String(event?.read ?? ''))?.[1] ?? null
+}
+
+/** How the agent knows the command a recall belongs to: the room message's id, or the automation run's. */
+function commandRef(events) {
+  const command = Array.isArray(events) ? events.findLast((event) => COMMAND_EVENTS.has(event?.type)) : null
+  if (command?.type === 'automation_dispatch') {
+    const run = command.dispatch?.run_id
+    return typeof run === 'string' && run ? `automation run ${run}` : 'automation run'
+  }
+  const id = command?.message_id ?? command?.message?.message_id ?? command?.message?.id
+  return typeof id === 'string' && id ? `room command ${id}` : 'room command'
 }
 
 /** Where recall notes wait to be read: one record per conversation and note. */
@@ -310,6 +334,26 @@ function conversationDigest(conversation) {
 
 function pendingFile(conversation, note, home) {
   return path.join(pendingDir(home), `${conversationDigest(conversation)}-${note}.json`)
+}
+
+/** This conversation's waiting recall notes, as `{ file, kept }`. */
+function pendingRecords(conversation, home) {
+  const prefix = `${conversationDigest(conversation)}-`
+  let names
+  try {
+    names = fs.readdirSync(pendingDir(home)).filter((name) => name.startsWith(prefix) && name.endsWith('.json'))
+  } catch {
+    return []
+  }
+  const records = []
+  for (const name of names) {
+    const file = path.join(pendingDir(home), name)
+    const kept = readPrivateJson(file)
+    if (kept?.version === STORE_VERSION && kept.conversation === conversation && typeof kept.note === 'string') {
+      records.push({ file, kept })
+    }
+  }
+  return records
 }
 
 /** Remove recall notes waiting longer than `SEEN_STORE.ttlMs`: their records stay unshown. */
@@ -332,52 +376,67 @@ function sweepPending(home, now) {
 }
 
 /**
- * Settle what a written wake handed over in `conversation`. A recall that went inline
- * is shown now. A recall in a note waits until the agent has read the note whole
- * (`noteRecallReads`): each pointing is a new delivery with nothing read yet. Returns
- * `'shown'`, `'awaiting_read'` or `'none'`; a failure here only means the records may
- * be offered again.
+ * Settle what a written wake did with its batch's recall, in `conversation`:
+ * - inline: its records are shown now (`'shown'`);
+ * - a pointer in the wake: they wait until the agent has read the note whole
+ *   (`'awaiting_read'`; `noteRecallReads`);
+ * - no room in the wake: the note is written now and the pointer is handed to the
+ *   agent at its next tool call instead (`'next_step'`; `recallAfterTool`), then waits
+ *   for the read the same way. A note that cannot be written gives no pointer.
+ * A recall still waiting for its next step from an earlier command is dropped first: its
+ * records were never shown, so this command's recall offers whichever still bear on it.
+ * Returns `'none'` when there was nothing to settle or it could not be recorded; that
+ * only means the records may be offered again.
  */
 export function settleRecallHandover(conversation, events, batch, { home = os.homedir(), now = Date.now() } = {}) {
-  if (!Array.isArray(events) || !events.some((event) => event?.type === 'turn_recall')) return 'none'
-  const keys = deliverableRecall(batch?.turn_recall)?.seen_keys ?? []
-  if (!conversation || keys.length === 0) return 'none'
-  const note = recallNoteOf(events)
-  if (!note) return rememberShown(conversation, keys, { home, now }) ? 'shown' : 'none'
+  const deliverable = deliverableRecall(batch?.turn_recall)
+  const keys = deliverable?.seen_keys ?? []
+  if (!conversation || keys.length === 0 || !Array.isArray(events) || !events.some((e) => COMMAND_EVENTS.has(e?.type))) return 'none'
+  for (const { file, kept } of pendingRecords(conversation, home)) {
+    if (kept.offer === 'next_step' && kept.offered !== true) fs.rmSync(file, { force: true })
+  }
+  const carried = events.some((event) => event?.type === 'turn_recall')
+  let note = carried ? recallNoteOf(events) : null
+  if (carried && !note) return rememberShown(conversation, keys, { home, now }) ? 'shown' : 'none'
+  if (!carried) {
+    try {
+      note = writeNote(deliverable.formatted_block, { home }).id
+    } catch {
+      return 'none'
+    }
+  }
   try {
     sweepPending(home, now)
-    writePrivateText(
-      pendingFile(conversation, note, home),
-      `${JSON.stringify({ version: STORE_VERSION, conversation, note, keys, parts: [], at: new Date(now).toISOString() })}\n`,
-    )
-    return 'awaiting_read'
+    const record = {
+      version: STORE_VERSION,
+      conversation,
+      note,
+      keys,
+      parts: [],
+      offer: carried ? 'wake' : 'next_step',
+      offered: carried,
+      command: commandRef(events),
+      at: new Date(now).toISOString(),
+    }
+    writePrivateText(pendingFile(conversation, note, home), `${JSON.stringify(record)}\n`)
+    return carried ? 'awaiting_read' : 'next_step'
   } catch {
     return 'none'
   }
 }
 
 /**
- * The postToolUse step: for each recall note waiting in this tool call's conversation,
- * add any part this call handed the agent whole (`readThrough`, the plugin's one proof
- * that a note was read); once every part has come back whole, its records are shown and
- * the note stops waiting. A read in another conversation (a helper agent's included)
- * never counts. Returns the notes read through by this call.
+ * For each recall note waiting in this tool call's conversation, add any part this call
+ * handed the agent whole (`readThrough`, the plugin's one proof that a note was read);
+ * once every part has come back whole, its records are shown and the note stops
+ * waiting. A read in another conversation (a helper agent's included) never counts.
+ * Returns the notes read through by this call.
  */
 export function noteRecallReads(input, { home = os.homedir(), now = Date.now() } = {}) {
   const conversation = firingConversation(input)
   if (!conversation) return []
-  const prefix = `${conversationDigest(conversation)}-`
-  let names
-  try {
-    names = fs.readdirSync(pendingDir(home)).filter((name) => name.startsWith(prefix) && name.endsWith('.json'))
-  } catch {
-    return []
-  }
   const read = []
-  for (const name of names) {
-    const file = path.join(pendingDir(home), name)
-    const kept = readPrivateJson(file)
-    if (kept?.version !== STORE_VERSION || kept.conversation !== conversation || typeof kept.note !== 'string') continue
+  for (const { file, kept } of pendingRecords(conversation, home)) {
     const { record, done } = readThrough({ note: kept.note, parts: kept.parts }, input, { home })
     try {
       if (done) {
@@ -395,6 +454,54 @@ export function noteRecallReads(input, { home = os.homedir(), now = Date.now() }
   return read
 }
 
+/** The line that hands over, at the agent's next step, a recall that had no room in its wake. */
+export function nextStepRecallLine(command, note) {
+  return (
+    `DevSpec's recall for ${command} (project records that bear on it) had no room beside it in its wake, ` +
+    `so it is in a file: run \`${noteCommand(note)}\`, and every further part it names, before you act on that command.`
+  )
+}
+
+/**
+ * The postToolUse step (`post-tool`): count the reads this tool call made
+ * (`noteRecallReads`), then hand over, once, the pointer to each recall that is waiting
+ * for its next step, within this hook's share of Cursor's ceiling on hook context
+ * (`fitHookContext`). Returns the context to answer with, or null. A pointer whose
+ * note is gone is not given, and its record is dropped: its records stay unshown.
+ */
+export function recallAfterTool(input, { home = os.homedir(), now = Date.now() } = {}) {
+  noteRecallReads(input, { home, now })
+  const conversation = firingConversation(input)
+  if (!conversation) return null
+  const lines = []
+  const offered = []
+  for (const { file, kept } of pendingRecords(conversation, home)) {
+    if (kept.offer !== 'next_step' || kept.offered === true) continue
+    if (noteParts(kept.note, { home }) === 0) {
+      fs.rmSync(file, { force: true })
+      continue
+    }
+    lines.push(nextStepRecallLine(typeof kept.command === 'string' ? kept.command : 'your newest room command', kept.note))
+    offered.push({ file, kept })
+  }
+  if (lines.length === 0) return null
+  let context
+  try {
+    context = fitHookContext(lines.join('\n\n'), { share: POST_TOOL_CONTEXT_SHARE, what: "DevSpec's recall for your room commands", home })
+  } catch {
+    return null
+  }
+  if (!context) return null
+  for (const { file, kept } of offered) {
+    try {
+      writePrivateText(file, `${JSON.stringify({ ...kept, offered: true })}\n`)
+    } catch {
+      // offered again at the next step
+    }
+  }
+  return context
+}
+
 // preCompact: the summary that replaces the conversation may not keep the cards shown
 // so far, so they may be shown again. Cursor reads nothing from this hook's output.
 if (isDirectRun(import.meta.url) && process.argv[2] === 'compact') {
@@ -406,14 +513,15 @@ if (isDirectRun(import.meta.url) && process.argv[2] === 'compact') {
   process.exit(0)
 }
 
-// postToolUse, while a recall note waits to be read: count what this tool call read.
-// It only observes, and answers Cursor with nothing, so it takes no share of the
-// context Cursor passes on after a step.
+// postToolUse, while a recall note waits: count what this tool call read, and hand over
+// a recall that had no room in its wake (its share of Cursor's ceiling on hook context
+// is counted in POST_TOOL_CONTEXT_HOOKS).
 if (isDirectRun(import.meta.url) && process.argv[2] === 'post-tool') {
   try {
-    noteRecallReads(JSON.parse(fs.readFileSync(0, 'utf8')))
+    const output = postToolUseOutput(recallAfterTool(JSON.parse(fs.readFileSync(0, 'utf8'))))
+    if (output) process.stdout.write(JSON.stringify(output))
   } catch {
-    // an input it cannot read counts nothing
+    // an input it cannot read counts nothing and hands nothing over
   }
   process.exit(0)
 }
