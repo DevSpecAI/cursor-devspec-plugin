@@ -206,6 +206,7 @@ import {
 } from './transcript-turn-end.mjs'
 import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
 import { clearTurnWakes } from './notice-reply.mjs'
+import { retireEndedSteps, retireSteps } from './step-delivery.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -570,6 +571,19 @@ function disableLocalState({ connectionId, reason, message = null }) {
     )
   } catch (e) {
     process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+  }
+  retireConnectionSteps(connectionId)
+}
+
+/**
+ * The connection has ended: what it held for the agent's next step is handed on and
+ * its folder removed (step-delivery.mjs), so later tool calls stop starting the hook.
+ */
+function retireConnectionSteps(connectionId) {
+  try {
+    retireSteps(connectionId, { dir: CONNECTIONS_DIR })
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not clear what waited for a step: ${e.message}\n`)
   }
 }
 
@@ -1485,6 +1499,14 @@ async function main() {
     process.exit(2)
   }
   state = readState(connectionId) || state
+
+  // Connections on this machine that ended without clearing what they held for a
+  // step (a process killed outright) are cleared now (step-delivery.mjs).
+  try {
+    retireEndedSteps({ dir: CONNECTIONS_DIR })
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not clear ended connections' steps: ${e.message}\n`)
+  }
 
   if (state && state.enabled === false) {
     process.stderr.write('devspec-remote-poll: remote control disabled in state file\n')
@@ -2861,6 +2883,7 @@ async function main() {
 
     const liveState = readState(connectionId)
     if (liveState && liveState.enabled === false) {
+      retireConnectionSteps(connectionId)
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
     }

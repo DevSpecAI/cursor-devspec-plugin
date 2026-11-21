@@ -108,7 +108,7 @@ import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
-import { holdForNextStep, isStepBatch, readTurnState, releaseAtIdle } from './step-delivery.mjs'
+import { holdForNextStep, isStepBatch, readTurnState, releaseAtIdle, retireSteps } from './step-delivery.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1673,9 +1673,21 @@ async function main() {
       state.ended_from_ui !== true &&
       state.end_reason !== 'ui',
   )
+  // The connection has ended: what it held for the agent's next step is handed on and
+  // its folder removed (step-delivery.mjs). Whoever ended it did so already; this
+  // covers a batch this follow held as the end landed.
+  const retireOnEnd = () => {
+    if (!args.follow) return
+    try {
+      retireSteps(connectionId, { dir: CONNECTIONS_DIR, ...(args.wakeFile ? { wakeFile: args.wakeFile } : {}) })
+    } catch (e) {
+      process.stderr.write(`devspec-remote-wait: could not clear what waited for a step: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
+  }
   while (args.follow || Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
+      retireOnEnd()
       closeCursorOnEnd({
         state: live,
         sawLive,
@@ -1688,11 +1700,13 @@ async function main() {
       process.exit(1)
     }
     if (live && live.enabled === false) {
+      retireOnEnd()
       if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
+      retireOnEnd()
       await emitEnded(
         { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
         args.wakeFile,

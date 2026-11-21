@@ -34,15 +34,20 @@ import {
   holdForNextStep,
   reclaimAbandoned,
   releaseAtIdle,
+  retireEndedSteps,
+  retireSteps,
   stepDeliveryHook,
   stepsDir,
 } from './step-delivery.mjs'
+import { randomUUID } from 'node:crypto'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const AFTER_TOOL = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks', 'hooks.json'), 'utf8')).hooks.postToolUse
 const STEP_HOOK = AFTER_TOOL.find((entry) => entry.command.includes('step-delivery.mjs'))
 const WAIT_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-wait.mjs')
+const POLL_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-poll.mjs')
+const STATE_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'remote-control-state.mjs')
 
 const CONN = FIXTURE_ID.connection
 const ROOM = '44444444-4444-4444-8444-444444444444'
@@ -546,5 +551,102 @@ describe('a hand-over that was cut short', () => {
     reclaimAbandoned(steps)
     assert.deepEqual(world.held(), [name])
     assert.ok(runStepHook(world, toolCall()))
+  })
+})
+
+describe('when the connection ends', () => {
+  /**
+   * A held check job and two held notices, one of them handed over at a step and not
+   * read, for connection `id` in `world`.
+   */
+  function holdSome(world, id = CONN) {
+    const notice = noticeBatch([[NOTICE_A, 'needs_person']])
+    holdForNextStep(id, notice, eventsOf(notice), { dir: world.dir })
+    if (id === CONN) assert.ok(runStepHook(world, toolCall()), 'handed over, not read')
+    const job = checkJobBatch()
+    holdForNextStep(id, job, eventsOf(job), { dir: world.dir })
+    const later = noticeBatch([[NOTICE_B, 'needs_person']], '22222222-2222-4222-8222-2222222222b2')
+    holdForNextStep(id, later, eventsOf(later), { dir: world.dir })
+  }
+
+  it('removes its folder, so later tool calls never start the hook, and loses nothing that matters', () => {
+    const world = connectedHome()
+    holdSome(world)
+    fs.writeFileSync(world.wakeFile, '')
+    const retired = retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile })
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
+    // The notices, read or not, go where they went before step delivery: the wake file.
+    const lines = world.wakeText().trim().split('\n').map((line) => JSON.parse(line))
+    assert.deepEqual(lines.filter((line) => line.type === 'system_notice').map((line) => line.notice_id), [NOTICE_A, NOTICE_B])
+    // A check job is DevSpec's to hand on once the connection ends: dropped, not woken for.
+    assert.equal(lines.filter((line) => line.type === 'check_job').length, 0)
+    assert.deepEqual(retired, { retired: true, notices: [NOTICE_A, NOTICE_B], dropped: [checkJobAcceptanceKey(checkJob())] })
+    // Pointed at a plugin folder that is not there, a started node would fail the hook.
+    assert.equal(runStepHook(world, toolCall(), { CLAUDE_PLUGIN_ROOT: path.join(world.home, 'no-plugin-here') }), null)
+  })
+
+  it('makes no wake file where none was listening, and keeps the folder when the wake file cannot be written', () => {
+    const world = connectedHome()
+    holdSome(world)
+    assert.equal(retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile }).retired, true)
+    assert.equal(fs.existsSync(world.wakeFile), false)
+    holdSome(world)
+    fs.writeFileSync(world.wakeFile, '')
+    const failing = retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile, append: () => { throw new Error('disk full') } })
+    assert.equal(failing.retired, false)
+    assert.ok(fs.existsSync(stepsDir(CONN, world.dir)), 'kept for the next poller start')
+  })
+
+  it('a remote stop clears it', () => {
+    const world = connectedHome()
+    const id = randomUUID()
+    fs.writeFileSync(path.join(world.dir, `${id}.json`), JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION }))
+    holdSome(world, id)
+    const run = spawnSync(process.execPath, [STATE_SCRIPT, 'disable', '--connection-id', id, '--agent', 'Cursor', '--local-id', CONVERSATION], {
+      env: { PATH: process.env.PATH, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    assert.equal(run.status, 0, run.stderr)
+    assert.equal(JSON.parse(run.stdout).steps_cleared, true)
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+  })
+
+  it('a poller that stands down (signed out) clears it', () => {
+    const world = connectedHome()
+    const id = randomUUID()
+    fs.writeFileSync(
+      path.join(world.dir, `${id}.json`),
+      JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, auth_source: 'login', principal: 'nobody', mcp_url: UNROUTABLE }),
+    )
+    holdSome(world, id)
+    const run = spawnSync(process.execPath, [POLL_SCRIPT, '--connection-id', id], {
+      env: { PATH: process.env.PATH, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    assert.match(run.stderr, /signed out/)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(world.dir, `${id}.json`), 'utf8')).enabled, false)
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+  })
+
+  it("the next poller start clears every ended connection's folder and leaves a live one's", () => {
+    const world = connectedHome()
+    const stopped = randomUUID()
+    const gone = randomUUID()
+    fs.writeFileSync(path.join(world.dir, `${stopped}.json`), JSON.stringify({ connection_id: stopped, enabled: false, end_reason: 'local_stop' }))
+    for (const id of [CONN, stopped, gone]) holdSome(world, id)
+    // A poller started for a connection that has since ended sweeps before it exits.
+    const run = spawnSync(process.execPath, [POLL_SCRIPT, '--connection-id', stopped], {
+      env: { PATH: process.env.PATH, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    assert.match(run.stderr, /disabled in state file/)
+    assert.equal(fs.existsSync(stepsDir(stopped, world.dir)), false)
+    assert.equal(fs.existsSync(stepsDir(gone, world.dir)), false, 'no state at all: ended')
+    assert.ok(fs.existsSync(stepsDir(CONN, world.dir)), 'still live: kept')
+    assert.ok(runStepHook(world, toolCall()), 'and still delivered')
+    assert.deepEqual(retireEndedSteps({ dir: world.dir }), [])
   })
 })

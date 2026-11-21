@@ -49,6 +49,11 @@
  *    wake, and an item the agent read at a step is never delivered again. Cursor does
  *    not run the plugin's `stop` hook for most people, so nothing here leans on it.
  *
+ * 4. When the connection ends (stopped at the terminal, ended in DevSpec, signed out,
+ *    its Cursor gone), its folder is removed (`retireSteps`) by whatever ended it, and
+ *    any left behind is removed at the next poller start (`retireEndedSteps`), so no
+ *    later tool call pays for starting the hook.
+ *
  * Each file (a held item, the handed-over record) is taken by renaming it to a name
  * only its taker knows, so the hook and the follow never both deliver one item; a
  * taker that died (a hook past Cursor's timeout) leaves its files to be put back
@@ -61,7 +66,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { appendWakeEvents } from './devspec-wake-file.mjs'
+import { appendWakeEvents, resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   noteCommand,
   pointToNote,
@@ -477,6 +482,82 @@ export async function releaseAtIdle(
   if (takenRecord) drop(takenRecord)
   if (events.length > 0) recordTurnWake(connectionId, turnWakeFromEvents(events), { dir })
   return { released: kept.map((item) => item.key), dropped }
+}
+
+/** The wake file the host follow writes for a connection, or null for an id that cannot have one. */
+function wakeFileOf(connectionId) {
+  try {
+    return resolveSpaceFreeWakeFile(connectionId)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * A connection has ended (stopped at the terminal, ended in DevSpec, signed out, its
+ * Cursor gone): what it still held for a step goes where it can still matter, and its
+ * folder is removed, so no later tool call on the machine pays for starting the hook.
+ *
+ * Nothing that matters is lost. A check job is DevSpec's to hand on once the connection
+ * that was offered it ends (semantics.check_job.busy), so a held one is dropped. A
+ * notice is kept on the record and in the project's Review either way; a held one,
+ * read or not, goes to the connection's wake file, exactly where it went before
+ * step delivery existed, so an agent whose wake tail is still listening hears it at
+ * idle as it would have before. A wake file that is not there has no one listening
+ * (the connection never had a follow, or its files were cleared), so none is made.
+ *
+ * Returns what it did, or null when there was no folder. When the wake file cannot be
+ * written the folder stays, for the next poller start to try again (`retireEndedSteps`).
+ */
+export function retireSteps(connectionId, { dir, wakeFile = wakeFileOf(connectionId), append = appendWakeEvents } = {}) {
+  const steps = stepsDir(connectionId, dir)
+  if (!fs.existsSync(steps)) return null
+  reclaimAbandoned(steps)
+  const items = []
+  const record = readPrivateJson(path.join(steps, HANDED))
+  if (validRecord(record)) items.push(...record.items)
+  for (const file of waitingFiles(steps)) {
+    const item = readPrivateJson(file)
+    if (validItem(item)) items.push(item)
+  }
+  const notices = items.filter((item) => item.kind === 'notices')
+  const events = notices.flatMap((item) => item.events)
+  if (events.length > 0 && wakeFile && fs.existsSync(wakeFile)) {
+    try {
+      append(wakeFile, events)
+    } catch {
+      return { retired: false, notices: [], dropped: [] }
+    }
+  }
+  fs.rmSync(steps, { recursive: true, force: true })
+  return {
+    retired: true,
+    notices: notices.flatMap((item) => item.notice_ids ?? []),
+    dropped: items.filter((item) => item.kind === 'check_job').map((item) => item.key),
+  }
+}
+
+/**
+ * At a poller's start: retire the folder of every connection in `dir` that is no
+ * longer live (its state disabled or gone), however it ended. Catches an end that
+ * could not clean up after itself (a process killed outright, a write that failed).
+ */
+export function retireEndedSteps({ dir } = {}) {
+  const retired = []
+  for (const name of list(dir)) {
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i.exec(name)
+    if (!match) continue
+    let state = null
+    try {
+      state = JSON.parse(fs.readFileSync(path.join(dir, `${match[1]}.json`), 'utf8'))
+    } catch (error) {
+      // A state file being rewritten right now is not an ended connection.
+      if (error?.code !== 'ENOENT') continue
+    }
+    if (state?.enabled === true) continue
+    if (retireSteps(match[1], { dir })?.retired) retired.push(match[1])
+  }
+  return retired
 }
 
 if (isDirectRun(import.meta.url)) {
