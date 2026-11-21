@@ -15,8 +15,9 @@
  *   and in the terminal, with `--plugin-dir` and as an installed local plugin. The
  *   plugin's own postToolUse runs for a person with no hooks file of their own on CLI
  *   2026.10.22, 2026.11.05 and 2026.11.19 (task 659a015f), unlike its `stop` hook.
- * - Cursor holds a background command's output (the wake tail, devspec-wake-tail.mjs)
- *   until the agent is idle, so the wake file cannot reach a working agent.
+ * - Cursor holds a background command's output (the wake tail, devspec-wake-tail.mjs,
+ *   whose lines notify the agent of new wakes) until the agent is idle, so the wake
+ *   file cannot reach a working agent.
  * - A helper agent's (subagent's) tool calls run the plugin's postToolUse too, and the
  *   helper receives what it adds. The call carries the helper's own `conversation_id`,
  *   with no parent id and no subagent flag (CLI 2026.11.05). Cursor's IDE release notes
@@ -80,7 +81,11 @@
  * and discards what it held; an end after a writer marks the connection ended once the
  * pointer or wake is out, and discards the record the writer wrote. A wake appended just
  * before an end is never printed: the wake reader skips a `held_for_step` line whose
- * connection has ended (`withoutEndedHeldWakes`, devspec-wake-tail.mjs).
+ * connection has ended (`withoutEndedConnectionWakes`, devspec-wake-tail.mjs). The wait
+ * takes the same lock to hand on, or keep, the rest of a delivery a one-shot run left
+ * frozen in the connection's state (devspec-remote-wait.mjs), and hands it on only while
+ * the connection is live; the reader skips a recall's own wake for an ended connection
+ * the same way.
  *
  * What this cannot see: an end DevSpec has decided that the plugin has not heard yet (the
  * poller learns it on its next poll). Until then the connection is live here, and a
@@ -712,15 +717,28 @@ function connectionEnded(dir, connectionId) {
 }
 
 /**
- * The last line of defence, at print time (devspec-wake-tail.mjs): `output`, whole wakes
- * the reader is about to print, without any wake holding a `held_for_step` line for a
- * connection that has ended. A writer holding the steps lock never appends one after the
- * end, but one appended just before it may not have been printed yet; it is skipped and
- * named on stderr, never printed. Other wakes, and output that is not whole wakes as
- * the wake writer wrote them, are printed as they are.
+ * The wakes, among those the reader prints, that point the agent at something for one
+ * connection, by its `connection_id`: a `held_for_step` line, and a command's recall in a
+ * wake of its own (turn-recall.mjs: a `turn_recall` naming its command in `for`, which a
+ * one-shot wait may have left frozen in the connection's state for the next printer).
  */
-export function withoutEndedHeldWakes(output, { dir = connectionsDirFor(), write = (line) => process.stderr.write(line) } = {}) {
-  if (typeof output !== 'string' || !output.includes('"held_for_step"')) return output
+const CONNECTION_WAKE_TYPES = Object.freeze(['held_for_step', 'turn_recall'])
+const namesConnection = (event) =>
+  typeof event?.connection_id === 'string' &&
+  (event.type === 'held_for_step' || (event.type === 'turn_recall' && typeof event.for === 'string'))
+
+/**
+ * The last line of defence, at print time (devspec-wake-tail.mjs: the reader, and the
+ * tail's notifications): `output`, whole wakes about to be printed or notified, without
+ * any wake for a connection that has ended (a `held_for_step` line, or a recall's own
+ * wake: `namesConnection`). A writer holding the
+ * steps lock never appends one after the end, but one appended just before it may not
+ * have been printed yet; it is skipped and named on stderr, never printed. Other wakes,
+ * and output that is not whole wakes as the wake writer wrote them, are printed as they
+ * are.
+ */
+export function withoutEndedConnectionWakes(output, { dir = connectionsDirFor(), write = (line) => process.stderr.write(line) } = {}) {
+  if (typeof output !== 'string' || !CONNECTION_WAKE_TYPES.some((type) => output.includes(`"${type}"`))) return output
   const { wakes } = splitWakes(output, { settled: true })
   if (wakes.join('') !== output) return output
   return wakes
@@ -732,10 +750,10 @@ export function withoutEndedHeldWakes(output, { dir = connectionsDirFor(), write
         } catch {
           continue
         }
-        if (event?.type === 'held_for_step' && typeof event.connection_id === 'string' && connectionEnded(dir, event.connection_id)) {
+        if (namesConnection(event) && connectionEnded(dir, event.connection_id)) {
           write(
-            `devspec-wake-tail: skipped a held_for_step wake for connection ${event.connection_id}, which has ended ` +
-              `(note ${event.note}); never printed. DevSpec keeps what it pointed at.\n`,
+            `devspec-wake-tail: skipped a ${event.type} wake for connection ${event.connection_id}, which has ended ` +
+              `(${event.type === 'held_for_step' ? `note ${event.note}` : `recall for ${event.for}`}); never printed. DevSpec keeps what it pointed at.\n`,
           )
           return false
         }

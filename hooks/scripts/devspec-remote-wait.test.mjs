@@ -41,7 +41,9 @@ import {
   resolveConnectionsDir,
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
-import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN, wakeLines } from './devspec-wake-file.mjs'
+import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { wakeNotice } from './room-unread.mjs'
 import { SYSTEM_NOTICE_CHANNEL_VERSION, remoteIngressNegotiationArgs } from './devspec-remote-poll.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { automationAcceptanceKey } from './remote-poll-acceptance.mjs'
@@ -1488,3 +1490,81 @@ describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
   })
 })
 
+describe('the one-shot wait freezes a delivery it splits over two results', () => {
+  const ROOM = '66666666-7777-4888-9999-000000000000'
+  const recallBlock = `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, n) => `- [MEMORY · decision] **Decision ${n}** — the settings page keeps its redirect`).join('\n')}`
+
+  /** A home whose room holds unread messages, so the command's wake carries a room_unread note. */
+  function homeWithUnreadRoom() {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-frozen-wakes-'))
+    const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.json`), JSON.stringify({
+      enabled: true, connection_id: CANONICAL_CONNECTION, session_id: ROOM, local_id: 'chat-frozen', agent_name: 'Cursor',
+    }), { mode: 0o600 })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript-state.json`), JSON.stringify({ version: 1, self_label: 'Cursor · Amber Dolphin' }), { mode: 0o600 })
+    const lines = Array.from({ length: 6 }, (_, n) => ({
+      seq: n + 1, at: `2026-11-21T01:0${n}:00.000Z`, message_id: `m-${n + 1}`, from: { label: `Teammate ${n}`, kind: 'human' },
+      to: null, text: `room message ${n + 1}`, attachments: [], state: 'final',
+    }))
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n', { mode: 0o600 })
+    return { home, dir }
+  }
+
+  function runOnce({ home, dir }) {
+    const child = spawn(process.execPath, [fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url)), '--connection-id', CANONICAL_CONNECTION, '--pending', '--poll-ms', '20'], {
+      env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => child.kill('SIGKILL'), 10_000)
+      child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+    })
+  }
+
+  it('prints the rest of it as frozen when built, even after the room-unread context clears, before the cursor moves', async () => {
+    const room = homeWithUnreadRoom()
+    try {
+      const state = () => JSON.parse(fs.readFileSync(path.join(room.dir, `${CANONICAL_CONNECTION}.json`), 'utf8'))
+      // Size the command so that with the room-unread note its wake needs a pointer wake of
+      // its own, and without it the pointer would fit beside it: a rebuild would differ.
+      const notice = wakeNotice({ connectionId: CANONICAL_CONNECTION, sessionId: ROOM, dir: room.dir })
+      assert.ok(notice, 'the room has unread messages')
+      const inbox = path.join(room.dir, `${CANONICAL_CONNECTION}.inbox.jsonl`)
+      const batchFor = (body) => canonicalBatch(fixtureCommand(body), { session_id: ROOM, turn_recall: { version: 1, formatted_block: recallBlock, seen_keys: ['memory:00000000-0000-4000-8000-000000000001:v1'] } })
+      const sizeWith = (body) => wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: notice, inboxFile: inbox })).length
+      let body = 'a'.repeat(9_000)
+      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - sizeWith(body)) / 2))
+      const sizeWithout = wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: null, inboxFile: inbox })).length
+      assert.ok(sizeWithout < 19_700, `without the note the pointer fits beside it (${sizeWithout})`)
+      const batch = batchFor(body)
+      fs.writeFileSync(inbox, JSON.stringify(batch) + '\n', { mode: 0o600 })
+
+      const first = await runOnce(room)
+      assert.equal(first.code, 0, first.stderr)
+      assert.ok(fitsShellOutput(first.stdout))
+      const one = first.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'room_unread', 'wake', 'recall_in_next_wake', 'wakes_waiting'])
+      assert.equal(one[0].body, body)
+      assert.equal(state().inbox_byte_offset ?? 0, 0, 'the cursor stays at the delivery')
+      assert.equal(state().wake_batch_progress.wakes.length, 1, 'the pointer wake is frozen as built')
+
+      // The room-unread context clears: a rebuild would now put the pointer beside the command.
+      fs.rmSync(path.join(room.dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript.jsonl`), { force: true })
+
+      const second = await runOnce(room)
+      assert.equal(second.code, 0, second.stderr)
+      const two = second.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(two.map((e) => e.type), ['turn_recall'], 'the frozen pointer wake, not a rebuilt delivery')
+      assert.equal(two[0].for, one[0].message_id)
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(two[0].read)[1], { home: room.home }), recallBlock)
+      assert.equal(state().inbox_byte_offset, fs.statSync(inbox).size, 'and only now the cursor moves past it')
+      assert.equal(state().wake_batch_progress, null)
+    } finally {
+      fs.rmSync(room.home, { recursive: true, force: true })
+    }
+  })
+})

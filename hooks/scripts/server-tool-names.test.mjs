@@ -12,10 +12,12 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS } from './request-ref.mjs'
+import { recallPollArguments } from './turn-recall.mjs'
 
 const SELF = fileURLToPath(import.meta.url)
 const ROOT = path.resolve(path.dirname(SELF), '../..')
@@ -312,5 +314,24 @@ describe('the DevSpec writes that record who asked', () => {
     if (!tools) return
     const server = tools.filter((tool) => tool.params.includes('provenance_ref')).map((tool) => tool.name).sort()
     assert.deepEqual([...PROVENANCE_REF_TOOLS].sort(), server)
+  })
+})
+
+describe('the project recall the poller asks poll_connection for', () => {
+  // A parameter the server does not take is dropped without a word, so a rename there
+  // would quietly end recall for room commands (turn-recall.mjs).
+  it('is negotiated with parameters poll_connection takes', (t) => {
+    const tools = pairedServer(t, serverToolList)
+    if (!tools) return
+    const poll = tools.find((tool) => tool.name === 'poll_connection')
+    assert.ok(poll, 'the server has no poll_connection')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-recall-params-'))
+    try {
+      const sent = Object.keys(recallPollArguments(null, { home }))
+      assert.deepEqual(sent.filter((name) => !poll.params.includes(name)), [])
+      assert.ok(poll.params.includes('seen_recall_versions'), 'the seen versions the poller sends once there are some')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
   })
 })
