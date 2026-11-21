@@ -12,6 +12,21 @@ import path from 'node:path'
 // The host-owned wake stream and its model notification must include the same events.
 export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|system_notice|question_answer|question_dismissal|session_ended|automation_dispatch|check_job'
 
+/**
+ * How many matches of its notify pattern one background command may print before Cursor
+ * stops telling the agent about it. Measured live on Cursor CLI 2026.11.19-f005e9d,
+ * 21 November 2026 (DevSpec task 7cbe5c32; a throwaway profile with no plugin): matches
+ * 1 to 1,000 were notified; at the 1,000th Cursor sent one last notification, "Notification
+ * limit reached (1000)", telling the agent to read the command's output file itself, and
+ * none after it, though the command printed 19,100 more. The number is Cursor's server's:
+ * the CLI's own code falls back to 100 when the server sends none, and the agent cannot
+ * set it (the Shell tool's notify_on_output takes `pattern`, `reason` and `debounce_ms`
+ * only). The command's exit is notified on its own, even past the limit. Cursor counts
+ * every match on stdout and stderr, not lines: a line naming two pattern words counts two.
+ * The wake tail (devspec-wake-tail.mjs) hands over to a new one before it gets there.
+ */
+export const CURSOR_NOTIFY_MATCH_LIMIT = 1_000
+
 const CONNECTION_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

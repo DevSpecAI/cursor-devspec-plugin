@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.0
+
+- **Your Cursor agent keeps hearing from DevSpec however long its session runs.** Cursor stops telling the agent about a background command once that command has printed a thousand matches of what the agent asked to be told about. The command the agent keeps running to hear about your messages from a room, DevSpec's notices and the checks it asks the agent to rule is one of those, so after about a thousand of them in one session the agent stopped hearing about anything new, and nothing anywhere said so. The plugin now hands over to a new command before Cursor's limit: from halfway there, each time the agent reads what has arrived it is asked to start a new one, which takes over, and the old one stops by itself just short of the limit, after which the agent is told to start the new one straight away.
+- **Nothing is missed or handed over twice across the switch.** Whatever arrives while the new command starts is announced by the new one, nothing the old one announced is announced again, and the two never run at once.
+- When several things arrive within a few seconds, Cursor tells the agent once and names only the last of them. The agent reads everything that has arrived each time it is told, so nothing is missed this way either.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.31.0
 
 - **A long message you send your Cursor agent from a DevSpec room is no longer cut when it arrives alongside another.** When the agent was told something had arrived from DevSpec, it read everything the plugin had received since it connected from one file. Each delivery fitted what Cursor shows the agent from one command, but two of them together, such as a long message and the line pointing to its project records, could add up to more than that, and Cursor then left out the middle, which could be the middle of your message. It could also hand the agent again messages it had already acted on.
