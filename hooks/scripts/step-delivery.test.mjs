@@ -578,11 +578,12 @@ function holdNotices(world, count, size, from = 0) {
   const finding = (chars) => 'A finding about your change. '.repeat(Math.ceil(chars / 29))
   for (let i = from; i < from + count; i += 1) {
     const id = `${String(i).padStart(8, '0')}-0000-4000-8000-0000000000aa`
-    const records = size > 7_000
-      ? [{ label: 'Finding', record_type: 'memory', record_id: `r${i}`, title: `Record ${i}`, text: finding(size - 7_000), url: null }]
-      : undefined
+    const records = []
+    for (let rest = size - 7_000, n = 0; rest > 0; rest -= 7_000, n += 1) {
+      records.push({ label: 'Finding', record_type: 'memory', record_id: `r${i}.${n}`, title: `Record ${i}.${n}`, text: finding(Math.min(rest, 7_000)), url: null })
+    }
     const batch = noticeBatch(
-      [[id, 'needs_person', `Notice ${i}`, `${finding(Math.min(size, 7_000))}END-${i}`, records]],
+      [[id, 'needs_person', `Notice ${i}`, `${finding(Math.min(size, 7_000))}END-${i}`, records.length > 0 ? records : undefined]],
       `${String(i).padStart(8, '0')}-2222-4222-8222-2222222222cc`,
     )
     holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir, now: Date.parse('2026-11-20T03:00:00.000Z') + i })
@@ -880,6 +881,83 @@ describe('when the connection ends', () => {
     }
     assert.ok(fs.existsSync(stepsDir(CONN, world.dir)), 'still live: kept')
     assert.ok(runStepHook(world, toolCall()), 'and still delivered')
+  })
+
+  it('a reader stopped while Cursor is not reading counts only the wakes it handed over whole; the rest are parked and handed over whole on reconnect', async () => {
+    const world = connectedHome()
+    world.endTurn()
+    // Twenty notices, each released whole in a wake of its own at idle.
+    for (let i = 0; i < 20; i += 1) {
+      holdNotices(world, 1, 17_000, i)
+      assert.equal((await releaseAtIdle(CONN, IDLE(world))).released.length, 1)
+    }
+    assert.equal(world.inFlight().length, 20)
+    const total = fs.statSync(world.wakeFile).size
+    // Cursor is not reading: the reader's pipe backs up.
+    assert.ok(total > 300_000, `${total} bytes in the wake file`)
+    const tail = spawn(process.execPath, [TAIL_SCRIPT, '--file', world.wakeFile], { stdio: ['ignore', 'pipe', 'ignore'] })
+    tail.stdout.pause()
+    const closed = new Promise((resolve) => tail.once('close', resolve))
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    let received = ''
+    try {
+      // Until what it notes stops moving: the pipe is full and a write waits.
+      let noted = -1
+      const deadline = Date.now() + 20_000
+      for (let still = 0; still < 6 && Date.now() < deadline; await pause(250)) {
+        const now = printedThrough(world.wakeFile)
+        still = now > 0 && now === noted ? still + 1 : 0
+        noted = now
+      }
+      assert.ok(noted > 0 && noted < total, `${noted} of ${total} bytes noted as printed`)
+      // Stopped, it waits for the write still in flight, which cannot finish; the host then kills it.
+      tail.kill('SIGTERM')
+      await pause(500)
+      assert.equal(tail.exitCode, null, 'still finishing the write in flight')
+      tail.kill('SIGKILL')
+      // What Cursor can still read from the pipe.
+      tail.stdout.on('data', (data) => { received += data.toString() })
+      tail.stdout.resume()
+      await closed
+      assert.equal(printedThrough(world.wakeFile), noted, 'nothing noted but what completed')
+    } finally {
+      tail.kill('SIGKILL')
+      await closed
+    }
+    const noted = printedThrough(world.wakeFile)
+
+    // Delivered: exactly the wakes noted, each whole in what Cursor received.
+    const flights = world.inFlight().map((name) => JSON.parse(fs.readFileSync(path.join(stepsDir(CONN, world.dir), name), 'utf8')))
+    const delivered = flights.filter((flight) => flight.end <= noted)
+    const undelivered = flights.filter((flight) => flight.end > noted)
+    assert.ok(delivered.length > 0 && undelivered.length > 0)
+    assert.ok(Buffer.byteLength(received) >= noted)
+    const shown = received.split('\n\n').filter((wake) => wake.trim()).map((wake) => JSON.parse(wake).content).filter(Boolean)
+    for (const flight of delivered) {
+      const end = flight.items[0].events.find((event) => event.type === 'system_notice').content.match(/END-\d+/)[0]
+      assert.ok(shown.some((content) => content.includes(`${end}\n`) || content.includes(end)), `${end} reached Cursor whole`)
+    }
+
+    // The connection ends with Cursor: what was printed is delivered, the rest parked.
+    parkSteps(CONN, { dir: world.dir })
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
+    assert.deepEqual(parkedKeys(world, CONN), undelivered.map((flight) => flight.items[0].key).sort())
+
+    // Reconnected, every undelivered notice is handed over whole, once.
+    const next = reconnect(world)
+    assert.equal(adoptParked(next, { dir: world.dir, localId: CONVERSATION }).length, undelivered.length)
+    world.inTurn()
+    const context = runStepHook(world, toolCall())
+    const note = readNoteText(noteIdIn(context), { home: world.home })
+    for (const flight of undelivered) {
+      const end = flight.items[0].events.find((event) => event.type === 'system_notice').content.match(/END-\d+/)[0]
+      assert.ok(note.includes(end), `${end} handed over`)
+    }
+    for (const flight of delivered) {
+      const end = flight.items[0].events.find((event) => event.type === 'system_notice').content.match(/END-\d+/)[0]
+      assert.ok(!new RegExp(`${end}\\b`).test(note), `${end} not handed over again`)
+    }
+    assert.equal(readNote(world, context), null)
   })
 
   it('never takes an item a live hook holds: the hook finishes, puts it back, parks it, and it is delivered once', async () => {
