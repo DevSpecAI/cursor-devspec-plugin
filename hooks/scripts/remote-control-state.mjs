@@ -98,7 +98,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
-import { parkSteps } from './step-delivery.mjs'
+import { discardSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -1121,14 +1121,14 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const capability_cleared = clearConnectionCapability(connectionId)
-  // What the connection held for its agent's next step is parked for the
-  // conversation's next connection, out of the folder the hook looks in
-  // (step-delivery.mjs).
+  // Its local copies of what it held for its agent's next step are discarded and named
+  // (step-delivery.mjs `discardSteps`, which says why that loses nothing).
   let steps = null
   try {
-    steps = parkSteps(connectionId, { dir: CONNECTIONS_DIR, localId: prev.local_id ?? localId ?? null })
+    steps = discardSteps(connectionId, { dir: CONNECTIONS_DIR })
+    logDiscarded('remote-control-state', connectionId, steps)
   } catch {
-    /* the next poller start parks it (parkEndedSteps) */
+    /* the next poller start discards it (discardEndedSteps) */
   }
   const killResult = stopPollerForConnection(connectionId)
   return {
@@ -1139,7 +1139,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     poller: killResult,
     bonds_stopped: bonds.length,
     capability_cleared,
-    steps_parked: steps ? steps.parked.length : 0,
+    steps_discarded: steps ? { notices: steps.notices, check_jobs: steps.check_jobs } : null,
   }
 }
 

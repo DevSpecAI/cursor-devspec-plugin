@@ -15,7 +15,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { ensureWakeFile, recordPrinted, splitWakes } from './devspec-wake-file.mjs'
+import { ensureWakeFile, splitWakes } from './devspec-wake-file.mjs'
 import { wakesForOneOutput } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 
@@ -62,29 +62,6 @@ async function main() {
   let lastSize = -1
   process.stderr.write(`devspec-wake-tail: watching ${file}\n`)
 
-  // A wake counts as printed, for a writer that waits on its wake reaching the agent
-  // (recordPrinted), only once its own write has completed: its bytes handed to the
-  // pipe, not merely queued in this process. While a write is still waiting (Cursor
-  // is not reading), nothing more is printed, so nothing more waits in this process.
-  let waiting = 0
-  let stopping = false
-  const handOver = (wake, end) => {
-    waiting += 1
-    process.stdout.write(wake, (error) => {
-      waiting -= 1
-      if (!error) recordPrinted(file, end)
-      if (stopping && waiting === 0) process.exit(0)
-    })
-  }
-  // Stopped: finish handing over what is already being written, then exit, so what
-  // completed is noted and nothing else is. A second signal exits at once.
-  const stop = () => {
-    if (stopping || waiting === 0) process.exit(0)
-    stopping = true
-  }
-  process.on('SIGTERM', stop)
-  process.on('SIGINT', stop)
-
   const poll = () => {
     const size = fileSize(file)
     if (size < offset) offset = 0
@@ -92,17 +69,15 @@ async function main() {
     // wake boundary wrote are whole by now.
     const settled = size === lastSize
     lastSize = size
-    if (size <= offset || waiting > 0 || stopping) return
+    if (size <= offset) return
     const fd = fs.openSync(file, 'r')
     try {
       const buf = Buffer.alloc(size - offset)
       fs.readSync(fd, buf, 0, buf.length, offset)
       const output = nextOutput(buf.toString('utf8'), { settled })
-      // One write per wake, so each is noted once its own bytes are handed over.
-      const wakes = output ? splitWakes(output, { settled: true }).wakes : []
-      for (const wake of wakes.join('') === output ? wakes : [output]) {
-        offset += Buffer.byteLength(wake)
-        handOver(wake, offset)
+      if (output) {
+        offset += Buffer.byteLength(output)
+        process.stdout.write(output)
       }
     } finally {
       fs.closeSync(fd)

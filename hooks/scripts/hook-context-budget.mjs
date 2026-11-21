@@ -48,8 +48,8 @@
  *   to its project until the pin is fixed); the repository-link nudge (the person
  *   must link the repository); and the check jobs and notices DevSpec sent while the
  *   agent was working (step-delivery.mjs keeps its own delivery record; between turns
- *   it offers what was not read through the idle wake, sized by `fitIntoWake`, and keeps
- *   it until it went whole in a wake or its note was read whole). Unread room messages are counted after every step until
+ *   the idle wake points at the same kind of note, and an item stays until its note
+ *   is read whole). Unread room messages are counted after every step until
  *   the reader's output has come back whole. A step whose notes Cursor dropped is
  *   followed by another that offers them again.
  * - Two hints are offered once: the note that a reference was added to a commit (the
