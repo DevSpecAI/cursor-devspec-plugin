@@ -42,18 +42,30 @@
  *    agent is seen reading the note whole (`readThrough`); Cursor gives no sign that
  *    hook context arrived, and drops it whole when all the hooks on a step together
  *    pass its ceiling, so a printed pointer is not a delivery.
- * 3. When Cursor is between turns again, the follow releases to the wake file whatever
- *    is still held and whatever was handed over but not read whole (`releaseAtIdle`),
- *    dropping settled check jobs the same way, and the pointer stops. A stretch with no
- *    tool calls (the agent only thinking or writing) therefore still ends in the idle
- *    wake, and an item the agent read at a step is never delivered again. Cursor does
- *    not run the plugin's `stop` hook for most people, so nothing here leans on it.
- *
+ * 3. When Cursor is between turns again, the follow offers through the wake file
+ *    whatever is still held and whatever was handed over but not read whole
+ *    (`releaseAtIdle`), dropping settled check jobs the same way, as the same kind of
+ *    note the steps hand over, in one `held_for_step` wake line. The wake is sized in the
+ *    one place that knows Cursor's limit on a background command's output
+ *    (hook-context-budget.mjs `fitIntoWake`): when the note fits the wake it goes in it
+ *    whole and is delivered; otherwise it is kept as a note file, and the wake points
+ *    at it. Such a note is delivered only once the agent is seen reading it whole: until
+ *    then its items stay here, every step points at it, and anything new that arrives
+ *    joins it in the next wake. A note the idle wake already pointed at, with nothing
+ *    new, is not woken for again, so an agent that does not read it is not woken in a
+ *    loop. A stretch with no tool calls (the agent only thinking or writing) therefore
+ *    still ends in the idle wake, and nothing the agent read is delivered again. Cursor
+ *    does not run the plugin's `stop` hook for most people, so nothing here leans on it.
  * 4. When the connection ends (stopped at the terminal, ended in DevSpec, signed out,
- *    its Cursor gone), its folder is removed (`retireSteps`) by whatever ended it, and
- *    any left behind is removed at the next poller start (`retireEndedSteps`), so no
- *    later tool call pays for starting the hook.
- *
+ *    its Cursor gone), nothing can hand its items over any more: the follow has stopped
+ *    and the hook serves only a live connection. So whatever ended it moves them out of
+ *    the folder the hook looks in (`parkSteps`), and the next poller start for the same
+ *    conversation takes them back as its own (`adoptParked`), to offer at its agent's
+ *    next step or idle wake; a check job DevSpec has handed on meanwhile is then dropped
+ *    as any settled one is. An end that could not do this itself (a process killed
+ *    outright) is caught at the next poller start (`parkEndedSteps`). Either way no
+ *    later tool call pays for starting the hook, and nothing is dropped unseen.
+
  * Each file (a held item, the handed-over record) is taken by renaming it to a name
  * only its taker knows, so the hook and the follow never both deliver one item; a
  * taker that died (a hook past Cursor's timeout) leaves its files to be put back
@@ -66,8 +78,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { appendWakeEvents, resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
+import { appendWakeEvents } from './devspec-wake-file.mjs'
 import {
+  fitIntoWake,
   noteCommand,
   pointToNote,
   POST_TOOL_CONTEXT_SHARE,
@@ -96,6 +109,8 @@ export const NOTICE_RULES =
 
 const RECORD_VERSION = 1
 const HANDED = 'handed.json'
+const MANIFEST = 'manifest.json'
+const CONNECTION_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(steps|parked)$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
 
@@ -121,6 +136,11 @@ export function connectionsDirFor(home = os.homedir(), env = process.env) {
 /** The folder holding what waits for one connection's next step. */
 export function stepsDir(connectionId, dir) {
   return path.join(dir, `${connectionId}.steps`)
+}
+
+/** Where an ended connection's items wait for the next connection of its conversation. */
+export function parkedDir(connectionId, dir) {
+  return path.join(dir, `${connectionId}.parked`)
 }
 
 const keyHash = (key) => createHash('sha256').update(String(key)).digest('hex').slice(0, 12)
@@ -243,10 +263,25 @@ function waitingFiles(steps) {
   return list(steps).filter((name) => WAITING.test(name)).sort().map((name) => path.join(steps, name))
 }
 
-/** Whether anything waits for this connection's next step: held, or handed over and not read. */
-export function stepsWaiting(connectionId, { dir }) {
-  const steps = stepsDir(connectionId, dir)
-  return list(steps).some((name) => WAITING.test(name) || name === HANDED || TAKEN.test(name))
+/** A waiting item's file name: when it was held, then its key, so names sort in arrival order. */
+function itemFileName(item) {
+  const at = Date.parse(item.held_at)
+  return `w-${String(Number.isFinite(at) ? at : 0).padStart(15, '0')}-${keyHash(item.key)}.json`
+}
+
+/** Whether `folder` already has `key`, waiting, being handed over, or in its handed-over note. */
+function holds(folder, key) {
+  const suffix = `-${keyHash(key)}.json`
+  const handed = readPrivateJson(path.join(folder, HANDED))
+  return list(folder).some((name) => name.startsWith('w-') && name.includes(suffix)) ||
+    (validRecord(handed) && handed.items.some((each) => each.key === key))
+}
+
+/** Keep `item` waiting in `folder`, once. A failed write throws. */
+function writeWaiting(folder, item) {
+  if (holds(folder, item.key)) return false
+  writePrivateJson(path.join(folder, itemFileName(item)), item)
+  return true
 }
 
 /**
@@ -256,15 +291,8 @@ export function stepsWaiting(connectionId, { dir }) {
  */
 export function holdForNextStep(connectionId, batch, events, { dir, now = Date.now() } = {}) {
   const item = stepItem(batch, events, { now })
-  const steps = stepsDir(connectionId, dir)
-  const suffix = `-${keyHash(item.key)}.json`
-  const handed = readPrivateJson(path.join(steps, HANDED))
-  if (list(steps).some((name) => name.startsWith('w-') && name.includes(suffix)) ||
-      (validRecord(handed) && handed.items.some((each) => each.key === item.key))) {
-    return { held: true, duplicate: true }
-  }
-  writePrivateJson(path.join(steps, `w-${String(now).padStart(15, '0')}${suffix}`), item)
-  return { held: true, duplicate: false }
+  const held = writeWaiting(stepsDir(connectionId, dir), item)
+  return { held: true, duplicate: !held }
 }
 
 /**
@@ -362,6 +390,42 @@ function stepWhat(items) {
 const STEP_ALSO = 'Deal with all of it in one pause, then carry on with your task. It comes back after each step until you have read it whole.'
 
 /**
+ * The idle wake's one line: everything held, as the note the steps hand over, carried
+ * whole (`content`) or pointed at (`read_with`) when that would not fit one wake.
+ * `holds` names the wake types inside, which are what the wake tail's notification
+ * watches for (devspec-wake-file.mjs `REMOTE_WAKE_NOTIFY_PATTERN`), so Cursor wakes the
+ * agent for it.
+ */
+function idleWakeEvent(items, connectionId, fields) {
+  return {
+    type: 'held_for_step',
+    holds: [...new Set(items.map((item) => (item.kind === 'check_job' ? 'check_job' : 'system_notice')))],
+    connection_id: connectionId,
+    ...fields,
+  }
+}
+
+function idleInline(items, connectionId) {
+  return (text) =>
+    idleWakeEvent(items, connectionId, {
+      instruction: `${stepWhat(items)} is in content below, whole. Deal with all of it as it says.`,
+      content: text,
+    })
+}
+
+function idlePointer(items, connectionId) {
+  return (note) =>
+    idleWakeEvent(items, connectionId, {
+      note: note.id,
+      read_with: note.command,
+      instruction:
+        `${stepWhat(items)} is waiting for you whole in a file, because all of it is longer than Cursor shows from one ` +
+        `background command. Read it now: \`${note.command}\`, and every further part it names, then deal with all of it ` +
+        'as it says. Until you have read it whole it comes back after each step.',
+    })
+}
+
+/**
  * The postToolUse hook: the pointer to everything DevSpec sent the agent while it was
  * working, or null when nothing waits. Only the conversation the connection was made in
  * gets it, never a helper agent's tool call. Returns the hook's stdout.
@@ -411,6 +475,20 @@ export async function stepDeliveryHook(
   )
   const adding = checked.filter((each) => each.open)
 
+  // The connection ended while this hook held its items: nothing it hands over now
+  // could be seen read. Everything goes back, read or settled excepted, and is parked
+  // for the conversation's next connection, as the end itself would have done.
+  if (readOwnConnectionState(firingConversation(input), { home })?.connection_id !== connectionId) {
+    for (const each of checked) {
+      if (each.open) giveBack(each.taken)
+      else drop(each.taken)
+    }
+    if (takenRecord && record) giveBack(takenRecord)
+    else if (takenRecord) drop(takenRecord)
+    parkSteps(connectionId, { dir: connDir, localId: state.local_id ?? null })
+    return null
+  }
+
   try {
     if (adding.length > 0) {
       const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
@@ -439,10 +517,14 @@ export async function stepDeliveryHook(
 }
 
 /**
- * Between turns, release to the wake file everything still held and everything handed
- * over but not read whole, so Cursor wakes the agent with it as before; a check job
- * DevSpec has settled is dropped. Does nothing while Cursor is in a turn. Returns what
- * it released and dropped, or null when there was nothing to do.
+ * Between turns, offer through the wake file everything still held and everything
+ * handed over but not read whole, so Cursor wakes the agent with it; a check job DevSpec
+ * has settled is dropped. It goes as the note the steps hand over, fitted to one
+ * background output (`fitIntoWake`): carried whole in the wake when it fits, and then
+ * delivered; otherwise kept as a note file the wake points at, and kept here as the
+ * handed-over record until the agent reads it whole. A note
+ * already woken for, with nothing new, waits for the agent's steps instead of waking it
+ * again. Does nothing while Cursor is in a turn. Returns what it did, or null.
  */
 export async function releaseAtIdle(
   connectionId,
@@ -451,113 +533,201 @@ export async function releaseAtIdle(
   const steps = stepsDir(connectionId, dir)
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
-  if (!stepsWaiting(connectionId, { dir })) return null
+  const handedPath = path.join(steps, HANDED)
+  if (waitingFiles(steps).length === 0) {
+    // Nothing new, and nothing handed over, or a note the idle wake already pointed at.
+    if (!fs.existsSync(handedPath) || readPrivateJson(handedPath)?.woken === true) return null
+  }
   const now = turnState ?? (await readTurnState(state?.local_id, { home }))
   if (now !== 'between') return null
 
-  const takenRecord = take(path.join(steps, HANDED))
-  const record = takenRecord ? readPrivateJson(takenRecord.file) : null
+  const takenRecord = take(handedPath)
+  const kept = takenRecord ? readPrivateJson(takenRecord.file) : null
+  const record = validRecord(kept) ? kept : null
+  if (takenRecord && !record) giveBack(takenRecord)
   const taken = waitingFiles(steps).map(take).filter(Boolean)
-  const items = []
-  if (validRecord(record)) items.push(...record.items)
+  const fresh = []
   for (const each of taken) {
     const item = readPrivateJson(each.file)
-    if (validItem(item)) items.push(item)
+    if (validItem(item)) fresh.push(item)
   }
-  const kept = []
+  if (record?.woken === true && fresh.length === 0) {
+    for (const each of taken) giveBack(each)
+    giveBack(takenRecord)
+    return null
+  }
+  const items = [...(record?.items ?? []), ...fresh]
+  const open = []
   const dropped = []
   for (const item of items) {
-    if (await isOpen(item, { connectionId, state })) kept.push(item)
+    if (await isOpen(item, { connectionId, state })) open.push(item)
     else dropped.push(item.key)
   }
-  const events = kept.flatMap((item) => item.events)
+  const finish = () => {
+    for (const each of taken) drop(each)
+    if (takenRecord && record) drop(takenRecord)
+  }
+  if (open.length === 0) {
+    finish()
+    return { released: [], pointed: [], dropped, note: null }
+  }
+  const events = open.flatMap((item) => item.events)
+  let wake = null
   try {
-    if (events.length > 0) append(wakeFile, events)
+    wake = fitIntoWake([], {
+      text: stepNoteText(open, { connectionId }),
+      inline: idleInline(open, connectionId),
+      pointer: idlePointer(open, connectionId),
+      home,
+    })
+    // Neither fitted, or the note could not be written: everything stays for the next try.
+    if (wake.route === 'none') throw new Error('the idle wake could not be fitted to one output')
+    if (wake.note) {
+      writePrivateJson(handedPath, {
+        version: RECORD_VERSION,
+        note: wake.note.id,
+        parts: record?.note === wake.note.id ? record.parts ?? [] : [],
+        items: open,
+        at: new Date().toISOString(),
+        woken: true,
+      })
+    }
+    append(wakeFile, wake.events)
   } catch (error) {
+    if (wake?.note) fs.rmSync(handedPath, { force: true })
     for (const each of taken) giveBack(each)
-    if (takenRecord) giveBack(takenRecord)
+    if (takenRecord && record) giveBack(takenRecord)
     throw error
   }
-  for (const each of taken) drop(each)
-  if (takenRecord) drop(takenRecord)
-  if (events.length > 0) recordTurnWake(connectionId, turnWakeFromEvents(events), { dir })
-  return { released: kept.map((item) => item.key), dropped }
+  finish()
+  recordTurnWake(connectionId, turnWakeFromEvents(events), { dir })
+  const keys = open.map((item) => item.key)
+  return { released: wake.note ? [] : keys, pointed: wake.note ? keys : [], dropped, note: wake.note?.id ?? null }
 }
 
-/** The wake file the host follow writes for a connection, or null for an id that cannot have one. */
-function wakeFileOf(connectionId) {
+function readStateOf(dir, connectionId) {
   try {
-    return resolveSpaceFreeWakeFile(connectionId)
-  } catch {
-    return null
+    return { state: JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8')), missing: false }
+  } catch (error) {
+    return { state: null, missing: error?.code === 'ENOENT' }
   }
 }
 
 /**
- * A connection has ended (stopped at the terminal, ended in DevSpec, signed out, its
- * Cursor gone): what it still held for a step goes where it can still matter, and its
- * folder is removed, so no later tool call on the machine pays for starting the hook.
- *
- * Nothing that matters is lost. A check job is DevSpec's to hand on once the connection
- * that was offered it ends (semantics.check_job.busy), so a held one is dropped. A
- * notice is kept on the record and in the project's Review either way; a held one,
- * read or not, goes to the connection's wake file, exactly where it went before
- * step delivery existed, so an agent whose wake tail is still listening hears it at
- * idle as it would have before. A wake file that is not there has no one listening
- * (the connection never had a follow, or its files were cleared), so none is made.
- *
- * Returns what it did, or null when there was no folder. When the wake file cannot be
- * written the folder stays, for the next poller start to try again (`retireEndedSteps`).
+ * The connection has ended (stopped at the terminal, ended in DevSpec, signed out, its
+ * Cursor gone), so nothing can hand its items over any more: the follow stops with it
+ * and the hook serves only a live connection. Its items, waiting or in a note not read
+ * whole, move to its parked folder, outside the folder the hook's guard looks in, where
+ * the next poller start for the same conversation (`localId`, else the state's) takes
+ * them back (`adoptParked`). An item a live hook has taken stays where it is, and so
+ * does the folder: that hook parks what it puts back when it finishes. Returns what it
+ * did, or null when there was no folder.
  */
-export function retireSteps(connectionId, { dir, wakeFile = wakeFileOf(connectionId), append = appendWakeEvents } = {}) {
+export function parkSteps(connectionId, { dir, localId = null } = {}) {
   const steps = stepsDir(connectionId, dir)
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
-  const items = []
-  const record = readPrivateJson(path.join(steps, HANDED))
-  if (validRecord(record)) items.push(...record.items)
-  for (const file of waitingFiles(steps)) {
-    const item = readPrivateJson(file)
-    if (validItem(item)) items.push(item)
+  const parked = parkedDir(connectionId, dir)
+  if (waitingFiles(steps).length > 0 || fs.existsSync(path.join(steps, HANDED))) {
+    // Whose they are goes first, so a poller starting meanwhile knows the conversation.
+    const manifestPath = path.join(parked, MANIFEST)
+    const conversation = localId ?? readPrivateJson(manifestPath)?.local_id ?? readStateOf(dir, connectionId).state?.local_id ?? null
+    writePrivateJson(manifestPath, {
+      version: RECORD_VERSION,
+      connection_id: connectionId,
+      local_id: typeof conversation === 'string' && conversation ? conversation : null,
+      parked_at: new Date().toISOString(),
+    })
   }
-  const notices = items.filter((item) => item.kind === 'notices')
-  const events = notices.flatMap((item) => item.events)
-  if (events.length > 0 && wakeFile && fs.existsSync(wakeFile)) {
+  const moved = []
+  const move = (taken, items) => {
     try {
-      append(wakeFile, events)
+      for (const item of items) writeWaiting(parked, item)
     } catch {
-      return { retired: false, notices: [], dropped: [] }
+      giveBack(taken)
+      return
     }
+    drop(taken)
+    moved.push(...items.map((item) => item.key))
   }
-  fs.rmSync(steps, { recursive: true, force: true })
-  return {
-    retired: true,
-    notices: notices.flatMap((item) => item.notice_ids ?? []),
-    dropped: items.filter((item) => item.kind === 'check_job').map((item) => item.key),
+  const takenRecord = take(path.join(steps, HANDED))
+  if (takenRecord) {
+    const record = readPrivateJson(takenRecord.file)
+    if (validRecord(record)) move(takenRecord, record.items)
+    else giveBack(takenRecord)
   }
+  for (const file of waitingFiles(steps)) {
+    const taken = take(file)
+    if (!taken) continue
+    const item = readPrivateJson(taken.file)
+    if (validItem(item)) move(taken, [item])
+    else giveBack(taken)
+  }
+  try {
+    fs.rmdirSync(steps)
+  } catch {
+    /* not empty: a live hook holds an item, and parks it when it finishes */
+  }
+  return { parked: moved, left: fs.existsSync(steps) }
 }
 
 /**
- * At a poller's start: retire the folder of every connection in `dir` that is no
- * longer live (its state disabled or gone), however it ended. Catches an end that
- * could not clean up after itself (a process killed outright, a write that failed).
+ * At a poller's start: park the items of every connection in `dir` that is no longer
+ * live (its state disabled or gone), however it ended. Catches an end that could not
+ * park them itself (a process killed outright, a write that failed).
  */
-export function retireEndedSteps({ dir } = {}) {
-  const retired = []
+export function parkEndedSteps({ dir } = {}) {
+  const parked = []
   for (const name of list(dir)) {
-    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i.exec(name)
-    if (!match) continue
-    let state = null
-    try {
-      state = JSON.parse(fs.readFileSync(path.join(dir, `${match[1]}.json`), 'utf8'))
-    } catch (error) {
-      // A state file being rewritten right now is not an ended connection.
-      if (error?.code !== 'ENOENT') continue
-    }
+    const match = CONNECTION_FOLDER.exec(name)
+    if (!match || match[2] !== 'steps') continue
+    const { state, missing } = readStateOf(dir, match[1])
+    // A state file being rewritten right now is not an ended connection.
+    if (!state && !missing) continue
     if (state?.enabled === true) continue
-    if (retireSteps(match[1], { dir })?.retired) retired.push(match[1])
+    if (parkSteps(match[1], { dir })) parked.push(match[1])
   }
-  return retired
+  return parked
+}
+
+/**
+ * At a poller's start: what earlier connections of the same conversation parked becomes
+ * this connection's, waiting for its agent's next step or idle wake. A check job among
+ * them that DevSpec has handed on is dropped when it is offered, as any settled one is.
+ * Returns the keys taken back.
+ */
+export function adoptParked(connectionId, { dir, localId } = {}) {
+  if (typeof localId !== 'string' || !localId) return []
+  const steps = stepsDir(connectionId, dir)
+  const adopted = []
+  for (const name of list(dir)) {
+    const match = CONNECTION_FOLDER.exec(name)
+    if (!match || match[2] !== 'parked') continue
+    const parked = path.join(dir, name)
+    if (readPrivateJson(path.join(parked, MANIFEST))?.local_id !== localId) continue
+    reclaimAbandoned(parked)
+    for (const file of waitingFiles(parked)) {
+      const taken = take(file)
+      if (!taken) continue
+      const item = readPrivateJson(taken.file)
+      try {
+        if (validItem(item) && writeWaiting(steps, item)) adopted.push(item.key)
+      } catch {
+        giveBack(taken)
+        continue
+      }
+      drop(taken)
+    }
+    if (waitingFiles(parked).length === 0) {
+      fs.rmSync(path.join(parked, MANIFEST), { force: true })
+      try {
+        fs.rmdirSync(parked)
+      } catch {
+        /* something else arrived meanwhile: a later start takes it */
+      }
+    }
+  }
+  return adopted
 }
 
 if (isDirectRun(import.meta.url)) {

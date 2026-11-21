@@ -98,7 +98,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
-import { retireSteps } from './step-delivery.mjs'
+import { parkSteps } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -1121,13 +1121,14 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const capability_cleared = clearConnectionCapability(connectionId)
-  // What the connection held for its agent's next step is handed on and its folder
-  // removed (step-delivery.mjs) while the wake tail still listens, before the stop.
+  // What the connection held for its agent's next step is parked for the
+  // conversation's next connection, out of the folder the hook looks in
+  // (step-delivery.mjs).
   let steps = null
   try {
-    steps = retireSteps(connectionId, { dir: CONNECTIONS_DIR })
+    steps = parkSteps(connectionId, { dir: CONNECTIONS_DIR, localId: prev.local_id ?? localId ?? null })
   } catch {
-    /* the next poller start clears it (retireEndedSteps) */
+    /* the next poller start parks it (parkEndedSteps) */
   }
   const killResult = stopPollerForConnection(connectionId)
   return {
@@ -1138,7 +1139,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     poller: killResult,
     bonds_stopped: bonds.length,
     capability_cleared,
-    steps_cleared: steps?.retired === true,
+    steps_parked: steps ? steps.parked.length : 0,
   }
 }
 

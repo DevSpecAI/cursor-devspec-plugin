@@ -59,6 +59,16 @@ export function ensureWakeFile(file) {
 }
 
 /**
+ * One wake's events as they are written, one JSON object per line: the bytes the
+ * wake file gains and the wait prints, so what Cursor shows the agent for that wake.
+ * @param {object[]} events
+ * @returns {string}
+ */
+export function wakeLines(events) {
+  return events.map((event) => JSON.stringify(event) + '\n').join('')
+}
+
+/**
  * Append one JSON object per line. Used by host follow so a surviving tail
  * can notify after Cursor `turn_ended`.
  * @param {string} file
@@ -67,6 +77,5 @@ export function ensureWakeFile(file) {
 export function appendWakeEvents(file, events) {
   if (!file || !Array.isArray(events) || events.length === 0) return
   const p = ensureWakeFile(file)
-  const chunk = events.map((event) => JSON.stringify(event) + '\n').join('')
-  fs.appendFileSync(p, chunk)
+  fs.appendFileSync(p, wakeLines(events))
 }

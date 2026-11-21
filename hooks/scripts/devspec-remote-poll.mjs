@@ -206,7 +206,7 @@ import {
 } from './transcript-turn-end.mjs'
 import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
 import { clearTurnWakes } from './notice-reply.mjs'
-import { retireEndedSteps, retireSteps } from './step-delivery.mjs'
+import { adoptParked, parkEndedSteps, parkSteps } from './step-delivery.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -572,18 +572,19 @@ function disableLocalState({ connectionId, reason, message = null }) {
   } catch (e) {
     process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
   }
-  retireConnectionSteps(connectionId)
+  parkConnectionSteps(connectionId)
 }
 
 /**
- * The connection has ended: what it held for the agent's next step is handed on and
- * its folder removed (step-delivery.mjs), so later tool calls stop starting the hook.
+ * The connection has ended: what it held for the agent's next step is parked for the
+ * conversation's next connection, out of the folder the hook looks in
+ * (step-delivery.mjs), so later tool calls stop starting the hook.
  */
-function retireConnectionSteps(connectionId) {
+function parkConnectionSteps(connectionId) {
   try {
-    retireSteps(connectionId, { dir: CONNECTIONS_DIR })
+    parkSteps(connectionId, { dir: CONNECTIONS_DIR })
   } catch (e) {
-    process.stderr.write(`devspec-remote-poll: could not clear what waited for a step: ${e.message}\n`)
+    process.stderr.write(`devspec-remote-poll: could not park what waited for a step: ${e.message}\n`)
   }
 }
 
@@ -1500,12 +1501,12 @@ async function main() {
   }
   state = readState(connectionId) || state
 
-  // Connections on this machine that ended without clearing what they held for a
-  // step (a process killed outright) are cleared now (step-delivery.mjs).
+  // Connections on this machine that ended without parking what they held for a step
+  // (a process killed outright) are parked now (step-delivery.mjs).
   try {
-    retireEndedSteps({ dir: CONNECTIONS_DIR })
+    parkEndedSteps({ dir: CONNECTIONS_DIR })
   } catch (e) {
-    process.stderr.write(`devspec-remote-poll: could not clear ended connections' steps: ${e.message}\n`)
+    process.stderr.write(`devspec-remote-poll: could not park ended connections' steps: ${e.message}\n`)
   }
 
   if (state && state.enabled === false) {
@@ -1526,6 +1527,14 @@ async function main() {
   }
   let token = firstCredential.token
   const mcpUrl = firstCredential.mcp_url
+  // What earlier connections of this conversation parked when they ended becomes this
+  // one's, offered at its agent's next step or idle wake (step-delivery.mjs).
+  try {
+    const adopted = adoptParked(connectionId, { dir: CONNECTIONS_DIR, localId: state?.local_id })
+    if (adopted.length > 0) process.stderr.write(`devspec-remote-poll: took back ${adopted.length} item(s) an earlier connection of this conversation held\n`)
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not take back parked items: ${e.message}\n`)
+  }
   const credentialSource = firstCredential.source
   const credentialPrincipal = firstCredential.principal
   let credentialRefusals = 0
@@ -2883,7 +2892,7 @@ async function main() {
 
     const liveState = readState(connectionId)
     if (liveState && liveState.enabled === false) {
-      retireConnectionSteps(connectionId)
+      parkConnectionSteps(connectionId)
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
     }

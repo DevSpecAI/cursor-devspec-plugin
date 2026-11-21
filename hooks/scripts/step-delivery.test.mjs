@@ -31,14 +31,17 @@ import { FIXTURE_ID, fixtureServerNotice, fixtureSystemNoticeEnvelope } from './
 import {
   CHECK_JOB_RULES,
   NOTICE_RULES,
+  adoptParked,
   holdForNextStep,
+  parkedDir,
+  parkSteps,
   reclaimAbandoned,
   releaseAtIdle,
-  retireEndedSteps,
-  retireSteps,
   stepDeliveryHook,
   stepsDir,
 } from './step-delivery.mjs'
+import { fitsShellOutput } from './hook-context-budget.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
 import { randomUUID } from 'node:crypto'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
@@ -343,10 +346,13 @@ describe('what the agent read at a step, and what it did not', () => {
       // Cursor may drop this step's context, or the turn may end before the agent reads it.
       assert.ok(runStepHook(world, toolCall()))
       world.endTurn()
-      assert.ok(await until(() => world.wakeText().includes('"type":"system_notice"')), follow.stderr())
+      assert.ok(await until(() => world.wakeText().includes('held_for_step')), follow.stderr())
       const lines = world.wakeText().trim().split('\n').map((line) => JSON.parse(line))
-      assert.deepEqual(lines.filter((line) => line.type === 'system_notice').map((line) => line.notice_id), [NOTICE_A, NOTICE_B])
-      assert.equal(lines.filter((line) => line.type === 'wake').length, 1)
+      assert.equal(lines.length, 1, 'one wake line')
+      assert.deepEqual(lines[0].holds, ['system_notice'])
+      assert.match(world.wakeText(), new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
+      // The same note the step handed over, whole in the wake: both notices, as they came.
+      for (const id of [NOTICE_A, NOTICE_B]) assert.match(lines[0].content, new RegExp(`## Notice ${id}`))
       // The next turn's steps no longer point at it.
       world.inTurn()
       assert.equal(runStepHook(world, toolCall()), null)
@@ -366,7 +372,8 @@ describe('what the agent read at a step, and what it did not', () => {
       await new Promise((resolve) => setTimeout(resolve, 200))
       assert.equal(world.wakeText(), '', 'still held while Cursor is in the turn')
       world.endTurn()
-      assert.ok(await until(() => world.wakeText().includes('"type":"check_job"')), follow.stderr())
+      assert.ok(await until(() => world.wakeText().includes('held_for_step')), follow.stderr())
+      assert.ok(JSON.parse(world.wakeText()).content.includes(`## Check job ${JOB_A}`))
       assert.deepEqual(world.held(), [])
     } finally {
       await follow.stop()
@@ -482,7 +489,7 @@ describe('a check job DevSpec has already settled', () => {
       wakeFile: world.wakeFile,
       home: world.home,
     })
-    assert.deepEqual(released, { released: [], dropped: [checkJobAcceptanceKey(checkJob())] })
+    assert.deepEqual(released, { released: [], pointed: [], dropped: [checkJobAcceptanceKey(checkJob())], note: null })
     assert.equal(world.wakeText(), '')
   })
 
@@ -554,10 +561,108 @@ describe('a hand-over that was cut short', () => {
   })
 })
 
+/** `count` notices of about `size` characters each, held for CONN, each ending in `END-<i>`. */
+function holdNotices(world, count, size, from = 0) {
+  for (let i = from; i < from + count; i += 1) {
+    const id = `${String(i).padStart(8, '0')}-0000-4000-8000-0000000000aa`
+    const batch = noticeBatch(
+      [[id, 'needs_person', `Notice ${i}`, `${'A finding about your change. '.repeat(Math.ceil(size / 29))}END-${i}`]],
+      `${String(i).padStart(8, '0')}-2222-4222-8222-2222222222cc`,
+    )
+    holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir, now: Date.parse('2026-11-20T03:00:00.000Z') + i })
+  }
+}
+
+const IDLE = (world, over = {}) => ({ dir: world.dir, state: { local_id: CONVERSATION }, wakeFile: world.wakeFile, home: world.home, ...over })
+
+describe('the idle wake is sized to what Cursor shows from one background command', () => {
+  it('a small backlog goes whole in the wake and is delivered', async () => {
+    const world = connectedHome()
+    holdNotices(world, 2, 300)
+    world.endTurn()
+    const released = await releaseAtIdle(CONN, IDLE(world))
+    assert.equal(released.released.length, 2)
+    assert.equal(released.note, null)
+    const wake = world.wakeText()
+    assert.ok(fitsShellOutput(wake))
+    assert.match(wake, new RegExp(REMOTE_WAKE_NOTIFY_PATTERN), 'Cursor wakes the agent for it')
+    const line = JSON.parse(wake)
+    assert.equal(line.type, 'held_for_step')
+    assert.equal(line.read_with, undefined, 'whole in the wake, no file to read')
+    for (const end of ['END-0', 'END-1']) assert.ok(line.content.includes(end), end)
+    assert.equal(fs.existsSync(path.join(stepsDir(CONN, world.dir), 'handed.json')), false, 'delivered, so nothing waits')
+    assert.deepEqual(world.held(), [])
+  })
+
+  it('a 44,000-character backlog: the wake fits, its note is complete, and nothing leaves the queue until the note is read', async () => {
+    const world = connectedHome()
+    holdNotices(world, 22, 2_000)
+    const raw = world.held().map((name) => JSON.parse(fs.readFileSync(path.join(stepsDir(CONN, world.dir), name), 'utf8')).events)
+      .flat().map((event) => JSON.stringify(event) + '\n').join('')
+    assert.ok(raw.length > 44_000, `${raw.length} characters held`)
+    world.endTurn()
+    const released = await releaseAtIdle(CONN, IDLE(world))
+    assert.equal(released.pointed.length, 22)
+    assert.deepEqual(released.released, [])
+    const wake = world.wakeText()
+    assert.ok(fitsShellOutput(wake), `${wake.length} characters`)
+    assert.match(wake, new RegExp(REMOTE_WAKE_NOTIFY_PATTERN), 'Cursor wakes the agent for it')
+    const pointer = JSON.parse(wake)
+    assert.equal(pointer.type, 'held_for_step')
+    assert.equal(pointer.note, released.note)
+    const note = readNoteText(released.note, { home: world.home })
+    for (let i = 0; i < 22; i += 1) assert.ok(note.includes(`END-${i}`), `notice ${i} whole`)
+    // Still queued: not delivered until read whole.
+    const record = JSON.parse(fs.readFileSync(path.join(stepsDir(CONN, world.dir), 'handed.json'), 'utf8'))
+    assert.equal(record.items.length, 22)
+    assert.equal(record.woken, true)
+    // No new wake for the same unread note: an agent that does not read it is not woken in a loop.
+    assert.equal(await releaseAtIdle(CONN, IDLE(world)), null)
+    assert.equal(world.wakeText(), wake)
+    // The turn the wake starts: every step points at it until it is read whole.
+    world.inTurn()
+    const context = runStepHook(world, toolCall())
+    assert.equal(noteIdIn(context), released.note)
+    assert.equal(readNote(world, context), null)
+    assert.equal(fs.existsSync(path.join(stepsDir(CONN, world.dir), 'handed.json')), false, 'read, so delivered')
+    world.endTurn()
+    assert.equal(await releaseAtIdle(CONN, IDLE(world)), null)
+    assert.equal(world.wakeText(), wake, 'never offered again')
+  })
+
+  it('what arrives after a note was woken for joins it, and the next idle wake offers everything', async () => {
+    const world = connectedHome()
+    holdNotices(world, 22, 2_000)
+    world.endTurn()
+    const first = await releaseAtIdle(CONN, IDLE(world))
+    holdNotices(world, 1, 100, 22)
+    const second = await releaseAtIdle(CONN, IDLE(world))
+    assert.equal(second.pointed.length, 23)
+    assert.notEqual(second.note, first.note)
+    assert.ok(readNoteText(second.note, { home: world.home }).includes('END-22'))
+    assert.equal(world.wakeText().trim().split('\n').length, 2)
+  })
+
+  it('the real follow sizes the idle wake the same way', async () => {
+    const world = connectedHome()
+    holdNotices(world, 22, 2_000)
+    const follow = startFollow(world)
+    try {
+      world.endTurn()
+      assert.ok(await until(() => world.wakeText().includes('held_for_step')), follow.stderr())
+      assert.ok(fitsShellOutput(world.wakeText()))
+      assert.ok(JSON.parse(world.wakeText()).read_with, 'a pointer to the note')
+      assert.ok(fs.existsSync(path.join(stepsDir(CONN, world.dir), 'handed.json')))
+    } finally {
+      await follow.stop()
+    }
+  })
+})
+
 describe('when the connection ends', () => {
   /**
-   * A held check job and two held notices, one of them handed over at a step and not
-   * read, for connection `id` in `world`.
+   * A notice handed over at a step and not read, then a check job and another notice
+   * held, for connection `id` in `world`.
    */
   function holdSome(world, id = CONN) {
     const notice = noticeBatch([[NOTICE_A, 'needs_person']])
@@ -569,55 +674,94 @@ describe('when the connection ends', () => {
     holdForNextStep(id, later, eventsOf(later), { dir: world.dir })
   }
 
-  it('removes its folder, so later tool calls never start the hook, and loses nothing that matters', () => {
+  const parkedKeys = (world, id) =>
+    fs.readdirSync(parkedDir(id, world.dir)).filter((name) => name.startsWith('w-'))
+      .map((name) => JSON.parse(fs.readFileSync(path.join(parkedDir(id, world.dir), name), 'utf8')).key).sort()
+
+  /** A second connection of the same conversation, live, as a reconnect writes it, `old` ended. */
+  function reconnect(world, over = {}, old = CONN) {
+    const id = randomUUID()
+    fs.writeFileSync(path.join(world.dir, `${old}.json`), JSON.stringify({ connection_id: old, enabled: false, end_reason: 'local_stop', agent_name: 'Cursor', local_id: CONVERSATION }))
+    fs.writeFileSync(path.join(world.dir, `${id}.json`), JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, session_id: ROOM, ...over }))
+    return id
+  }
+
+  it('parks everything out of the hook\'s way: no later tool call starts the hook, nothing is written anywhere unseen', () => {
     const world = connectedHome()
     holdSome(world)
-    fs.writeFileSync(world.wakeFile, '')
-    const retired = retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile })
+    const parked = parkSteps(CONN, { dir: world.dir })
+    assert.equal(parked.parked.length, 3)
     assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
-    // The notices, read or not, go where they went before step delivery: the wake file.
-    const lines = world.wakeText().trim().split('\n').map((line) => JSON.parse(line))
-    assert.deepEqual(lines.filter((line) => line.type === 'system_notice').map((line) => line.notice_id), [NOTICE_A, NOTICE_B])
-    // A check job is DevSpec's to hand on once the connection ends: dropped, not woken for.
-    assert.equal(lines.filter((line) => line.type === 'check_job').length, 0)
-    assert.deepEqual(retired, { retired: true, notices: [NOTICE_A, NOTICE_B], dropped: [checkJobAcceptanceKey(checkJob())] })
+    assert.deepEqual(parkedKeys(world, CONN), [
+      checkJobAcceptanceKey(checkJob()),
+      noticeBatch([[NOTICE_A, 'needs_person']]).acceptance_key,
+      noticeBatch([[NOTICE_B, 'needs_person']], '22222222-2222-4222-8222-2222222222b2').acceptance_key,
+    ].sort())
+    assert.equal(JSON.parse(fs.readFileSync(path.join(parkedDir(CONN, world.dir), 'manifest.json'), 'utf8')).local_id, CONVERSATION)
+    assert.equal(world.wakeText(), '', 'nothing written where no one may read it')
     // Pointed at a plugin folder that is not there, a started node would fail the hook.
     assert.equal(runStepHook(world, toolCall(), { CLAUDE_PLUGIN_ROOT: path.join(world.home, 'no-plugin-here') }), null)
   })
 
-  it('makes no wake file where none was listening, and keeps the folder when the wake file cannot be written', () => {
+  it('the next connection of the same conversation takes them back and delivers them once, the woken note too', async () => {
     const world = connectedHome()
+    holdNotices(world, 22, 2_000)
+    world.endTurn()
+    await releaseAtIdle(CONN, IDLE(world))
     holdSome(world)
-    assert.equal(retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile }).retired, true)
-    assert.equal(fs.existsSync(world.wakeFile), false)
-    holdSome(world)
-    fs.writeFileSync(world.wakeFile, '')
-    const failing = retireSteps(CONN, { dir: world.dir, wakeFile: world.wakeFile, append: () => { throw new Error('disk full') } })
-    assert.equal(failing.retired, false)
-    assert.ok(fs.existsSync(stepsDir(CONN, world.dir)), 'kept for the next poller start')
+    parkSteps(CONN, { dir: world.dir })
+    const next = reconnect(world)
+    assert.equal(adoptParked(next, { dir: world.dir, localId: 'another-conversation' }).length, 0, 'never another conversation\'s')
+    assert.equal(adoptParked(next, { dir: world.dir, localId: CONVERSATION }).length, 25)
+    assert.equal(fs.existsSync(parkedDir(CONN, world.dir)), false)
+    world.inTurn()
+    const context = runStepHook(world, toolCall())
+    const note = readNoteText(noteIdIn(context), { home: world.home })
+    for (const end of ['END-0', 'END-21', NOTICE_A, NOTICE_B, JOB_A]) assert.ok(note.includes(end), end)
+    assert.equal(readNote(world, context), null)
+    world.endTurn()
+    assert.equal(await releaseAtIdle(next, IDLE(world, { state: { local_id: CONVERSATION } })), null, 'nothing left to offer')
   })
 
-  it('a remote stop clears it', () => {
-    const world = connectedHome()
-    const id = randomUUID()
-    fs.writeFileSync(path.join(world.dir, `${id}.json`), JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION }))
-    holdSome(world, id)
-    const run = spawnSync(process.execPath, [STATE_SCRIPT, 'disable', '--connection-id', id, '--agent', 'Cursor', '--local-id', CONVERSATION], {
+  it('a remote stop parks them, and the next poller start of the conversation takes them back', async () => {
+    // A connection id of its own: a stop signals every process on the machine whose
+    // command line names the connection, and other tests' pollers use the fixture's.
+    const world = connectedHome({ state: { local_id: 'another-conversation' } })
+    const old = randomUUID()
+    fs.writeFileSync(path.join(world.dir, `${old}.json`), JSON.stringify({ connection_id: old, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION }))
+    holdSome(world, old)
+    const stop = spawnSync(process.execPath, [STATE_SCRIPT, 'disable', '--connection-id', old, '--agent', 'Cursor', '--local-id', CONVERSATION], {
       env: { PATH: process.env.PATH, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE },
       encoding: 'utf8',
       timeout: 60_000,
     })
-    assert.equal(run.status, 0, run.stderr)
-    assert.equal(JSON.parse(run.stdout).steps_cleared, true)
-    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+    assert.equal(stop.status, 0, stop.stderr)
+    assert.equal(JSON.parse(stop.stdout).steps_parked, 3)
+    assert.equal(fs.existsSync(stepsDir(old, world.dir)), false)
+    const next = reconnect(world, { token: 'dvs_test_token', mcp_url: UNROUTABLE }, old)
+    const env = { ...process.env, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE }
+    delete env.DEVSPEC_MCP_TOKEN
+    const poller = spawn(process.execPath, [POLL_SCRIPT, '--connection-id', next, '--owner-pid', String(process.pid)], { env })
+    let stderr = ''
+    poller.stdout.resume()
+    poller.stderr.on('data', (chunk) => { stderr += chunk })
+    const closed = new Promise((resolve) => poller.once('close', resolve))
+    try {
+      assert.ok(await until(() => list(stepsDir(next, world.dir)).filter((name) => name.startsWith('w-')).length === 3), stderr)
+      assert.match(stderr, /took back 3 item/)
+    } finally {
+      poller.kill('SIGTERM')
+      await closed
+    }
+    assert.equal(fs.existsSync(parkedDir(old, world.dir)), false)
   })
 
-  it('a poller that stands down (signed out) clears it', () => {
+  it('a poller that stands down (signed out) parks them', () => {
     const world = connectedHome()
     const id = randomUUID()
     fs.writeFileSync(
       path.join(world.dir, `${id}.json`),
-      JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, auth_source: 'login', principal: 'nobody', mcp_url: UNROUTABLE }),
+      JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: 'conversation-two', auth_source: 'login', principal: 'nobody', mcp_url: UNROUTABLE }),
     )
     holdSome(world, id)
     const run = spawnSync(process.execPath, [POLL_SCRIPT, '--connection-id', id], {
@@ -626,11 +770,12 @@ describe('when the connection ends', () => {
       timeout: 60_000,
     })
     assert.match(run.stderr, /signed out/)
-    assert.equal(JSON.parse(fs.readFileSync(path.join(world.dir, `${id}.json`), 'utf8')).enabled, false)
     assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+    assert.equal(parkedKeys(world, id).length, 3)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(parkedDir(id, world.dir), 'manifest.json'), 'utf8')).local_id, 'conversation-two')
   })
 
-  it("the next poller start clears every ended connection's folder and leaves a live one's", () => {
+  it("the next poller start parks every ended connection's items and leaves a live one's", () => {
     const world = connectedHome()
     const stopped = randomUUID()
     const gone = randomUUID()
@@ -643,10 +788,47 @@ describe('when the connection ends', () => {
       timeout: 60_000,
     })
     assert.match(run.stderr, /disabled in state file/)
-    assert.equal(fs.existsSync(stepsDir(stopped, world.dir)), false)
-    assert.equal(fs.existsSync(stepsDir(gone, world.dir)), false, 'no state at all: ended')
+    for (const id of [stopped, gone]) {
+      assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+      assert.equal(parkedKeys(world, id).length, 3)
+    }
     assert.ok(fs.existsSync(stepsDir(CONN, world.dir)), 'still live: kept')
     assert.ok(runStepHook(world, toolCall()), 'and still delivered')
-    assert.deepEqual(retireEndedSteps({ dir: world.dir }), [])
+  })
+
+  it('never takes an item a live hook holds: the hook finishes, puts it back, parks it, and it is delivered once', async () => {
+    const world = connectedHome()
+    const batch = noticeBatch([[NOTICE_A, 'needs_person']])
+    holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir })
+    let during = null
+    const output = await stepDeliveryHook(toolCall(), {
+      home: world.home,
+      // While the hook holds the item (checking it is still open), the connection ends.
+      isOpen: async () => {
+        fs.writeFileSync(path.join(world.dir, `${CONN}.json`), JSON.stringify({ connection_id: CONN, enabled: false, end_reason: 'local_stop', agent_name: 'Cursor', local_id: CONVERSATION }))
+        const parked = parkSteps(CONN, { dir: world.dir })
+        during = { parked: parked.parked.length, left: parked.left, taken: list(stepsDir(CONN, world.dir)).filter((name) => name.includes('.taken-')).length }
+        return true
+      },
+    })
+    assert.deepEqual(during, { parked: 0, left: true, taken: 1 }, 'the cleanup left the held item and its folder alone')
+    assert.equal(output, null, 'nothing handed over for a connection that has ended')
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false, 'the hook parked it as it finished')
+    assert.equal(parkedKeys(world, CONN).length, 1)
+    const next = reconnect(world)
+    adoptParked(next, { dir: world.dir, localId: CONVERSATION })
+    const context = runStepHook(world, toolCall())
+    assert.ok(readNoteText(noteIdIn(context), { home: world.home }).includes(NOTICE_A))
+    assert.equal(readNote(world, context), null)
+    assert.equal(runStepHook(world, toolCall({ tool_input: { command: 'ls' } })), null, 'delivered once')
+    assert.equal(world.wakeText(), '')
   })
 })
+
+function list(dir) {
+  try {
+    return fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+}
