@@ -27,6 +27,7 @@ import { leaveTellPersonNote } from './notice-reply.mjs'
 import { noteFiles, readCall } from '../../tests/helpers/note-reads.mjs'
 import { writePrivateJson, writePrivateText } from './private-state.mjs'
 import { contextFile, selectProjectContext } from './project-context.mjs'
+import { holdForNextStep } from './step-delivery.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const AFTER_TOOL = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks', 'hooks.json'), 'utf8')).hooks.postToolUse
@@ -91,6 +92,22 @@ function worstCaseHome() {
     state: 'final',
   }))
   writePrivateText(path.join(connections, `${CONN}.${SESSION}.transcript.jsonl`), lines.map((line) => JSON.stringify(line)).join('\n') + '\n')
+
+  // Check jobs and notices DevSpec sent while the agent was working, held for this step
+  // the way the host follow holds them (step-delivery.mjs).
+  for (let i = 0; i < 40; i += 1) {
+    const id = `${String(i).padStart(8, '0')}-9c9c-4c9c-8c9c-9c9c9c9c9c9c`
+    const job = { check_job_id: id, delivery_connection_id: CONN, record: { type: 'task', id, title: `Task ${i} ${'with a long title '.repeat(20)}` } }
+    holdForNextStep(CONN, { type: 'check_job_dispatches', acceptance_key: `check_job:${id}`, messages: [job] }, [
+      { type: 'check_job', check_job_id: id, check_job: job, instruction: `A check is waiting on "${job.record.title}".` },
+      { type: 'wake', reason: 'check_job', check_job_id: id },
+    ], { dir: connections, now: Date.parse('2026-11-20T13:00:00.000Z') + i })
+    const notice = `${String(i).padStart(8, '0')}-f7d6-4bcc-98ee-354e5f309a6b`
+    holdForNextStep(CONN, { type: 'canonical_system_notices', acceptance_key: `notices:${notice}` }, [
+      { type: 'system_notice', notice_id: notice, audience: 'needs_person', content: `${'A finding on your change. '.repeat(300)}${i === 39 ? 'STEP-END' : ''}` },
+      { type: 'wake', reason: 'exact_connection_system_notice', system_notice_ids: [notice] },
+    ], { dir: connections, now: Date.parse('2026-11-20T13:00:01.000Z') + i })
+  }
 
   // A commit note waiting for this tool call, where the commit hook keeps it.
   writePrivateJson(
@@ -186,15 +203,15 @@ describe('every after-tool hook, together, at its longest', () => {
     // Every seeded note was handed over, each whole in the note its pointer names.
     const notes = answers.map((answer) => pointedNote(home, answer.context)).filter(Boolean)
     const whole = notes.map((note) => readNoteText(note.id, { home }))
-    for (const end of ['RULES-END', 'TELL-END', 'NOTE-END', 'Teammate number 600', 'unexpected_key_1999']) {
+    for (const end of ['RULES-END', 'TELL-END', 'NOTE-END', 'Teammate number 600', 'unexpected_key_1999', 'STEP-END']) {
       assert.ok(whole.some((text) => text.includes(end)), `${end} handed over whole`)
     }
-    assert.equal(answers.length, 5, answers.map((answer) => answer.command).join('\n'))
+    assert.equal(answers.length, 6, answers.map((answer) => answer.command).join('\n'))
 
     // Cursor may have dropped all of it (another plugin's hook, or the person's own, can
     // push the step over the ceiling), and it leaves no record either way. So the next
     // step offers again what must reach the agent: the rules, the person's message, the
-    // unread room, the commit note and the pin problem.
+    // unread room, the commit note, the pin problem, and what DevSpec sent meanwhile.
     const again = runHooks(home, { ...input, tool_use_id: 'tool-use-after-tool-2', tool_input: { command: 'ls' } })
       .map(({ stdout }) => contextOf(stdout))
       .filter((context) => context !== null)
@@ -203,6 +220,7 @@ describe('every after-tool hook, together, at its longest', () => {
     assert.ok(again.some((context) => /^DevSpec room: 600 messages you have not read yet/.test(context)), 'the unread room, again')
     assert.ok(again.some((context) => /note about a commit you made/.test(context)), 'the commit note, again')
     assert.ok(again.some((context) => /pin you just wrote/.test(context)), 'the pin problem, again')
+    assert.ok(again.some((context) => /What DevSpec sent you while you were working \(40 check jobs and 40 notices\)/.test(context)), 'the checks and notices, again')
     assert.ok(again.join(CURSOR_HOOK_CONTEXT_SEPARATOR).length <= CURSOR_HOOK_CONTEXT_MAX_CHARS)
 
     // Once the agent has read every part of the rules note, that pointer stops; the

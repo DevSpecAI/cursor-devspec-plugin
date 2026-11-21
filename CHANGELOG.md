@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.29.0
+
+- **Your Cursor agent now hears about checks and problems with its own work while it is still working, not only once it has finished.** When DevSpec asks the agent to rule a check, or tells it something about its own work (a conflict with a decision, a held change, a failed check), the agent gets it after the step it is on finishes, never in the middle of one. Everything that arrived meanwhile comes together, so the agent deals with all of it in one pause and then carries on with what you asked. Until now it ran on to the end of its task first, however long that took.
+- **Nothing reaches the agent twice, and nothing is lost.** The agent reads what arrived from a short file the plugin points it to, and the plugin keeps pointing until the agent has read all of it. Anything it hasn't read by the time it stops, for example because it finished without another step, reaches it once it stops, as a short message pointing it to the same file, and keeps coming back until the agent has read it. A check that DevSpec has already settled in the meantime is dropped instead of being handed over.
+- **If remote control ends while something is still waiting**, the plugin lets its copy go. DevSpec keeps the check and the notice, and you still see them in the project's Review.
+- **Helper agents are left alone.** When your agent hands part of its work to a helper agent, the helper doesn't receive any of this; your agent gets it at its own next step.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.28.0
 
 - **The room stops showing your Cursor agent as Working once it has finished.** Cursor's command-line agent currently skips the plugin's end-of-turn step unless you have a Cursor hooks file of your own, which most people don't. Until now that left the room showing the agent as Working for up to an hour after it had answered. The plugin now notices the end of each turn in the conversation Cursor keeps on your machine, and tells DevSpec within a few seconds which of your messages the turn finished.

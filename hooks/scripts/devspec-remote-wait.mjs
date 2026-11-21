@@ -39,6 +39,9 @@
  *     Host-owned Connect follow (item 9d89a6d2): never exit 0 on a command; append
  *     each accepted batch to the wake file so a background tail can notify after
  *     Cursor turn_ended. Do not pass --after-reply on follow (would hide mid-turn work).
+ *     A check job or notice that arrives while Cursor is in a turn is held for the
+ *     agent's next step instead, and what did not reach it there goes to the wake file
+ *     once Cursor is between turns (step-delivery.mjs).
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
@@ -105,6 +108,7 @@ import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
+import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, releaseAtIdle } from './step-delivery.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1669,9 +1673,21 @@ async function main() {
       state.ended_from_ui !== true &&
       state.end_reason !== 'ui',
   )
+  // The connection has ended: its local copies of what it held for the agent's next
+  // step are discarded and named (step-delivery.mjs `discardSteps`). Whoever ended it
+  // did so already; this covers a batch this follow held as the end landed.
+  const discardOnEnd = () => {
+    if (!args.follow) return
+    try {
+      logDiscarded('devspec-remote-wait', connectionId, discardSteps(connectionId, { dir: CONNECTIONS_DIR }))
+    } catch (e) {
+      process.stderr.write(`devspec-remote-wait: could not discard what waited for a step: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
+  }
   while (args.follow || Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
+      discardOnEnd()
       closeCursorOnEnd({
         state: live,
         sawLive,
@@ -1684,11 +1700,13 @@ async function main() {
       process.exit(1)
     }
     if (live && live.enabled === false) {
+      discardOnEnd()
       if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
+      discardOnEnd()
       await emitEnded(
         { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
         args.wakeFile,
@@ -1697,6 +1715,23 @@ async function main() {
       process.exit(1)
     }
     if (live) sawLive = true
+
+    // Cursor is between turns: what waited for the agent's next step and did not reach
+    // it (held, or handed over and not read whole) goes to the wake file now, so Cursor
+    // wakes the agent with it as before (step-delivery.mjs).
+    if (args.follow && args.wakeFile) {
+      try {
+        const released = await releaseAtIdle(connectionId, { dir: CONNECTIONS_DIR, state: live, wakeFile: args.wakeFile })
+        if (released) {
+          process.stderr.write(
+            `devspec-remote-wait: at idle, ${released.pointed.length} held for a step in a note the wake points at, ` +
+              `${released.dropped.length} settled dropped — follow\n`,
+          )
+        }
+      } catch (e) {
+        process.stderr.write(`devspec-remote-wait: release at idle failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
 
     // Rotation or truncate/regrow may happen while this one-shot wait is armed.
     // Rebind before reading so a stale byte count never starts inside a new record.
@@ -1760,6 +1795,25 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
+        // A check job or notice that arrives while Cursor is in a turn waits for the
+        // agent's next step instead (step-delivery.mjs): Cursor would hold the wake
+        // file until the turn ended. Held before the offset moves, so nothing is lost;
+        // if it cannot be held, it goes to the wake file as before.
+        if (args.follow && args.wakeFile && isStepBatch(batch) && (await readTurnState(live?.local_id)) === 'in_turn') {
+          let held = false
+          try {
+            held = holdForNextStep(connectionId, batch, events, { dir: CONNECTIONS_DIR }).held
+          } catch (e) {
+            process.stderr.write(`devspec-remote-wait: hold for the next step failed: ${e instanceof Error ? e.message : String(e)}\n`)
+          }
+          if (held) {
+            for (const event of events) await emitStdoutEvent(event)
+            offset = newOffset
+            offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            process.stderr.write(`devspec-remote-wait: held (${wakeCount} msg) for the agent's next step — follow\n`)
+            continue
+          }
+        }
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {

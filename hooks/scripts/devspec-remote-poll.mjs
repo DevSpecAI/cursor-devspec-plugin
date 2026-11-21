@@ -206,6 +206,7 @@ import {
 } from './transcript-turn-end.mjs'
 import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
 import { clearTurnWakes } from './notice-reply.mjs'
+import { discardEndedSteps, discardSteps, endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
@@ -553,23 +554,52 @@ function standDownSignedOut(connectionId, message) {
   process.exit(1)
 }
 
-/** Disable THIS connection only — never other remotes on the machine. */
+/**
+ * Disable THIS connection only — never other remotes on the machine. The disabling write
+ * and the discard of its local copies of what it held for the agent's next step happen
+ * under the connection's steps lock (step-delivery.mjs `endConnectionSteps`, which says
+ * why the discard loses nothing), so nothing is handed to the agent after the end.
+ */
 function disableLocalState({ connectionId, reason, message = null }) {
   clearConnectionCapability(connectionId)
+  let marked = false
+  const markEnded = () => {
+    marked = true
+    try {
+      const prev = readState(connectionId) || {}
+      writeState(
+        {
+          ...prev,
+          ...disabledStatePatch(reason),
+          ...(message ? { end_message: message } : {}),
+          connection_id: connectionId || prev.connection_id,
+          updated_at: new Date().toISOString(),
+        },
+        connectionId,
+      )
+    } catch (e) {
+      process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+    }
+  }
   try {
-    const prev = readState(connectionId) || {}
-    writeState(
-      {
-        ...prev,
-        ...disabledStatePatch(reason),
-        ...(message ? { end_message: message } : {}),
-        connection_id: connectionId || prev.connection_id,
-        updated_at: new Date().toISOString(),
-      },
-      connectionId,
-    )
+    logDiscarded('devspec-remote-poll', connectionId, endConnectionSteps(connectionId, { dir: CONNECTIONS_DIR, markEnded }))
   } catch (e) {
-    process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+    process.stderr.write(`devspec-remote-poll: could not discard what waited for a step: ${e.message}\n`)
+    // The end stands even when the lock could not be taken; the next poller start
+    // discards what was held (discardEndedSteps).
+    if (!marked) markEnded()
+  }
+}
+
+/**
+ * The connection was found ended by someone else's write: its local copies of what it
+ * held for the agent's next step are discarded and named, if that write left any.
+ */
+function discardConnectionSteps(connectionId) {
+  try {
+    logDiscarded('devspec-remote-poll', connectionId, discardSteps(connectionId, { dir: CONNECTIONS_DIR }))
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not discard what waited for a step: ${e.message}\n`)
   }
 }
 
@@ -1486,6 +1516,14 @@ async function main() {
   }
   state = readState(connectionId) || state
 
+  // Connections on this machine that ended without discarding what they held for a
+  // step (a process killed outright) have it discarded now (step-delivery.mjs).
+  try {
+    for (const ended of discardEndedSteps({ dir: CONNECTIONS_DIR })) logDiscarded('devspec-remote-poll', ended.connection_id, ended)
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not discard ended connections' steps: ${e.message}\n`)
+  }
+
   if (state && state.enabled === false) {
     process.stderr.write('devspec-remote-poll: remote control disabled in state file\n')
     process.exit(1)
@@ -1504,6 +1542,7 @@ async function main() {
   }
   let token = firstCredential.token
   const mcpUrl = firstCredential.mcp_url
+
   const credentialSource = firstCredential.source
   const credentialPrincipal = firstCredential.principal
   let credentialRefusals = 0
@@ -2861,6 +2900,7 @@ async function main() {
 
     const liveState = readState(connectionId)
     if (liveState && liveState.enabled === false) {
+      discardConnectionSteps(connectionId)
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
     }

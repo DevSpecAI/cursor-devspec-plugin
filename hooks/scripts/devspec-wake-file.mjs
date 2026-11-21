@@ -59,6 +59,50 @@ export function ensureWakeFile(file) {
 }
 
 /**
+ * One wake's events as they are written to the wake file: one JSON object per line,
+ * then an empty line that closes the wake. JSON never holds a raw line break, so an
+ * empty line can only be that boundary, and the reader (devspec-wake-tail.mjs) can
+ * hand Cursor whole wakes, never part of one (`splitWakes`). These are the bytes the
+ * wake file gains for the wake, so what Cursor shows the agent for it.
+ * @param {object[]} events
+ * @returns {string}
+ */
+export function wakeLines(events) {
+  return events.map((event) => JSON.stringify(event) + '\n').join('') + '\n'
+}
+
+/**
+ * The whole wakes at the start of `text` (wake-file text not yet printed), each as
+ * written, and the text after them, which is a wake still being written. A wake ends at
+ * the empty line `wakeLines` closes it with. Lines with no closing empty line, from a
+ * wait older than that boundary, count as one whole wake once the file has stopped
+ * growing (`settled`), so they are printed together as they always were.
+ * @param {string} text
+ * @param {{ settled?: boolean }} [opts]
+ * @returns {{ wakes: string[], rest: string }}
+ */
+export function splitWakes(text, { settled = false } = {}) {
+  const wakes = []
+  let at = 0
+  for (let end = text.indexOf('\n\n', at); end >= 0; end = text.indexOf('\n\n', at)) {
+    wakes.push(text.slice(at, end + 2))
+    at = end + 2
+  }
+  let rest = text.slice(at)
+  // Stray empty lines between wakes are boundaries too, not wakes of their own.
+  while (rest.startsWith('\n')) {
+    if (wakes.length > 0) wakes[wakes.length - 1] += '\n'
+    else wakes.push('\n')
+    rest = rest.slice(1)
+  }
+  if (settled && rest.endsWith('\n')) {
+    wakes.push(rest)
+    rest = ''
+  }
+  return { wakes, rest }
+}
+
+/**
  * Append one JSON object per line. Used by host follow so a surviving tail
  * can notify after Cursor `turn_ended`.
  * @param {string} file
@@ -67,6 +111,5 @@ export function ensureWakeFile(file) {
 export function appendWakeEvents(file, events) {
   if (!file || !Array.isArray(events) || events.length === 0) return
   const p = ensureWakeFile(file)
-  const chunk = events.map((event) => JSON.stringify(event) + '\n').join('')
-  fs.appendFileSync(p, chunk)
+  fs.appendFileSync(p, wakeLines(events))
 }

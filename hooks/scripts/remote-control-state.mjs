@@ -98,6 +98,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
+import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -1100,11 +1101,26 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     end_reason: prev.end_reason || 'local_stop',
     updated_at: new Date().toISOString(),
   }
-  writeJson(perPath, next)
-  // Update legacy only if it currently points at this connection (or is empty).
-  const legacy = readJson(LEGACY_PATH)
-  if (!legacy || !legacy.connection_id || legacy.connection_id === connectionId) {
-    writeJson(LEGACY_PATH, next)
+  // The disabling write and the discard of the connection's local copies of what it held
+  // for its agent's next step happen under its steps lock (step-delivery.mjs
+  // `endConnectionSteps`, which says why the discard loses nothing), so nothing is
+  // handed to the agent after the stop.
+  let steps = null
+  const markEnded = () => {
+    writeJson(perPath, next)
+    // Update legacy only if it currently points at this connection (or is empty).
+    const legacy = readJson(LEGACY_PATH)
+    if (!legacy || !legacy.connection_id || legacy.connection_id === connectionId) {
+      writeJson(LEGACY_PATH, next)
+    }
+  }
+  try {
+    steps = endConnectionSteps(connectionId, { dir: CONNECTIONS_DIR, markEnded })
+    logDiscarded('remote-control-state', connectionId, steps)
+  } catch {
+    // The lock could not be taken (its folder cannot be written): the stop still stands,
+    // and the next poller start discards what was held (discardEndedSteps).
+    if (readJson(perPath)?.enabled !== false) markEnded()
   }
   // Mark the exact conversation bond stopped (so soft-reconnect can find it).
   if (localId && agent) {
@@ -1129,6 +1145,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     poller: killResult,
     bonds_stopped: bonds.length,
     capability_cleared,
+    steps_discarded: steps ? { notices: steps.notices, check_jobs: steps.check_jobs } : null,
   }
 }
 
