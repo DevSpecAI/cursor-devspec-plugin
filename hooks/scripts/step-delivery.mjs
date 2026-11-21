@@ -479,6 +479,12 @@ export async function stepDeliveryHook(
     if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
     else drop(takenRecord)
   }
+  // An end that landed between the check above and the write found these items held
+  // and left them: discard them now, as it would have, and hand nothing over.
+  if (readOwnConnectionState(firingConversation(input), { home })?.connection_id !== connectionId) {
+    logDiscarded('stepDeliveryHook', connectionId, discardSteps(connectionId, { dir: connDir }))
+    return null
+  }
   if (adding.length > 0) {
     recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
   }
@@ -536,6 +542,13 @@ export async function releaseAtIdle(
     for (const each of taken) drop(each)
     if (takenRecord && record) drop(takenRecord)
   }
+  // Decided again under this hold, after the lookups and just before anything is
+  // written: an end that landed meanwhile left these items to it, so they are discarded
+  // and named as the end would have, and no record or wake is written.
+  if (connectionEnded(dir, connectionId)) {
+    discardHeld('releaseAtIdle', connectionId, dir, taken, record ? takenRecord : null)
+    return { pointed: [], dropped, note: null, discarded: true }
+  }
   if (open.length === 0) {
     finish()
     return { pointed: [], dropped, note: null }
@@ -563,8 +576,34 @@ export async function releaseAtIdle(
     throw error
   }
   finish()
+  // An end that landed between that check and the write found these items held and
+  // left them: discard the record now, as it would have.
+  if (connectionEnded(dir, connectionId)) {
+    logDiscarded('releaseAtIdle', connectionId, discardSteps(connectionId, { dir }))
+    return { pointed: [], dropped, note: null, discarded: true }
+  }
   recordTurnWake(connectionId, turnWakeFromEvents(open.flatMap((item) => item.events)), { dir })
   return { pointed: open.map((item) => item.key), dropped, note: note.id }
+}
+
+/**
+ * Whether the connection has ended, read afresh from its state file: disabled, or the
+ * file gone. A file that cannot be read just now (being rewritten) is not an end.
+ */
+function connectionEnded(dir, connectionId) {
+  const { state, missing } = readStateOf(dir, connectionId)
+  return missing || state?.enabled === false
+}
+
+/**
+ * The connection ended while this process held its items, so the end left them to it
+ * (`discardSteps` never takes a held file). Put them all back and discard them as the
+ * end would have, naming them once.
+ */
+function discardHeld(who, connectionId, dir, taken, takenRecord) {
+  for (const each of taken) giveBack(each)
+  if (takenRecord) giveBack(takenRecord)
+  logDiscarded(who, connectionId, discardSteps(connectionId, { dir }))
 }
 
 function readStateOf(dir, connectionId) {

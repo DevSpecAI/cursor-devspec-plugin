@@ -814,6 +814,39 @@ describe('when the connection ends', () => {
     assert.equal(world.wakeText(), '')
   })
 
+  it('an end during the idle lookup: no wake appended, no record written again, the items discarded and named once', async () => {
+    const world = connectedHome()
+    holdSome(world)
+    world.endTurn()
+    const stderr = []
+    const write = process.stderr.write
+    process.stderr.write = (line) => { stderr.push(String(line)); return true }
+    let during = null
+    let released
+    try {
+      released = await releaseAtIdle(CONN, IDLE(world, {
+        // While the idle path holds the items (asking DevSpec about the check job), the
+        // connection is disabled and its cleanup runs, as DevSpec's own check did.
+        isOpen: async () => {
+          if (!during) {
+            fs.writeFileSync(path.join(world.dir, `${CONN}.json`), JSON.stringify({ connection_id: CONN, enabled: false, end_reason: 'local_stop', agent_name: 'Cursor', local_id: CONVERSATION }))
+            during = discardSteps(CONN, { dir: world.dir })
+          }
+          return true
+        },
+      }))
+    } finally {
+      process.stderr.write = write
+    }
+    assert.deepEqual(during, { notices: [], check_jobs: [], left: true }, 'the cleanup left the held items to the idle path')
+    assert.equal(released.discarded, true)
+    assert.equal(world.wakeText(), '', 'no wake appended')
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false, 'no record written again')
+    const lines = stderr.join('').split('\n').filter((line) => line.includes('discarded its local copies'))
+    assert.equal(lines.length, 1, 'named once')
+    assert.match(lines[0], discardedLine(CONN))
+  })
+
   it('a hook that finishes before the end lands delivers once; the end then discards only what is left', async () => {
     const world = connectedHome()
     const batch = noticeBatch([[NOTICE_A, 'needs_person']])
