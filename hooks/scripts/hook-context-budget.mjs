@@ -798,8 +798,9 @@ export function postToolUseOutput(context, extra = {}) {
 
 /**
  * The one way anything that prints wakes for Cursor sizes what it prints as one output:
- * the reader of the wake file (devspec-wake-tail.mjs) and the one-shot wait, whose
- * output is one Shell result (devspec-remote-wait.mjs). Of `wakes` (whole wakes
+ * the wake file's reader (devspec-wake-tail.mjs `read`, which puts its header line
+ * first) and the one-shot wait, each of whose output is one Shell result
+ * (devspec-remote-wait.mjs). Of `wakes` (whole wakes
  * waiting, oldest first, each as `wakeLines` wrote it), as many as fit Cursor's rules
  * on one output together (`fitsShellOutput`), never part of one. When some are left and
  * `waiting(left)` is given, the line it returns goes after them, and room is kept for

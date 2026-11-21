@@ -46,6 +46,17 @@ export function resolveSpaceFreeWakeFile(connectionId, opts = {}) {
 }
 
 /**
+ * The connection a wake file belongs to, from its own name (`<connection-id>.jsonl`,
+ * as `resolveSpaceFreeWakeFile` names it), or null for a file named otherwise.
+ * @param {string} file
+ * @returns {string | null}
+ */
+export function wakeFileConnectionId(file) {
+  const id = path.basename(String(file ?? ''), '.jsonl')
+  return CONNECTION_ID_RE.test(id) ? id : null
+}
+
+/**
  * Create an empty wake file so the model tail can open it before the first line.
  * @param {string} file
  * @returns {string}
@@ -61,9 +72,9 @@ export function ensureWakeFile(file) {
 /**
  * One wake's events as they are written to the wake file: one JSON object per line,
  * then an empty line that closes the wake. JSON never holds a raw line break, so an
- * empty line can only be that boundary, and the reader (devspec-wake-tail.mjs) can
- * hand Cursor whole wakes, never part of one (`splitWakes`). These are the bytes the
- * wake file gains for the wake, so what Cursor shows the agent for it.
+ * empty line can only be that boundary, and the reader (devspec-wake-tail.mjs `read`)
+ * can hand the agent whole wakes, never part of one (`splitWakes`). These are the bytes
+ * the wake file gains for the wake, so what the reader prints for it when it fits.
  * @param {object[]} events
  * @returns {string}
  */

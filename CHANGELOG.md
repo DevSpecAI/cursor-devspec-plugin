@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.31.0
+
+- **A long message you send your Cursor agent from a DevSpec room is no longer cut when it arrives alongside another.** When the agent was told something had arrived from DevSpec, it read everything the plugin had received since it connected from one file. Each delivery fitted what Cursor shows the agent from one command, but two of them together, such as a long message and the line pointing to its project records, could add up to more than that, and Cursor then left out the middle, which could be the middle of your message. It could also hand the agent again messages it had already acted on.
+- **The agent now gets what arrived through one plugin command, and never reads that file itself.** When Cursor lets the agent know something has arrived, what it passes on names the command to run. That command shows exactly what the agent hasn't seen yet, oldest first, each whole, and never more than Cursor shows from one command. If more is waiting, it says how many, and the agent runs it again before acting. Anything too long to show whole is saved complete to a file the agent is pointed to, so nothing is cut. Something counts as seen only once the command has shown it: if showing it fails, it is shown again next time.
+- The background command that listens for DevSpec now only announces that something has arrived; it no longer copies what arrived into its own output.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.30.0
 
 - **Messages you send your Cursor agent from a DevSpec room now arrive with what your project has already decided.** For each message you send from a room, and each automation run, DevSpec looks up the project's records that bear on it (requirements, decisions, conventions, documents, plans and past work) and the agent receives them together with your message, before it starts. It is the same recall the other DevSpec agents get. A record the agent has already been shown in the conversation is not repeated until someone changes it, and after Cursor compacts the conversation it can be shown again.

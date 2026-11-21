@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
-import { nextOutput } from './devspec-wake-tail.mjs'
+import { readerHeader, readerPage } from './devspec-wake-tail.mjs'
 import { wakeLines } from './devspec-wake-file.mjs'
 import {
   deliverableRecall,
@@ -342,10 +342,13 @@ describe('the three routes, by the size of the command', () => {
         assert.equal(out.recallWake[0].for, 'm1', 'naming the command it belongs to')
         assert.equal(noteOf(out.recallWake[0].read, home), each.formatted_block)
         for (const wake of out.wakes) assert.ok(fitsShellOutput(wakeLines(wake)))
-        const file = out.wakes.map(wakeLines).join('')
-        const first = nextOutput(file)
-        assert.equal(first, wakeLines(out.events))
-        assert.equal(nextOutput(file.slice(first.length)), wakeLines(out.recallWake))
+        // The wake reader hands them over in order, each whole, one output each.
+        const wakes = out.wakes.map(wakeLines)
+        const first = readerPage(wakes, { home })
+        assert.equal(first.text, readerHeader(1, 1) + wakeLines(out.events))
+        const second = readerPage(wakes.slice(first.through), { home })
+        assert.equal(second.text, readerHeader(1, 0) + wakeLines(out.recallWake))
+        for (const page of [first, second]) assert.ok(fitsShellOutput(page.text))
       }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })

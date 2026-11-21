@@ -42,6 +42,7 @@ import {
 } from './step-delivery.mjs'
 import { fitsShellOutput } from './hook-context-budget.mjs'
 import { REMOTE_WAKE_NOTIFY_PATTERN, appendWakeEvents } from './devspec-wake-file.mjs'
+import { NOTHING_UNREAD, readerHeader } from './devspec-wake-tail.mjs'
 import { randomUUID } from 'node:crypto'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
@@ -863,7 +864,7 @@ describe('when the connection ends', () => {
     return done
   }
 
-  /** What the real wake reader prints of the wake file, and what it says on stderr. */
+  /** What the real background tail prints for the wake file (its notification lines), and what it says on stderr. */
   async function readerPrints(world, until_) {
     const tail = spawn(process.execPath, [TAIL_SCRIPT, '--file', world.wakeFile], { env: { PATH: process.env.PATH, HOME: world.home } })
     let stdout = ''
@@ -904,8 +905,12 @@ describe('when the connection ends', () => {
     assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false, 'the record the writer wrote is discarded')
     assert.match(world.wakeText(), /held_for_step/, 'appended just before the end')
     const reader = await readerPrints(world, ({ stderr }) => /skipped a held_for_step wake/.test(stderr))
-    assert.equal(reader.stdout, '', 'never printed')
+    assert.equal(reader.stdout, '', 'no notification for it')
     assert.match(reader.stderr, new RegExp(`connection ${CONN}, which has ended`))
+    // And the agent's reader never prints it.
+    const read = spawnSync(process.execPath, [TAIL_SCRIPT, 'read', '--file', world.wakeFile, '--connection-id', CONN], { env: { PATH: process.env.PATH, HOME: world.home }, encoding: 'utf8' })
+    assert.equal(read.status, 0, read.stderr)
+    assert.equal(read.stdout, readerHeader(0, 0, NOTHING_UNREAD), 'never printed')
   })
 
   it('the cleanup first: the idle writer sees the end under the lock, writes nothing, and nothing is printed', async () => {
@@ -1073,14 +1078,17 @@ describe('when the connection ends', () => {
     assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
   })
 
-  it('a live connection is unaffected: its held_for_step wake is printed', async () => {
+  it('a live connection is unaffected: its held_for_step wake raises a notification, and the reader prints it', async () => {
     const world = connectedHome()
     holdNotices(world, 1, 300)
     world.endTurn()
     await releaseAtIdle(CONN, IDLE(world))
-    const reader = await readerPrints(world, ({ stdout }) => stdout.includes('held_for_step'))
-    assert.equal(reader.stdout, world.wakeText())
-    assert.doesNotMatch(reader.stderr, /skipped/)
+    const tail = await readerPrints(world, ({ stdout }) => stdout.includes('unread_wake'))
+    assert.deepEqual(JSON.parse(tail.stdout).carries, ['system_notice'])
+    assert.doesNotMatch(tail.stderr, /skipped/)
+    const read = spawnSync(process.execPath, [TAIL_SCRIPT, 'read', '--file', world.wakeFile, '--connection-id', CONN], { env: { PATH: process.env.PATH, HOME: world.home }, encoding: 'utf8' })
+    assert.equal(read.status, 0, read.stderr)
+    assert.equal(read.stdout, readerHeader(1, 0) + world.wakeText())
     assert.equal(withoutEndedConnectionWakes(world.wakeText(), { dir: world.dir, write: () => assert.fail('nothing skipped') }), world.wakeText())
   })
 

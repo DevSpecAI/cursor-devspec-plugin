@@ -38,8 +38,8 @@ import {
   fixtureOrder,
   fixtureUuid,
 } from './remote-ingress-test-fixtures.mjs'
-import { resolveSpaceFreeWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
-import { nextOutput } from './devspec-wake-tail.mjs'
+import { resolveSpaceFreeWakeFile, splitWakes, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
+import { NOTHING_UNREAD, readerHeader } from './devspec-wake-tail.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { RECALL_IN_NEXT_WAKE, RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
 import { withoutEndedConnectionWakes } from './step-delivery.mjs'
@@ -48,6 +48,7 @@ import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const POLL_SCRIPT = path.join(HERE, 'devspec-remote-poll.mjs')
 const WAIT_SCRIPT = path.join(HERE, 'devspec-remote-wait.mjs')
+const TAIL_SCRIPT = path.join(HERE, 'devspec-wake-tail.mjs')
 const CONNECTION = FIXTURE_ID.connection
 const CHAT = 'cursor-chat-recall-test'
 
@@ -58,6 +59,15 @@ const CHAT = 'cursor-chat-recall-test'
 const SHARED_RECALL_BUDGET_MS = 4_800
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** What the agent runs when a wake's notification arrives: the wake reader, once; its whole output. */
+function readWakesAsTheAgentDoes(home, wakeFile) {
+  const run = spawnSync(process.execPath, [TAIL_SCRIPT, 'read', '--file', wakeFile], { env: { PATH: process.env.PATH, HOME: home }, encoding: 'utf8', timeout: 30_000 })
+  assert.equal(run.status, 0, run.stderr)
+  assert.equal(run.stderr, '', 'nothing beside the wakes in the output')
+  return run.stdout
+}
+
 const until = async (condition, ms = 10_000) => {
   const deadline = Date.now() + ms
   while (!condition() && Date.now() < deadline) await sleep(25)
@@ -395,18 +405,26 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       const follow = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--follow', '--wake-file', wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'], {
         env: { ...process.env, HOME: run.home },
       })
+      let followLog = ''
+      follow.stderr.on('data', (chunk) => { followLog += chunk })
       try {
         assert.ok(await until(() => fs.existsSync(wakeFile) && fs.readFileSync(wakeFile, 'utf8').includes('turn_recall')), 'no wake written')
+        // Stopped only once it has finished the delivery (its recall waits to be read), not
+        // between writing the wake and recording the recall.
+        assert.ok(await until(() => /wake \(1 msg\) — follow/.test(followLog)), `the follow did not finish the delivery:\n${followLog}`)
       } finally {
         follow.kill('SIGKILL')
       }
       const file = fs.readFileSync(wakeFile, 'utf8')
-      const first = nextOutput(file)
-      const second = nextOutput(file.slice(first.length))
-      assert.equal(first + second, file, 'two whole wakes, nothing else')
+      // The reader, run as its header says: the command's wake, then its recall's.
+      const first = readWakesAsTheAgentDoes(run.home, wakeFile)
+      const second = readWakesAsTheAgentDoes(run.home, wakeFile)
       assert.ok(fitsShellOutput(first) && fitsShellOutput(second))
-      const commandWake = first.split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      const recallWake = second.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.ok(first.startsWith(readerHeader(1, 1)), first.slice(0, 120))
+      assert.ok(second.startsWith(readerHeader(1, 0)), second.slice(0, 120))
+      assert.equal(first.slice(readerHeader(1, 1).length) + second.slice(readerHeader(1, 0).length), file, 'two whole wakes, nothing else')
+      const commandWake = first.slice(readerHeader(1, 1).length).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const recallWake = second.slice(readerHeader(1, 0).length).split('\n').filter(Boolean).map((line) => JSON.parse(line))
       assert.deepEqual(commandWake.map((e) => e.type), ['owner_message', 'wake', 'recall_in_next_wake'], 'the command\'s own print says its recall is next')
       assert.equal(commandWake[0].body, tight, 'the command inline, byte for byte')
       assert.deepEqual(recallWake.map((e) => e.type), ['turn_recall'])
@@ -580,8 +598,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
       const wakeFile = path.join(run.home, 'wake.jsonl')
       const file = await followOnce(run, wakeFile, (text) => text.includes('"for"'))
-      const first = nextOutput(file)
-      const second = nextOutput(file.slice(first.length))
+      const [first, second] = splitWakes(file).wakes
       const own = JSON.parse(second.split('\n')[0])
       assert.equal(own.type, 'turn_recall')
       assert.equal(own.connection_id, CONNECTION, 'the recall\'s own wake names its connection')
@@ -592,6 +609,9 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.equal(withoutEndedConnectionWakes(file, { dir, write: (line) => skipped.push(line) }), first)
       assert.equal(skipped.length, 1)
       assert.match(skipped[0], new RegExp(`skipped a turn_recall wake for connection ${CONNECTION}, which has ended \\(recall for ${own.for}\\); never printed`))
+      // The agent's reader: the command's wake, never the ended connection's recall wake, and then nothing.
+      assert.equal(readWakesAsTheAgentDoes(run.home, wakeFile), readerHeader(1, 0) + first)
+      assert.equal(readWakesAsTheAgentDoes(run.home, wakeFile), readerHeader(0, 0, NOTHING_UNREAD))
     } finally {
       await run.cleanup()
     }

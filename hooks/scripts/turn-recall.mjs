@@ -12,9 +12,10 @@
  *
  * How a room command gets its recall
  * ----------------------------------
- * A room command reaches Cursor as a background command's output (the host wake
- * follow writes it, devspec-wake-tail.mjs prints it), never as a prompt, so no prompt
- * hook runs for it. So the poller asks `poll_connection` to attach the turn's recall
+ * A room command reaches Cursor through the wake file (the host wake follow writes it;
+ * the background tail's line notifies the agent, and the wake reader,
+ * devspec-wake-tail.mjs `read`, prints it), never as a prompt, so no prompt hook runs
+ * for it. So the poller asks `poll_connection` to attach the turn's recall
  * to a response that delivers a command or an automation run (`turn_recall_version`),
  * and sends the record versions this conversation has already been shown
  * (`seen_recall_versions`): a record shown once is not shown again in the same

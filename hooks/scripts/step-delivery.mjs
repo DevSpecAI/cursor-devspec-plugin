@@ -15,8 +15,9 @@
  *   and in the terminal, with `--plugin-dir` and as an installed local plugin. The
  *   plugin's own postToolUse runs for a person with no hooks file of their own on CLI
  *   2026.10.22, 2026.11.05 and 2026.11.19 (task 659a015f), unlike its `stop` hook.
- * - Cursor holds a background command's output (the wake tail, devspec-wake-tail.mjs)
- *   until the agent is idle, so the wake file cannot reach a working agent.
+ * - Cursor holds a background command's output (the wake tail, devspec-wake-tail.mjs,
+ *   whose lines notify the agent of new wakes) until the agent is idle, so the wake
+ *   file cannot reach a working agent.
  * - A helper agent's (subagent's) tool calls run the plugin's postToolUse too, and the
  *   helper receives what it adds. The call carries the helper's own `conversation_id`,
  *   with no parent id and no subagent flag (CLI 2026.11.05). Cursor's IDE release notes
@@ -727,9 +728,10 @@ const namesConnection = (event) =>
   (event.type === 'held_for_step' || (event.type === 'turn_recall' && typeof event.for === 'string'))
 
 /**
- * The last line of defence, at print time (devspec-wake-tail.mjs): `output`, whole wakes
- * the reader is about to print, without any wake for a connection that has ended (a
- * `held_for_step` line, or a recall's own wake: `namesConnection`). A writer holding the
+ * The last line of defence, at print time (devspec-wake-tail.mjs: the reader, and the
+ * tail's notifications): `output`, whole wakes about to be printed or notified, without
+ * any wake for a connection that has ended (a `held_for_step` line, or a recall's own
+ * wake: `namesConnection`). A writer holding the
  * steps lock never appends one after the end, but one appended just before it may not
  * have been printed yet; it is skipped and named on stderr, never printed. Other wakes,
  * and output that is not whole wakes as the wake writer wrote them, are printed as they
