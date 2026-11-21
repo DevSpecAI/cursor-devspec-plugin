@@ -20,6 +20,7 @@ import {
   parseReapPlan,
   processIdentity,
   processTable,
+  PS_LOOKUP_TIMEOUT_MS,
   reapCommands,
 } from './close-on-end.mjs'
 import { disabledStatePatch } from './devspec-remote-poll.mjs'
@@ -219,14 +220,68 @@ describe('stopping the commands the closed Cursor started', () => {
     assert.equal(slept, 0)
   })
 
-  it('the reaper accepts only a well-formed plan', () => {
+  it('the reaper accepts only a well-formed plan, with no arbitrary upper ceiling on graceMs', () => {
     assert.equal(parseReapPlan('not json'), null)
     assert.equal(parseReapPlan(JSON.stringify({ graceMs: -1, targets: [] })), null)
-    assert.equal(parseReapPlan(JSON.stringify({ graceMs: 1e9, targets: [] })), null)
+    assert.equal(parseReapPlan(JSON.stringify({ graceMs: null, targets: [] })), null)
+    assert.equal(parseReapPlan(JSON.stringify({ graceMs: '5000', targets: [] })), null)
     assert.deepEqual(
-      parseReapPlan(JSON.stringify({ graceMs: 10, targets: [{ pid: 1, identity: 'init' }, { pid: 42, identity: '' }, { pid: 43, identity: 'ok', extra: 1 }, { pid: '44', identity: 'x' }] })),
-      { graceMs: 10, targets: [{ pid: 43, identity: 'ok' }] },
+      parseReapPlan(JSON.stringify({ graceMs: 120_000, targets: [{ pid: 1, identity: 'init' }, { pid: 42, identity: '' }, { pid: 43, identity: 'ok', extra: 1 }, { pid: '44', identity: 'x' }] })),
+      { graceMs: 120_000, targets: [{ pid: 43, identity: 'ok' }] },
     )
+  })
+
+  it('spares the closing process and every ancestor up to Cursor across deep process trees (>64 hops)', () => {
+    const table = new Map()
+    let prev = CURSOR
+    for (let i = 1; i <= 80; i++) {
+      const pid = 10_000 + i
+      table.set(pid, prev)
+      prev = pid
+    }
+    const selfPid = prev
+    const siblingCommand = 20_001
+    table.set(siblingCommand, CURSOR)
+    const listed = commandsStartedBy(CURSOR, { selfPid, table, identityOf: (pid) => `id-${pid}` })
+    assert.deepEqual(listed, [{ pid: siblingCommand, identity: `id-${siblingCommand}` }])
+  })
+
+  it('identifies a ps lookup timeout instead of treating it as no processes running', () => {
+    assert.equal(PS_LOOKUP_TIMEOUT_MS, 2_000)
+    const timedOutPs = () => {
+      throw Object.assign(new Error('spawnSync ps ETIMEDOUT'), { code: 'ETIMEDOUT' })
+    }
+    assert.throws(
+      () => processTable({ platform: 'darwin', execPs: timedOutPs }),
+      (err) => err.code === 'ETIMEDOUT' && err.timedOut === true && err.timeoutMs === PS_LOOKUP_TIMEOUT_MS && err.lookup === 'process_table',
+    )
+    assert.throws(
+      () => processIdentity(5001, { platform: 'darwin', execPs: timedOutPs }),
+      (err) => err.code === 'ETIMEDOUT' && err.timedOut === true && err.timeoutMs === PS_LOOKUP_TIMEOUT_MS && err.lookup === 'process_identity' && err.pid === 5001,
+    )
+    const { outcome: tableTimedOut, kills: tableKills } = run(ended, {
+      listCommands: () => processTable({ platform: 'darwin', execPs: timedOutPs }),
+    })
+    assert.equal(tableTimedOut.closed, true)
+    assert.deepEqual(tableKills, [[CURSOR, 'SIGTERM']])
+    assert.equal(tableTimedOut.commands.lookupTimedOut, true)
+    assert.equal(tableTimedOut.commands.lookupTimeoutMs, PS_LOOKUP_TIMEOUT_MS)
+    assert.match(tableTimedOut.commands.lookupError, /timed out/)
+
+    const table = new Map([[5001, CURSOR]])
+    const { outcome: identityTimedOut, kills: idKills } = run(ended, {
+      listCommands: (cursorPid) =>
+        commandsStartedBy(cursorPid, {
+          selfPid: 9999,
+          table,
+          identityOf: (pid) => processIdentity(pid, { platform: 'darwin', execPs: timedOutPs }),
+        }),
+    })
+    assert.equal(identityTimedOut.closed, true)
+    assert.deepEqual(idKills, [[CURSOR, 'SIGTERM'], [5001, 'SIGTERM']])
+    assert.equal(identityTimedOut.commands.lookupTimedOut, true)
+    assert.equal(identityTimedOut.commands.lookupTimeoutMs, PS_LOOKUP_TIMEOUT_MS)
+    assert.match(identityTimedOut.commands.lookupError, /timed out/)
   })
 
   it('the grace period is a few seconds, stated once', () => {
