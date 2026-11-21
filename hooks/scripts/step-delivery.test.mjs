@@ -1,0 +1,550 @@
+#!/usr/bin/env node
+/**
+ * Check jobs and notices reach a working Cursor agent at its next step (DevSpec task
+ * 8f940862, step-delivery.mjs).
+ *
+ * What could break: an item that arrives mid-turn could still wait for the turn's end,
+ * or go to the wake file as well and be delivered twice; items waiting together could
+ * be handed over one per step; an item the agent read at a step could come back in the
+ * idle wake; one it never read (Cursor dropped the step's context, or the turn ended
+ * first) could be lost; a check job DevSpec already settled could still be handed
+ * over; a helper agent's tool calls could receive the parent's items; the hook's
+ * context could pass its share of Cursor's ceiling and take every other hook's context
+ * down with it; and a hook killed mid-hand-over could leave its items stranded.
+ * Run: node --test hooks/scripts/step-delivery.test.mjs
+ */
+import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import { after, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
+
+import { buildOwnerMessageEvents } from './devspec-remote-wait.mjs'
+import { POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
+import { readTurnWakes } from './notice-reply.mjs'
+import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
+import { checkJobAcceptanceKey } from './remote-poll-acceptance.mjs'
+import { FIXTURE_ID, fixtureServerNotice, fixtureSystemNoticeEnvelope } from './remote-ingress-test-fixtures.mjs'
+import {
+  CHECK_JOB_RULES,
+  NOTICE_RULES,
+  holdForNextStep,
+  reclaimAbandoned,
+  releaseAtIdle,
+  stepDeliveryHook,
+  stepsDir,
+} from './step-delivery.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const AFTER_TOOL = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks', 'hooks.json'), 'utf8')).hooks.postToolUse
+const STEP_HOOK = AFTER_TOOL.find((entry) => entry.command.includes('step-delivery.mjs'))
+const WAIT_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-wait.mjs')
+
+const CONN = FIXTURE_ID.connection
+const ROOM = '44444444-4444-4444-8444-444444444444'
+const CONVERSATION = 'c5ad9955-d354-4a1e-9b1f-0d3c2a1b0e9f'
+const HELPER = 'a69bf1a0-77cc-4d2e-8f3a-6b5c4d3e2f10'
+const JOB_A = '9c9c9c9c-9c9c-4c9c-8c9c-9c9c9c9c9c9c'
+const JOB_B = '9d9d9d9d-9d9d-4d9d-8d9d-9d9d9d9d9d9d'
+const RECORD = '9e9e9e9e-9e9e-4e9e-8e9e-9e9e9e9e9e9e'
+const NOTICE_A = 'f7d6a637-bb5a-4bcc-98ee-354e5f309a6b'
+const NOTICE_B = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+const UNROUTABLE = 'http://127.0.0.1:9/api/mcp'
+
+const roots = []
+after(() => {
+  for (const root of roots) fs.rmSync(root, { recursive: true, force: true })
+})
+
+function checkJob(id = JOB_A, title = 'Fix the login redirect') {
+  return {
+    id,
+    kind: 'check_job',
+    check_job_id: id,
+    check_kind: 'conflict',
+    record: { type: 'task', id: RECORD, title },
+    entries: 3,
+    yours: true,
+    offered_at: '2026-11-20T03:00:00.000Z',
+    delivery_connection_id: CONN,
+  }
+}
+
+/** A check job as the poller keeps it in the inbox. */
+function checkJobBatch(job = checkJob()) {
+  return {
+    type: 'check_job_dispatches',
+    connection_id: CONN,
+    session_id: ROOM,
+    received_at: '2026-11-20T03:00:01.000Z',
+    count: 1,
+    next_after_message_id: null,
+    messages: [job],
+    acceptance_key: checkJobAcceptanceKey(job),
+  }
+}
+
+/** Notices as the poller keeps them in the inbox: `[id, audience, summary, prompt]`. */
+function noticeBatch(notices, envelopeId = '22222222-2222-4222-8222-2222222222a1') {
+  const envelope = fixtureSystemNoticeEnvelope({
+    envelopeId,
+    wakeKind: 'system_notice',
+    commands: [],
+    systemNotices: notices.map(([id, audience, summary, prompt]) =>
+      fixtureServerNotice({
+        notice_id: id,
+        summary: summary ?? `Notice ${id.slice(0, 4)}`,
+        ...(prompt ? { prompt } : {}),
+        ...(audience ? { audience } : {}),
+      })),
+  })
+  return {
+    type: 'canonical_system_notices',
+    connection_id: CONN,
+    session_id: ROOM,
+    received_at: '2026-11-20T03:00:02.000Z',
+    count: notices.length,
+    next_after_message_id: null,
+    execute_notice_ids: notices.map(([id]) => id),
+    acceptance_key: canonicalAcceptanceKey(envelope),
+    ingress: { canonical: true, envelope },
+    messages: envelope.system_notices,
+  }
+}
+
+const eventsOf = (batch) => buildOwnerMessageEvents(batch, { inboxFile: '/inbox.jsonl' })
+
+/** A home with this conversation connected to DevSpec, Cursor in a turn of it. */
+function connectedHome({ state = {} } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-step-delivery-'))
+  roots.push(home)
+  const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(
+    path.join(dir, `${CONN}.json`),
+    JSON.stringify({ connection_id: CONN, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, session_id: ROOM, inbox_byte_offset: 0, ...state }),
+    { mode: 0o600 },
+  )
+  const transcript = path.join(home, '.cursor', 'projects', 'work', 'agent-transcripts', CONVERSATION, `${CONVERSATION}.jsonl`)
+  fs.mkdirSync(path.dirname(transcript), { recursive: true })
+  const world = {
+    home,
+    dir,
+    transcript,
+    wakeFile: path.join(home, 'wake.jsonl'),
+    /** Cursor starts a turn: the transcript ends in the turn's rows. */
+    inTurn() {
+      fs.writeFileSync(
+        transcript,
+        [
+          { role: 'user', message: { content: [{ type: 'text', text: '<user_query>\nFix the flaky test\n</user_query>' }] } },
+          { role: 'assistant', message: { content: [{ type: 'text', text: 'Looking at the test now.' }] } },
+        ].map((row) => JSON.stringify(row)).join('\n') + '\n',
+      )
+    },
+    /** Cursor ends the turn: its final line is the turn end. */
+    endTurn() {
+      fs.appendFileSync(transcript, JSON.stringify({ type: 'turn_ended', status: 'success' }) + '\n')
+    },
+    wakeText() {
+      return fs.existsSync(world.wakeFile) ? fs.readFileSync(world.wakeFile, 'utf8') : ''
+    },
+    held() {
+      try {
+        return fs.readdirSync(stepsDir(CONN, dir)).filter((name) => /^w-.*\.json$/.test(name))
+      } catch {
+        return []
+      }
+    },
+  }
+  world.inTurn()
+  return world
+}
+
+/** A tool call of the conversation, as Cursor hands it to postToolUse. */
+function toolCall(over = {}) {
+  return {
+    conversation_id: CONVERSATION,
+    generation_id: 'g-1',
+    tool_name: 'Shell',
+    tool_input: { command: 'npm test' },
+    tool_output: JSON.stringify({ output: 'ok', exitCode: 0 }),
+    ...over,
+  }
+}
+
+/** The step-delivery hook from hooks.json, run as Cursor runs it; its context, or null. */
+function runStepHook(world, input, env = {}) {
+  const run = spawnSync('sh', ['-c', STEP_HOOK.command], {
+    input: JSON.stringify(input),
+    env: { PATH: process.env.PATH, HOME: world.home, CLAUDE_PLUGIN_ROOT: ROOT, DEVSPEC_MCP_URL: UNROUTABLE, ...env },
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  if (run.error && run.error.code !== 'EPIPE') throw run.error
+  assert.equal(run.status, 0, run.stderr)
+  const out = run.stdout.trim()
+  if (!out) return null
+  const parsed = JSON.parse(out)
+  assert.equal(parsed.additional_context, parsed.hookSpecificOutput?.additionalContext)
+  return parsed.additional_context
+}
+
+/** `runStepHook` without blocking this process, for a DevSpec stand-in served from it. */
+async function runStepHookAsync(world, input, env = {}) {
+  const child = spawn('sh', ['-c', STEP_HOOK.command], {
+    env: { PATH: process.env.PATH, HOME: world.home, CLAUDE_PLUGIN_ROOT: ROOT, DEVSPEC_MCP_URL: UNROUTABLE, ...env },
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  child.stdin.on('error', () => {})
+  child.stdin.end(JSON.stringify(input))
+  const status = await new Promise((resolve) => child.once('close', resolve))
+  assert.equal(status, 0, stderr)
+  const out = stdout.trim()
+  return out ? JSON.parse(out).additional_context : null
+}
+
+/** Read every part of the note a pointer names, as the agent would, one tool call each. */
+function readNote(world, context, run = (input) => runStepHook(world, input)) {
+  const id = noteIdIn(context)
+  assert.ok(id, `a pointer to a note: ${context}`)
+  let last
+  for (const file of noteFiles(world.home, id)) last = run(catCall(world.home, file, { conversation: CONVERSATION }))
+  return last
+}
+
+async function until(predicate, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return predicate()
+}
+
+/** The host follow for this connection, as the plugin starts it. */
+function startFollow(world) {
+  const inbox = path.join(world.dir, `${CONN}.inbox.jsonl`)
+  fs.writeFileSync(inbox, '', { mode: 0o600 })
+  const env = { ...process.env, HOME: world.home, DEVSPEC_REMOTE_CONNECTIONS_DIR: world.dir, DEVSPEC_MCP_URL: UNROUTABLE }
+  delete env.DEVSPEC_MCP_TOKEN
+  const child = spawn(
+    process.execPath,
+    [WAIT_SCRIPT, '--connection-id', CONN, '--pending', '--follow', '--wake-file', world.wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'],
+    { env, cwd: world.home, windowsHide: true },
+  )
+  let stderr = ''
+  child.stdout.resume()
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const closed = new Promise((resolve) => child.once('close', resolve))
+  return {
+    /** The poller keeps a batch in the inbox. */
+    deliver(batch) {
+      fs.appendFileSync(inbox, JSON.stringify(batch) + '\n')
+    },
+    consumed() {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(world.dir, `${CONN}.json`), 'utf8')).inbox_byte_offset === fs.statSync(inbox).size
+      } catch {
+        return false
+      }
+    },
+    stderr: () => stderr,
+    async stop() {
+      child.kill('SIGTERM')
+      await closed
+    },
+  }
+}
+
+describe('a check job and a notice that arrive while the agent works', () => {
+  it('are held by the follow, never written to the wake file, and handed over together after the next tool call', async () => {
+    const world = connectedHome()
+    const follow = startFollow(world)
+    try {
+      follow.deliver(checkJobBatch())
+      follow.deliver(noticeBatch([[NOTICE_A, 'needs_person', 'Your change clashes with the release decision']]))
+      assert.ok(await until(() => world.held().length === 2 && follow.consumed()), follow.stderr())
+      assert.equal(world.wakeText(), '', 'nothing for Cursor to hold until the turn ends')
+
+      const context = runStepHook(world, toolCall())
+      assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE, `${context.length} characters`)
+      assert.match(context, /1 check job and 1 notice/)
+      assert.match(context, /one pause, then carry on with your task/)
+      const note = readNoteText(noteIdIn(context), { home: world.home })
+      // Both, in one note, as the idle wake would have carried them.
+      assert.match(note, new RegExp(`## Check job ${JOB_A}`))
+      assert.match(note, /A check is waiting on "Fix the login redirect": before you take it, read semantics\.check_job\.helpers/)
+      assert.match(note, new RegExp(`Your connection id \\(its delivery_connection_id\\): ${CONN}`))
+      assert.match(note, new RegExp(`## Notice ${NOTICE_A}`))
+      assert.match(note, /Your change clashes with the release decision/)
+      assert.match(note, new RegExp(`system_notice_ids: \\["${NOTICE_A}"\\]`))
+      // DevSpec's rules, by id.
+      assert.ok(note.includes(CHECK_JOB_RULES))
+      assert.ok(note.includes(NOTICE_RULES))
+      assert.deepEqual(world.held(), [], 'taken from the queue')
+      // The turn now holds what was delivered into it (notice-reply.mjs).
+      const wakes = readTurnWakes(CONN, { dir: world.dir })
+      assert.deepEqual(wakes.noticeIds, [NOTICE_A])
+      assert.deepEqual(wakes.checkJobIds, [JOB_A])
+    } finally {
+      await follow.stop()
+    }
+  })
+
+  it('wakes an idle agent through the wake file as before', async () => {
+    const world = connectedHome()
+    world.endTurn()
+    const follow = startFollow(world)
+    try {
+      follow.deliver(checkJobBatch())
+      assert.ok(await until(() => world.wakeText().includes('"type":"check_job"') && follow.consumed()), follow.stderr())
+      assert.deepEqual(world.held(), [])
+      assert.equal(runStepHook(world, toolCall()), null)
+    } finally {
+      await follow.stop()
+    }
+  })
+})
+
+describe('what the agent read at a step, and what it did not', () => {
+  it('an item read at a step is not delivered again when the agent next goes idle', async () => {
+    const world = connectedHome()
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    const context = runStepHook(world, toolCall())
+    assert.ok(context)
+    // The pointer comes back after every step until the note is read whole.
+    assert.equal(runStepHook(world, toolCall({ tool_input: { command: 'ls' } })), context)
+    assert.equal(readNote(world, context), null, 'read whole, so no longer offered')
+    world.endTurn()
+    const released = await releaseAtIdle(CONN, { dir: world.dir, state: { local_id: CONVERSATION }, wakeFile: world.wakeFile, home: world.home })
+    assert.equal(released, null)
+    assert.equal(world.wakeText(), '')
+  })
+
+  it('an item handed over but not read whole goes to the idle wake, once, and the pointer stops', async () => {
+    const world = connectedHome()
+    const follow = startFollow(world)
+    try {
+      follow.deliver(noticeBatch([[NOTICE_A, 'needs_person'], [NOTICE_B, 'for_the_record']]))
+      assert.ok(await until(() => world.held().length === 1 && follow.consumed()), follow.stderr())
+      // Cursor may drop this step's context, or the turn may end before the agent reads it.
+      assert.ok(runStepHook(world, toolCall()))
+      world.endTurn()
+      assert.ok(await until(() => world.wakeText().includes('"type":"system_notice"')), follow.stderr())
+      const lines = world.wakeText().trim().split('\n').map((line) => JSON.parse(line))
+      assert.deepEqual(lines.filter((line) => line.type === 'system_notice').map((line) => line.notice_id), [NOTICE_A, NOTICE_B])
+      assert.equal(lines.filter((line) => line.type === 'wake').length, 1)
+      // The next turn's steps no longer point at it.
+      world.inTurn()
+      assert.equal(runStepHook(world, toolCall()), null)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(world.wakeText().trim().split('\n').length, lines.length, 'released once')
+    } finally {
+      await follow.stop()
+    }
+  })
+
+  it('a stretch with no tool calls ends in the idle wake: what is still held goes to the wake file when the turn ends', async () => {
+    const world = connectedHome()
+    const follow = startFollow(world)
+    try {
+      follow.deliver(checkJobBatch())
+      assert.ok(await until(() => world.held().length === 1 && follow.consumed()), follow.stderr())
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(world.wakeText(), '', 'still held while Cursor is in the turn')
+      world.endTurn()
+      assert.ok(await until(() => world.wakeText().includes('"type":"check_job"')), follow.stderr())
+      assert.deepEqual(world.held(), [])
+    } finally {
+      await follow.stop()
+    }
+  })
+
+  it('what arrives while an earlier note is unread joins it: one pointer, one note with everything', () => {
+    const world = connectedHome()
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    const first = runStepHook(world, toolCall())
+    const second = checkJobBatch(checkJob(JOB_B, 'Retire the old importer'))
+    holdForNextStep(CONN, second, eventsOf(second), { dir: world.dir })
+    const joined = runStepHook(world, toolCall({ tool_input: { command: 'ls' } }))
+    assert.notEqual(noteIdIn(joined), noteIdIn(first))
+    assert.match(joined, /2 check jobs/)
+    const note = readNoteText(noteIdIn(joined), { home: world.home })
+    assert.ok(note.includes(JOB_A) && note.includes(JOB_B))
+    // Reading the earlier note does not count for the joined one.
+    assert.equal(readNote(world, first), joined)
+    assert.equal(readNote(world, joined), null)
+  })
+
+  it('holds a batch once however often the follow offers it', () => {
+    const world = connectedHome()
+    const batch = checkJobBatch()
+    assert.equal(holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir }).duplicate, false)
+    assert.equal(holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir }).duplicate, true)
+    assert.equal(world.held().length, 1)
+    runStepHook(world, toolCall())
+    assert.equal(holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir }).duplicate, true, 'handed over and unread')
+  })
+})
+
+describe('nothing waiting', () => {
+  it('says nothing, and does not start node when no connection has anything held', () => {
+    const world = connectedHome()
+    // Pointed at a plugin folder that is not there, a started node would fail the hook.
+    assert.equal(runStepHook(world, toolCall(), { CLAUDE_PLUGIN_ROOT: path.join(world.home, 'no-plugin-here') }), null)
+    assert.equal(runStepHook(world, toolCall()), null)
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
+  })
+
+  it('says nothing once everything has been read', async () => {
+    const world = connectedHome()
+    fs.mkdirSync(stepsDir(CONN, world.dir), { recursive: true })
+    assert.equal(await stepDeliveryHook(toolCall(), { home: world.home }), null)
+  })
+})
+
+describe('a check job DevSpec has already settled', () => {
+  /** A DevSpec stand-in answering get_connection_dispatch with the jobs in `open`. */
+  async function devspec(open, { status = 200 } = {}) {
+    const calls = []
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body)
+        calls.push(parsed.params)
+        if (status !== 200) {
+          res.writeHead(status)
+          res.end('upstream unavailable')
+          return
+        }
+        const dispatches = open.filter((id) => id === parsed.params?.arguments?.dispatch_id).map((id) => checkJob(id))
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed.id,
+          result: { content: [{ type: 'text', text: JSON.stringify({ connection_id: CONN, dispatches, count: dispatches.length }) }] },
+        }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    after(() => server.close())
+    return { url: `http://127.0.0.1:${server.address().port}/api/mcp`, calls }
+  }
+
+  it('is dropped without being handed over; what is still open is handed over', async () => {
+    const server = await devspec([JOB_B])
+    const world = connectedHome({ state: { token: 'dvs_test_token', mcp_url: server.url } })
+    for (const batch of [checkJobBatch(checkJob(JOB_A)), checkJobBatch(checkJob(JOB_B, 'Retire the old importer'))]) {
+      holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir })
+    }
+    const context = await runStepHookAsync(world, toolCall(), { DEVSPEC_MCP_URL: server.url })
+    assert.match(context, /1 check job\)/)
+    const note = readNoteText(noteIdIn(context), { home: world.home })
+    assert.ok(note.includes(JOB_B))
+    assert.ok(!note.includes(JOB_A), 'the settled job is not handed over')
+    assert.deepEqual(world.held(), [], 'and is gone from the queue')
+    assert.deepEqual(server.calls.map((call) => [call.name, call.arguments.dispatch_id]).sort(), [
+      ['get_connection_dispatch', JOB_A],
+      ['get_connection_dispatch', JOB_B],
+    ])
+  })
+
+  it('when it was the only thing waiting, the step says nothing at all', async () => {
+    const server = await devspec([])
+    const world = connectedHome({ state: { token: 'dvs_test_token', mcp_url: server.url } })
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    assert.equal(await runStepHookAsync(world, toolCall(), { DEVSPEC_MCP_URL: server.url }), null)
+    assert.deepEqual(world.held(), [])
+  })
+
+  it('is dropped at idle too, instead of waking the agent for it', async () => {
+    const server = await devspec([])
+    const world = connectedHome({ state: { token: 'dvs_test_token', mcp_url: server.url } })
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    world.endTurn()
+    const released = await releaseAtIdle(CONN, {
+      dir: world.dir,
+      state: { local_id: CONVERSATION, token: 'dvs_test_token', mcp_url: server.url },
+      wakeFile: world.wakeFile,
+      home: world.home,
+    })
+    assert.deepEqual(released, { released: [], dropped: [checkJobAcceptanceKey(checkJob())] })
+    assert.equal(world.wakeText(), '')
+  })
+
+  it('is handed over when DevSpec cannot say, so a real check is never lost', async () => {
+    const server = await devspec([], { status: 503 })
+    const world = connectedHome({ state: { token: 'dvs_test_token', mcp_url: server.url } })
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    const context = await runStepHookAsync(world, toolCall(), { DEVSPEC_MCP_URL: server.url })
+    assert.ok(readNoteText(noteIdIn(context), { home: world.home }).includes(JOB_A))
+  })
+})
+
+describe("a helper agent's tool calls", () => {
+  it("never receive the parent's items, which wait for the parent's next step", () => {
+    const world = connectedHome()
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    // Measured on CLI 2026.11.05: a helper's call carries its own conversation id.
+    assert.equal(runStepHook(world, toolCall({ conversation_id: HELPER })), null)
+    // Cursor documents parent_tool_call_id on a helper's calls.
+    assert.equal(runStepHook(world, toolCall({ parent_tool_call_id: 'tool-call-7' })), null)
+    assert.equal(world.held().length, 1, 'still waiting')
+    // The parent's own Task call, which ends when its helper does, gets them.
+    assert.ok(runStepHook(world, toolCall({ tool_name: 'Task' })))
+  })
+
+  it('a connection bonded to another conversation gets nothing, even when it is the only one', () => {
+    const world = connectedHome({ state: { local_id: 'some-other-conversation' } })
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    assert.equal(runStepHook(world, toolCall()), null)
+    assert.equal(world.held().length, 1)
+  })
+})
+
+describe("within Cursor's ceiling, nothing cut", () => {
+  it('many long items still fit the hook\'s share, and the note holds every one whole', () => {
+    const world = connectedHome()
+    const ids = Array.from({ length: 60 }, (_, i) => `${String(i).padStart(8, '0')}-0000-4000-8000-000000000001`)
+    for (const [i, id] of ids.entries()) {
+      const batch = noticeBatch(
+        [[id, 'needs_person', `Notice ${i}`, `${'A long finding about your change. '.repeat(200)}END-${i}`]],
+        `${String(i).padStart(8, '0')}-2222-4222-8222-222222222222`,
+      )
+      holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir })
+    }
+    const context = runStepHook(world, toolCall())
+    assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE, `${context.length} characters`)
+    assert.match(context, /60 notices/)
+    const note = readNoteText(noteIdIn(context), { home: world.home })
+    for (let i = 0; i < ids.length; i += 1) assert.ok(note.includes(`END-${i}`), `notice ${i} whole`)
+    assert.ok(noteFiles(world.home, noteIdIn(context)).length > 1, 'in parts, each one Shell page')
+    // One reply can answer every notice that needs the person.
+    assert.match(note, /One reply can answer all of these notices/)
+  })
+})
+
+describe('a hand-over that was cut short', () => {
+  it('puts back what a hook that died had taken, so the next step or the idle wake delivers it', () => {
+    const world = connectedHome()
+    holdForNextStep(CONN, checkJobBatch(), eventsOf(checkJobBatch()), { dir: world.dir })
+    const steps = stepsDir(CONN, world.dir)
+    const [name] = world.held()
+    // A pid no process has: the hook that took it was killed past Cursor's timeout.
+    const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout
+    fs.renameSync(path.join(steps, name), path.join(steps, `${name}.taken-${dead}-0badf00d`))
+    assert.deepEqual(world.held(), [])
+    reclaimAbandoned(steps)
+    assert.deepEqual(world.held(), [name])
+    assert.ok(runStepHook(world, toolCall()))
+  })
+})

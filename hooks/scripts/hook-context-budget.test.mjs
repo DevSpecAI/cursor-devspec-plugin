@@ -104,9 +104,10 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     const a = fitHookContext(text, { home: shortHome, what: 'A note' })
     const b = fitHookContext(text, { home: longHome, what: 'A note' })
     assert.equal(a, b, 'the pointer names the note through ~, never the home folder')
-    // The longest pointer the plugin gives (its longest description and addition) is
-    // well inside the smallest share.
-    const longest = notePointer(writeNote(text, { home: shortHome }), { what: 'w'.repeat(200), also: 'a'.repeat(300) })
+    // A pointer with a longer description and addition than any the plugin gives
+    // (repository-context.mjs has the longest, about 110 and 190 characters) is well
+    // inside the smallest share.
+    const longest = notePointer(writeNote(text, { home: shortHome }), { what: 'w'.repeat(160), also: 'a'.repeat(240) })
     assert.ok(longest.length < POST_TOOL_CONTEXT_SHARE / 2, `${longest.length} characters`)
   })
 
@@ -468,7 +469,7 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     for (const note of readable) handOver(prefix, catCall(home, noteFiles(home, note.id)[0]), { what: 'A note', home })
     const after = handOver(prefix, ls, { what: 'A note', home })
     assert.ok(broken.every((note) => after.includes(noteCommand(note.id)) && after.includes(noteStatusCommand(note.id))))
-    assert.match(after, /\n\n4 DevSpec notes are waiting for you; they come back after each step until you have read each one whole\.$/)
+    assert.match(after, /\n4 DevSpec notes are waiting for you; they come back after each step until you have read each one whole\.$/)
     assert.deepEqual(pendingNotes(home, prefix).sort(), broken.map((note) => note.id).sort())
   })
 
