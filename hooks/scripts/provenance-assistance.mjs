@@ -665,11 +665,12 @@ export function namesTask(requested, id) {
   return requested.length === 8 ? id.startsWith(requested) : requested === id
 }
 
-/** The task object in a get_task answer, also when DevSpec appended a notice block after it. */
+/**
+ * The task object in a get_task answer. `mcpToolsCall` reads it from the first text
+ * block, so a notice DevSpec appended after it no longer hides it (tool-reply.mjs).
+ */
 function taskFromAnswer(answer) {
-  if (answer && typeof answer === 'object' && !Array.isArray(answer) && typeof answer.id === 'string') return answer
-  const content = answer?.result?.content
-  return Array.isArray(content) ? parseJsonObject(content.find((block) => block?.type === 'text')?.text) : null
+  return answer && typeof answer === 'object' && !Array.isArray(answer) && typeof answer.id === 'string' ? answer : null
 }
 
 /**

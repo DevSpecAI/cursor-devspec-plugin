@@ -31,6 +31,7 @@ import { prePostHoldReason } from './room-unread.mjs'
 import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { currentTurnNoticeIds, normalizeNoticeIds, prepareNoticeReply, recordNoticeReply } from './notice-reply.mjs'
+import { readToolReply } from './tool-reply.mjs'
 
 const CAPABILITY_BRIDGE_HELPERS = {
   manage_plan: 'manage-plan',
@@ -179,7 +180,12 @@ export function projectInput(mode, input, { home, env = process.env } = {}) {
       const args = toolArguments(input)
       const result = typeof input.result_json === 'string' ? JSON.parse(input.result_json) : input.result_json
       if (!id || (namespaced === 'register_connection' && args.local_id !== id) || result?.isError || !Array.isArray(result?.content)) return null
-      const data = JSON.parse(result.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n'))
+      // DevSpec's receipt is the first text block. A notice DevSpec appended after it
+      // (a paused project, the organisation out of funds) is not part of the receipt;
+      // the model already sees it in the result Cursor hands it (item 75d3b14a).
+      const reply = readToolReply(result)
+      const data = reply.readable ? reply.answer : null
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return null
       if (namespaced === 'attach_connection') {
         if (data.connection_id === args.connection_id && UUID.test(data.connection_id ?? '')) refreshRepositoryRules(id, data, home)
         return null

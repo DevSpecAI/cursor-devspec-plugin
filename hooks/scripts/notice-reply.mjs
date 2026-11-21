@@ -699,15 +699,12 @@ export function tellPersonPost({ connectionId, text, agentName = null, sourceId 
   }
 }
 
-/** DevSpec's receipt for a post, from the parsed result or its first text block. */
+/**
+ * DevSpec's receipt for a post. `mcpToolsCall` reads it from the reply's first text
+ * block and keeps any notice DevSpec appended beside it (tool-reply.mjs), so a receipt
+ * that is not stored is kept whole, notices included.
+ */
 function postReceipt(result) {
-  if (result && typeof result === 'object' && typeof result.raw === 'string') {
-    try {
-      return JSON.parse(result.raw.split('\n')[0])
-    } catch {
-      return null
-    }
-  }
   return result && typeof result === 'object' ? result : null
 }
 
