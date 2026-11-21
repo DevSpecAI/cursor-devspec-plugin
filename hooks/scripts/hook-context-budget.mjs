@@ -832,3 +832,25 @@ export function fitIntoWake(events, { text, inline, pointer, at = events.length,
   const pointed = place(pointer(note))
   return fits(pointed) ? { events: pointed, route: 'note', note } : none
 }
+
+/**
+ * fitIntoWake's companion for the reader that prints the wake file
+ * (devspec-wake-tail.mjs): of `wakes` (whole wakes waiting to be printed, oldest first,
+ * each as `wakeLines` wrote it), how many go out together in one output. As many whole
+ * wakes as still fit Cursor's rules on one output together (`fitsShellOutput`), never
+ * part of one; the rest wait for the next output. The first always goes, so a single
+ * wake over the rules on its own is printed as it always was (fitIntoWake never makes
+ * one so; only a command too long on its own is).
+ * @param {string[]} wakes
+ * @returns {{ count: number, text: string }}
+ */
+export function wakesForOneOutput(wakes) {
+  let count = 0
+  let text = ''
+  for (const wake of wakes) {
+    if (count > 0 && !fitsShellOutput(text + wake)) break
+    text += wake
+    count += 1
+  }
+  return { count, text }
+}

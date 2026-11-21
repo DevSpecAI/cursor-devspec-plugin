@@ -41,7 +41,8 @@ import {
   stepsDir,
 } from './step-delivery.mjs'
 import { fitsShellOutput } from './hook-context-budget.mjs'
-import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN, printedThrough, recordPrinted } from './devspec-wake-file.mjs'
+import { nextOutput } from './devspec-wake-tail.mjs'
 import { randomUUID } from 'node:crypto'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
@@ -51,6 +52,7 @@ const STEP_HOOK = AFTER_TOOL.find((entry) => entry.command.includes('step-delive
 const WAIT_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-wait.mjs')
 const POLL_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-poll.mjs')
 const STATE_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'remote-control-state.mjs')
+const TAIL_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-wake-tail.mjs')
 
 const CONN = FIXTURE_ID.connection
 const ROOM = '44444444-4444-4444-8444-444444444444'
@@ -96,17 +98,18 @@ function checkJobBatch(job = checkJob()) {
   }
 }
 
-/** Notices as the poller keeps them in the inbox: `[id, audience, summary, prompt]`. */
+/** Notices as the poller keeps them in the inbox: `[id, audience, summary, prompt, records]`. */
 function noticeBatch(notices, envelopeId = '22222222-2222-4222-8222-2222222222a1') {
   const envelope = fixtureSystemNoticeEnvelope({
     envelopeId,
     wakeKind: 'system_notice',
     commands: [],
-    systemNotices: notices.map(([id, audience, summary, prompt]) =>
+    systemNotices: notices.map(([id, audience, summary, prompt, records]) =>
       fixtureServerNotice({
         notice_id: id,
         summary: summary ?? `Notice ${id.slice(0, 4)}`,
         ...(prompt ? { prompt } : {}),
+        ...(records ? { records } : {}),
         ...(audience ? { audience } : {}),
       })),
   })
@@ -164,6 +167,14 @@ function connectedHome({ state = {} } = {}) {
     held() {
       try {
         return fs.readdirSync(stepsDir(CONN, dir)).filter((name) => /^w-.*\.json$/.test(name))
+      } catch {
+        return []
+      }
+    },
+    /** Items written whole in an idle wake that the reader has not printed yet. */
+    inFlight() {
+      try {
+        return fs.readdirSync(stepsDir(CONN, dir)).filter((name) => /^printing-.*\.json$/.test(name))
       } catch {
         return []
       }
@@ -347,7 +358,7 @@ describe('what the agent read at a step, and what it did not', () => {
       assert.ok(runStepHook(world, toolCall()))
       world.endTurn()
       assert.ok(await until(() => world.wakeText().includes('held_for_step')), follow.stderr())
-      const lines = world.wakeText().trim().split('\n').map((line) => JSON.parse(line))
+      const lines = world.wakeText().split('\n').filter(Boolean).map((line) => JSON.parse(line))
       assert.equal(lines.length, 1, 'one wake line')
       assert.deepEqual(lines[0].holds, ['system_notice'])
       assert.match(world.wakeText(), new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
@@ -357,7 +368,7 @@ describe('what the agent read at a step, and what it did not', () => {
       world.inTurn()
       assert.equal(runStepHook(world, toolCall()), null)
       await new Promise((resolve) => setTimeout(resolve, 200))
-      assert.equal(world.wakeText().trim().split('\n').length, lines.length, 'released once')
+      assert.equal(world.wakeText().split('\n').filter(Boolean).length, lines.length, 'released once')
     } finally {
       await follow.stop()
     }
@@ -563,10 +574,15 @@ describe('a hand-over that was cut short', () => {
 
 /** `count` notices of about `size` characters each, held for CONN, each ending in `END-<i>`. */
 function holdNotices(world, count, size, from = 0) {
+  // A notice's prompt and each record's text hold at most 8,000 characters (remote-ingress-v1.mjs).
+  const finding = (chars) => 'A finding about your change. '.repeat(Math.ceil(chars / 29))
   for (let i = from; i < from + count; i += 1) {
     const id = `${String(i).padStart(8, '0')}-0000-4000-8000-0000000000aa`
+    const records = size > 7_000
+      ? [{ label: 'Finding', record_type: 'memory', record_id: `r${i}`, title: `Record ${i}`, text: finding(size - 7_000), url: null }]
+      : undefined
     const batch = noticeBatch(
-      [[id, 'needs_person', `Notice ${i}`, `${'A finding about your change. '.repeat(Math.ceil(size / 29))}END-${i}`]],
+      [[id, 'needs_person', `Notice ${i}`, `${finding(Math.min(size, 7_000))}END-${i}`, records]],
       `${String(i).padStart(8, '0')}-2222-4222-8222-2222222222cc`,
     )
     holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir, now: Date.parse('2026-11-20T03:00:00.000Z') + i })
@@ -590,8 +606,78 @@ describe('the idle wake is sized to what Cursor shows from one background comman
     assert.equal(line.type, 'held_for_step')
     assert.equal(line.read_with, undefined, 'whole in the wake, no file to read')
     for (const end of ['END-0', 'END-1']) assert.ok(line.content.includes(end), end)
-    assert.equal(fs.existsSync(path.join(stepsDir(CONN, world.dir), 'handed.json')), false, 'delivered, so nothing waits')
     assert.deepEqual(world.held(), [])
+    // Written is not delivered: in flight until the reader has printed the wake.
+    assert.equal(world.inFlight().length, 1)
+    recordPrinted(world.wakeFile, fs.statSync(world.wakeFile).size)
+    assert.equal(await releaseAtIdle(CONN, IDLE(world)), null)
+    assert.deepEqual(world.inFlight(), [], 'printed, so delivered')
+    assert.equal(fs.existsSync(path.join(stepsDir(CONN, world.dir), 'handed.json')), false)
+  })
+
+  it('two notices that each fit one output but not together come out in two prints, and each leaves the queue only once printed', async () => {
+    const world = connectedHome()
+    holdNotices(world, 1, 11_000)
+    world.endTurn()
+    const first = await releaseAtIdle(CONN, IDLE(world))
+    world.inTurn()
+    holdNotices(world, 1, 11_000, 1)
+    world.endTurn()
+    const second = await releaseAtIdle(CONN, IDLE(world))
+    assert.equal(first.released.length, 1)
+    assert.equal(second.released.length, 1)
+    const file = world.wakeText()
+    assert.equal(fitsShellOutput(file), false, 'together they are over the limit')
+    assert.equal(world.inFlight().length, 2, 'neither delivered by being written')
+
+    // The reader's first print: the first wake alone, within the limit.
+    const one = nextOutput(file)
+    assert.ok(fitsShellOutput(one), `${one.length} characters`)
+    assert.ok(one.includes('END-0') && !one.includes('END-1'))
+    recordPrinted(world.wakeFile, Buffer.byteLength(one))
+    await releaseAtIdle(CONN, IDLE(world))
+    assert.equal(world.inFlight().length, 1, 'the second waits for its print')
+
+    // Its next print: the second.
+    const two = nextOutput(file.slice(one.length))
+    assert.ok(fitsShellOutput(two))
+    assert.ok(two.includes('END-1'))
+    assert.equal(one + two, file, 'nothing lost, nothing split')
+    recordPrinted(world.wakeFile, Buffer.byteLength(one + two))
+    await releaseAtIdle(CONN, IDLE(world))
+    assert.deepEqual(world.inFlight(), [])
+  })
+
+  it('the real reader prints them in two outputs, each within the limit, and notes how far it printed', async () => {
+    const world = connectedHome()
+    holdNotices(world, 1, 11_000)
+    world.endTurn()
+    await releaseAtIdle(CONN, IDLE(world))
+    world.inTurn()
+    holdNotices(world, 1, 11_000, 1)
+    world.endTurn()
+    await releaseAtIdle(CONN, IDLE(world))
+    const expected = world.wakeText()
+    const tail = spawn(process.execPath, [TAIL_SCRIPT, '--file', world.wakeFile], { windowsHide: true })
+    const chunks = []
+    tail.stdout.on('data', (data) => chunks.push({ at: Date.now(), text: data.toString() }))
+    try {
+      assert.ok(await until(() => printedThrough(world.wakeFile) === Buffer.byteLength(expected)))
+    } finally {
+      tail.kill()
+      await new Promise((resolve) => tail.once('close', resolve))
+    }
+    assert.equal(chunks.map((chunk) => chunk.text).join(''), expected)
+    // Pipe chunks of one print arrive together; prints are a poll (250 ms) apart.
+    const prints = []
+    for (const chunk of chunks) {
+      if (prints.length > 0 && chunk.at - prints.at(-1).at < 150) prints.at(-1).text += chunk.text
+      else prints.push({ ...chunk })
+    }
+    assert.equal(prints.length, 2, prints.map((print) => print.text.length).join(', '))
+    for (const print of prints) assert.ok(fitsShellOutput(print.text))
+    await releaseAtIdle(CONN, IDLE(world))
+    assert.deepEqual(world.inFlight(), [], 'both printed, both delivered')
   })
 
   it('a 44,000-character backlog: the wake fits, its note is complete, and nothing leaves the queue until the note is read', async () => {
@@ -640,7 +726,7 @@ describe('the idle wake is sized to what Cursor shows from one background comman
     assert.equal(second.pointed.length, 23)
     assert.notEqual(second.note, first.note)
     assert.ok(readNoteText(second.note, { home: world.home }).includes('END-22'))
-    assert.equal(world.wakeText().trim().split('\n').length, 2)
+    assert.equal(world.wakeText().split('\n').filter(Boolean).length, 2)
   })
 
   it('the real follow sizes the idle wake the same way', async () => {
@@ -747,8 +833,8 @@ describe('when the connection ends', () => {
     poller.stderr.on('data', (chunk) => { stderr += chunk })
     const closed = new Promise((resolve) => poller.once('close', resolve))
     try {
-      assert.ok(await until(() => list(stepsDir(next, world.dir)).filter((name) => name.startsWith('w-')).length === 3), stderr)
-      assert.match(stderr, /took back 3 item/)
+      // The files and the poller's own line are separate observations: wait for both.
+      assert.ok(await until(() => list(stepsDir(next, world.dir)).filter((name) => name.startsWith('w-')).length === 3 && /took back 3 item/.test(stderr)), stderr)
     } finally {
       poller.kill('SIGTERM')
       await closed

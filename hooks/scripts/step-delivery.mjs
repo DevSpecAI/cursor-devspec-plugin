@@ -48,9 +48,11 @@
  *    note the steps hand over, in one `held_for_step` wake line. The wake is sized in the
  *    one place that knows Cursor's limit on a background command's output
  *    (hook-context-budget.mjs `fitIntoWake`): when the note fits the wake it goes in it
- *    whole and is delivered; otherwise it is kept as a note file, and the wake points
- *    at it. Such a note is delivered only once the agent is seen reading it whole: until
- *    then its items stay here, every step points at it, and anything new that arrives
+ *    whole, and is delivered once the wake reader (devspec-wake-tail.mjs) has printed
+ *    that wake, which may be a print later than it was written when earlier wakes filled
+ *    the one before; until then its items stay here, in flight (`printing-…`).
+ *    Otherwise it is kept as a note file, and the wake points at it. Such a note is
+ *    delivered only once the agent is seen reading it whole: until then its items stay here, every step points at it, and anything new that arrives
  *    joins it in the next wake. A note the idle wake already pointed at, with nothing
  *    new, is not woken for again, so an agent that does not read it is not woken in a
  *    loop. A stretch with no tool calls (the agent only thinking or writing) therefore
@@ -78,7 +80,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { appendWakeEvents } from './devspec-wake-file.mjs'
+import { appendWakeEvents, ensureWakeFile, printedThrough, wakeLines } from './devspec-wake-file.mjs'
 import {
   fitIntoWake,
   noteCommand,
@@ -110,6 +112,8 @@ export const NOTICE_RULES =
 const RECORD_VERSION = 1
 const HANDED = 'handed.json'
 const MANIFEST = 'manifest.json'
+/** A wake written whole at idle, its items in flight until the reader has printed it. */
+const PRINTING = /^printing-\d{15}-[0-9a-f]{8}\.json$/
 const CONNECTION_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(steps|parked)$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
@@ -204,6 +208,35 @@ function validRecord(record) {
     Array.isArray(record.items) && record.items.every(validItem)
 }
 
+function validInFlight(record) {
+  return record?.version === RECORD_VERSION && typeof record.wake_file === 'string' &&
+    Number.isSafeInteger(record.end) && Array.isArray(record.items) && record.items.every(validItem)
+}
+
+function inFlightFiles(folder) {
+  return list(folder).filter((name) => PRINTING.test(name)).sort().map((name) => path.join(folder, name))
+}
+
+/** Whether the reader has printed the whole wake `record` was written in. */
+function printed(record) {
+  try {
+    return fs.statSync(record.wake_file).ino === record.ino && printedThrough(record.wake_file) >= record.end
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Items written whole in an idle wake are delivered once the reader has printed that
+ * wake; their record goes then, and not before.
+ */
+function settlePrinted(steps) {
+  for (const file of inFlightFiles(steps)) {
+    const record = readPrivateJson(file)
+    if (validInFlight(record) && printed(record)) fs.rmSync(file, { force: true })
+  }
+}
+
 function list(dir) {
   try {
     return fs.readdirSync(dir)
@@ -274,7 +307,8 @@ function holds(folder, key) {
   const suffix = `-${keyHash(key)}.json`
   const handed = readPrivateJson(path.join(folder, HANDED))
   return list(folder).some((name) => name.startsWith('w-') && name.includes(suffix)) ||
-    (validRecord(handed) && handed.items.some((each) => each.key === key))
+    (validRecord(handed) && handed.items.some((each) => each.key === key)) ||
+    inFlightFiles(folder).some((file) => readPrivateJson(file)?.items?.some?.((each) => each.key === key))
 }
 
 /** Keep `item` waiting in `folder`, once. A failed write throws. */
@@ -445,6 +479,7 @@ export async function stepDeliveryHook(
   const steps = stepsDir(connectionId, connDir)
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
+  settlePrinted(steps)
 
   // What came back of the note already handed over, in this tool call.
   const takenRecord = take(path.join(steps, HANDED))
@@ -520,9 +555,10 @@ export async function stepDeliveryHook(
  * Between turns, offer through the wake file everything still held and everything
  * handed over but not read whole, so Cursor wakes the agent with it; a check job DevSpec
  * has settled is dropped. It goes as the note the steps hand over, fitted to one
- * background output (`fitIntoWake`): carried whole in the wake when it fits, and then
- * delivered; otherwise kept as a note file the wake points at, and kept here as the
- * handed-over record until the agent reads it whole. A note
+ * background output (`fitIntoWake`): carried whole in the wake when it fits, and kept
+ * here in flight until the reader has printed that wake; otherwise kept as a note file
+ * the wake points at, and kept here as the handed-over record until the agent reads it
+ * whole. A note
  * already woken for, with nothing new, waits for the agent's steps instead of waking it
  * again. Does nothing while Cursor is in a turn. Returns what it did, or null.
  */
@@ -533,6 +569,7 @@ export async function releaseAtIdle(
   const steps = stepsDir(connectionId, dir)
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
+  settlePrinted(steps)
   const handedPath = path.join(steps, HANDED)
   if (waitingFiles(steps).length === 0) {
     // Nothing new, and nothing handed over, or a note the idle wake already pointed at.
@@ -582,6 +619,21 @@ export async function releaseAtIdle(
     })
     // Neither fitted, or the note could not be written: everything stays for the next try.
     if (wake.route === 'none') throw new Error('the idle wake could not be fitted to one output')
+    let inFlight = null
+    if (!wake.note) {
+      // Delivered once the reader has printed this wake, not when it is written.
+      ensureWakeFile(wakeFile)
+      const end = fs.statSync(wakeFile).size + Buffer.byteLength(wakeLines(wake.events))
+      inFlight = path.join(steps, `printing-${String(end).padStart(15, '0')}-${randomBytes(4).toString('hex')}.json`)
+      writePrivateJson(inFlight, {
+        version: RECORD_VERSION,
+        wake_file: wakeFile,
+        ino: fs.statSync(wakeFile).ino,
+        end,
+        items: open,
+        at: new Date().toISOString(),
+      })
+    }
     if (wake.note) {
       writePrivateJson(handedPath, {
         version: RECORD_VERSION,
@@ -592,7 +644,12 @@ export async function releaseAtIdle(
         woken: true,
       })
     }
-    append(wakeFile, wake.events)
+    try {
+      append(wakeFile, wake.events)
+    } catch (error) {
+      if (inFlight) fs.rmSync(inFlight, { force: true })
+      throw error
+    }
   } catch (error) {
     if (wake?.note) fs.rmSync(handedPath, { force: true })
     for (const each of taken) giveBack(each)
@@ -628,7 +685,7 @@ export function parkSteps(connectionId, { dir, localId = null } = {}) {
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
   const parked = parkedDir(connectionId, dir)
-  if (waitingFiles(steps).length > 0 || fs.existsSync(path.join(steps, HANDED))) {
+  if (waitingFiles(steps).length > 0 || fs.existsSync(path.join(steps, HANDED)) || inFlightFiles(steps).length > 0) {
     // Whose they are goes first, so a poller starting meanwhile knows the conversation.
     const manifestPath = path.join(parked, MANIFEST)
     const conversation = localId ?? readPrivateJson(manifestPath)?.local_id ?? readStateOf(dir, connectionId).state?.local_id ?? null
@@ -655,6 +712,15 @@ export function parkSteps(connectionId, { dir, localId = null } = {}) {
     const record = readPrivateJson(takenRecord.file)
     if (validRecord(record)) move(takenRecord, record.items)
     else giveBack(takenRecord)
+  }
+  // A wake the reader printed was delivered; one it has not may never be now.
+  settlePrinted(steps)
+  for (const file of inFlightFiles(steps)) {
+    const taken = take(file)
+    if (!taken) continue
+    const record = readPrivateJson(taken.file)
+    if (validInFlight(record)) move(taken, record.items)
+    else giveBack(taken)
   }
   for (const file of waitingFiles(steps)) {
     const taken = take(file)
