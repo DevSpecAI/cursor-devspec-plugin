@@ -276,7 +276,7 @@ function runAfterTool(home, input) {
     encoding: 'utf8',
   })
   assert.equal(run.status, 0, run.stderr)
-  assert.equal(run.stdout, '')
+  assert.equal(run.stdout, '{}', 'it adds nothing, and still answers Cursor (item 6ddde907)')
 }
 
 /** The agent reads a recall's note whole, part by part, as the postToolUse hook sees it. */

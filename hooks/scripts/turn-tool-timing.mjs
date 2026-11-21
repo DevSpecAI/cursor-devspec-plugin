@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { activeDiagnostics, appendDiagnostic, safeToolName, updateDiagnosticPending } from './local-diagnostics.mjs'
 import { loadState, resolveHookConversationId } from './mirror-turn.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const BEFORE = new Set(['preToolUse', 'beforeShellExecution', 'beforeMCPExecution'])
 const AFTER = new Set(['postToolUse', 'postToolUseFailure', 'afterShellExecution', 'afterMCPExecution'])
@@ -69,5 +70,6 @@ async function main() {
   await handleTurnToolHook(mode, data, { connectionId: state.connection_id, local_id: localId, turn_id: state.current_command_turn_id || state.turn_id })
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  answerCursorAtExit()
   main().catch(() => {}).finally(() => process.exit(0))
 }

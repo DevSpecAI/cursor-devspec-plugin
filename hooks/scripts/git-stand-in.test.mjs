@@ -519,10 +519,26 @@ describe('reporting', () => {
     const waiting = JSON.parse(fs.readFileSync(file, 'utf8'))
     waiting.reports[0].next_attempt_at = 0
     fs.writeFileSync(file, JSON.stringify(waiting))
-    const refused = await report(home, async () => ({ recorded: false, message: 'This repository is not tracked on the project.' }))
-    assert.deepEqual(refused.outcomes.map((o) => [o.outcome, o.reason]), [['refused', 'This repository is not tracked on the project.']])
+    const conflictReply = {
+      recorded: false,
+      conflict: true,
+      commit_sha: sha,
+      connection_id: CONNECTION,
+      original_connection_id: '99999999-9999-4999-8999-999999999999',
+      project_id: PROJECT,
+      message: 'Another connection already reported this commit.',
+      devspec_notices: [{ devspec_account_notice: { kind: 'project_paused' } }],
+    }
+    const refused = await report(home, async () => conflictReply)
+    assert.deepEqual(refused.outcomes.map((o) => [o.outcome, o.reason, o.conflict, o.original_connection_id]), [
+      ['refused', 'Another connection already reported this commit.', true, '99999999-9999-4999-8999-999999999999'],
+    ])
+    assert.deepEqual(refused.outcomes[0].details, conflictReply)
     assert.deepEqual(commitsLog(home).map((e) => e.outcome), ['observed', 'retry', 'refused'])
     assert.equal(commitsLog(home).at(-1).commit_sha, sha)
+    assert.equal(commitsLog(home).at(-1).conflict, true)
+    assert.equal(commitsLog(home).at(-1).original_connection_id, '99999999-9999-4999-8999-999999999999')
+    assert.deepEqual(commitsLog(home).at(-1).details, conflictReply)
     assert.equal(fs.existsSync(path.join(queue, folder, 'pending')), false)
   })
 
@@ -634,14 +650,15 @@ describe('the plugin\'s other hooks', () => {
     const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks', 'hooks.json'), 'utf8')).hooks
     const entries = [...hooks.postToolUse, ...hooks.stop].filter((entry) => entry.command.includes('commit-reports.mjs'))
     assert.equal(entries.length, 2)
-    const probe = entries[0].command.replace(/command -v node[^;]*commit-reports\.mjs\\?"?/, 'echo RAN')
+    const probe = entries[0].command.replace(/command -v node[^;]*commit-reports\.mjs\\?"?/, 'exec echo RAN')
     assert.notEqual(probe, entries[0].command)
     const home = tempDir()
     const run = () => execFileSync('sh', ['-c', probe], { input: '{}', encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, CLAUDE_PLUGIN_ROOT: ROOT } }).trim()
-    assert.equal(run(), '')
+    // Without Node, the hook still answers Cursor, with `{}` (item 6ddde907).
+    assert.equal(run(), '{}')
     const folder = path.join(home, '.devspec', 'cursor-git-stand-in', '0'.repeat(32))
     fs.mkdirSync(folder, { recursive: true })
-    assert.equal(run(), '')
+    assert.equal(run(), '{}')
     fs.writeFileSync(path.join(folder, 'pending'), '')
     assert.equal(run(), 'RAN')
   })

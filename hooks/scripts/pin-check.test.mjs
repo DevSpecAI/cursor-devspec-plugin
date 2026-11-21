@@ -136,15 +136,16 @@ describe('the hooks.json commands, run the way Cursor runs them', () => {
   })
 
   // The filter is what keeps these hooks free on ordinary calls, so test it directly:
-  // swap the node call for a probe that says whether it ran.
+  // swap the node call for a probe that says whether it ran. When it does not run, the
+  // hook still answers Cursor, with `{}` (item 6ddde907).
   const probe = (cmd) => cmd.replace(/node "\$\{CLAUDE_PLUGIN_ROOT\}\/hooks\/scripts\/[\w-]+\.mjs"/, 'cat >/dev/null; echo RAN')
 
   it('the pin check starts node only when the input mentions the pin, or a pin note is still waiting', () => {
     const cmd = probe(command('pin-check.mjs'))
     assert.notEqual(cmd, command('pin-check.mjs'), 'probe substituted')
-    assert.equal(runHook(cmd, { tool_name: 'Edit', cwd: '/w', tool_input: { file_path: '/w/src/app.ts' } }), '')
+    assert.equal(runHook(cmd, { tool_name: 'Edit', cwd: '/w', tool_input: { file_path: '/w/src/app.ts' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
     assert.equal(runHook(cmd, { tool_name: 'Write', cwd: '/w', tool_input: { file_path: '/w/.devspec/project.json' } }).trim(), 'RAN')
-    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }), '')
+    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
     const waiting = tmpDir('devspec-hookhome-')
     fs.mkdirSync(path.join(waiting, '.devspec', 'notes', 'pending'), { recursive: true })
     fs.writeFileSync(path.join(waiting, '.devspec', 'notes', 'pending', 'pin-0123456789abcdef.json'), '{}')
@@ -153,7 +154,7 @@ describe('the hooks.json commands, run the way Cursor runs them', () => {
 
   it('the repo-link reminder starts node only for commands that could add a remote, or a reminder still waiting', () => {
     const cmd = probe(command('repo-link-nudge.mjs'))
-    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }), '')
+    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
     assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'git remote add origin x' } }).trim(), 'RAN')
     assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'gh repo create app --source=.' } }).trim(), 'RAN')
     const waiting = tmpDir('devspec-hookhome-')

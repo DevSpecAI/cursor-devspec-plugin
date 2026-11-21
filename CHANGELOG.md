@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.33.0
+
+- **The plugin reads DevSpec's answers correctly while your project is paused or your organisation is out of funds.** In those cases DevSpec adds a short notice after its answer, as it does when an agent uses DevSpec without the plugin. The plugin read the answer and the notice together as one, so it could read neither: connecting remote control failed as though DevSpec had not answered, and the conversation did not take the project you chose. The plugin now reads DevSpec's answer on its own and keeps the notice beside it, so a notice is never dropped and a refusal is still a refusal.
+- **Ending your agent from DevSpec now stops the commands it was running too.** When you press End, the plugin closes Cursor, but a command Cursor had started, such as a long test run or a server, kept running on your computer afterwards. Now every command that Cursor process started is asked to stop, and anything still running five seconds later is stopped outright. Nothing else on your computer is touched, and End still closes only the Cursor session that was connected, and only when you press End.
+- **Cursor no longer logs the plugin's hooks as failed.** Cursor counted a hook that had nothing to say as a failure, so its hook log filled with hundreds of them a session; every hook now gives Cursor an explicit answer. If your shell is zsh (the default on macOS), the hooks that check for waiting work also failed outright after every tool call whenever nothing was waiting; they now behave the same in every shell.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.32.0
 
 - **Your Cursor agent keeps hearing from DevSpec however long its session runs.** Cursor stops telling the agent about a background command once that command has printed a thousand matches of what the agent asked to be told about. The command the agent keeps running to hear about your messages from a room, DevSpec's notices and the checks it asks the agent to rule is one of those, so after about a thousand of them in one session the agent stopped hearing about anything new, and nothing anywhere said so. The plugin now hands over to a new command before Cursor's limit: from halfway there, each time the agent reads what has arrived it is asked to start a new one, which takes over, and the old one stops by itself just short of the limit, after which the agent is told to start the new one straight away.

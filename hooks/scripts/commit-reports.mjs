@@ -35,6 +35,7 @@ import {
   takeLock,
 } from './git-observer.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -133,10 +134,24 @@ function repositoryLabel(item) {
   return item.git_remote ?? `pin:${item.pinned_project_id}`
 }
 
+function structuredRefusalFields(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {}
+  return {
+    ...(source.conflict !== undefined ? { conflict: source.conflict === true } : {}),
+    ...(source.original_connection_id !== undefined ? { original_connection_id: source.original_connection_id } : {}),
+    ...(source.project_id !== undefined ? { project_id: source.project_id } : {}),
+    details: source,
+  }
+}
+
 function classify(result) {
   if (result?.recorded === true) return { outcome: 'sent' }
   if (result?.recorded === false) {
-    return { outcome: 'refused', reason: String(result.message || (result.conflict ? 'another connection already reported this commit' : 'not recorded')) }
+    return {
+      outcome: 'refused',
+      reason: String(result.message || (result.conflict ? 'another connection already reported this commit' : 'not recorded')),
+      ...structuredRefusalFields(result),
+    }
   }
   return { outcome: 'retry', reason: 'DevSpec answered without saying whether it was recorded' }
 }
@@ -144,17 +159,23 @@ function classify(result) {
 function classifyError(error) {
   const message = String(error?.message || error)
   if (error instanceof CursorMcpRefusal || error?.name === 'CursorMcpRefusal') {
+    const details = error?.details && typeof error.details === 'object' && !Array.isArray(error.details) ? error.details : null
+    const reason = String(details?.message || message)
+    const extra = {
+      ...(details ? structuredRefusalFields(details) : {}),
+      ...(Array.isArray(error?.notices) && error.notices.length > 0 ? { notices: error.notices } : {}),
+    }
     // A failure to store it is DevSpec's own trouble, worth another try; anything else
     // is DevSpec's answer about this commit.
-    return /^Could not record commit provenance/i.test(message)
-      ? { outcome: 'retry', reason: message.slice(0, 500) }
-      : { outcome: 'refused', reason: message.slice(0, 500) }
+    return /^Could not record commit provenance/i.test(reason)
+      ? { outcome: 'retry', reason, ...extra }
+      : { outcome: 'refused', reason, ...extra }
   }
   if (error?.code === 'timeout' || isRetryableHttpFailure(error) || error?.status === 401 || error?.status === 403 ||
     /fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket/i.test(message)) {
-    return { outcome: 'retry', reason: message.slice(0, 300) }
+    return { outcome: 'retry', reason: message }
   }
-  return { outcome: 'refused', reason: message.slice(0, 500) }
+  return { outcome: 'refused', reason: message }
 }
 
 async function sendOne(item, { home, call }) {
@@ -227,11 +248,12 @@ async function reportFolder({ dir, connectionId }, { home, call, now, deadline }
       const attempt = item.attempts + 1
       const result = await sendOne(item, { home, call })
       outcomes.push({ connectionId, sha: item.commit_sha, ...result })
-      if (result.outcome === 'retry') {
-        log({ outcome: 'retry', ...base, attempts: attempt, reason: result.reason })
+      const { outcome, ...rest } = result
+      if (outcome === 'retry') {
+        log({ outcome: 'retry', ...base, attempts: attempt, ...rest })
         kept.push({ ...item, attempts: attempt, last_error: result.reason, next_attempt_at: now + (BACKOFF_MS[attempt] ?? BACKOFF_MS.at(-1)) })
       } else {
-        log({ outcome: result.outcome, ...base, attempts: attempt, ...(result.reason ? { reason: result.reason } : {}) })
+        log({ outcome, ...base, attempts: attempt, ...rest })
       }
     }
     if (kept.length > 0) writePrivateJson(path.join(dir, 'queue.json'), { v: 1, reports: kept })
@@ -271,7 +293,8 @@ export async function reportCommits({ home = os.homedir(), call = mcpToolsCall, 
 }
 
 if (isDirectRun(import.meta.url)) {
-  // Hook output is context for the model: this says nothing there, and always exits 0.
+  // Hook output is context for the model: this says nothing there (`{}`), and always exits 0.
+  answerCursorAtExit()
   // The hook input is not needed, but is read so Cursor never writes into a closed pipe.
   if (!process.stdin.isTTY) {
     try { fs.readFileSync(0) } catch { /* nothing to read */ }

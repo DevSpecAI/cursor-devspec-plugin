@@ -65,6 +65,7 @@ import {
 } from './transcript-turn-end.mjs'
 import { fitRoomMessage } from './room-message.mjs'
 import { clearTurnWakes, postTellPersonAtStop, recordPromptWake } from './notice-reply.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const MODES = new Set(['user_prompt', 'stop', 'background_launch'])
 const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
@@ -1012,4 +1013,7 @@ async function main() {
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+if (isMain) {
+  answerCursorAtExit()
+  main()
+}

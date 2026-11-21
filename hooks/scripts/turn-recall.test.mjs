@@ -164,7 +164,7 @@ describe('the seen store: what one conversation has been shown', () => {
           }))
       for (const run of runHooks(JSON.stringify({ conversation_id: 'chat-1', trigger: 'auto' }))) {
         assert.equal(run.status, 0, run.stderr)
-        assert.equal(run.stdout, '')
+        assert.equal(run.stdout, '{}', 'an answer that asks Cursor for nothing (item 6ddde907)')
       }
       assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
       assert.deepEqual(seenRecallKeys('chat-2', { home }), [key(2)])
@@ -450,7 +450,7 @@ describe('what counts as shown: only a read of the recall\'s note', () => {
       encoding: 'utf8',
     })
     assert.equal(run.status, 0, run.stderr)
-    assert.equal(run.stdout, '', 'it only observes: it adds nothing to what Cursor passes on')
+    assert.equal(run.stdout, '{}', 'it only observes: it adds nothing to what Cursor passes on, and still answers (item 6ddde907)')
   }
 
   for (const [route, command] of [['pointer', () => wake()], ['separate', () => wakeOfLength(19_870)]]) {

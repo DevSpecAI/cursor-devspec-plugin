@@ -113,14 +113,14 @@ describe('touch — the PostToolUse hook', () => {
     assert.equal(touch(JSON.stringify({ conversation_id: CONVERSATION }), { env: {}, home, now: NOW }), false)
   })
 
-  it('as a command it always exits 0 and prints nothing, whatever it is given', () => {
+  it('as a command it always exits 0 and answers Cursor with nothing to say, whatever it is given', () => {
     const home = tempHome()
     bond(home)
     openTurn(home, { startedAt: Date.now() - 1_000 })
     for (const stdin of [JSON.stringify({ conversation_id: CONVERSATION }), 'not json', '']) {
       const run = spawnSync(process.execPath, [SCRIPT, 'touch'], { input: stdin, env: { HOME: home, PATH: process.env.PATH }, encoding: 'utf8' })
       assert.equal(run.status, 0)
-      assert.equal(run.stdout, '')
+      assert.equal(run.stdout, '{}', 'an answer that asks Cursor for nothing (item 6ddde907)')
     }
     assert.equal(readTurnActivity(CONNECTION, connectionsDir(home))?.turn > 0, true)
   })

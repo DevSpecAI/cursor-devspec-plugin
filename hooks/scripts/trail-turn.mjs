@@ -30,6 +30,7 @@ import {
 import { recordTurnActivity } from './turn-liveness.mjs'
 import { currentTurnOwnsNoCommand } from './notice-reply.mjs'
 import { recordRuntimeReport } from './agent-telemetry.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const VALID_MODES = new Set([
   'seed',
@@ -244,4 +245,7 @@ async function main() {
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+if (isMain) {
+  answerCursorAtExit()
+  main()
+}

@@ -22,6 +22,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gitRoot } from './devspec-scope.mjs'
 import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const PIN_RELATIVE = path.join('.devspec', 'project.json')
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
@@ -141,5 +142,6 @@ const isMain =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
 if (isMain) {
+  answerCursorAtExit()
   main().catch(() => {})
 }

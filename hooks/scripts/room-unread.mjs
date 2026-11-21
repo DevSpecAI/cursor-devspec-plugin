@@ -60,6 +60,7 @@ import {
   unseal,
   writeNote,
 } from './hook-context-budget.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 export const READ_STATE_VERSION = 1
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
@@ -755,7 +756,8 @@ function readStdinJson() {
 function main(argv) {
   const [command] = argv
   if (command === 'post-tool' || command === 'pre-post') {
-    // A hook never fails the tool call: any error is silence.
+    // A hook never fails the tool call: any error is silence (`{}`).
+    answerCursorAtExit()
     try {
       const input = readStdinJson()
       const out = command === 'post-tool' ? postToolNotice({ input }) : prePostHold({ input })

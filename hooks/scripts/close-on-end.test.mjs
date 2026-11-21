@@ -8,9 +8,21 @@
  * the connection (a resumed conversation), and a window the conversation moved away from.
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { describe, it } from 'node:test'
 
-import { closeCursorOnEnd, closeOnEndDecision } from './close-on-end.mjs'
+import {
+  closeCursorOnEnd,
+  closeOnEndDecision,
+  commandsStartedBy,
+  COMMAND_STOP_GRACE_MS,
+  cursorProcessOf,
+  parseReapPlan,
+  processIdentity,
+  processTable,
+  PS_LOOKUP_TIMEOUT_MS,
+  reapCommands,
+} from './close-on-end.mjs'
 import { disabledStatePatch } from './devspec-remote-poll.mjs'
 
 const CURSOR = 4242
@@ -27,6 +39,9 @@ function run(state, overrides = {}) {
     resolvePid: () => CURSOR,
     owns: ownsAll,
     kill: (pid, signal) => kills.push([pid, signal]),
+    // Never the real process table or a real reaper here: the pid above is made up.
+    listCommands: () => [],
+    reap: () => null,
     ...overrides,
   })
   return { outcome, kills }
@@ -105,5 +120,254 @@ describe('closing Cursor when a person ends the agent from DevSpec', () => {
       },
     })
     assert.deepEqual(seen, [777])
+  })
+})
+
+/**
+ * End stops the commands Cursor started, too (item b7523464). Signalling Cursor alone
+ * left a shell command it was running (a `sleep 240` in the live check) behind.
+ */
+describe('stopping the commands the closed Cursor started', () => {
+  const ended = { ...live, ...disabledStatePatch('ui') }
+
+  it('signals Cursor first, then each command it started, and hands them to the reaper', () => {
+    const reaped = []
+    const { outcome, kills } = run(ended, {
+      listCommands: () => [{ pid: 5001, identity: 'a' }, { pid: 5002, identity: 'b' }],
+      reap: (commands, { graceMs }) => {
+        reaped.push([commands.map((c) => c.pid), graceMs])
+        return 6001
+      },
+    })
+    assert.deepEqual(kills, [[CURSOR, 'SIGTERM'], [5001, 'SIGTERM'], [5002, 'SIGTERM']])
+    assert.deepEqual(reaped, [[[5001, 5002], COMMAND_STOP_GRACE_MS]])
+    assert.deepEqual(outcome.commands, { stopped: [5001, 5002], failed: [], reaper: 6001, forceAfterMs: COMMAND_STOP_GRACE_MS })
+  })
+
+  it('lists the commands before Cursor is signalled, while they are still its children', () => {
+    const order = []
+    run(ended, {
+      listCommands: () => { order.push('list'); return [] },
+      kill: (pid) => order.push(`kill ${pid}`),
+    })
+    assert.deepEqual(order, ['list', `kill ${CURSOR}`])
+  })
+
+  it('touches no command when it does not close Cursor, or when Cursor could not be signalled', () => {
+    const listed = []
+    const listCommands = (pid) => { listed.push(pid); return [{ pid: 5001, identity: 'a' }] }
+    for (const overrides of [{ sawLive: false }, { owns: () => false }, { platform: 'win32' }]) {
+      const { kills } = run(ended, { ...overrides, listCommands })
+      assert.deepEqual(kills, [])
+    }
+    run({ ...live, ...disabledStatePatch('local_stop') }, { listCommands })
+    assert.deepEqual(listed, [], 'nothing is even listed unless End closes Cursor')
+    const signalled = []
+    const { outcome } = run(ended, {
+      listCommands,
+      kill: (pid) => {
+        signalled.push(pid)
+        if (pid === CURSOR) throw Object.assign(new Error('nope'), { code: 'EPERM' })
+      },
+    })
+    assert.equal(outcome.closed, false)
+    assert.deepEqual(signalled, [CURSOR])
+  })
+
+  it('reports a command it could not signal, and treats one that already exited as stopped', () => {
+    const { outcome } = run(ended, {
+      listCommands: () => [{ pid: 5001, identity: 'a' }, { pid: 5002, identity: 'b' }],
+      kill: (pid) => {
+        if (pid === 5001) throw Object.assign(new Error('gone'), { code: 'ESRCH' })
+        if (pid === 5002) throw Object.assign(new Error('not yours'), { code: 'EPERM' })
+      },
+    })
+    assert.equal(outcome.closed, true)
+    assert.deepEqual(outcome.commands.stopped, [])
+    assert.deepEqual(outcome.commands.failed, [{ pid: 5002, reason: 'EPERM' }])
+    assert.equal(outcome.commands.reaper, null)
+  })
+
+  it('the reaper kills only what is still the process it was given, after the grace', async () => {
+    const identities = new Map([[11, 'start-11'], [12, 'start-12'], [13, 'reused']])
+    const killed = []
+    let clock = 0
+    const result = await reapCommands(
+      { graceMs: 300, targets: [{ pid: 11, identity: 'start-11' }, { pid: 12, identity: 'start-12' }, { pid: 13, identity: 'start-13' }] },
+      {
+        identityOf: (pid) => identities.get(pid) ?? null,
+        kill: (pid, signal) => killed.push([pid, signal]),
+        now: () => clock,
+        sleep: async (ms) => {
+          clock += ms
+          if (clock >= 100) identities.delete(12) // 12 stops on its own during the grace
+        },
+      },
+    )
+    assert.deepEqual(killed, [[11, 'SIGKILL']], '13 is someone else now, 12 exited')
+    assert.deepEqual(result.killed, [11])
+    assert.ok(clock >= 300, 'it waited out the grace before killing')
+  })
+
+  it('the reaper returns at once when everything already stopped', async () => {
+    let slept = 0
+    const result = await reapCommands({ graceMs: 5_000, targets: [{ pid: 11, identity: 'x' }] }, {
+      identityOf: () => null,
+      kill: () => assert.fail('nothing to kill'),
+      sleep: async () => { slept++ },
+    })
+    assert.deepEqual(result.killed, [])
+    assert.equal(slept, 0)
+  })
+
+  it('the reaper accepts only a well-formed plan, with no arbitrary upper ceiling on graceMs', () => {
+    assert.equal(parseReapPlan('not json'), null)
+    assert.equal(parseReapPlan(JSON.stringify({ graceMs: -1, targets: [] })), null)
+    assert.equal(parseReapPlan(JSON.stringify({ graceMs: null, targets: [] })), null)
+    assert.equal(parseReapPlan(JSON.stringify({ graceMs: '5000', targets: [] })), null)
+    assert.deepEqual(
+      parseReapPlan(JSON.stringify({ graceMs: 120_000, targets: [{ pid: 1, identity: 'init' }, { pid: 42, identity: '' }, { pid: 43, identity: 'ok', extra: 1 }, { pid: '44', identity: 'x' }] })),
+      { graceMs: 120_000, targets: [{ pid: 43, identity: 'ok' }] },
+    )
+  })
+
+  it('spares the closing process and every ancestor up to Cursor across deep process trees (>64 hops)', () => {
+    const table = new Map()
+    let prev = CURSOR
+    for (let i = 1; i <= 80; i++) {
+      const pid = 10_000 + i
+      table.set(pid, prev)
+      prev = pid
+    }
+    const selfPid = prev
+    const siblingCommand = 20_001
+    table.set(siblingCommand, CURSOR)
+    const listed = commandsStartedBy(CURSOR, { selfPid, table, identityOf: (pid) => `id-${pid}` })
+    assert.deepEqual(listed, [{ pid: siblingCommand, identity: `id-${siblingCommand}` }])
+  })
+
+  it('identifies a ps lookup timeout instead of treating it as no processes running', () => {
+    assert.equal(PS_LOOKUP_TIMEOUT_MS, 2_000)
+    const timedOutPs = () => {
+      throw Object.assign(new Error('spawnSync ps ETIMEDOUT'), { code: 'ETIMEDOUT' })
+    }
+    assert.throws(
+      () => processTable({ platform: 'darwin', execPs: timedOutPs }),
+      (err) => err.code === 'ETIMEDOUT' && err.timedOut === true && err.timeoutMs === PS_LOOKUP_TIMEOUT_MS && err.lookup === 'process_table',
+    )
+    assert.throws(
+      () => processIdentity(5001, { platform: 'darwin', execPs: timedOutPs }),
+      (err) => err.code === 'ETIMEDOUT' && err.timedOut === true && err.timeoutMs === PS_LOOKUP_TIMEOUT_MS && err.lookup === 'process_identity' && err.pid === 5001,
+    )
+    const { outcome: tableTimedOut, kills: tableKills } = run(ended, {
+      listCommands: () => processTable({ platform: 'darwin', execPs: timedOutPs }),
+    })
+    assert.equal(tableTimedOut.closed, true)
+    assert.deepEqual(tableKills, [[CURSOR, 'SIGTERM']])
+    assert.equal(tableTimedOut.commands.lookupTimedOut, true)
+    assert.equal(tableTimedOut.commands.lookupTimeoutMs, PS_LOOKUP_TIMEOUT_MS)
+    assert.match(tableTimedOut.commands.lookupError, /timed out/)
+
+    const table = new Map([[5001, CURSOR]])
+    const { outcome: identityTimedOut, kills: idKills } = run(ended, {
+      listCommands: (cursorPid) =>
+        commandsStartedBy(cursorPid, {
+          selfPid: 9999,
+          table,
+          identityOf: (pid) => processIdentity(pid, { platform: 'darwin', execPs: timedOutPs }),
+        }),
+    })
+    assert.equal(identityTimedOut.closed, true)
+    assert.deepEqual(idKills, [[CURSOR, 'SIGTERM'], [5001, 'SIGTERM']])
+    assert.equal(identityTimedOut.commands.lookupTimedOut, true)
+    assert.equal(identityTimedOut.commands.lookupTimeoutMs, PS_LOOKUP_TIMEOUT_MS)
+    assert.match(identityTimedOut.commands.lookupError, /timed out/)
+  })
+
+  it('the grace period is a few seconds, stated once', () => {
+    assert.equal(COMMAND_STOP_GRACE_MS, 5_000)
+  })
+})
+
+/**
+ * The same with real processes: a stand-in "cursor-agent" that, like the real one,
+ * exits on SIGTERM and leaves its children behind; a long `sleep` it started through a
+ * shell; a command that ignores SIGTERM; and an unrelated `sleep` that must survive.
+ */
+describe('End with real processes', { skip: process.platform === 'win32' && 'no signals on Windows' }, () => {
+  const running = (pid) => processIdentity(pid) !== null
+  const until = async (check, ms) => {
+    const deadline = Date.now() + ms
+    while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25))
+    return check()
+  }
+  const FAKE_CURSOR = [
+    "const { spawn } = require('node:child_process')",
+    "const shell = spawn('sh', ['-c', 'sleep 240 & echo $!; wait'], { stdio: ['ignore', 'pipe', 'ignore'] })",
+    "const stubborn = spawn(process.execPath, ['-e', 'process.on(\"SIGTERM\", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })",
+    "process.on('SIGTERM', () => process.exit(0))",
+    "shell.stdout.once('data', (d) => process.stdout.write(JSON.stringify({ shell: shell.pid, sleep: Number(String(d).trim()), stubborn: stubborn.pid }) + '\\n'))",
+    'setInterval(() => {}, 1000)',
+  ].join('\n')
+
+  async function startFakeCursor() {
+    // The trailing `cursor-agent` argument is what makes it look like Cursor by its command line.
+    const cursor = spawn(process.execPath, ['-e', FAKE_CURSOR, 'cursor-agent'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    const pids = await new Promise((resolve, reject) => {
+      cursor.stdout.once('data', (d) => resolve(JSON.parse(String(d))))
+      cursor.once('error', reject)
+    })
+    // Wait until the stubborn command has installed its handler (it would die on SIGTERM before).
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    return { cursor, pids: { cursor: cursor.pid, ...pids } }
+  }
+
+  function cleanUp(pids) {
+    for (const pid of pids) {
+      try { if (running(pid)) process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+  }
+
+  it('lists what Cursor started, sparing the closing process and the shell it runs in', async () => {
+    const { pids } = await startFakeCursor()
+    try {
+      assert.equal(cursorProcessOf(pids.cursor), pids.cursor, 'the stand-in is recognised as Cursor')
+      const all = commandsStartedBy(pids.cursor).map((c) => c.pid).sort()
+      assert.deepEqual(all, [pids.shell, pids.sleep, pids.stubborn].sort())
+      assert.ok(commandsStartedBy(pids.cursor).every((c) => typeof c.identity === 'string' && c.identity))
+      // Closing from inside the shell: that shell is spared, the sleep it started is not.
+      const fromShell = commandsStartedBy(pids.cursor, { selfPid: pids.shell, table: processTable() }).map((c) => c.pid).sort()
+      assert.deepEqual(fromShell, [pids.sleep, pids.stubborn].sort())
+    } finally {
+      cleanUp(Object.values(pids))
+    }
+  })
+
+  it('after End, the long command Cursor was running is gone, and nothing else is touched', async () => {
+    const unrelated = spawn('sleep', ['240'], { stdio: 'ignore' })
+    const { pids } = await startFakeCursor()
+    try {
+      assert.ok(running(pids.sleep) && running(pids.stubborn) && running(unrelated.pid))
+      const outcome = closeCursorOnEnd({
+        state: { ...live, owner_pid: pids.cursor, ...disabledStatePatch('ui') },
+        sawLive: true,
+        ownerPid: pids.cursor,
+        // Resolve only the stand-in: never walk this test's own ancestry to a real agent.
+        resolvePid: (pid) => cursorProcessOf(Number(pid)),
+        graceMs: 1_500,
+      })
+      assert.equal(outcome.closed, true, outcome.reason)
+      assert.equal(outcome.pid, pids.cursor)
+      assert.deepEqual([...outcome.commands.stopped].sort(), [pids.shell, pids.sleep, pids.stubborn].sort())
+      assert.ok(Number.isInteger(outcome.commands.reaper), 'a reaper took the stubborn ones')
+
+      assert.ok(await until(() => !running(pids.cursor), 3_000), 'Cursor closed')
+      assert.ok(await until(() => !running(pids.sleep) && !running(pids.shell), 3_000), 'the sleep Cursor started is gone')
+      assert.ok(running(pids.stubborn), 'it ignored SIGTERM, and the grace has not run out yet')
+      assert.ok(await until(() => !running(pids.stubborn), 6_000), 'the command that ignored SIGTERM was killed after the grace')
+      assert.ok(running(unrelated.pid), 'an unrelated sleep is untouched')
+    } finally {
+      cleanUp([...Object.values(pids), unrelated.pid])
+    }
   })
 })

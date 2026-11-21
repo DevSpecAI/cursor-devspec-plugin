@@ -32,6 +32,7 @@ import { fitHookContext, handOver, handOverPrefix, POST_TOOL_CONTEXT_SHARE } fro
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -665,11 +666,12 @@ export function namesTask(requested, id) {
   return requested.length === 8 ? id.startsWith(requested) : requested === id
 }
 
-/** The task object in a get_task answer, also when DevSpec appended a notice block after it. */
+/**
+ * The task object in a get_task answer. `mcpToolsCall` reads it from the first text
+ * block, so a notice DevSpec appended after it no longer hides it (tool-reply.mjs).
+ */
 function taskFromAnswer(answer) {
-  if (answer && typeof answer === 'object' && !Array.isArray(answer) && typeof answer.id === 'string') return answer
-  const content = answer?.result?.content
-  return Array.isArray(content) ? parseJsonObject(content.find((block) => block?.type === 'text')?.text) : null
+  return answer && typeof answer === 'object' && !Array.isArray(answer) && typeof answer.id === 'string' ? answer : null
 }
 
 /**
@@ -1214,4 +1216,7 @@ async function main() {
 }
 
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-if (isMain) void main()
+if (isMain) {
+  answerCursorAtExit()
+  void main()
+}

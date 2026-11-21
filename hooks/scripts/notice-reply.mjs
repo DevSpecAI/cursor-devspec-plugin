@@ -699,16 +699,27 @@ export function tellPersonPost({ connectionId, text, agentName = null, sourceId 
   }
 }
 
-/** DevSpec's receipt for a post, from the parsed result or its first text block. */
+/**
+ * DevSpec's receipt for a post. `mcpToolsCall` reads it from the reply's first text
+ * block and keeps any notice DevSpec appended beside it (tool-reply.mjs), so a receipt
+ * that is not stored is kept whole, notices included. When a reply could not be parsed
+ * as JSON (`{ raw, result }`), try the first line of `raw` and discard an unparseable
+ * body (item d50b8d6e) so raw text and the result wrapper never enter the diagnostic log.
+ */
 function postReceipt(result) {
-  if (result && typeof result === 'object' && typeof result.raw === 'string') {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  if (typeof result.raw === 'string') {
     try {
-      return JSON.parse(result.raw.split('\n')[0])
+      const parsed = JSON.parse(result.raw.split('\n')[0])
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+      return Array.isArray(result.devspec_notices)
+        ? { ...parsed, devspec_notices: result.devspec_notices }
+        : parsed
     } catch {
       return null
     }
   }
-  return result && typeof result === 'object' ? result : null
+  return result
 }
 
 /**
