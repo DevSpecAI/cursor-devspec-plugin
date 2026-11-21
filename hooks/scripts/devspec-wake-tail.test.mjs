@@ -12,16 +12,28 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { appendWakeEvents, REMOTE_WAKE_NOTIFY_PATTERN, splitWakes, wakeLines } from './devspec-wake-file.mjs'
+import { appendWakeEvents, CURSOR_NOTIFY_MATCH_LIMIT, REMOTE_WAKE_NOTIFY_PATTERN, splitWakes, wakeLines } from './devspec-wake-file.mjs'
 import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import {
+  LISTENER_MATCH_BUDGET,
+  LISTENER_REASON,
+  LISTENER_RELIEF_AT,
+  LISTENER_REPLACE_NOTE,
+  LISTENER_STOPPED_NOTE,
+  listenerAdvice,
+  listenerCommand,
+  listenerLeasePath,
   NOTHING_UNREAD,
   NOTIFY_NOTE,
   notifyLine,
+  notifyMatches,
   readerCommand,
   readerHeader,
+  readerPage,
+  readListenerLease,
   readPositionPath,
   readWakes,
+  startOffset,
 } from './devspec-wake-tail.mjs'
 import { RECALL_IN_NEXT_WAKE, recallWakeOut } from './turn-recall.mjs'
 import { noteIdIn } from '../../tests/helpers/note-reads.mjs'
@@ -298,23 +310,30 @@ describe('the wake reader: what the agent runs when a wake notification arrives'
   })
 })
 
-describe('the background tail: notification lines only', () => {
-  /** The real tail on `file`, started through `script`: what it has printed so far, and how to stop it. */
-  function startTail(script, file, home) {
-    const child = spawn(process.execPath, [script, '--file', file], { env: { PATH: process.env.PATH, HOME: home }, windowsHide: true })
-    let stdout = ''
-    child.stdout.on('data', (chunk) => { stdout += chunk })
-    return {
-      child,
-      stdout: () => stdout,
-      lines: () => stdout.split('\n').filter(Boolean),
-      async stop() {
-        child.kill()
-        await new Promise((resolve) => child.once('close', resolve))
-      },
-    }
+/** The real tail on `file`, started through `script`: what it has printed so far, whether it has exited, and how to stop it. */
+function startTail(script, file, home) {
+  const child = spawn(process.execPath, [script, '--file', file], { env: { PATH: process.env.PATH, HOME: home }, windowsHide: true })
+  let stdout = ''
+  let stderr = ''
+  let exit = null
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const closed = new Promise((resolve) => child.once('close', (code) => { exit = code; resolve(code) }))
+  return {
+    child,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    lines: () => stdout.split('\n').filter(Boolean),
+    /** The exit code once it has exited by itself (and its output is all in), else null. */
+    exit: () => exit,
+    async stop() {
+      if (exit === null) child.kill()
+      await closed
+    },
   }
+}
 
+describe('the background tail: notification lines only', () => {
   async function assertTailNotifiesVia(script) {
     const world = connected()
     const tail = startTail(script, world.file, world.home)
@@ -441,5 +460,255 @@ describe('the background tail: notification lines only', () => {
     } finally {
       await tail.stop()
     }
+  })
+})
+
+/** Every wake the reader has left, read to the end as the agent does (again while `remaining` is above 0): the room commands' ids, in order, and each read's header. */
+async function readAll(world, options = {}) {
+  const ids = []
+  const headers = []
+  for (let reads = 0; reads < 200; reads += 1) {
+    const { printed } = await world.read(options)
+    const { header, wakes } = parsed(printed)
+    headers.push(header)
+    for (const line of wakes.split('\n').filter(Boolean)) {
+      const event = JSON.parse(line)
+      if (event.type === 'owner_message') ids.push(event.message_id)
+    }
+    if (header.devspec_wakes.remaining === 0) return { ids, headers }
+  }
+  throw new Error('the reader never finished')
+}
+
+/** `n` room commands, numbered from `from`, appended one wake each, as the host follow writes them. */
+function appendCommands(world, from, n) {
+  for (let i = from; i < from + n; i += 1) world.append(command(i, `B${i}`))
+}
+
+const ids = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => `m${from + i}`)
+/** A tail's lines for wakes announced for the first time, and its reminder line (`again`) for a backlog an earlier tail announced. */
+const fresh = (tail) => tail.lines().filter((line) => !JSON.parse(line).again)
+const again = (tail) => tail.lines().filter((line) => JSON.parse(line).again)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+describe("the listener hands over to a new one before Cursor's notification limit", () => {
+  it('counts matches as Cursor does, never lines, and keeps one short of the limit', () => {
+    assert.equal(LISTENER_MATCH_BUDGET, CURSOR_NOTIFY_MATCH_LIMIT - 1, "Cursor's own limit notification never comes")
+    assert.ok(LISTENER_RELIEF_AT > 0 && LISTENER_RELIEF_AT < LISTENER_MATCH_BUDGET)
+    const one = notifyLine(wakeLines(command(1)), readerCommand('/var/tmp/devspec-wakes/x.jsonl'))
+    const two = notifyLine(wakeLines([{ type: 'held_for_step', holds: ['check_job', 'system_notice'], connection_id: CONN }]), 'node reader')
+    assert.equal(notifyMatches(one), 1)
+    assert.equal(notifyMatches(two), 2, 'a line naming two of its words counts two')
+    assert.equal(notifyMatches('devspec-wake-tail: watching /var/tmp/devspec-wakes/x.jsonl'), 0)
+  })
+
+  it('stops one match short of the limit and exits; the reader then says to start the next, which announces exactly what the first did not, wakes that arrived in between included, and reminds once of what the first announced that is still unread', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    let second = null
+    try {
+      await sleep(300)
+      appendCommands(world, 1, LISTENER_MATCH_BUDGET + 1)
+      assert.ok(await until(() => first.exit() !== null, 20_000), `still running after ${first.lines().length} lines`)
+      assert.equal(first.exit(), 0)
+      assert.equal(first.lines().length, LISTENER_MATCH_BUDGET, 'one line per wake up to the budget, none past it')
+      assert.equal(notifyMatches(first.stdout()) + notifyMatches(first.stderr()), LISTENER_MATCH_BUDGET, 'fewer matches than Cursor allows, on stdout and stderr together')
+      const lease = readListenerLease(world.file, CONN, world.dir)
+      assert.equal(lease.state, 'retired')
+      assert.equal(lease.announced_through, Buffer.byteLength(Array.from({ length: LISTENER_MATCH_BUDGET }, (_, i) => wakeLines(command(i + 1, `B${i + 1}`))).join('')))
+
+      // Two more arrive while no listener runs; then the agent, sent to the reader by Cursor's exit notification, is told to start the next.
+      appendCommands(world, LISTENER_MATCH_BUDGET + 2, 2)
+      const advice = listenerAdvice(readListenerLease(world.file, CONN, world.dir), world.file)
+      assert.deepEqual(advice, {
+        status: 'stopped',
+        start: listenerCommand(world.file),
+        notify_on_output: { pattern: REMOTE_WAKE_NOTIFY_PATTERN, reason: LISTENER_REASON },
+        note: LISTENER_STOPPED_NOTE,
+      })
+      second = startTail(realScript, world.file, world.home)
+      assert.ok(await until(() => fresh(second).length >= 3), second.stdout())
+      await sleep(600)
+      assert.equal(fresh(second).length, 3, 'the one the first stopped before, and the two that came in between; nothing the first announced')
+      // None of what the first announced has been read yet, so the new one says so once, for the earliest.
+      assert.equal(again(second).length, 1)
+      assert.equal(second.lines()[0], again(second)[0], 'before anything new')
+      assert.deepEqual(JSON.parse(again(second)[0]).carries, ['owner_message'])
+      appendCommands(world, LISTENER_MATCH_BUDGET + 4, 1)
+      assert.ok(await until(() => fresh(second).length === 4), second.stdout())
+      assert.equal(second.exit(), null, 'the new one keeps running')
+      assert.doesNotMatch(second.stderr(), /taking over/, 'nothing was running to take over from')
+
+      // Each wake was announced once across the two, and the reader hands each over once, whole.
+      const total = LISTENER_MATCH_BUDGET + 4
+      assert.equal(first.lines().length + fresh(second).length, total)
+      const { ids: read, headers } = await readAll(world)
+      assert.deepEqual(read, ids(1, total))
+      for (const header of headers) assert.equal(header.listener, undefined, 'a running listener needs no replacing yet')
+    } finally {
+      await first.stop()
+      await second?.stop()
+    }
+  })
+
+  it('a next listener started after the agent has read announces only what arrives after that read', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    let second = null
+    try {
+      await sleep(300)
+      appendCommands(world, 1, LISTENER_MATCH_BUDGET + 1)
+      assert.ok(await until(() => first.exit() !== null, 20_000))
+      const { ids: read, headers } = await readAll(world)
+      assert.deepEqual(read, ids(1, LISTENER_MATCH_BUDGET + 1), 'the reader hands over the wake the listener stopped before, too')
+      assert.ok(headers.every((header) => header.listener?.status === 'stopped'), 'every read until a new listener runs says to start one')
+      for (const header of headers) assert.ok(fitsShellOutput(JSON.stringify(header)))
+      second = startTail(realScript, world.file, world.home)
+      await sleep(800)
+      assert.equal(second.stdout(), '', 'everything is read: nothing to announce, and no reminder')
+      appendCommands(world, LISTENER_MATCH_BUDGET + 2, 1)
+      assert.ok(await until(() => second.lines().length === 1), second.stdout())
+      assert.deepEqual((await readAll(world)).ids, [`m${LISTENER_MATCH_BUDGET + 2}`])
+    } finally {
+      await first.stop()
+      await second?.stop()
+    }
+  })
+
+  it('counts a line that names two words as two: it stops when the next line would pass the budget', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    try {
+      await sleep(300)
+      const both = (n) => [{ type: 'held_for_step', holds: ['check_job', 'system_notice'], connection_id: CONN, note: `${String(n).padStart(16, '0')}` }]
+      for (let i = 0; i < LISTENER_MATCH_BUDGET; i += 1) world.append(both(i))
+      assert.ok(await until(() => first.exit() !== null, 20_000))
+      assert.equal(first.lines().length, Math.floor(LISTENER_MATCH_BUDGET / 2))
+      assert.ok(notifyMatches(first.stdout()) <= LISTENER_MATCH_BUDGET)
+      assert.ok(notifyMatches(first.stdout()) + 2 > LISTENER_MATCH_BUDGET, 'it stopped only when the next line would not fit')
+    } finally {
+      await first.stop()
+    }
+  })
+
+  it('from halfway to the limit every read asks for a new listener; the new one takes over from the running one while wakes keep arriving, and each is announced once', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    let second = null
+    try {
+      await sleep(300)
+      appendCommands(world, 1, LISTENER_RELIEF_AT)
+      assert.ok(await until(() => first.lines().length === LISTENER_RELIEF_AT), String(first.lines().length))
+      assert.ok(await until(() => readListenerLease(world.file, CONN, world.dir)?.state === 'relief'))
+      const asked = await readAll(world)
+      assert.deepEqual(asked.ids, ids(1, LISTENER_RELIEF_AT))
+      assert.ok(asked.headers.every((header) => header.listener?.status === 'replace' && header.listener.note === LISTENER_REPLACE_NOTE))
+      assert.equal(asked.headers[0].listener.start, listenerCommand(world.file))
+      assert.equal(first.exit(), null, 'the running one keeps announcing until it is replaced')
+
+      // Wakes keep arriving, every few milliseconds, while the agent starts the new listener.
+      const more = 200
+      let appended = 0
+      const arriving = (async () => {
+        for (; appended < more; appended += 1) {
+          world.append(command(LISTENER_RELIEF_AT + 1 + appended, `B${LISTENER_RELIEF_AT + 1 + appended}`))
+          await sleep(4)
+        }
+      })()
+      await until(() => appended >= 50)
+      second = startTail(realScript, world.file, world.home)
+      await arriving
+      assert.ok(await until(() => first.exit() !== null), 'the old listener stops by itself')
+      assert.equal(first.exit(), 0)
+      assert.match(first.stderr(), new RegExp(`the listener in process ${second.child.pid} has taken over`))
+      assert.match(second.stderr(), new RegExp(`taking over from the listener in process ${first.child.pid}`))
+      const total = LISTENER_RELIEF_AT + more
+      assert.ok(await until(() => first.lines().length + fresh(second).length >= total), `${first.lines().length} + ${fresh(second).length}`)
+      await sleep(600)
+      assert.equal(first.lines().length + fresh(second).length, total, 'every wake announced once between the two: none lost, none twice')
+      assert.ok(again(second).length <= 1, 'at most one reminder, for wakes the first announced that were still unread at the switch')
+      assert.ok(fresh(second).length > 0, 'the new one announced what came after the switch')
+      const rest = await readAll(world)
+      assert.deepEqual(rest.ids, ids(LISTENER_RELIEF_AT + 1, total))
+      for (const header of rest.headers) assert.equal(header.listener, undefined, 'the new listener is far from the limit')
+    } finally {
+      await first.stop()
+      await second?.stop()
+    }
+  })
+
+  it('never two listeners: one started beside a running one that was not handing over takes over at once, and the first stops without printing again; an unread wake it had announced is announced again, never lost', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    let second = null
+    try {
+      await sleep(300)
+      appendCommands(world, 1, 1)
+      assert.ok(await until(() => first.lines().length === 1))
+      second = startTail(realScript, world.file, world.home)
+      assert.ok(await until(() => first.exit() !== null), 'the first stops at its next look')
+      assert.ok(await until(() => second.lines().length === 1), 'the unread wake, announced again')
+      assert.equal(again(second).length, 0, 'announced as new: the first was not handing over, so the second starts after what was read')
+      appendCommands(world, 2, 1)
+      assert.ok(await until(() => second.lines().length === 2))
+      await sleep(400)
+      assert.equal(first.lines().length, 1, 'nothing printed by the first after the second took over')
+      assert.deepEqual((await readAll(world)).ids, ['m1', 'm2'], 'and the reader hands each over once')
+    } finally {
+      await first.stop()
+      await second?.stop()
+    }
+  })
+
+  it('a burst of wakes, which Cursor folds into one notification showing only the latest, reaches the agent whole from one read', async () => {
+    const world = connected()
+    const first = startTail(realScript, world.file, world.home)
+    try {
+      await sleep(300)
+      const burst = [command(1), notice('n1'), [{ type: 'check_job', check_job_id: 'j1', instruction: 'BODY-CHECK' }, { type: 'wake', count: 1 }]]
+      for (const wake of burst) world.append(wake)
+      assert.ok(await until(() => first.lines().length === 3))
+      // Cursor's notification would name only the last line's word; whatever it names, the agent runs the reader.
+      assert.deepEqual(JSON.parse(first.lines().at(-1)).carries, ['check_job'])
+      const { printed } = await world.read()
+      assert.equal(printed, readerHeader(3, 0) + burst.map(wakeLines).join(''))
+      assert.equal((await world.read()).printed, readerHeader(0, 0, NOTHING_UNREAD), 'a later notification for the same burst finds nothing new')
+    } finally {
+      await first.stop()
+    }
+  })
+
+  it('the reader names a listener to start only when one is needed', async () => {
+    const world = connected()
+    const write = (lease) => fs.writeFileSync(listenerLeasePath(CONN, world.dir), JSON.stringify({ version: 1, file: path.resolve(world.file), ...lease }))
+    const header = async (isAlive) => parsed((await world.read({ isAlive })).printed).header
+    world.append(command(1))
+    assert.equal((await header(() => true)).listener, undefined, 'no lease: no listener of this version has run')
+    write({ pid: 4242, state: 'listening', matches: 3, announced_through: 0 })
+    assert.equal((await header(() => true)).listener, undefined, 'a running listener far from the limit')
+    assert.equal((await header(() => false)).listener.status, 'stopped', 'its process is gone')
+    write({ pid: 4242, state: 'relief', matches: LISTENER_RELIEF_AT, announced_through: 0 })
+    assert.equal((await header(() => true)).listener.status, 'replace')
+    write({ pid: 4242, state: 'retired', matches: LISTENER_MATCH_BUDGET, announced_through: 0 })
+    assert.equal((await header(() => true)).listener.status, 'stopped')
+    fs.writeFileSync(listenerLeasePath(CONN, world.dir), JSON.stringify({ version: 1, file: '/elsewhere.jsonl', pid: 4242, state: 'retired' }))
+    assert.equal((await header(() => true)).listener, undefined, "another file's lease says nothing about this one")
+  })
+
+  it('a page that says to start a listener still fits one Shell output, its wakes whole', () => {
+    const listener = listenerAdvice({ pid: 1, state: 'retired' }, '/var/tmp/devspec-wakes/6f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f.jsonl')
+    const wakes = [wakeLines(commandOfLength(CURSOR_SHELL_OUTPUT_MAX_CHARS - readerHeader(1, 1).length, 1)), wakeLines(command(2))]
+    const page = readerPage(wakes, { listener, home: connected().home })
+    assert.ok(fitsShellOutput(page.text))
+    assert.equal(JSON.parse(page.text.slice(0, page.text.indexOf('\n'))).listener.status, 'stopped')
+    assert.equal(page.printed + page.remaining, 2)
+  })
+
+  it('where a new listener starts: after what a handing-over listener announced, else after what the reader printed', () => {
+    assert.equal(startOffset(null, 40, 100), 40)
+    assert.equal(startOffset({ state: 'listening', announced_through: 90 }, 40, 100), 40)
+    assert.equal(startOffset({ state: 'relief', announced_through: 90 }, 40, 100), 90)
+    assert.equal(startOffset({ state: 'retired', announced_through: 90 }, 95, 100), 95)
+    assert.equal(startOffset({ state: 'retired', announced_through: 90 }, 40, 50), 0, 'a file shorter than both starts again from its beginning')
   })
 })
