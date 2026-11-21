@@ -101,7 +101,8 @@ import {
   turnWakeFromEvents,
 } from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
-import { recallConversation, recallWakeOut, settleRecallHandover, withTurnRecall } from './turn-recall.mjs'
+import { recallConversation, recallWakeOut, settleRecallHandover } from './turn-recall.mjs'
+import { turnFailureNotice } from './turn-failure.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
@@ -1388,15 +1389,7 @@ export function materialiseAttachments(message, opts = {}) {
  * stream had no live signal for which session a command belonged to and fell back to a
  * value cached at attach time — stale after a server-side reattach.
  */
-export function buildOwnerMessageEvents(batch, opts = {}) {
-  // A command or an automation run brings the project recall DevSpec attached to it,
-  // after the command and whole: inline, or as a pointer to a note, when the whole wake
-  // still fits; otherwise inline, and the whole wake goes out in one note
-  // (turn-recall.mjs). Nothing else carries one.
-  return withTurnRecall(commandWakeEvents(batch, opts), batch?.turn_recall, opts.home ? { home: opts.home } : {})
-}
-
-function commandWakeEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
+export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
   if (batch?.type === 'canonical_system_notices' || batch?.type === 'system_notices') {
     return buildCanonicalSystemNoticeEvents(batch, { inboxFile })
   }
@@ -1586,6 +1579,56 @@ function commandWakeEvents(batch, { inboxFile, attachmentDir, writeFile, unread 
   return events
 }
 
+/** The command a held wake carries, as the room knows it: its acceptance key, else its first message's id. */
+function heldWakeKey(batch) {
+  if (typeof batch?.acceptance_key === 'string' && batch.acceptance_key) return batch.acceptance_key
+  const first = Array.isArray(batch?.messages) ? batch.messages[0] : null
+  return String(first?.message_id ?? first?.id ?? first?.run_id ?? first?.check_job_id ?? '')
+}
+
+/** What the room is told when a command cannot reach the agent yet. */
+export function wakeHeldMessage(agentName, error) {
+  const why = error instanceof Error ? error.message : String(error ?? 'unknown error')
+  return (
+    `${agentName} couldn't receive a message from this room yet. It is too long for Cursor to show whole, so it goes into a file first, ` +
+    `and that file couldn't be saved on the computer ${agentName} is running on (${why.slice(0, 300)}). ` +
+    `It keeps trying, and the message reaches ${agentName} as soon as the file can be saved.`
+  )
+}
+
+/**
+ * Tell the room, once per command (`told`), that the wake carrying it is held because
+ * its note could not be written, through the plugin's room notice (`turnFailureNotice`,
+ * turn-failure.mjs: by `session_id`, tied to no turn). A connection with no room has
+ * no one to tell; the wait's log has it. A post that fails is tried again next lap.
+ */
+export async function tellRoomWakeHeld({ connectionId, batch, state, error, told, call = mcpToolsCall }) {
+  const key = heldWakeKey(batch)
+  if (!key || told.has(key)) return false
+  const sessionId = batch?.session_id ?? state?.session_id ?? null
+  if (!sessionId) {
+    told.add(key)
+    return false
+  }
+  const credential = state ? connectionCredential(state) : { ok: false }
+  if (!credential.ok || !credential.token) return false
+  const agentName = state?.agent_name || AGENT_NAME
+  try {
+    await call({
+      mcpUrl: credential.mcp_url || state?.mcp_url,
+      token: credential.token,
+      name: 'post_session_message',
+      arguments: turnFailureNotice({ sessionId, agentName, message: wakeHeldMessage(agentName, error) }),
+      timeoutMs: 15_000,
+    })
+  } catch (e) {
+    process.stderr.write(`devspec-remote-wait: could not tell the room a wake is held: ${e instanceof Error ? e.message : String(e)}\n`)
+    return false
+  }
+  told.add(key)
+  return true
+}
+
 async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
@@ -1672,6 +1715,9 @@ async function main() {
     })
   }
 
+  // Room commands the room has already been told cannot reach the agent yet
+  // (`tellRoomWakeHeld`), so it is told once per command, not every lap.
+  const heldTold = new Set()
   let sawLive = Boolean(
     state &&
       state.enabled !== false &&
@@ -1769,9 +1815,23 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
-        // What goes out: the wake as built when Cursor shows it whole, otherwise the whole
-        // wake kept in one sealed note with a short line in its place (turn-recall.mjs).
-        const out = recallWakeOut(built)
+        // What goes out, with the project recall DevSpec attached to a command or an
+        // automation run: the wake as it is when Cursor shows it whole, otherwise kept
+        // whole in one sealed note with a short line in its place (turn-recall.mjs). A
+        // wake that needs its note to arrive whole is held when the note cannot be
+        // written: not sent, the inbox cursor not moved, nothing counted as shown. It is
+        // tried again every lap until it goes, with no cap: notes live in the same home
+        // folder as the wake file, so this is a disk problem that clears, and the room is
+        // told once (`tellRoomWakeHeld`).
+        const out = recallWakeOut(built, batch?.turn_recall)
+        if (out.held) {
+          process.stderr.write(
+            `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${out.held instanceof Error ? out.held.message : String(out.held)}); trying again\n`,
+          )
+          await tellRoomWakeHeld({ connectionId, batch, state: live, error: out.held, told: heldTold })
+          await sleep(pollMs)
+          continue
+        }
         const events = out.events
         // Dequeue only after the entire one-command-turn payload reached stdout.
         for (const event of events) await emitStdoutEvent(event)
@@ -1800,7 +1860,7 @@ async function main() {
         recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
-        recordTurnWake(connectionId, turnWakeFromEvents(built), { dir: CONNECTIONS_DIR })
+        recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
         // The recall this wake carried counts as shown now if it went inline, or once the
         // agent has read its note (its own, or the whole wake's) whole; until then the
         // next command's recall can offer those records again (turn-recall.mjs).

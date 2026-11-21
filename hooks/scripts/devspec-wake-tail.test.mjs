@@ -77,7 +77,7 @@ describe('what one print of the wake tail hands Cursor', () => {
       formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 160 }, (_, i) => `- [REQUIREMENT] **Requirement ${n}.${i}** governs the settings page redirect (get_requirement({ id: "${i}" }))`).join('\n')}`,
       seen_keys: [`memory:00000000-0000-4000-8000-00000000000${n}:v1`],
     }
-    return { command, withRecall: mod.withTurnRecall(command, recall, { home }) }
+    return { command, withRecall: mod.recallWakeOut(command, recall, { home }).events }
   }
 
   it('two wakes that fit together without recall, and each fit with its recall pointer, go out in two prints, each within the limit, nothing lost', async () => {

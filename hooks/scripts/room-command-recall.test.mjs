@@ -40,7 +40,7 @@ import {
 } from './remote-ingress-test-fixtures.mjs'
 import { resolveSpaceFreeWakeFile, wakeLines } from './devspec-wake-file.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
-import { seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
+import { RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
 import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -129,6 +129,7 @@ function checkJob() {
 /** A stub DevSpec that serves queued poll responses, one per poll, and records every poll's arguments. */
 async function stubDevSpec() {
   const polls = []
+  const calls = []
   const queue = []
   let idleCursor = { cursor: null, cursor_v2: null, dispatch_cursor: null }
   const server = http.createServer((request, response) => {
@@ -139,6 +140,7 @@ async function stubDevSpec() {
       const parsed = JSON.parse(body)
       const name = parsed.params?.name
       const args = parsed.params?.arguments ?? {}
+      calls.push({ name, args })
       let result = {}
       if (name === 'poll_connection') {
         polls.push(args)
@@ -163,6 +165,7 @@ async function stubDevSpec() {
   return {
     url: `http://127.0.0.1:${server.address().port}/mcp`,
     polls,
+    named: (name) => calls.filter((call) => call.name === name).map((call) => call.args),
     serve: (payload) => queue.push(payload),
     close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) }),
   }
@@ -201,6 +204,30 @@ async function startPoller({ beforeStart } = {}) {
     stub,
     stderr: () => stderr,
     records,
+    /** The wait, started on the inbox and left running: what it printed so far, and its exit. */
+    startWait() {
+      const wait = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--poll-ms', '20'], {
+        env: { ...process.env, HOME: home },
+      })
+      let out = ''
+      let err = ''
+      wait.stdout.on('data', (chunk) => { out += chunk })
+      wait.stderr.on('data', (chunk) => { err += chunk })
+      const exited = new Promise((resolve) => wait.once('close', resolve))
+      return {
+        stdout: () => out,
+        stderr: () => err,
+        events: () => out.split('\n').filter(Boolean).map((line) => JSON.parse(line)),
+        exited,
+        kill: () => wait.kill('SIGKILL'),
+      }
+    },
+    /** The connection's state file, as the wait reads it. */
+    state: () => JSON.parse(fs.readFileSync(path.join(dir, `${CONNECTION}.json`), 'utf8')),
+    patchState: (patch) => {
+      const file = path.join(dir, `${CONNECTION}.json`)
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), ...patch }), { mode: 0o600 })
+    },
     /** What the wait hands Cursor for the next wake in the inbox, as the events it writes. */
     async nextWake() {
       const wait = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--poll-ms', '20'], {
@@ -414,6 +441,99 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(await until(() => run.records().some((r) => r.type === 'automation_dispatches')), `not kept; stderr:\n${run.stderr()}`)
       assert.equal(run.records().find((r) => r.type === 'owner_messages').turn_recall.formatted_block, recall(5).formatted_block)
       assert.equal(run.records().find((r) => r.type === 'automation_dispatches').turn_recall, undefined)
+    } finally {
+      await run.cleanup()
+    }
+  })
+})
+
+describe('when notes cannot be written (a disk problem in the home folder)', () => {
+  const ROOM = fixtureUuid(990)
+  /** Make ~/.devspec/notes unwritable: a file where the folder should be. Returns the undo. */
+  function breakNotes(home) {
+    const notes = path.join(home, '.devspec', 'notes')
+    fs.rmSync(notes, { recursive: true, force: true })
+    fs.writeFileSync(notes, 'a file where the folder should be')
+    return () => fs.rmSync(notes, { force: true })
+  }
+  const big = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 300 }, (_, i) => `- [REQUIREMENT] **Requirement ${n}.${i}** governs the settings page redirect`).join('\n')}` })
+
+  for (const [label, target, turnRecall] of [
+    ['19,990 characters with its recall', 19_990, (n) => recall(n)],
+    ['25,300 characters with no recall', 25_300, () => undefined],
+  ]) {
+    it(`holds a command of ${label}: nothing is sent, the cursor stays, the room is told once, and it goes out whole once notes can be written`, async () => {
+      const run = await startPoller()
+      try {
+        assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+        run.stub.serve(commandPoll(1, 'a'.repeat(100)))
+        assert.ok(await until(() => run.records().length === 1))
+        const around = wakeLines(await run.nextWake()).length - 2 * 100
+        const body = 'a'.repeat(Math.floor((target - around - 2) / 2))
+        const offsetBefore = run.state().inbox_byte_offset
+        run.patchState({ session_id: ROOM })
+        const restore = breakNotes(run.home)
+        const n = target === 19_990 ? 20 : 21
+        run.stub.serve(commandPoll(2, body, turnRecall(n) ? { turn_recall: turnRecall(n) } : {}))
+        assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+
+        const wait = run.startWait()
+        assert.ok(await until(() => (wait.stderr().match(/holding a wake/g) ?? []).length >= 5), `not held; stderr:\n${wait.stderr()}`)
+        assert.equal(wait.stdout(), '', 'nothing is sent')
+        assert.equal(run.state().inbox_byte_offset, offsetBefore, 'the inbox cursor stays where it was')
+        assert.equal(run.stub.named('post_session_message').length, 1, 'the room is told once, not every try')
+        const told = run.stub.named('post_session_message')[0]
+        assert.equal(told.session_id, ROOM)
+        assert.match(told.message, /couldn't receive a message from this room yet/)
+        assert.match(told.message, /keeps trying/)
+        assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
+
+        restore()
+        const code = await Promise.race([wait.exited, sleep(10_000).then(() => 'timeout')])
+        assert.equal(code, 0, `not sent once notes could be written; stderr:\n${wait.stderr()}`)
+        const [line, ...rest] = wait.events()
+        assert.deepEqual(rest, [])
+        assert.equal(line.type, 'wake_in_note')
+        const inNote = readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(line.read)[1], { home: run.home }).split('\n').filter(Boolean).map((l) => JSON.parse(l))
+        assert.equal(inNote.find((e) => e.type === 'owner_message').body, body, 'the command, byte for byte')
+        if (turnRecall(n)) assert.equal(inNote.find((e) => e.type === 'turn_recall').block, recall(n).formatted_block)
+        assert.equal(run.stub.named('post_session_message').length, 1)
+      } finally {
+        await run.cleanup()
+      }
+    })
+  }
+
+  it('sends a small command whose recall needed a note at once, with a line saying its recall could not be saved, and counts nothing as shown', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      run.patchState({ session_id: ROOM })
+      breakNotes(run.home)
+      run.stub.serve(commandPoll(1, 'Which requirements govern the settings page?', { turn_recall: big(22) }))
+      assert.ok(await until(() => run.records().length === 1), `not kept; stderr:\n${run.stderr()}`)
+      const events = await run.nextWake()
+      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'turn_recall', 'wake'])
+      assert.equal(events[0].body, 'Which requirements govern the settings page?')
+      assert.equal(events[1].note, RECALL_UNSAVED_NOTE)
+      assert.equal(events[1].block, undefined)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'its records come with the next command')
+      assert.equal(run.stub.named('post_session_message').length, 0, 'nothing held, nothing to tell')
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('sends a command that fits with no recall as usual: it needs no note', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      breakNotes(run.home)
+      run.stub.serve(commandPoll(1, 'Why does the settings page redirect to login?'))
+      assert.ok(await until(() => run.records().length === 1), `not kept; stderr:\n${run.stderr()}`)
+      const events = await run.nextWake()
+      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'wake'])
+      assert.equal(events[0].body, 'Why does the settings page redirect to login?')
     } finally {
       await run.cleanup()
     }

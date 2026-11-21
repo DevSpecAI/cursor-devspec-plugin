@@ -23,15 +23,18 @@ import {
   noteRecallReads,
   RECALL_INLINE_NOTE,
   RECALL_POINTER_NOTE,
+  RECALL_UNSAVED_NOTE,
   recallWakeOut,
   rememberShown,
   SEEN_STORE,
   seenRecallKeys,
   seenStoreFile,
   settleRecallHandover,
-  withTurnRecall,
 } from './turn-recall.mjs'
 import { catCall, noteFiles, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
+
+/** The wake as built with its recall placed, before any whole-wake note: what the old withTurnRecall gave. */
+const placed = (events, recall, opts) => recallWakeOut(events, recall, opts).full
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HOOKS_JSON = path.join(PLUGIN_ROOT, 'hooks', 'hooks.json')
@@ -217,7 +220,7 @@ describe('a wake that carries the recall', () => {
   it('puts it right after the command, ahead of the room notes and the wake line, when the whole wake still reaches the agent whole', () => {
     const home = tempHome()
     try {
-      const events = withTurnRecall(wake(), recall(), { home })
+      const events = placed(wake(), recall(), { home })
       assert.deepEqual(events.map((event) => event.type), ['owner_message', 'turn_recall', 'room_unread', 'wake'])
       const carried = events[1]
       assert.equal(carried.block, recall().formatted_block)
@@ -236,7 +239,7 @@ describe('a wake that carries the recall', () => {
         { type: 'automation_dispatch', session_id: null, dispatch: { run_id: 'r1' }, instruction: 'Run the nightly dependency review' },
         { type: 'wake', reason: 'automation_dispatch', session_id: null, count: 1 },
       ]
-      assert.deepEqual(withTurnRecall(run, recall(), { home }).map((event) => event.type), ['automation_dispatch', 'turn_recall', 'wake'])
+      assert.deepEqual(placed(run, recall(), { home }).map((event) => event.type), ['automation_dispatch', 'turn_recall', 'wake'])
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
@@ -253,12 +256,12 @@ describe('a wake that carries the recall', () => {
         { type: 'system_notice', notice_id: 'n1', kind: 'server_notice', content: 'A finding on your work' },
         { type: 'wake', reason: 'exact_connection_system_notice', count: 1 },
       ]
-      assert.deepEqual(withTurnRecall(checkJob, recall(), { home }), checkJob)
-      assert.deepEqual(withTurnRecall(notice, recall(), { home }), notice)
-      assert.equal(settleRecallHandover('chat-1', recallWakeOut(checkJob, { home }), { turn_recall: recall() }, { home }), 'none')
+      assert.deepEqual(placed(checkJob, recall(), { home }), checkJob)
+      assert.deepEqual(placed(notice, recall(), { home }), notice)
+      assert.equal(settleRecallHandover('chat-1', recallWakeOut(checkJob, recall(), { home }), { turn_recall: recall() }, { home }), 'none')
       assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
       // And a wake with no recall is left exactly as it was.
-      assert.deepEqual(withTurnRecall(wake(), null, { home }), wake())
+      assert.deepEqual(placed(wake(), null, { home }), wake())
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
@@ -271,7 +274,7 @@ describe('a wake that carries the recall', () => {
       const lines = Array.from({ length: 400 }, (_, n) => `- [REQUIREMENT] **Requirement ${n}** — ${'governs the change; '.repeat(4)}(get_requirement({ id: "${n}" }))`)
       const block = `== PROACTIVE PROJECT RECALL ==\n${lines.join('\n')}`
       assert.ok(block.length > 40_000)
-      const events = withTurnRecall(wake(), recall({ block }), { home })
+      const events = placed(wake(), recall({ block }), { home })
       const carried = events.find((event) => event.type === 'turn_recall')
       assert.equal(carried.block, undefined)
       assert.match(carried.read, /^cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md$/)
@@ -293,9 +296,9 @@ describe('a wake that carries the recall', () => {
       const block = `== PROACTIVE PROJECT RECALL ==\n${lines.join('\n')}`
       // The command fits on its own, and the recall would fit a wake on its own, but not both.
       assert.ok(fitsShellOutput(wakeLines(wake(body))))
-      assert.ok(fitsShellOutput(wakeLines(withTurnRecall(wake(), recall({ block }), { home }))))
+      assert.ok(fitsShellOutput(wakeLines(placed(wake(), recall({ block }), { home }))))
       assert.ok(wakeLines(wake(body)).length + block.length > 20_000)
-      const events = withTurnRecall(wake(body), recall({ block }), { home })
+      const events = placed(wake(body), recall({ block }), { home })
       const carried = events.find((event) => event.type === 'turn_recall')
       assert.equal(carried.block, undefined)
       assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md/.exec(carried.read)[1], { home }), block)
@@ -311,7 +314,7 @@ describe('a wake that carries the recall', () => {
       // 14,000 characters, but over 40,000 bytes once written into the wake.
       const block = `== PROACTIVE PROJECT RECALL ==\n${'要件は変更を管理します。'.repeat(1_160)}`
       assert.ok(block.length < 20_000 && Buffer.byteLength(block) > 40_000)
-      const events = withTurnRecall(wake(), recall({ block }), { home })
+      const events = placed(wake(), recall({ block }), { home })
       const carried = events.find((event) => event.type === 'turn_recall')
       assert.equal(carried.block, undefined)
       assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md/.exec(carried.read)[1], { home }), block)
@@ -320,15 +323,42 @@ describe('a wake that carries the recall', () => {
     }
   })
 
-  it('sends the command as it was when no note can be written: never part of the recall, and never a longer command', () => {
+  it('when no note can be written: a command that fits goes with one short line saying its recall could not be saved, and nothing is shown', () => {
     const home = tempHome()
     try {
       fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
       const block = `== PROACTIVE PROJECT RECALL ==\n${'x'.repeat(30_000)}`
-      const out = recallWakeOut(withTurnRecall(wake(), recall({ block }), { home }), { home })
-      assert.deepEqual(out.events, wake())
-      assert.equal(out.note, null)
-      assert.equal(settleRecallHandover('chat-1', out, { turn_recall: recall({ block }) }, { home }), 'none')
+      const batch = { turn_recall: recall({ block }) }
+      const out = recallWakeOut(wake(), batch.turn_recall, { home })
+      assert.equal(out.recall, 'unsaved')
+      assert.deepEqual(out.events.map((event) => event.type), ['owner_message', 'turn_recall', 'room_unread', 'wake'])
+      assert.deepEqual(out.events[1], { type: 'turn_recall', note: RECALL_UNSAVED_NOTE })
+      // The line is no longer than the pointer it stands in for, so it fits wherever that would have.
+      const pointer = { type: 'turn_recall', read: `cat ~/.devspec/notes/${'0'.repeat(16)}.md`, note: RECALL_POINTER_NOTE }
+      assert.ok(JSON.stringify(out.events[1]).length <= JSON.stringify(pointer).length)
+      assert.deepEqual(out.events.filter((event) => event.type !== 'turn_recall'), wake(), 'the command as it is')
+      assert.equal(settleRecallHandover('chat-1', out, batch, { home }), 'none')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
+      // A command that fits, with no recall, goes as it is: it needs no note.
+      assert.deepEqual(recallWakeOut(wake(), null, { home }).events, wake())
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('when no note can be written and the command itself needs one to arrive whole (19,990 with recall, 25,300 alone): held, nothing goes out', () => {
+    const home = tempHome()
+    try {
+      fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
+      const near = recallWakeOut(wakeOfLength(19_990), mediumRecall(), { home })
+      assert.ok(near.held instanceof Error)
+      assert.equal(near.events, undefined)
+      const over = recallWakeOut(wakeOfLength(25_300), null, { home })
+      assert.ok(over.held instanceof Error)
+      // Once storage can be written again, the same wakes go out whole in their notes.
+      fs.rmSync(path.join(home, '.devspec'), { force: true })
+      assert.equal(recallWakeOut(wakeOfLength(19_990), mediumRecall(), { home }).recall, 'whole')
+      assert.equal(recallWakeOut(wakeOfLength(25_300), null, { home }).events[0].type, 'wake_in_note')
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
@@ -368,9 +398,9 @@ describe('a command wake near Cursor\'s limit', () => {
     try {
       const command = wakeOfLength(19_990)
       for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
-        const full = withTurnRecall(command, each, { home })
+        const out = recallWakeOut(command, each, { home })
+        const full = out.full
         assert.deepEqual(full.map((event) => event.type), ['owner_message', 'turn_recall', 'room_unread', 'wake'])
-        const out = recallWakeOut(full, { home })
         assert.equal(out.events.length, 1)
         const [line] = out.events
         assert.equal(line.type, 'wake_in_note')
@@ -390,9 +420,9 @@ describe('a command wake near Cursor\'s limit', () => {
   it('leaves a wake that fits unchanged, and keeps any wake too long on its own whole in a note, with or without recall', () => {
     const home = tempHome()
     try {
-      assert.deepEqual(recallWakeOut(wake(), { home }), { events: wake(), note: null, full: wake() })
+      assert.deepEqual(recallWakeOut(wake(), null, { home }), { events: wake(), note: null, full: wake(), recall: 'none' })
       const notice = [{ type: 'system_notice', notice_id: 'n1', content: 'finding '.repeat(4_000) }, { type: 'wake' }]
-      const out = recallWakeOut(notice, { home })
+      const out = recallWakeOut(notice, null, { home })
       assert.deepEqual(out.events[0].carries, ['system_notice', 'wake'])
       assert.equal(wakeNote(out, home), wakeLines(notice))
     } finally {
@@ -407,8 +437,8 @@ describe('a command wake near Cursor\'s limit', () => {
       for (let chars = 17_000; chars <= 20_000; chars += 97) {
         const command = wakeOfLength(chars)
         for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
-          const full = withTurnRecall(command, each, { home })
-          const out = recallWakeOut(full, { home })
+          const out = recallWakeOut(command, each, { home })
+          const full = out.full
           assert.ok(fitsShellOutput(wakeLines(out.events)), `a ${chars}-character command wake went out past the limit`)
           // The command's own events are untouched, in order, in the wake or in its note.
           assert.deepEqual(full.filter((event) => event.type !== 'turn_recall'), command)
@@ -444,7 +474,7 @@ describe('a command wake near Cursor\'s limit', () => {
       const command = wake(body)
       assert.ok(fitsShellOutput(wakeLines(command)))
       for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
-        const out = recallWakeOut(withTurnRecall(command, each, { home }), { home })
+        const out = recallWakeOut(command, each, { home })
         assert.ok(fitsShellOutput(wakeLines(out.events)))
         const text = out.note ? wakeNote(out, home) : wakeLines(out.events)
         assert.ok(text.includes(JSON.stringify(body)))
@@ -475,10 +505,10 @@ describe('what counts as shown', () => {
     const home = tempHome()
     try {
       const batch = { turn_recall: recall({ keys: [key(1), key(2)] }) }
-      assert.equal(settleRecallHandover('chat-1', recallWakeOut(withTurnRecall(wake(), batch.turn_recall, { home }), { home }), batch, { home }), 'shown')
+      assert.equal(settleRecallHandover('chat-1', recallWakeOut(wake(), batch.turn_recall, { home }), batch, { home }), 'shown')
       assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(1), key(2)])
       // A wake with no command to recall for (a check job, a notice) settles nothing.
-      assert.equal(settleRecallHandover('chat-2', recallWakeOut([{ type: 'check_job' }, { type: 'wake' }], { home }), batch, { home }), 'none')
+      assert.equal(settleRecallHandover('chat-2', recallWakeOut([{ type: 'check_job' }, { type: 'wake' }], batch.turn_recall, { home }), batch, { home }), 'none')
       assert.deepEqual(seenRecallKeys('chat-2', { home }), [])
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
@@ -489,7 +519,7 @@ describe('what counts as shown', () => {
     const home = tempHome()
     try {
       const batch = { turn_recall: { ...largeRecall(), seen_keys: [key(3), key(4)] } }
-      const out = recallWakeOut(withTurnRecall(wake(), batch.turn_recall, { home }), { home })
+      const out = recallWakeOut(wake(), batch.turn_recall, { home })
       const id = noteIdIn(out.events.find((event) => event.type === 'turn_recall').read)
       const files = noteFiles(home, id)
       assert.ok(files.length > 1)
@@ -521,8 +551,8 @@ describe('what counts as shown', () => {
       const second = { turn_recall: { ...largeRecall(), seen_keys: [key(7)] } }
       const commandA = wakeOfLength(19_990)
       const commandB = wakeOfLength(19_990, 'b')
-      const outA = recallWakeOut(withTurnRecall(commandA, first.turn_recall, { home }), { home })
-      const outB = recallWakeOut(withTurnRecall(commandB, second.turn_recall, { home }), { home })
+      const outA = recallWakeOut(commandA, first.turn_recall, { home })
+      const outB = recallWakeOut(commandB, second.turn_recall, { home })
       assert.notEqual(outA.note.id, outB.note.id, 'each wake has its own note')
       assert.equal(settleRecallHandover('chat-1', outA, first, { home }), 'awaiting_read')
       assert.equal(settleRecallHandover('chat-1', outB, second, { home }), 'awaiting_read')
@@ -544,7 +574,7 @@ describe('what counts as shown', () => {
     const home = tempHome()
     try {
       const batch = { turn_recall: { ...mediumRecall(), seen_keys: [key(5)] } }
-      const out = recallWakeOut(withTurnRecall(wakeOfLength(19_000), batch.turn_recall, { home }), { home })
+      const out = recallWakeOut(wakeOfLength(19_000), batch.turn_recall, { home })
       const id = noteIdIn(out.events.find((event) => event.type === 'turn_recall').read)
       assert.equal(settleRecallHandover('chat-1', out, batch, { home }), 'awaiting_read')
       const [file] = noteFiles(home, id)

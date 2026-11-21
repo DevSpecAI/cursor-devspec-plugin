@@ -664,12 +664,15 @@ describe('wakeWithin, one wake as it goes out', () => {
     }
   })
 
-  it('leaves the wake as it was when the note cannot be written', () => {
+  it('says why when the note cannot be written, so the caller can hold the wake rather than send it to be cut', () => {
     const home = tmp()
     try {
       fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
       const big = [{ type: 'owner_message', body: 'x'.repeat(30_000) }, { type: 'wake' }]
-      assert.deepEqual(wakeWithin(big, { home }), { events: big, note: null })
+      const out = wakeWithin(big, { home })
+      assert.equal(out.note, null)
+      assert.ok(out.error instanceof Error)
+      assert.equal(out.events, big)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

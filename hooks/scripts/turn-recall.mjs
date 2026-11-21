@@ -36,7 +36,11 @@
  * saying so and how to read it (`recallWakeOut`, `wakeWithin`); the same holds for any
  * wake too long to show whole, with or without recall. The agent sees that line before
  * it does anything, and each wake points at its own note, so nothing displaces
- * anything. The reader that prints the wake file hands Cursor whole wakes only, as many
+ * anything. A note that cannot be written never costs the command: a recall that needed
+ * one gives way to a short line saying it could not be saved this time (its records
+ * stay unshown, so the next command brings them), and a wake that needs its own note to
+ * arrive whole is held and tried again until it can be written, with the room told
+ * (devspec-remote-wait.mjs). The reader that prints the wake file hands Cursor whole wakes only, as many
  * as fit one output together (`wakesForOneOutput`, devspec-wake-tail.mjs).
  *
  * What counts as shown (`settleRecallHandover`): a recall that went inline, once its
@@ -272,20 +276,36 @@ export const RECALL_INLINE_NOTE = 'Project records DevSpec recalled for the comm
  */
 export const RECALL_POINTER_NOTE = 'DevSpec recall for the command above: run `read`, and each part it names, before acting.'
 
+/** What the wake says when a recall that needed a note could not be saved: short enough to fit wherever its pointer would have. */
+export const RECALL_UNSAVED_NOTE = 'DevSpec recall for the command above could not be saved this time; it comes with the next command.'
+
 /**
- * `events`, one wake's events in the order they are written, with the batch's recall
- * after its last command, sized with the whole wake by the plugin's one wake sizer
- * (`fitIntoWake`, hook-context-budget.mjs): inline when the whole wake with it still
- * reaches the model whole; otherwise a short pointer to a note that keeps it whole,
- * when the whole wake with the pointer still does. Otherwise the recall goes inline
- * all the same, and the whole wake, command and recall together, goes out in one note
- * (`recallWakeOut`). `events` unchanged when there is no recall or no command to follow.
+ * One wake as it goes out, `base` being its events without recall, in the order they
+ * are written, and `recall` the batch's `turn_recall`. Sized as a whole wake by the
+ * plugin's sizers (`fitIntoWake`, `wakeWithin`, hook-context-budget.mjs), cheapest
+ * first:
+ * - `'inline'`: the recall after the last command, when the whole wake still fits;
+ * - `'pointer'`: a short pointer to a note that keeps the recall whole, when that fits;
+ * - `'whole'`: otherwise the whole wake, the command and its recall inline, kept in
+ *   one sealed note, and a single `wake_in_note` line in its place;
+ * - `'none'`: no recall, and the wake as it is, or whole in a note when too long.
+ * When a note is needed and cannot be written, the recall (advisory) gives way, never
+ * the command: the command goes as it is with one short line saying its recall could
+ * not be saved this time (`'unsaved'`), when that fits. When the command itself needs
+ * the note to arrive whole, the result is `{ held: error }`: nothing goes out, and the
+ * caller tries again later (devspec-remote-wait.mjs).
+ * Returns `{ events, note, full, recall }` otherwise: what goes out, the whole-wake note
+ * when there is one, the wake it stands for, and the route the recall took.
  */
-export function withTurnRecall(events, recall, { home = os.homedir() } = {}) {
+export function recallWakeOut(base, recall, { home = os.homedir() } = {}) {
+  const events = Array.isArray(base) ? base : []
   const deliverable = deliverableRecall(recall)
-  if (!deliverable || !Array.isArray(events)) return events
   const at = events.findLastIndex((event) => COMMAND_EVENTS.has(event?.type)) + 1
-  if (at === 0) return events
+  if (!deliverable || at === 0) {
+    const out = wakeWithin(events, { home })
+    return out.error ? { held: out.error } : { events: out.events, note: out.note, full: events, recall: 'none' }
+  }
+  const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
   const inline = (block) => ({ type: 'turn_recall', note: RECALL_INLINE_NOTE, block })
   const placed = fitIntoWake(events, {
     at,
@@ -294,21 +314,18 @@ export function withTurnRecall(events, recall, { home = os.homedir() } = {}) {
     pointer: (note) => ({ type: 'turn_recall', read: note.command, note: RECALL_POINTER_NOTE }),
     home,
   })
-  return placed.route === 'none' ? [...events.slice(0, at), inline(deliverable.formatted_block), ...events.slice(at)] : placed.events
-}
-
-/**
- * One wake as it goes out (`wakeWithin`, hook-context-budget.mjs): as it is when it
- * fits Cursor's rules on one output, otherwise kept whole in one sealed note with a
- * short line in its place. Returns `{ events, note, full }`: what goes out, the note
- * when there is one, and the wake it stands for. When that note cannot be written, a
- * recall never makes the command longer than it was: the command goes without it.
- */
-export function recallWakeOut(events, { home = os.homedir() } = {}) {
-  const out = wakeWithin(events, { home })
-  if (out.note || fitsShellOutput(wakeLines(out.events))) return { ...out, full: events }
-  const bare = events.filter((event) => event?.type !== 'turn_recall')
-  return { events: bare, note: null, full: bare }
+  if (placed.route === 'inline') return { events: placed.events, note: null, full: placed.events, recall: 'inline' }
+  if (placed.route === 'note') return { events: placed.events, note: null, full: placed.events, recall: 'pointer' }
+  let error = placed.error
+  if (!error) {
+    const whole = place(inline(deliverable.formatted_block))
+    const out = wakeWithin(whole, { home })
+    if (!out.error) return { events: out.events, note: out.note, full: whole, recall: 'whole' }
+    error = out.error
+  }
+  const unsaved = place({ type: 'turn_recall', note: RECALL_UNSAVED_NOTE })
+  if (fitsShellOutput(wakeLines(unsaved))) return { events: unsaved, note: null, full: unsaved, recall: 'unsaved' }
+  return { held: error }
 }
 
 /** The note a wake points its recall to, or null when the recall went inline or not at all. */
@@ -375,16 +392,18 @@ function sweepPending(home, now) {
  * - inline in the wake: its records are shown now (`'shown'`);
  * - a pointer in the wake, or the whole wake in a note: they wait until the agent has
  *   read that note whole (`'awaiting_read'`; `noteRecallReads`). Each wake points at its
- *   own note, so nothing replaces anything.
- * Returns `'none'` when there was nothing to settle or it could not be recorded; that
- * only means the records may be offered again.
+ *   own note, so nothing replaces anything;
+ * - not carried, or not saved: nothing is shown, so the next command's recall offers
+ *   them again (`'none'`).
+ * `'none'` too when it could not be recorded; that only means the records may be
+ * offered again.
  */
 export function settleRecallHandover(conversation, out, batch, { home = os.homedir(), now = Date.now() } = {}) {
   const keys = deliverableRecall(batch?.turn_recall)?.seen_keys ?? []
-  const full = Array.isArray(out?.full) ? out.full : []
-  if (!conversation || keys.length === 0 || !full.some((event) => event?.type === 'turn_recall')) return 'none'
-  const note = out.note?.id ?? recallNoteOf(full)
-  if (!note) return rememberShown(conversation, keys, { home, now }) ? 'shown' : 'none'
+  if (!conversation || keys.length === 0) return 'none'
+  if (out?.recall === 'inline') return rememberShown(conversation, keys, { home, now }) ? 'shown' : 'none'
+  const note = out?.recall === 'whole' ? out.note?.id : out?.recall === 'pointer' ? recallNoteOf(out.events) : null
+  if (!note) return 'none'
   try {
     sweepPending(home, now)
     const record = { version: STORE_VERSION, conversation, note, keys, parts: [], at: new Date(now).toISOString() }

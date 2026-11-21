@@ -806,9 +806,10 @@ const SAME_LENGTH_NOTE = '0'.repeat(16)
  * - otherwise nothing is added: what was already in the wake is never pushed past
  *   Cursor's rules, and a wake that was over them before is left as it was.
  *
- * Returns `{ events, route, note }`: `route` is `'inline'`, `'note'` (with the `note`
- * from `writeNote`) or `'none'`, when nothing fitted or the note could not be written.
- * The caller keeps whatever it could not add, to offer again or let go.
+ * Returns `{ events, route, note, error }`: `route` is `'inline'`, `'note'` (with the
+ * `note` from `writeNote`) or `'none'`, when nothing fitted, or when the note could not
+ * be written (`error` says why). The caller decides what to do with what it could not
+ * add.
  */
 export function fitIntoWake(events, { text, inline, pointer, at = events.length, home = os.homedir() }) {
   const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
@@ -822,8 +823,8 @@ export function fitIntoWake(events, { text, inline, pointer, at = events.length,
   let note
   try {
     note = writeNote(text, { home })
-  } catch {
-    return none
+  } catch (error) {
+    return { ...none, error }
   }
   const pointed = place(pointer(note))
   return fits(pointed) ? { events: pointed, route: 'note', note } : none
@@ -862,8 +863,10 @@ export const WAKE_IN_NOTE =
  * agent whole), and in its place a single short line that says so, names what the wake
  * carries (`carries`: its events' types, which the reader's notification pattern
  * matches) and gives the command that reads it. Each wake has its own note, named by
- * its own content. Returns `{ events, note }`, `note` null when the wake went out as it
- * was. A note that cannot be written leaves `events` as they were, as before this rule.
+ * its own content. Returns `{ events, note }`, `note` null when the wake goes out as it
+ * is. When the note cannot be written, `{ events, note: null, error }`: the wake needs
+ * the note to arrive whole, so the caller holds it (devspec-remote-wait.mjs) rather
+ * than send it to be cut.
  */
 export function wakeWithin(events, { home = os.homedir() } = {}) {
   const text = wakeLines(events)
@@ -871,8 +874,8 @@ export function wakeWithin(events, { home = os.homedir() } = {}) {
   let note
   try {
     note = writeNote(text, { home })
-  } catch {
-    return { events, note: null }
+  } catch (error) {
+    return { events, note: null, error }
   }
   const carries = [...new Set(events.map((event) => String(event?.type ?? '')).filter(Boolean))]
   return { events: [{ type: 'wake_in_note', carries, read: note.command, note: WAKE_IN_NOTE }], note }
