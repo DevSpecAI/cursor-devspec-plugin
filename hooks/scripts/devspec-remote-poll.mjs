@@ -210,6 +210,7 @@ import { discardEndedSteps, discardSteps, endConnectionSteps, logDiscarded } fro
 import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { pluginHeaders } from './connection-version.mjs'
+import { deliverableRecall, recallConversation, recallPollArguments } from './turn-recall.mjs'
 
 export { roomStatePath }
 
@@ -250,7 +251,11 @@ const ATTENDED_CADENCE = { waitMs: 25_000, tier: 'attended', checkTier: 'respons
 const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 // Client-side ceiling on a held request. fetch() has NO default timeout, so a
 // silently-dropped TCP connection would wedge the poller forever with no heartbeat.
-const POLL_HTTP_GRACE_MS = 15_000
+// It is also what a response that delivers a command has beyond the hold for the
+// project recall DevSpec runs before answering (turn-recall.mjs): that recall gives
+// up within the 4.8 s every DevSpec plugin's recall shares, so a slow recall can
+// never make this deadline cut the command off.
+export const POLL_HTTP_GRACE_MS = 15_000
 const MAX_TURN_MS = 60 * 60 * 1000
 /** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
 export const TURN_SILENCE_MS = 90_000
@@ -487,7 +492,7 @@ function appendInbox(
   {
     type = 'owner_messages', nextCursor = null, sessionId = null, context = null,
     ingress = null, acceptanceKey = null, instructionContextFile = null, wakeContext = null,
-    projectIncidents = null,
+    projectIncidents = null, turnRecall = null,
   } = {},
 ) {
   if (!connectionId || !messages?.length) return { ok: false, duplicate: false }
@@ -505,6 +510,9 @@ function appendInbox(
     // Adapter metadata stays outside the exact-key canonical context schema:
     // older wait processes can ignore it without dropping the command on upgrade.
     ...(instructionContextFile ? {instruction_context_file:instructionContextFile} : {}),
+    // The project recall DevSpec attached to this delivery, which the wake hands over
+    // with the command (turn-recall.mjs). Adapter metadata like the line above.
+    ...(turnRecall ? { turn_recall: turnRecall } : {}),
     messages,
   }
   if (acceptanceKey) {
@@ -1262,12 +1270,14 @@ async function deliverOwnerMessages(
   instructionContextFile = null,
   wakeContext = null,
   projectIncidents = null,
+  turnRecall = null,
 ) {
   // The durable inbox is the wake payload source. Stable turn identity makes replay
   // after an append-before-cursor crash a no-op rather than a second execution.
   const accepted = appendInbox(connectionId, ownerMsgs, {
     type: 'owner_messages', nextCursor, sessionId, context, ingress, instructionContextFile, wakeContext,
     ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
+    turnRecall,
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
@@ -1410,9 +1420,13 @@ export async function deliverAutomationDispatches(
     readStateFn = readState,
     emit = (line) => process.stdout.write(line),
     projectIncidents = null,
+    turnRecall = null,
   } = {},
 ) {
   let acceptedCount = 0
+  // The response's recall goes with the first run kept here, and only that one: it is
+  // one recall for the whole delivery (turn-recall.mjs).
+  let recall = turnRecall
   for (const dispatch of dispatches) {
     const accepted = appendInboxFn(connectionId, [dispatch], {
       type: 'automation_dispatches',
@@ -1420,10 +1434,12 @@ export async function deliverAutomationDispatches(
       sessionId,
       acceptanceKey: automationAcceptanceKey(dispatch),
       ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
+      ...(recall ? { turnRecall: recall } : {}),
     })
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
       acceptedCount++
+      recall = null
       emit(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
     }
   }
@@ -2244,6 +2260,9 @@ async function main() {
         // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
         ...agentStatsArgs(connectionId),
         ...usageRefusal,
+        // The project recall DevSpec attaches to a delivered command or automation
+        // run, leaving out what this conversation has already been shown (turn-recall.mjs).
+        ...recallPollArguments(recallConversation(tierState, connectionId)),
       },
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
@@ -2605,6 +2624,10 @@ async function main() {
     let newlyDelivered = false
     let instructionContextFile = null
     let instructionContextDelivered = false
+    // DevSpec's recall for this delivery's commands and automation runs, or null. It
+    // rides with the first of them kept here, never a notice or a check job
+    // (turn-recall.mjs).
+    let turnRecall = deliverableRecall(res?.turn_recall)
 
     if (accepted.canonicalWake && envelope.wake.kind === 'system_notice') {
       ensureHostWakeFollow(connectionId, ownerAnchor)
@@ -2664,8 +2687,10 @@ async function main() {
         instructionContextFile,
         wakeContext,
         projectIncidents,
+        turnRecall,
       )
       if (!delivered.ok) return false
+      if (!delivered.duplicate) turnRecall = null
       // Each command handed over is started by name, mid-turn or not (turn-commands.mjs).
       if (!delivered.duplicate) await nameCommandPickups(delivered.commands, { startsTurn: delivered.startsTurn })
       if (roomChanges) roomAnnounced = roomChanges.seen
@@ -2729,7 +2754,7 @@ async function main() {
       accepted.automations,
       accepted.dispatchCursor,
       sessionId,
-      { projectIncidents },
+      { projectIncidents, turnRecall },
     )
     if (!automations.ok) return false
     newlyDelivered ||= automations.acceptedCount > 0

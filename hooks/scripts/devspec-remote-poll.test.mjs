@@ -24,6 +24,7 @@ import {
   splitRoomWindow,
   remoteIngressNegotiationArgs,
   handleKeepaliveRejection,
+  POLL_HTTP_GRACE_MS,
   PUSH_HEALTHY_MS,
   PUSH_SAFETY_MS,
   createPushGate,
@@ -121,6 +122,17 @@ describe('isDeliverableCommand (command gate)', () => {
   it('rejects everything when we do not know our own connection id', () => {
     assert.equal(isDeliverableCommand(command(), null), false)
     assert.equal(isDeliverableCommand(null, ME), false)
+  })
+})
+
+describe('the held poll\'s own deadline', () => {
+  it('leaves room for the project recall DevSpec runs before it answers a command (turn-recall.mjs)', () => {
+    // Every DevSpec plugin's recall shares one time budget: DevSpec gives up before a
+    // plugin's 4.8 s wait ends (DevSpecV2 packages/core/src/recall/budget.ts,
+    // HOST_RECALL_WAIT_MS). A command that lands at the end of a hold is answered that
+    // much later, and the poll's deadline (the hold plus this grace) must not cut it off.
+    const sharedRecallBudgetMs = 4_800
+    assert.ok(POLL_HTTP_GRACE_MS > sharedRecallBudgetMs)
   })
 })
 

@@ -67,6 +67,11 @@
       },
       {
         "type": "command",
+        "command": "for f in \"$HOME\"/.devspec/recall/cursor/pending/*.json; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-recall.mjs\" post-tool; break; fi; done; exit 0",
+        "timeout": 5
+      },
+      {
+        "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/mirror-turn.mjs\" background_launch",
         "matcher": "^(Bash|Shell|Agent|Task|Workflow|Monitor|ScheduleWakeup|CronCreate)$",
         "timeout": 10
@@ -226,6 +231,11 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repository-context.mjs\" compact",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-recall.mjs\" compact",
         "timeout": 5
       }
     ]

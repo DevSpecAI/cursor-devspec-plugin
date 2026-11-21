@@ -167,7 +167,11 @@ export const CURSOR_HOOK_CONTEXT_SEPARATOR = '\n\n---\n\n'
  * a message the person has not heard (mark-explicit-reply.mjs), the room's unread
  * count (room-unread.mjs) and what DevSpec sent the agent while it was working
  * (step-delivery.mjs). Each hands its context over through this module, within its
- * share; adding another means counting it here.
+ * share; adding another means counting it here. The plugin's other postToolUse hooks
+ * add none and are not counted: the recall-note read watcher (turn-recall.mjs
+ * `post-tool`, which only observes), the work trail and timing (mirror-turn.mjs,
+ * turn-tool-timing.mjs, trail-turn.mjs), the commit observers (commit-observation.mjs,
+ * commit-reports.mjs) and turn liveness (turn-liveness.mjs).
  */
 export const POST_TOOL_CONTEXT_HOOKS = 7
 
@@ -792,59 +796,22 @@ export function postToolUseOutput(context, extra = {}) {
   }
 }
 
-/** A note's id is always 16 hex characters, so a pointer to this stand-in is as long as one to the real note. */
-const SAME_LENGTH_NOTE = '0'.repeat(16)
-
 /**
- * The one place a wake is sized against Cursor's rules on one command's output: a wake
- * reaches the agent as a background command's output (the host wake follow writes it,
- * devspec-wake-tail.mjs prints it), so it is held to `fitsShellOutput` whole, as
- * `wakeLines` writes it, everything already in it included.
- *
- * `events` with `text` added at index `at` (the end when not given):
- * - `inline(text)`, the event that carries it, when the whole wake with it still fits;
- * - otherwise `pointer(note)`, an event pointing to a note that keeps the text whole
- *   (`writeNote`), when the whole wake with that pointer still fits. That is checked
- *   before the note is written, with a pointer of the same length, and again with the
- *   real one;
- * - otherwise nothing is added: what was already in the wake is never pushed past
- *   Cursor's rules, and a wake that was over them before is left as it was.
- *
- * Returns `{ events, route, note }`: `route` is `'inline'`, `'note'` (with the `note`
- * from `writeNote`) or `'none'`, when nothing fitted or the note could not be written.
- * The caller keeps whatever it could not add, to offer again or let go.
- */
-export function fitIntoWake(events, { text, inline, pointer, at = events.length, home = os.homedir() }) {
-  const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
-  const fits = (candidate) => fitsShellOutput(wakeLines(candidate))
-  const none = { events, route: 'none', note: null }
-  if (typeof text !== 'string' || text.length === 0) return none
-  const withText = place(inline(text))
-  if (fits(withText)) return { events: withText, route: 'inline', note: null }
-  const parts = splitText(text).length
-  if (!fits(place(pointer({ id: SAME_LENGTH_NOTE, command: noteCommand(SAME_LENGTH_NOTE), parts })))) return none
-  let note
-  try {
-    note = writeNote(text, { home })
-  } catch {
-    return none
-  }
-  const pointed = place(pointer(note))
-  return fits(pointed) ? { events: pointed, route: 'note', note } : none
-}
-
-/**
- * fitIntoWake's companion for the reader that prints the wake file
- * (devspec-wake-tail.mjs): of `wakes` (whole wakes waiting to be printed, oldest first,
- * each as `wakeLines` wrote it), how many go out together in one output. As many whole
- * wakes as still fit Cursor's rules on one output together (`fitsShellOutput`), never
- * part of one; the rest wait for the next output. The first always goes, so a single
- * wake over the rules on its own is printed as it always was (fitIntoWake never makes
- * one so; only a command too long on its own is).
+ * The one way anything that prints wakes for Cursor sizes what it prints as one output:
+ * the wake file's reader (devspec-wake-tail.mjs `read`, which puts its header line
+ * first) and the one-shot wait, each of whose output is one Shell result
+ * (devspec-remote-wait.mjs). Of `wakes` (whole wakes
+ * waiting, oldest first, each as `wakeLines` wrote it), as many as fit Cursor's rules
+ * on one output together (`fitsShellOutput`), never part of one. When some are left and
+ * `waiting(left)` is given, the line it returns goes after them, and room is kept for
+ * it; it is left out only when the first wake alone leaves no room for it. The first
+ * wake always goes, so a single wake over the rules on its own is printed as it always
+ * was.
  * @param {string[]} wakes
+ * @param {{ waiting?: (left: number) => string }} [opts]
  * @returns {{ count: number, text: string }}
  */
-export function wakesForOneOutput(wakes) {
+export function wakesForOneOutput(wakes, { waiting = null } = {}) {
   let count = 0
   let text = ''
   for (const wake of wakes) {
@@ -852,5 +819,48 @@ export function wakesForOneOutput(wakes) {
     text += wake
     count += 1
   }
-  return { count, text }
+  if (count === wakes.length || typeof waiting !== 'function') return { count, text }
+  // Some are left: make room for the line that says so, giving back wakes (never the first).
+  while (count > 1 && !fitsShellOutput(wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
+  const taken = wakes.slice(0, count).join('')
+  const line = waiting(wakes.length - count)
+  return { count, text: fitsShellOutput(taken + line) ? taken + line : taken }
+}
+
+/** What a wake kept whole in a note says about itself: one fixed sentence. */
+export const WAKE_IN_NOTE =
+  "This wake is longer than Cursor shows whole, so all of it is in a file: read it, and every further part it names, before you act on anything in it."
+
+/**
+ * One wake as it goes out (`wakeLines`), never longer than Cursor shows from one
+ * output (`fitsShellOutput`): `events` themselves when they fit; otherwise the whole
+ * wake kept whole and sealed in one note (`writeNote`, in parts that each reach the
+ * agent whole), and in its place a single short line that says so, names what the wake
+ * carries (`carries`: its events' types, which the reader's notification pattern
+ * matches) and gives the command that reads it. Each wake has its own note, named by
+ * its own content. Returns `{ events, note }`, `note` null when the wake goes out as it
+ * is. When the note cannot be written, `{ events, note: null, error }`: the wake needs
+ * the note to arrive whole, so the caller holds it (devspec-remote-wait.mjs) rather
+ * than send it to be cut.
+ */
+export function wakeWithin(events, { home = os.homedir() } = {}) {
+  if (fitsShellOutput(wakeLines(events))) return { events, note: null }
+  return wakeInNote(events, { home })
+}
+
+/**
+ * `events` kept whole and sealed in one note, whatever their size, with the single short
+ * `wake_in_note` line in their place (`wakeWithin` uses it for a wake too long to show
+ * whole); `say` is that line's sentence. When the note cannot be written,
+ * `{ events, note: null, error }`, for the caller to hold.
+ */
+export function wakeInNote(events, { home = os.homedir(), say = WAKE_IN_NOTE } = {}) {
+  let note
+  try {
+    note = writeNote(wakeLines(events), { home })
+  } catch (error) {
+    return { events, note: null, error }
+  }
+  const carries = [...new Set(events.map((event) => String(event?.type ?? '')).filter(Boolean))]
+  return { events: [{ type: 'wake_in_note', carries, read: note.command, note: say }], note }
 }

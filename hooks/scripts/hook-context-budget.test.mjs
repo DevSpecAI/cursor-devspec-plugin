@@ -19,7 +19,9 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
-  fitIntoWake,
+  wakesForOneOutput,
+  wakeWithin,
+  WAKE_IN_NOTE,
   fitsShellOutput,
   handOverLineMax,
   hookContextShare,
@@ -575,69 +577,63 @@ describe('fitHookContext, the one way a hook hands context over', () => {
   })
 })
 
-describe('fitIntoWake, the one place a wake is sized against Cursor\'s rules on one output', () => {
-  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wake-fit-'))
-  /** A wake of exactly `chars` characters: one event padded to get there, and the wake line. */
-  function wakeOf(chars) {
-    const bare = wakeLines([{ type: 'owner_message', body: '' }, { type: 'wake' }]).length
-    const events = [{ type: 'owner_message', body: 'a'.repeat(chars - bare) }, { type: 'wake' }]
-    assert.equal(wakeLines(events).length, chars)
-    return events
+describe('wakesForOneOutput, how anything that prints wakes for Cursor sizes one output', () => {
+  const wake = (chars, tag) => {
+    const bare = wakeLines([{ type: tag, body: '' }]).length
+    return wakeLines([{ type: tag, body: 'a'.repeat(chars - bare) }])
   }
-  const options = (text, home) => ({
-    text,
-    at: 1,
-    inline: (body) => ({ type: 'extra', body }),
-    pointer: (note) => ({ type: 'extra', read: note.command, parts: note.parts }),
-    home,
+  const waiting = (left) => wakeLines([{ type: 'wakes_waiting', count: left }])
+
+  it('takes whole wakes while they fit together, and leaves the rest for the next output', () => {
+    const wakes = [wake(9_000, 'one'), wake(9_000, 'two'), wake(9_000, 'three')]
+    const first = wakesForOneOutput(wakes)
+    assert.equal(first.count, 2)
+    assert.equal(first.text, wakes[0] + wakes[1])
+    assert.ok(fitsShellOutput(first.text))
+    assert.deepEqual(wakesForOneOutput(wakes.slice(first.count)), { count: 1, text: wakes[2] })
   })
 
-  it('adds the text inline, then a pointer to its note, then nothing, as the whole wake allows, and never pushes the wake past the rules', () => {
+  it('keeps room for the line saying how many wait, giving back a wake for it, never the first', () => {
+    const wakes = [wake(9_000, 'one'), wake(10_950, 'two'), wake(500, 'three')]
+    const out = wakesForOneOutput(wakes, { waiting })
+    assert.ok(fitsShellOutput(out.text))
+    assert.equal(out.text, wakes.slice(0, out.count).join('') + waiting(wakes.length - out.count))
+    // The first wake alone leaves no room for the line: it goes alone, as it always did.
+    const full = [wake(19_990, 'one'), wake(500, 'two')]
+    assert.deepEqual(wakesForOneOutput(full, { waiting }), { count: 1, text: full[0] })
+    // Everything fits: no line.
+    assert.deepEqual(wakesForOneOutput([wake(100, 'one')], { waiting }), { count: 1, text: wake(100, 'one') })
+  })
+})
+
+describe('wakeWithin, one wake as it goes out', () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wake-within-'))
+
+  it('leaves a wake that fits as it is, and keeps one that does not whole in one note, with one short line in its place', () => {
     const home = tmp()
     try {
-      const text = 'x'.repeat(2_000)
-      const inline = fitIntoWake(wakeOf(10_000), options(text, home))
-      assert.equal(inline.route, 'inline')
-      assert.deepEqual(inline.events.map((event) => event.type), ['owner_message', 'extra', 'wake'])
-
-      const pointed = fitIntoWake(wakeOf(19_000), options(text, home))
-      assert.equal(pointed.route, 'note')
-      assert.equal(readNoteText(pointed.note.id, { home }), text)
-      assert.equal(pointed.events[1].read, noteCommand(pointed.note.id))
-      assert.ok(fitsShellOutput(wakeLines(pointed.events)))
-
-      const before = wakeOf(19_990)
-      const full = fitIntoWake(before, options(text, home))
-      assert.equal(full.route, 'none')
-      assert.equal(wakeLines(full.events), wakeLines(before))
+      const small = [{ type: 'owner_message', body: 'hello' }, { type: 'wake' }]
+      assert.deepEqual(wakeWithin(small, { home }), { events: small, note: null })
+      const big = [{ type: 'owner_message', body: 'x'.repeat(30_000) }, { type: 'turn_recall', block: 'records' }, { type: 'wake' }]
+      const out = wakeWithin(big, { home })
+      assert.deepEqual(out.events, [{ type: 'wake_in_note', carries: ['owner_message', 'turn_recall', 'wake'], read: noteCommand(out.note.id), note: WAKE_IN_NOTE }])
+      assert.ok(fitsShellOutput(wakeLines(out.events)))
+      assert.equal(readNoteText(out.note.id, { home }), wakeLines(big), 'the whole wake, exactly as it would have been written')
+      assert.ok(noteFiles(home, out.note.id).length > 1, 'in parts that each reach the agent whole')
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
 
-  it('writes no note for a pointer it cannot give, and leaves a wake already over the rules as it was', () => {
+  it('says why when the note cannot be written, so the caller can hold the wake rather than send it to be cut', () => {
     const home = tmp()
     try {
-      assert.equal(fitIntoWake(wakeOf(19_990), options('y'.repeat(30_000), home)).route, 'none')
-      assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes')), false)
-      const over = wakeOf(25_000)
-      const result = fitIntoWake(over, options('z', home))
-      assert.equal(result.route, 'none')
-      assert.equal(result.events, over)
-    } finally {
-      fs.rmSync(home, { recursive: true, force: true })
-    }
-  })
-
-  it('counts bytes as well as characters, and adds at the end when no place is given', () => {
-    const home = tmp()
-    try {
-      const events = [{ type: 'owner_message', body: 'é'.repeat(19_000) }]
-      assert.ok(fitsShellOutput(wakeLines(events)))
-      const result = fitIntoWake(events, { ...options('é'.repeat(2_000), home), at: undefined })
-      assert.equal(result.route, 'note', 'inline would pass 40,000 bytes')
-      assert.equal(result.events.at(-1).type, 'extra')
-      assert.ok(fitsShellOutput(wakeLines(result.events)))
+      fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
+      const big = [{ type: 'owner_message', body: 'x'.repeat(30_000) }, { type: 'wake' }]
+      const out = wakeWithin(big, { home })
+      assert.equal(out.note, null)
+      assert.ok(out.error instanceof Error)
+      assert.equal(out.events, big)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
