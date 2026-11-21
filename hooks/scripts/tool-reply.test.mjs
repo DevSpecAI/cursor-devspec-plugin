@@ -156,10 +156,12 @@ describe('callers of mcpToolsCall', () => {
     assert.deepEqual(result[REPLY_NOTICES_KEY], [ACCOUNT_NOTICE], 'the notice reaches whoever reads the connect result')
   })
 
-  it('a post DevSpec stored is no refusal, notice or not; one it did not store keeps its notices', () => {
+  it('a post DevSpec stored is no refusal, notice or not; one it did not store keeps its notices and discards an unparseable body', () => {
     assert.equal(postRefusal({ result: { delivery: { status: 'stored' }, [REPLY_NOTICES_KEY]: [ACCOUNT_NOTICE] } }), null)
     const notStored = { delivery: { status: 'not_stored', reason: 'paused' }, [REPLY_NOTICES_KEY]: [ACCOUNT_NOTICE] }
     assert.deepEqual(postRefusal({ result: notStored }), { message: null, details: notStored })
+    const unparseable = { raw: 'unparseable response body', result: { content: [text('unparseable response body')] }, [REPLY_NOTICES_KEY]: [ACCOUNT_NOTICE] }
+    assert.deepEqual(postRefusal({ result: unparseable }), { message: null, details: null })
   })
 })
 

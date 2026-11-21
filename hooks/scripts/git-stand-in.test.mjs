@@ -519,10 +519,26 @@ describe('reporting', () => {
     const waiting = JSON.parse(fs.readFileSync(file, 'utf8'))
     waiting.reports[0].next_attempt_at = 0
     fs.writeFileSync(file, JSON.stringify(waiting))
-    const refused = await report(home, async () => ({ recorded: false, message: 'This repository is not tracked on the project.' }))
-    assert.deepEqual(refused.outcomes.map((o) => [o.outcome, o.reason]), [['refused', 'This repository is not tracked on the project.']])
+    const conflictReply = {
+      recorded: false,
+      conflict: true,
+      commit_sha: sha,
+      connection_id: CONNECTION,
+      original_connection_id: '99999999-9999-4999-8999-999999999999',
+      project_id: PROJECT,
+      message: 'Another connection already reported this commit.',
+      devspec_notices: [{ devspec_account_notice: { kind: 'project_paused' } }],
+    }
+    const refused = await report(home, async () => conflictReply)
+    assert.deepEqual(refused.outcomes.map((o) => [o.outcome, o.reason, o.conflict, o.original_connection_id]), [
+      ['refused', 'Another connection already reported this commit.', true, '99999999-9999-4999-8999-999999999999'],
+    ])
+    assert.deepEqual(refused.outcomes[0].details, conflictReply)
     assert.deepEqual(commitsLog(home).map((e) => e.outcome), ['observed', 'retry', 'refused'])
     assert.equal(commitsLog(home).at(-1).commit_sha, sha)
+    assert.equal(commitsLog(home).at(-1).conflict, true)
+    assert.equal(commitsLog(home).at(-1).original_connection_id, '99999999-9999-4999-8999-999999999999')
+    assert.deepEqual(commitsLog(home).at(-1).details, conflictReply)
     assert.equal(fs.existsSync(path.join(queue, folder, 'pending')), false)
   })
 
