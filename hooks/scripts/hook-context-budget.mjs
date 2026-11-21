@@ -835,14 +835,23 @@ export const WAKE_IN_NOTE =
  * than send it to be cut.
  */
 export function wakeWithin(events, { home = os.homedir() } = {}) {
-  const text = wakeLines(events)
-  if (fitsShellOutput(text)) return { events, note: null }
+  if (fitsShellOutput(wakeLines(events))) return { events, note: null }
+  return wakeInNote(events, { home })
+}
+
+/**
+ * `events` kept whole and sealed in one note, whatever their size, with the single short
+ * `wake_in_note` line in their place (`wakeWithin` uses it for a wake too long to show
+ * whole); `say` is that line's sentence. When the note cannot be written,
+ * `{ events, note: null, error }`, for the caller to hold.
+ */
+export function wakeInNote(events, { home = os.homedir(), say = WAKE_IN_NOTE } = {}) {
   let note
   try {
-    note = writeNote(text, { home })
+    note = writeNote(wakeLines(events), { home })
   } catch (error) {
     return { events, note: null, error }
   }
   const carries = [...new Set(events.map((event) => String(event?.type ?? '')).filter(Boolean))]
-  return { events: [{ type: 'wake_in_note', carries, read: note.command, note: WAKE_IN_NOTE }], note }
+  return { events: [{ type: 'wake_in_note', carries, read: note.command, note: say }], note }
 }

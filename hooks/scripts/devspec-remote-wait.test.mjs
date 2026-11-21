@@ -1537,7 +1537,7 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
       const batchFor = (body) => canonicalBatch(fixtureCommand(body), { session_id: ROOM, turn_recall: { version: 1, formatted_block: recallBlock, seen_keys: ['memory:00000000-0000-4000-8000-000000000001:v1'] } })
       const sizeWith = (body) => wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: notice, inboxFile: inbox })).length
       let body = 'a'.repeat(9_000)
-      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_870 - sizeWith(body)) / 2))
+      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - sizeWith(body)) / 2))
       const sizeWithout = wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: null, inboxFile: inbox })).length
       assert.ok(sizeWithout < 19_700, `without the note the pointer fits beside it (${sizeWithout})`)
       const batch = batchFor(body)
@@ -1547,7 +1547,7 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
       assert.equal(first.code, 0, first.stderr)
       assert.ok(fitsShellOutput(first.stdout))
       const one = first.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'room_unread', 'wake', 'wakes_waiting'])
+      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'room_unread', 'wake', 'recall_in_next_wake', 'wakes_waiting'])
       assert.equal(one[0].body, body)
       assert.equal(state().inbox_byte_offset ?? 0, 0, 'the cursor stays at the delivery')
       assert.equal(state().wake_batch_progress.wakes.length, 1, 'the pointer wake is frozen as built')

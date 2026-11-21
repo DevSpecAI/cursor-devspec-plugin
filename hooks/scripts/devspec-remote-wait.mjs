@@ -1822,12 +1822,23 @@ async function main() {
             continue
           }
         }
-        // The rest of a delivery an earlier one-shot run began: its frozen wakes, printed
-        // as they were built, never rebuilt. The delivery's bookkeeping was done when it
-        // began; the cursor moves past it once the last of them is printed.
-        const frozen = args.follow ? null : frozenWakesOf(readState(connectionId), offset, batch)
+        // The rest of a delivery a one-shot run began: its frozen wakes, handed on as they
+        // were built, never rebuilt, by whichever printer comes next. The one continuation
+        // state both share: the wake file's follow writes them all to the wake file, a
+        // one-shot run prints what fits one result. Neither prints a wake the other already
+        // has. The delivery's bookkeeping was done when it began; the cursor moves past it
+        // once the last of them is out.
+        const frozen = frozenWakesOf(readState(connectionId), offset, batch)
         if (frozen) {
-          const count = await printOneShot(frozen)
+          let count = frozen.length
+          if (args.follow) {
+            for (const wake of frozen) {
+              for (const event of wake) await emitStdoutEvent(event)
+              appendWakeEvents(args.wakeFile, wake)
+            }
+          } else {
+            count = await printOneShot(frozen)
+          }
           if (count < frozen.length) {
             writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(count) } })
           } else {
@@ -1835,7 +1846,12 @@ async function main() {
             offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
             writeStatePatch(connectionId, { wake_batch_progress: null })
           }
-          process.stderr.write(`devspec-remote-wait: printed ${count} of ${frozen.length} waiting wake(s) — exit 0\n`)
+          process.stderr.write(`devspec-remote-wait: handed on ${count} of ${frozen.length} waiting wake(s)\n`)
+          if (args.follow) {
+            args.fromEnd = false
+            args.pending = true
+            continue
+          }
           return
         }
         // A directed-question answer is its own event type — it wakes, but it is never

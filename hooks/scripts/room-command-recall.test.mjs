@@ -406,7 +406,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(fitsShellOutput(first) && fitsShellOutput(second))
       const commandWake = first.split('\n').filter(Boolean).map((line) => JSON.parse(line))
       const recallWake = second.split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      assert.deepEqual(commandWake.map((e) => e.type), ['owner_message', 'wake'])
+      assert.deepEqual(commandWake.map((e) => e.type), ['owner_message', 'wake', 'recall_in_next_wake'], 'the command\'s own print says its recall is next')
       assert.equal(commandWake[0].body, tight, 'the command inline, byte for byte')
       assert.deepEqual(recallWake.map((e) => e.type), ['turn_recall'])
       assert.equal(recallWake[0].for, commandWake[0].message_id, 'naming the command it belongs to')
@@ -470,9 +470,9 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.equal(await Promise.race([first.exited, sleep(10_000).then(() => 'timeout')]), 0, first.stderr())
       assert.ok(fitsShellOutput(first.stdout()), `${first.stdout().length} characters in one result`)
       const one = first.events()
-      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'wake', 'wakes_waiting'])
+      assert.deepEqual(one.map((e) => e.type).slice(0, 3), ['owner_message', 'wake', 'recall_in_next_wake'])
+      assert.ok(one.length === 3 || one[3].type === 'wakes_waiting')
       assert.equal(one[0].body, body, 'the command, whole')
-      assert.equal(one[2].count, 1)
       assert.equal(run.state().inbox_byte_offset, before, 'the cursor stays at this delivery: part of it is still to print')
 
       const second = run.startWait()
@@ -487,6 +487,69 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
       readNote(run.home, two[0].read)
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(12)])
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  /** The host's follow, run until its wake file is `ready`, then stopped: the wake file's text. */
+  async function followOnce(run, wakeFile, ready) {
+    const follow = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--follow', '--wake-file', wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'], {
+      env: { ...process.env, HOME: run.home },
+    })
+    try {
+      assert.ok(await until(() => fs.existsSync(wakeFile) && ready(fs.readFileSync(wakeFile, 'utf8'))), 'the follow wrote nothing')
+      await sleep(300)
+    } finally {
+      follow.kill('SIGKILL')
+    }
+    return fs.readFileSync(wakeFile, 'utf8')
+  }
+
+  it('one continuation for both printers: the manual wait prints the command, then the background listener prints only the pointer wake, never the command again', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      const body = bodyFor(19_870)
+      run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(13) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+
+      const manual = run.startWait()
+      assert.equal(await Promise.race([manual.exited, sleep(10_000).then(() => 'timeout')]), 0, manual.stderr())
+      const printed = manual.events()
+      assert.equal(printed[0].body, body)
+      assert.equal(printed.some((e) => e.type === 'turn_recall'), false)
+
+      const wakeFile = path.join(run.home, 'wake-after-manual.jsonl')
+      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall'))
+      const lines = text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(lines.map((e) => e.type), ['turn_recall'], 'only the remaining pointer wake')
+      assert.equal(lines[0].for, printed[0].message_id)
+      assert.equal(run.state().wake_batch_progress, null)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('one continuation for both printers, the other way: the background listener hands on the whole delivery, and a manual wait after it prints none of it again', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      const body = bodyFor(19_870)
+      run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(14) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+
+      const wakeFile = path.join(run.home, 'wake-first.jsonl')
+      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall'))
+      const lines = text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(lines.map((e) => e.type), ['owner_message', 'wake', 'recall_in_next_wake', 'turn_recall'])
+
+      const manual = run.startWait()
+      await sleep(1_000)
+      assert.equal(manual.stdout(), '', 'the manual wait prints nothing the listener already handed on')
+      manual.kill()
     } finally {
       await run.cleanup()
     }
