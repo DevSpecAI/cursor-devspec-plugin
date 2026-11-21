@@ -722,8 +722,14 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
         assert.equal(run.stub.named('post_session_message').length, 1, 'the room is told once, not every try')
         const told = run.stub.named('post_session_message')[0]
         assert.equal(told.session_id, ROOM)
-        assert.match(told.message, /couldn't receive a message from this room yet/)
+        assert.match(told.message, /hasn't received a message from this room yet/)
         assert.match(told.message, /keeps trying/)
+        // The system's error names private paths on that computer: it goes to the local
+        // log, never to the people in the room.
+        const logged = /holding a wake: [^(]*\((.+)\); trying again/.exec(wait.stderr())
+        assert.ok(logged, `the error is in the local log; stderr:\n${wait.stderr()}`)
+        assert.ok(!told.message.includes(logged[1]), 'the room notice carries no system error')
+        assert.ok(!told.message.includes(run.home), 'the room notice names no path on that computer')
         assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
 
         restore()

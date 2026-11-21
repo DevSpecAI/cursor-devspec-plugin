@@ -1591,13 +1591,17 @@ function heldWakeKey(batch) {
   return String(first?.message_id ?? first?.id ?? first?.run_id ?? first?.check_job_id ?? '')
 }
 
-/** What the room is told when a command cannot reach the agent yet. */
-export function wakeHeldMessage(agentName, error) {
-  const why = error instanceof Error ? error.message : String(error ?? 'unknown error')
+/**
+ * What the room is told when a command cannot reach the agent yet: what is happening,
+ * what usually causes it and what the person can check, and that nothing is lost. The
+ * system's own error (which names private paths on that computer) stays in the wait's
+ * log, where the holding loop writes it every try; the room never gets it.
+ */
+export function wakeHeldMessage(agentName) {
   return (
-    `${agentName} couldn't receive a message from this room yet. It is too long for Cursor to show whole, so it goes into a file first, ` +
-    `and that file couldn't be saved on the computer ${agentName} is running on (${why}). ` +
-    `It keeps trying, and the message reaches ${agentName} as soon as the file can be saved.`
+    `${agentName} hasn't received a message from this room yet: it couldn't save the message on the computer it runs on. ` +
+    `That usually means the computer's disk is full, or its DevSpec folder can't be written to. ` +
+    `${agentName} keeps trying and gets the message as soon as it can save it. Nothing is lost.`
   )
 }
 
@@ -1607,7 +1611,7 @@ export function wakeHeldMessage(agentName, error) {
  * turn-failure.mjs: by `session_id`, tied to no turn). A connection with no room has
  * no one to tell; the wait's log has it. A post that fails is tried again next lap.
  */
-export async function tellRoomWakeHeld({ connectionId, batch, state, error, told, call = mcpToolsCall }) {
+export async function tellRoomWakeHeld({ connectionId, batch, state, told, call = mcpToolsCall }) {
   const key = heldWakeKey(batch)
   if (!key || told.has(key)) return false
   const sessionId = batch?.session_id ?? state?.session_id ?? null
@@ -1623,7 +1627,7 @@ export async function tellRoomWakeHeld({ connectionId, batch, state, error, told
       mcpUrl: credential.mcp_url || state?.mcp_url,
       token: credential.token,
       name: 'post_session_message',
-      arguments: turnFailureNotice({ sessionId, agentName, message: wakeHeldMessage(agentName, error) }),
+      arguments: turnFailureNotice({ sessionId, agentName, message: wakeHeldMessage(agentName) }),
       timeoutMs: 15_000,
     })
   } catch (e) {
@@ -1974,7 +1978,7 @@ async function main() {
           process.stderr.write(
             `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${out.held instanceof Error ? out.held.message : String(out.held)}); trying again\n`,
           )
-          await tellRoomWakeHeld({ connectionId, batch, state: live, error: out.held, told: heldTold })
+          await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold })
           await sleep(pollMs)
           continue
         }
