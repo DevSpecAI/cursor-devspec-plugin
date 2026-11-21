@@ -39,6 +39,7 @@ import {
   fixtureUuid,
 } from './remote-ingress-test-fixtures.mjs'
 import { resolveSpaceFreeWakeFile, wakeLines } from './devspec-wake-file.mjs'
+import { nextOutput } from './devspec-wake-tail.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
 import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
@@ -369,7 +370,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
   }
   const mediumRecall = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, i) => `- [MEMORY · decision] **Decision ${i}** — the settings page keeps its redirect (get_memory({ id: "${i}" }))`).join('\n')}` })
 
-  it('near Cursor\'s limit (19,990 characters with the command alone): the wake is one short line pointing at a note that holds the command byte for byte and its recall, and the records count as shown once it is read', async () => {
+  it('near Cursor\'s limit (19,990 characters with the command alone): the command goes inline in its own wake, byte for byte, and its recall follows as the next wake; the reader prints both whole, in order', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -377,19 +378,30 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       const tight = bodyFor(19_990)
       run.stub.serve(commandPoll(2, tight, { turn_recall: mediumRecall(9) }))
       assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
-      const wakeOut = await run.nextWake()
-      assert.equal(wakeOut.length, 1)
-      assert.equal(wakeOut[0].type, 'wake_in_note')
-      assert.deepEqual(wakeOut[0].carries, ['owner_message', 'turn_recall', 'wake'])
-      assert.ok(fitsShellOutput(wakeLines(wakeOut)))
-      const id = /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(wakeOut[0].read)[1]
-      const inNote = readNoteText(id, { home: run.home }).split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      assert.deepEqual(inNote.map((e) => e.type), ['owner_message', 'turn_recall', 'wake'])
-      assert.equal(inNote[0].body, tight, 'the command, byte for byte')
-      assert.equal(inNote[1].block, mediumRecall(9).formatted_block, 'and its recall')
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'not shown until the note is read')
-      for (const file of noteFiles(run.home, id)) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(9)])
+
+      // The host's follow writes the wake file the reader prints.
+      const wakeFile = path.join(run.home, 'wake.jsonl')
+      const follow = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--follow', '--wake-file', wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'], {
+        env: { ...process.env, HOME: run.home },
+      })
+      try {
+        assert.ok(await until(() => fs.existsSync(wakeFile) && fs.readFileSync(wakeFile, 'utf8').includes('turn_recall')), 'no wake written')
+      } finally {
+        follow.kill('SIGKILL')
+      }
+      const file = fs.readFileSync(wakeFile, 'utf8')
+      const first = nextOutput(file)
+      const second = nextOutput(file.slice(first.length))
+      assert.equal(first + second, file, 'two whole wakes, nothing else')
+      assert.ok(fitsShellOutput(first) && fitsShellOutput(second))
+      const commandWake = first.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const recallWake = second.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(commandWake.map((e) => e.type), ['owner_message', 'wake'])
+      assert.equal(commandWake[0].body, tight, 'the command inline, byte for byte')
+      assert.deepEqual(recallWake.map((e) => e.type), ['turn_recall'])
+      assert.equal(recallWake[0].for, commandWake[0].message_id, 'naming the command it belongs to')
+      assert.equal(recallWake[0].block, mediumRecall(9).formatted_block)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(9)], 'shown once its wake is written')
 
       // 19,000 characters alone: the recall does not fit inline, its short pointer does.
       const roomy = bodyFor(19_000)
@@ -406,24 +418,25 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     }
   })
 
-  it('two near-limit commands in a row: two wakes, each pointing at its own note, both whole and readable', async () => {
+  it('a command too long to fit on its own (25,300 characters): the one case it goes whole into a note, with its recall, behind one short line', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      const first = bodyFor(19_990)
-      const second = bodyFor(19_990).replaceAll('a', 'b')
-      run.stub.serve(commandPoll(2, first, { turn_recall: mediumRecall(11) }))
-      run.stub.serve(commandPoll(3, second, { turn_recall: mediumRecall(12) }))
-      assert.ok(await until(() => run.records().length === 3), `not kept; stderr:\n${run.stderr()}`)
-      const wakes = [await run.nextWake(), await run.nextWake()]
-      const ids = wakes.map((w) => /notes\/([0-9a-f]{16})\.md$/.exec(w[0].read)[1])
-      assert.notEqual(ids[0], ids[1])
-      const bodies = ids.map((id) => JSON.parse(readNoteText(id, { home: run.home }).split('\n')[0]).body)
-      assert.deepEqual(bodies, [first, second])
-      for (const file of noteFiles(run.home, ids[1])) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
-      for (const file of noteFiles(run.home, ids[0])) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(12), key(11)])
+      const body = bodyFor(25_300)
+      run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(11) }))
+      assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
+      const wakeOut = await run.nextWake()
+      assert.equal(wakeOut.length, 1)
+      assert.equal(wakeOut[0].type, 'wake_in_note')
+      assert.deepEqual(wakeOut[0].carries, ['owner_message', 'turn_recall', 'wake'])
+      const id = /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(wakeOut[0].read)[1]
+      const inNote = readNoteText(id, { home: run.home }).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.equal(inNote[0].body, body, 'the command, byte for byte')
+      assert.equal(inNote[1].block, mediumRecall(11).formatted_block, 'and its recall')
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'not shown until the note is read')
+      for (const file of noteFiles(run.home, id)) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(11)])
     } finally {
       await run.cleanup()
     }
@@ -459,7 +472,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
   const big = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 300 }, (_, i) => `- [REQUIREMENT] **Requirement ${n}.${i}** governs the settings page redirect`).join('\n')}` })
 
   for (const [label, target, turnRecall] of [
-    ['19,990 characters with its recall', 19_990, (n) => recall(n)],
+    ['25,300 characters with its recall', 25_300, (n) => recall(n)],
     ['25,300 characters with no recall', 25_300, () => undefined],
   ]) {
     it(`holds a command of ${label}: nothing is sent, the cursor stays, the room is told once, and it goes out whole once notes can be written`, async () => {
@@ -473,7 +486,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
         const offsetBefore = run.state().inbox_byte_offset
         run.patchState({ session_id: ROOM })
         const restore = breakNotes(run.home)
-        const n = target === 19_990 ? 20 : 21
+        const n = turnRecall(1) ? 20 : 21
         run.stub.serve(commandPoll(2, body, turnRecall(n) ? { turn_recall: turnRecall(n) } : {}))
         assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
 
@@ -503,6 +516,28 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
       }
     })
   }
+
+  it('never holds a 19,990-character command: it fits on its own, so it goes inline, with its recall in the next wake', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      run.stub.serve(commandPoll(1, 'a'.repeat(100)))
+      assert.ok(await until(() => run.records().length === 1))
+      const around = wakeLines(await run.nextWake()).length - 2 * 100
+      run.patchState({ session_id: ROOM })
+      breakNotes(run.home)
+      const tight = 'a'.repeat(Math.floor((19_990 - around - 2) / 2))
+      run.stub.serve(commandPoll(2, tight, { turn_recall: recall(23) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      const events = await run.nextWake()
+      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'wake', 'turn_recall'])
+      assert.equal(events[0].body, tight)
+      assert.equal(events[2].block, recall(23).formatted_block)
+      assert.equal(run.stub.named('post_session_message').length, 0, 'nothing held')
+    } finally {
+      await run.cleanup()
+    }
+  })
 
   it('sends a small command whose recall needed a note at once, with a line saying its recall could not be saved, and counts nothing as shown', async () => {
     const run = await startPoller()

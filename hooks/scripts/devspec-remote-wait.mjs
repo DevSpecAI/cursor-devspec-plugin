@@ -1591,7 +1591,7 @@ export function wakeHeldMessage(agentName, error) {
   const why = error instanceof Error ? error.message : String(error ?? 'unknown error')
   return (
     `${agentName} couldn't receive a message from this room yet. It is too long for Cursor to show whole, so it goes into a file first, ` +
-    `and that file couldn't be saved on the computer ${agentName} is running on (${why.slice(0, 300)}). ` +
+    `and that file couldn't be saved on the computer ${agentName} is running on (${why}). ` +
     `It keeps trying, and the message reaches ${agentName} as soon as the file can be saved.`
   )
 }
@@ -1833,8 +1833,10 @@ async function main() {
           continue
         }
         const events = out.events
-        // Dequeue only after the entire one-command-turn payload reached stdout.
+        // Dequeue only after the entire one-command-turn payload reached stdout: the
+        // command's wake, then its recall's own wake when it has one.
         for (const event of events) await emitStdoutEvent(event)
+        for (const event of out.recallWake ?? []) await emitStdoutEvent(event)
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
           const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
           if (decision === 'defer') { await sleep(pollMs); continue }
@@ -1846,6 +1848,9 @@ async function main() {
         }
         if (args.follow && args.wakeFile) {
           appendWakeEvents(args.wakeFile, events)
+          // A recall that only fits beside the command as a wake of its own follows it as
+          // its own wake, so the reader prints each whole, in order (turn-recall.mjs).
+          if (out.recallWake) appendWakeEvents(args.wakeFile, out.recallWake)
           if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
             const current = readDismissalState(connectionId)
             const held = current?.interaction_continuation

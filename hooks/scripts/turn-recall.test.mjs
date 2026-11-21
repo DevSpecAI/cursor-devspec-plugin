@@ -13,7 +13,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 
-import { fitsShellOutput, readNoteText, WAKE_IN_NOTE } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { nextOutput } from './devspec-wake-tail.mjs'
 import { wakeLines } from './devspec-wake-file.mjs'
 import {
   deliverableRecall,
@@ -346,24 +347,33 @@ describe('a wake that carries the recall', () => {
     }
   })
 
-  it('when no note can be written and the command itself needs one to arrive whole (19,990 with recall, 25,300 alone): held, nothing goes out', () => {
+  it('when no note can be written: only a command too long to fit on its own is held; one that fits goes inline with its recall in a wake of its own, or a line that it could not be saved', () => {
     const home = tempHome()
     try {
       fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
+      // 19,990 alone fits: the command goes as it is; a recall that fits a wake of its own follows it, needing no note.
       const near = recallWakeOut(wakeOfLength(19_990), mediumRecall(), { home })
-      assert.ok(near.held instanceof Error)
-      assert.equal(near.events, undefined)
-      const over = recallWakeOut(wakeOfLength(25_300), null, { home })
-      assert.ok(over.held instanceof Error)
-      // Once storage can be written again, the same wakes go out whole in their notes.
+      assert.equal(near.recall, 'separate')
+      assert.deepEqual(near.events, wakeOfLength(19_990))
+      // One too long even for a wake of its own needed a note: it gives way to the line, in that wake.
+      const tooLong = recallWakeOut(wakeOfLength(19_990), recall({ block: `== PROACTIVE PROJECT RECALL ==\n${'r'.repeat(25_000)}` }), { home })
+      assert.equal(tooLong.recall, 'unsaved')
+      assert.deepEqual(tooLong.events, wakeOfLength(19_990))
+      assert.deepEqual(tooLong.recallWake, [{ type: 'turn_recall', for: 'm1', note: RECALL_UNSAVED_NOTE }])
+      // 25,300 does not fit on its own: held, with or without recall.
+      for (const each of [null, mediumRecall()]) {
+        const over = recallWakeOut(wakeOfLength(25_300), each, { home })
+        assert.ok(over.held instanceof Error)
+        assert.equal(over.wakes, undefined)
+      }
+      // Once notes can be written again, it goes out whole in its note.
       fs.rmSync(path.join(home, '.devspec'), { force: true })
-      assert.equal(recallWakeOut(wakeOfLength(19_990), mediumRecall(), { home }).recall, 'whole')
+      assert.equal(recallWakeOut(wakeOfLength(25_300), mediumRecall(), { home }).recall, 'whole')
       assert.equal(recallWakeOut(wakeOfLength(25_300), null, { home }).events[0].type, 'wake_in_note')
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
-
 })
 
 /** One wake whose JSON lines are exactly `chars` characters long, its command body padded to get there. */
@@ -393,24 +403,27 @@ describe('a command wake near Cursor\'s limit', () => {
   /** The note a `wake_in_note` line points to, read back whole. */
   const wakeNote = (out, home) => readNoteText(noteIdIn(out.events[0].read), { home })
 
-  it('measured at the boundary: a 19,990-character command wake has no room for even the short pointer, so the whole wake, the command byte for byte and its recall, goes out in one note', () => {
+  it('measured at the boundary: a 19,990-character command goes inline in its own wake, byte for byte, and its recall follows as the next wake, and the reader prints both whole, in order', () => {
     const home = tempHome()
     try {
       const command = wakeOfLength(19_990)
-      for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
+      for (const [each, route] of [[smallRecall(), 'separate'], [mediumRecall(), 'separate'], [largeRecall(), 'separate_pointer']]) {
         const out = recallWakeOut(command, each, { home })
-        const full = out.full
-        assert.deepEqual(full.map((event) => event.type), ['owner_message', 'turn_recall', 'room_unread', 'wake'])
-        assert.equal(out.events.length, 1)
-        const [line] = out.events
-        assert.equal(line.type, 'wake_in_note')
-        assert.deepEqual(line.carries, ['owner_message', 'turn_recall', 'room_unread', 'wake'])
-        assert.equal(line.note, WAKE_IN_NOTE)
-        assert.ok(fitsShellOutput(wakeLines(out.events)))
-        // The note holds the whole wake exactly as it would have been written.
-        assert.equal(wakeNote(out, home), wakeLines(full))
-        assert.ok(wakeNote(out, home).includes(JSON.stringify(command[0])), 'the command, byte for byte')
-        assert.ok(wakeNote(out, home).includes(JSON.stringify(each.formatted_block)), 'and its recall')
+        assert.equal(out.recall, route)
+        assert.equal(out.note, null)
+        assert.deepEqual(out.events, command, 'the command, byte for byte, in its own wake')
+        assert.equal(out.recallWake.length, 1)
+        const [carried] = out.recallWake
+        assert.equal(carried.type, 'turn_recall')
+        assert.equal(carried.for, 'm1', 'naming the command it belongs to')
+        if (route === 'separate') assert.equal(carried.block, each.formatted_block)
+        else assert.equal(readNoteText(noteIdIn(carried.read), { home }), each.formatted_block)
+        for (const wake of out.wakes) assert.ok(fitsShellOutput(wakeLines(wake)))
+        // As the wake file holds them: the reader prints the command's wake, then the recall's.
+        const file = out.wakes.map(wakeLines).join('')
+        const first = nextOutput(file)
+        assert.equal(first, wakeLines(command))
+        assert.equal(nextOutput(file.slice(first.length)), wakeLines(out.recallWake))
       }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
@@ -420,48 +433,46 @@ describe('a command wake near Cursor\'s limit', () => {
   it('leaves a wake that fits unchanged, and keeps any wake too long on its own whole in a note, with or without recall', () => {
     const home = tempHome()
     try {
-      assert.deepEqual(recallWakeOut(wake(), null, { home }), { events: wake(), note: null, full: wake(), recall: 'none' })
+      assert.deepEqual(recallWakeOut(wake(), null, { home }), { wakes: [wake()], events: wake(), recallWake: null, note: null, full: wake(), recall: 'none' })
       const notice = [{ type: 'system_notice', notice_id: 'n1', content: 'finding '.repeat(4_000) }, { type: 'wake' }]
       const out = recallWakeOut(notice, null, { home })
       assert.deepEqual(out.events[0].carries, ['system_notice', 'wake'])
       assert.equal(wakeNote(out, home), wakeLines(notice))
+      // 25,300 with recall: the command does not fit on its own, so it and its recall go whole into one note.
+      const over = recallWakeOut(wakeOfLength(25_300), mediumRecall(), { home })
+      assert.equal(over.recall, 'whole')
+      assert.equal(wakeNote(over, home), wakeLines(over.full))
+      assert.ok(wakeNote(over, home).includes(JSON.stringify(wakeOfLength(25_300)[0])))
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
 
-  it('across every size up to the limit: inline when the whole wake fits, then the pointer, otherwise the whole wake in a note, and what goes out always fits', () => {
+  it('across every size to past the limit: each route only when the cheaper one does not fit, the command inline whenever it fits on its own, and every wake within the limit', () => {
     const home = tempHome()
     try {
-      const seen = { inline: 0, pointer: 0, whole: 0 }
-      for (let chars = 17_000; chars <= 20_000; chars += 97) {
+      const seen = { inline: 0, pointer: 0, separate: 0, separate_pointer: 0, whole: 0 }
+      const pointerEvent = { type: 'turn_recall', read: `cat ~/.devspec/notes/${'0'.repeat(16)}.md`, note: RECALL_POINTER_NOTE }
+      for (let chars = 17_000; chars <= 21_000; chars += 97) {
         const command = wakeOfLength(chars)
         for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
           const out = recallWakeOut(command, each, { home })
-          const full = out.full
-          assert.ok(fitsShellOutput(wakeLines(out.events)), `a ${chars}-character command wake went out past the limit`)
-          // The command's own events are untouched, in order, in the wake or in its note.
-          assert.deepEqual(full.filter((event) => event.type !== 'turn_recall'), command)
-          if (out.note) {
-            seen.whole += 1
-            assert.equal(wakeNote(out, home), wakeLines(full))
+          seen[out.recall] += 1
+          for (const wake of out.wakes) assert.ok(fitsShellOutput(wakeLines(wake)), `a ${chars}-character command gave a wake past the limit`)
+          const inlineEvent = { type: 'turn_recall', note: RECALL_INLINE_NOTE, block: each.formatted_block }
+          const wouldFit = (event) => fitsShellOutput(wakeLines([command[0], event, ...command.slice(1)]))
+          if (out.recall !== 'inline') assert.equal(wouldFit(inlineEvent), false, `inline would have fitted at ${chars}`)
+          if (out.recall.startsWith('separate') || out.recall === 'whole') assert.equal(wouldFit(pointerEvent), false, `the pointer would have fitted at ${chars}`)
+          if (out.recall === 'whole') {
+            assert.equal(fitsShellOutput(wakeLines(command)), false, `the command fitted on its own at ${chars}`)
+            assert.equal(wakeNote(out, home), wakeLines(out.full))
           } else {
-            assert.deepEqual(out.events, full)
-            seen[full.find((event) => event.type === 'turn_recall').read ? 'pointer' : 'inline'] += 1
-          }
-          // Never a pointer when inline would have fitted, never a whole-wake note when the pointer would have.
-          const carried = full.find((event) => event.type === 'turn_recall')
-          if (carried.read || out.note) {
-            const inline = { type: 'turn_recall', note: RECALL_INLINE_NOTE, block: each.formatted_block }
-            assert.equal(fitsShellOutput(wakeLines([command[0], inline, ...command.slice(1)])), false, `inline would have fitted at ${chars}`)
-          }
-          if (out.note) {
-            const pointer = { type: 'turn_recall', read: `cat ~/.devspec/notes/${'0'.repeat(16)}.md`, note: RECALL_POINTER_NOTE }
-            assert.equal(fitsShellOutput(wakeLines([command[0], pointer, ...command.slice(1)])), false, `the pointer would have fitted at ${chars}`)
+            // The command's own events, untouched and in order, in its wake.
+            assert.deepEqual(out.events.filter((event) => event.type !== 'turn_recall'), command)
           }
         }
       }
-      assert.ok(seen.inline > 0 && seen.pointer > 0 && seen.whole > 0, JSON.stringify(seen))
+      for (const [route, count] of Object.entries(seen)) assert.ok(count > 0, `${route} never used: ${JSON.stringify(seen)}`)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
@@ -475,9 +486,8 @@ describe('a command wake near Cursor\'s limit', () => {
       assert.ok(fitsShellOutput(wakeLines(command)))
       for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
         const out = recallWakeOut(command, each, { home })
-        assert.ok(fitsShellOutput(wakeLines(out.events)))
-        const text = out.note ? wakeNote(out, home) : wakeLines(out.events)
-        assert.ok(text.includes(JSON.stringify(body)))
+        for (const wake of out.wakes) assert.ok(fitsShellOutput(wakeLines(wake)))
+        assert.equal(out.events.find((event) => event.type === 'owner_message').body, body, 'the command inline, as it fits on its own')
       }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
@@ -544,13 +554,26 @@ describe('what counts as shown', () => {
     }
   })
 
-  it('a recall that went out with its whole wake in a note: shown once that note is read; two near-limit commands give two notes, each read on its own', () => {
+  it('a recall in a wake of its own after a near-limit command: shown once that wake is written', () => {
+    const home = tempHome()
+    try {
+      const batch = { turn_recall: { ...mediumRecall(), seen_keys: [key(8)] } }
+      const out = recallWakeOut(wakeOfLength(19_990), batch.turn_recall, { home })
+      assert.equal(out.recall, 'separate')
+      assert.equal(settleRecallHandover('chat-1', out, batch, { home }), 'shown')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(8)])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('a recall that went out with its command whole in a note (a command too long on its own): shown once that note is read; two such commands give two notes, each read on its own', () => {
     const home = tempHome()
     try {
       const first = { turn_recall: { ...mediumRecall(), seen_keys: [key(6)] } }
       const second = { turn_recall: { ...largeRecall(), seen_keys: [key(7)] } }
-      const commandA = wakeOfLength(19_990)
-      const commandB = wakeOfLength(19_990, 'b')
+      const commandA = wakeOfLength(25_300)
+      const commandB = wakeOfLength(25_300, 'b')
       const outA = recallWakeOut(commandA, first.turn_recall, { home })
       const outB = recallWakeOut(commandB, second.turn_recall, { home })
       assert.notEqual(outA.note.id, outB.note.id, 'each wake has its own note')
