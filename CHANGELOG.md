@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.29.0
+
+- **Messages you send your Cursor agent from a DevSpec room now arrive with what your project has already decided.** For each message you send from a room, and each automation run, DevSpec looks up the project's records that bear on it (requirements, decisions, conventions, documents, plans and past work) and the agent receives them together with your message, before it starts. It is the same recall the other DevSpec agents get. A record the agent has already been shown in the conversation is not repeated until someone changes it, and after Cursor compacts the conversation it can be shown again.
+- **Nothing is cut, and your message is never held up.** When the records would make the message too long for Cursor to show the agent whole, they go whole to a file the agent is told to read. If DevSpec can't look them up within a few seconds, your message is delivered without them.
+- Prompts you type in the terminal don't get this yet. Cursor skips the plugin's step before a typed prompt unless you have a Cursor hooks file of your own, which Cursor is tracking as a bug; typed prompts will get it once Cursor fixes that. Checks DevSpec asks the agent to rule, and DevSpec's notices about the agent's work, don't get it either.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.28.0
 
 - **The room stops showing your Cursor agent as Working once it has finished.** Cursor's command-line agent currently skips the plugin's end-of-turn step unless you have a Cursor hooks file of your own, which most people don't. Until now that left the room showing the agent as Working for up to an hour after it had answered. The plugin now notices the end of each turn in the conversation Cursor keeps on your machine, and tells DevSpec within a few seconds which of your messages the turn finished.

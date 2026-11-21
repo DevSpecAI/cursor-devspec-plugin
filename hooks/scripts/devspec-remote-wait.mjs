@@ -105,6 +105,7 @@ import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
+import { recallConversation, recallShownIn, rememberShown, withTurnRecall } from './turn-recall.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1387,7 +1388,17 @@ export function materialiseAttachments(message, opts = {}) {
  * stream had no live signal for which session a command belonged to and fell back to a
  * value cached at attach time — stale after a server-side reattach.
  */
-export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
+export function buildOwnerMessageEvents(batch, opts = {}) {
+  // A command or an automation run brings the project recall DevSpec attached to it,
+  // after the command and whole, inline or in a note (turn-recall.mjs). Nothing else
+  // carries one.
+  return withTurnRecall(commandWakeEvents(batch, opts), batch?.turn_recall, {
+    ...(opts.home ? { home: opts.home } : {}),
+    sessionId: batch?.session_id ?? null,
+  })
+}
+
+function commandWakeEvents(batch, { inboxFile, attachmentDir, writeFile, unread = null } = {}) {
   if (batch?.type === 'canonical_system_notices' || batch?.type === 'system_notices') {
     return buildCanonicalSystemNoticeEvents(batch, { inboxFile })
   }
@@ -1788,6 +1799,9 @@ async function main() {
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
         recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
+        // The recall this wake carried is now shown in the conversation; the next
+        // command's recall leaves those records out until they change (turn-recall.mjs).
+        rememberShown(recallConversation(readState(connectionId), connectionId), recallShownIn(events, batch))
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,
