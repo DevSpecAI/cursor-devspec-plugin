@@ -38,10 +38,10 @@ import {
   fixtureOrder,
   fixtureUuid,
 } from './remote-ingress-test-fixtures.mjs'
-import { resolveSpaceFreeWakeFile, wakeLines } from './devspec-wake-file.mjs'
+import { resolveSpaceFreeWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
 import { nextOutput } from './devspec-wake-tail.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
-import { RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
+import { RECALL_IN_NEXT_WAKE, RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
 import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -492,6 +492,40 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     }
   })
 
+  it('the one-shot wait at 19,950 characters: the result ends with the line that says the recall is next (no room for the waiting line), the cursor stays, and the re-arm prints the pointer wake', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      const body = bodyFor(19_950)
+      run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(13) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      const before = run.state().inbox_byte_offset
+
+      const first = run.startWait()
+      assert.equal(await Promise.race([first.exited, sleep(10_000).then(() => 'timeout')]), 0, first.stderr())
+      assert.ok(fitsShellOutput(first.stdout()), `${first.stdout().length} characters in one result`)
+      const one = first.events()
+      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'wake', RECALL_IN_NEXT_WAKE.type], 'the marker closes the result; the waiting line has no room')
+      assert.ok(!fitsShellOutput(first.stdout() + wakeLines([wakesWaitingEvent(1)])), 'the waiting line really would not fit')
+      assert.equal(one[0].body, body, 'the command, whole')
+      assert.equal(run.state().inbox_byte_offset, before, 'the cursor stays at this delivery')
+      assert.ok(run.state().wake_batch_progress, 'and the rest is kept for the re-arm')
+
+      // The re-arm the skill asks for on that line: --pending, straight away.
+      const second = run.startWait()
+      assert.equal(await Promise.race([second.exited, sleep(10_000).then(() => 'timeout')]), 0, second.stderr())
+      const two = second.events()
+      assert.deepEqual(two.map((e) => e.type), ['turn_recall'])
+      assert.equal(two[0].for, one[0].message_id)
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(two[0].read)[1], { home: run.home }), mediumRecall(13).formatted_block, 'nothing lost')
+      assert.ok(run.state().inbox_byte_offset > before, 'and now past it')
+      assert.equal(run.state().wake_batch_progress, null)
+    } finally {
+      await run.cleanup()
+    }
+  })
+
   /** The host's follow, run until its wake file is `ready`, then stopped: the wake file's text. */
   async function followOnce(run, wakeFile, ready) {
     const follow = spawn(process.execPath, [WAIT_SCRIPT, '--connection-id', CONNECTION, '--pending', '--follow', '--wake-file', wakeFile, '--owner-pid', String(process.pid), '--poll-ms', '20'], {
@@ -748,5 +782,24 @@ describe('a recall that is slow, missing or broken never holds the command back'
     } finally {
       await run.cleanup()
     }
+  })
+})
+
+describe('the instructions the agent reads for the lines that say more follows', () => {
+  // Loaded as scripts/authority-prose.test.mjs loads them: the file, split into sentences.
+  // The two lines are the ones the printers really emit, so a renamed line fails here too.
+  const lines = [RECALL_IN_NEXT_WAKE.type, wakesWaitingEvent(1).type]
+  const sentences = (file) => fs.readFileSync(path.join(HERE, '..', '..', file), 'utf8').split(/(?<=[.!?|])\s+/)
+
+  it('teach both lines as one rule: whatever names one names the other, and says how a one-shot wait gets the rest', () => {
+    const rules = []
+    for (const file of ['skills/devspec-remote/SKILL.md', 'rules/devspec.mdc']) {
+      for (const sentence of sentences(file).filter((text) => lines.some((line) => text.includes(`\`${line}\``)))) {
+        for (const line of lines) assert.ok(sentence.includes(`\`${line}\``), `${file} teaches one line without the other: ${sentence.slice(0, 200)}`)
+        rules.push(sentence)
+      }
+    }
+    assert.equal(rules.length, 1, 'one rule, not parallel ones')
+    assert.match(rules[0], /`--pending`/, 'a one-shot wait is re-armed with --pending')
   })
 })
