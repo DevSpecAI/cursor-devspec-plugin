@@ -7,7 +7,8 @@
  * - The poller negotiates the recall on every poll and sends what this conversation
  *   was already shown; the recall goes into the inbox with the command and into the
  *   wake right after it, and only then counts as shown.
- * - A recall too long for one wake is handed over whole in a note the wake points to.
+ * - A recall too long for one wake is handed over whole in a note the wake points to,
+ *   and its records count as shown only once the agent has read every part of it.
  * - An automation run gets the recall the same way; a check job never carries one,
  *   and when a delivery holds both a command and an automation run only the command
  *   carries it.
@@ -22,7 +23,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -40,6 +41,7 @@ import {
 import { resolveSpaceFreeWakeFile, wakeLines } from './devspec-wake-file.mjs'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
+import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const POLL_SCRIPT = path.join(HERE, 'devspec-remote-poll.mjs')
@@ -224,6 +226,19 @@ async function startPoller({ beforeStart } = {}) {
   }
 }
 
+const AFTER_TOOL_RECALL = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'hooks.json'), 'utf8')).hooks.postToolUse
+  .find((entry) => entry.command.includes('turn-recall.mjs'))
+
+/** The plugin's postToolUse hook that counts recall-note reads, run as hooks.json has Cursor run it. */
+function runAfterTool(home, input) {
+  const run = spawnSync('sh', ['-c', AFTER_TOOL_RECALL.command], {
+    input: JSON.stringify(input),
+    env: { PATH: process.env.PATH, HOME: home, CLAUDE_PLUGIN_ROOT: path.resolve(HERE, '..', '..') },
+    encoding: 'utf8',
+  })
+  assert.equal(run.status, 0, run.stderr)
+}
+
 describe('a command sent from a DevSpec room gets its project recall', () => {
   it('asks for it on every poll, hands it over right after the command, and leaves out what the conversation was shown', async () => {
     const run = await startPoller()
@@ -300,7 +315,56 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       const id = /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(carried.read)[1]
       assert.equal(readNoteText(id, { home: run.home }), big.formatted_block, 'the note holds the whole recall')
       assert.ok(fitsShellOutput(wakeLines(events)), 'and the wake that points to it reaches the agent whole')
+
+      // Pointed at is not shown: until the agent reads the note, its records stay unshown
+      // and the next poll does not leave them out.
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
+      const before = run.stub.polls.length
+      assert.ok(await until(() => run.stub.polls.length > before + 1))
+      assert.equal(run.stub.polls.at(-1).seen_recall_versions, undefined)
+
+      // The agent reads every part, and the plugin's postToolUse hook sees each read.
+      for (const file of noteFiles(run.home, id)) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(8)])
+      assert.ok(await until(() => run.stub.polls.at(-1)?.seen_recall_versions?.includes(key(8))), 'now the next poll leaves them out')
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('never pushes a command wake past Cursor\'s limit: near it the recall goes to a pointer only if that fits, otherwise not at all, and the command arrives byte for byte', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const medium = { ...recall(9), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, n) => `- [MEMORY · decision] **Decision ${n}** — the settings page keeps its redirect (get_memory({ id: "${n}" }))`).join('\n')}` }
+      // How long the real wake is around a command body, measured with no recall. The
+      // wake carries the body twice (the command's text, and the message it came in).
+      run.stub.serve(commandPoll(1, 'a'.repeat(100)))
+      assert.ok(await until(() => run.records().length === 1), `no command kept; stderr:\n${run.stderr()}`)
+      const around = wakeLines(await run.nextWake()).length - 2 * 100
+      const bodyFor = (chars) => 'a'.repeat(Math.floor((chars - around - 2) / 2)) // body_chars gains up to two digits
+
+      // 19,990 characters with the command alone: no recall fits beside it, pointer included.
+      const tight = bodyFor(19_990)
+      run.stub.serve(commandPoll(2, tight, { turn_recall: medium }))
+      assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
+      const tightWake = await run.nextWake()
+      assert.ok(wakeLines(tightWake).length <= 19_990 && wakeLines(tightWake).length > 19_559, String(wakeLines(tightWake).length))
+      assert.equal(tightWake.some((e) => e.type === 'turn_recall'), false)
+      assert.equal(tightWake.find((e) => e.type === 'owner_message').body, tight)
+      assert.equal(fs.existsSync(path.join(run.home, '.devspec', 'notes')), false)
+
+      // 19,000 with the command alone: the recall does not fit inline, its pointer does.
+      const roomy = bodyFor(19_000)
+      run.stub.serve(commandPoll(3, roomy, { turn_recall: medium }))
+      assert.ok(await until(() => run.records().length === 3), `no command kept; stderr:\n${run.stderr()}`)
+      const roomyWake = await run.nextWake()
+      const carried = roomyWake.find((e) => e.type === 'turn_recall')
+      assert.equal(carried.block, undefined)
+      assert.match(carried.read, /^cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md$/)
+      assert.ok(fitsShellOutput(wakeLines(roomyWake)))
+      assert.equal(roomyWake.find((e) => e.type === 'owner_message').body, roomy)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'pointed at, not yet read')
     } finally {
       await run.cleanup()
     }

@@ -23,18 +23,27 @@
  * (devspec-remote-wait.mjs), so the agent receives both together. DevSpec recalls
  * nothing for a check job, a notice or an idle poll, so they carry none.
  *
- * What counts as shown: only a recall that went into a wake, and only once that wake
- * has been written (`recallShownIn`, `rememberShown`). A command whose wake never went
- * out leaves nothing remembered, so its cards come back with the next command. A
- * compaction forgets what was shown before it (the preCompact hook runs this file with
- * `compact`), because the summary that replaces the conversation may not keep it.
+ * Nothing is cut, the command least of all. The plugin's one wake sizer
+ * (`fitIntoWake`, hook-context-budget.mjs) holds the whole wake to Cursor's rules on
+ * one command's output (`fitsShellOutput`: past 20,000 characters Cursor keeps the
+ * first and last 10,000, and past 40,000 bytes it shows a file path instead). The
+ * recall goes into the wake itself only while the whole wake, command and recall
+ * together, still fits. Otherwise it is kept whole as a note in ~/.devspec/notes/
+ * (`writeNote`, in parts that each reach the model whole) and the wake carries only a
+ * pointer to it, when the whole wake with that pointer still fits.
+ * When not even the pointer fits, this wake carries no recall: the recall is advisory,
+ * and the command goes exactly as it would have without it (a command too long on its
+ * own is handled as it always was).
  *
- * Nothing is cut. The recall goes into the wake itself only while the whole wake still
- * reaches the model whole under Cursor's rules on one command's output
- * (`fitsShellOutput`, hook-context-budget.mjs: past 20,000 characters Cursor keeps the
- * first and last 10,000, and past 40,000 bytes it shows a file path instead). Otherwise
- * it is kept whole as a note in ~/.devspec/notes/ (`writeNote`, in parts that each
- * reach the model whole) and the wake says how to read it.
+ * What counts as shown (`settleRecallHandover`): a recall that went inline, once its
+ * wake has been written; a recall in a note, only once the agent has read every part
+ * of that note whole, by the same proof every other note of the plugin is counted read
+ * with (`readThrough`, hook-context-budget.mjs). The plugin's postToolUse hook runs this
+ * file with `post-tool` while a note is waiting to be read (`noteRecallReads`). Until
+ * then its records stay unshown, so the next command's recall can offer them again. A
+ * command whose wake never went out leaves nothing remembered either. A compaction
+ * forgets what was shown before it (the preCompact hook runs this file with `compact`),
+ * because the summary that replaces the conversation may not keep it.
  *
  * Never in the way. DevSpec runs the recall within the time budget every plugin's
  * recall shares (DevSpecV2 packages/core/src/recall/budget.ts: the server gives up
@@ -45,6 +54,26 @@
  * Anything that goes wrong here (an unreadable or unwritable seen store, a malformed
  * recall, a note that cannot be written) costs the recall or repeats a card, never the
  * command.
+ *
+ * Maintainer notes: compaction runs the plugin's own preCompact hook
+ * -------------------------------------------------------------------
+ * Unlike `beforeSubmitPrompt` and `stop` (below), Cursor runs a plugin's own
+ * `preCompact` hook with no hooks file of the person's own. Measured on CLI
+ * 2026.11.19-f005e9d, 21 November 2026 (DevSpec task 0dec37d4): a throwaway plugin
+ * whose hooks log their input, a temporary HOME holding only `.config/cursor`, no
+ * DevSpec plugin, no `~/.cursor/hooks.json` and no project `.cursor/hooks.json`, an
+ * interactive session, one answered prompt, then `/summarize`. The plugin's
+ * `preCompact` ran both with `--plugin-dir` and installed as a local plugin
+ * (`~/.cursor/plugins/local/`), with `conversation_id` (the chat's id, the same as
+ * `session_id`), `trigger: "manual"` and the transcript path in its input, and
+ * Cursor's summary row then appeared in the transcript; its `beforeSubmitPrompt` and
+ * `stop` did not run. The 2026.11.19 bundle runs `preCompact`
+ * whenever Cursor's server asks for it during a compaction, outside the local
+ * hooks-file gate; only `/summarize` was measured, not a compaction Cursor starts by
+ * itself. So the preCompact hook is what forgets the shown records; if a later Cursor
+ * stops running it, records shown before a compaction stay hidden until they change,
+ * and the poller would need to notice Cursor's summary row in the transcript instead
+ * (transcript-turn-end.mjs already recognises it).
  *
  * Maintainer notes: typed prompts get no recall yet
  * -------------------------------------------------
@@ -75,8 +104,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { fitsShellOutput, writeNote } from './hook-context-budget.mjs'
-import { wakeLines } from './devspec-wake-file.mjs'
+import { fitIntoWake, readThrough } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateText } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
@@ -95,7 +123,8 @@ export const TURN_RECALL_VERSION = 1
  *   longer would make the whole poll invalid, command included, so it is never kept.
  * - `maxBytes` and `ttlMs`: one conversation's file stays small, and a conversation
  *   left untouched for 30 days has its file removed when another conversation's file
- *   is first written.
+ *   is first written. A recall note never read in 30 days is let go the same way: its
+ *   records simply stay unshown.
  */
 export const SEEN_STORE = Object.freeze({
   maxKeys: 512,
@@ -242,34 +271,128 @@ export function recallPointer(note) {
 
 /**
  * `events`, one wake's events in the order they are written, with the batch's recall
- * after its last command: inline when the whole wake, written as the wake file and
- * stdout write it (`wakeLines`), still reaches the model whole (`fitsShellOutput`);
- * otherwise as a pointer to a note that keeps it whole (`writeNote`). `events`
- * unchanged when there is no recall, no command to follow, or a note that cannot be
- * written: the command goes without it rather than with part of it.
+ * after its last command, sized with the whole wake by the plugin's one wake sizer
+ * (`fitIntoWake`, hook-context-budget.mjs): inline when the whole wake with it still
+ * reaches the model whole; otherwise a pointer to a note that keeps it whole, when the
+ * whole wake with the pointer still does; otherwise no recall at all, since it is
+ * advisory and never shortens or pushes out the command. `events` unchanged too when
+ * there is no recall, no command to follow, or a note that cannot be written.
  */
 export function withTurnRecall(events, recall, { home = os.homedir(), sessionId = null } = {}) {
   const deliverable = deliverableRecall(recall)
   if (!deliverable || !Array.isArray(events)) return events
   const at = events.findLastIndex((event) => COMMAND_EVENTS.has(event?.type)) + 1
   if (at === 0) return events
-  const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
   const base = { type: 'turn_recall', session_id: sessionId, executable: false }
-  const inline = place({ ...base, note: RECALL_INLINE_NOTE, block: deliverable.formatted_block })
-  if (fitsShellOutput(wakeLines(inline))) return inline
-  let note
-  try {
-    note = writeNote(deliverable.formatted_block, { home })
-  } catch {
-    return events
-  }
-  return place({ ...base, note: recallPointer(note), read: note.command, parts: note.parts })
+  return fitIntoWake(events, {
+    at,
+    text: deliverable.formatted_block,
+    inline: (block) => ({ ...base, note: RECALL_INLINE_NOTE, block }),
+    pointer: (note) => ({ ...base, note: recallPointer(note), read: note.command, parts: note.parts }),
+    home,
+  }).events
 }
 
-/** The record versions a written wake showed: the batch's recall keys, when the wake carried its recall. */
-export function recallShownIn(events, batch) {
-  if (!Array.isArray(events) || !events.some((event) => event?.type === 'turn_recall')) return []
-  return deliverableRecall(batch?.turn_recall)?.seen_keys ?? []
+/** The note a wake points its recall to, or null when the recall went inline or not at all. */
+function recallNoteOf(events) {
+  const event = Array.isArray(events) ? events.find((each) => each?.type === 'turn_recall') : null
+  return /^cat ~\/\.devspec\/notes\/([0-9a-f]{16})\.md$/.exec(String(event?.read ?? ''))?.[1] ?? null
+}
+
+/** Where recall notes wait to be read: one record per conversation and note. */
+function pendingDir(home) {
+  return path.join(recallDir(home), 'pending')
+}
+
+function conversationDigest(conversation) {
+  return createHash('sha256').update(String(conversation), 'utf8').digest('hex').slice(0, 32)
+}
+
+function pendingFile(conversation, note, home) {
+  return path.join(pendingDir(home), `${conversationDigest(conversation)}-${note}.json`)
+}
+
+/** Remove recall notes waiting longer than `SEEN_STORE.ttlMs`: their records stay unshown. */
+function sweepPending(home, now) {
+  let names
+  try {
+    names = fs.readdirSync(pendingDir(home))
+  } catch {
+    return
+  }
+  for (const name of names) {
+    const file = path.join(pendingDir(home), name)
+    try {
+      const stat = fs.lstatSync(file)
+      if (stat.isFile() && now - stat.mtimeMs > SEEN_STORE.ttlMs) fs.rmSync(file, { force: true })
+    } catch {
+      // removed or replaced meanwhile
+    }
+  }
+}
+
+/**
+ * Settle what a written wake handed over in `conversation`. A recall that went inline
+ * is shown now. A recall in a note waits until the agent has read the note whole
+ * (`noteRecallReads`): each pointing is a new delivery with nothing read yet. Returns
+ * `'shown'`, `'awaiting_read'` or `'none'`; a failure here only means the records may
+ * be offered again.
+ */
+export function settleRecallHandover(conversation, events, batch, { home = os.homedir(), now = Date.now() } = {}) {
+  if (!Array.isArray(events) || !events.some((event) => event?.type === 'turn_recall')) return 'none'
+  const keys = deliverableRecall(batch?.turn_recall)?.seen_keys ?? []
+  if (!conversation || keys.length === 0) return 'none'
+  const note = recallNoteOf(events)
+  if (!note) return rememberShown(conversation, keys, { home, now }) ? 'shown' : 'none'
+  try {
+    sweepPending(home, now)
+    writePrivateText(
+      pendingFile(conversation, note, home),
+      `${JSON.stringify({ version: STORE_VERSION, conversation, note, keys, parts: [], at: new Date(now).toISOString() })}\n`,
+    )
+    return 'awaiting_read'
+  } catch {
+    return 'none'
+  }
+}
+
+/**
+ * The postToolUse step: for each recall note waiting in this tool call's conversation,
+ * add any part this call handed the agent whole (`readThrough`, the plugin's one proof
+ * that a note was read); once every part has come back whole, its records are shown and
+ * the note stops waiting. A read in another conversation (a helper agent's included)
+ * never counts. Returns the notes read through by this call.
+ */
+export function noteRecallReads(input, { home = os.homedir(), now = Date.now() } = {}) {
+  const conversation = firingConversation(input)
+  if (!conversation) return []
+  const prefix = `${conversationDigest(conversation)}-`
+  let names
+  try {
+    names = fs.readdirSync(pendingDir(home)).filter((name) => name.startsWith(prefix) && name.endsWith('.json'))
+  } catch {
+    return []
+  }
+  const read = []
+  for (const name of names) {
+    const file = path.join(pendingDir(home), name)
+    const kept = readPrivateJson(file)
+    if (kept?.version !== STORE_VERSION || kept.conversation !== conversation || typeof kept.note !== 'string') continue
+    const { record, done } = readThrough({ note: kept.note, parts: kept.parts }, input, { home })
+    try {
+      if (done) {
+        if (rememberShown(conversation, kept.keys, { home, now })) {
+          fs.rmSync(file, { force: true })
+          read.push(kept.note)
+        }
+      } else if (record.parts.length !== (Array.isArray(kept.parts) ? kept.parts.length : 0)) {
+        writePrivateText(file, `${JSON.stringify({ ...kept, parts: record.parts })}\n`)
+      }
+    } catch {
+      // the read is counted again at the next step that shows it
+    }
+  }
+  return read
 }
 
 // preCompact: the summary that replaces the conversation may not keep the cards shown
@@ -279,6 +402,18 @@ if (isDirectRun(import.meta.url) && process.argv[2] === 'compact') {
     forgetShown(firingConversation(JSON.parse(fs.readFileSync(0, 'utf8'))))
   } catch {
     // nothing to forget, or no conversation named
+  }
+  process.exit(0)
+}
+
+// postToolUse, while a recall note waits to be read: count what this tool call read.
+// It only observes, and answers Cursor with nothing, so it takes no share of the
+// context Cursor passes on after a step.
+if (isDirectRun(import.meta.url) && process.argv[2] === 'post-tool') {
+  try {
+    noteRecallReads(JSON.parse(fs.readFileSync(0, 'utf8')))
+  } catch {
+    // an input it cannot read counts nothing
   }
   process.exit(0)
 }

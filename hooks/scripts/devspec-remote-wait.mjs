@@ -101,11 +101,11 @@ import {
   turnWakeFromEvents,
 } from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
+import { recallConversation, settleRecallHandover, withTurnRecall } from './turn-recall.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
-import { recallConversation, recallShownIn, rememberShown, withTurnRecall } from './turn-recall.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1799,9 +1799,10 @@ async function main() {
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
         recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
-        // The recall this wake carried is now shown in the conversation; the next
-        // command's recall leaves those records out until they change (turn-recall.mjs).
-        rememberShown(recallConversation(readState(connectionId), connectionId), recallShownIn(events, batch))
+        // The recall this wake carried counts as shown now if it went inline, or once
+        // the agent has read its note whole; until then the next command's recall can
+        // offer those records again (turn-recall.mjs).
+        settleRecallHandover(recallConversation(readState(connectionId), connectionId), events, batch)
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

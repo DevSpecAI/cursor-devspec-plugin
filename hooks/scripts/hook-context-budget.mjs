@@ -147,6 +147,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+import { wakeLines } from './devspec-wake-file.mjs'
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
 
 /** In UTF-16 code units: the CLI's hooks carrier compares the joined text's JavaScript `.length`. */
@@ -785,4 +786,45 @@ export function postToolUseOutput(context, extra = {}) {
     additional_context: context,
     hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: context },
   }
+}
+
+/** A note's id is always 16 hex characters, so a pointer to this stand-in is as long as one to the real note. */
+const SAME_LENGTH_NOTE = '0'.repeat(16)
+
+/**
+ * The one place a wake is sized against Cursor's rules on one command's output: a wake
+ * reaches the agent as a background command's output (the host wake follow writes it,
+ * devspec-wake-tail.mjs prints it), so it is held to `fitsShellOutput` whole, as
+ * `wakeLines` writes it, everything already in it included.
+ *
+ * `events` with `text` added at index `at` (the end when not given):
+ * - `inline(text)`, the event that carries it, when the whole wake with it still fits;
+ * - otherwise `pointer(note)`, an event pointing to a note that keeps the text whole
+ *   (`writeNote`), when the whole wake with that pointer still fits. That is checked
+ *   before the note is written, with a pointer of the same length, and again with the
+ *   real one;
+ * - otherwise nothing is added: what was already in the wake is never pushed past
+ *   Cursor's rules, and a wake that was over them before is left as it was.
+ *
+ * Returns `{ events, route, note }`: `route` is `'inline'`, `'note'` (with the `note`
+ * from `writeNote`) or `'none'`, when nothing fitted or the note could not be written.
+ * The caller keeps whatever it could not add, to offer again or let go.
+ */
+export function fitIntoWake(events, { text, inline, pointer, at = events.length, home = os.homedir() }) {
+  const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
+  const fits = (candidate) => fitsShellOutput(wakeLines(candidate))
+  const none = { events, route: 'none', note: null }
+  if (typeof text !== 'string' || text.length === 0) return none
+  const withText = place(inline(text))
+  if (fits(withText)) return { events: withText, route: 'inline', note: null }
+  const parts = splitText(text).length
+  if (!fits(place(pointer({ id: SAME_LENGTH_NOTE, command: noteCommand(SAME_LENGTH_NOTE), parts })))) return none
+  let note
+  try {
+    note = writeNote(text, { home })
+  } catch {
+    return none
+  }
+  const pointed = place(pointer(note))
+  return fits(pointed) ? { events: pointed, route: 'note', note } : none
 }

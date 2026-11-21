@@ -12,12 +12,14 @@ import { after, describe, it } from 'node:test'
 import { execFileSync } from 'node:child_process'
 
 import { catCall, noteFiles, readCall } from '../../tests/helpers/note-reads.mjs'
+import { wakeLines } from './devspec-wake-file.mjs'
 import {
   CURSOR_HOOK_CONTEXT_MAX_CHARS,
   CURSOR_HOOK_CONTEXT_SEPARATOR,
   CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitHookContext,
+  fitIntoWake,
   fitsShellOutput,
   handOverLineMax,
   hookContextShare,
@@ -569,5 +571,74 @@ describe('fitHookContext, the one way a hook hands context over', () => {
     await Promise.all(texts.map(add))
     const kept = pendingNotes(home, prefix).map((id) => readNoteText(id, { home })).join('\n')
     for (const text of ['already waiting', ...texts]) assert.ok(kept.includes(text), `${text} was lost`)
+  })
+})
+
+describe('fitIntoWake, the one place a wake is sized against Cursor\'s rules on one output', () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wake-fit-'))
+  /** A wake of exactly `chars` characters: one event padded to get there, and the wake line. */
+  function wakeOf(chars) {
+    const bare = wakeLines([{ type: 'owner_message', body: '' }, { type: 'wake' }]).length
+    const events = [{ type: 'owner_message', body: 'a'.repeat(chars - bare) }, { type: 'wake' }]
+    assert.equal(wakeLines(events).length, chars)
+    return events
+  }
+  const options = (text, home) => ({
+    text,
+    at: 1,
+    inline: (body) => ({ type: 'extra', body }),
+    pointer: (note) => ({ type: 'extra', read: note.command, parts: note.parts }),
+    home,
+  })
+
+  it('adds the text inline, then a pointer to its note, then nothing, as the whole wake allows, and never pushes the wake past the rules', () => {
+    const home = tmp()
+    try {
+      const text = 'x'.repeat(2_000)
+      const inline = fitIntoWake(wakeOf(10_000), options(text, home))
+      assert.equal(inline.route, 'inline')
+      assert.deepEqual(inline.events.map((event) => event.type), ['owner_message', 'extra', 'wake'])
+
+      const pointed = fitIntoWake(wakeOf(19_000), options(text, home))
+      assert.equal(pointed.route, 'note')
+      assert.equal(readNoteText(pointed.note.id, { home }), text)
+      assert.equal(pointed.events[1].read, noteCommand(pointed.note.id))
+      assert.ok(fitsShellOutput(wakeLines(pointed.events)))
+
+      const before = wakeOf(19_990)
+      const full = fitIntoWake(before, options(text, home))
+      assert.equal(full.route, 'none')
+      assert.equal(wakeLines(full.events), wakeLines(before))
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('writes no note for a pointer it cannot give, and leaves a wake already over the rules as it was', () => {
+    const home = tmp()
+    try {
+      assert.equal(fitIntoWake(wakeOf(19_990), options('y'.repeat(30_000), home)).route, 'none')
+      assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes')), false)
+      const over = wakeOf(25_000)
+      const result = fitIntoWake(over, options('z', home))
+      assert.equal(result.route, 'none')
+      assert.equal(result.events, over)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('counts bytes as well as characters, and adds at the end when no place is given', () => {
+    const home = tmp()
+    try {
+      const events = [{ type: 'owner_message', body: 'é'.repeat(19_000) }]
+      assert.ok(fitsShellOutput(wakeLines(events)))
+      const result = fitIntoWake(events, { ...options('é'.repeat(2_000), home), at: undefined })
+      assert.equal(result.route, 'note', 'inline would pass 40,000 bytes')
+      assert.equal(result.events.at(-1).type, 'extra')
+      assert.ok(fitsShellOutput(wakeLines(result.events)))
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
   })
 })

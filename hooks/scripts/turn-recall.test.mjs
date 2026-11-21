@@ -20,13 +20,16 @@ import {
   forgetShown,
   recallConversation,
   recallPollArguments,
-  recallShownIn,
+  noteRecallReads,
+  RECALL_INLINE_NOTE,
   rememberShown,
   SEEN_STORE,
   seenRecallKeys,
   seenStoreFile,
+  settleRecallHandover,
   withTurnRecall,
 } from './turn-recall.mjs'
+import { catCall, noteFiles, noteIdIn, readCall } from '../../tests/helpers/note-reads.mjs'
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HOOKS_JSON = path.join(PLUGIN_ROOT, 'hooks', 'hooks.json')
@@ -251,7 +254,8 @@ describe('a wake that carries the recall', () => {
       ]
       assert.deepEqual(withTurnRecall(checkJob, recall(), { home }), checkJob)
       assert.deepEqual(withTurnRecall(notice, recall(), { home }), notice)
-      assert.deepEqual(recallShownIn(checkJob, { turn_recall: recall() }), [])
+      assert.equal(settleRecallHandover('chat-1', checkJob, { turn_recall: recall() }, { home }), 'none')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
       // And a wake with no recall is left exactly as it was.
       assert.deepEqual(withTurnRecall(wake(), null, { home }), wake())
     } finally {
@@ -321,19 +325,170 @@ describe('a wake that carries the recall', () => {
       fs.writeFileSync(path.join(home, '.devspec'), 'a file where the folder should be')
       const block = `== PROACTIVE PROJECT RECALL ==\n${'x'.repeat(30_000)}`
       assert.deepEqual(withTurnRecall(wake(), recall({ block }), { home }), wake())
-      assert.deepEqual(recallShownIn(wake(), { turn_recall: recall({ block }) }), [])
+      assert.equal(settleRecallHandover('chat-1', wake(), { turn_recall: recall({ block }) }, { home }), 'none')
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
 
-  it('counts as shown only the records of a recall the wake carried', () => {
+})
+
+/** One wake whose JSON lines are exactly `chars` characters long, its command body padded to get there. */
+function wakeOfLength(chars, filler = 'a') {
+  const bare = wakeLines(wake('')).length
+  // body_chars grows by a digit or so as the body grows: settle it in a few passes.
+  let body = filler.repeat(Math.max(0, chars - bare))
+  for (let pass = 0; pass < 4; pass += 1) {
+    const over = wakeLines(wake(body)).length - chars
+    if (over === 0) break
+    body = filler.repeat(Math.max(0, body.length - over))
+  }
+  const events = wake(body)
+  assert.equal(wakeLines(events).length, chars)
+  return events
+}
+
+const smallRecall = () => recall()
+const mediumRecall = () => recall({
+  block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, n) => `- [MEMORY · decision] **Decision ${n}** — the settings page keeps its redirect (get_memory({ id: "${n}" }))`).join('\n')}`,
+})
+const largeRecall = () => recall({
+  block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 400 }, (_, n) => `- [REQUIREMENT] **Requirement ${n}** — ${'governs the change; '.repeat(4)}`).join('\n')}`,
+})
+
+describe('a command wake near Cursor\'s limit', () => {
+  it('measured at the boundary: a 19,990-character command wake that fits gets no recall rather than a 20,431-character one, and the command is byte for byte as it was', () => {
+    const home = tempHome()
+    try {
+      const command = wakeOfLength(19_990)
+      assert.ok(fitsShellOutput(wakeLines(command)))
+      for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
+        const events = withTurnRecall(command, each, { home })
+        assert.equal(wakeLines(events), wakeLines(command), 'no recall, inline or pointer, fits beside this command')
+      }
+      // Nothing was written for a pointer that could not be given.
+      assert.equal(fs.existsSync(path.join(home, '.devspec', 'notes')), false)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('takes the inline route only when the whole wake fits, then the pointer only when that fits, otherwise none, across every size up to the limit', () => {
+    const home = tempHome()
+    try {
+      const seen = { inline: 0, pointer: 0, none: 0 }
+      for (let chars = 17_000; chars <= 20_000; chars += 97) {
+        const command = wakeOfLength(chars)
+        for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
+          const events = withTurnRecall(command, each, { home })
+          const carried = events.find((event) => event.type === 'turn_recall')
+          // The command's own events are untouched, in order, whatever happens.
+          assert.deepEqual(events.filter((event) => event.type !== 'turn_recall'), command)
+          if (!carried) seen.none += 1
+          else {
+            seen[carried.block === undefined ? 'pointer' : 'inline'] += 1
+            assert.ok(fitsShellOutput(wakeLines(events)), `a ${chars}-character command wake was pushed past the limit`)
+          }
+          // Inline whenever inline fits; never a pointer when inline would have fitted.
+          if (carried?.block === undefined) {
+            const inline = { type: 'turn_recall', session_id: null, executable: false, note: RECALL_INLINE_NOTE, block: each.formatted_block }
+            assert.equal(fitsShellOutput(wakeLines([command[0], inline, ...command.slice(1)])), false, `inline would have fitted at ${chars}`)
+          }
+        }
+      }
+      // The sweep crossed all three routes, so each was really decided by the size.
+      assert.ok(seen.inline > 0 && seen.pointer > 0 && seen.none > 0, JSON.stringify(seen))
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('counts the bytes of the whole wake too: a non-Latin command near 40,000 bytes gets no recall that would pass it', () => {
+    const home = tempHome()
+    try {
+      const body = '要件は変更を管理します。'.repeat(1_090) // ~13,000 characters, ~39,240 bytes
+      const command = wake(body)
+      assert.ok(fitsShellOutput(wakeLines(command)))
+      for (const each of [smallRecall(), mediumRecall(), largeRecall()]) {
+        const events = withTurnRecall(command, each, { home })
+        assert.ok(fitsShellOutput(wakeLines(events)))
+        assert.equal(events.find((event) => event.type === 'owner_message').body, body)
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('what counts as shown', () => {
+  const afterTool = JSON.parse(fs.readFileSync(HOOKS_JSON, 'utf8')).hooks.postToolUse.filter((entry) => entry.command.includes('turn-recall.mjs'))
+
+  /** The plugin's postToolUse hook for recall reads, run as hooks.json has Cursor run it. */
+  function runAfterTool(home, input) {
+    assert.equal(afterTool.length, 1, 'hooks.json runs the recall read check after each tool call')
+    const run = spawnSync('sh', ['-c', afterTool[0].command], {
+      input: JSON.stringify(input),
+      env: { PATH: process.env.PATH, HOME: home, CLAUDE_PLUGIN_ROOT: PLUGIN_ROOT },
+      encoding: 'utf8',
+    })
+    assert.equal(run.status, 0, run.stderr)
+    assert.equal(run.stdout, '', 'it only observes: it adds nothing to what Cursor passes on')
+  }
+
+  it('an inline recall, once its wake is written', () => {
     const home = tempHome()
     try {
       const batch = { turn_recall: recall({ keys: [key(1), key(2)] }) }
-      assert.deepEqual(recallShownIn(withTurnRecall(wake(), batch.turn_recall, { home }), batch), [key(1), key(2)])
-      assert.deepEqual(recallShownIn(wake(), batch), [])
-      assert.deepEqual(recallShownIn(withTurnRecall(wake(), batch.turn_recall, { home }), {}), [])
+      assert.equal(settleRecallHandover('chat-1', withTurnRecall(wake(), batch.turn_recall, { home }), batch, { home }), 'shown')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(1), key(2)])
+      // A wake that carried no recall shows nothing.
+      assert.equal(settleRecallHandover('chat-2', wake(), batch, { home }), 'none')
+      assert.deepEqual(seenRecallKeys('chat-2', { home }), [])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('a recall in a note only once the agent has read every part of it whole; a pointer never read leaves its records unshown', () => {
+    const home = tempHome()
+    try {
+      const batch = { turn_recall: { ...largeRecall(), seen_keys: [key(3), key(4)] } }
+      const events = withTurnRecall(wake(), batch.turn_recall, { home })
+      const id = noteIdIn(events.find((event) => event.type === 'turn_recall').read)
+      const files = noteFiles(home, id)
+      assert.ok(files.length > 1)
+      assert.equal(settleRecallHandover('chat-1', events, batch, { home }), 'awaiting_read')
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [], 'pointed at, not read')
+      assert.deepEqual(recallPollArguments('chat-1', { home }), { turn_recall_version: 1 }, 'so the next command can be offered them again')
+
+      // Tool calls that are not a whole read of it: another command, a mention, the same
+      // read in another conversation (a helper agent's), and only some of the parts.
+      runAfterTool(home, { conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: JSON.stringify({ output: 'README.md\n', exitCode: 0 }) })
+      runAfterTool(home, { conversation_id: 'chat-1', tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${id}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) })
+      runAfterTool(home, catCall(home, files[0], { conversation: 'helper-chat' }))
+      for (const file of files.slice(0, -1)) runAfterTool(home, catCall(home, file, { conversation: 'chat-1' }))
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [])
+
+      // The last part read whole: shown, and the note no longer waits.
+      runAfterTool(home, catCall(home, files.at(-1), { conversation: 'chat-1' }))
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(3), key(4)])
+      assert.deepEqual(fs.readdirSync(path.join(home, '.devspec', 'recall', 'cursor', 'pending')), [])
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('counts Cursor\'s Read tool as a read too, by the length it reports', () => {
+    const home = tempHome()
+    try {
+      const batch = { turn_recall: { ...mediumRecall(), seen_keys: [key(5)] } }
+      const events = withTurnRecall(wakeOfLength(19_000), batch.turn_recall, { home })
+      const id = noteIdIn(events.find((event) => event.type === 'turn_recall').read)
+      assert.equal(settleRecallHandover('chat-1', events, batch, { home }), 'awaiting_read')
+      const [file] = noteFiles(home, id)
+      assert.deepEqual(noteRecallReads(readCall(file, { conversation: 'chat-1', contentLength: 10 }), { home }), [], 'a partial read')
+      assert.deepEqual(noteRecallReads(readCall(file, { conversation: 'chat-1' }), { home }), [id])
+      assert.deepEqual(seenRecallKeys('chat-1', { home }), [key(5)])
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
