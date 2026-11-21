@@ -380,12 +380,12 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
   }
   const mediumRecall = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, i) => `- [MEMORY · decision] **Decision ${i}** — the settings page keeps its redirect (get_memory({ id: "${i}" }))`).join('\n')}` })
 
-  it('near Cursor\'s limit (19,990 characters with the command alone): the command goes inline in its own wake, byte for byte, and a pointer-only wake naming it follows; the reader prints both whole, in order', async () => {
+  it('near Cursor\'s limit (19,870 characters with the command alone): the command goes inline in its own wake, byte for byte, and a pointer-only wake naming it follows; the reader prints both whole, in order', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      const tight = bodyFor(19_990)
+      const tight = bodyFor(19_870)
       run.stub.serve(commandPoll(2, tight, { turn_recall: mediumRecall(9) }))
       assert.ok(await until(() => run.records().length === 2), `no command kept; stderr:\n${run.stderr()}`)
 
@@ -524,6 +524,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
   for (const [label, target, turnRecall] of [
     ['25,300 characters with its recall', 25_300, (n) => recall(n)],
     ['25,300 characters with no recall', 25_300, () => undefined],
+    ['19,990 characters with its recall (no room for the waiting line)', 19_990, (n) => recall(n)],
   ]) {
     it(`holds a command of ${label}: nothing is sent, the cursor stays, the room is told once, and it goes out whole once notes can be written`, async () => {
       const run = await startPoller()
@@ -567,7 +568,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
     })
   }
 
-  it('never holds a 19,990-character command: it fits on its own, so it goes inline, and a wake of its own says its recall could not be saved', async () => {
+  it('never holds a 19,870-character command: it fits on its own with room for the waiting line, so it goes inline, with a line saying its recall could not be saved', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -576,15 +577,14 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
       const around = wakeLines(await run.nextWake()).length - 2 * 100
       run.patchState({ session_id: ROOM })
       breakNotes(run.home)
-      const tight = 'a'.repeat(Math.floor((19_990 - around - 2) / 2))
+      const tight = 'a'.repeat(Math.floor((19_870 - around - 2) / 2))
       run.stub.serve(commandPoll(2, tight, { turn_recall: recall(23) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
-      // The one-shot result has room only for the command; its line follows in the next.
+      // Its recall's note cannot be saved: the line saying so goes beside it, and nothing waits.
       const events = await run.nextWake()
-      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'wake'])
+      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'turn_recall', 'wake'])
       assert.equal(events[0].body, tight)
-      const next = await run.nextWake()
-      assert.deepEqual(next, [{ type: 'turn_recall', for: events[0].message_id, note: RECALL_UNSAVED_NOTE }], 'its recall could not be saved: it says so, in a wake of its own')
+      assert.deepEqual(events[1], { type: 'turn_recall', note: RECALL_UNSAVED_NOTE })
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
       assert.equal(run.stub.named('post_session_message').length, 0, 'nothing held')
     } finally {

@@ -80,7 +80,7 @@ import {
   emitConnectPhase,
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
-import { appendWakeEvents, ensureWakeFile, wakeLines } from './devspec-wake-file.mjs'
+import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
 import { wakesForOneOutput } from './hook-context-budget.mjs'
 import {
   buildInteractionAnswerEvents,
@@ -1630,21 +1630,18 @@ export async function tellRoomWakeHeld({ connectionId, batch, state, error, told
   return true
 }
 
-/** What a one-shot result says when some of a delivery's wakes wait for the next re-arm. */
-export function wakesWaitingEvent(left) {
-  return {
-    type: 'wakes_waiting',
-    count: left,
-    note: 'Re-arm the wait with --pending now to print the rest.',
-  }
-}
-
-/** How many of this delivery's wakes an earlier one-shot run printed, when the inbox cursor still stands at it. */
-function wakesPrintedOf(state, offset, batch) {
+/**
+ * The wakes of this delivery an earlier one-shot run built and left to print, exactly as
+ * it built them, when the inbox cursor still stands at it; null otherwise. A delivery's
+ * wakes are frozen the first time they are built, so a later run prints them as they
+ * were and never rebuilds them from context that may have changed since (room unread,
+ * room state), which could merge or reshape them.
+ */
+function frozenWakesOf(state, offset, batch) {
   const progress = state?.wake_batch_progress
-  return progress && progress.offset === offset && progress.key === heldWakeKey(batch) && Number.isInteger(progress.printed)
-    ? progress.printed
-    : 0
+  if (!progress || progress.offset !== offset || progress.key !== heldWakeKey(batch)) return null
+  const wakes = Array.isArray(progress.wakes) ? progress.wakes.filter((wake) => Array.isArray(wake) && wake.length > 0) : []
+  return wakes.length > 0 ? wakes : null
 }
 
 /**
@@ -1825,6 +1822,22 @@ async function main() {
             continue
           }
         }
+        // The rest of a delivery an earlier one-shot run began: its frozen wakes, printed
+        // as they were built, never rebuilt. The delivery's bookkeeping was done when it
+        // began; the cursor moves past it once the last of them is printed.
+        const frozen = args.follow ? null : frozenWakesOf(readState(connectionId), offset, batch)
+        if (frozen) {
+          const count = await printOneShot(frozen)
+          if (count < frozen.length) {
+            writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(count) } })
+          } else {
+            offset = newOffset
+            offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            writeStatePatch(connectionId, { wake_batch_progress: null })
+          }
+          process.stderr.write(`devspec-remote-wait: printed ${count} of ${frozen.length} waiting wake(s) — exit 0\n`)
+          return
+        }
         // A directed-question answer is its own event type — it wakes, but it is never
         // a command, so it never goes through the owner-message builder.
         const built = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
@@ -1867,17 +1880,18 @@ async function main() {
         // mode what reaches Cursor is the wake file, whose reader sizes each print, and
         // this process's stdout is its log. A one-shot run's stdout is one Shell result:
         // it holds whole wakes only while they fit one output together, then a line saying
-        // how many wait, and the inbox cursor moves past this delivery only once all its
-        // wakes are printed (`printOneShot`, `wakesForOneOutput`).
-        const already = args.follow ? 0 : wakesPrintedOf(readState(connectionId), offset, batch)
+        // how many wait; the rest are frozen as built, and the inbox cursor moves past
+        // this delivery only once all its wakes are printed (`printOneShot`,
+        // `wakesForOneOutput`, `frozenWakesOf`).
         let printedAll = true
         if (args.follow) {
           for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
         } else {
-          const count = await printOneShot(out.wakes.slice(already))
-          printedAll = already + count >= out.wakes.length
+          const count = await printOneShot(out.wakes)
+          printedAll = count >= out.wakes.length
+          // The rest is frozen as built, for the next re-arm to print as it is.
           if (!printedAll) {
-            writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), printed: already + count } })
+            writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: out.wakes.slice(count) } })
           }
         }
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
@@ -1906,18 +1920,15 @@ async function main() {
         if (printedAll) {
           offset = newOffset
           offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
-          if (already > 0) writeStatePatch(connectionId, { wake_batch_progress: null })
         }
         // A delivery's bookkeeping is done once, when its first wake is printed.
-        if (already === 0) {
-          recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
-          // What this delivery brings into the turn: notice ids, or that something
-          // other than a notice woke it (notice-reply.mjs).
-          recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
-          // Its recall's records count as shown once the agent has read its note whole;
-          // until then the next command's recall can offer them again (turn-recall.mjs).
-          settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
-        }
+        recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        // What this delivery brings into the turn: notice ids, or that something
+        // other than a notice woke it (notice-reply.mjs).
+        recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
+        // Its recall's records count as shown once the agent has read its note whole;
+        // until then the next command's recall can offer them again (turn-recall.mjs).
+        settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

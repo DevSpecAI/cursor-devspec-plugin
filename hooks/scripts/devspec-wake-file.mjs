@@ -72,6 +72,17 @@ export function wakeLines(events) {
 }
 
 /**
+ * What a one-shot wait's result says when some of a delivery's wakes wait for the next
+ * re-arm (devspec-remote-wait.mjs). A delivery is split over results only when room is
+ * kept for this line (turn-recall.mjs), so a result that leaves wakes behind always
+ * says so.
+ * @param {number} left
+ */
+export function wakesWaitingEvent(left) {
+  return { type: 'wakes_waiting', count: left, note: 'Re-arm the wait with --pending now to print the rest.' }
+}
+
+/**
  * The whole wakes at the start of `text` (wake-file text not yet printed), each as
  * written, and the text after them, which is a wake still being written. A wake ends at
  * the empty line `wakeLines` closes it with. Lines with no closing empty line, from a
