@@ -63,6 +63,24 @@
  *    devspec://product/remote-ingress-contract); a check job is DevSpec's to hand on
  *    once that connection ends (semantics.check_job.busy). So nothing is carried over to
  *    a later connection, and no later tool call pays for starting the hook.
+ *
+ * Each file (a held item, the handed-over record) is taken by renaming it to a name only
+ * its taker knows, so the hook and the follow never both deliver one item, and the
+ * cleanup never deletes an item a live process has taken; a taker that died (a hook past
+ * Cursor's timeout) leaves its files to be put back (`reclaimAbandoned`).
+ *
+ * One lock per connection (`withStepsLock`) is taken by both writers, the step hook and
+ * the idle wake, and by the cleanup at the connection's end. A writer takes it after it
+ * has asked DevSpec about check jobs, and holds it from its check that the connection is
+ * still live, through writing the note and the record, to handing the pointer over or
+ * appending the wake. So whichever comes second sees what the other did: a writer after
+ * the end writes nothing and discards what it held; a cleanup after a writer discards
+ * the record that writer wrote. A wake that writer appended just before the end is never
+ * printed: the wake reader skips a `held_for_step` line whose connection has ended
+ * (`withoutEndedHeldWakes`, devspec-wake-tail.mjs).
+ *
+ * How a check job is taken and ruled, and what a notice asks of the agent, are DevSpec's
+ * rules: the note points at them by id and never restates them.
  */
 
 import { createHash, randomBytes } from 'node:crypto'
@@ -70,7 +88,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { appendWakeEvents, wakeLines } from './devspec-wake-file.mjs'
+import { appendWakeEvents, splitWakes, wakeLines } from './devspec-wake-file.mjs'
 import {
   fitsShellOutput,
   noteCommand,
@@ -234,6 +252,63 @@ function drop(taken) {
     fs.rmSync(taken.file, { force: true })
   } catch {
     /* gone already */
+  }
+}
+
+/**
+ * How long a process waiting for a connection's steps lock sleeps between looks. The
+ * holder keeps it only for local file work (writing a note, a record and one wake line,
+ * or printing a hook's pointer), and the plugin's state writes retry the same way
+ * (private-state.mjs retries a rename every 20 ms).
+ */
+const LOCK_RETRY_MS = 20
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function lockPath(connectionId, dir) {
+  return path.join(dir, `${connectionId}.steps.lock`)
+}
+
+/**
+ * Run `work` (synchronous) holding the connection's steps lock: a file holding this
+ * process's id, made by hard-linking a file already written, so it never exists
+ * half-written. A lock whose holder has gone is cleared. It sits beside the steps folder,
+ * not in it, so the hook's guard (hooks.json) never sees it. Returns what `work` returns.
+ */
+export function withStepsLock(connectionId, dir, work) {
+  const target = lockPath(connectionId, dir)
+  const mine = `${target}.${process.pid}-${randomBytes(4).toString('hex')}`
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(mine, String(process.pid), { mode: 0o600 })
+  try {
+    for (;;) {
+      try {
+        fs.linkSync(mine, target)
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
+      }
+      let holder = null
+      try {
+        holder = Number(fs.readFileSync(target, 'utf8'))
+      } catch {
+        continue // released just now
+      }
+      if (Number.isSafeInteger(holder) && holder > 0 && !pidAlive(holder)) {
+        fs.rmSync(target, { force: true })
+        continue
+      }
+      sleepSync(LOCK_RETRY_MS)
+    }
+  } finally {
+    fs.rmSync(mine, { force: true })
+  }
+  try {
+    return work()
+  } finally {
+    fs.rmSync(target, { force: true })
   }
 }
 
@@ -402,7 +477,7 @@ function idlePointer(note, items, connectionId) {
  */
 export async function stepDeliveryHook(
   input,
-  { env = process.env, home = os.homedir(), dir = null, isOpen = itemStillOpen, share = POST_TOOL_CONTEXT_SHARE } = {},
+  { env = process.env, home = os.homedir(), dir = null, isOpen = itemStillOpen, share = POST_TOOL_CONTEXT_SHARE, emit = () => {} } = {},
 ) {
   if (!input || typeof input !== 'object') return null
   // A helper agent's call: its conversation id is its own, so the lookup below finds no
@@ -445,52 +520,52 @@ export async function stepDeliveryHook(
   )
   const adding = checked.filter((each) => each.open)
 
-  // The connection ended while this hook held its items, so the end left them to it:
-  // nothing is handed over for a connection that has ended. Everything goes back, and
-  // is discarded as the end would have done (`discardSteps`).
-  if (readOwnConnectionState(firingConversation(input), { home })?.connection_id !== connectionId) {
-    for (const each of checked) {
-      if (each.open) giveBack(each.taken)
-      else drop(each.taken)
+  // From the check that the connection is still live to handing the pointer over, under
+  // the connection's steps lock, which its cleanup takes too (`withStepsLock`).
+  return withStepsLock(connectionId, connDir, () => {
+    // The connection ended while this hook held its items, so the end left them to it:
+    // nothing is handed over for a connection that has ended. Everything goes back, and
+    // is discarded as the end would have done.
+    if (readOwnConnectionState(firingConversation(input), { home })?.connection_id !== connectionId) {
+      for (const each of checked) {
+        if (each.open) giveBack(each.taken)
+        else drop(each.taken)
+      }
+      // A note read whole in this very call was delivered: not given back to be discarded.
+      if (takenRecord && record) giveBack(takenRecord)
+      else if (takenRecord) drop(takenRecord)
+      logDiscarded('stepDeliveryHook', connectionId, discardLocked(connectionId, connDir))
+      return null
     }
-    // A note read whole in this very call was delivered: not given back to be discarded.
-    if (takenRecord && record) giveBack(takenRecord)
-    else if (takenRecord) drop(takenRecord)
-    logDiscarded('stepDeliveryHook', connectionId, discardSteps(connectionId, { dir: connDir }))
-    return null
-  }
-
-  try {
+    try {
+      if (adding.length > 0) {
+        const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
+        const note = writeNote(stepNoteText(items, { connectionId }), { home })
+        record = { version: RECORD_VERSION, note: note.id, parts: [], items, at: new Date().toISOString() }
+      }
+      if (record && (adding.length > 0 || readChanged)) writePrivateJson(path.join(steps, HANDED), record)
+    } catch {
+      // Not handed over, so not taken: everything goes back for the next step.
+      for (const each of adding) giveBack(each.taken)
+      if (takenRecord) giveBack(takenRecord)
+      for (const each of checked.filter((one) => !one.open)) drop(each.taken)
+      return null
+    }
+    for (const each of checked) drop(each.taken)
+    if (takenRecord) {
+      if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
+      else drop(takenRecord)
+    }
     if (adding.length > 0) {
-      const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
-      const note = writeNote(stepNoteText(items, { connectionId }), { home })
-      record = { version: RECORD_VERSION, note: note.id, parts: [], items, at: new Date().toISOString() }
+      recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
-    if (record && (adding.length > 0 || readChanged)) writePrivateJson(path.join(steps, HANDED), record)
-  } catch {
-    // Not handed over, so not taken: everything goes back for the next step.
-    for (const each of adding) giveBack(each.taken)
-    if (takenRecord) giveBack(takenRecord)
-    for (const each of checked.filter((one) => !one.open)) drop(each.taken)
-    return null
-  }
-  for (const each of checked) drop(each.taken)
-  if (takenRecord) {
-    if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
-    else drop(takenRecord)
-  }
-  // An end that landed between the check above and the write found these items held
-  // and left them: discard them now, as it would have, and hand nothing over.
-  if (readOwnConnectionState(firingConversation(input), { home })?.connection_id !== connectionId) {
-    logDiscarded('stepDeliveryHook', connectionId, discardSteps(connectionId, { dir: connDir }))
-    return null
-  }
-  if (adding.length > 0) {
-    recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
-  }
-  if (!record) return null
-  const context = pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
-  return context ? JSON.stringify(postToolUseOutput(context)) : null
+    if (!record) return null
+    const context = pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+    const output = context ? JSON.stringify(postToolUseOutput(context)) : null
+    // Handed over while the lock is held, so no end comes between the check and this.
+    if (output) emit(output)
+    return output
+  })
 }
 
 /**
@@ -542,48 +617,47 @@ export async function releaseAtIdle(
     for (const each of taken) drop(each)
     if (takenRecord && record) drop(takenRecord)
   }
-  // Decided again under this hold, after the lookups and just before anything is
-  // written: an end that landed meanwhile left these items to it, so they are discarded
-  // and named as the end would have, and no record or wake is written.
-  if (connectionEnded(dir, connectionId)) {
-    discardHeld('releaseAtIdle', connectionId, dir, taken, record ? takenRecord : null)
-    return { pointed: [], dropped, note: null, discarded: true }
-  }
-  if (open.length === 0) {
+  // From the check that the connection is still live to appending the wake, under the
+  // connection's steps lock, which its cleanup takes too (`withStepsLock`).
+  return withStepsLock(connectionId, dir, () => {
+    // An end that landed during the lookups left these items to this hold: they are
+    // discarded and named as the end would have, and no record or wake is written.
+    if (connectionEnded(dir, connectionId)) {
+      for (const each of taken) giveBack(each)
+      if (takenRecord && record) giveBack(takenRecord)
+      logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
+      return { pointed: [], dropped, note: null, discarded: true }
+    }
+    if (open.length === 0) {
+      finish()
+      return { pointed: [], dropped, note: null }
+    }
+    let note = null
+    try {
+      note = writeNote(stepNoteText(open, { connectionId }), { home })
+      const wake = [idlePointer(note, open, connectionId)]
+      // The pointer is a few hundred characters whatever the note holds; checked against
+      // Cursor's rules on one output all the same, in the one place they are kept.
+      if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
+      writePrivateJson(handedPath, {
+        version: RECORD_VERSION,
+        note: note.id,
+        parts: record?.note === note.id ? record.parts ?? [] : [],
+        items: open,
+        at: new Date().toISOString(),
+        woken: true,
+      })
+      append(wakeFile, wake)
+    } catch (error) {
+      if (note) fs.rmSync(handedPath, { force: true })
+      for (const each of taken) giveBack(each)
+      if (takenRecord && record) giveBack(takenRecord)
+      throw error
+    }
     finish()
-    return { pointed: [], dropped, note: null }
-  }
-  let note = null
-  try {
-    note = writeNote(stepNoteText(open, { connectionId }), { home })
-    const wake = [idlePointer(note, open, connectionId)]
-    // The pointer is a few hundred characters whatever the note holds; checked against
-    // Cursor's rules on one output all the same, in the one place they are kept.
-    if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
-    writePrivateJson(handedPath, {
-      version: RECORD_VERSION,
-      note: note.id,
-      parts: record?.note === note.id ? record.parts ?? [] : [],
-      items: open,
-      at: new Date().toISOString(),
-      woken: true,
-    })
-    append(wakeFile, wake)
-  } catch (error) {
-    if (note) fs.rmSync(handedPath, { force: true })
-    for (const each of taken) giveBack(each)
-    if (takenRecord && record) giveBack(takenRecord)
-    throw error
-  }
-  finish()
-  // An end that landed between that check and the write found these items held and
-  // left them: discard the record now, as it would have.
-  if (connectionEnded(dir, connectionId)) {
-    logDiscarded('releaseAtIdle', connectionId, discardSteps(connectionId, { dir }))
-    return { pointed: [], dropped, note: null, discarded: true }
-  }
-  recordTurnWake(connectionId, turnWakeFromEvents(open.flatMap((item) => item.events)), { dir })
-  return { pointed: open.map((item) => item.key), dropped, note: note.id }
+    recordTurnWake(connectionId, turnWakeFromEvents(open.flatMap((item) => item.events)), { dir })
+    return { pointed: open.map((item) => item.key), dropped, note: note.id }
+  })
 }
 
 /**
@@ -596,14 +670,37 @@ function connectionEnded(dir, connectionId) {
 }
 
 /**
- * The connection ended while this process held its items, so the end left them to it
- * (`discardSteps` never takes a held file). Put them all back and discard them as the
- * end would have, naming them once.
+ * The last line of defence, at print time (devspec-wake-tail.mjs): `output`, whole wakes
+ * the reader is about to print, without any wake holding a `held_for_step` line for a
+ * connection that has ended. A writer holding the steps lock never appends one after the
+ * end, but one appended just before it may not have been printed yet; it is skipped and
+ * named on stderr, never printed. Other wakes, and output that is not whole wakes as
+ * the wake writer wrote them, are printed as they are.
  */
-function discardHeld(who, connectionId, dir, taken, takenRecord) {
-  for (const each of taken) giveBack(each)
-  if (takenRecord) giveBack(takenRecord)
-  logDiscarded(who, connectionId, discardSteps(connectionId, { dir }))
+export function withoutEndedHeldWakes(output, { dir = connectionsDirFor(), write = (line) => process.stderr.write(line) } = {}) {
+  if (typeof output !== 'string' || !output.includes('"held_for_step"')) return output
+  const { wakes } = splitWakes(output, { settled: true })
+  if (wakes.join('') !== output) return output
+  return wakes
+    .filter((wake) => {
+      for (const line of wake.split('\n')) {
+        let event = null
+        try {
+          event = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (event?.type === 'held_for_step' && typeof event.connection_id === 'string' && connectionEnded(dir, event.connection_id)) {
+          write(
+            `devspec-wake-tail: skipped a held_for_step wake for connection ${event.connection_id}, which has ended ` +
+              `(note ${event.note}); never printed. DevSpec keeps what it pointed at.\n`,
+          )
+          return false
+        }
+      }
+      return true
+    })
+    .join('')
 }
 
 function readStateOf(dir, connectionId) {
@@ -624,6 +721,12 @@ function readStateOf(dir, connectionId) {
  * whether the folder is still there, or null when there was no folder.
  */
 export function discardSteps(connectionId, { dir } = {}) {
+  if (!fs.existsSync(stepsDir(connectionId, dir))) return null
+  return withStepsLock(connectionId, dir, () => discardLocked(connectionId, dir))
+}
+
+/** `discardSteps`, for a caller already holding the connection's steps lock. */
+function discardLocked(connectionId, dir) {
   const steps = stepsDir(connectionId, dir)
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
@@ -692,8 +795,8 @@ if (isDirectRun(import.meta.url)) {
       input = null
     }
     try {
-      const output = await stepDeliveryHook(input)
-      if (output) process.stdout.write(output)
+      // Printed from inside the hook, while it holds the connection's steps lock.
+      await stepDeliveryHook(input, { emit: (output) => process.stdout.write(output) })
     } catch {
       /* what waits stays where it is, for the next step or the idle wake */
     }

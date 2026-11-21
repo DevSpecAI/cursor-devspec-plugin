@@ -20,7 +20,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { after, describe, it } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { buildOwnerMessageEvents } from './devspec-remote-wait.mjs'
 import { POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
@@ -38,9 +38,10 @@ import {
   releaseAtIdle,
   stepDeliveryHook,
   stepsDir,
+  withoutEndedHeldWakes,
 } from './step-delivery.mjs'
 import { fitsShellOutput } from './hook-context-budget.mjs'
-import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN, appendWakeEvents } from './devspec-wake-file.mjs'
 import { randomUUID } from 'node:crypto'
 import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
@@ -50,6 +51,8 @@ const STEP_HOOK = AFTER_TOOL.find((entry) => entry.command.includes('step-delive
 const WAIT_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-wait.mjs')
 const POLL_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-remote-poll.mjs')
 const STATE_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'remote-control-state.mjs')
+const TAIL_SCRIPT = path.join(ROOT, 'hooks', 'scripts', 'devspec-wake-tail.mjs')
+const STEP_MODULE = path.join(ROOT, 'hooks', 'scripts', 'step-delivery.mjs')
 
 const CONN = FIXTURE_ID.connection
 const ROOM = '44444444-4444-4444-8444-444444444444'
@@ -845,6 +848,116 @@ describe('when the connection ends', () => {
     const lines = stderr.join('').split('\n').filter((line) => line.includes('discarded its local copies'))
     assert.equal(lines.length, 1, 'named once')
     assert.match(lines[0], discardedLine(CONN))
+  })
+
+  /** The connection's end as another process runs it: state disabled, then its cleanup, which waits for the steps lock. */
+  function endInAnotherProcess(world, id = CONN) {
+    fs.writeFileSync(path.join(world.dir, `${id}.json`), JSON.stringify({ connection_id: id, enabled: false, end_reason: 'local_stop', agent_name: 'Cursor', local_id: CONVERSATION }))
+    const child = spawn(process.execPath, ['--input-type=module', '-e', [
+      `import { discardSteps, logDiscarded } from ${JSON.stringify(pathToFileURL(STEP_MODULE).href)}`,
+      `logDiscarded('cleanup', ${JSON.stringify(id)}, discardSteps(${JSON.stringify(id)}, { dir: ${JSON.stringify(world.dir)} }))`,
+    ].join('\n')], { env: { PATH: process.env.PATH, HOME: world.home } })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    const done = new Promise((resolve) => child.once('close', (code) => resolve({ code, stderr })))
+    return done
+  }
+
+  /** What the real wake reader prints of the wake file, and what it says on stderr. */
+  async function readerPrints(world, until_) {
+    const tail = spawn(process.execPath, [TAIL_SCRIPT, '--file', world.wakeFile], { env: { PATH: process.env.PATH, HOME: world.home } })
+    let stdout = ''
+    let stderr = ''
+    tail.stdout.on('data', (chunk) => { stdout += chunk })
+    tail.stderr.on('data', (chunk) => { stderr += chunk })
+    const closed = new Promise((resolve) => tail.once('close', resolve))
+    try {
+      assert.ok(await until(() => until_({ stdout, stderr })), `reader stdout: ${stdout}\nstderr: ${stderr}`)
+      // A few more polls, to show nothing more comes out.
+      await new Promise((resolve) => setTimeout(resolve, 600))
+    } finally {
+      tail.kill()
+      await closed
+    }
+    return { stdout, stderr }
+  }
+
+  it('the writer first: an end while the idle writer holds the lock waits for it, discards its record, and its wake is never printed', async () => {
+    const world = connectedHome()
+    holdSome(world)
+    world.endTurn()
+    let ending = null
+    const released = await releaseAtIdle(CONN, IDLE(world, {
+      // After the writer's check, while it writes the note and the record and appends the
+      // wake under the lock, the connection ends in another process.
+      append: (file, events) => {
+        ending = endInAnotherProcess(world)
+        appendWakeEvents(file, events)
+      },
+    }))
+    assert.ok(released.note, 'the connection was live when the writer checked')
+    const cleanup = await ending
+    assert.equal(cleanup.code, 0, cleanup.stderr)
+    const lines = cleanup.stderr.split('\n').filter((line) => line.includes('discarded its local copies'))
+    assert.equal(lines.length, 1, 'one discard, after the writer')
+    assert.match(lines[0], discardedLine(CONN))
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false, 'the record the writer wrote is discarded')
+    assert.match(world.wakeText(), /held_for_step/, 'appended just before the end')
+    const reader = await readerPrints(world, ({ stderr }) => /skipped a held_for_step wake/.test(stderr))
+    assert.equal(reader.stdout, '', 'never printed')
+    assert.match(reader.stderr, new RegExp(`connection ${CONN}, which has ended`))
+  })
+
+  it('the cleanup first: the idle writer sees the end under the lock, writes nothing, and nothing is printed', async () => {
+    const world = connectedHome()
+    holdSome(world)
+    world.endTurn()
+    const stderr = []
+    const write = process.stderr.write
+    process.stderr.write = (line) => { stderr.push(String(line)); return true }
+    try {
+      await releaseAtIdle(CONN, IDLE(world, {
+        isOpen: async () => {
+          if (!fs.readFileSync(path.join(world.dir, `${CONN}.json`), 'utf8').includes('"enabled":false')) {
+            const cleanup = await endInAnotherProcess(world)
+            stderr.push(cleanup.stderr)
+          }
+          return true
+        },
+      }))
+    } finally {
+      process.stderr.write = write
+    }
+    assert.equal(stderr.join('').split('\n').filter((line) => line.includes('discarded its local copies')).length, 1)
+    assert.equal(world.wakeText(), '', 'nothing appended')
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
+  })
+
+  it('the step writer first: an end while the hook hands its pointer over waits for it, then discards the record once', async () => {
+    const world = connectedHome()
+    const batch = noticeBatch([[NOTICE_A, 'needs_person']])
+    holdForNextStep(CONN, batch, eventsOf(batch), { dir: world.dir })
+    let ending = null
+    const output = await stepDeliveryHook(toolCall(), {
+      home: world.home,
+      emit: () => { ending = endInAnotherProcess(world) },
+    })
+    assert.ok(output, 'handed over while the connection was live')
+    const cleanup = await ending
+    assert.equal(cleanup.stderr.split('\n').filter((line) => line.includes('discarded its local copies')).length, 1)
+    assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
+    assert.equal(runStepHook(world, toolCall({ tool_input: { command: 'ls' } })), null, 'nothing more for an ended connection')
+  })
+
+  it('a live connection is unaffected: its held_for_step wake is printed', async () => {
+    const world = connectedHome()
+    holdNotices(world, 1, 300)
+    world.endTurn()
+    await releaseAtIdle(CONN, IDLE(world))
+    const reader = await readerPrints(world, ({ stdout }) => stdout.includes('held_for_step'))
+    assert.equal(reader.stdout, world.wakeText())
+    assert.doesNotMatch(reader.stderr, /skipped/)
+    assert.equal(withoutEndedHeldWakes(world.wakeText(), { dir: world.dir, write: () => assert.fail('nothing skipped') }), world.wakeText())
   })
 
   it('a hook that finishes before the end lands delivers once; the end then discards only what is left', async () => {
