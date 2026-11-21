@@ -130,14 +130,14 @@ function noticeBatch(notices, envelopeId = '22222222-2222-4222-8222-2222222222a1
 const eventsOf = (batch) => buildOwnerMessageEvents(batch, { inboxFile: '/inbox.jsonl' })
 
 /** A home with this conversation connected to DevSpec, Cursor in a turn of it. */
-function connectedHome({ state = {} } = {}) {
+function connectedHome({ state = {}, id = CONN } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-step-delivery-'))
   roots.push(home)
   const dir = path.join(home, '.devspec', 'remote-control', 'connections')
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(
-    path.join(dir, `${CONN}.json`),
-    JSON.stringify({ connection_id: CONN, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, session_id: ROOM, inbox_byte_offset: 0, ...state }),
+    path.join(dir, `${id}.json`),
+    JSON.stringify({ connection_id: id, enabled: true, agent_name: 'Cursor', local_id: CONVERSATION, session_id: ROOM, inbox_byte_offset: 0, ...state }),
     { mode: 0o600 },
   )
   const transcript = path.join(home, '.cursor', 'projects', 'work', 'agent-transcripts', CONVERSATION, `${CONVERSATION}.jsonl`)
@@ -947,6 +947,130 @@ describe('when the connection ends', () => {
     assert.equal(cleanup.stderr.split('\n').filter((line) => line.includes('discarded its local copies')).length, 1)
     assert.equal(fs.existsSync(stepsDir(CONN, world.dir)), false)
     assert.equal(runStepHook(world, toolCall({ tool_input: { command: 'ls' } })), null, 'nothing more for an ended connection')
+  })
+
+  /**
+   * A stop at the terminal, the real one (remote-control-state.mjs disable), for
+   * connection `id`. Its own id, not the fixture's: a stop signals every process on the
+   * machine whose command line names the connection.
+   */
+  const stopArgs = (id) => [STATE_SCRIPT, 'disable', '--connection-id', id, '--agent', 'Cursor', '--local-id', CONVERSATION]
+  const stopEnv = (world) => ({ PATH: process.env.PATH, HOME: world.home, DEVSPEC_MCP_URL: UNROUTABLE })
+  function stopNow(world, id) {
+    const run = spawnSync(process.execPath, stopArgs(id), { env: stopEnv(world), encoding: 'utf8', timeout: 60_000 })
+    assert.equal(run.status, 0, run.stderr)
+    return run
+  }
+  function stopInAnotherProcess(world, id) {
+    const child = spawn(process.execPath, stopArgs(id), { env: stopEnv(world) })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    return new Promise((resolve) => child.once('close', (code) => resolve({ code, stdout, stderr })))
+  }
+  const isLive = (world, id) => JSON.parse(fs.readFileSync(path.join(world.dir, `${id}.json`), 'utf8')).enabled === true
+  const pauseSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  /** Capture this process's stderr while `work` runs. */
+  async function capturingStderr(work) {
+    const lines = []
+    const write = process.stderr.write
+    process.stderr.write = (line) => { lines.push(String(line)); return true }
+    try {
+      return { result: await work(), stderr: lines.join('') }
+    } finally {
+      process.stderr.write = write
+    }
+  }
+  const discardLines = (text) => text.split('\n').filter((line) => line.includes('discarded its local copies'))
+
+  it('a stop racing the hook, the stop first: no pointer is printed, and what the hook held is discarded once', async () => {
+    const id = randomUUID()
+    const world = connectedHome({ id })
+    const batch = noticeBatch([[NOTICE_A, 'needs_person']])
+    holdForNextStep(id, batch, eventsOf(batch), { dir: world.dir })
+    const printed = []
+    let stop = null
+    const { result, stderr } = await capturingStderr(() => stepDeliveryHook(toolCall(), {
+      home: world.home,
+      // During the hook's lookup, before it takes the lock, the stop runs whole.
+      isOpen: async () => {
+        stop ??= stopNow(world, id)
+        return true
+      },
+      emit: async (output) => { printed.push(output) },
+    }))
+    assert.equal(result, null)
+    assert.deepEqual(printed, [], 'never a pointer after the stop')
+    assert.equal(discardLines(stop.stderr + stderr).length, 1, 'discarded once, by the hook that held it')
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+  })
+
+  it('a stop racing the hook, the hook first: the pointer is printed while the connection is live, and the stop lands after it', async () => {
+    const id = randomUUID()
+    const world = connectedHome({ id })
+    const batch = noticeBatch([[NOTICE_A, 'needs_person']])
+    holdForNextStep(id, batch, eventsOf(batch), { dir: world.dir })
+    let stopping = null
+    const printed = []
+    const output = await stepDeliveryHook(toolCall(), {
+      home: world.home,
+      // The hook holds the lock and is printing its pointer when the stop starts.
+      emit: async (text) => {
+        stopping = stopInAnotherProcess(world, id)
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        printed.push({ text, live: isLive(world, id) })
+      },
+    })
+    assert.ok(output)
+    assert.deepEqual(printed.map((each) => each.live), [true], 'live at the moment of printing: the stop waited for the lock')
+    const stop = await stopping
+    assert.equal(stop.code, 0, stop.stderr)
+    assert.equal(isLive(world, id), false, 'then the stop landed')
+    assert.deepEqual(JSON.parse(stop.stdout).steps_discarded, { notices: [NOTICE_A], check_jobs: [] }, 'and discarded the record once')
+    assert.equal(discardLines(stop.stderr).length, 1)
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+  })
+
+  it('a stop racing the idle writer, the stop first: no wake is appended, and what it held is discarded once', async () => {
+    const id = randomUUID()
+    const world = connectedHome({ id })
+    holdSome(world, id)
+    world.endTurn()
+    let stop = null
+    const { result, stderr } = await capturingStderr(() => releaseAtIdle(id, IDLE(world, {
+      isOpen: async () => {
+        stop ??= stopNow(world, id)
+        return true
+      },
+    })))
+    assert.equal(result.discarded, true)
+    assert.equal(world.wakeText(), '', 'no wake after the stop')
+    assert.equal(discardLines(stop.stderr + stderr).length, 1)
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
+  })
+
+  it('a stop racing the idle writer, the writer first: the wake is appended while the connection is live, and the stop lands after it', async () => {
+    const id = randomUUID()
+    const world = connectedHome({ id })
+    holdSome(world, id)
+    world.endTurn()
+    let stopping = null
+    let liveAtAppend = null
+    const released = await releaseAtIdle(id, IDLE(world, {
+      append: (file, events) => {
+        stopping = stopInAnotherProcess(world, id)
+        pauseSync(400)
+        liveAtAppend = isLive(world, id)
+        appendWakeEvents(file, events)
+      },
+    }))
+    assert.ok(released.note)
+    assert.equal(liveAtAppend, true, 'live at the moment of appending: the stop waited for the lock')
+    const stop = await stopping
+    assert.equal(isLive(world, id), false)
+    assert.equal(discardLines(stop.stderr).length, 1, 'the stop discarded the record once')
+    assert.equal(fs.existsSync(stepsDir(id, world.dir)), false)
   })
 
   it('a live connection is unaffected: its held_for_step wake is printed', async () => {

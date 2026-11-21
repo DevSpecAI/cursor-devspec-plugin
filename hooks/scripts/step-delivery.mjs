@@ -69,15 +69,23 @@
  * cleanup never deletes an item a live process has taken; a taker that died (a hook past
  * Cursor's timeout) leaves its files to be put back (`reclaimAbandoned`).
  *
- * One lock per connection (`withStepsLock`) is taken by both writers, the step hook and
- * the idle wake, and by the cleanup at the connection's end. A writer takes it after it
- * has asked DevSpec about check jobs, and holds it from its check that the connection is
- * still live, through writing the note and the record, to handing the pointer over or
- * appending the wake. So whichever comes second sees what the other did: a writer after
- * the end writes nothing and discards what it held; a cleanup after a writer discards
- * the record that writer wrote. A wake that writer appended just before the end is never
- * printed: the wake reader skips a `held_for_step` line whose connection has ended
- * (`withoutEndedHeldWakes`, devspec-wake-tail.mjs).
+ * One lock per connection is taken by both writers, the step hook and the idle wake, and
+ * by every write that marks the connection ended, with its cleanup (`endConnectionSteps`:
+ * the poller's `disableLocalState` for every end it sees, remote-control-state.mjs's
+ * `disableConnectionState` for a stop at the terminal; those are the only two writes of
+ * `enabled: false`). A writer takes it after it has asked DevSpec about check jobs, and
+ * holds it from its check that the connection is still live, through writing the note
+ * and the record, until the hook's pointer has been written out or the wake appended. So
+ * whichever comes second sees what the other did: a writer after the end writes nothing
+ * and discards what it held; an end after a writer marks the connection ended once the
+ * pointer or wake is out, and discards the record the writer wrote. A wake appended just
+ * before an end is never printed: the wake reader skips a `held_for_step` line whose
+ * connection has ended (`withoutEndedHeldWakes`, devspec-wake-tail.mjs).
+ *
+ * What this cannot see: an end DevSpec has decided that the plugin has not heard yet (the
+ * poller learns it on its next poll). Until then the connection is live here, and a
+ * pointer or wake can still go out for it. What that leaves for a notice is DevSpec's to
+ * own: semantics.notice_audience in devspec://product/remote-ingress-contract.
  *
  * How a check job is taken and ruled, and what a notice asks of the agent, are DevSpec's
  * rules: the note points at them by id and never restates them.
@@ -272,12 +280,13 @@ function lockPath(connectionId, dir) {
 }
 
 /**
- * Run `work` (synchronous) holding the connection's steps lock: a file holding this
- * process's id, made by hard-linking a file already written, so it never exists
- * half-written. A lock whose holder has gone is cleared. It sits beside the steps folder,
- * not in it, so the hook's guard (hooks.json) never sees it. Returns what `work` returns.
+ * Take the connection's steps lock, waiting while a live process holds it, and return
+ * the function that releases it. The lock is a file holding the taker's process id,
+ * made by hard-linking a file already written, so it never exists half-written; one
+ * whose holder has gone is cleared. It sits beside the steps folder, not in it, so the
+ * hook's guard (hooks.json) never sees it.
  */
-export function withStepsLock(connectionId, dir, work) {
+function acquireStepsLock(connectionId, dir) {
   const target = lockPath(connectionId, dir)
   const mine = `${target}.${process.pid}-${randomBytes(4).toString('hex')}`
   fs.mkdirSync(dir, { recursive: true })
@@ -305,11 +314,41 @@ export function withStepsLock(connectionId, dir, work) {
   } finally {
     fs.rmSync(mine, { force: true })
   }
+  return () => fs.rmSync(target, { force: true })
+}
+
+/** Run `work` (synchronous) holding the connection's steps lock; returns what it returns. */
+export function withStepsLock(connectionId, dir, work) {
+  const release = acquireStepsLock(connectionId, dir)
   try {
     return work()
   } finally {
-    fs.rmSync(target, { force: true })
+    release()
   }
+}
+
+/** The same, for `work` that must finish something asynchronous (a flushed write) before the lock goes. */
+export async function withStepsLockAsync(connectionId, dir, work) {
+  const release = acquireStepsLock(connectionId, dir)
+  try {
+    return await work()
+  } finally {
+    release()
+  }
+}
+
+/**
+ * Mark the connection ended (`markEnded`, the caller's own write of its state file)
+ * holding its steps lock, then discard what it held, still holding it. Every write that
+ * ends a connection goes through here, so a writer holding the lock finishes what it
+ * hands over while the connection is live, or sees it ended and hands nothing over:
+ * never a pointer or wake after the end. Returns the ids discarded, as `discardSteps`.
+ */
+export function endConnectionSteps(connectionId, { dir, markEnded }) {
+  return withStepsLock(connectionId, dir, () => {
+    markEnded()
+    return discardLocked(connectionId, dir)
+  })
 }
 
 /** Put back what a process that has gone took and never finished with. */
@@ -520,9 +559,10 @@ export async function stepDeliveryHook(
   )
   const adding = checked.filter((each) => each.open)
 
-  // From the check that the connection is still live to handing the pointer over, under
-  // the connection's steps lock, which its cleanup takes too (`withStepsLock`).
-  return withStepsLock(connectionId, connDir, () => {
+  // From the check that the connection is still live until the pointer has been written
+  // out, under the connection's steps lock, which every write that ends the connection
+  // takes too (`endConnectionSteps`). The hold is a note, a record and one short line.
+  return withStepsLockAsync(connectionId, connDir, async () => {
     // The connection ended while this hook held its items, so the end left them to it:
     // nothing is handed over for a connection that has ended. Everything goes back, and
     // is discarded as the end would have done.
@@ -562,8 +602,9 @@ export async function stepDeliveryHook(
     if (!record) return null
     const context = pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
     const output = context ? JSON.stringify(postToolUseOutput(context)) : null
-    // Handed over while the lock is held, so no end comes between the check and this.
-    if (output) emit(output)
+    // Written out, and the write finished, before the lock goes, so no end comes between
+    // the check and the agent's pointer.
+    if (output) await emit(output)
     return output
   })
 }
@@ -618,7 +659,8 @@ export async function releaseAtIdle(
     if (takenRecord && record) drop(takenRecord)
   }
   // From the check that the connection is still live to appending the wake, under the
-  // connection's steps lock, which its cleanup takes too (`withStepsLock`).
+  // connection's steps lock, which every write that ends the connection takes too
+  // (`endConnectionSteps`).
   return withStepsLock(connectionId, dir, () => {
     // An end that landed during the lookups left these items to this hold: they are
     // discarded and named as the end would have, and no record or wake is written.
@@ -795,8 +837,9 @@ if (isDirectRun(import.meta.url)) {
       input = null
     }
     try {
-      // Printed from inside the hook, while it holds the connection's steps lock.
-      await stepDeliveryHook(input, { emit: (output) => process.stdout.write(output) })
+      // Printed from inside the hook, while it holds the connection's steps lock, which
+      // it releases only once the write has finished.
+      await stepDeliveryHook(input, { emit: (output) => new Promise((resolve) => process.stdout.write(output, () => resolve())) })
     } catch {
       /* what waits stays where it is, for the next step or the idle wake */
     }
