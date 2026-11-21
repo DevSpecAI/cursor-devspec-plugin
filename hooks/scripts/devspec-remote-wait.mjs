@@ -80,7 +80,8 @@ import {
   emitConnectPhase,
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
-import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
+import { appendWakeEvents, ensureWakeFile, wakeLines } from './devspec-wake-file.mjs'
+import { wakesForOneOutput } from './hook-context-budget.mjs'
 import {
   buildInteractionAnswerEvents,
   INTERACTION_ANSWER_RECORD_TYPE,
@@ -1629,6 +1630,35 @@ export async function tellRoomWakeHeld({ connectionId, batch, state, error, told
   return true
 }
 
+/** What a one-shot result says when some of a delivery's wakes wait for the next re-arm. */
+export function wakesWaitingEvent(left) {
+  return {
+    type: 'wakes_waiting',
+    count: left,
+    note: 'Re-arm the wait with --pending now to print the rest.',
+  }
+}
+
+/** How many of this delivery's wakes an earlier one-shot run printed, when the inbox cursor still stands at it. */
+function wakesPrintedOf(state, offset, batch) {
+  const progress = state?.wake_batch_progress
+  return progress && progress.offset === offset && progress.key === heldWakeKey(batch) && Number.isInteger(progress.printed)
+    ? progress.printed
+    : 0
+}
+
+/**
+ * Print `wakes` as one Shell result (a one-shot run): whole wakes while they fit one
+ * output together, and a line saying how many wait (`wakesForOneOutput`,
+ * hook-context-budget.mjs, the same sizing the wake file's reader uses). Returns how many
+ * were printed.
+ */
+async function printOneShot(wakes) {
+  const { count, text } = wakesForOneOutput(wakes.map(wakeLines), { waiting: (left) => wakeLines([wakesWaitingEvent(left)]) })
+  await new Promise((resolve, reject) => process.stdout.write(text, (error) => (error ? reject(error) : resolve())))
+  return count
+}
+
 async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
@@ -1833,10 +1863,23 @@ async function main() {
           continue
         }
         const events = out.events
-        // Dequeue only after the entire one-command-turn payload reached stdout: the
-        // command's wake, then its recall's own wake when it has one.
-        for (const event of events) await emitStdoutEvent(event)
-        for (const event of out.recallWake ?? []) await emitStdoutEvent(event)
+        // Dequeue only after the entire one-command-turn payload reached stdout. In follow
+        // mode what reaches Cursor is the wake file, whose reader sizes each print, and
+        // this process's stdout is its log. A one-shot run's stdout is one Shell result:
+        // it holds whole wakes only while they fit one output together, then a line saying
+        // how many wait, and the inbox cursor moves past this delivery only once all its
+        // wakes are printed (`printOneShot`, `wakesForOneOutput`).
+        const already = args.follow ? 0 : wakesPrintedOf(readState(connectionId), offset, batch)
+        let printedAll = true
+        if (args.follow) {
+          for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
+        } else {
+          const count = await printOneShot(out.wakes.slice(already))
+          printedAll = already + count >= out.wakes.length
+          if (!printedAll) {
+            writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), printed: already + count } })
+          }
+        }
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
           const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
           if (decision === 'defer') { await sleep(pollMs); continue }
@@ -1848,8 +1891,8 @@ async function main() {
         }
         if (args.follow && args.wakeFile) {
           appendWakeEvents(args.wakeFile, events)
-          // A recall that only fits beside the command as a wake of its own follows it as
-          // its own wake, so the reader prints each whole, in order (turn-recall.mjs).
+          // A recall pointer with no room beside the command follows it as a wake of its
+          // own, so the reader prints each whole, in order (turn-recall.mjs).
           if (out.recallWake) appendWakeEvents(args.wakeFile, out.recallWake)
           if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
             const current = readDismissalState(connectionId)
@@ -1860,16 +1903,21 @@ async function main() {
             }
           }
         }
-        offset = newOffset
-        offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
-        recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
-        // What this delivery brings into the turn: notice ids, or that something
-        // other than a notice woke it (notice-reply.mjs).
-        recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
-        // The recall this wake carried counts as shown now if it went inline, or once the
-        // agent has read its note (its own, or the whole wake's) whole; until then the
-        // next command's recall can offer those records again (turn-recall.mjs).
-        settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
+        if (printedAll) {
+          offset = newOffset
+          offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+          if (already > 0) writeStatePatch(connectionId, { wake_batch_progress: null })
+        }
+        // A delivery's bookkeeping is done once, when its first wake is printed.
+        if (already === 0) {
+          recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+          // What this delivery brings into the turn: notice ids, or that something
+          // other than a notice woke it (notice-reply.mjs).
+          recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
+          // Its recall's records count as shown once the agent has read its note whole;
+          // until then the next command's recall can offer them again (turn-recall.mjs).
+          settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
+        }
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

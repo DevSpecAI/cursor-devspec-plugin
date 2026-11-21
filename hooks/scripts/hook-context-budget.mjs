@@ -788,60 +788,21 @@ export function postToolUseOutput(context, extra = {}) {
   }
 }
 
-/** A note's id is always 16 hex characters, so a pointer to this stand-in is as long as one to the real note. */
-const SAME_LENGTH_NOTE = '0'.repeat(16)
-
 /**
- * The one place a wake is sized against Cursor's rules on one command's output: a wake
- * reaches the agent as a background command's output (the host wake follow writes it,
- * devspec-wake-tail.mjs prints it), so it is held to `fitsShellOutput` whole, as
- * `wakeLines` writes it, everything already in it included.
- *
- * `events` with `text` added at index `at` (the end when not given):
- * - `inline(text)`, the event that carries it, when the whole wake with it still fits;
- * - otherwise `pointer(note)`, an event pointing to a note that keeps the text whole
- *   (`writeNote`), when the whole wake with that pointer still fits. That is checked
- *   before the note is written, with a pointer of the same length, and again with the
- *   real one;
- * - otherwise nothing is added: what was already in the wake is never pushed past
- *   Cursor's rules, and a wake that was over them before is left as it was.
- *
- * Returns `{ events, route, note, error }`: `route` is `'inline'`, `'note'` (with the
- * `note` from `writeNote`) or `'none'`, when nothing fitted, or when the note could not
- * be written (`error` says why). The caller decides what to do with what it could not
- * add.
- */
-export function fitIntoWake(events, { text, inline, pointer, at = events.length, home = os.homedir() }) {
-  const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]
-  const fits = (candidate) => fitsShellOutput(wakeLines(candidate))
-  const none = { events, route: 'none', note: null }
-  if (typeof text !== 'string' || text.length === 0) return none
-  const withText = place(inline(text))
-  if (fits(withText)) return { events: withText, route: 'inline', note: null }
-  const parts = splitText(text).length
-  if (!fits(place(pointer({ id: SAME_LENGTH_NOTE, command: noteCommand(SAME_LENGTH_NOTE), parts })))) return none
-  let note
-  try {
-    note = writeNote(text, { home })
-  } catch (error) {
-    return { ...none, error }
-  }
-  const pointed = place(pointer(note))
-  return fits(pointed) ? { events: pointed, route: 'note', note } : none
-}
-
-/**
- * fitIntoWake's companion for the reader that prints the wake file
- * (devspec-wake-tail.mjs): of `wakes` (whole wakes waiting to be printed, oldest first,
- * each as `wakeLines` wrote it), how many go out together in one output. As many whole
- * wakes as still fit Cursor's rules on one output together (`fitsShellOutput`), never
- * part of one; the rest wait for the next output. The first always goes, so a single
- * wake over the rules on its own is printed as it always was (fitIntoWake never makes
- * one so; only a command too long on its own is).
+ * The one way anything that prints wakes for Cursor sizes what it prints as one output:
+ * the reader of the wake file (devspec-wake-tail.mjs) and the one-shot wait, whose
+ * output is one Shell result (devspec-remote-wait.mjs). Of `wakes` (whole wakes
+ * waiting, oldest first, each as `wakeLines` wrote it), as many as fit Cursor's rules
+ * on one output together (`fitsShellOutput`), never part of one. When some are left and
+ * `waiting(left)` is given, the line it returns goes after them, and room is kept for
+ * it; it is left out only when the first wake alone leaves no room for it. The first
+ * wake always goes, so a single wake over the rules on its own is printed as it always
+ * was.
  * @param {string[]} wakes
+ * @param {{ waiting?: (left: number) => string }} [opts]
  * @returns {{ count: number, text: string }}
  */
-export function wakesForOneOutput(wakes) {
+export function wakesForOneOutput(wakes, { waiting = null } = {}) {
   let count = 0
   let text = ''
   for (const wake of wakes) {
@@ -849,7 +810,12 @@ export function wakesForOneOutput(wakes) {
     text += wake
     count += 1
   }
-  return { count, text }
+  if (count === wakes.length || typeof waiting !== 'function') return { count, text }
+  // Some are left: make room for the line that says so, giving back wakes (never the first).
+  while (count > 1 && !fitsShellOutput(wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
+  const taken = wakes.slice(0, count).join('')
+  const line = waiting(wakes.length - count)
+  return { count, text: fitsShellOutput(taken + line) ? taken + line : taken }
 }
 
 /** What a wake kept whole in a note says about itself: one fixed sentence. */

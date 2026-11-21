@@ -268,6 +268,13 @@ function runAfterTool(home, input) {
   assert.equal(run.stdout, '')
 }
 
+/** The agent reads a recall's note whole, part by part, as the postToolUse hook sees it. */
+function readNote(home, read) {
+  const id = /notes\/([0-9a-f]{16})\.md$/.exec(read)[1]
+  for (const file of noteFiles(home, id)) runAfterTool(home, catCall(home, file, { conversation: CHAT }))
+  return id
+}
+
 describe('a command sent from a DevSpec room gets its project recall', () => {
   it('asks for it on every poll, hands it over right after the command, and leaves out what the conversation was shown', async () => {
     const run = await startPoller()
@@ -285,8 +292,10 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       const events = await run.nextWake()
       assert.deepEqual(events.map((e) => e.type), ['owner_message', 'turn_recall', 'wake'])
       const carried = events.find((e) => e.type === 'turn_recall')
-      assert.equal(carried.block, recall(1).formatted_block)
-      assert.equal(carried.read, undefined)
+      assert.equal(carried.block, undefined, 'the recall is always in a note')
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(carried.read)[1], { home: run.home }), recall(1).formatted_block)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'printed is not read')
+      readNote(run.home, carried.read)
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(1)])
 
       // The next poll leaves out what the conversation has been shown.
@@ -297,7 +306,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       run.stub.serve(commandPoll(2, 'And make the redirect keep the return path', { turn_recall: recall(2) }))
       assert.ok(await until(() => run.records().filter((r) => r.type === 'owner_messages').length === 2))
       const second = await run.nextWake()
-      assert.equal(second.find((e) => e.type === 'turn_recall').block, recall(2).formatted_block)
+      readNote(run.home, second.find((e) => e.type === 'turn_recall').read)
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(1), key(2)])
     } finally {
       await run.cleanup()
@@ -319,7 +328,8 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(await until(() => run.records().some((r) => r.type === 'automation_dispatches')), `no run kept; stderr:\n${run.stderr()}`)
       const events = await run.nextWake()
       assert.deepEqual(events.map((e) => e.type), ['automation_dispatch', 'turn_recall', 'wake'])
-      assert.equal(events[1].block, recall(4).formatted_block)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
+      readNote(run.home, events[1].read)
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(4)])
     } finally {
       await run.cleanup()
@@ -370,7 +380,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
   }
   const mediumRecall = (n) => ({ ...recall(n), formatted_block: `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, i) => `- [MEMORY · decision] **Decision ${i}** — the settings page keeps its redirect (get_memory({ id: "${i}" }))`).join('\n')}` })
 
-  it('near Cursor\'s limit (19,990 characters with the command alone): the command goes inline in its own wake, byte for byte, and its recall follows as the next wake; the reader prints both whole, in order', async () => {
+  it('near Cursor\'s limit (19,990 characters with the command alone): the command goes inline in its own wake, byte for byte, and a pointer-only wake naming it follows; the reader prints both whole, in order', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -400,8 +410,11 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.equal(commandWake[0].body, tight, 'the command inline, byte for byte')
       assert.deepEqual(recallWake.map((e) => e.type), ['turn_recall'])
       assert.equal(recallWake[0].for, commandWake[0].message_id, 'naming the command it belongs to')
-      assert.equal(recallWake[0].block, mediumRecall(9).formatted_block)
-      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(9)], 'shown once its wake is written')
+      assert.equal(recallWake[0].block, undefined, 'a pointer only')
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(recallWake[0].read)[1], { home: run.home }), mediumRecall(9).formatted_block)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'printed is not read')
+      readNote(run.home, recallWake[0].read)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(9)], 'shown once its note is read')
 
       // 19,000 characters alone: the recall does not fit inline, its short pointer does.
       const roomy = bodyFor(19_000)
@@ -437,6 +450,43 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [], 'not shown until the note is read')
       for (const file of noteFiles(run.home, id)) runAfterTool(run.home, catCall(run.home, file, { conversation: CHAT }))
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(11)])
+    } finally {
+      await run.cleanup()
+    }
+  })
+
+  it('the one-shot wait sizes its whole result: a command and its pointer wake that do not fit together come out in two results, each within the limit, the cursor moving only past what was printed, nothing lost', async () => {
+    const run = await startPoller()
+    try {
+      assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
+      const bodyFor = await measuredBodies(run)
+      // A command wake that fits on its own but not with the pointer beside it, with room for the waiting line.
+      const body = bodyFor(19_870)
+      run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(12) }))
+      assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      const before = run.state().inbox_byte_offset
+
+      const first = run.startWait()
+      assert.equal(await Promise.race([first.exited, sleep(10_000).then(() => 'timeout')]), 0, first.stderr())
+      assert.ok(fitsShellOutput(first.stdout()), `${first.stdout().length} characters in one result`)
+      const one = first.events()
+      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'wake', 'wakes_waiting'])
+      assert.equal(one[0].body, body, 'the command, whole')
+      assert.equal(one[2].count, 1)
+      assert.equal(run.state().inbox_byte_offset, before, 'the cursor stays at this delivery: part of it is still to print')
+
+      const second = run.startWait()
+      assert.equal(await Promise.race([second.exited, sleep(10_000).then(() => 'timeout')]), 0, second.stderr())
+      assert.ok(fitsShellOutput(second.stdout()))
+      const two = second.events()
+      assert.deepEqual(two.map((e) => e.type), ['turn_recall'])
+      assert.equal(two[0].for, one[0].message_id)
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(two[0].read)[1], { home: run.home }), mediumRecall(12).formatted_block, 'nothing lost')
+      assert.ok(run.state().inbox_byte_offset > before, 'and now past it')
+      assert.equal(run.state().wake_batch_progress, null)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
+      readNote(run.home, two[0].read)
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(12)])
     } finally {
       await run.cleanup()
     }
@@ -517,7 +567,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
     })
   }
 
-  it('never holds a 19,990-character command: it fits on its own, so it goes inline, with its recall in the next wake', async () => {
+  it('never holds a 19,990-character command: it fits on its own, so it goes inline, and a wake of its own says its recall could not be saved', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -529,10 +579,13 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
       const tight = 'a'.repeat(Math.floor((19_990 - around - 2) / 2))
       run.stub.serve(commandPoll(2, tight, { turn_recall: recall(23) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
+      // The one-shot result has room only for the command; its line follows in the next.
       const events = await run.nextWake()
-      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'wake', 'turn_recall'])
+      assert.deepEqual(events.map((e) => e.type), ['owner_message', 'wake'])
       assert.equal(events[0].body, tight)
-      assert.equal(events[2].block, recall(23).formatted_block)
+      const next = await run.nextWake()
+      assert.deepEqual(next, [{ type: 'turn_recall', for: events[0].message_id, note: RECALL_UNSAVED_NOTE }], 'its recall could not be saved: it says so, in a wake of its own')
+      assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [])
       assert.equal(run.stub.named('post_session_message').length, 0, 'nothing held')
     } finally {
       await run.cleanup()
@@ -614,7 +667,7 @@ describe('a recall that is slow, missing or broken never holds the command back'
       run.stub.serve(commandPoll(1, 'Why does the settings page redirect to login?', { turn_recall: recall(6) }))
       assert.ok(await until(() => run.records().some((r) => r.type === 'owner_messages')), `no command kept; stderr:\n${run.stderr()}`)
       const events = await run.nextWake()
-      assert.equal(events.find((e) => e.type === 'turn_recall').block, recall(6).formatted_block)
+      readNote(run.home, events.find((e) => e.type === 'turn_recall').read)
       assert.deepEqual(seenRecallKeys(CHAT, { home: run.home }), [key(6)], 'the torn store is replaced by what was shown')
     } finally {
       await run.cleanup()
