@@ -630,7 +630,7 @@ describe('the final message of a notice-only turn', () => {
     fs.mkdirSync(notes, { recursive: true })
     fs.chmodSync(notes, 0o500)
     try {
-      assert.equal(await postToolUse(), '', 'nothing could be written, so nothing is offered')
+      assert.equal(await postToolUse(), '{}', 'nothing could be written, so nothing is offered (and the hook still answers, item 6ddde907)')
     } finally {
       fs.chmodSync(notes, 0o700)
     }
@@ -672,10 +672,10 @@ describe('the final message of a notice-only turn', () => {
     const both = readNoteText(joined, { home })
     assert.ok(both.includes(long) && both.includes('Also reopened the task Brandon closed.'))
     // Only mentioning the note is not reading it.
-    assert.ok(await postToolUse({ tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${joined}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }))
+    assert.ok(JSON.parse(await postToolUse({ tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${joined}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) })).additional_context)
     // Read whole, by Cursor's Read tool: no more pointers.
-    assert.equal(await postToolUse(readCall(noteFiles(home, joined)[0])), '')
-    assert.equal(await postToolUse(), '')
+    assert.equal(await postToolUse(readCall(noteFiles(home, joined)[0])), '{}')
+    assert.equal(await postToolUse(), '{}')
   })
 })
 
@@ -931,8 +931,8 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
 
     // Kept for the next turn: not on an afterMCPExecution, nor for a subagent's call...
     const toolCall = { tool_name: 'Shell', tool_input: { command: 'git status' }, tool_output: 'clean' }
-    assert.equal((await run('mark-explicit-reply.mjs', 'afterMCPExecution', { mcp_server_name: 'devspec', tool_name: 'devspec__get_task', result_json: '{}' })).stdout, '')
-    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', { ...toolCall, agent_id: 'sub-1' })).stdout, '')
+    assert.equal((await run('mark-explicit-reply.mjs', 'afterMCPExecution', { mcp_server_name: 'devspec', tool_name: 'devspec__get_task', result_json: '{}' })).stdout, '{}')
+    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', { ...toolCall, agent_id: 'sub-1' })).stdout, '{}')
     assert.equal(fs.existsSync(tellPersonNotePath(CONN, dir)), true)
 
     // ...and handed over at the conversation's next tool call, as a note it is offered until it reads.
@@ -946,8 +946,8 @@ describe('Stop and the trail in a notice-only turn, end to end', () => {
     assert.match(note, /semantics\.notice_audience\.telling_anyway/)
     assert.equal(JSON.parse((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout).additional_context, out.additional_context, 'offered again until read')
     const { conversation_id: _, ...cat } = catCall(home, noteFiles(home, id)[0])
-    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', cat)).stdout, '', 'read whole by `cat`, so done')
-    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout, '')
+    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', cat)).stdout, '{}', 'read whole by `cat`, so done')
+    assert.equal((await run('mark-explicit-reply.mjs', 'postToolUse', toolCall)).stdout, '{}')
   })
 
   it('a notice-only turn posts no trail, which DevSpec would file under someone\'s command', async () => {

@@ -35,6 +35,7 @@ import {
   takeLock,
 } from './git-observer.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const FULL_SHA = /^[0-9a-f]{40}$/
@@ -271,7 +272,8 @@ export async function reportCommits({ home = os.homedir(), call = mcpToolsCall, 
 }
 
 if (isDirectRun(import.meta.url)) {
-  // Hook output is context for the model: this says nothing there, and always exits 0.
+  // Hook output is context for the model: this says nothing there (`{}`), and always exits 0.
+  answerCursorAtExit()
   // The hook input is not needed, but is read so Cursor never writes into a closed pipe.
   if (!process.stdin.isTTY) {
     try { fs.readFileSync(0) } catch { /* nothing to read */ }

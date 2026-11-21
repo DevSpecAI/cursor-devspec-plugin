@@ -117,6 +117,7 @@ import { wakeLines } from './devspec-wake-file.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateText } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 /** The `turn_recall_version` this plugin negotiates on `poll_connection`. */
 export const TURN_RECALL_VERSION = 1
@@ -483,6 +484,7 @@ export function noteRecallReads(input, { home = os.homedir(), now = Date.now() }
 // preCompact: the summary that replaces the conversation may not keep the cards shown
 // so far, so they may be shown again. Cursor reads nothing from this hook's output.
 if (isDirectRun(import.meta.url) && process.argv[2] === 'compact') {
+  answerCursorAtExit()
   try {
     forgetShown(firingConversation(JSON.parse(fs.readFileSync(0, 'utf8'))))
   } catch {
@@ -495,6 +497,7 @@ if (isDirectRun(import.meta.url) && process.argv[2] === 'compact') {
 // It only observes, and answers Cursor with nothing, so it takes no share of the
 // context Cursor passes on after a step.
 if (isDirectRun(import.meta.url) && process.argv[2] === 'post-tool') {
+  answerCursorAtExit()
   try {
     noteRecallReads(JSON.parse(fs.readFileSync(0, 'utf8')))
   } catch {

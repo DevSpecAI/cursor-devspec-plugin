@@ -33,6 +33,7 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
 import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const LOOKUP_TIMEOUT_MS = 8_000
 
@@ -189,5 +190,6 @@ const isMain =
   Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
 if (isMain) {
+  answerCursorAtExit()
   main().catch(() => {})
 }

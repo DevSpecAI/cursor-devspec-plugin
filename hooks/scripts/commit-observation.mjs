@@ -22,6 +22,7 @@ import { connectionToken, credentialIdentity } from './resolve-mcp-auth.mjs'
 import { devspecFolderMarker, findProjectPin, gitRemoteOrigin, mainWorkTreeFrom } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { withoutStandInPrefix } from './git-observer.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const REPORT_TIMEOUT_MS = 2_500
@@ -483,4 +484,7 @@ async function main() {
   } catch { /* malformed envelopes and every observation failure fail open */ }
 }
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-if (isMain) main().catch(() => {})
+if (isMain) {
+  answerCursorAtExit()
+  main().catch(() => {})
+}

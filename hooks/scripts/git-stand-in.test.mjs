@@ -634,14 +634,15 @@ describe('the plugin\'s other hooks', () => {
     const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks', 'hooks.json'), 'utf8')).hooks
     const entries = [...hooks.postToolUse, ...hooks.stop].filter((entry) => entry.command.includes('commit-reports.mjs'))
     assert.equal(entries.length, 2)
-    const probe = entries[0].command.replace(/command -v node[^;]*commit-reports\.mjs\\?"?/, 'echo RAN')
+    const probe = entries[0].command.replace(/command -v node[^;]*commit-reports\.mjs\\?"?/, 'exec echo RAN')
     assert.notEqual(probe, entries[0].command)
     const home = tempDir()
     const run = () => execFileSync('sh', ['-c', probe], { input: '{}', encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, CLAUDE_PLUGIN_ROOT: ROOT } }).trim()
-    assert.equal(run(), '')
+    // Without Node, the hook still answers Cursor, with `{}` (item 6ddde907).
+    assert.equal(run(), '{}')
     const folder = path.join(home, '.devspec', 'cursor-git-stand-in', '0'.repeat(32))
     fs.mkdirSync(folder, { recursive: true })
-    assert.equal(run(), '')
+    assert.equal(run(), '{}')
     fs.writeFileSync(path.join(folder, 'pending'), '')
     assert.equal(run(), 'RAN')
   })

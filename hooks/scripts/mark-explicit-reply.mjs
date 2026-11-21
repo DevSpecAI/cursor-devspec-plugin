@@ -46,6 +46,7 @@ import {
 } from './notice-reply.mjs'
 import { isDevspecServer, namespacedVerb } from './project-context.mjs'
 import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 function readStdin() {
   try {
@@ -268,4 +269,7 @@ async function main() {
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+if (isMain) {
+  answerCursorAtExit()
+  main()
+}

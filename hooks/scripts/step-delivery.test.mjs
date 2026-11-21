@@ -207,11 +207,10 @@ function runStepHook(world, input, env = {}) {
   })
   if (run.error && run.error.code !== 'EPIPE') throw run.error
   assert.equal(run.status, 0, run.stderr)
-  const out = run.stdout.trim()
-  if (!out) return null
-  const parsed = JSON.parse(out)
+  // Every hook answers Cursor, `{}` when it has nothing to say (item 6ddde907).
+  const parsed = JSON.parse(run.stdout.trim())
   assert.equal(parsed.additional_context, parsed.hookSpecificOutput?.additionalContext)
-  return parsed.additional_context
+  return parsed.additional_context ?? null
 }
 
 /** `runStepHook` without blocking this process, for a DevSpec stand-in served from it. */
@@ -227,8 +226,7 @@ async function runStepHookAsync(world, input, env = {}) {
   child.stdin.end(JSON.stringify(input))
   const status = await new Promise((resolve) => child.once('close', resolve))
   assert.equal(status, 0, stderr)
-  const out = stdout.trim()
-  return out ? JSON.parse(out).additional_context : null
+  return JSON.parse(stdout.trim()).additional_context ?? null
 }
 
 /** Read every part of the note a pointer names, as the agent would, one tool call each. */

@@ -118,6 +118,7 @@ import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
 import { readLastTurnEnd, STABLE_READ_ATTEMPTS, STABLE_READ_GAP_MS } from './transcript-turn-end.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 /** The inbox batches that reach a working agent at its next step: check jobs and notices. */
 export const STEP_BATCH_TYPES = Object.freeze(['check_job_dispatches', 'canonical_system_notices'])
@@ -848,6 +849,7 @@ export function discardEndedSteps({ dir } = {}) {
 
 if (isDirectRun(import.meta.url)) {
   if (process.argv[2] === 'post-tool') {
+    answerCursorAtExit()
     let input = null
     try {
       input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}')

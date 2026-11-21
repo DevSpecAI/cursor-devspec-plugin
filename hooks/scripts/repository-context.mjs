@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
 import { deliveryReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
 import { cursorProcessOf, processStartTime } from './close-on-end.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 /**
  * The instruction tiers that hold for this conversation's whole run, and the only ones
  * the run-wide project context file renders. The owner's reply style
@@ -236,6 +237,7 @@ export function hostSession() {
 }
 
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
+  answerCursorAtExit()
   // preCompact: the summary that replaces the conversation may not keep the rules, so a
   // new delivery begins. Cursor reads nothing from this hook's output.
   if (process.argv[2]==='compact') {

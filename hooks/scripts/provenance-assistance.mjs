@@ -32,6 +32,7 @@ import { fitHookContext, handOver, handOverPrefix, POST_TOOL_CONTEXT_SHARE } fro
 import { readProjectContext, isDevspecServer } from './project-context.mjs'
 import { prepareStandIn, projectRepositoryKeys } from './git-observer.mjs'
 import { normalizeRemoteKey, unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 export const HOOK_MODES = new Set(['preToolUse', 'postToolUse', 'afterMCPExecution'])
 export const TERMINAL_WORK_VERBS = new Set(['record_implementation', 'release_work_item', 'fail_work_item'])
@@ -1215,4 +1216,7 @@ async function main() {
 }
 
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-if (isMain) void main()
+if (isMain) {
+  answerCursorAtExit()
+  void main()
+}

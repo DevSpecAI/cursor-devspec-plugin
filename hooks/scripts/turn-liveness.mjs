@@ -33,6 +33,7 @@ import { pathToFileURL } from 'node:url'
 import { CONVERSATION_ID_ENV_VARS, LOCAL_ID_OVERRIDE_ENV_VAR } from './agent-identity.mjs'
 import { ownConnectionId } from './own-connection.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 /**
  * How long a running turn may go with no sign of life before its end is taken as
@@ -164,6 +165,7 @@ export function touch(raw, { env = process.env, home = os.homedir(), now = Date.
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   if (process.argv[2] === 'touch') {
+    answerCursorAtExit()
     let raw = ''
     try {
       raw = fs.readFileSync(0, 'utf8')

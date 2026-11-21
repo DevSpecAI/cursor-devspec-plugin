@@ -844,7 +844,7 @@ describe('executable fail-open boundary', () => {
       }),
     })
     assert.equal(result.status, 0)
-    assert.equal(result.stdout, '')
+    assert.equal(result.stdout, '{}', 'no decision: an answer that asks Cursor for nothing (item 6ddde907)')
     assert.match(result.stderr, /failed open/i)
   })
 })

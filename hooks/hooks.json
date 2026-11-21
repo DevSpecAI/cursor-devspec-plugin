@@ -17,7 +17,7 @@
       },
       {
         "type": "command",
-        "command": "for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; break; fi; done; exit 0",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; fi; break; done; printf \"{}\"'",
         "timeout": 15
       }
     ],
@@ -67,7 +67,7 @@
       },
       {
         "type": "command",
-        "command": "for f in \"$HOME\"/.devspec/recall/cursor/pending/*.json; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-recall.mjs\" post-tool; break; fi; done; exit 0",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/recall/cursor/pending/*.json; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-recall.mjs\" post-tool; fi; break; done; printf \"{}\"'",
         "timeout": 5
       },
       {
@@ -94,17 +94,17 @@
       },
       {
         "type": "command",
-        "command": "for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; break; fi; done; exit 0",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/cursor-git-stand-in/*/pending; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/commit-reports.mjs\"; fi; break; done; printf \"{}\"'",
         "timeout": 15
       },
       {
         "type": "command",
-        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); run=; case \"$input\" in *remote*|*'repo create'*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/repo-link-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\"; fi; exit 0",
+        "command": "sh -c 'command -v node >/dev/null 2>&1 || { printf \"{}\"; exit 0; }; input=$(cat); run=; case \"$input\" in *remote*|*\"repo create\"*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/repo-link-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf \"%s\" \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/repo-link-nudge.mjs\"; else printf \"{}\"; fi'",
         "timeout": 10
       },
       {
         "type": "command",
-        "command": "command -v node >/dev/null 2>&1 || exit 0; input=$(cat); run=; case \"$input\" in *project.json*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/pin-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf '%s' \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\"; fi; exit 0",
+        "command": "sh -c 'command -v node >/dev/null 2>&1 || { printf \"{}\"; exit 0; }; input=$(cat); run=; case \"$input\" in *project.json*) run=1 ;; esac; for f in \"$HOME\"/.devspec/notes/pending/pin-*.json; do [ -e \"$f\" ] && run=1; break; done; if [ -n \"$run\" ]; then printf \"%s\" \"$input\" | node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pin-check.mjs\"; else printf \"{}\"; fi'",
         "timeout": 10
       },
       {
@@ -124,12 +124,12 @@
       },
       {
         "type": "command",
-        "command": "for f in \"$HOME\"/.devspec/remote-control/connections/*.steps/*; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/step-delivery.mjs\" post-tool; break; fi; done; exit 0",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/remote-control/connections/*.steps/*; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/step-delivery.mjs\" post-tool; fi; break; done; printf \"{}\"'",
         "timeout": 15
       },
       {
         "type": "command",
-        "command": "for f in \"$HOME\"/.devspec/remote-control/connections/*.turn; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-liveness.mjs\" touch; break; fi; done; exit 0",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/remote-control/connections/*.turn; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/turn-liveness.mjs\" touch; fi; break; done; printf \"{}\"'",
         "timeout": 5
       }
     ],
