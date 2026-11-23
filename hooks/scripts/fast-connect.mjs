@@ -20,6 +20,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
 import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { authForConnect } from './sign-in-flow.mjs'
 import {
   durationMs,
   emitConnectPhase,
@@ -300,6 +301,7 @@ export async function fastConnect(opts = {}) {
   const emitPhase = opts.emitPhase || emitConnectPhase
   const mcpCall = opts.mcpCall || mcpToolsCallWithRetry
   const resolveAuth = opts.resolveAuth || resolveDevspecMcpAuth
+  const signIn = opts.signIn || authForConnect
   const resolveGitRemoteFn = opts.resolveGitRemoteFn || resolveGitRemote
   const registerFn = opts.registerFn || registerConnection
   const attachFn = async args => {
@@ -371,7 +373,23 @@ export async function fastConnect(opts = {}) {
     extra: { local_id_source: localIdSource, minted },
   })
 
-  const auth = resolveAuth(cwd, { hostToken })
+  // The first DevSpec call of a connect: when the background features are not signed
+  // in yet, this is where the one browser approval for them starts (item 95a67ee4).
+  // An injected resolver (tests, native helpers) is used exactly as given.
+  const auth = opts.resolveAuth ? resolveAuth(cwd, { hostToken }) : await signIn(cwd, { hostToken })
+  if (!auth.ok && ['sign_in_required', 'signed_out', 'sign_in_pending', 'sign_in_code_required', 'sign_in_failed', 'sign_in_unavailable'].includes(auth.code)) {
+    return {
+      ok: false,
+      code: auth.code,
+      error: auth.error,
+      ...(auth.sign_in_url ? { sign_in_url: auth.sign_in_url } : {}),
+      local_id: localId,
+      launch_id: launchId,
+      connection_id: null,
+      session_id: sessionId,
+      codename: null,
+    }
+  }
   const authFailed = () => ({
     ok: false,
     error: auth.error || 'auth_failed',
@@ -674,7 +692,8 @@ export async function fastConnect(opts = {}) {
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
-    warning_tokens: written.warning_tokens || null,
+    ...(auth.warning_env_token ? { warning_env_token: auth.warning_env_token } : {}),
+    ...(auth.signed_in_now ? { signed_in_now: true } : {}),
   }
 }
 

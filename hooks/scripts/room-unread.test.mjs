@@ -15,8 +15,12 @@ import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
 
 import { writePrivateJson, writePrivateText } from './private-state.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 import { projectInput } from './project-input.mjs'
 import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
   isRealMessage,
   messageVersion,
   postToolNotice,
@@ -108,11 +112,26 @@ const readerRun = (room) =>
     env: { ...process.env, HOME: room.home, DEVSPEC_REMOTE_CONNECTIONS_DIR: room.dir },
     encoding: 'utf8',
   })
+/** The reader's JSON lines, without the seal that closes the page. */
 const parseReader = (stdout) =>
   stdout
     .trim()
     .split('\n')
+    .filter((line) => line.startsWith('{'))
     .map((line) => JSON.parse(line))
+/** The reader's Shell call as Cursor hands it to the post-tool hook, with what it printed. */
+const readerCall = (stdout, exitCode = 0) => ({
+  conversation_id: CONVERSATION,
+  tool_name: 'Shell',
+  tool_input: { command: readCommand(CONN, SCRIPT) },
+  tool_output: JSON.stringify({ output: stdout, exitCode }),
+})
+/** The reader run as the agent runs it, its output then handed to the post-tool hook as Cursor does. */
+const readAndHandOver = (room) => {
+  const run = readerRun(room)
+  postTool(room, readerCall(run.stdout))
+  return run
+}
 const noticeOf = (out) =>
   JSON.parse(JSON.parse(out).hookSpecificOutput.additionalContext.split('\n')[1])
 const readFile = (room) => readStatePath(CONN, SESSION, room.dir)
@@ -153,7 +172,7 @@ describe('what counts is what a person sees, never the row state', () => {
 })
 
 describe('the mid-turn notice (PostToolUse)', () => {
-  it('tells once, as counts, and never carries a body', () => {
+  it('tells as counts, never a body, and reminds after every step until the messages are read', () => {
     const lines = [
       presence(),
       msg({ text: 'please look at the deploy' }),
@@ -183,16 +202,23 @@ describe('the mid-turn notice (PostToolUse)', () => {
       !out.includes('please look at the deploy') && !out.includes('secret plan details'),
       'counts only',
     )
+    // Printed is not delivered (Cursor may have dropped every hook's note on that step),
+    // so until the reader hands the messages over, each step carries a one-line reminder.
+    const reminder = JSON.parse(postTool(room)).additional_context
+    assert.equal(reminder, `DevSpec room: 2 messages you have not read yet. Read them with: ${readCommand(CONN, SCRIPT)}`)
+    assert.equal(JSON.parse(postTool(room)).additional_context, reminder)
+    assert.equal(readAndHandOver(room).status, 0)
+    assert.equal(postTool(room), null, 'read, so nothing more to say')
     assert.equal(postTool(room), null)
   })
 
-  it('stays quiet when the room changed only by my own message, and speaks for the next real one', () => {
+  it('treats my own message as no news, and gives the full count for the next real one', () => {
     const lines = [msg()]
     const room = makeHome(lines)
     assert.ok(postTool(room))
     lines.push(mine())
     writeRoom(room, lines)
-    assert.equal(postTool(room), null)
+    assert.match(JSON.parse(postTool(room)).additional_context, /^DevSpec room: 1 message you have not read yet\./, 'only the reminder')
     lines.push(pi({ text: 'heads-up: I moved the file you are editing' }))
     writeRoom(room, lines)
     const notice = noticeOf(postTool(room))
@@ -228,6 +254,8 @@ describe('the reader is the only thing that marks a message read', () => {
     const room = makeHome(lines)
     const run = readerRun(room)
     assert.equal(run.status, 0, run.stderr)
+    assert.equal(fs.existsSync(readFile(room)), false, 'printing proves nothing: not read yet')
+    postTool(room, readerCall(run.stdout))
     const [header, ...entries] = parseReader(run.stdout)
     assert.deepEqual(header.room_messages, {
       returned: 3,
@@ -247,6 +275,25 @@ describe('the reader is the only thing that marks a message read', () => {
       [lines[1], lines[2], lines[4]].map((line) => line.message_id).sort(),
     )
     assert.equal(parseReader(readerRun(room).stdout)[0].note, 'Nothing unread.')
+  })
+
+  it("marks nothing read when what came back is not the whole page: cut in the middle, failed, or another command's", () => {
+    const lines = Array.from({ length: 12 }, (_, i) => msg({ text: `${i}:${'p'.repeat(1_400)}` }))
+    const room = makeHome(lines)
+    const run = readerRun(room)
+    const out = run.stdout
+    // Cursor's own cut: the first and last part kept, the middle gone.
+    const cut = `${out.slice(0, 6_000)}\n... (output truncated) ...\n${out.slice(-6_000)}`
+    postTool(room, readerCall(cut))
+    assert.equal(fs.existsSync(readFile(room)), false, 'head and tail kept, middle cut: not read')
+    postTool(room, readerCall(out, 1))
+    assert.equal(fs.existsSync(readFile(room)), false, 'a failed command: not read')
+    postTool(room, { ...readerCall(out), tool_name: 'Read' })
+    assert.equal(fs.existsSync(readFile(room)), false, 'not a shell output: not read')
+    postTool(room, readerCall(out.replace('p', 'q')))
+    assert.equal(fs.existsSync(readFile(room)), false, 'a changed page: not read')
+    postTool(room, readerCall(out))
+    assert.equal(Object.keys(JSON.parse(fs.readFileSync(readFile(room), 'utf8')).read).length, parseReader(out).length - 1)
   })
 
   it('a wake, a notice, a hold and my own reply move nothing', () => {
@@ -276,7 +323,7 @@ describe('the reader is the only thing that marks a message read', () => {
     const live = pi({ state: 'in_progress', text: 'Investigating' })
     const lines = [live]
     const room = makeHome(lines)
-    readerRun(room)
+    readAndHandOver(room)
     lines[0] = { ...live, state: 'final' }
     writeRoom(room, lines)
     assert.equal(postTool(room), null)
@@ -322,6 +369,46 @@ describe('the reader is the only thing that marks a message read', () => {
     assert.equal(second.total, 2)
   })
 
+  it("never prints more than Cursor hands the model from one Shell command, and pages a big room through whole", () => {
+    // 30 messages of 1,500 characters: more than two of Cursor's 20,000-character
+    // Shell results, so the reader has to page, and a page that ran past it would
+    // lose its middle to Cursor's truncation.
+    const lines = Array.from({ length: 30 }, (_, i) => msg({ text: `${String(i).padStart(2, '0')}:${'w'.repeat(1_497)}` }))
+    const room = makeHome(lines)
+    const seen = []
+    for (let reads = 0; reads < 10; reads += 1) {
+      const run = readAndHandOver(room)
+      assert.equal(run.status, 0, run.stderr)
+      assert.ok(run.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `one read printed ${run.stdout.length} characters`)
+      const [header, ...entries] = parseReader(run.stdout)
+      seen.push(...entries.map((entry) => entry.text))
+      if (header.room_messages.remaining === 0) {
+        assert.equal(header.room_messages.next, null)
+        break
+      }
+      assert.match(header.room_messages.next, / read --connection-id /)
+    }
+    assert.deepEqual(seen, lines.map((line) => line.text), 'every message once, oldest first, whole')
+  })
+
+  it("keeps every read under Cursor's byte rule too, so a room in Chinese or emoji is never moved to a file", () => {
+    // 3 bytes a character: 20,000 characters would be 60,000 bytes, which Cursor shows
+    // as "written to a file" instead of the output.
+    const lines = Array.from({ length: 30 }, (_, i) => msg({ text: `${i}:${'\u4e2d\u6587'.repeat(700)}\u{1F600}` }))
+    const room = makeHome(lines)
+    const seen = []
+    for (let reads = 0; reads < 20; reads += 1) {
+      const run = readAndHandOver(room)
+      assert.equal(run.status, 0, run.stderr)
+      assert.ok(run.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `${run.stdout.length} characters`)
+      assert.ok(Buffer.byteLength(run.stdout) <= CURSOR_SHELL_OUTPUT_MAX_BYTES, `${Buffer.byteLength(run.stdout)} bytes`)
+      const [header, ...entries] = parseReader(run.stdout)
+      seen.push(...entries.map((entry) => entry.text))
+      if (header.room_messages.remaining === 0) break
+    }
+    assert.deepEqual(seen, lines.map((line) => line.text), 'every message once, oldest first, whole')
+  })
+
   it('hands over a message too long for a page as a file, whole', () => {
     const huge = 'z'.repeat(5_000)
     const lines = [msg({ text: huge })]
@@ -331,17 +418,83 @@ describe('the reader is the only thing that marks a message read', () => {
       read: {},
       selfLabel: ME,
       budget: 1_000,
-      writeOverflow: (line) => {
-        stored = line.text
-        return '/tmp/x.txt'
+      writeOverflow: (entry) => {
+        stored = entry
+        return 'cat ~/.devspec/notes/0123456789abcdef.md'
       },
     })
-    const entry = JSON.parse(page.printed[0])
-    assert.equal(entry.text, null)
-    assert.equal(entry.text_chars, 5_000)
-    assert.equal(entry.text_file, '/tmp/x.txt')
-    assert.equal(stored, huge)
-    assert.ok(page.read[lines[0].message_id], 'handed over, so read')
+    const pointer = JSON.parse(page.printed[0])
+    assert.equal(pointer.read_with, 'cat ~/.devspec/notes/0123456789abcdef.md')
+    assert.equal(pointer.message_id, lines[0].message_id)
+    assert.equal(pointer.text, undefined, 'nothing of the message itself on the page')
+    assert.equal(stored.text, huge, 'the whole message in the file')
+    assert.equal(stored.from, 'Ali Price')
+    assert.equal(page.read[lines[0].message_id], undefined, 'a note counts as read only once it has been read')
+    assert.deepEqual(page.noted.map((entry) => [entry.message_id, entry.note]), [[lines[0].message_id, '0123456789abcdef']])
+  })
+
+  it('never marks a message read when it could not be handed over', () => {
+    const lines = [msg({ text: 'z'.repeat(5_000) })]
+    assert.throws(() =>
+      readPage({
+        lines,
+        read: {},
+        selfLabel: ME,
+        budget: 1_000,
+        writeOverflow: () => {
+          throw new Error('disk full')
+        },
+      }),
+    /disk full/)
+  })
+
+  it('hands over a message with a huge attachment list whole, as a note, and keeps the read within Cursor\'s Shell ceiling', () => {
+    const attachments = Array.from({ length: 400 }, (_, i) => ({
+      resource_id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      name: `screenshot-${i}.png`,
+      delivery: 'resource',
+    }))
+    const lines = [msg({ text: 'see the screenshots', attachments }), msg({ text: 'and this' })]
+    const room = makeHome(lines)
+    const first = readerRun(room)
+    assert.equal(first.status, 0, first.stderr)
+    assert.ok(first.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS, `${first.stdout.length} characters`)
+    const [header, pointer, ...rest] = parseReader(first.stdout)
+    assert.equal(pointer.message_id, lines[0].message_id)
+    // Over a Shell page itself, so the note is in parts the agent reads one by one.
+    const whole = JSON.parse(readNoteText(noteIdIn(pointer.read_with), { home: room.home }))
+    assert.equal(whole.text, 'see the screenshots')
+    assert.deepEqual(whole.attachments, attachments, 'every attachment, in the note')
+    assert.deepEqual(rest.map((entry) => entry.text), ['and this'])
+    assert.equal(header.room_messages.remaining, 0)
+    // The page came back whole, so 'and this' is read; the note is not, until every
+    // part of it has come back whole.
+    postTool(room, readerCall(first.stdout))
+    const again = parseReader(readerRun(room).stdout)
+    assert.deepEqual(again.slice(1).map((entry) => entry.message_id), [lines[0].message_id])
+    const parts = noteFiles(room.home, noteIdIn(pointer.read_with))
+    assert.ok(parts.length > 1)
+    for (const file of parts) postTool(room, catCall(room.home, file, { conversation: CONVERSATION }))
+    assert.match(parseReader(readerRun(room).stdout)[0].note, /Nothing unread/, 'both handed over whole, so both read')
+  })
+
+  it('keeps what an earlier pointer was issued for when the message changes', () => {
+    const attachments = (label) => Array.from({ length: 300 }, (_, i) => ({ resource_id: `id-${i}`, name: `${label}-${i}.png`, delivery: 'resource' }))
+    const lines = [msg({ text: 'first version', attachments: attachments('before') })]
+    const room = makeHome(lines)
+    const firstPointer = parseReader(readAndHandOver(room).stdout)[1]
+    for (const file of noteFiles(room.home, noteIdIn(firstPointer.read_with))) postTool(room, catCall(room.home, file, { conversation: CONVERSATION }))
+    lines[0] = { ...lines[0], text: 'second version', attachments: attachments('after') }
+    writeRoom(room, lines)
+    const [header, secondPointer] = parseReader(readerRun(room).stdout)
+    assert.equal(header.room_messages.updated, 1)
+    assert.equal(secondPointer.updated, true)
+    assert.notEqual(secondPointer.read_with, firstPointer.read_with, 'a new version is a new note')
+    const earlier = JSON.parse(readNoteText(noteIdIn(firstPointer.read_with), { home: room.home }))
+    const later = JSON.parse(readNoteText(noteIdIn(secondPointer.read_with), { home: room.home }))
+    assert.equal(earlier.text, 'first version')
+    assert.equal(earlier.attachments[0].name, 'before-0.png', 'the earlier reference still returns what it was issued for')
+    assert.equal(later.text, 'second version')
   })
 })
 

@@ -24,6 +24,14 @@ import {
   splitRoomWindow,
   remoteIngressNegotiationArgs,
   handleKeepaliveRejection,
+  POLL_HTTP_GRACE_MS,
+  PUSH_HEALTHY_MS,
+  PUSH_SAFETY_MS,
+  createPushGate,
+  nextPushReconnectDelayMs,
+  openPushChannel,
+  parseSseFrame,
+  pushChannelUrl,
 } from './devspec-remote-poll.mjs'
 
 const ME = 'conn-mine-1111'
@@ -80,15 +88,16 @@ describe('isDeliverableCommand (command gate)', () => {
     assert.equal(isDeliverableCommand(command({ project_scope: delegated.project_scope }), ME), false)
   })
 
-  it('negotiates delegated project scope and room context alongside canonical ingress', () => {
+  it('negotiates delegated project scope, room context and check jobs alongside canonical ingress', () => {
     assert.deepEqual(remoteIngressNegotiationArgs(), {
       ingress_version: 1,
       delegated_scope_version: 1,
       active_plan_projection_version: 1,
-      system_notice_version: 2,
+      system_notice_version: 3,
       sender_style_version: 1,
       room_context_version: 1,
       session_polls_projection_version: 2,
+      check_job_version: 2,
     })
   })
 
@@ -113,6 +122,17 @@ describe('isDeliverableCommand (command gate)', () => {
   it('rejects everything when we do not know our own connection id', () => {
     assert.equal(isDeliverableCommand(command(), null), false)
     assert.equal(isDeliverableCommand(null, ME), false)
+  })
+})
+
+describe('the held poll\'s own deadline', () => {
+  it('leaves room for the project recall DevSpec runs before it answers a command (turn-recall.mjs)', () => {
+    // Every DevSpec plugin's recall shares one time budget: DevSpec gives up before a
+    // plugin's 4.8 s wait ends (DevSpecV2 packages/core/src/recall/budget.ts,
+    // HOST_RECALL_WAIT_MS). A command that lands at the end of a hold is answered that
+    // much later, and the poll's deadline (the hold plus this grace) must not cut it off.
+    const sharedRecallBudgetMs = 4_800
+    assert.ok(POLL_HTTP_GRACE_MS > sharedRecallBudgetMs)
   })
 })
 
@@ -567,6 +587,116 @@ describe('handleKeepaliveRejection', () => {
     const res = handleKeepaliveRejection('fetch failed: network timeout', 'conn-test-abc', io)
     assert.equal(res.cleared, false)
     assert.equal(removedPath, null)
+  })
+})
+
+describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDelayMs, openPushChannel, createPushGate)', () => {
+  it('builds /connection-stream URL with version query parameters', () => {
+    const url = pushChannelUrl('https://api.devspec.ai/api/mcp/', ME)
+    assert.equal(
+      url,
+      'https://api.devspec.ai/api/mcp/connection-stream?connection_id=conn-mine-1111&system_notice_version=3&interaction_event_version=1&question_dismissal_event_version=1&check_job_version=2',
+    )
+  })
+
+  it('parses comment, hello, wake, ended, and system_notice frames', () => {
+    assert.deepEqual(parseSseFrame(': keepalive'), { kind: 'comment' })
+    assert.deepEqual(parseSseFrame('event: hello\ndata: {}'), { kind: 'hello' })
+    assert.deepEqual(parseSseFrame('event: wake\ndata: {"reason":"message"}'), { kind: 'wake' })
+    assert.deepEqual(parseSseFrame('event: ended\ndata: {"end_reason":"ui"}'), {
+      kind: 'ended',
+      endReason: 'ui',
+    })
+    assert.deepEqual(
+      parseSseFrame('event: system_notice\ndata: {"notice_id":"n1","text":"hi"}'),
+      { kind: 'system_notice', notice: { notice_id: 'n1', text: 'hi' } },
+    )
+  })
+
+  it('backs off reconnect attempts and resets after a healthy stream', () => {
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 0, openedAtMs: null }), {
+      delayMs: 1_000,
+      nextAttempt: 1,
+    })
+    assert.deepEqual(nextPushReconnectDelayMs({ attempt: 3, openedAtMs: null }), {
+      delayMs: null,
+      nextAttempt: 4,
+    })
+    assert.deepEqual(
+      nextPushReconnectDelayMs({
+        attempt: 3,
+        openedAtMs: 1_000,
+        nowMs: 1_000 + PUSH_HEALTHY_MS + 50,
+      }),
+      { delayMs: 1_000, nextAttempt: 1 },
+    )
+  })
+
+  it('falls back cleanly to poll_connection when SSE endpoint returns non-200', async () => {
+    let fallbackReason = null
+    const handle = openPushChannel({
+      mcpUrl: 'https://api.devspec.ai/api/mcp',
+      token: 'tok',
+      connectionId: ME,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 404,
+        headers: new Map([['content-type', 'application/json']]),
+      }),
+      onFallback: (reason) => {
+        fallbackReason = reason
+      },
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    handle.close()
+    assert.equal(fallbackReason, 'push_http_404')
+  })
+
+  it('sleeps locally on the open SSE push channel, wakes immediately on SSE frames or local turn changes, and falls back to held waitMs on disconnect (59afbe7e)', async () => {
+    assert.equal(PUSH_SAFETY_MS, 45_000)
+    const gate = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+
+    assert.equal(gate.isConnected(), false)
+    assert.equal(gate.consumePollWaitMs(25_000), 25_000)
+
+    gate.onEvent({ kind: 'hello' })
+    assert.equal(gate.isConnected(), true)
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    const startSafety = Date.now()
+    await gate.waitIfIdle()
+    assert.ok(Date.now() - startSafety >= 55, 'waitIfIdle sleeps until safetyMs when quiet')
+    assert.equal(gate.consumePollWaitMs(25_000), 0)
+
+    for (const kind of ['wake', 'system_notice', 'interaction_event', 'question_dismissal_event']) {
+      const gateFrame = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+      gateFrame.onEvent({ kind: 'hello' })
+      setTimeout(() => gateFrame.onEvent({ kind }), 15)
+      const t0 = Date.now()
+      await gateFrame.waitIfIdle()
+      assert.ok(Date.now() - t0 < 500, `SSE ${kind} frame wakes waitIfIdle immediately`)
+      assert.equal(gateFrame.consumePollWaitMs(25_000), 0)
+    }
+
+    let localTurnChanged = false
+    const gateLocal = createPushGate({ safetyMs: 5_000, localCheckMs: 10 })
+    gateLocal.onEvent({ kind: 'hello' })
+    setTimeout(() => {
+      localTurnChanged = true
+    }, 15)
+    const tLocal = Date.now()
+    await gateLocal.waitIfIdle({ shouldWakeImmediately: () => localTurnChanged })
+    assert.ok(Date.now() - tLocal < 500, 'local state change wakes waitIfIdle immediately')
+    assert.equal(gateLocal.consumePollWaitMs(25_000), 0)
+
+    const gateDrop = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
+    gateDrop.onEvent({ kind: 'hello' })
+    setTimeout(() => gateDrop.onDisconnect(), 15)
+    const tDrop = Date.now()
+    await gateDrop.waitIfIdle()
+    assert.ok(Date.now() - tDrop < 500, 'disconnect wakes waitIfIdle immediately')
+    assert.equal(gateDrop.isConnected(), false)
+    assert.equal(gateDrop.consumePollWaitMs(25_000), 25_000)
   })
 })
 

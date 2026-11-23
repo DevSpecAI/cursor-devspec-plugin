@@ -4,7 +4,7 @@
  * A summary line or a changed HEAD alone does not prove creation. Require a
  * bounded readable direct invocation, its own pre/post pair, one new commit
  * reflog entry, parent continuity, and unchanged repository/connection binding.
- * Merge/rewrite/background/opaque commands remain ingestion/analyzer territory.
+ * Merge/rewrite/background/opaque commands remain server ingestion and unlinked-work accountability territory.
  * This is same-user operational evidence, not hostile-process attestation.
  *
  * Since item c2a7ab72 this is the fallback: where the git stand-in runs (a connected
@@ -18,9 +18,11 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { connectionToken, credentialIdentity } from './resolve-mcp-auth.mjs'
 import { devspecFolderMarker, findProjectPin, gitRemoteOrigin, mainWorkTreeFrom } from './devspec-scope.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { withoutStandInPrefix } from './git-observer.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const REPORT_TIMEOUT_MS = 2_500
@@ -323,8 +325,12 @@ function repositoryBinding(repoDir) {
 /** A hash freezes account, endpoint, project (when supplied) and hidden capability;
  * no credential or command text is copied to an observation marker. */
 function connectionBinding(state) {
-  if (!state?.connection_id || !state?.mcp_url || !state?.token) return null
-  return digest([state.connection_id, state.mcp_url, state.token, state.project_id ?? null,
+  // Who the connection acts as: the token itself for a token from the environment (the
+  // binding it always had), a browser login's stable identity otherwise, so the login's
+  // daily token change does not unbind a commit observed across it (item 95a67ee4).
+  const identity = credentialIdentity(state)
+  if (!state?.connection_id || !state?.mcp_url || !identity) return null
+  return digest([state.connection_id, state.mcp_url, identity, state.project_id ?? null,
     state.connection_capability ?? null])
 }
 
@@ -455,8 +461,10 @@ export async function handleBashPost(rawInput, options = {}) {
     if (!repository || digest(repository) !== digest(before.repository)) return null
     const sha = createdSha(repoDir, before, now)
     if (!sha) return null
+    const token = connectionToken(state)
+    if (!token) return null
     await (options.call ?? mcpToolsCall)({
-      mcpUrl: state.mcp_url, token: state.token,
+      mcpUrl: state.mcp_url, token,
       connectionCapability: state.connection_capability ?? null,
       name: 'report_commit_provenance',
       arguments: { connection_id: state.connection_id, commit_sha: sha,
@@ -476,4 +484,7 @@ async function main() {
   } catch { /* malformed envelopes and every observation failure fail open */ }
 }
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-if (isMain) main().catch(() => {})
+if (isMain) {
+  answerCursorAtExit()
+  main().catch(() => {})
+}

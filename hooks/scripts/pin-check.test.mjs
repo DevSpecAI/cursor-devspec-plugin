@@ -16,6 +16,8 @@ import { after, describe, it } from 'node:test'
 
 import { candidatePins, checkPinAfterTool, pinProblem } from './pin-check.mjs'
 import { findProjectPin } from './devspec-scope.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '../..')
@@ -83,60 +85,81 @@ describe('which files a tool call could have written', () => {
 
 describe('the correction', () => {
   it('tells the model exactly what to write, with the id it used', () => {
-    const { folder, file } = folderWithPin(`{\n  "projectId": "${ID}"\n}\n`)
-    const out = checkPinAfterTool({ tool_name: 'Write', cwd: folder, tool_input: { file_path: file } })
-    const text = out?.hookSpecificOutput?.additionalContext
+    const { home, folder, file } = folderWithPin(`{\n  "projectId": "${ID}"\n}\n`)
+    const out = checkPinAfterTool({ conversation_id: 'one', tool_name: 'Write', cwd: folder, tool_input: { file_path: file } }, { home })
+    const pointer = out?.hookSpecificOutput?.additionalContext
     assert.equal(out?.hookSpecificOutput?.hookEventName, 'PostToolUse')
-    assert.equal(out?.additional_context, text)
+    assert.equal(out?.additional_context, pointer)
+    const text = readNoteText(noteIdIn(pointer), { home })
     assert.match(text, /"project_id"/)
     assert.ok(text.includes(`{"project_id": "${ID}"}`), text)
   })
 
+  it('offers it after every step until the model has read it whole: until then the folder is not linked', () => {
+    const { home, folder, file } = folderWithPin(`{"projectId": "${ID}"}`)
+    const pointer = checkPinAfterTool({ conversation_id: 'one', tool_name: 'Write', cwd: folder, tool_input: { file_path: file } }, { home }).additional_context
+    const ls = { conversation_id: 'one', tool_name: 'Shell', cwd: folder, tool_input: { command: 'ls' } }
+    assert.equal(checkPinAfterTool(ls, { home })?.additional_context, pointer, 'printed is not delivered')
+    assert.equal(checkPinAfterTool({ conversation_id: 'one', tool_name: 'Read', tool_input: { file_path: file } }, { home })?.additional_context, pointer, 'a Read of the pin itself raises nothing new')
+    const notes = noteFiles(home, noteIdIn(pointer))
+    for (const note of notes) checkPinAfterTool(catCall(home, note), { home })
+    assert.equal(checkPinAfterTool(ls, { home }), null, 'read whole: done')
+  })
+
   it('is silent for a good pin and for a file that is not there', () => {
-    const { folder, file } = folderWithPin(`{"project_id": "${ID}"}`)
-    assert.equal(checkPinAfterTool({ tool_name: 'Write', cwd: folder, tool_input: { file_path: file } }), null)
-    assert.equal(checkPinAfterTool({ tool_name: 'Write', cwd: folder, tool_input: { file_path: '/nope/.devspec/project.json' } }), null)
+    const { home, folder, file } = folderWithPin(`{"project_id": "${ID}"}`)
+    assert.equal(checkPinAfterTool({ tool_name: 'Write', cwd: folder, tool_input: { file_path: file } }, { home }), null)
+    assert.equal(checkPinAfterTool({ tool_name: 'Write', cwd: folder, tool_input: { file_path: '/nope/.devspec/project.json' } }, { home }), null)
   })
 })
 
 describe('the hooks.json commands, run the way Cursor runs them', () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, 'hooks/hooks.json'), 'utf8')).hooks.postToolUse
-  const command = (matcher, script) =>
-    hooks.find((e) => e.matcher === matcher && e.command.includes(script)).command
-  const runHook = (cmd, input) =>
+  const command = (script) => hooks.find((e) => e.command.includes(script)).command
+  const runHook = (cmd, input, home = tmpDir('devspec-hookhome-')) =>
     execFileSync('sh', ['-c', cmd], {
       input: JSON.stringify(input),
-      env: { PATH: process.env.PATH, CLAUDE_PLUGIN_ROOT: ROOT, HOME: tmpDir('devspec-hookhome-') },
+      env: { PATH: process.env.PATH, CLAUDE_PLUGIN_ROOT: ROOT, HOME: home },
       encoding: 'utf8',
     })
 
-  it('the Write|Edit pin check reaches node and speaks for a bad pin', () => {
-    const { folder, file } = folderWithPin(`{"projectId": "${ID}"}`)
-    const out = runHook(command('^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$', 'pin-check.mjs'), {
+  it('the pin check reaches node and speaks for a bad pin', () => {
+    const { home, folder, file } = folderWithPin(`{"projectId": "${ID}"}`)
+    const out = runHook(command('pin-check.mjs'), {
+      conversation_id: 'one',
       tool_name: 'Write',
       cwd: folder,
       tool_input: { file_path: file },
-    })
-    assert.match(out, /"additionalContext":"DevSpec cannot use the pin/)
+    }, home)
+    const pointer = JSON.parse(out).additional_context
+    assert.match(readNoteText(noteIdIn(pointer), { home }), /^DevSpec cannot use the pin/)
   })
 
   // The filter is what keeps these hooks free on ordinary calls, so test it directly:
-  // swap the node call for a probe that says whether it ran.
+  // swap the node call for a probe that says whether it ran. When it does not run, the
+  // hook still answers Cursor, with `{}` (item 6ddde907).
   const probe = (cmd) => cmd.replace(/node "\$\{CLAUDE_PLUGIN_ROOT\}\/hooks\/scripts\/[\w-]+\.mjs"/, 'cat >/dev/null; echo RAN')
 
-  it('the pin check starts node only when the input mentions the pin', () => {
-    const cmd = probe(command('^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$', 'pin-check.mjs'))
-    assert.notEqual(cmd, command('^(Write|Edit|MultiEdit|ApplyPatch|apply_patch)$', 'pin-check.mjs'), 'probe substituted')
-    assert.equal(runHook(cmd, { tool_name: 'Edit', cwd: '/w', tool_input: { file_path: '/w/src/app.ts' } }), '')
+  it('the pin check starts node only when the input mentions the pin, or a pin note is still waiting', () => {
+    const cmd = probe(command('pin-check.mjs'))
+    assert.notEqual(cmd, command('pin-check.mjs'), 'probe substituted')
+    assert.equal(runHook(cmd, { tool_name: 'Edit', cwd: '/w', tool_input: { file_path: '/w/src/app.ts' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
     assert.equal(runHook(cmd, { tool_name: 'Write', cwd: '/w', tool_input: { file_path: '/w/.devspec/project.json' } }).trim(), 'RAN')
-    const shell = probe(command('^(Bash|Shell)$', 'pin-check.mjs'))
-    assert.equal(runHook(shell, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }), '')
+    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
+    const waiting = tmpDir('devspec-hookhome-')
+    fs.mkdirSync(path.join(waiting, '.devspec', 'notes', 'pending'), { recursive: true })
+    fs.writeFileSync(path.join(waiting, '.devspec', 'notes', 'pending', 'pin-0123456789abcdef.json'), '{}')
+    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }, waiting).trim(), 'RAN')
   })
 
-  it('the repo-link reminder starts node only for commands that could add a remote', () => {
-    const cmd = probe(command('^(Bash|Shell)$', 'repo-link-nudge.mjs'))
-    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }), '')
+  it('the repo-link reminder starts node only for commands that could add a remote, or a reminder still waiting', () => {
+    const cmd = probe(command('repo-link-nudge.mjs'))
+    assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'npm test' } }),'{}', 'without node, the hook still answers Cursor (item 6ddde907)')
     assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'git remote add origin x' } }).trim(), 'RAN')
     assert.equal(runHook(cmd, { tool_name: 'Shell', cwd: '/w', tool_input: { command: 'gh repo create app --source=.' } }).trim(), 'RAN')
+    const waiting = tmpDir('devspec-hookhome-')
+    fs.mkdirSync(path.join(waiting, '.devspec', 'notes', 'pending'), { recursive: true })
+    fs.writeFileSync(path.join(waiting, '.devspec', 'notes', 'pending', 'repo-link-0123456789abcdef.json'), '{}')
+    assert.equal(runHook(cmd, { tool_name: 'Read', cwd: '/w', tool_input: { file_path: '/w/a.ts' } }, waiting).trim(), 'RAN')
   })
 })

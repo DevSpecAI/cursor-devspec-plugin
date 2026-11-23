@@ -27,35 +27,19 @@ You need [Cursor's command-line agent](https://cursor.com/docs/cli/installation)
 
 Start `cursor-agent`, type `/plugin`, search the marketplace for **DevSpec**, and install it **for your user**, so it works in every folder. You can also use **Add to Cursor** on DevSpec's page in the [Cursor Marketplace](https://cursor.com/marketplace).
 
-### 2. Enter your DevSpec token
+### 2. Approve DevSpec for the agent
 
-Create a **Read & write** token on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page. It starts with `dvs_`. In `cursor-agent`, type `/plugin`, open **DevSpec**, choose **Configure variables**, paste the token into **DevSpec token**, and save.
+In `cursor-agent`, type `/mcp` and open the DevSpec server (`devspec-cursor`). Choose **Enable** if Cursor asks, then **Login**. Your browser opens DevSpec's approval page for Cursor: sign in to DevSpec if asked and click **Allow**, then restart `cursor-agent` so the agent's DevSpec tools and connection load cleanly.
 
-### 3. Let remote control and commit tracking use your token
+### 3. Connect
 
-Remote control and commit tracking run in the background, and Cursor doesn't share plugin settings with them, so they read your token from Cursor's MCP settings file: `~/.cursor/mcp.json` (on Windows, `%USERPROFILE%\.cursor\mcp.json`). Merge in this entry, keeping any servers already there:
+In a git repository linked to your DevSpec project, type `/devspec-remote`. The first time, your browser opens DevSpec's approval page once more, again for Cursor: click **Allow**. This second approval is for remote control and commit tracking, which run in the background, where Cursor can't share its own sign-in. Both approvals are for the same Cursor app, so DevSpec's Agent setup page lists Cursor once. The conversation then appears on the project's **Agents** page, ready to take work from your browser or phone. Use `/devspec-remote --new` to open a new session room for it.
 
-```json
-{
-  "mcpServers": {
-    "devspec": {
-      "url": "https://api.devspec.ai/api/mcp?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection",
-      "headers": {
-        "Authorization": "Bearer dvs_your_token_here",
-        "x-devspec-plugin": "cursor/0.17.1"
-      }
-    }
-  }
-}
-```
+You stay signed in until you sign out or disconnect Cursor on DevSpec's Agent setup page: both sign-ins renew themselves. To check everything is working, ask the agent: *"Check my DevSpec connection."* It tells you which DevSpec account it is connected as. If DevSpec's tools are missing, type `/mcp` to see whether Cursor is signed in to DevSpec.
 
-Keep the `x-devspec-plugin` line. It tells DevSpec the agent is using the plugin, and it doesn't need changing when the plugin updates. On macOS and Linux, make the file readable only by you with `chmod 600 ~/.cursor/mcp.json`. Then restart `cursor-agent`.
+**Working on a machine your browser can't reach** (over SSH, say)? `/devspec-remote` gives you a link instead of opening a browser. Open it on your own computer, click **Allow**, copy the code the page shows, and paste it back into the chat; the agent finishes signing in and connects.
 
-### 4. Connect
-
-Start `cursor-agent` in a git repository linked to your DevSpec project and type `/devspec-remote`. The conversation appears on the project's **Agents** page, ready to take work from your browser or phone. Use `/devspec-remote --new` to open a new session room for it.
-
-To check everything is working, ask the agent: *"Check my DevSpec connection."* It tells you which DevSpec account it is connected as. If DevSpec's tools are missing, type `/mcp` to see whether Cursor could reach DevSpec, then check your token and restart `cursor-agent`.
+**Signing out.** Ask the agent to sign DevSpec's background features out, or disconnect Cursor on DevSpec's [Agent setup](https://app.devspec.ai/settings/agents) page. If remote control's sign-in stops working, the plugin tells you so and how to sign in again: run `/devspec-remote` and approve once more.
 
 > **Tip for phone and remote control:** `cursor-agent` asks for your approval before running commands, and a remotely driven agent waits at your desk until you give it. Choose **Run Everything** for the conversation: press **Shift+Tab** at the first approval prompt, or type `/run-everything`. Cursor offers to make it your default after you've chosen it a few times. You can also start with `cursor-agent --yolo`.
 
@@ -77,7 +61,7 @@ You can ask the agent to do anything in DevSpec in plain words (*"Work on DevSpe
 
 **Choosing a project.** The agent finds your project by itself when your repository belongs to one DevSpec project, or when the folder has a `.devspec/project.json` file naming one. Otherwise it asks you. Moving to a different project needs a fresh conversation, so nothing carries over from one project to another. If you attach the agent to a DevSpec session that has a shared plan, it picks the plan up where it left off after it reconnects.
 
-**Commit tracking.** While a conversation is connected, each commit the agent makes in one of your project's repositories is reported to DevSpec and credited to Cursor. When exactly one task is claimed, the task's reference is added to the commit message for the agent. A commit with no task to link it to is stopped before anything changes, and the agent is told how to recover. Repositories that aren't part of the project are left alone. On native Windows only simple `git commit` commands are tracked; use WSL for full commit tracking.
+**Commit tracking.** While a conversation is connected, each commit the agent makes in one of your project's repositories is reported to DevSpec and credited to Cursor. When exactly one task is claimed, the task's reference is added to the commit message for the agent. When several are claimed, the commit is stopped before anything changes and the agent is asked which task it belongs to. A commit made with no task claimed, such as a dependency update or an automation run, goes through as written, with a short note telling the agent how to link its next commit to a task. If the agent claims a task and the plugin cannot record that claim, it never adds a different task's reference instead. What the plugin may and may not do to a commit follows the commit provenance rules DevSpec serves to every coding agent (`commit_provenance_contract` in `devspec://product/implementation-contract`). Repositories that aren't part of the project are left alone. On native Windows only simple `git commit` commands are tracked; use WSL for full commit tracking.
 
 ---
 
@@ -85,7 +69,9 @@ You can ask the agent to do anything in DevSpec in plain words (*"Work on DevSpe
 
 New releases reach you through the Cursor Marketplace once Cursor has reviewed them. Restart `cursor-agent` to start using a new release. What changed in each release is in [CHANGELOG.md](./CHANGELOG.md).
 
-**Coming from `devspec-autopilot`?** That earlier version of the plugin won't update to DevSpec. In `cursor-agent`, type `/plugin` and uninstall **devspec-autopilot**, run `cursor-agent plugin marketplace remove devspec-autopilot`, then install DevSpec as above. An existing `devspec` entry in `~/.cursor/mcp.json` keeps working; just make sure it has the `x-devspec-plugin` line from step 3.
+**Coming from an earlier version?** DevSpec no longer uses a token. If you added a `devspec` entry with a token to `~/.cursor/mcp.json` (on Windows, `%USERPROFILE%\.cursor\mcp.json`), remove that entry and restart `cursor-agent`: while it is there, Cursor uses its token for the agent's DevSpec tools instead of signing in. Then approve DevSpec as in steps 2 and 3. A token you saved in the plugin's settings is no longer used.
+
+**Coming from `devspec-autopilot`?** That earlier version of the plugin won't update to DevSpec. In `cursor-agent`, type `/plugin` and uninstall **devspec-autopilot**, run `cursor-agent plugin marketplace remove devspec-autopilot`, then install DevSpec as above.
 
 ---
 
@@ -93,14 +79,15 @@ New releases reach you through the Cursor Marketplace once Cursor has reviewed t
 
 For transparency and security review, here is what the plugin connects to, runs and stores:
 
-- **Connection to DevSpec.** The agent's DevSpec tools talk over HTTPS to `https://api.devspec.ai/api/mcp` (or the **DevSpec API URL** setting, if DevSpec support asks you to change it), signed in with your DevSpec token.
+- **Connection to DevSpec.** The agent's DevSpec tools talk over HTTPS to `https://api.devspec.ai/api/mcp`, signed in through Cursor's own sign-in with your approval. Remote control and commit tracking sign in separately, through the same Cursor app and your approval in the browser; the approval comes back to a short-lived listener on your own machine (`127.0.0.1`), or as a code you paste, and never by checking a server for it.
 - **While you're connected.** `/devspec-remote` starts a small Node.js listener in the background for that conversation. It checks DevSpec for messages addressed to the agent and stops when you disconnect or `cursor-agent` exits.
 - **Hooks.** The plugin's hooks:
   - add this conversation's DevSpec connection and project to the agent's DevSpec calls;
   - report the agent's progress and model to the session it's attached to;
   - while you're connected, put a small `git` stand-in in front of the agent's shell commands, so commits are tagged and reported. The stand-in runs your own git unchanged, and nothing is installed in your repositories or git configuration.
 - **Files on your machine.**
-  - `~/.devspec/` holds each connection's state, the session's recent messages, commit tracking records and logs, readable only by you.
+  - `~/.devspec/cursor/auth.json` holds remote control's and commit tracking's sign-in, one per DevSpec server, renewed automatically and readable only by you. Nothing else reads it, and the plugin reads no other tool's sign-in.
+  - `~/.devspec/` also holds each connection's state, the session's recent messages, commit tracking records and logs, readable only by you. Its `notes/` folder holds what the plugin hands the agent as a file to read: the project's rules for a conversation, a message for you the plugin could not post, anything too long for Cursor to pass on at once, and, for a note part of which cannot be read back, a status file saying which parts and how to retry.
   - `.devspec/project.json` is written in a repository only when you ask `/devspec-project` to remember a default project.
 
 ---
@@ -108,7 +95,7 @@ For transparency and security review, here is what the plugin connects to, runs 
 ## Learn more
 
 - **Website and sign-up:** [devspec.ai](https://devspec.ai)
-- **Agent setup and tokens:** [app.devspec.ai/settings/agents](https://app.devspec.ai/settings/agents)
+- **Agent setup (connected tools):** [app.devspec.ai/settings/agents](https://app.devspec.ai/settings/agents)
 - **Privacy policy:** [devspec.ai/privacy](https://devspec.ai/privacy)
 - **Changelog:** [CHANGELOG.md](./CHANGELOG.md)
 
@@ -124,11 +111,21 @@ For people working on the plugin or trying a release before it's in the Marketpl
   git clone -b staging https://github.com/DevSpecAI/cursor-devspec-plugin ~/.cursor/plugins/local/devspec
   ```
 
-  To move to the latest version, run `git -C ~/.cursor/plugins/local/devspec pull` and restart `cursor-agent`. A local copy has no plugin settings, so the `~/.cursor/mcp.json` entry from step 3 provides the token, pointing at whichever DevSpec environment you're testing.
-- **Develop against a checkout.** Run `cursor-agent --plugin-dir <path-to-checkout>`, with `DEVSPEC_MCP_TOKEN` (and `DEVSPEC_API_URL` for another DevSpec environment) set in the environment you start it from.
+  To move to the latest version, run `git -C ~/.cursor/plugins/local/devspec pull` and restart `cursor-agent`. A local copy signs in through the browser like an installed one.
+- **Develop against a checkout.** Run `cursor-agent --plugin-dir <path-to-checkout>`.
+- **Another DevSpec server.** Start `cursor-agent` with the server and its Cursor sign-in app in the environment, for example DevSpec staging:
+
+  ```bash
+  DEVSPEC_API_URL=https://api.devspecstaging.com DEVSPEC_CURSOR_CLIENT_ID=0gPBpmMnw37junr4 cursor-agent
+  ```
+
+  Cursor's own connection and the background features both read these, so both use that server; nothing in a settings file changes. Each server keeps its own sign-in, so switching back needs no new approval. (Setting the same values under the plugin's **Configure variables** moves only the agent's DevSpec tools, not remote control and commit tracking.)
+- **Signing the background features in or out from a terminal.** `node <plugin-folder>/scripts/devspec-login.mjs` signs in through the browser; add `--code` on a machine the browser can't reach, `--status` to see where things stand, or `--sign-out` to sign out of that server only. The server is the one above, or `--server https://api.devspecstaging.com`.
+- **Machines with no browser** (CI, cloud workers). Set `DEVSPEC_MCP_TOKEN` (and `DEVSPEC_MCP_URL` for another server) for the background features. It takes precedence over a browser sign-in, and the plugin says so whenever both are present.
 - **Simulate a customer install.** Add this repository as a plugin marketplace with `cursor-agent plugin marketplace add https://github.com/DevSpecAI/cursor-devspec-plugin`, then install **devspec** from `/plugin`. Adding a marketplace does not install the plugin; installing it from `/plugin` is what loads it. A copy installed this way stays on the version you installed: to move on, run `cursor-agent plugin marketplace remove devspec`, add it again and reinstall. `cursor-agent plugin marketplace update` does not bring a newer version.
-- **The token entry.** `node scripts/setup-cursor.mjs` writes or refreshes the `devspec` entry in `~/.cursor/mcp.json`. It reads the token from `DEVSPEC_MCP_TOKEN`, standard input or `~/.devspec/auth.json`, never from the command line, and never prints it.
 - **Resuming chats.** `cursor-agent --resume` works as usual; the plugin reports Cursor's conversation id to DevSpec as `local_session_id`. A chat without a Cursor conversation id is matched to a DevSpec connection only when exactly one live, attached Cursor connection is in the folder; with several, the plugin refuses rather than guess.
+- **Context the hooks add.** Cursor passes on at most 10,000 characters from all the hooks that answer one step, this plugin's, other plugins' and your own together, and drops all of them when they run over. It keeps no record of what reached the agent: the agent transcript never holds hook context. So each of this plugin's hooks keeps to an equal share and puts anything longer in `~/.devspec/notes/`, split, between whole lines or whole characters, into parts that each fit what Cursor shows the agent from one shell command (20,000 characters, and 40,000 bytes before it moves the output to a file instead), and what must reach the agent (the project's rules, a message for you, unread room messages, a note about an untracked commit, a broken pin, a repository to link) is offered again after every step until the agent has read all of it. Each hand-over must be read on its own: rules that change and change back, a resumed chat and a compacted one are offered the rules again, and a note that cannot be read back is never dropped or replaced: the line pointing at it says so in a fixed number of characters, and which parts failed and how to retry are in a small status file beside it (`~/.devspec/notes/<id>.status.md`). When several notes wait at once, every line the plugin adds has a fixed largest size, notes the agent can read are listed before any that cannot, and room is kept first for the line counting them all, so the count always arrives. The full list of paths and the one rule they keep is at the top of `hooks/scripts/hook-context-budget.mjs`. Each part, and each page of room messages, closes with its own length and checksum, and counts as read only when the output that came back carries all of it, never because a command mentioned it or Cursor kept only its beginning and end. `hooks/scripts/hook-context-budget.mjs` has the measurements and the details.
+- **Turn ends read from Cursor's transcript.** Cursor's command-line agent runs a plugin's own `stop` and `beforeSubmitPrompt` hooks only when the person also has a hooks file of their own, and never headless. Cursor's staff have confirmed this as a known bug ([173219](https://forum.cursor.com/t/cursor-cli-does-not-run-enterprise-or-team-beforesubmitprompt-hooks/173219), [177989](https://forum.cursor.com/t/cursor-cli-2026-11-05-macos-user-level-cursor-hooks-json-is-never-loaded-project-level-cursor-hooks-json-works/177989), [169059](https://forum.cursor.com/t/cursor-cli-omits-beforesubmitprompt-afteragentresponse-and-stop-hooks-loses-token-usage-and-emits-inconsistent-generation-id-values/169059)). The plugin never writes to a person's hooks file to get around it. Instead the remote-control poller notices each turn's end in the conversation's transcript and reports it as the `stop` hook would (`hooks/scripts/transcript-turn-end.mjs`, whose header has the details). Once Cursor runs plugin `stop` hooks without a user hooks file, in the terminal and headless, that fallback can be removed.
 - **Tests.** Run them with `npm test`.
 
 ## License

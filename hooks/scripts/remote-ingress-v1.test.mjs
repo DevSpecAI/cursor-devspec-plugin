@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  canonicalAcceptanceKey,
   emptyCanonicalContextCarry,
+  isProjectIncidentsProjectionV1,
+  isSystemNoticeV1,
   mergeCanonicalContextCarry,
+  noticeAudience,
   normalizeRemoteIngressV1,
   validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
 } from './remote-ingress-v1.mjs'
+import { roomChangesSince, writeRoomState } from './devspec-remote-poll.mjs'
+import { buildOwnerMessageEvents, parseWakeBatches } from './devspec-remote-wait.mjs'
 import {
   FIXTURE_ID as ID,
   emptyFixtureContext as emptyContext,
@@ -398,6 +404,28 @@ describe('canonical remote ingress v1', () => {
     )
   })
 
+  it('accepts DevSpec\'s audience label on every notice kind (system_notice_version 3), and only a known label', () => {
+    const wake = (notice) => fixtureSystemNoticeEnvelope({ wakeKind: 'system_notice', commands: [], systemNotices: [notice] })
+    for (const audience of ['needs_person', 'for_the_record']) {
+      assert.equal(validateRemoteIngressEnvelopeV1(wake(fixtureServerNotice({ audience })), ID.connection), null, `server_notice ${audience}`)
+      assert.equal(validateRemoteIngressEnvelopeV1(wake(fixtureUnlinkedCommitNotice({ audience })), ID.connection), null, `unlinked ${audience}`)
+      assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience })), true)
+    }
+    // The label is the one key a notice adds; its body version stays 1.
+    assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience: 'needs_person', version: 3 })), false)
+    for (const audience of ['later', '', null, 'NEEDS_PERSON']) {
+      assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience })), false, String(audience))
+      assert.equal(isSystemNoticeV1(fixtureUnlinkedCommitNotice({ audience })), false, String(audience))
+      assert.match(validateRemoteIngressEnvelopeV1(wake(fixtureServerNotice({ audience })), ID.connection), /malformed system notices/)
+    }
+    // Still exact: another new key is refused.
+    assert.equal(isSystemNoticeV1(fixtureServerNotice({ audience: 'for_the_record', ask: 'OK it' })), false)
+    // No label reads as needing a person, the way DevSpec reads one it stored unlabelled.
+    assert.equal(noticeAudience(fixtureServerNotice()), 'needs_person')
+    assert.equal(noticeAudience(fixtureServerNotice({ audience: 'needs_person' })), 'needs_person')
+    assert.equal(noticeAudience(fixtureServerNotice({ audience: 'for_the_record' })), 'for_the_record')
+  })
+
   it('accepts active_session_plans on the 1.5 tier without regressing 1.2 strictness', () => {
     const styledWithPlans = fixtureSenderStyleEnvelope({
       activeSessionPlans: fixtureActiveSessionPlans(),
@@ -409,5 +437,74 @@ describe('canonical remote ingress v1', () => {
     assert.equal(validateRemoteIngressEnvelopeV1(scoped, ID.connection), null)
     scoped.system_notices = []
     assert.match(validateRemoteIngressEnvelopeV1(scoped, ID.connection), /malformed canonical ingress/)
+  })
+
+  it('validates passive project_incidents and surfaces it on wakes and .room.json without waking idle connections', () => {
+    const projection = {
+      version: 1,
+      authority: 'advisory_read_awareness',
+      recent_resolved_window_minutes: 60,
+      active: [
+        {
+          id: fixtureUuid(901),
+          short_code: '90100000',
+          kind: 'checks_failing',
+          kind_label: 'Checks failing',
+          title: 'Typecheck failing on staging',
+          summary: 'CI failing on staging',
+          state: 'handled',
+          since: '2026-11-12T01:00:00.000Z',
+          last_seen_at: '2026-11-12T01:05:00.000Z',
+          status_line: 'Being handled by Gentle Urchin',
+          handler: {
+            kind: 'agent_connection',
+            label: 'Gentle Urchin',
+            user_id: ID.requester,
+            connection_id: ID.connection,
+            run_id: null,
+            expires_at: '2026-11-12T01:35:00.000Z',
+          },
+          decision_prompt: null,
+          blocked_pull_request_count: 1,
+          blocked_task_count: 0,
+        },
+      ],
+      recently_resolved: [],
+      truncated: { active_omitted: 0, resolved_omitted: 0 },
+      note: 'Advisory read-awareness only.',
+    }
+    assert.equal(isProjectIncidentsProjectionV1(projection), true)
+    assert.equal(isProjectIncidentsProjectionV1({ ...projection, active: [], recently_resolved: [] }), false)
+
+    const writes = []
+    writeRoomState(ID.connection, { session_id: fixtureUuid(902), project_incidents: projection }, {}, {
+      write: (_file, doc) => writes.push(doc),
+    })
+    assert.equal(writes.length, 1)
+    assert.equal(writes[0].sections.project_incidents, 'present')
+    assert.deepEqual(writes[0].project_incidents, projection)
+    assert.deepEqual(roomChangesSince({ project_incidents: projection }, null, {}).changed, ['project_incidents'])
+
+    const env = envelope()
+    const batchLine = JSON.stringify({
+      type: 'owner_messages',
+      connection_id: ID.connection,
+      session_id: fixtureUuid(902),
+      received_at: '2026-11-12T01:06:00.000Z',
+      count: env.commands.length,
+      next_after_message_id: ID.message,
+      acceptance_key: canonicalAcceptanceKey(env),
+      ingress: { canonical: true, envelope: env },
+      project_incidents: projection,
+      messages: env.commands,
+    })
+    const parsed = parseWakeBatches([batchLine], { canonicalOnly: true, connectionId: ID.connection })
+    assert.equal(parsed.length, 1)
+    const events = buildOwnerMessageEvents(parsed[0])
+    const incidentEvent = events.find((event) => event.type === 'project_incidents')
+    assert.ok(incidentEvent)
+    assert.equal(incidentEvent.advisory, true)
+    assert.equal(incidentEvent.executable, false)
+    assert.equal(incidentEvent.active.length, 1)
   })
 })

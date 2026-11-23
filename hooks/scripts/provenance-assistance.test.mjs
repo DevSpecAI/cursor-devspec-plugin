@@ -5,10 +5,11 @@ import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
+import { saveLogin } from './auth-store.mjs'
+import { DEFAULT_MCP_URL } from './devspec-server.mjs'
 import {
   MALFORMED_REFERENCE_MESSAGE,
   MULTIPLE_CLAIMS_MESSAGE,
-  NO_CLAIM_MESSAGE,
   ONLINE_REFERENCE_TIMEOUT_MS,
   appendReference,
   confirmReferenceOnline,
@@ -23,6 +24,10 @@ import {
   unresolvedReferenceMessage,
   writeConversationState,
 } from './provenance-assistance.mjs'
+import { unlinkedCommitText, unrecordedClaimText, unrecordedCommitText } from './git-stand-in.mjs'
+import { selectProjectContext } from './project-context.mjs'
+import { catCall, noteFiles, noteIdIn } from '../../tests/helpers/note-reads.mjs'
+import { POST_TOOL_CONTEXT_SHARE, readNoteText } from './hook-context-budget.mjs'
 
 const PROJECT = '11111111-2222-3333-4444-555555555555'
 const ITEM_A = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -84,6 +89,22 @@ function observeClaim(stateRoot, item = ITEM_A, conversationId = 'chat-a', nowMs
     { task_id: item, project_id: PROJECT },
     conversationId,
   ), { stateRoot, nowMs })
+}
+
+/**
+ * What postToolUse hands the agent once the Shell call `toolUseId` has run. A commit
+ * note arrives as a pointer to a note, offered until read: this returns the note's
+ * text as `additional_context`, and then reads it the way the agent would, so the next
+ * commit's note starts a delivery of its own.
+ */
+function noteAfter(stateRoot, toolUseId = 'tool-1', conversationId = 'chat-a') {
+  const out = handleHook('postToolUse', { conversation_id: conversationId, tool_name: 'Shell', tool_use_id: toolUseId }, { stateRoot, home: stateRoot })
+  const id = noteIdIn(out?.additional_context)
+  if (!id) return out
+  for (const file of noteFiles(stateRoot, id)) {
+    handleHook('postToolUse', catCall(stateRoot, file, { conversation: conversationId }), { stateRoot, home: stateRoot })
+  }
+  return { additional_context: readNoteText(id, { home: stateRoot }) }
 }
 
 function pre(command, cwd, stateRoot, extra = {}) {
@@ -394,7 +415,7 @@ describe('online reference confirmation', () => {
     })
   })
 
-  it('inherits pin, remote, endpoint, and bearer from a real linked worktree', async () => {
+  it('inherits pin and remote from a real linked worktree, and signs in with the plugin’s own login', async () => {
     const root = tempRoot()
     const home = path.join(root, 'home')
     const main = path.join(root, 'main')
@@ -408,10 +429,19 @@ describe('online reference confirmation', () => {
     execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'linked', linked])
     fs.mkdirSync(path.join(main, '.devspec'))
     fs.writeFileSync(path.join(main, '.devspec', 'project.json'), JSON.stringify({ project_id: PROJECT }))
+    // A pasted token in the repository's Cursor MCP settings is no longer read (item 95a67ee4).
     fs.mkdirSync(path.join(main, '.cursor'))
     fs.writeFileSync(path.join(main, '.cursor', 'mcp.json'), JSON.stringify({
       mcpServers: { devspec: { url: 'https://staging.example/mcp', headers: { Authorization: 'Bearer dvs_main_worktree' } } },
     }))
+    await saveLogin({
+      mcpUrl: DEFAULT_MCP_URL,
+      tokens: { accessToken: 'oat_browser_login', refreshToken: 'rt_browser_login', issuedAt: Date.now(), expiresAt: Date.now() + 86_400_000 },
+      issuer: 'https://clerk.devspec.ai',
+      tokenEndpoint: 'https://clerk.devspec.ai/oauth/token',
+      clientId: 'bGf2U1lPyRZDYkzY',
+      resource: 'https://api.devspec.ai/api/mcp',
+    }, { home })
     let request = null
     const output = await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, linked, tempRoot(), {
       home,
@@ -419,8 +449,8 @@ describe('online reference confirmation', () => {
       onlineCall: async (value) => { request = value; return { online: { status: 'valid' } } },
     })
     assert.equal(output, null)
-    assert.equal(request?.token, 'dvs_main_worktree')
-    assert.equal(request?.mcpUrl, 'https://staging.example/mcp')
+    assert.equal(request?.token, 'oat_browser_login')
+    assert.equal(request?.mcpUrl, DEFAULT_MCP_URL)
     assert.equal(request?.arguments?.pinned_project_id, PROJECT)
     assert.equal(request?.arguments?.git_remote, 'git@github.com:DevSpecAI/worktree-online.git')
   })
@@ -500,18 +530,11 @@ describe('online reference confirmation', () => {
     assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo, resolveAuth: () => ({ ok: false }), onlineCall,
     }), null)
-    const unreferenced = pre("git commit -m 'plain'", repo, stateRoot, {
+    // With no task claimed the commit runs as written, and asks DevSpec nothing.
+    assert.equal(pre("git commit -m 'plain'", repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo,
       resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
-    })
-    assert.equal(unreferenced?.permission, 'deny')
-    assert.equal(unreferenced?.agent_message, NO_CLAIM_MESSAGE)
-    // Recovery asks for the smallest adequate task and a retry; the server refuses a
-    // thin task, and the hook appends the reference once one is claimed (item 8f047489).
-    assert.match(NO_CLAIM_MESSAGE, /smallest adequate task/)
-    assert.match(NO_CLAIM_MESSAGE, /claim_work_item/)
-    assert.match(NO_CLAIM_MESSAGE, /retry the same commit/)
-    assert.doesNotMatch(NO_CLAIM_MESSAGE, /last-mile|thin (item|one|task) is fine|<full-uuid>/i)
+    }), null)
     assert.equal(pre(`git commit --message=hidden -m 'ship [devspec:${ITEM_A}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: repo,
       resolveAuth: () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' }), onlineCall,
@@ -538,20 +561,71 @@ describe('online reference confirmation', () => {
 })
 
 describe('claim observation and commit decisions', () => {
-  it('accepts a valid reference without any live claim, denies unreferenced readable commits without a claim, and allows offline/non-commit work', async () => {
+  it('takes in a commit note whose own command never reported back, however much later the next step comes', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    // The commit ran, but its command failed afterwards: Cursor sends postToolUseFailure,
+    // never this call's postToolUse.
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'failed-1' }), null)
+    const later = Date.now() + 3 * 24 * 60 * 60 * 1000
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Read', tool_use_id: 'other-2', tool_input: { file_path: '/x' } }, { stateRoot, home: stateRoot, nowMs: later })
+    const id = noteIdIn(out?.additional_context)
+    assert.ok(id, 'offered at the next step, three days on')
+    assert.equal(readNoteText(id, { home: stateRoot }), unlinkedCommitText())
+  })
+
+  it('keeps a commit note in the state when its hand-over cannot be written, and hands it over once it can', { skip: process.getuid?.() === 0 && 'root writes anywhere' }, () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-7' }), null)
+    const notes = path.join(stateRoot, '.devspec', 'notes')
+    fs.mkdirSync(notes, { recursive: true })
+    fs.chmodSync(notes, 0o500)
+    try {
+      assert.throws(() => handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Shell', tool_use_id: 'plain-7' }, { stateRoot, home: stateRoot }))
+    } finally {
+      fs.chmodSync(notes, 0o700)
+    }
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Read', tool_use_id: 'next-1', tool_input: { file_path: '/x' } }, { stateRoot, home: stateRoot })
+    assert.equal(readNoteText(noteIdIn(out?.additional_context), { home: stateRoot }), unlinkedCommitText(), 'still waiting, and handed over now')
+  })
+
+  it('offers a commit note after every step until the agent has read it whole, never just because it was printed', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-9' }), null)
+    const after = (input) => handleHook('postToolUse', { conversation_id: 'chat-a', ...input }, { stateRoot, home: stateRoot })?.additional_context ?? null
+    const pointer = after({ tool_name: 'Shell', tool_use_id: 'plain-9' })
+    const id = noteIdIn(pointer)
+    assert.ok(id, 'a pointer to the note')
+    assert.equal(readNoteText(id, { home: stateRoot }), unlinkedCommitText())
+    // Cursor may have dropped that step's notes: the next steps offer it again.
+    assert.equal(after({ tool_name: 'Read', tool_input: { file_path: '/x' } }), pointer)
+    assert.equal(after({ tool_name: 'Shell', tool_input: { command: `test -e ~/.devspec/notes/${id}.md` }, tool_output: JSON.stringify({ output: '', exitCode: 0 }) }), pointer, 'mentioning it is not reading it')
+    const file = noteFiles(stateRoot, id)[0]
+    const whole = fs.readFileSync(file, 'utf8')
+    const cut = { ...catCall(stateRoot, file, { conversation: 'chat-a' }), tool_output: JSON.stringify({ output: `${whole.slice(0, 40)}\n...\n${whole.slice(-90)}`, exitCode: 0 }) }
+    assert.equal(after(cut), pointer, 'a cut read is not a read')
+    assert.equal(after(catCall(stateRoot, file, { conversation: 'chat-a' })), null, 'read whole: done')
+    assert.equal(after({ tool_name: 'Read', tool_input: { file_path: '/x' } }), null)
+  })
+
+  it('accepts a valid reference without any live claim, lets an unreferenced commit with no claim through with a note, and allows offline/non-commit work', async () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_B}]'`, repo, stateRoot, {
       home, repoRoot: repo, mainWorktree: null, resolveAuth: () => ({ ok: false }),
     }), null)
-    const noClaimSingle = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
-    assert.equal(noClaimSingle?.permission, 'deny')
-    assert.equal(noClaimSingle?.agent_message, NO_CLAIM_MESSAGE)
+    // No decision and no rewrite: the commit runs exactly as written.
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-1' }), null)
+    // The note reaches the agent once the command has run, once.
+    assert.deepEqual(noteAfter(stateRoot, 'plain-1'), { additional_context: unlinkedCommitText() })
+    assert.equal(noteAfter(stateRoot, 'plain-1'), null)
     assert.equal(pre("git commit -m 'broken [devspec:not-a-uuid]'", repo, stateRoot, { home, repoRoot: repo })?.permission, 'deny')
     assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo, tool_name: 'Write' }), null)
   })
 
-  it('denies without a claim and stamps with exactly one claim across all three multi-line commit shapes', () => {
+  it('lets a commit through without a claim and stamps with exactly one claim across all three multi-line commit shapes', () => {
     const { home, repo } = pinnedRepo()
     const stateRoot = tempRoot()
     const msgFile = path.join(repo, 'COMMIT_MSG.txt')
@@ -564,9 +638,8 @@ describe('claim observation and commit decisions', () => {
     ]
 
     for (const cmd of shapes) {
-      const denied = pre(cmd, repo, stateRoot, { home, repoRoot: repo })
-      assert.equal(denied?.permission, 'deny', `expected deny without claim for: ${cmd}`)
-      assert.equal(denied?.agent_message, NO_CLAIM_MESSAGE)
+      assert.equal(pre(cmd, repo, stateRoot, { home, repoRoot: repo }), null, `expected the commit as written without a claim for: ${cmd}`)
+      assert.deepEqual(noteAfter(stateRoot), { additional_context: unlinkedCommitText() })
     }
 
     observeClaim(stateRoot, ITEM_A)
@@ -594,6 +667,19 @@ describe('claim observation and commit decisions', () => {
     }, { stateRoot, pinOptions: { home, repoRoot: repo } })
     assert.match(reported?.additional_context || '', new RegExp(`appended \\[devspec:${ITEM_A}\\]`))
     assert.equal(readConversationState('chat-a', stateRoot).pending_stamps['stamp-1'], undefined)
+  })
+
+  it('says a reference was added beside a waiting commit note, both within the share and the note pointed at directly', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    assert.equal(pre("git commit -m 'first'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'plain-3' }), null)
+    observeClaim(stateRoot)
+    assert.equal(pre("git commit -m 'second'", repo, stateRoot, { home, repoRoot: repo, tool_use_id: 'stamp-3' })?.permission, 'allow')
+    const out = handleHook('postToolUse', { conversation_id: 'chat-a', tool_name: 'Shell', tool_use_id: 'stamp-3', cwd: repo }, { stateRoot, home: stateRoot })
+    const context = out?.additional_context || ''
+    assert.ok(context.length <= POST_TOOL_CONTEXT_SHARE, `${context.length} characters`)
+    assert.match(context, new RegExp(`\\nDevSpec appended \\[devspec:${ITEM_A}\\] to the commit message that just ran\\.$`))
+    assert.equal(readNoteText(noteIdIn(context), { home: stateRoot }), unlinkedCommitText(), 'the commit note itself, not a note wrapping its pointer')
   })
 
   it('resets pre-cutover transient pending_stamps entries without deleting active_claims or nudged_projects', () => {
@@ -631,10 +717,9 @@ describe('claim observation and commit decisions', () => {
       { claim_success: true, project_id: '99999999-8888-7777-6666-555555555555', id: ITEM_A },
       { task_id: ITEM_A },
     ), { stateRoot })
-    const output = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
-    assert.equal(output?.updated_input, undefined)
-    assert.equal(output?.permission, 'deny')
-    assert.equal(output?.agent_message, NO_CLAIM_MESSAGE)
+    // Not this project's claim, so none is claimed here: the commit runs as written.
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo }), null)
+    assert.deepEqual(noteAfter(stateRoot), { additional_context: unlinkedCommitText() })
   })
 
   it('denies only readable ambiguity with observed recovery and never terminates the turn', () => {
@@ -679,18 +764,12 @@ describe('claim observation and commit decisions', () => {
     const observed = Date.parse('2026-02-01T00:00:00Z')
     observeClaim(stateRoot, ITEM_A, 'chat-a', observed)
     assert.match(pre("git commit -m 'fresh'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 1_000 })?.updated_input?.command || '', new RegExp(ITEM_A))
-    const stale = pre("git commit -m 'stale'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 24 * 60 * 60 * 1_000 + 1 })
-    assert.equal(stale?.updated_input, undefined)
-    assert.equal(stale?.permission, 'deny')
-    assert.equal(stale?.agent_message, NO_CLAIM_MESSAGE)
+    assert.equal(pre("git commit -m 'stale'", repo, stateRoot, { home, repoRoot: repo, nowMs: observed + 24 * 60 * 60 * 1_000 + 1 }), null)
 
     writeConversationState('chat-old', { active_claims: [ITEM_A] }, stateRoot)
-    const legacy = pre("git commit -m 'legacy'", repo, stateRoot, {
+    assert.equal(pre("git commit -m 'legacy'", repo, stateRoot, {
       home, repoRoot: repo, conversation_id: 'chat-old', nowMs: observed + 1_000,
-    })
-    assert.equal(legacy?.updated_input, undefined)
-    assert.equal(legacy?.permission, 'deny')
-    assert.equal(legacy?.agent_message, NO_CLAIM_MESSAGE)
+    }), null)
   })
 })
 
@@ -713,7 +792,8 @@ describe('bounded after-the-fact nudge', () => {
     assert.doesNotMatch(first?.agent_message || '', /thin|last-mile|<full-uuid>/i)
     // When a task is warranted is the served contract's, not this message's.
     assert.match(first?.agent_message || '', /work_entry_contract/)
-    assert.match(first?.agent_message || '', /reason it is needed/)
+    // So is how to write the new task's intent (item 95e4f277).
+    assert.match(first?.agent_message || '', /core\.write-the-persons-intent/)
     assert.doesNotMatch(first?.agent_message || '', /refused|reconciliation|analy[sz]er/i)
     assert.equal(first?.permission, undefined)
     const second = handleHook('postToolUse', {
@@ -764,7 +844,7 @@ describe('executable fail-open boundary', () => {
       }),
     })
     assert.equal(result.status, 0)
-    assert.equal(result.stdout, '')
+    assert.equal(result.stdout, '{}', 'no decision: an answer that asks Cursor for nothing (item 6ddde907)')
     assert.match(result.stderr, /failed open/i)
   })
 })
@@ -829,17 +909,33 @@ describe('a claim whose result Cursor withheld (item ef54cfcb)', () => {
     })
     assert.deepEqual(requests.map((r) => [r.name, r.arguments]), [['get_task', { task_id: ITEM_A, project_id: PROJECT }]])
     assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((c) => [c.id, c.project_id]), [[ITEM_A, PROJECT]])
+    assert.deepEqual(readConversationState('chat-a', stateRoot).unrecorded_claims, [])
   })
 
-  it('does not record a claim held by another conversation, or none, or when DevSpec cannot answer', async () => {
+  it('records nothing when DevSpec shows another conversation holds it, or nobody does', async () => {
     for (const answer of [
       async () => ({ id: ITEM_A, agent_activity: 'implementing', local_session_id: 'chat-elsewhere' }),
       async () => ({ id: ITEM_A, agent_activity: 'idle', local_session_id: 'chat-a' }),
-      async () => { throw new Error('offline') },
     ]) {
       const stateRoot = tempRoot()
       await handleHook('afterMCPExecution', claimCall(), { stateRoot, resolveAuth: auth, onlineCall: answer })
-      assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims, [])
+      const state = readConversationState('chat-a', stateRoot)
+      assert.deepEqual(state.active_claims, [])
+      assert.deepEqual(state.unrecorded_claims, [])
+    }
+  })
+
+  it('keeps the claim as unrecorded, never as no claim, when DevSpec cannot be asked or cannot answer', async () => {
+    for (const [resolveAuth, onlineCall] of [
+      [auth, async () => { throw new Error('offline') }],
+      [() => ({ ok: false }), async () => ({})],
+      [auth, async () => ({ raw: 'not a task' })],
+    ]) {
+      const stateRoot = tempRoot()
+      await handleHook('afterMCPExecution', claimCall(), { stateRoot, resolveAuth, onlineCall })
+      const state = readConversationState('chat-a', stateRoot)
+      assert.deepEqual(state.active_claims, [])
+      assert.deepEqual(state.unrecorded_claims.map((e) => [e.requested, e.task_id, e.project_id, e.confirmed]), [[ITEM_A, ITEM_A, PROJECT, false]])
     }
   })
 
@@ -853,6 +949,161 @@ describe('a claim whose result Cursor withheld (item ef54cfcb)', () => {
       onlineCall: async () => { asked = true; return {} },
     })
     assert.equal(asked, false)
-    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims, [])
+    const state = readConversationState('chat-a', stateRoot)
+    assert.deepEqual(state.active_claims, [])
+    assert.deepEqual(state.unrecorded_claims, [])
+  })
+})
+
+describe('a claim made by short code (item 953ab72e)', () => {
+  const SHORT = ITEM_A.slice(0, 8)
+  const auth = () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' })
+
+  it('is recorded against the full id DevSpec names, and the next commit is tagged with it', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    handleHook('afterMCPExecution', mcp('devspec__claim_work_item', envelope(claimResponse(ITEM_A)), { task_id: SHORT, project_id: PROJECT }), { stateRoot })
+    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((c) => [c.id, c.project_id]), [[ITEM_A, PROJECT]])
+    assert.match(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })?.updated_input?.command || '', new RegExp(`\\[devspec:${ITEM_A}\\]`))
+    // An answer naming a task the short code does not begin is not this claim.
+    assert.equal(parseMcpExecution(mcp('devspec__claim_work_item', claimResponse(ITEM_B), { task_id: SHORT, project_id: PROJECT })).successful, false)
+  })
+
+  it('is resolved through DevSpec when Cursor withheld the result', async () => {
+    const stateRoot = tempRoot()
+    const requests = []
+    await handleHook('afterMCPExecution', mcp('devspec__claim_work_item', { content: [{ type: 'text', text: '' }], isError: false }, { task_id: SHORT, project_id: PROJECT }), {
+      stateRoot,
+      resolveAuth: auth,
+      onlineCall: async (request) => {
+        requests.push(request.arguments)
+        return { id: ITEM_A, agent_activity: 'implementing', local_session_id: 'chat-a' }
+      },
+    })
+    assert.deepEqual(requests, [{ task_id: SHORT, project_id: PROJECT }])
+    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((c) => c.id), [ITEM_A])
+  })
+
+  it('is released by its short code', () => {
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    observeClaim(stateRoot, ITEM_B)
+    handleHook('afterMCPExecution', mcp('devspec__release_work_item', { released: true }, { task_id: SHORT }), { stateRoot })
+    assert.deepEqual(readConversationState('chat-a', stateRoot).active_claims.map((c) => c.id), [ITEM_B])
+  })
+})
+
+describe('a claim that could not be recorded never lends the commit an older claim (item 953ab72e)', () => {
+  const auth = () => ({ ok: true, token: 'dvs_test', mcp_url: 'https://mcp.example/test' })
+  const withheldClaim = (args) => mcp('devspec__claim_work_item', { content: [{ type: 'text', text: '' }], isError: false }, args)
+  const holds = async (request) => ({ id: request.arguments.task_id, agent_activity: 'implementing', local_session_id: 'chat-a' })
+
+  it('lets the commit through untagged, with a note, when DevSpec could not confirm the claim', async () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B, project_id: PROJECT }), {
+      stateRoot, resolveAuth: auth, onlineCall: async () => { throw new Error('offline') },
+    })
+    // Not tagged with ITEM_A, the older claim, and not stopped.
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo }), null)
+    const note = noteAfter(stateRoot)?.additional_context
+    assert.equal(note, unrecordedCommitText())
+  })
+
+  it('stops the commit to ask which task, naming both, when DevSpec confirmed a claim it could not record and the repository is the project\'s', async () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    // Claimed with no project: DevSpec confirms it, but the plugin cannot tell whose it is.
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B }), { stateRoot, resolveAuth: auth, onlineCall: holds })
+    assert.deepEqual(readConversationState('chat-a', stateRoot).unrecorded_claims.map((e) => [e.task_id, e.project_id, e.confirmed]), [[ITEM_B, null, true]])
+    const stopped = pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })
+    assert.equal(stopped?.permission, 'deny')
+    assert.equal(stopped?.agent_message, unrecordedClaimText([ITEM_A], [ITEM_B]))
+    assert.match(stopped.agent_message, new RegExp(`\\[devspec:${ITEM_B}\\], \\[devspec:${ITEM_A}\\]`))
+    assert.equal(stopped?.updated_input, undefined)
+    // The agent's own reference goes through.
+    assert.equal(await pre(`git commit -m 'ship [devspec:${ITEM_B}]'`, repo, stateRoot, { home, repoRoot: repo, mainWorktree: null, resolveAuth: () => ({ ok: false }) }), null)
+  })
+
+  it('a visible successful claim with no project is the same: confirmed, so the commit asks', () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    handleHook('afterMCPExecution', mcp('devspec__claim_work_item', envelope(claimResponse(ITEM_B)), { task_id: ITEM_B }), { stateRoot })
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })?.agent_message, unrecordedClaimText([], [ITEM_B]))
+  })
+
+  it('lets the commit through untagged, with a note, when the repository is not certainly the project\'s', async () => {
+    // The project is only the conversation's choice: no pin, and an origin DevSpec did not list.
+    const root = tempRoot()
+    const projectHome = path.join(root, 'home')
+    const repo = path.join(root, 'repo')
+    fs.mkdirSync(repo)
+    execFileSync('git', ['-C', repo, 'init', '-q'])
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:someone/else.git'])
+    selectProjectContext('chat-a', 'https://devspec.test/api/mcp', { id: PROJECT, name: 'App', organization: { id: PROJECT, name: 'Org' } }, 'conversation', projectHome)
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B }), { stateRoot, resolveAuth: auth, onlineCall: holds })
+    const output = handleHook('preToolUse', {
+      conversation_id: 'chat-a', tool_name: 'Shell', tool_input: { command: "git commit -m 'ship'" }, tool_use_id: 'tool-1', cwd: repo,
+    }, { stateRoot, projectHome, home: projectHome, pinOptions: { home: projectHome, repoRoot: repo }, prepareStandIn: () => null })
+    assert.equal(output, null)
+    assert.equal(noteAfter(stateRoot)?.additional_context, unrecordedCommitText())
+  })
+
+  it('still stops on several recorded claims when an unconfirmed one is outstanding', async () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    observeClaim(stateRoot, ITEM_B)
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: 'cccccccc' , project_id: PROJECT }), {
+      stateRoot, resolveAuth: auth, onlineCall: async () => { throw new Error('offline') },
+    })
+    assert.equal(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })?.agent_message, MULTIPLE_CLAIMS_MESSAGE)
+  })
+
+  it('clears once the claim is recorded or the task is released, and tagging resumes', async () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    observeClaim(stateRoot, ITEM_A)
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B, project_id: PROJECT }), {
+      stateRoot, resolveAuth: auth, onlineCall: async () => { throw new Error('offline') },
+    })
+    handleHook('afterMCPExecution', mcp('devspec__release_work_item', { released: true }, { task_id: ITEM_B }), { stateRoot })
+    assert.deepEqual(readConversationState('chat-a', stateRoot).unrecorded_claims, [])
+    assert.match(pre("git commit -m 'ship'", repo, stateRoot, { home, repoRoot: repo })?.updated_input?.command || '', new RegExp(ITEM_A))
+
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B, project_id: PROJECT }), {
+      stateRoot, resolveAuth: auth, onlineCall: async () => { throw new Error('offline') },
+    })
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B, project_id: PROJECT }), { stateRoot, resolveAuth: auth, onlineCall: holds })
+    const state = readConversationState('chat-a', stateRoot)
+    assert.deepEqual(state.unrecorded_claims, [])
+    assert.deepEqual(state.active_claims.map((c) => c.id).sort(), [ITEM_A, ITEM_B])
+  })
+
+  it('suppresses the no-claim edit reminder while a claim is unrecorded', async () => {
+    const { home, repo } = pinnedRepo()
+    const stateRoot = tempRoot()
+    await handleHook('afterMCPExecution', withheldClaim({ task_id: ITEM_B, project_id: PROJECT }), {
+      stateRoot, resolveAuth: auth, onlineCall: async () => { throw new Error('offline') },
+    })
+    assert.equal(handleHook('postToolUse', {
+      conversation_id: 'chat-a', tool_name: 'Write', cwd: repo, tool_input: { path: path.join(repo, 'src', 'one.ts') },
+    }, { stateRoot, pinOptions: { home, repoRoot: repo } }), null)
+  })
+})
+
+describe('the notes beside a commit that went through untagged', () => {
+  it('say how to link the next commit and name no internal rule', () => {
+    for (const note of [unlinkedCommitText(), unrecordedCommitText()]) {
+      assert.match(note, /It was not stopped\./)
+      assert.match(note, /\[devspec:<uuid>\]/)
+      assert.match(note, /if it needs no task, there is nothing to do/)
+      assert.doesNotMatch(note, /_contract|devspec:\/\/|\bcore\.|\bsemantics\./)
+    }
+    assert.match(unlinkedCommitText(), /claim_work_item/)
   })
 })

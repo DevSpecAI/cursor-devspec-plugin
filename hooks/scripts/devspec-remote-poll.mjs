@@ -19,6 +19,9 @@
  *      own cursor and typed claim/record wake, separate from canonical conversation.
  *   5. ACTIVE SESSION PLANS — strict 1.3 all-room inventory carried as advisory
  *      read awareness; it never grants execution or mutation authority.
+ *   6. CHECK JOBS — negotiated `check_job_version: 2`; a check DevSpec asks this
+ *      agent to rule arrives beside automation runs on the dispatch lane, is kept
+ *      once per id and wakes with one line (`check_job`), never as a command.
  *
  * A connection may be SESSIONLESS (available, no room) or ATTACHED to one session
  * (optional shared context). Both poll the same canonical connection endpoint;
@@ -66,7 +69,10 @@
  * Usage:
  *   node devspec-remote-poll.mjs --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *
- * Requires token in per-connection state / ~/.devspec/remote-control.json or DEVSPEC_MCP_TOKEN.
+ * Uses the connection's own credential: the plugin's browser sign-in it connected with
+ * (its current token, taken afresh every lap) or the DEVSPEC_MCP_TOKEN it connected with.
+ * When DevSpec refuses that sign-in, the poller stands the connection down and says so
+ * plainly (`end_reason: 'signed_out'`, with the sentence to show), never failing silently.
  */
 
 import fs from 'node:fs'
@@ -74,7 +80,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { distinctTokenPairs, enumerateCredentialPairs, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { connectionCredential, connectionToken, credentialRefusal, handleCredentialRefusal } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { refreshRepositoryRules } from './repository-context.mjs'
 import { logRemoteControlStory } from './remote-control-story.mjs'
@@ -86,6 +92,7 @@ import {
   canonicalContextAcceptanceKey,
   emptyCanonicalContextCarry,
   isActiveSessionPlansProjectionV1,
+  isProjectIncidentsProjectionV1,
   isSessionActivityV1,
   isSessionEventsV1,
   isSessionPollsProjection,
@@ -120,6 +127,8 @@ import {
   inspectPollResponseV1,
   isCatchUpCursorRefusal,
   automationAcceptanceKey,
+  checkJobAcceptanceKey,
+  CHECK_JOB_VERSION,
 } from './remote-poll-acceptance.mjs'
 import { executeCursorHostControl } from './cursor-host-control.mjs'
 import { agentStatsArgs } from './agent-telemetry.mjs'
@@ -142,6 +151,7 @@ import {
   interactionActivityPlan,
   interactionAnswerRecord,
   interactionNegotiationArgs,
+  turnEndInteractionDecision,
   INTERACTION_EVENT_CONTRACT_URI,
   INTERACTION_EVENT_VERSION,
   validateInteractionEvent,
@@ -151,17 +161,56 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
-import { openRequest } from './requests.mjs'
-import { attachmentFromPoll } from './local-turn.mjs'
+import { commandsAnsweredNow, finishTurnRequests, openRequest, readRequestState } from './requests.mjs'
+import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
   NO_SIGN_OF_LIFE_MS,
   readTurnActivity,
   turnActivityPath,
   turnIsLive,
 } from './turn-liveness.mjs'
-import { erroredTurnEnd, erroredTurnNotice } from './turn-error-end.mjs'
-import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import {
+  attemptEndArguments,
+  clearTurnCommands,
+  commandsHandedOver,
+  completionArguments,
+  pickupArguments,
+  readTurnCommands,
+  recordTurnCommands,
+  turnCommandsPath,
+} from './turn-commands.mjs'
+import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
+import {
+  claimTurnEnd,
+  clearSettle,
+  nextReportTry,
+  noteTurnEndAttemptEnded,
+  noteTurnEndCompleted,
+  noteTurnEndNoticed,
+  noteTurnEndTold,
+  readSettle,
+  readTurnBaseline,
+  recordTurnBaseline,
+  reportHoldingClaim,
+  settleDue,
+  settleStep,
+  settleTurnEnd,
+  startSettle,
+  transcriptConversation,
+  transcriptTurnEnd,
+  turnEndClaimed,
+  turnEndIdentity,
+  turnEndPending,
+  updateSettle,
+  writeTurnBaseline,
+} from './transcript-turn-end.mjs'
+import { answerUnsettledCommands, postTurnFailure, postTurnNotice } from './turn-failure.mjs'
+import { clearTurnWakes } from './notice-reply.mjs'
+import { discardEndedSteps, discardSteps, endConnectionSteps, logDiscarded } from './step-delivery.mjs'
+import { noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
+import { pluginHeaders } from './connection-version.mjs'
+import { deliverableRecall, recallConversation, recallPollArguments } from './turn-recall.mjs'
 
 export { roomStatePath }
 
@@ -202,7 +251,11 @@ const ATTENDED_CADENCE = { waitMs: 25_000, tier: 'attended', checkTier: 'respons
 const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 // Client-side ceiling on a held request. fetch() has NO default timeout, so a
 // silently-dropped TCP connection would wedge the poller forever with no heartbeat.
-const POLL_HTTP_GRACE_MS = 15_000
+// It is also what a response that delivers a command has beyond the hold for the
+// project recall DevSpec runs before answering (turn-recall.mjs): that recall gives
+// up within the 4.8 s every DevSpec plugin's recall shares, so a slow recall can
+// never make this deadline cut the command off.
+export const POLL_HTTP_GRACE_MS = 15_000
 const MAX_TURN_MS = 60 * 60 * 1000
 /** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
 export const TURN_SILENCE_MS = 90_000
@@ -227,13 +280,31 @@ function readTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
  */
 function writeTurnMarker(
   connectionId,
-  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR } = {},
+  { held = false, remoteTurn = true, dir = CONNECTIONS_DIR, startedAt: trackedFrom = null, baseline = null } = {},
 ) {
   if (!connectionId) return
   const existing = readTurnMarker(connectionId, dir)
   const live = turnIsLive(existing, { activity: readTurnActivity(connectionId, dir) })
-  const startedAt = live ? existing.startedAt : Date.now()
+  const startedAt = live ? existing.startedAt : (trackedFrom ?? Date.now())
   const keepRemote = Boolean(remoteTurn || (live && existing?.remoteTurn))
+  // A turn starting now: note how far Cursor's transcript of the conversation had got,
+  // so this turn's end can be told from the end of a turn already running when it
+  // started (transcript-turn-end.mjs). Written before the marker, so a marker never
+  // goes with an older turn's baseline. A turn a settle hands over (`baseline`) was
+  // noted from just before it started.
+  if (!live) {
+    const conversationId = readState(connectionId)?.local_id || null
+    const transcriptPath = resolveAgentTranscriptPath(conversationId)
+    if (baseline) {
+      writeTurnBaseline(
+        connectionId,
+        { turn: startedAt, conversation: transcriptConversation(transcriptPath) ?? conversationId, baseline },
+        { dir },
+      )
+    } else {
+      recordTurnBaseline(connectionId, { turn: startedAt, conversationId, transcriptPath, dir })
+    }
+  }
   try {
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(
@@ -263,6 +334,12 @@ export function handleKeepaliveRejection(errorMessage, connectionId, io = {}) {
     } catch {
       /* ignore */
     }
+    // Nothing is working, so the commands that turn started are already finished.
+    try {
+      rmSync(turnCommandsPath(connectionId, CONNECTIONS_DIR), { force: true })
+    } catch {
+      /* ignore */
+    }
     return { cleared: true }
   }
   return { cleared: false }
@@ -277,7 +354,7 @@ export function shouldForceCompleteAndInject({ hasNewOwnerCommands, marker, nowM
   return Boolean(hasNewOwnerCommands && isTurnMarkerStale(marker, nowMs))
 }
 
-function clearTurnMarker(connectionId) {
+function clearTurnMarker(connectionId, { keepCommands = false } = {}) {
   if (!connectionId) return
   try {
     fs.rmSync(turnMarkerPath(connectionId), { force: true })
@@ -289,6 +366,10 @@ function clearTurnMarker(connectionId) {
   } catch {
     /* non-fatal */
   }
+  // The turn is over, and its end names what it finished (turn-commands.mjs). After only
+  // a notice, the stop hook may still name them (keepCommands); the next turn's start
+  // replaces the record.
+  if (!keepCommands) clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
 }
 
 /**
@@ -411,6 +492,7 @@ function appendInbox(
   {
     type = 'owner_messages', nextCursor = null, sessionId = null, context = null,
     ingress = null, acceptanceKey = null, instructionContextFile = null, wakeContext = null,
+    projectIncidents = null, turnRecall = null,
   } = {},
 ) {
   if (!connectionId || !messages?.length) return { ok: false, duplicate: false }
@@ -424,9 +506,13 @@ function appendInbox(
     ...(context ? { context } : {}),
     ...(ingress ? { ingress } : {}),
     ...(wakeContext ? { wake_context: wakeContext } : {}),
+    ...(isProjectIncidentsProjectionV1(projectIncidents) ? { project_incidents: projectIncidents } : {}),
     // Adapter metadata stays outside the exact-key canonical context schema:
     // older wait processes can ignore it without dropping the command on upgrade.
     ...(instructionContextFile ? {instruction_context_file:instructionContextFile} : {}),
+    // The project recall DevSpec attached to this delivery, which the wake hands over
+    // with the command (turn-recall.mjs). Adapter metadata like the line above.
+    ...(turnRecall ? { turn_recall: turnRecall } : {}),
     messages,
   }
   if (acceptanceKey) {
@@ -458,22 +544,70 @@ export function disabledStatePatch(reason) {
   }
 }
 
-/** Disable THIS connection only — never other remotes on the machine. */
-function disableLocalState({ connectionId, reason }) {
+/** Credential states that mean the connection's sign-in is over until the person signs in again. */
+const SIGNED_OUT_CODES = new Set(['signed_out', 'signed_in_again'])
+
+/**
+ * The connection's sign-in is over (DevSpec refused it, it ended, or the person signed
+ * in as someone else since). Stop, and leave the plain sentence where the wait reads
+ * it: the agent is woken with it and tells the person how to sign in again. Not a UI
+ * End, and not something to re-register on its own: signing in again needs the person.
+ */
+function standDownSignedOut(connectionId, message) {
+  disableLocalState({ connectionId, reason: 'signed_out', message })
+  process.stdout.write(
+    JSON.stringify({ type: 'session_ended', reason: 'signed_out', recoverable: false, connection_id: connectionId, message }) + '\n',
+  )
+  process.stderr.write(`devspec-remote-poll: signed out — ${message}\n`)
+  process.exit(1)
+}
+
+/**
+ * Disable THIS connection only — never other remotes on the machine. The disabling write
+ * and the discard of its local copies of what it held for the agent's next step happen
+ * under the connection's steps lock (step-delivery.mjs `endConnectionSteps`, which says
+ * why the discard loses nothing), so nothing is handed to the agent after the end.
+ */
+function disableLocalState({ connectionId, reason, message = null }) {
   clearConnectionCapability(connectionId)
+  let marked = false
+  const markEnded = () => {
+    marked = true
+    try {
+      const prev = readState(connectionId) || {}
+      writeState(
+        {
+          ...prev,
+          ...disabledStatePatch(reason),
+          ...(message ? { end_message: message } : {}),
+          connection_id: connectionId || prev.connection_id,
+          updated_at: new Date().toISOString(),
+        },
+        connectionId,
+      )
+    } catch (e) {
+      process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+    }
+  }
   try {
-    const prev = readState(connectionId) || {}
-    writeState(
-      {
-        ...prev,
-        ...disabledStatePatch(reason),
-        connection_id: connectionId || prev.connection_id,
-        updated_at: new Date().toISOString(),
-      },
-      connectionId,
-    )
+    logDiscarded('devspec-remote-poll', connectionId, endConnectionSteps(connectionId, { dir: CONNECTIONS_DIR, markEnded }))
   } catch (e) {
-    process.stderr.write(`devspec-remote-poll: failed to disable state: ${e.message}\n`)
+    process.stderr.write(`devspec-remote-poll: could not discard what waited for a step: ${e.message}\n`)
+    // The end stands even when the lock could not be taken; the next poller start
+    // discards what was held (discardEndedSteps).
+    if (!marked) markEnded()
+  }
+}
+
+/**
+ * The connection was found ended by someone else's write: its local copies of what it
+ * held for the agent's next step are discarded and named, if that write left any.
+ */
+function discardConnectionSteps(connectionId) {
+  try {
+    logDiscarded('devspec-remote-poll', connectionId, discardSteps(connectionId, { dir: CONNECTIONS_DIR }))
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not discard what waited for a step: ${e.message}\n`)
   }
 }
 
@@ -501,6 +635,7 @@ export function roomChangesSince(res, activity, seen = {}) {
     session_polls: isSessionPollsProjection(res?.session_polls) ? JSON.stringify(res.session_polls) : null,
     still_to_discuss: isStillToDiscussProjectionV1(res?.still_to_discuss) ? JSON.stringify(res.still_to_discuss) : null,
     active_session_plans: isActiveSessionPlansProjectionV1(plans) ? JSON.stringify(plans) : null,
+    project_incidents: isProjectIncidentsProjectionV1(res?.project_incidents) ? JSON.stringify(res.project_incidents) : null,
     session_activity: activity ? JSON.stringify({ items: activity.items, events: activity.events.length }) : null,
   }
   return {
@@ -535,6 +670,7 @@ export function writeRoomState(
   const polls = isSessionPollsProjection(res?.session_polls) ? res.session_polls : null
   const discuss = isStillToDiscussProjectionV1(res?.still_to_discuss) ? res.still_to_discuss : null
   const plans = isActiveSessionPlansProjectionV1(ingress?.active_session_plans) ? ingress.active_session_plans : null
+  const incidents = isProjectIncidentsProjectionV1(res?.project_incidents) ? res.project_incidents : null
   const notices = Array.isArray(ingress?.system_notices) ? ingress.system_notices : null
   const body = {
     advisory: true,
@@ -547,6 +683,7 @@ export function writeRoomState(
     session_polls: polls,
     still_to_discuss: discuss,
     active_session_plans: plans,
+    project_incidents: incidents,
     system_notices: notices ?? [],
     session_activity: activity,
     transcript,
@@ -554,6 +691,7 @@ export function writeRoomState(
       session_polls: polls ? 'present' : 'none_or_unavailable',
       still_to_discuss: discuss ? 'present' : 'none_or_unavailable',
       active_session_plans: plans ? 'present' : ingress ? 'none' : 'not_sent',
+      project_incidents: incidents ? 'present' : 'none_or_unavailable',
       system_notices: notices === null ? 'not_sent' : notices.length > 0 ? 'present' : 'none',
       session_activity: activity ? (activity.list_readable ? 'present' : 'unavailable') : 'not_sent',
       transcript: transcript ? transcript.status : 'not_sent',
@@ -705,10 +843,12 @@ export function splitRoomWindow({ commands, ownerAmbient, roomContext, seed = fa
  * busy-heartbeat (syncActivityFromBusy). Driven by the poller's turn marker, so it
  * is host-agnostic (Grok works too — no per-host Stop hook needed).
  *
- *   false → true  = a turn just started (owner-command pickup / local turn) → 'pickup'
+ *   false → true  = a turn just started (room command, check job, run, local turn) → 'pickup'
  *   true  → true  = still working this turn (per heartbeat/loop tick)        → 'keepalive'
  *   true  → false = the turn ended (marker cleared by Stop / wait re-arm)    → 'complete'
  *   false → false = idle, nothing to report                                  → null
+ *
+ * What each verb sends is `activityCalls`: a turn's start sends no pickup of its own.
  *
  * @returns {'pickup'|'keepalive'|'complete'|null}
  */
@@ -736,11 +876,33 @@ export function extraActivityVerbArgs({ stalling, verb } = {}) {
   return { reason: stalling ? 'max_turn_ms' : 'turn_end' }
 }
 
-/** Activity verb → connection-native MCP tool name. */
-const ACTIVITY_VERB_TOOL = {
-  pickup: 'report_pickup',
-  keepalive: 'report_keepalive',
-  complete: 'report_complete',
+/**
+ * The MCP calls one turn transition sends (turn-commands.mjs).
+ *
+ * - pickup: none. A room command is started by name as it is handed over
+ *   (`nameCommandPickups`), into a new turn or a running one alike. Any other turn
+ *   (a check job, an automation run, a prompt typed at the terminal) starts no
+ *   command, and a pickup naming none can start one that is waiting, so its start
+ *   is the busy this poller reports, and a typed turn's is the exact pickup the
+ *   prompt hook sent (local-turn.mjs).
+ * - keepalive: the working attempt, whichever it is.
+ * - complete: a turn's end that no Stop hook or reply re-arm reported: one the poller
+ *   noticed in Cursor's transcript (transcript-turn-end.mjs), or the backstop for a
+ *   turn that went quiet. It names the commands this poller started that turn with
+ *   (`commands`) and the terminal turn the owner typed (`localAttemptId`), or says the
+ *   turn is unbound.
+ *
+ * @returns {{ name: string, arguments: object }[]}
+ */
+export function activityCalls({ verb, connectionId, commands = [], localAttemptId = null, reason = null } = {}) {
+  if (verb === 'keepalive') return [{ name: 'report_keepalive', arguments: { connection_id: connectionId } }]
+  if (verb === 'complete') {
+    return completionArguments({ connectionId, commands, localAttemptId, reason }).map((args) => ({
+      name: 'report_complete',
+      arguments: args,
+    }))
+  }
+  return []
 }
 
 /**
@@ -777,6 +939,281 @@ export function installStopSignalHandlers(proc = process) {
   proc.once('SIGINT', () => proc.exit(0))
 }
 
+// ---------------------------------------------------------------------------
+// SSE Push Channel (parity with Pi push-channel.ts, falls back to poll_connection)
+// ---------------------------------------------------------------------------
+
+export const PUSH_RECONNECT_BACKOFF_MS = [1_000, 4_000, 10_000]
+export const PUSH_HEALTHY_MS = 30_000
+export const PUSH_SAFETY_MS = 45_000
+export const PUSH_LOCAL_CHECK_MS = 1_000
+
+export function createPushGate({
+  safetyMs = PUSH_SAFETY_MS,
+  localCheckMs = PUSH_LOCAL_CHECK_MS,
+} = {}) {
+  let connected = false
+  let wakePending = false
+  let wakeWaiter = null
+
+  const notify = () => {
+    if (wakeWaiter) {
+      const fn = wakeWaiter
+      wakeWaiter = null
+      fn()
+    }
+  }
+
+  return {
+    isConnected: () => connected,
+    hasWakePending: () => wakePending,
+    onEvent(evt) {
+      if (!evt) return
+      if (evt.kind === 'hello') {
+        connected = true
+        return
+      }
+      if (
+        evt.kind === 'wake' ||
+        evt.kind === 'ended' ||
+        evt.kind === 'system_notice' ||
+        evt.kind === 'interaction_event' ||
+        evt.kind === 'question_dismissal_event'
+      ) {
+        wakePending = true
+        notify()
+      }
+    },
+    onDisconnect() {
+      connected = false
+      notify()
+    },
+    consumePollWaitMs(fallbackWaitMs) {
+      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
+      wakePending = false
+      return waitMs
+    },
+    async waitIfIdle({ shouldWakeImmediately } = {}) {
+      if (!connected || wakePending) return
+      if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
+      await new Promise((resolve) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(safetyTimer)
+          clearInterval(localTimer)
+          if (wakeWaiter === finish) wakeWaiter = null
+          resolve()
+        }
+        wakeWaiter = finish
+        const safetyTimer = setTimeout(finish, safetyMs)
+        const localTimer = setInterval(() => {
+          if (!connected || wakePending) {
+            finish()
+            return
+          }
+          if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) {
+            finish()
+          }
+        }, localCheckMs)
+      })
+    },
+  }
+}
+
+export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
+  const effectiveAttempt =
+    openedAtMs !== null && openedAtMs !== undefined && nowMs - openedAtMs >= PUSH_HEALTHY_MS
+      ? 0
+      : attempt
+  if (effectiveAttempt >= PUSH_RECONNECT_BACKOFF_MS.length) {
+    return { delayMs: null, nextAttempt: effectiveAttempt + 1 }
+  }
+  return {
+    delayMs: PUSH_RECONNECT_BACKOFF_MS[effectiveAttempt],
+    nextAttempt: effectiveAttempt + 1,
+  }
+}
+
+export function pushChannelUrl(mcpUrl, connectionId, options = {}) {
+  const base = String(mcpUrl || '').replace(/\/$/, '')
+  const params = new URLSearchParams({
+    connection_id: String(connectionId || ''),
+    system_notice_version: String(options.systemNoticeVersion ?? SYSTEM_NOTICE_CHANNEL_VERSION),
+    interaction_event_version: String(options.interactionEventVersion ?? 1),
+    question_dismissal_event_version: String(options.questionDismissalEventVersion ?? 1),
+    check_job_version: String(options.checkJobVersion ?? CHECK_JOB_VERSION),
+  })
+  return `${base}/connection-stream?${params.toString()}`
+}
+
+export function parseSseFrame(block) {
+  let eventName = 'message'
+  const dataLines = []
+  let sawComment = false
+
+  for (const rawLine of String(block || '').split(/\r?\n/)) {
+    if (!rawLine) continue
+    if (rawLine.startsWith(':')) {
+      sawComment = true
+      continue
+    }
+    const colon = rawLine.indexOf(':')
+    const field = colon === -1 ? rawLine : rawLine.slice(0, colon)
+    let value = colon === -1 ? '' : rawLine.slice(colon + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'event') eventName = value
+    else if (field === 'data') dataLines.push(value)
+  }
+
+  if (dataLines.length === 0 && sawComment) {
+    return { kind: 'comment' }
+  }
+  const data = dataLines.join('\n')
+  if (eventName === 'hello') return { kind: 'hello' }
+  if (eventName === 'wake') return { kind: 'wake' }
+  if (eventName === 'ended') {
+    try {
+      const parsed = data ? JSON.parse(data) : {}
+      return {
+        kind: 'ended',
+        endReason: typeof parsed.end_reason === 'string' ? parsed.end_reason : null,
+      }
+    } catch {
+      return { kind: 'ended', endReason: null }
+    }
+  }
+  if (eventName === 'system_notice') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'system_notice', notice: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'interaction_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object' ? { kind: 'interaction_event', event: parsed } : null
+    } catch {
+      return null
+    }
+  }
+  if (eventName === 'question_dismissal_event') {
+    try {
+      const parsed = data ? JSON.parse(data) : null
+      return parsed && typeof parsed === 'object'
+        ? { kind: 'question_dismissal_event', event: parsed }
+        : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+export function openPushChannel({
+  mcpUrl,
+  token,
+  connectionId,
+  connectionCapability = null,
+  onEvent,
+  onDisconnect,
+  onFallback,
+  fetchImpl = fetch,
+}) {
+  let closed = false
+  let controller = null
+  let reconnectTimer = null
+  let attempt = 0
+
+  const stop = () => {
+    closed = true
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (controller) {
+      controller.abort()
+      controller = null
+    }
+  }
+
+  const scheduleReconnect = (openedAtMs, reason) => {
+    if (closed) return
+    onDisconnect?.(reason)
+    const { delayMs, nextAttempt } = nextPushReconnectDelayMs({ attempt, openedAtMs })
+    attempt = nextAttempt
+    if (delayMs === null) {
+      onFallback?.(`push_reconnect_exhausted:${reason}`)
+      return
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      void connect()
+    }, delayMs)
+  }
+
+  const connect = async () => {
+    if (closed) return
+    controller = new AbortController()
+    let openedAtMs = null
+    try {
+      const cap = typeof connectionCapability === 'function' ? connectionCapability() : connectionCapability
+      const res = await fetchImpl(pushChannelUrl(mcpUrl, connectionId), {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${typeof token === 'function' ? token() : token}`,
+          Accept: 'text/event-stream',
+          ...pluginHeaders(),
+          ...(cap ? { 'x-devspec-connection-capability': cap } : {}),
+        },
+        signal: controller.signal,
+      })
+      const contentType = res.headers?.get?.('content-type') || ''
+      if (!res.ok || !contentType.includes('text/event-stream') || !res.body) {
+        onDisconnect?.(`push_http_${res.status}`)
+        onFallback?.(`push_http_${res.status}`)
+        return
+      }
+      openedAtMs = Date.now()
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!closed) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let sep = buffer.indexOf('\n\n')
+        while (sep !== -1) {
+          const rawFrame = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          const parsed = parseSseFrame(rawFrame)
+          if (parsed && parsed.kind !== 'comment') {
+            onEvent?.(parsed)
+            if (parsed.kind === 'ended') {
+              stop()
+              return
+            }
+          }
+          sep = buffer.indexOf('\n\n')
+        }
+      }
+      if (!closed) {
+        scheduleReconnect(openedAtMs, 'eof')
+      }
+    } catch (err) {
+      if (closed) return
+      const msg = err instanceof Error ? err.message : String(err)
+      scheduleReconnect(openedAtMs, msg)
+    }
+  }
+
+  void connect()
+  return { close: stop }
+}
+
 /**
  * COMMAND gate — the authority boundary, re-checked locally.
  */
@@ -790,16 +1227,20 @@ export function isDeliverableCommand(msg, connectionId) {
 }
 
 /** The nested ingress ladder. Each tier requires the one below it (item 7c421a20). */
-export const SYSTEM_NOTICE_CHANNEL_VERSION = 2
+export const SYSTEM_NOTICE_CHANNEL_VERSION = 3
 export const SYSTEM_NOTICE_VERSION = SYSTEM_NOTICE_CHANNEL_VERSION
 export const SENDER_STYLE_VERSION = 1
 
 /**
  * Feature negotiation for canonical ingress. `sender_style_version` makes the
  * person who SENT a command decide how they get answered, rather than whoever
- * owns this connection; `system_notice_version: 2` delivers server_notice and
- * unlinked_commit_item_review wakes; `room_context_version: 1` delivers the
- * 1.6.0 room context for local transcript materialization.
+ * owns this connection; `system_notice_version: 3` delivers server_notice and
+ * unlinked_commit_item_review wakes, each with DevSpec's `audience` label (needs a
+ * person, or for the record); `room_context_version: 1` delivers the
+ * 1.6.0 room context for local transcript materialization; `check_job_version: 2`
+ * says this poller reads check jobs beside automation runs in `dispatches[]`, in the
+ * version-2 envelope (remote-poll-acceptance.mjs), and DevSpec offers them only while
+ * it is sent.
  */
 export function remoteIngressNegotiationArgs() {
   return {
@@ -810,6 +1251,7 @@ export function remoteIngressNegotiationArgs() {
     system_notice_version: SYSTEM_NOTICE_CHANNEL_VERSION,
     sender_style_version: SENDER_STYLE_VERSION,
     room_context_version: 1,
+    check_job_version: CHECK_JOB_VERSION,
   }
 }
 
@@ -827,11 +1269,15 @@ async function deliverOwnerMessages(
   ingress = null,
   instructionContextFile = null,
   wakeContext = null,
+  projectIncidents = null,
+  turnRecall = null,
 ) {
   // The durable inbox is the wake payload source. Stable turn identity makes replay
   // after an append-before-cursor crash a no-op rather than a second execution.
   const accepted = appendInbox(connectionId, ownerMsgs, {
     type: 'owner_messages', nextCursor, sessionId, context, ingress, instructionContextFile, wakeContext,
+    ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
+    turnRecall,
     acceptanceKey: canonicalAcceptanceKey(ingress.envelope),
   })
   if (!accepted.ok || accepted.duplicate) return accepted
@@ -846,7 +1292,7 @@ async function deliverOwnerMessages(
   if (sessionId) {
     try {
       const s = readState(connectionId) || {}
-      const token = s.token || s.mcp_token || null
+      const token = connectionToken(s)
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
         await seedWorkTrailForConnection({
@@ -875,6 +1321,11 @@ async function deliverOwnerMessages(
       continuous: true,
     }) + '\n',
   )
+  // Whether these commands start a turn, or are handed over into one already running
+  // (turn-commands.mjs): read before the marker below makes the turn live.
+  const startsTurn = !turnIsLive(readTurnMarker(connectionId), {
+    activity: readTurnActivity(connectionId, CONNECTIONS_DIR),
+  })
   // Turn start at pickup — poller re-asserts busy while the marker is fresh.
   writeTurnMarker(connectionId)
   // Cursor CLI often never fires mid-turn hooks; start a transcript-tail trail
@@ -904,7 +1355,7 @@ async function deliverOwnerMessages(
   } catch {
     /* ignore */
   }
-  return { ok: true, duplicate: false }
+  return { ok: true, duplicate: false, commands: commandsHandedOver(acceptedMessages), startsTurn }
 }
 
 export async function deliverSystemNotices(
@@ -968,19 +1419,27 @@ export async function deliverAutomationDispatches(
     appendInboxFn = appendInbox,
     readStateFn = readState,
     emit = (line) => process.stdout.write(line),
+    projectIncidents = null,
+    turnRecall = null,
   } = {},
 ) {
   let acceptedCount = 0
+  // The response's recall goes with the first run kept here, and only that one: it is
+  // one recall for the whole delivery (turn-recall.mjs).
+  let recall = turnRecall
   for (const dispatch of dispatches) {
     const accepted = appendInboxFn(connectionId, [dispatch], {
       type: 'automation_dispatches',
       nextCursor: nextDispatchCursor,
       sessionId,
       acceptanceKey: automationAcceptanceKey(dispatch),
+      ...(isProjectIncidentsProjectionV1(projectIncidents) ? { projectIncidents } : {}),
+      ...(recall ? { turnRecall: recall } : {}),
     })
     if (!accepted.ok) return { ok: false, acceptedCount }
     if (!accepted.duplicate) {
       acceptedCount++
+      recall = null
       emit(JSON.stringify({ type: 'automation_dispatch', dispatch }) + '\n')
     }
   }
@@ -989,7 +1448,7 @@ export async function deliverAutomationDispatches(
   if (sessionId) {
     try {
       const s = readStateFn(connectionId) || {}
-      const token = s.token || s.mcp_token || null
+      const token = connectionToken(s)
       const mcpUrl = s.mcp_url || null
       if (token && mcpUrl) {
         await seedFn({ connectionId, mcpUrl, token, agentName: AGENT_NAME })
@@ -1000,6 +1459,46 @@ export async function deliverAutomationDispatches(
   }
   writeTurnMarker(connectionId, { remoteTurn: true, dir })
   try { ensureWatch({ connectionId, dir }) } catch { /* best effort */ }
+  return { ok: true, acceptedCount }
+}
+
+/**
+ * Check jobs: DevSpec asks this agent to rule the checks on a change, its own
+ * changes included (DevSpec item 55d71b0c). Each one is kept in the inbox once,
+ * keyed by its id, because the server lists every open job on every poll until it
+ * is ruled or dropped. A newly kept one starts the turn that will rule it, so the
+ * poller reports busy while the agent works it and not after the turn ends: DevSpec
+ * drops a job nobody took when a turn that started after delivery ends, and a taken
+ * one when its taker stops working. A check job is nobody's command, so it opens
+ * no work trail and no command turn in the room (notice-reply.mjs keeps its work
+ * out of the room the same way it does for notices).
+ */
+export async function deliverCheckJobDispatches(
+  connectionId,
+  checkJobs,
+  nextDispatchCursor,
+  sessionId,
+  {
+    dir = CONNECTIONS_DIR,
+    appendInboxFn = appendInbox,
+    emit = (line) => process.stdout.write(line),
+  } = {},
+) {
+  let acceptedCount = 0
+  for (const job of checkJobs) {
+    const accepted = appendInboxFn(connectionId, [job], {
+      type: 'check_job_dispatches',
+      nextCursor: nextDispatchCursor,
+      sessionId,
+      acceptanceKey: checkJobAcceptanceKey(job),
+    })
+    if (!accepted.ok) return { ok: false, acceptedCount }
+    if (!accepted.duplicate) {
+      acceptedCount++
+      emit(JSON.stringify({ type: 'check_job', check_job_id: job.check_job_id, check_job: job }) + '\n')
+    }
+  }
+  if (acceptedCount > 0) writeTurnMarker(connectionId, { remoteTurn: false, dir })
   return { ok: true, acceptedCount }
 }
 
@@ -1033,34 +1532,36 @@ async function main() {
   }
   state = readState(connectionId) || state
 
+  // Connections on this machine that ended without discarding what they held for a
+  // step (a process killed outright) have it discarded now (step-delivery.mjs).
+  try {
+    for (const ended of discardEndedSteps({ dir: CONNECTIONS_DIR })) logDiscarded('devspec-remote-poll', ended.connection_id, ended)
+  } catch (e) {
+    process.stderr.write(`devspec-remote-poll: could not discard ended connections' steps: ${e.message}\n`)
+  }
+
   if (state && state.enabled === false) {
     process.stderr.write('devspec-remote-poll: remote control disabled in state file\n')
     process.exit(1)
   }
 
-  let token = state?.token || null
-  let mcpUrl = state?.mcp_url || null
-  if (!token) {
-    const { pairs } = enumerateCredentialPairs(state?.cwd || process.cwd(), {
-      hostToken: hostTokenFromEnv(process.env),
-    })
-    const only = distinctTokenPairs(pairs)
-    if (only.length !== 1) {
-      process.stderr.write(
-        'devspec-remote-poll: no proven token in state. Re-run connect / write — the poller will not guess among multiple DevSpec keys.\n',
-      )
-      process.exit(1)
+  // The connection's own credential. A browser login's token changes daily, so it is
+  // taken afresh at the top of every lap (below); the identity never changes.
+  const firstCredential = connectionCredential(state)
+  if (!firstCredential.ok) {
+    if (SIGNED_OUT_CODES.has(firstCredential.code)) {
+      standDownSignedOut(connectionId, firstCredential.error)
+      return
     }
-    token = only[0].token
-    mcpUrl = only[0].mcp_url
-  }
-  if (!token) {
-    process.stderr.write(
-      'devspec-remote-poll: no token. Run remote-control-state.mjs write after connect, or set DEVSPEC_MCP_TOKEN.\n',
-    )
+    process.stderr.write(`devspec-remote-poll: no DevSpec credential: ${firstCredential.error}\n`)
     process.exit(1)
   }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  let token = firstCredential.token
+  const mcpUrl = firstCredential.mcp_url
+
+  const credentialSource = firstCredential.source
+  const credentialPrincipal = firstCredential.principal
+  let credentialRefusals = 0
   // Identity is a fixed property of THIS plugin — never trust state/args for it.
   const agentName = AGENT_NAME
   // Bond key for the attached-session heartbeat's connection dual-write.
@@ -1127,49 +1628,481 @@ async function main() {
     })
   }
 
-  // Emit a connection-scoped activity verb DIRECTLY (item 71a8b201). Best-effort:
-  // this is ADDITIVE to the busy-heartbeat above (the server's syncActivityFromBusy
-  // translation stays the safety net during rollout), so a failed verb must NEVER
-  // break the poll loop — log to stderr and move on. attempt_id is omitted; the
-  // server resolves this connection's current attempt (pickup opens one for a
-  // locally-initiated turn; keepalive/complete refresh/close the working attempt).
+  // The room commands this poller started a turn with (turn-commands.mjs), so the
+  // backstop that ends that turn can name them. Commands handed over into a turn
+  // already running are not kept: their own answer finishes them.
+  let turnStartCommands = []
+
+  // Emit a connection-scoped activity verb DIRECTLY (item 71a8b201), as the calls
+  // activityCalls plans. Best-effort: a failed verb must NEVER break the poll loop —
+  // log to stderr and move on.
   //
   // While an exact directed-question attempt is open, the generic verbs are the wrong
-  // writer for it (interactionActivityPlan): pickup/complete would touch an attempt
-  // they do not own, and completing one from outside its claim generation is how a
+  // writer for it (interactionActivityPlan): a completion would touch an attempt it
+  // does not own, and completing one from outside its claim generation is how a
   // Cursor turn was sealed empty while the model was still inside it. Keepalive is
   // translated to the exact form so Working stays truthful.
   async function emitActivityVerb(verb, extraArgs = {}) {
     if (!verb) return { ok: true }
+    // The turn is over however its end is reported: what started it goes with it.
+    const ending = verb === 'complete' ? (extraArgs.commands ?? turnStartCommands) : []
+    if (verb === 'complete') {
+      turnStartCommands = []
+      clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    }
     const plan = interactionActivityPlan({ verb, continuation: interactionContinuation })
     if (plan.kind === 'suppress') return { ok: true }
     if (plan.kind === 'exact_keepalive') {
       const exactRes = await keepaliveInteractionContinuation()
       return exactRes ?? { ok: true }
     }
-    const name = ACTIVITY_VERB_TOOL[verb]
-    if (!name) return { ok: true }
-    try {
-      await mcpToolsCall({
-        mcpUrl,
-        token,
-        name,
-        arguments: { connection_id: connectionId, ...extraArgs },
-        timeoutMs: 10_000,
-      })
-      return { ok: true }
-    } catch (e) {
-      process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${name}) failed: ${e.message}\n`)
-      if (verb === 'keepalive') {
-        const rejection = handleKeepaliveRejection(e.message, connectionId)
-        if (rejection.cleared) {
-          process.stderr.write(
-            `devspec-remote-poll: cleared turn marker on keepalive rejection connection=${connectionId}\n`,
-          )
-          return { ok: false, turnStale: true }
+    let result = { ok: true }
+    for (const call of activityCalls({
+      verb,
+      connectionId,
+      commands: ending,
+      localAttemptId: extraArgs.localAttemptId ?? null,
+      reason: extraArgs.reason ?? null,
+    })) {
+      try {
+        await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: activity verb ${verb} (${call.name}) failed: ${e.message}\n`)
+        result = { ok: false }
+        if (verb === 'keepalive') {
+          const rejection = handleKeepaliveRejection(e.message, connectionId)
+          if (rejection.cleared) {
+            process.stderr.write(
+              `devspec-remote-poll: cleared turn marker on keepalive rejection connection=${connectionId}\n`,
+            )
+            turnStartCommands = []
+            return { ok: false, turnStale: true }
+          }
         }
       }
-      return { ok: false }
+    }
+    return result
+  }
+
+  /**
+   * The request ids of the room commands that started the tracked turn (turn-commands.mjs)
+   * and are still open and unanswered: the commands a room command's turn can be tied to.
+   * One delivered into a turn already running is not among them: Cursor holds its wake.
+   */
+  function startingRequests(state) {
+    const started = new Set(readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }).map((command) => command.messageId))
+    return [...state.open]
+      .filter(([, info]) => info.kind === 'command' && !info.answered && started.has(info.message_id))
+      .map(([id]) => id)
+  }
+
+  /**
+   * Report the end of the tracked turn that Cursor's transcript shows, as the stop hook
+   * would have (transcript-turn-end.mjs). A turn end that is the tracked command's beyond
+   * doubt (`ended.attributed`) is reported in full: an error or a stop is told to the
+   * room in Cursor's own words (turn-failure.mjs: the unanswered command's failure reply,
+   * or a room message of its own when the turn carries none), the room commands that
+   * started the turn and the turn the owner typed are named as finished, the turn end's
+   * request bookkeeping is done (requests.mjs), and Working clears. Any other error or
+   * stop gets the notice level only (noticeTranscriptTurnEnd).
+   *
+   * Only while this poller holds the turn end's claim. Every step must reach DevSpec for
+   * the claim to be settled and the marker cleared. Otherwise the claim is given back and
+   * the marker kept, so the stop hook or this poller's next try (nextReportTry) does what
+   * is left, and nothing is sent twice. Returns 'reported'; 'retry' (try again later);
+   * 'reported_elsewhere' (the stop hook reported it in full); or 'reporting_elsewhere'
+   * (the stop hook is reporting it now).
+   */
+  async function reportTranscriptTurnEnd(ended, marker) {
+    let onlyRequests = null
+    if (!ended.attributed) {
+      // Not the tracked command's beyond doubt: which turn it was, from its first row
+      // (transcript-turn-end.mjs "Every way a turn ends").
+      const state = readRequestState(connectionId, { dir: CONNECTIONS_DIR })
+      const kind = ended.firstRow?.kind ?? 'unknown'
+      if (kind === 'typed') {
+        // A turn typed at the terminal: told, never replied to; the commands waiting
+        // stay open until their own turns run (watched, so those report themselves).
+        return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+      }
+      if (kind === 'command') {
+        // A room command's turn: the commands that started it, still unanswered. One is
+        // answered as the matched turn would be; several get the settle point's reply.
+        // A turn already running at handover was started by none of the tracked ones.
+        const starters = ended.firstRow.beforeHandover ? [] : startingRequests(state)
+        if (starters.length >= 2) return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: starters })
+        if (starters.length === 0 && commandsAnsweredNow(state).length > 0) {
+          // Its own command answered (or none tracked), others waiting: told, not replied to.
+          return noticeTranscriptTurnEnd(ended, marker, { reply: false, requests: [] })
+        }
+        onlyRequests = starters
+      } else {
+        return noticeTranscriptTurnEnd(ended, marker, { reply: true, requests: commandsAnsweredNow(state) })
+      }
+    }
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      goal: 'report',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim.outcome === 'reported') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting' || claim.outcome === 'noticing') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
+    // A throw part-way gives the claim back, keeping what landed (reportHoldingClaim).
+    return reportHoldingClaim(connectionId, ended.identity, () => reportClaimedTurnEnd(ended, claim, onlyRequests), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function reportClaimedTurnEnd(ended, claim, onlyRequests = null) {
+    let delivered = true
+    clearTrailState(connectionId)
+    if (ended.failure && sessionId && !claim.told) {
+      try {
+        await postTurnFailure({
+          failure: ended.failure,
+          connectionId,
+          sessionId,
+          dir: CONNECTIONS_DIR,
+          agentName,
+          // The room saw this turn working: it is told why it ended either way, unless a
+          // notice already told it (an upgrade of a noticed turn end).
+          notice: !claim.noticed,
+          requestIds: onlyRequests,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+        noteTurnEndTold(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      } catch (e) {
+        delivered = false
+        process.stderr.write(`devspec-remote-poll: turn failure post failed: ${e.message}\n`)
+      }
+    }
+    // What woke the ended turn no longer describes the next one (notice-reply.mjs).
+    clearTurnWakes(connectionId, { dir: CONNECTIONS_DIR })
+    const recorded = readTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+    const commands = recorded.length > 0 ? recorded : turnStartCommands
+    const localTurn = readState(connectionId)?.local_turn ?? null
+    // What started the turn is kept until the report lands, so a retry names it too; a
+    // completion that already landed is not sent again.
+    if (
+      !claim.completed &&
+      interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind !== 'suppress'
+    ) {
+      let completed = true
+      for (const call of activityCalls({
+        verb: 'complete',
+        connectionId,
+        commands,
+        localAttemptId: localTurnToComplete(localTurn, sessionId),
+        reason: 'turn_end',
+      })) {
+        try {
+          await mcpToolsCall({ mcpUrl, token, name: call.name, arguments: call.arguments, timeoutMs: 10_000 })
+        } catch (e) {
+          completed = false
+          process.stderr.write(`devspec-remote-poll: turn-end completion failed: ${e.message}\n`)
+        }
+      }
+      if (completed) noteTurnEndCompleted(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      else delivered = false
+    }
+    // The same request bookkeeping the stop hook does at a turn's end. The poller has no
+    // list of the host's background work, so a request whose launched work has not woken
+    // the agent yet stays open. A directed question's answer still on its way keeps the
+    // current request open, as at a stop.
+    const capability = readConnectionCapability(connectionId)
+    if (capability) {
+      try {
+        const { failed } = await finishTurnRequests({
+          connectionId,
+          dir: CONNECTIONS_DIR,
+          holdCurrent:
+            turnEndInteractionDecision({
+              continuation: interactionContinuation,
+              wakeFileBytes: wakeFileSizeForConnection(connectionId),
+            }).action === 'hold',
+          call: (args) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'report_request',
+              arguments: args,
+              timeoutMs: 3_000,
+            }),
+        })
+        if (failed.length > 0) delivered = false
+      } catch (e) {
+        delivered = false
+        process.stderr.write(`devspec-remote-poll: turn-end request bookkeeping failed: ${e.message}\n`)
+      }
+    }
+    settleTurnEnd(connectionId, ended.identity, { reported: delivered, dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: delivered ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_end',
+      reason: ended.status,
+    })
+    if (!delivered) return 'retry'
+    turnStartCommands = []
+    clearTurnMarker(connectionId)
+    // The turn is over: never carry the typed turn into the next one.
+    if (localTurn) patchState({ local_turn: null })
+    prevTurnActive = false
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}) per Cursor's transcript connection=${connectionId}\n`,
+    )
+    return 'reported'
+  }
+
+  /**
+   * The notice level, for an error or a stop the poller cannot tie to the tracked
+   * command beyond doubt (transcript-turn-end.mjs): the room is told in Cursor's words in
+   * a message of its own, which answers nothing (turn-failure.mjs postTurnNotice), and
+   * the working attempt is ended without saying which command finished
+   * (turn-commands.mjs attemptEndArguments), so Working clears now instead of lapsing.
+   * No command is answered and no request closed: that is the report level, which the
+   * stop hook adds when it runs, since it knows its turn (the upgrade), without a second
+   * notice.
+   *
+   * Nothing is sent when the stop hook has reported the turn end or is reporting it (the
+   * claim). The attempt is ended only once the room has been told, so Working never
+   * clears without a word, and only while the transcript still ends at this turn end: a
+   * turn Cursor has started since owns Working now. Returns as reportTranscriptTurnEnd.
+   */
+  async function noticeTranscriptTurnEnd(ended, marker, settleWith = { reply: true, requests: [] }) {
+    const claim = claimTurnEnd(connectionId, ended.identity, {
+      by: 'poller',
+      goal: 'notice',
+      after: marker.startedAt,
+      dir: CONNECTIONS_DIR,
+    })
+    if (claim.outcome === 'reported' || claim.outcome === 'noticed') return 'reported_elsewhere'
+    if (claim.outcome === 'reporting') return 'reporting_elsewhere'
+    if (claim.outcome !== 'claimed') return 'retry'
+    return reportHoldingClaim(connectionId, ended.identity, () => noticeClaimedTurnEnd(ended, claim, marker, settleWith), {
+      dir: CONNECTIONS_DIR,
+      onError: (e) => process.stderr.write(`devspec-remote-poll: turn-end report failed part-way: ${e?.message ?? e}\n`),
+    })
+  }
+
+  async function noticeClaimedTurnEnd(ended, claim, marker, settleWith) {
+    clearTrailState(connectionId)
+    let done = true
+    // A stop hook that gave its report back after posting its message told the room already.
+    if (ended.failure && sessionId && !claim.told && !claim.noticed) {
+      try {
+        await postTurnNotice({
+          failure: ended.failure,
+          sessionId,
+          agentName,
+          post: (args) =>
+            mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+        })
+        noteTurnEndNoticed(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+      } catch (e) {
+        done = false
+        process.stderr.write(`devspec-remote-poll: turn notice failed: ${e.message}\n`)
+      }
+    }
+    if (done && !claim.completed && !claim.ended) {
+      // An exact directed-question attempt is the one a generic end must not touch
+      // (interactionActivityPlan).
+      const suppressed =
+        interactionActivityPlan({ verb: 'complete', continuation: interactionContinuation }).kind === 'suppress'
+      // Read again: a newer turn has replaced this end, or the read failed and the step
+      // is tried again later (never taken for a newer turn).
+      const now = suppressed ? null : turnEndIdentity(lapTranscriptPath)
+      if (!suppressed && now === null) {
+        done = false
+        process.stderr.write('devspec-remote-poll: transcript unreadable before ending the working attempt; trying again\n')
+      } else if (!suppressed && now === ended.identity) {
+        try {
+          await mcpToolsCall({
+            mcpUrl,
+            token,
+            name: 'report_complete',
+            arguments: attemptEndArguments({ connectionId, reason: 'turn_end' }),
+            timeoutMs: 10_000,
+          })
+        } catch (e) {
+          done = false
+          process.stderr.write(`devspec-remote-poll: ending the working attempt failed: ${e.message}\n`)
+        }
+      }
+      if (done) noteTurnEndAttemptEnded(connectionId, ended.identity, { dir: CONNECTIONS_DIR })
+    }
+    settleTurnEnd(connectionId, ended.identity, { noticed: done, dir: CONNECTIONS_DIR })
+    logRemoteControlStory({
+      phase: 'complete_turn',
+      outcome: done ? 'completed' : 'failed',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'transcript_turn_notice',
+      reason: ended.status,
+    })
+    if (!done) return 'retry'
+    // Working has cleared. The turn end now settles: the room commands picked up before
+    // it are answered once Cursor has stayed idle for SETTLE_MS, or a turn Cursor starts
+    // from a wake is tracked and decides it (transcript-turn-end.mjs "Settling and watching"). The
+    // commands the turn started with stay on record for that, and for the stop hook's
+    // upgrade, which names them; the backstop does not report them.
+    if (sessionId && ended.failure && ended.position) {
+      startSettle(connectionId, {
+        ended,
+        conversation: transcriptConversation(lapTranscriptPath),
+        turn: marker?.startedAt ?? null,
+        requests: settleWith.requests,
+        reply: settleWith.reply,
+        commands: readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }),
+        dir: CONNECTIONS_DIR,
+      })
+    }
+    turnStartCommands = []
+    clearTurnMarker(connectionId, { keepCommands: true })
+    prevTurnActive = false
+    process.stderr.write(
+      `devspec-remote-poll: turn ended (${ended.status}), told the room and ended the working attempt; not tied to a command connection=${connectionId}\n`,
+    )
+    return 'reported'
+  }
+
+  /**
+   * The settle point of a turn end the poller could only notice (transcript-turn-end.mjs
+   * "Settling and watching"): Cursor has stayed idle at it for SETTLE_MS, or a command was handed over
+   * since. Every room command picked up before it and still unanswered is answered with
+   * what is certain (turn-failure.mjs answerUnsettledCommands) and its request closed;
+   * Working cleared at the notice. Done as the report level of the turn end's claim, so
+   * a stop hook that answered it already, or is answering it, adds nothing here. Returns
+   * true once settled (or answered elsewhere), false to try again later.
+   */
+  async function resolveSettle(settle) {
+    const claim = claimTurnEnd(connectionId, settle.identity, { by: 'poller', goal: 'report', dir: CONNECTIONS_DIR })
+    if (claim.outcome === 'reported') return true
+    if (claim.outcome !== 'claimed') return false
+    const outcome = await reportHoldingClaim(
+      connectionId,
+      settle.identity,
+      async () => {
+        let delivered = true
+        if (!claim.told && sessionId) {
+          try {
+            await answerUnsettledCommands({
+              failure: settle.failure,
+              requestIds: settle.requests ?? [],
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              agentName,
+              post: (args) =>
+                mcpToolsCall({ mcpUrl, token, name: 'post_session_message', arguments: args, timeoutMs: 15_000 }),
+            })
+            noteTurnEndTold(connectionId, settle.identity, { dir: CONNECTIONS_DIR })
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end reply failed: ${e.message}\n`)
+          }
+        }
+        const capability = readConnectionCapability(connectionId)
+        if (delivered && capability) {
+          try {
+            const { failed } = await finishTurnRequests({
+              connectionId,
+              dir: CONNECTIONS_DIR,
+              call: (args) =>
+                mcpToolsCall({
+                  mcpUrl,
+                  token,
+                  connectionCapability: capability,
+                  name: 'report_request',
+                  arguments: args,
+                  timeoutMs: 3_000,
+                }),
+            })
+            if (failed.length > 0) delivered = false
+          } catch (e) {
+            delivered = false
+            process.stderr.write(`devspec-remote-poll: settled turn-end request bookkeeping failed: ${e.message}\n`)
+          }
+        }
+        settleTurnEnd(connectionId, settle.identity, { reported: delivered, dir: CONNECTIONS_DIR })
+        return delivered ? 'reported' : 'retry'
+      },
+      {
+        dir: CONNECTIONS_DIR,
+        onError: (e) => process.stderr.write(`devspec-remote-poll: settling failed part-way: ${e?.message ?? e}\n`),
+      },
+    )
+    if (outcome === 'reported') {
+      process.stderr.write(`devspec-remote-poll: turn end settled; unanswered commands answered connection=${connectionId}\n`)
+    }
+    return outcome === 'reported'
+  }
+
+  /**
+   * One lap's look at a settle under way (transcript-turn-end.mjs settleStep). A
+   * command handed over since (a marker) settles it at once: the commands picked up
+   * before the turn end are answered, and the new command's turn is tracked as any
+   * other.
+   */
+  async function lapSettle(marker, transcriptPath) {
+    const settle = readSettle(connectionId, { dir: CONNECTIONS_DIR })
+    if (!settle) return
+    if (marker) {
+      // A watch only (a typed turn's end) answers nothing: the new command's turn is tracked.
+      if (settle.reply === false || settle.resolved || (await resolveSettle(settle))) clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      return
+    }
+    const step = settleStep(settle, { transcriptPath })
+    if (step.action === 'track') {
+      // Cursor started a turn from a wake since: track it as any command's turn, so
+      // Working shows while it runs and its end is reported (and decides the settle).
+      recordTurnCommands(connectionId, settle.commands ?? [], { dir: CONNECTIONS_DIR })
+      writeTurnMarker(connectionId, { remoteTurn: true, startedAt: step.startedAt, baseline: step.baseline })
+      clearSettle(connectionId, { dir: CONNECTIONS_DIR })
+      process.stderr.write(`devspec-remote-poll: a wake turn started after a noticed turn end; tracking it connection=${connectionId}\n`)
+    } else if (step.action === 'restart') {
+      updateSettle(connectionId, { idle: { ...settle.idle, stamp: step.stamp, since: Date.now() } }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'rebase') {
+      updateSettle(connectionId, { kept: step.kept, keptDigest: step.keptDigest, idle: step.idle }, { dir: CONNECTIONS_DIR })
+    } else if (step.action === 'resolve') {
+      if (await resolveSettle(settle)) updateSettle(connectionId, { resolved: true }, { dir: CONNECTIONS_DIR })
+    }
+  }
+
+  /**
+   * Start each room command this poller hands over, by name (turn-commands.mjs), in
+   * the order delivered, whether it starts a turn or joins one already running. The
+   * ones that start a turn are kept for that turn's end. Best-effort: a pickup that
+   * does not land leaves its command waiting, as it was, until its answer.
+   */
+  async function nameCommandPickups(commands, { startsTurn }) {
+    if (!Array.isArray(commands) || commands.length === 0) return
+    if (startsTurn) {
+      turnStartCommands = [...commands]
+      recordTurnCommands(connectionId, commands, { dir: CONNECTIONS_DIR })
+    }
+    for (const command of commands) {
+      try {
+        await mcpToolsCall({
+          mcpUrl,
+          token,
+          name: 'report_pickup',
+          arguments: pickupArguments(connectionId, command),
+          timeoutMs: 10_000,
+        })
+      } catch (e) {
+        process.stderr.write(
+          `devspec-remote-poll: report_pickup for message ${command.messageId} failed: ${e.message}\n`,
+        )
+      }
     }
   }
 
@@ -1240,6 +2173,21 @@ async function main() {
   let ownerUserId = args.ownerUserId || state?.owner_user_id || null
   let lastTier = null
   let lastBusySent = null
+  // The transcript this poller last read for a turn end (usage-refusal.mjs), so an
+  // unchanged one is not read again every lap.
+  const turnEndMemo = {}
+  // Cursor's transcript, read for the end of the turn this poller tracks when no stop
+  // hook reports it (transcript-turn-end.mjs): what each lap last decided, what the
+  // once-a-second local check last looked at, the transcript this lap resolved (for that
+  // check), and the turn the marker tracked when last seen (for the backstop below).
+  const transcriptTurnEndMemo = {}
+  const turnEndProbeMemo = {}
+  const settleProbeMemo = {}
+  // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
+  // and when the next is due (nextReportTry). Null once due is null: given up.
+  let reportRetry = null
+  let lapTranscriptPath = null
+  let trackedTurnStartedAt = null
   let canonicalCarry = state?.ingress_context_carry || emptyCanonicalContextCarry()
   let activeSessionPlans = state?.active_session_plans || null
   let roomAnnounced = {}
@@ -1280,6 +2228,9 @@ async function main() {
     const negotiatesInteraction = Object.keys(interactionArgs).length > 0
     const ack = negotiatesInteraction ? pendingInteractionAck : null
     const tierState = readState(connectionId)
+    // Cursor stopping this agent for a usage limit, while it stands, or the clear once a
+    // turn has run since (usage-refusal.mjs, `semantics.check_job.usage_refusal`).
+    const usageRefusal = usageRefusalArgument(connectionId, { dir: CONNECTIONS_DIR })
     const response = await mcpToolsCall({
       mcpUrl,
       token,
@@ -1308,6 +2259,10 @@ async function main() {
         ...(checkTier ? { check_tier: checkTier } : {}),
         // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
         ...agentStatsArgs(connectionId),
+        ...usageRefusal,
+        // The project recall DevSpec attaches to a delivered command or automation
+        // run, leaving out what this conversation has already been shown (turn-recall.mjs).
+        ...recallPollArguments(recallConversation(tierState, connectionId)),
       },
       // A held request MUST have a client ceiling — fetch has no default timeout, so
       // a silently-dropped connection would wedge the loop with no heartbeat at all.
@@ -1321,6 +2276,7 @@ async function main() {
     // queued, and a lost ACK is recovered by the ledger path on redelivery — the
     // answer itself is never the thing that gets lost.
     if (ack && pendingInteractionAck === ack) pendingInteractionAck = null
+    noteUsageRefusalSent(connectionId, usageRefusal, { dir: CONNECTIONS_DIR })
     return response
   }
 
@@ -1662,9 +2618,16 @@ async function main() {
     const rows = Object.values(envelope.context).flat()
     const nextCarry = mergeCanonicalContextCarry(canonicalCarry, envelope)
     const ingress = { canonical: true, envelope }
+    const projectIncidents = isProjectIncidentsProjectionV1(res?.project_incidents)
+      ? res.project_incidents
+      : null
     let newlyDelivered = false
     let instructionContextFile = null
     let instructionContextDelivered = false
+    // DevSpec's recall for this delivery's commands and automation runs, or null. It
+    // rides with the first of them kept here, never a notice or a check job
+    // (turn-recall.mjs).
+    let turnRecall = deliverableRecall(res?.turn_recall)
 
     if (accepted.canonicalWake && envelope.wake.kind === 'system_notice') {
       ensureHostWakeFollow(connectionId, ownerAnchor)
@@ -1723,8 +2686,13 @@ async function main() {
         ingress,
         instructionContextFile,
         wakeContext,
+        projectIncidents,
+        turnRecall,
       )
       if (!delivered.ok) return false
+      if (!delivered.duplicate) turnRecall = null
+      // Each command handed over is started by name, mid-turn or not (turn-commands.mjs).
+      if (!delivered.duplicate) await nameCommandPickups(delivered.commands, { startsTurn: delivered.startsTurn })
       if (roomChanges) roomAnnounced = roomChanges.seen
       instructionContextDelivered = Boolean(!delivered.duplicate && instructionContextFile)
       newlyDelivered ||= !delivered.duplicate
@@ -1786,9 +2754,22 @@ async function main() {
       accepted.automations,
       accepted.dispatchCursor,
       sessionId,
+      { projectIncidents, turnRecall },
     )
     if (!automations.ok) return false
     newlyDelivered ||= automations.acceptedCount > 0
+
+    // A check job wakes through the host follow like a notice, so make sure it is
+    // there (a live one is reused) before the job lands in the inbox.
+    if (accepted.checkJobs.length > 0) ensureHostWakeFollow(connectionId, ownerAnchor)
+    const checkJobs = await deliverCheckJobDispatches(
+      connectionId,
+      accepted.checkJobs,
+      accepted.dispatchCursor,
+      sessionId,
+    )
+    if (!checkJobs.ok) return false
+    newlyDelivered ||= checkJobs.acceptedCount > 0
 
     // Commit all independent clocks only after their complete durable acceptance.
     liveCursorV2 = advancedCursors.liveCursorV2
@@ -1818,12 +2799,18 @@ async function main() {
       },
     })
     logRemoteControlStory({
-      phase: accepted.canonicalWake || automations.acceptedCount > 0 ? 'inject' : 'wake',
+      phase: accepted.canonicalWake || automations.acceptedCount > 0 || checkJobs.acceptedCount > 0 ? 'inject' : 'wake',
       outcome: newlyDelivered ? 'delivered' : 'deduped',
       connectionId, sessionId, agent: AGENT_NAME, tool: 'poll_connection',
       reason: accepted.control ? 'control' : accepted.canonicalWake ? 'canonical_conversational_command' :
-        automations.acceptedCount > 0 ? 'automation_dispatch' : envelope.wake.kind,
-      data: { commands: envelope.commands.length, context: rows.length, automations: accepted.automations.length },
+        automations.acceptedCount > 0 ? 'automation_dispatch' :
+        checkJobs.acceptedCount > 0 ? 'check_job' : envelope.wake.kind,
+      data: {
+        commands: envelope.commands.length,
+        context: rows.length,
+        automations: accepted.automations.length,
+        check_jobs: accepted.checkJobs.length,
+      },
     })
     lastIngressAccepted = true
     return newlyDelivered || Boolean(transportProgress)
@@ -1849,12 +2836,106 @@ async function main() {
       state.end_reason !== 'ui',
   )
 
+  function handlePermanentEnd(reason = 'ended_from_ui') {
+    if (shuttingDown) return
+    shuttingDown = true
+    disableLocalState({ connectionId, reason })
+    const disabledState = readState(connectionId) || {
+      ...(readState(connectionId) || state || {}),
+      ...disabledStatePatch(reason),
+    }
+    closeCursorOnEnd({
+      state: disabledState,
+      sawLive,
+      ownerPid: ownerAnchor,
+    })
+    process.stdout.write(
+      JSON.stringify({
+        type: 'session_ended',
+        reason,
+        recoverable: false,
+        connection_id: connectionId,
+        message: 'Remote control was ended. Local poller stopping; do not restart.',
+      }) + '\n',
+    )
+    process.stderr.write(`devspec-remote-poll: ended (${reason}) — disabling and exiting\n`)
+    process.exit(1)
+  }
+
+  const pushGate = createPushGate()
+  if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
+    openPushChannel({
+      mcpUrl,
+      token: () => token,
+      connectionId,
+      connectionCapability: () => readConnectionCapability(connectionId),
+      onEvent: (evt) => {
+        pushGate.onEvent(evt)
+        if (evt.kind === 'ended') {
+          if (evt.endReason && PERMANENT_END_REASONS.includes(evt.endReason)) {
+            handlePermanentEnd(evt.endReason)
+          }
+        }
+      },
+      onDisconnect: () => {
+        pushGate.onDisconnect()
+      },
+      onFallback: (reason) => {
+        pushGate.onDisconnect()
+        process.stderr.write(
+          `devspec-remote-poll: SSE push unavailable (${reason}) — using poll_connection\n`,
+        )
+      },
+    })
+  }
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (!needsSeed && !catchUpCursor && !redrainRequested && !pendingInteractionAck && !pendingControlAck) {
+      await pushGate.waitIfIdle({
+        shouldWakeImmediately: () => {
+          const s = readState(connectionId)
+          if (s && s.enabled === false) return true
+          if (ownerAnchor && !ownerAlive(ownerAnchor)) return true
+          const m = readTurnMarker(connectionId)
+          const liveNow = turnIsLive(m, { activity: readTurnActivity(connectionId, CONNECTIONS_DIR) })
+          if (liveNow !== prevTurnActive) return true
+          // Cursor's transcript now ends in a turn end: the lap decides whether it is the
+          // tracked turn's (transcript-turn-end.mjs).
+          if (
+            m &&
+            turnEndPending({ marker: m, transcriptPath: lapTranscriptPath, connectionId, dir: CONNECTIONS_DIR, memo: turnEndProbeMemo })
+          ) {
+            return true
+          }
+          if (m && reportRetry?.dueAt != null && Date.now() >= reportRetry.dueAt) return true
+          // A noticed turn end settling: its clock ran out, or Cursor wrote since.
+          if (!m && settleDue({ connectionId, transcriptPath: lapTranscriptPath, dir: CONNECTIONS_DIR, memo: settleProbeMemo })) {
+            return true
+          }
+          const nextCont = activeContinuation(s?.interaction_continuation, {
+            connectionId,
+            sessionId,
+          })
+          if (Boolean(nextCont) !== Boolean(interactionContinuation)) return true
+          return false
+        },
+      })
+    }
+
     const liveState = readState(connectionId)
     if (liveState && liveState.enabled === false) {
+      discardConnectionSteps(connectionId)
       process.stderr.write('devspec-remote-poll: disabled — exiting\n')
       process.exit(1)
+    }
+    // This lap's token for the same sign-in (renewed when past half its life). A
+    // sign-in that has ended stands the connection down with a plain message.
+    const lapCredential = connectionCredential(liveState || state)
+    if (lapCredential.ok) token = lapCredential.token
+    else if (SIGNED_OUT_CODES.has(lapCredential.code)) {
+      standDownSignedOut(connectionId, lapCredential.error)
+      return
     }
     // NOTE: local state is read ONLY to observe a local stop (enabled === false).
     // Attachment is NOT adopted from it — the server (now the poll response's
@@ -1891,41 +2972,56 @@ async function main() {
     // Cursor shows (held for this command's own background work, or a tool call /
     // transcript update recently), never a fixed clock from pickup (turn-liveness.mjs).
     let marker = readTurnMarker(connectionId)
-    const erroredEnd = marker
-      ? erroredTurnEnd({
-          transcriptPath: resolveAgentTranscriptPath(liveState?.local_id),
-          startedAt: marker.startedAt,
-        })
-      : null
-    if (erroredEnd) {
-      // Cursor ended the turn itself (usage limit, provider error): no Stop hook ran and
-      // the model cannot reply, so say so in the room and close the working attempt now
-      // rather than after the 1h no-sign-of-life backstop (item 45eb0708).
-      if (sessionId) {
-        try {
-          await mcpToolsCall({
-            mcpUrl,
-            token,
-            name: 'post_session_message',
-            arguments: {
-              connection_id: connectionId,
-              message: erroredTurnNotice(erroredEnd),
-              agent_name: agentName,
-              turn_kind: 'agent',
-              phase: 'answer',
-            },
-            timeoutMs: 10_000,
-          })
-        } catch (e) {
-          process.stderr.write(`devspec-remote-poll: errored-turn notice failed: ${e.message}\n`)
+    const transcriptPath = resolveAgentTranscriptPath(liveState?.local_id)
+    lapTranscriptPath = transcriptPath
+    // How Cursor ended the conversation's last turn, read whether or not a stop hook
+    // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
+    // (usage-refusal.mjs).
+    observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
+    // Cursor ended the tracked turn and no stop hook has reported it: Cursor runs a
+    // plugin's stop hook only when the person has a hooks file of their own
+    // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
+    if (marker) {
+      if (reportRetry && reportRetry.turn !== marker.startedAt) reportRetry = null
+      const retryDue = reportRetry && reportRetry.dueAt !== null && Date.now() >= reportRetry.dueAt
+      // A try that failed is decided afresh when it is due again.
+      if (retryDue) transcriptTurnEndMemo.decided = null
+      const ended =
+        reportRetry && !retryDue
+          ? null
+          : transcriptTurnEnd({
+              connectionId,
+              marker,
+              transcriptPath,
+              dir: CONNECTIONS_DIR,
+              memo: transcriptTurnEndMemo,
+            })
+      if (ended) {
+        const outcome = await reportTranscriptTurnEnd(ended, marker)
+        if (outcome === 'reported') {
+          marker = null
+          reportRetry = null
+        } else if (outcome === 'retry') {
+          const attempts = (reportRetry?.identity === ended.identity ? reportRetry.attempts : 0) + 1
+          reportRetry = { turn: marker.startedAt, identity: ended.identity, attempts, dueAt: nextReportTry(attempts, Date.now()) }
+        } else if (outcome === 'reported_elsewhere') {
+          // The stop hook reported this turn end in full, and ends the turn itself.
+          turnStartCommands = []
+          clearTurnMarker(connectionId)
+          prevTurnActive = false
+          marker = null
+          reportRetry = null
+        } else {
+          // The stop hook is reporting it now: look again next lap. It either settles it
+          // or gives it back, and the marker stays until the report lands.
+          transcriptTurnEndMemo.decided = null
         }
       }
-      await emitActivityVerb('complete', extraActivityVerbArgs({ stalling: true, verb: 'complete' }))
-      clearTurnMarker(connectionId)
-      prevTurnActive = false
-      marker = null
-      process.stderr.write(`devspec-remote-poll: turn ended with a Cursor error connection=${connectionId}\n`)
     }
+    // A turn end the poller could only notice settles (transcript-turn-end.mjs
+    // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
+    await lapSettle(marker, transcriptPath)
+    if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
     let turnActive = turnIsLive(marker, { activity })
@@ -1943,16 +3039,28 @@ async function main() {
       })
     }
 
-    // ADDITIVE (item 71a8b201): emit the connection activity verb DIRECTLY off the
-    // turn-active transition (pickup / keepalive / complete). This is ON TOP of the
-    // busy signal the poll carries — both feed the same server-side activity attempt
-    // idempotently, so leaving the busy path untouched keeps the server's
-    // syncActivityFromBusy translation as the safety net during rollout. One tick =
-    // one keepalive (≈25s while a turn runs, well inside the 5-minute working lease).
-    // Best-effort inside emitActivityVerb — a failed verb never breaks the loop.
-    // Complete always carries a reason: turn_end on a healthy marker clear
+    // Emit the connection activity verb off the turn-active transition (item
+    // 71a8b201), as activityCalls plans it: a turn's start sends nothing of its own
+    // (its room commands were started by name as they were handed over; what the busy
+    // below does is heartbeat_connection's to say), a running turn one keepalive per tick (≈25s, well
+    // inside the 5-minute working lease), and its end a completion naming what it
+    // finished. Best-effort inside emitActivityVerb — a failed verb never breaks the
+    // loop. Complete always carries a reason: turn_end on a healthy marker clear
     // (do not abandon leftover trails), max_turn_ms on stall (do abandon).
-    const activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    let activityVerb = verbForTurnTransition(prevTurnActive, turnActive)
+    // The marker went because the stop hook ended the turn, and the stop hook claimed and
+    // reported that turn's end (transcript-turn-end.mjs): there is nothing to add.
+    if (
+      activityVerb === 'complete' &&
+      !marker &&
+      turnEndClaimed(connectionId, readTurnBaseline(connectionId, trackedTurnStartedAt, { dir: CONNECTIONS_DIR }), {
+        dir: CONNECTIONS_DIR,
+      })
+    ) {
+      turnStartCommands = []
+      clearTurnCommands(connectionId, { dir: CONNECTIONS_DIR })
+      activityVerb = null
+    }
     const verbResult = await emitActivityVerb(activityVerb, extraActivityVerbArgs({ stalling, verb: activityVerb }))
     if (verbResult?.turnStale) {
       turnActive = false
@@ -1987,13 +3095,15 @@ async function main() {
     const drainingCatchUp = Boolean(catchUpCursor)
     const sentControlAck = pendingControlAck
     try {
+      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
       res = await pollOnce({
-        waitMs: tier.waitMs,
+        waitMs: effectiveWaitMs,
         busy: busyArg,
         checkTier: tier.checkTier,
         catchUp: needsSeed || drainingCatchUp,
       })
       consecutiveErrors = 0
+      credentialRefusals = 0
       if (sentControlAck && pendingControlAck === sentControlAck) {
         pendingControlAck = null
         patchState({ pending_control_ack: null })
@@ -2011,6 +3121,21 @@ async function main() {
         await offlineAndExit('owner_gone', 1)
         return
       }
+      // DevSpec refused the credential itself. Once may be a token renewed a moment
+      // ago elsewhere; refused again with this lap's token, the sign-in is over.
+      const refusal = credentialRefusal(e, { mcpUrl, source: credentialSource })
+      if (refusal) {
+        credentialRefusals++
+        if (credentialRefusals >= 2) {
+          await handleCredentialRefusal(e, { mcp_url: mcpUrl, source: credentialSource, principal: credentialPrincipal })
+          standDownSignedOut(connectionId, refusal.message)
+          return
+        }
+        process.stderr.write(`devspec-remote-poll: DevSpec refused the credential (${refusal.code}); trying once more with the current one\n`)
+        await sleep(1_000)
+        continue
+      }
+      credentialRefusals = 0
       if (catchUpCursor && isCatchUpCursorRefusal(e)) {
         process.stderr.write('devspec-remote-poll: server refused the catch-up cursor; re-reading the room\n')
         catchUpCursor = null

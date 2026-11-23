@@ -1,346 +1,205 @@
 #!/usr/bin/env node
 /**
- * Unit tests for the Cursor DevSpec MCP auth resolver.
- * Run: node --test hooks/scripts/resolve-mcp-auth.test.mjs
- *
- * The load-bearing property: the Cursor extension writes the token to Cursor's own
- * MCP config (~/.cursor/mcp.json, or a project .cursor/mcp.json), so that MUST win
- * over a generic project .mcp.json — otherwise the poller heartbeats a different
- * token and the server rejects "connection belongs to a different token".
+ * The credential the background features use (item 95a67ee4): DEVSPEC_MCP_TOKEN for a
+ * machine with no browser, otherwise the plugin's own browser sign-in for the server
+ * its mcp.json names, and nothing else. A connection keeps the identity it connected
+ * with across a browser login's daily token change.
  */
 import assert from 'node:assert/strict'
-import { afterEach, beforeEach, describe, it } from 'node:test'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
-import { resolveDevspecMcpAuth, hostTokenFromEnv, enumerateCredentialPairs, fingerprintToken, buildTokensWarning, noOwningKeyError, proveCredentialPair } from './resolve-mcp-auth.mjs'
+import { beforeEach, describe, it } from 'node:test'
+import { loginPrincipal, loginState, renewLogin, saveLogin } from './auth-store.mjs'
+import { SignInEndedError } from './sign-in.mjs'
+import {
+  connectionCredential,
+  credentialIdentity,
+  credentialRefusal,
+  credentialStateFields,
+  envTokenNotice,
+  envTokenShadowsLogin,
+  handleCredentialRefusal,
+  resolveDevspecMcpAuth,
+} from './resolve-mcp-auth.mjs'
 
-let root
-let fakeHome
-const savedEnv = {}
+const HOUR = 60 * 60 * 1000
+const QUERY = '?tool_namespace=devspec&model_tools=heartbeat_connection,detach_connection'
+const PROD = `https://api.devspec.ai/api/mcp${QUERY}`
+const STAGING = `https://api.devspecstaging.com/api/mcp${QUERY}`
 
+let home
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'cursorres-'))
-  fakeHome = path.join(root, 'home')
-  fs.mkdirSync(fakeHome, { recursive: true })
-  for (const k of ['HOME', 'USERPROFILE', 'DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL']) savedEnv[k] = process.env[k]
-  process.env.HOME = fakeHome
-  process.env.USERPROFILE = fakeHome
-  delete process.env.DEVSPEC_MCP_TOKEN
-  delete process.env.DEVSPEC_TOKEN
-  delete process.env.DEVSPEC_MCP_URL
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-resolve-'))
 })
 
-afterEach(() => {
-  for (const [k, v] of Object.entries(savedEnv)) {
-    if (v === undefined) delete process.env[k]
-    else process.env[k] = v
-  }
-  fs.rmSync(root, { recursive: true, force: true })
-})
+const sha = (value) => createHash('sha256').update(value).digest('hex')
 
-function proj(name) {
-  const d = path.join(root, name)
-  fs.mkdirSync(d, { recursive: true })
-  return d
-}
-function cursorJson(dir, token, url = 'https://api.devspec.ai/api/mcp') {
-  const c = path.join(dir, '.cursor')
-  fs.mkdirSync(c, { recursive: true })
-  fs.writeFileSync(
-    path.join(c, 'mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url, headers: { Authorization: `Bearer ${token}` } } } }),
-  )
-}
-function mcpJson(dir, token, url = 'https://api.devspec.ai/api/mcp') {
-  fs.writeFileSync(
-    path.join(dir, '.mcp.json'),
-    JSON.stringify({ mcpServers: { devspec: { url, headers: { Authorization: `Bearer ${token}` } } } }),
-  )
+function save(mcpUrl, tag, issuedAt = Date.now()) {
+  const parsed = new URL(mcpUrl)
+  return saveLogin({
+    mcpUrl,
+    tokens: { accessToken: `oat_${tag}`, refreshToken: `rt_${tag}`, issuedAt, expiresAt: issuedAt + 24 * HOUR },
+    issuer: 'https://issuer.test',
+    tokenEndpoint: 'https://issuer.test/oauth/token',
+    clientId: 'cursor-client',
+    resource: `${parsed.origin}${parsed.pathname}`,
+    signedInAs: 'Ada Lovelace',
+  }, { home })
 }
 
-function realWorktree() {
-  const main = proj('main')
-  const linked = path.join(root, 'linked')
-  execFileSync('git', ['-C', main, 'init', '-q', '-b', 'main'])
-  execFileSync('git', ['-C', main, 'config', 'user.name', 'Cursor Auth Test'])
-  execFileSync('git', ['-C', main, 'config', 'user.email', 'cursor-auth@example.invalid'])
-  execFileSync('git', ['-C', main, 'commit', '--allow-empty', '-q', '-m', 'initial'])
-  execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'linked', linked])
-  return { main, linked }
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(value))
 }
 
-describe('resolveDevspecMcpAuth (Cursor)', () => {
-  it('prefers .cursor/mcp.json over a generic project .mcp.json (the fix)', () => {
-    const d = proj('both')
-    mcpJson(d, 'dvs_from_mcpjson')
-    cursorJson(d, 'dvs_from_cursor')
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.ok, true)
-    assert.equal(auth.token, 'dvs_from_cursor')
-    assert.match(auth.source, /\.cursor[\\/]mcp\.json$/)
-  })
-
-  it('reads ~/.cursor/mcp.json (home) when the project has none', () => {
-    const d = proj('homeonly')
-    cursorJson(fakeHome, 'dvs_home_cursor')
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.token, 'dvs_home_cursor')
-    assert.equal(hostTokenFromEnv(process.env), null)
-  })
-
-  it('project .cursor/mcp.json wins over home ~/.cursor/mcp.json', () => {
-    const d = proj('projwins')
-    cursorJson(fakeHome, 'dvs_home')
-    cursorJson(d, 'dvs_project')
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.token, 'dvs_project')
-  })
-
-  it('falls back to .mcp.json when no .cursor config token is reachable', () => {
-    const d = proj('mcponly')
-    mcpJson(d, 'dvs_only_mcp')
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.token, 'dvs_only_mcp')
-    assert.match(auth.source, /\.mcp\.json$/)
-  })
-
-  it('DEVSPEC_MCP_TOKEN overrides the config files', () => {
-    const d = proj('envwin')
-    cursorJson(d, 'dvs_cursor')
-    process.env.DEVSPEC_MCP_TOKEN = 'dvs_env_override'
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.token, 'dvs_env_override')
-    assert.equal(auth.source, 'env')
-  })
-
-  it('an explicit opts.hostToken wins over the Cursor config (below env)', () => {
-    const d = proj('hosttok')
-    cursorJson(d, 'dvs_cursor')
-    const auth = resolveDevspecMcpAuth(d, { hostToken: 'dvs_explicit_host' })
-    assert.equal(auth.token, 'dvs_explicit_host')
-    assert.equal(auth.source, 'host')
-    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp', 'host token must not inherit the Cursor MCP URL')
-  })
-
-  it('walks upward to repository-root .cursor/mcp.json from a nested target', () => {
-    const repo = proj('nested')
-    const nested = path.join(repo, 'packages', 'app')
-    fs.mkdirSync(nested, { recursive: true })
-    cursorJson(repo, 'dvs_repo_cursor')
-    assert.equal(resolveDevspecMcpAuth(nested).token, 'dvs_repo_cursor')
-  })
-
-  it('inherits main-worktree Cursor credentials before home credentials', () => {
-    const { main, linked } = realWorktree()
-    cursorJson(main, 'dvs_main_cursor', 'https://staging.example/mcp')
-    cursorJson(fakeHome, 'dvs_home_cursor', 'https://prod.example/mcp')
-    const auth = resolveDevspecMcpAuth(linked, { mainWorktree: main })
-    assert.equal(auth.token, 'dvs_main_cursor')
-    assert.equal(auth.mcp_url, 'https://staging.example/mcp')
-  })
-
-  it('prefers target-worktree project credentials over main-worktree credentials', () => {
-    const { main, linked } = realWorktree()
-    cursorJson(main, 'dvs_main_cursor')
-    cursorJson(linked, 'dvs_linked_cursor')
-    assert.equal(resolveDevspecMcpAuth(linked, { mainWorktree: main }).token, 'dvs_linked_cursor')
-  })
-
-  it('uses main-worktree generic .mcp.json only after Cursor-specific sources', () => {
-    const { main, linked } = realWorktree()
-    mcpJson(main, 'dvs_main_generic', 'https://generic.example/mcp')
-    const auth = resolveDevspecMcpAuth(linked, { mainWorktree: main, env: { HOME: fakeHome } })
-    assert.equal(auth.token, 'dvs_main_generic')
-    assert.equal(auth.mcp_url, 'https://generic.example/mcp')
-  })
-
-  it('honors an injected environment without borrowing ambient credentials', () => {
-    const d = path.join(fakeHome, 'ambient-project')
-    fs.mkdirSync(d, { recursive: true })
-    cursorJson(fakeHome, 'dvs_ambient_home')
-    process.env.DEVSPEC_MCP_TOKEN = 'dvs_ambient'
-    const isolated = resolveDevspecMcpAuth(d, { env: {} })
-    assert.equal(isolated.ok, false)
-    const injected = resolveDevspecMcpAuth(d, {
-      env: { DEVSPEC_MCP_TOKEN: 'dvs_injected', DEVSPEC_MCP_URL: 'https://injected.example/mcp' },
-    })
-    assert.equal(injected.token, 'dvs_injected')
-    assert.equal(injected.mcp_url, 'https://injected.example/mcp')
-    assert.equal(hostTokenFromEnv({ DEVSPEC_MCP_TOKEN: 'dvs_explicit' }), 'dvs_explicit')
-  })
-
-  it('reports a Cursor-shaped error when a URL is present but no token', () => {
-    const d = proj('urlonly')
-    const c = path.join(d, '.cursor')
-    fs.mkdirSync(c, { recursive: true })
-    fs.writeFileSync(
-      path.join(c, 'mcp.json'),
-      JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
-    )
-    // Stop walkMcpJson from climbing into a real ancestor ~/.mcp.json that has a
-    // token (common on developer machines) — project .mcp.json with URL-only wins
-    // the walk without a bearer.
-    fs.writeFileSync(
-      path.join(d, '.mcp.json'),
-      JSON.stringify({ mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp' } } }),
-    )
-    const auth = resolveDevspecMcpAuth(d)
+describe('which credential the background features use', () => {
+  it('with no sign-in, says so plainly and how to sign in, for the production server', () => {
+    const auth = resolveDevspecMcpAuth(home, { env: { HOME: home } })
     assert.equal(auth.ok, false)
-    // The hint must name something that exists. It used to name the VS Code
-    // command "DevSpec: Set MCP token", which was deleted with the IDE half.
-    assert.match(auth.error, /setup-cursor\.mjs/)
-    assert.match(auth.error, /DEVSPEC_MCP_TOKEN/)
+    assert.equal(auth.code, 'sign_in_required')
+    assert.equal(auth.mcp_url, PROD)
+    assert.equal(auth.token, undefined)
+    assert.match(auth.error, /not signed in to DevSpec \(production\)/)
+    assert.match(auth.error, /\/devspec-remote/)
+    assert.match(auth.error, /scripts\/devspec-login\.mjs/)
   })
 
-  it('reads a UTF-8 BOM-prefixed ~/.cursor/mcp.json instead of treating it as missing', () => {
-    const d = proj('bomhome')
-    const cursorDir = path.join(fakeHome, '.cursor')
-    fs.mkdirSync(cursorDir, { recursive: true })
-    const body = JSON.stringify({
-      mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_home' } } },
-    })
-    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), `\uFEFF${body}`)
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.ok, true)
-    assert.equal(auth.token, 'dvs_bom_home')
-    assert.match(auth.source, /\.cursor[\\/]mcp\.json$/)
-  })
-
-  it('reads a UTF-8 BOM-prefixed project .cursor/mcp.json', () => {
-    const d = proj('bomproj')
-    const cursorDir = path.join(d, '.cursor')
-    fs.mkdirSync(cursorDir, { recursive: true })
-    const body = JSON.stringify({
-      mcpServers: { devspec: { url: 'https://api.devspec.ai/api/mcp', headers: { Authorization: 'Bearer dvs_bom_proj' } } },
-    })
-    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body)]))
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.ok, true)
-    assert.equal(auth.token, 'dvs_bom_proj')
-  })
-
-  it('distinguishes an unreadable mcp.json from a missing file', () => {
-    const d = proj('corrupt')
-    const cursorDir = path.join(d, '.cursor')
-    fs.mkdirSync(cursorDir, { recursive: true })
-    fs.writeFileSync(path.join(cursorDir, 'mcp.json'), '{ this is not json')
-    const auth = resolveDevspecMcpAuth(d)
+  it("never reads a token from Cursor's MCP settings or any project MCP file", () => {
+    const entry = { mcpServers: { devspec: { url: PROD, headers: { Authorization: 'Bearer dvs_pasted' } } } }
+    writeJson(path.join(home, '.cursor', 'mcp.json'), entry)
+    const project = path.join(home, 'project')
+    writeJson(path.join(project, '.cursor', 'mcp.json'), entry)
+    writeJson(path.join(project, '.mcp.json'), entry)
+    writeJson(path.join(home, '.devspec', 'auth.json'), { token: 'dvs_shared' })
+    writeJson(path.join(home, '.pi', 'agent', 'devspec', 'auth.json'), { version: 2, logins: {} })
+    const auth = resolveDevspecMcpAuth(project, { env: { HOME: home } })
     assert.equal(auth.ok, false)
-    assert.match(auth.error, /could not parse/i)
-    assert.match(auth.error, /\.cursor[\\/]mcp\.json/)
-    assert.doesNotMatch(auth.error, /this is not json/)
-    assert.doesNotMatch(auth.error, /Bearer /)
+    assert.equal(auth.code, 'sign_in_required')
   })
 
-  it('names the files searched when no token is found', () => {
-    const d = proj('emptysearch')
-    const auth = resolveDevspecMcpAuth(d)
+  it("uses the plugin's own browser sign-in for its server, by a stable identity", async () => {
+    const login = await save(PROD, 'prod')
+    const auth = resolveDevspecMcpAuth(home, { env: { HOME: home } })
+    assert.equal(auth.ok, true)
+    assert.equal(auth.source, 'login')
+    assert.equal(auth.token, 'oat_prod')
+    assert.equal(auth.mcp_url, PROD)
+    assert.equal(auth.principal, loginPrincipal(login))
+    assert.notEqual(auth.principal, sha('oat_prod'))
+    assert.equal(auth.signed_in_as, 'Ada Lovelace')
+  })
+
+  it('DEVSPEC_API_URL picks the staging login, beside production, with no new login to switch back', async () => {
+    await save(PROD, 'prod')
+    await save(STAGING, 'staging')
+    const staging = resolveDevspecMcpAuth(home, { env: { HOME: home, DEVSPEC_API_URL: 'https://api.devspecstaging.com' } })
+    assert.equal(staging.token, 'oat_staging')
+    assert.equal(staging.mcp_url, STAGING)
+    assert.equal(resolveDevspecMcpAuth(home, { env: { HOME: home } }).token, 'oat_prod')
+  })
+
+  it('DEVSPEC_MCP_TOKEN wins for a machine with no browser, keeps its old fingerprint, and is called out', async () => {
+    const env = { HOME: home, DEVSPEC_MCP_TOKEN: ' dvs_ci ', DEVSPEC_MCP_URL: 'https://devspec.example/api/mcp' }
+    assert.equal(envTokenShadowsLogin({ env }), false, 'nothing to call out without a browser login')
+    await save(PROD, 'prod')
+    const auth = resolveDevspecMcpAuth(home, { env })
+    assert.deepEqual(auth, { ok: true, token: 'dvs_ci', mcp_url: 'https://devspec.example/api/mcp', source: 'env', principal: sha('dvs_ci') })
+    assert.equal(envTokenShadowsLogin({ env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_ci' } }), true)
+    const notice = envTokenNotice('linux')
+    assert.match(notice, /DEVSPEC_MCP_TOKEN is set/)
+    assert.match(notice, /ignore your browser sign-in/)
+    assert.match(notice, /unset DEVSPEC_MCP_TOKEN/)
+    assert.match(notice, /restart cursor-agent/)
+  })
+
+  it('a login that has ended is reported with where to reconnect and how to sign in again', async () => {
+    await save(STAGING, 'staging', Date.now() - 13 * HOUR)
+    await renewLogin(STAGING, { home, refresh: async () => { throw new SignInEndedError('ended') } })
+    const auth = resolveDevspecMcpAuth(home, { env: { HOME: home, DEVSPEC_API_URL: 'https://api.devspecstaging.com' } })
     assert.equal(auth.ok, false)
-    assert.match(auth.error, /No DevSpec MCP token found/)
-    assert.match(auth.error, /Searched:/)
-    assert.match(auth.error, /env DEVSPEC_MCP_TOKEN/)
-    assert.match(auth.error, /\.cursor[\\/]mcp\.json/)
-    assert.match(auth.error, /missing/)
-    assert.doesNotMatch(auth.error, /dvs_/)
-    assert.doesNotMatch(auth.error, /Bearer /)
+    assert.equal(auth.code, 'signed_out')
+    assert.match(auth.error, /sign-in for Cursor's background features has ended/)
+    assert.match(auth.error, /https:\/\/app\.devspecstaging\.com\/settings\/agents/)
+    assert.match(auth.error, /--server https:\/\/api\.devspecstaging\.com/)
   })
 })
 
-describe('credential pairs (item 8bb707fd — never cross-wire token and URL)', () => {
-  it('enumerates Cursor MCP config and project .mcp.json as separate pairs', () => {
-    const d = proj('pairs')
-    cursorJson(d, 'dvs_cursor_prod', 'https://api.devspec.ai/api/mcp')
-    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
-    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
-    const cursor = pairs.find((p) => p.sourceLabel === 'Cursor MCP config')
-    const project = pairs.find((p) => p.sourceLabel === 'project .mcp.json')
-    assert.equal(cursor.token, 'dvs_cursor_prod')
-    assert.equal(cursor.mcp_url, 'https://api.devspec.ai/api/mcp')
-    assert.equal(project.token, 'dvs_project_staging')
-    assert.equal(project.mcp_url, 'https://api.devspecstaging.com/api/mcp')
-  })
+describe("a connection's credential", () => {
+  it('takes the login’s current token on every use, and never another login', async () => {
+    const login = await save(PROD, 'first')
+    const auth = resolveDevspecMcpAuth(home, { env: { HOME: home } })
+    const state = { connection_id: 'c', mcp_url: PROD, ...credentialStateFields(auth) }
+    assert.equal(state.token, undefined, 'a browser login’s token is never written into connection state')
+    assert.equal(state.auth_source, 'login')
+    assert.equal(state.principal, loginPrincipal(login))
 
-  it('Cursor token does not inherit the .mcp.json URL', () => {
-    const d = proj('nomix')
-    cursorJson(d, 'dvs_cursor_prod', 'https://api.devspec.ai/api/mcp')
-    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
-    const auth = resolveDevspecMcpAuth(d)
-    assert.equal(auth.token, 'dvs_cursor_prod')
-    assert.equal(auth.mcp_url, 'https://api.devspec.ai/api/mcp')
-  })
-
-  it('warning names both sources with fingerprints and never the raw tokens', () => {
-    const d = proj('warn')
-    cursorJson(d, 'dvs_cursor_prod')
-    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
-    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
-    const warning = buildTokensWarning(pairs, { env: {} })
-    assert.match(warning, /Cursor MCP config/)
-    assert.match(warning, /project \.mcp\.json/)
-    // One key per environment, so each environment's Agent setup page is linked —
-    // never a breadcrumb, never production alone for a staging key.
-    assert.ok(
-      warning.includes(
-        "Open DevSpec's Agent setup page at https://app.devspec.ai/settings/agents or https://app.devspecstaging.com/settings/agents to reveal the key you want",
-      ),
-      warning,
-    )
-    assert.doesNotMatch(warning, /You →|Coding agents/)
-    assert.ok(warning.includes(fingerprintToken('dvs_cursor_prod')))
-    assert.ok(warning.includes(fingerprintToken('dvs_project_staging')))
-    assert.doesNotMatch(warning, /dvs_cursor_prod|dvs_project_staging/)
-  })
-
-  it('links one Agent setup page when every key is on the same environment', () => {
-    const pairs = [
-      { sourceLabel: 'Cursor MCP config', token: 'dvs_a', mcp_url: 'https://api.devspecstaging.com/api/mcp?tool_namespace=devspec' },
-      { sourceLabel: 'project .mcp.json', token: 'dvs_b', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
-    ]
-    const warning = buildTokensWarning(pairs, { env: {} })
-    assert.ok(warning.includes('Agent setup page at https://app.devspecstaging.com/settings/agents to reveal'), warning)
-    assert.doesNotMatch(warning, /app\.devspec\.ai/)
-  })
-
-  it('the no-owning-key error links the Agent setup page of the keys it tried', () => {
-    const staging = [
-      { token: 'dvs_a', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
-      { token: 'dvs_b', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
-    ]
-    assert.equal(
-      noOwningKeyError(staging, { env: {} }),
-      "No reachable DevSpec key owns this connection. Open DevSpec's Agent setup page at https://app.devspecstaging.com/settings/agents and make the Cursor MCP key and the project .mcp.json key the same.",
-    )
-    const mixed = [
-      { token: 'dvs_a', mcp_url: 'https://api.devspec.ai/api/mcp' },
-      { token: 'dvs_b', mcp_url: 'https://api.devspecstaging.com/api/mcp' },
-    ]
-    assert.match(
-      noOwningKeyError(mixed, { env: {} }),
-      /at https:\/\/app\.devspec\.ai\/settings\/agents or https:\/\/app\.devspecstaging\.com\/settings\/agents and make/,
-    )
-  })
-
-  it('falls through a "belongs to a different token" probe to the next pair', async () => {
-    const d = proj('probe')
-    cursorJson(d, 'dvs_cursor_prod')
-    mcpJson(d, 'dvs_project_staging', 'https://api.devspecstaging.com/api/mcp')
-    const { pairs } = enumerateCredentialPairs(d, { env: { HOME: fakeHome, USERPROFILE: fakeHome } })
-    const seen = []
-    const proven = await proveCredentialPair(pairs, {
-      connectionId: 'conn-1',
-      probe: async (pair) => {
-        seen.push(pair.token)
-        if (pair.token === 'dvs_cursor_prod') {
-          throw new Error('This connection belongs to a different token')
-        }
-      },
+    // Thirteen hours on, the token is renewed.
+    const file = path.join(home, '.devspec', 'cursor', 'auth.json')
+    const store = JSON.parse(fs.readFileSync(file, 'utf8'))
+    Object.assign(Object.values(store.logins)[0], {
+      issuedAt: new Date(Date.now() - 13 * HOUR).toISOString(),
+      expiresAt: new Date(Date.now() + 11 * HOUR).toISOString(),
     })
-    assert.deepEqual(seen, ['dvs_cursor_prod', 'dvs_project_staging'])
-    assert.equal(proven.pair.token, 'dvs_project_staging')
-    assert.equal(proven.pair.mcp_url, 'https://api.devspecstaging.com/api/mcp')
-    assert.equal(proven.probed, true)
-    assert.doesNotMatch(proven.warning, /dvs_cursor_prod|dvs_project_staging/)
+    fs.writeFileSync(file, JSON.stringify(store))
+    await renewLogin(PROD, { home, refresh: async () => ({ accessToken: 'oat_second', refreshToken: 'rt_second', issuedAt: Date.now(), expiresAt: Date.now() + 24 * HOUR }) })
+    const renewed = connectionCredential(state, { home })
+    assert.equal(renewed.ok, true)
+    assert.equal(renewed.token, 'oat_second')
+    assert.equal(credentialIdentity(state), `login:${loginPrincipal(login)}`)
+
+    await save(PROD, 'someone-else')
+    const other = connectionCredential(state, { home })
+    assert.equal(other.ok, false)
+    assert.equal(other.code, 'signed_in_again')
+    assert.match(other.error, /Run \/devspec-remote/)
+  })
+
+  it('a connection made with DEVSPEC_MCP_TOKEN keeps that token and its exact binding', () => {
+    const state = { connection_id: 'c', mcp_url: PROD, ...credentialStateFields({ ok: true, token: 'dvs_ci', source: 'env', mcp_url: PROD }) }
+    assert.equal(state.token, 'dvs_ci')
+    assert.equal(connectionCredential(state, { home }).token, 'dvs_ci')
+    assert.equal(credentialIdentity(state), 'dvs_ci')
+  })
+
+  it('a connection whose login was signed out says so', async () => {
+    const login = await save(PROD, 'prod')
+    const state = { connection_id: 'c', mcp_url: PROD, auth_source: 'login', principal: loginPrincipal(login) }
+    fs.rmSync(path.join(home, '.devspec', 'cursor', 'auth.json'))
+    const credential = connectionCredential(state, { home })
+    assert.equal(credential.code, 'signed_out')
+    assert.match(credential.error, /signed out of DevSpec/)
+  })
+})
+
+describe("DevSpec's refusals", () => {
+  const refusal = (status, body, retryable = false) => Object.assign(new Error(`MCP HTTP ${status}`), {
+    status, serverCode: body.code ?? null, retryable, body: JSON.stringify(body),
+  })
+
+  it("a disconnected tool is told in DevSpec's own sentence, then how to sign in again", () => {
+    const said = 'This tool was disconnected from your DevSpec account. You can reconnect it from Agent setup in your DevSpec settings.'
+    const mapped = credentialRefusal(refusal(401, { error: said, code: 'signed_out', retryable: false }), { mcpUrl: PROD })
+    assert.equal(mapped.code, 'signed_out')
+    assert.ok(mapped.message.startsWith(said))
+    assert.match(mapped.message, /To sign in again, run \/devspec-remote/)
+  })
+
+  it('an unknown token is refused plainly, and a passing outage is not a refusal', () => {
+    const invalid = refusal(401, { error: 'Invalid or revoked API token', code: 'invalid_api_token', retryable: false })
+    assert.match(credentialRefusal(invalid, { mcpUrl: PROD }).message, /no longer accepts Cursor's sign-in/)
+    assert.match(credentialRefusal(invalid, { mcpUrl: PROD, source: 'env' }).message, /DEVSPEC_MCP_TOKEN/)
+    assert.equal(credentialRefusal(refusal(503, { code: 'auth_validation_unavailable', retryable: true }, true)), null)
+    assert.equal(credentialRefusal(new Error('fetch failed')), null)
+  })
+
+  it('a refused browser login is ended, so the next sign-in starts afresh', async () => {
+    const login = await save(PROD, 'prod')
+    const auth = { mcp_url: PROD, source: 'login', principal: loginPrincipal(login) }
+    const mapped = await handleCredentialRefusal(refusal(401, { error: 'gone', code: 'signed_out' }), auth, { env: { HOME: home } })
+    assert.equal(mapped.code, 'signed_out')
+    assert.equal(loginState(PROD, { home }).kind, 'ended')
+    assert.equal(resolveDevspecMcpAuth(home, { env: { HOME: home } }).code, 'signed_out')
   })
 })

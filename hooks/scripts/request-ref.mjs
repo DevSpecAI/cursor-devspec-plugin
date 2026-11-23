@@ -13,6 +13,13 @@
  * which it is working on, a write that records who asked is refused, with the
  * requests it could serve and the one command that names one. Never a guess: a
  * write credited to the wrong person is judged by the wrong person's role.
+ *
+ * A write that takes `request_ref` gets the request and nothing beside it. DevSpec
+ * reads a `provenance_ref` before the request and refuses one whose command has
+ * closed, while the request still answers for its work after that; so the command
+ * is stamped only on the few tools that take it and no request (`stampsCommand`),
+ * and only the command of the request the turn serves now, never one remembered
+ * from earlier.
  */
 
 import os from 'node:os'
@@ -48,35 +55,46 @@ export const REQUEST_REF_TOOLS = new Set([
   'import_instruction_rules',
   'link_tasks',
   'manage_goals',
+  'manage_incident',
   'manage_knowledge_links',
   'manage_protected_intent',
   'record_completed_work',
   'record_criterion_verdicts',
+  'record_dependency_review',
   'record_duplicate_nonmatch',
   'record_implementation',
+  'record_inventory_entry',
   'record_memory',
+  'record_requirement',
   'release_work_item',
   'reopen_task',
+  'report_incident',
   'resolve_duplicate',
   'resolve_memory_flag',
   'resolve_resource_flag',
   'resolve_task_flag',
+  'retract_inventory_entry',
   'retract_memory',
+  'retract_requirement',
+  'revise_inventory_entry',
   'spin_off_task',
   'supersede_task',
   'supersede_memory',
+  'supersede_requirement',
   'supersede_resource',
   'unlink_tasks',
   'update_task',
   'update_automation',
   'update_memory',
+  'update_requirement',
   'update_resource',
   'write_project_instruction_rule',
 ])
 
 /**
- * The DevSpec tools that accept `provenance_ref`. Verified against devspecv2 in
- * server-tool-names.test.mjs.
+ * The DevSpec tools that accept `provenance_ref`, checked against a devspecv2
+ * checkout in server-tool-names.test.mjs. Not the tools that get one stamped: see
+ * `stampsCommand`.
  */
 export const PROVENANCE_REF_TOOLS = new Set([
   ...REQUEST_REF_TOOLS,
@@ -88,6 +106,15 @@ export const PROVENANCE_REF_TOOLS = new Set([
 ])
 
 /**
+ * Whether the host adds the command a write serves (`provenance_ref`) to this
+ * tool: only where the server takes the command and has no `request_ref` to name
+ * the request with.
+ */
+export function stampsCommand(toolName) {
+  return PROVENANCE_REF_TOOLS.has(toolName) && !REQUEST_REF_TOOLS.has(toolName)
+}
+
+/**
  * @returns {{ args: object } | { deny: string }} the call's arguments, stamped, or
  *   why it is refused
  */
@@ -96,7 +123,7 @@ export function stampRequest(
   args,
   connectionId,
   agentId = null,
-  { home = os.homedir(), connectionState = null, includeProvenance = false } = {},
+  { home = os.homedir(), includeProvenance = false } = {},
 ) {
   if (!args || typeof args !== 'object') return { args }
   let own = args
@@ -125,15 +152,9 @@ export function stampRequest(
   }
   const ref = requestRefForWrite(state, agent)
   let next = ref && (!includeProvenance || REQUEST_REF_TOOLS.has(toolName)) ? { ...own, request_ref: ref } : own
-  if (includeProvenance && next.provenance_ref === undefined && PROVENANCE_REF_TOOLS.has(toolName)) {
-    const provRef =
-      provenanceRefForWrite(state, agent) ||
-      (typeof connectionState?.provenance_ref === 'string' && connectionState.provenance_ref
-        ? connectionState.provenance_ref
-        : null)
-    if (provRef) {
-      next = { ...next, provenance_ref: provRef }
-    }
+  if (includeProvenance && next.provenance_ref === undefined && stampsCommand(toolName)) {
+    const provRef = provenanceRefForWrite(state, agent)
+    if (provRef) next = { ...next, provenance_ref: provRef }
   }
   return { args: next }
 }

@@ -359,6 +359,20 @@ function withinWindow(row, window) {
 
 export const SYSTEM_NOTICE_VERSION = 1
 export const READABLE_SYSTEM_NOTICE_KINDS = Object.freeze(['unlinked_commit_item_review', 'server_notice'])
+/**
+ * DevSpec's label on a notice (DevSpec item a868f41f; `semantics.notice_audience` in
+ * the served contract). A channel that negotiated system_notice_version 3 receives it
+ * on every kind as `audience`; the notice body's own `version` stays 1.
+ */
+export const NOTICE_AUDIENCES = Object.freeze(['needs_person', 'for_the_record'])
+
+/** The keys a notice may add to its kind's exact shape: `audience`, when present, holds a known label. */
+function noticeAudienceKeys(value) {
+  return Object.hasOwn(value, 'audience') ? ['audience'] : []
+}
+function validNoticeAudience(value) {
+  return !Object.hasOwn(value, 'audience') || NOTICE_AUDIENCES.includes(value.audience)
+}
 const FULL_LOWERCASE_SHA = /^[0-9a-f]{40}$/
 const NOTICE_KIND = /^[a-z][a-z0-9_.-]{0,119}$/
 const UNLINKED_COMMIT_NOTICE_OUTCOMES = [
@@ -404,10 +418,11 @@ export function isSystemNoticeV1(value) {
     const keys = [
       'version', 'kind', 'notice_id', 'commit_sha', 'task_id',
       'task_title', 'branch', ...(Object.hasOwn(value, 'prompt') ? ['prompt'] : []),
-      'contract_uri', 'allowed_outcomes', 'allowed_tools',
+      'contract_uri', 'allowed_outcomes', 'allowed_tools', ...noticeAudienceKeys(value),
     ]
     return (
       exact(value, keys) &&
+      validNoticeAudience(value) &&
       uuid(value.notice_id) &&
       typeof value.commit_sha === 'string' && FULL_LOWERCASE_SHA.test(value.commit_sha) &&
       uuid(value.task_id) &&
@@ -423,7 +438,9 @@ export function isSystemNoticeV1(value) {
       exact(value, [
         'version', 'kind', 'notice_id', 'topic', 'notice_type',
         'summary', 'prompt', 'contract_uri', 'records', 'allowed_outcomes', 'allowed_tools',
+        ...noticeAudienceKeys(value),
       ]) &&
+      validNoticeAudience(value) &&
       uuid(value.notice_id) &&
       text(value.topic) && value.topic.length <= 120 &&
       text(value.notice_type) && value.notice_type.length <= 120 &&
@@ -438,6 +455,14 @@ export function isSystemNoticeV1(value) {
     )
   }
   return false
+}
+
+/**
+ * The notice's label, read as DevSpec reads one it stored without a label: anything
+ * but `for_the_record` needs a person, because an unknown never makes a notice quiet.
+ */
+export function noticeAudience(notice) {
+  return notice?.audience === 'for_the_record' ? 'for_the_record' : 'needs_person'
 }
 
 export function isUnreadableSystemNoticeV1(value) {
@@ -646,6 +671,125 @@ export function isSessionEventsV1(value) {
   }
   if (value.status === 'unchanged' && value.events.length > 0) return false
   return value.revision !== null
+}
+
+const PROJECT_INCIDENTS_PROJECTION_VERSION = 1
+const PROJECT_INCIDENTS_MAX_ACTIVE = 25
+const PROJECT_INCIDENTS_MAX_RECENT_RESOLVED = 10
+const INCIDENT_SHORT_CODE = /^[0-9a-f]{8}$/i
+const INCIDENT_KINDS = new Set([
+  'deploy_failed',
+  'checks_failing',
+  'security_advisory',
+  'unlinked_work',
+  'undo_requested',
+  'followup_failed',
+  'reported',
+])
+const ACTIVE_INCIDENT_STATES = new Set(['open', 'handled', 'awaiting_followup', 'needs_decision'])
+const INCIDENT_HANDLER_KINDS = new Set(['person', 'agent_connection', 'automation_run'])
+
+function incidentHandler(value) {
+  return (
+    exact(value, ['kind', 'label', 'user_id', 'connection_id', 'run_id', 'expires_at']) &&
+    INCIDENT_HANDLER_KINDS.has(value.kind) &&
+    (value.label === null || (text(value.label) && value.label.length <= 240)) &&
+    (value.user_id === null || uuid(value.user_id)) &&
+    (value.connection_id === null || uuid(value.connection_id)) &&
+    (value.run_id === null || uuid(value.run_id)) &&
+    (value.expires_at === null || datetime(value.expires_at))
+  )
+}
+
+function activeIncidentSummary(value) {
+  return (
+    exact(value, [
+      'id',
+      'short_code',
+      'kind',
+      'kind_label',
+      'title',
+      'summary',
+      'state',
+      'since',
+      'last_seen_at',
+      'status_line',
+      'handler',
+      'decision_prompt',
+      'blocked_pull_request_count',
+      'blocked_task_count',
+    ]) &&
+    uuid(value.id) &&
+    typeof value.short_code === 'string' && INCIDENT_SHORT_CODE.test(value.short_code) &&
+    INCIDENT_KINDS.has(value.kind) &&
+    text(value.kind_label) && value.kind_label.length <= 120 &&
+    text(value.title) && value.title.length <= 500 &&
+    (value.summary === null || (text(value.summary) && value.summary.length <= 500)) &&
+    ACTIVE_INCIDENT_STATES.has(value.state) &&
+    datetime(value.since) &&
+    datetime(value.last_seen_at) &&
+    text(value.status_line) && value.status_line.length <= 500 &&
+    (value.handler === null || incidentHandler(value.handler)) &&
+    (value.decision_prompt === null || (text(value.decision_prompt) && value.decision_prompt.length <= 500)) &&
+    integer(value.blocked_pull_request_count) &&
+    integer(value.blocked_task_count)
+  )
+}
+
+function resolvedIncidentSummary(value) {
+  return (
+    exact(value, [
+      'id',
+      'short_code',
+      'kind',
+      'kind_label',
+      'title',
+      'state',
+      'resolved_at',
+      'resolution_kind',
+      'resolution_summary',
+    ]) &&
+    uuid(value.id) &&
+    typeof value.short_code === 'string' && INCIDENT_SHORT_CODE.test(value.short_code) &&
+    INCIDENT_KINDS.has(value.kind) &&
+    text(value.kind_label) && value.kind_label.length <= 120 &&
+    text(value.title) && value.title.length <= 500 &&
+    (value.state === 'cleared' || value.state === 'closed') &&
+    datetime(value.resolved_at) &&
+    (value.resolution_kind === null || (text(value.resolution_kind) && value.resolution_kind.length <= 120)) &&
+    (value.resolution_summary === null || (text(value.resolution_summary) && value.resolution_summary.length <= 500))
+  )
+}
+
+/** Passive project incidents projection carried beside changed poll responses (7115301e). */
+export function isProjectIncidentsProjectionV1(value) {
+  return (
+    exact(value, [
+      'version',
+      'authority',
+      'recent_resolved_window_minutes',
+      'active',
+      'recently_resolved',
+      'truncated',
+      'note',
+    ]) &&
+    value.version === PROJECT_INCIDENTS_PROJECTION_VERSION &&
+    value.authority === 'advisory_read_awareness' &&
+    integer(value.recent_resolved_window_minutes, 1) &&
+    Array.isArray(value.active) &&
+    value.active.length <= PROJECT_INCIDENTS_MAX_ACTIVE &&
+    value.active.every(activeIncidentSummary) &&
+    new Set(value.active.map((row) => row.id)).size === value.active.length &&
+    Array.isArray(value.recently_resolved) &&
+    value.recently_resolved.length <= PROJECT_INCIDENTS_MAX_RECENT_RESOLVED &&
+    value.recently_resolved.every(resolvedIncidentSummary) &&
+    new Set(value.recently_resolved.map((row) => row.id)).size === value.recently_resolved.length &&
+    value.active.length + value.recently_resolved.length >= 1 &&
+    exact(value.truncated, ['active_omitted', 'resolved_omitted']) &&
+    integer(value.truncated.active_omitted) &&
+    integer(value.truncated.resolved_omitted) &&
+    text(value.note) && value.note.length <= 500
+  )
 }
 
 function roomContextCrossCheck(value, allRows) {

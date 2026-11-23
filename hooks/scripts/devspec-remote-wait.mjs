@@ -11,7 +11,8 @@
  *   - Grok Build:  monitor tool on this process stdout → chat notification
  *
  * It wakes only on twice-validated canonical `owner_messages` turns and, on its
- * separate typed path, explicit owner-scoped `automation_dispatch` records. Canonical
+ * separate typed path, explicit owner-scoped `automation_dispatch` records and
+ * `check_job` records (a check DevSpec asks this agent to rule). Canonical
  * commands retain their exact addressee, server-decided owner/delegated authority,
  * and immutable requester provenance. `advisory_context` inbox entries are
  * DELIBERATELY ignored as a WAKE TRIGGER — advisory must never force a model wake or
@@ -38,6 +39,9 @@
  *     Host-owned Connect follow (item 9d89a6d2): never exit 0 on a command; append
  *     each accepted batch to the wake file so a background tail can notify after
  *     Cursor turn_ended. Do not pass --after-reply on follow (would hide mid-turn work).
+ *     A check job or notice that arrives while Cursor is in a turn is held for the
+ *     agent's next step instead, and what did not reach it there goes to the wake file
+ *     once Cursor is between turns (step-delivery.mjs).
  *
  * Exit codes:
  *   0  — one or more new owner_messages batches printed to stdout; agent should act
@@ -53,13 +57,15 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import {
   canonicalAcceptanceKey,
   canonicalAttachmentDescriptor,
+  isProjectIncidentsProjectionV1,
   isSystemNoticeV1,
   isUnreadableSystemNoticeV1,
+  noticeAudience,
   REMOTE_INGRESS_RESOURCE_URI,
   validateCanonicalContextCarry,
   validateRemoteIngressEnvelopeV1,
@@ -67,14 +73,18 @@ import {
 import {
   automationAcceptanceKey,
   automationRunInstruction,
+  checkJobAcceptanceKey,
+  checkJobWakeText,
   validateAutomationDispatch,
+  validateCheckJobDispatch,
 } from './remote-poll-acceptance.mjs'
 import {
   durationMs,
   emitConnectPhase,
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
-import { appendWakeEvents, ensureWakeFile } from './devspec-wake-file.mjs'
+import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
+import { wakesForOneOutput } from './hook-context-budget.mjs'
 import {
   buildInteractionAnswerEvents,
   INTERACTION_ANSWER_RECORD_TYPE,
@@ -87,14 +97,21 @@ import { isDirectRun } from './is-direct-run.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
 import {
   clearTurnWakes,
+  FOR_THE_RECORD_HANDLING,
+  FOR_THE_RECORD_WAKE,
   noticeReplyCall,
   noticeReplyInstruction,
   recordTurnWake,
   turnWakeFromEvents,
 } from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
+import { recallConversation, recallWakeOut, settleRecallHandover } from './turn-recall.mjs'
+import { turnFailureNotice } from './turn-failure.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
+import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
+import { localTurnToComplete } from './local-turn.mjs'
+import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -111,8 +128,10 @@ const MAX_WAIT_MS = 24 * 60 * 60 * 1000
 
 /**
  * Remove the connection turn marker, so the continuous poller stops re-asserting
- * busy. Pair with `notifyWorkingEnded` so Working/dots clear immediately — the
- * poller's own `report_complete` only runs on its next long-poll tick (~25–30s).
+ * busy, with the record of the room commands that started the turn
+ * (turn-commands.mjs). Pair with `notifyWorkingEnded` so Working/dots clear
+ * immediately — the poller's own `report_complete` only runs on its next long-poll
+ * tick (~25–30s).
  */
 export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   if (!connectionId) return
@@ -126,6 +145,7 @@ export function clearTurnMarker(connectionId, dir = CONNECTIONS_DIR) {
   } catch {
     /* ignore */
   }
+  clearTurnCommands(connectionId, { dir })
 }
 
 /**
@@ -172,20 +192,29 @@ export function applyArmTurnSemantics(connectionId, args, dir = CONNECTIONS_DIR)
  * never fires Stop for remote turns, so `--after-reply` must do this itself
  * (item cd989606). Idempotent if Stop already completed the attempt.
  *
- * @param {{ connectionId: string, state?: object|null, call?: typeof mcpToolsCall, resolveAuth?: typeof resolveDevspecMcpAuth }} opts
+ * Like Stop, it names what the turn finishes (turn-commands.mjs): `commands`, the room
+ * commands that started the turn, and the terminal turn the owner typed, or, with
+ * neither, says the turn is unbound.
+ *
+ * @param {{ connectionId: string, state?: object|null, commands?: { turnId: string, messageId: string }[], call?: typeof mcpToolsCall, resolveAuth?: typeof resolveDevspecMcpAuth }} opts
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function notifyWorkingEnded({
   connectionId,
   state = null,
+  commands = [],
   call = mcpToolsCall,
   resolveAuth = resolveDevspecMcpAuth,
 } = {}) {
   if (!connectionId) return { ok: false, reason: 'missing_connection_id' }
 
-  let token = state?.token || null
+  let token = null
   let mcpUrl = state?.mcp_url || null
-  if (!token) {
+  if (state && (state.auth_source === 'login' || state.token || state.mcp_token)) {
+    const credential = connectionCredential(state)
+    token = credential.ok ? credential.token : null
+    mcpUrl = credential.mcp_url || mcpUrl
+  } else {
     try {
       const auth = resolveAuth(state?.cwd || process.cwd())
       token = auth?.token || null
@@ -195,7 +224,6 @@ export async function notifyWorkingEnded({
     }
   }
   if (!token) return { ok: false, reason: 'no_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
 
   try {
     await call({
@@ -214,21 +242,21 @@ export async function notifyWorkingEnded({
     /* non-fatal — report_complete is the durable clear */
   }
 
-  try {
-    await call({
-      mcpUrl,
-      token,
-      name: 'report_complete',
-      arguments: { connection_id: connectionId, reason: 'turn_end' },
-      timeoutMs: 15_000,
-    })
-    return { ok: true }
-  } catch (e) {
-    return {
-      ok: false,
-      reason: e instanceof Error ? e.message : String(e),
+  const calls = completionArguments({
+    connectionId,
+    commands,
+    localAttemptId: localTurnToComplete(state?.local_turn, state?.session_id ?? null),
+    reason: 'turn_end',
+  })
+  let failure = null
+  for (const args of calls) {
+    try {
+      await call({ mcpUrl, token, name: 'report_complete', arguments: args, timeoutMs: 15_000 })
+    } catch (e) {
+      failure ??= e instanceof Error ? e.message : String(e)
     }
   }
+  return failure ? { ok: false, reason: failure } : { ok: true }
 }
 
 function parseArgs(argv) {
@@ -627,6 +655,23 @@ async function emitEnded(event, wakeFile) {
   if (wakeFile) appendWakeEvents(wakeFile, [event])
 }
 
+/**
+ * The poller stood the connection down because its DevSpec sign-in is over. Wake the
+ * agent with the plain sentence it left, so the person hears it and how to sign in
+ * again, rather than the connection just going quiet (item 95a67ee4).
+ */
+async function emitSignedOut(state, connectionId, wakeFile) {
+  await emitEnded({
+    type: 'session_ended',
+    reason: 'signed_out',
+    recoverable: false,
+    connection_id: connectionId,
+    message: typeof state.end_message === 'string' && state.end_message
+      ? state.end_message
+      : 'Remote control stopped because Cursor\'s DevSpec sign-in has ended. Run /devspec-remote to sign in again.',
+  }, wakeFile)
+}
+
 function fileSize(p) {
   try {
     return fs.statSync(p).size
@@ -746,7 +791,7 @@ export function offsetAfterAdvisoryHistory(text) {
     if (parsed?.type === QUESTION_DISMISSAL_RECORD_TYPE) return Buffer.byteLength(src.slice(0, searchFrom), 'utf8')
     const canonicalWake = parseWakeBatches([line], {
       canonicalOnly: true,
-      includeAutomations: true,
+      includeDispatches: true,
     }).length > 0
     if (canonicalWake || (
       parsed?.type === 'owner_messages' &&
@@ -842,7 +887,7 @@ export function readNewLines(file, offset) {
 export function consumeInboxSlice(
   file,
   offset,
-  { canonicalOnly = false, includeAutomations = false, oneCommandTurn = false, connectionId = null } = {},
+  { canonicalOnly = false, includeDispatches = false, oneCommandTurn = false, connectionId = null } = {},
 ) {
   if (!oneCommandTurn) {
     const { lines, newOffset } = readNewLines(file, offset)
@@ -850,7 +895,7 @@ export function consumeInboxSlice(
       lines,
       newOffset,
       batches: lines.length > 0
-        ? parseWakeBatches(lines, { canonicalOnly, includeAutomations, connectionId })
+        ? parseWakeBatches(lines, { canonicalOnly, includeDispatches, connectionId })
         : [],
       evidence: createInboxCursorEvidence(file, newOffset),
     }
@@ -882,7 +927,7 @@ export function consumeInboxSlice(
       const line = segment.slice(0, -1)
       if (!line.trim()) continue
       lines.push(line)
-      const found = parseWakeBatches([line], { canonicalOnly, includeAutomations, connectionId })
+      const found = parseWakeBatches([line], { canonicalOnly, includeDispatches, connectionId })
       if (found.length > 0) {
         batches = found
         break
@@ -904,7 +949,13 @@ export function consumeInboxSlice(
   }
 }
 
-const ROOM_STATE_SECTIONS = new Set(['session_polls', 'still_to_discuss', 'active_session_plans', 'session_activity'])
+const ROOM_STATE_SECTIONS = new Set([
+  'session_polls',
+  'still_to_discuss',
+  'active_session_plans',
+  'project_incidents',
+  'session_activity',
+])
 
 function validWakeContext(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -954,17 +1005,24 @@ function isCanonicalSystemNoticeBatch(obj, connectionId = null) {
   return true
 }
 
-function isAutomationBatch(obj) {
-  if (obj?.type !== 'automation_dispatches' || !Array.isArray(obj.messages) ||
+/** The two dispatch records the poller keeps, each revalidated against its own exact shape. */
+const DISPATCH_RECORDS = {
+  automation_dispatches: { validate: validateAutomationDispatch, key: automationAcceptanceKey },
+  check_job_dispatches: { validate: validateCheckJobDispatch, key: checkJobAcceptanceKey },
+}
+
+function isDispatchBatch(obj) {
+  const record = Object.hasOwn(DISPATCH_RECORDS, obj?.type) ? DISPATCH_RECORDS[obj.type] : null
+  if (!record || !Array.isArray(obj.messages) ||
       obj.messages.length !== 1 || typeof obj.acceptance_key !== 'string') return false
   const dispatch = obj.messages[0]
-  return validateAutomationDispatch(dispatch, obj.connection_id) === null &&
-    automationAcceptanceKey(dispatch) === obj.acceptance_key
+  return record.validate(dispatch, obj.connection_id) === null &&
+    record.key(dispatch) === obj.acceptance_key
 }
 
 export function parseWakeBatches(
   lines,
-  { canonicalOnly = false, includeAutomations = false, connectionId = null } = {},
+  { canonicalOnly = false, includeDispatches = false, connectionId = null } = {},
 ) {
   const batches = []
   for (const line of lines) {
@@ -978,15 +1036,21 @@ export function parseWakeBatches(
         continue
       }
       if (isCanonicalOwnerBatch(obj) || isCanonicalSystemNoticeBatch(obj, connectionId)) {
+        const { project_incidents: rawIncidents, ...rest } = obj
         batches.push({
-          ...obj,
+          ...rest,
           ...(obj.wake_context !== undefined ? { wake_context: validWakeContext(obj.wake_context) } : {}),
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
         })
       } else if (
-        (includeAutomations && isAutomationBatch(obj)) ||
+        (includeDispatches && isDispatchBatch(obj)) ||
         (!canonicalOnly && obj?.type === 'owner_messages' && Array.isArray(obj.messages) && obj.messages.length > 0)
       ) {
-        batches.push(obj)
+        const { project_incidents: rawIncidents, ...rest } = obj
+        batches.push({
+          ...rest,
+          ...(isProjectIncidentsProjectionV1(rawIncidents) ? { project_incidents: rawIncidents } : {}),
+        })
       }
     } catch {
       /* skip garbage */
@@ -996,35 +1060,45 @@ export function parseWakeBatches(
 }
 
 export function parseOwnerBatches(lines, { canonicalOnly = false } = {}) {
-  return parseWakeBatches(lines, { canonicalOnly, includeAutomations: false })
+  return parseWakeBatches(lines, { canonicalOnly, includeDispatches: false })
 }
 
 /**
- * How every readable notice is handled, carried with the notice itself so it
- * costs nothing until one arrives (item 984ca8b4). A notice is about the agent's
- * own work: a finding on it, or what happened to a change that waited on
- * someone. The agent tells its person; it never answers for one.
+ * How a readable notice that needs a person is handled, carried with the notice
+ * itself so it costs nothing until one arrives (item 984ca8b4). A notice is about
+ * the agent's own work: a finding on it, or what happened to a change that waited on
+ * someone. The agent tells its person; it never answers for one. A notice DevSpec
+ * labels for the record carries `FOR_THE_RECORD_HANDLING` instead (notice-reply.mjs).
  */
 export const NOTICE_HANDLING =
   'Handling: the labelled records above are your reading context — never dump their full text into the conversation. ' +
-  'Act only within the allowed outcomes and tools, based on who asked for the work (remember a teammate can drive someone else\'s agent, so the requester\'s authority is what counts), their authority, and whether this finding is already understood or new information: ' +
-  '(1) If it is a descriptive staleness flag and the change the requester asked for clearly makes that detail out of date, update or retire it straight away without asking permission and mention what you updated in one brief sentence (or say it was queued if their role queues a proposal); ask only if the right change is unclear or surfaces something new. ' +
-  '(2) If it is a decision conflict or duplicate and the requester has authority to settle it and has already clearly asked to proceed despite the earlier record, act for them straight away without a redundant confirmation and confirm briefly in context. ' +
-  '(3) If the finding brings new information or a consequence the requester did not appear aware of, or if the requester does not have authority to settle it themselves, explain what clashes and why in plain words in context (plus who it waits on when they cannot give the OK) and recommend the practical options. ' +
-  'Telling the person about the notice in the room is the notice reply below, never an answer to a command.'
+  'Act within the allowed outcomes and tools above, for the person who asked for the work and with their authority (authority_contract.requester_rule and authority_contract.acting_rule in devspec://product/implementation-contract). ' +
+  'What settles a clash with a decision, convention or requirement, or a duplicate, and whose OK it otherwise waits for, is the served contract\'s to say, not yours (authority_contract.reversal_rule, core.waiting-work-stays-on-its-branch and core.resolve-duplicates-on-the-spot): follow what each write returns, and when an answer is refused, the refusal says what to do instead. ' +
+  'Whether you settle it quietly or your person still needs to hear from you is semantics.notice_audience and semantics.notice_reply in devspec://product/remote-ingress-contract.'
 
 /**
- * The model-readable rendering of one notice. Every kind ends with the exact notice
- * reply for its own id (notice-reply.mjs): telling the person about a notice in the
- * room is a reply to that notice, never an answer to a command.
+ * The model-readable rendering of one notice. A notice DevSpec labels as needing a
+ * person ends with the exact notice reply for its own id (notice-reply.mjs): telling
+ * the person about a notice in the room is a reply to that notice, never an answer to
+ * a command. One labelled for the record ends with no reply at all
+ * (`FOR_THE_RECORD_HANDLING`): the label is DevSpec's, never the plugin's guess
+ * (`semantics.notice_audience`), and a notice with no label needs a person.
  */
 export function formatSystemNoticeContent(notice, { connectionId = null } = {}) {
-  const reply = noticeReplyInstruction([notice?.notice_id], { connectionId })
+  const forTheRecord = noticeAudience(notice) === 'for_the_record'
+  const reply = forTheRecord
+    ? FOR_THE_RECORD_HANDLING
+    : noticeReplyInstruction([notice?.notice_id], { connectionId })
+  // The rest of the handling (how to act, and when to tell the person) is for a
+  // notice that needs a person; one for the record is housekeeping, done quietly.
+  const handling = forTheRecord ? [] : [NOTICE_HANDLING]
   if (isUnreadableSystemNoticeV1(notice)) {
     return [
       '[DevSpec System Notice: not readable by this plugin version]',
       `DevSpec sent a notice of a kind this version of the DevSpec plugin cannot read (kind ${notice.kind}, notice ${notice.notice_id}). It may be a finding or an outcome about your own work.`,
-      'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
+      forTheRecord
+        ? 'It is on the record and in the project\'s Review. Do not act on it.'
+        : 'Tell the person plainly that DevSpec sent something this plugin cannot show yet: it is on the record and in the project\'s Review, and updating the DevSpec plugin will show notices like it here. Do not act on it.',
       reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice, not a room message or new work authorization.',
@@ -1054,7 +1128,7 @@ export function formatSystemNoticeContent(notice, { connectionId = null } = {}) 
     }
     lines.push(
       '',
-      NOTICE_HANDLING,
+      ...handling,
       reply,
       'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
         'This is a server-initiated notice on your own work, not a room message or new work authorization.',
@@ -1069,7 +1143,7 @@ export function formatSystemNoticeContent(notice, { connectionId = null } = {}) 
     ...(notice?.prompt ? [`Prompt: ${notice.prompt}`] : []),
     `Allowed outcomes: ${Array.isArray(notice?.allowed_outcomes) ? notice.allowed_outcomes.join(', ') : ''}`,
     `Allowed tools: ${Array.isArray(notice?.allowed_tools) ? notice.allowed_tools.join(', ') : ''}`,
-    NOTICE_HANDLING,
+    ...handling,
     reply,
     'Authority: exact_connection_system_notice (devspec://product/remote-ingress-contract). ' +
       'This is a narrow server review prompt for your own claimed item and commit — not a room command or new work authorization.',
@@ -1092,15 +1166,21 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
   const pointers = batch?.wake_context ?? null
   const events = []
 
-  // Each notice names the exact reply to it near the start of its line, ahead of the
-  // records, so a cut-short preview still shows it (notice-reply.mjs).
+  // Each notice names DevSpec's label and, when it needs a person, the exact reply to
+  // it near the start of its line, ahead of the records, so a cut-short preview still
+  // shows them (notice-reply.mjs). A notice for the record carries no reply.
+  const replyTo = (notice) =>
+    noticeAudience(notice) === 'for_the_record'
+      ? {}
+      : { notice_reply: noticeReplyCall([notice.notice_id], { connectionId }) }
   for (const notice of notices) {
     if (isUnreadableSystemNoticeV1(notice)) {
       events.push({
         type: 'system_notice',
         kind: notice.kind,
         notice_id: notice.notice_id,
-        notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
+        audience: noticeAudience(notice),
+        ...replyTo(notice),
         readable: false,
         content: formatSystemNoticeContent(notice, { connectionId }),
         session_id: sessionId,
@@ -1117,7 +1197,8 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
       type: 'system_notice',
       kind: notice.kind,
       notice_id: notice.notice_id,
-      notice_reply: noticeReplyCall([notice.notice_id], { connectionId }),
+      audience: noticeAudience(notice),
+      ...replyTo(notice),
       ...(notice.kind === 'server_notice'
         ? {
             topic: notice.topic,
@@ -1148,6 +1229,12 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     })
   }
 
+  const forTheRecordIds = notices
+    .filter((notice) => noticeAudience(notice) === 'for_the_record')
+    .map((notice) => notice.notice_id)
+  const needsPersonIds = notices
+    .filter((notice) => noticeAudience(notice) !== 'for_the_record')
+    .map((notice) => notice.notice_id)
   events.push({
     type: 'wake',
     reason: 'exact_connection_system_notice',
@@ -1158,8 +1245,11 @@ export function buildCanonicalSystemNoticeEvents(batch, { inboxFile } = {}) {
     count: notices.length,
     envelope_id: ingress?.envelope_id ?? null,
     system_notice_ids: notices.map((notice) => notice.notice_id),
-    // One reply can answer every notice this wake handed over, and no others.
-    notice_reply: noticeReplyInstruction(notices.map((notice) => notice.notice_id), { connectionId }),
+    ...(forTheRecordIds.length > 0 ? { for_the_record_notice_ids: forTheRecordIds } : {}),
+    // One reply can answer every notice of this wake that needs a person, and no others.
+    notice_reply: needsPersonIds.length > 0
+      ? noticeReplyInstruction(needsPersonIds, { connectionId })
+      : FOR_THE_RECORD_WAKE,
     inbox: inboxFile ?? null,
     authoritative: false,
     executable: false,
@@ -1310,6 +1400,30 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   }
   const sessionId = batch?.session_id ?? null
   const messages = Array.isArray(batch?.messages) ? batch.messages : []
+  if (batch?.type === 'check_job_dispatches') {
+    const job = messages[0]
+    return [
+      {
+        type: 'check_job',
+        check_job_id: job.check_job_id,
+        session_id: sessionId,
+        check_job: job,
+        instruction: checkJobWakeText(job),
+        note: 'A check DevSpec asks you to rule; not a conversation command, task assignment or automation run.',
+      },
+      {
+        type: 'wake',
+        reason: 'check_job',
+        check_job_id: job.check_job_id,
+        session_id: sessionId,
+        count: 1,
+        dispatch_cursor: batch?.next_after_message_id ?? null,
+        inbox: inboxFile ?? null,
+        continuous_poller: true,
+        rearm: 'devspec-remote-wait',
+      },
+    ]
+  }
   if (batch?.type === 'automation_dispatches') {
     const dispatch = messages[0]
     return [
@@ -1320,6 +1434,17 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
         instruction: automationRunInstruction(dispatch),
         note: 'Explicit automation dispatch; not a canonical conversation command or task assignment.',
       },
+      ...(isProjectIncidentsProjectionV1(batch?.project_incidents)
+        ? [
+            {
+              type: 'project_incidents',
+              session_id: sessionId,
+              advisory: true,
+              executable: false,
+              ...batch.project_incidents,
+            },
+          ]
+        : []),
       {
         type: 'wake',
         reason: 'automation_dispatch',
@@ -1423,6 +1548,16 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
     })
   }
 
+  if (canonical && messages.length > 0 && isProjectIncidentsProjectionV1(batch?.project_incidents)) {
+    events.push({
+      type: 'project_incidents',
+      session_id: sessionId,
+      advisory: true,
+      executable: false,
+      ...batch.project_incidents,
+    })
+  }
+
   events.push({
     type: 'wake',
     reason: canonical ? 'canonical_conversational_command' : 'owner_message',
@@ -1449,6 +1584,95 @@ export function buildOwnerMessageEvents(batch, { inboxFile, attachmentDir, write
   return events
 }
 
+/** The command a held wake carries, as the room knows it: its acceptance key, else its first message's id. */
+function heldWakeKey(batch) {
+  if (typeof batch?.acceptance_key === 'string' && batch.acceptance_key) return batch.acceptance_key
+  const first = Array.isArray(batch?.messages) ? batch.messages[0] : null
+  return String(first?.message_id ?? first?.id ?? first?.run_id ?? first?.check_job_id ?? '')
+}
+
+/**
+ * What the room is told when a command cannot reach the agent yet: what is happening,
+ * what usually causes it and what the person can check, and that nothing is lost. The
+ * system's own error (which names private paths on that computer) stays in the wait's
+ * log, where the holding loop writes it every try; the room never gets it.
+ */
+export function wakeHeldMessage(agentName) {
+  return (
+    `${agentName} hasn't received a message from this room yet: it couldn't save the message on the computer it runs on. ` +
+    `That usually means the computer's disk is full, or its DevSpec folder can't be written to. ` +
+    `${agentName} keeps trying and gets the message as soon as it can save it. Nothing is lost.`
+  )
+}
+
+/**
+ * Tell the room, once per command (`told`), that the wake carrying it is held because
+ * its note could not be written, through the plugin's room notice (`turnFailureNotice`,
+ * turn-failure.mjs: by `session_id`, tied to no turn). A connection with no room has
+ * no one to tell; the wait's log has it. A post that fails is tried again next lap.
+ */
+export async function tellRoomWakeHeld({ connectionId, batch, state, told, call = mcpToolsCall }) {
+  const key = heldWakeKey(batch)
+  if (!key || told.has(key)) return false
+  const sessionId = batch?.session_id ?? state?.session_id ?? null
+  if (!sessionId) {
+    told.add(key)
+    return false
+  }
+  const credential = state ? connectionCredential(state) : { ok: false }
+  if (!credential.ok || !credential.token) return false
+  const agentName = state?.agent_name || AGENT_NAME
+  try {
+    await call({
+      mcpUrl: credential.mcp_url || state?.mcp_url,
+      token: credential.token,
+      name: 'post_session_message',
+      arguments: turnFailureNotice({ sessionId, agentName, message: wakeHeldMessage(agentName) }),
+      timeoutMs: 15_000,
+    })
+  } catch (e) {
+    process.stderr.write(`devspec-remote-wait: could not tell the room a wake is held: ${e instanceof Error ? e.message : String(e)}\n`)
+    return false
+  }
+  told.add(key)
+  return true
+}
+
+/**
+ * Whether the connection has ended, read afresh from its state: disabled, ended from
+ * DevSpec, or its state gone, as the wait's own exit checks read an end.
+ */
+function connectionEnded(connectionId) {
+  const state = readState(connectionId)
+  return !state || state.enabled === false || state.ended_from_ui === true || state.end_reason === 'ui'
+}
+
+/**
+ * The wakes of this delivery an earlier one-shot run built and left to print, exactly as
+ * it built them, when the inbox cursor still stands at it; null otherwise. A delivery's
+ * wakes are frozen the first time they are built, so a later run prints them as they
+ * were and never rebuilds them from context that may have changed since (room unread,
+ * room state), which could merge or reshape them.
+ */
+function frozenWakesOf(state, offset, batch) {
+  const progress = state?.wake_batch_progress
+  if (!progress || progress.offset !== offset || progress.key !== heldWakeKey(batch)) return null
+  const wakes = Array.isArray(progress.wakes) ? progress.wakes.filter((wake) => Array.isArray(wake) && wake.length > 0) : []
+  return wakes.length > 0 ? wakes : null
+}
+
+/**
+ * Print `wakes` as one Shell result (a one-shot run): whole wakes while they fit one
+ * output together, and a line saying how many wait (`wakesForOneOutput`,
+ * hook-context-budget.mjs, the same sizing the wake file's reader uses). Returns how many
+ * were printed.
+ */
+async function printOneShot(wakes) {
+  const { count, text } = wakesForOneOutput(wakes.map(wakeLines), { waiting: (left) => wakeLines([wakesWaitingEvent(left)]) })
+  await new Promise((resolve, reject) => process.stdout.write(text, (error) => (error ? reject(error) : resolve())))
+  return count
+}
+
 async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
@@ -1469,6 +1693,7 @@ async function main() {
 
   const state = readState(connectionId)
   if (state && state.enabled === false) {
+    if (state.end_reason === 'signed_out') await emitSignedOut(state, connectionId, args.wakeFile)
     process.stderr.write('devspec-remote-wait: remote control disabled\n')
     process.exit(1)
   }
@@ -1500,8 +1725,11 @@ async function main() {
   // ends Working; plain --pending keeps the turn marker (see armEndsTurn).
   // Marker clear + immediate report_complete (mirror-turn stop parity) — do not
   // wait for the poller's next long-poll tick or dots linger ~30s (cd989606).
+  // The room commands that started the turn this arm ends, read before it removes
+  // the record of them (turn-commands.mjs).
+  const endedTurnCommands = armEndsTurn(args) ? readTurnCommands(connectionId, { dir: CONNECTIONS_DIR }) : []
   if (applyArmTurnSemantics(connectionId, args)) {
-    const ended = await notifyWorkingEnded({ connectionId, state })
+    const ended = await notifyWorkingEnded({ connectionId, state, commands: endedTurnCommands })
     if (!ended.ok && ended.reason && ended.reason !== 'no_token') {
       process.stderr.write(
         `devspec-remote-wait: notifyWorkingEnded soft-fail: ${ended.reason}\n`,
@@ -1531,15 +1759,30 @@ async function main() {
     })
   }
 
+  // Room commands the room has already been told cannot reach the agent yet
+  // (`tellRoomWakeHeld`), so it is told once per command, not every lap.
+  const heldTold = new Set()
   let sawLive = Boolean(
     state &&
       state.enabled !== false &&
       state.ended_from_ui !== true &&
       state.end_reason !== 'ui',
   )
+  // The connection has ended: its local copies of what it held for the agent's next
+  // step are discarded and named (step-delivery.mjs `discardSteps`). Whoever ended it
+  // did so already; this covers a batch this follow held as the end landed.
+  const discardOnEnd = () => {
+    if (!args.follow) return
+    try {
+      logDiscarded('devspec-remote-wait', connectionId, discardSteps(connectionId, { dir: CONNECTIONS_DIR }))
+    } catch (e) {
+      process.stderr.write(`devspec-remote-wait: could not discard what waited for a step: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
+  }
   while (args.follow || Date.now() - started < MAX_WAIT_MS) {
     const live = readState(connectionId)
     if (live?.end_reason === 'ui' || live?.ended_from_ui) {
+      discardOnEnd()
       closeCursorOnEnd({
         state: live,
         sawLive,
@@ -1552,10 +1795,13 @@ async function main() {
       process.exit(1)
     }
     if (live && live.enabled === false) {
+      discardOnEnd()
+      if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
     if (ownerAnchor && !ownerAlive(ownerAnchor)) {
+      discardOnEnd()
       await emitEnded(
         { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
         args.wakeFile,
@@ -1564,6 +1810,23 @@ async function main() {
       process.exit(1)
     }
     if (live) sawLive = true
+
+    // Cursor is between turns: what waited for the agent's next step and did not reach
+    // it (held, or handed over and not read whole) goes to the wake file now, so Cursor
+    // wakes the agent with it as before (step-delivery.mjs).
+    if (args.follow && args.wakeFile) {
+      try {
+        const released = await releaseAtIdle(connectionId, { dir: CONNECTIONS_DIR, state: live, wakeFile: args.wakeFile })
+        if (released) {
+          process.stderr.write(
+            `devspec-remote-wait: at idle, ${released.pointed.length} held for a step in a note the wake points at, ` +
+              `${released.dropped.length} settled dropped — follow\n`,
+          )
+        }
+      } catch (e) {
+        process.stderr.write(`devspec-remote-wait: release at idle failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
 
     // Rotation or truncate/regrow may happen while this one-shot wait is armed.
     // Rebind before reading so a stale byte count never starts inside a new record.
@@ -1589,7 +1852,7 @@ async function main() {
 
     const { lines, newOffset, batches, evidence: readEvidence } = consumeInboxSlice(file, offset, {
       canonicalOnly: true,
-      includeAutomations: true,
+      includeDispatches: true,
       oneCommandTurn: true,
       connectionId,
     })
@@ -1607,9 +1870,65 @@ async function main() {
             continue
           }
         }
+        // The rest of a delivery a one-shot run began: its frozen wakes, handed on as they
+        // were built, never rebuilt, by whichever printer comes next. The one continuation
+        // state both share: the wake file's follow writes them all to the wake file, a
+        // one-shot run prints what fits one result. Neither prints a wake the other already
+        // has. The delivery's bookkeeping was done when it began; the cursor moves past it
+        // once the last of them is out.
+        //
+        // They are handed on holding the connection's steps lock (step-delivery.mjs), the
+        // lock every write that ends the connection takes, and only once the connection
+        // is seen live under it: a wake left for a connection that has ended is skipped,
+        // never printed, and this state write and the end's never undo each other. The
+        // wake reader skips one appended just before an end (`withoutEndedConnectionWakes`).
+        const frozen = frozenWakesOf(readState(connectionId), offset, batch)
+        if (frozen) {
+          let count
+          try {
+            count = await withStepsLockAsync(connectionId, CONNECTIONS_DIR, async () => {
+              if (connectionEnded(connectionId)) return null
+              let printed = frozen.length
+              if (args.follow) {
+                for (const wake of frozen) {
+                  for (const event of wake) await emitStdoutEvent(event)
+                  appendWakeEvents(args.wakeFile, wake)
+                }
+              } else {
+                printed = await printOneShot(frozen)
+              }
+              if (printed < frozen.length) {
+                writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(printed) } })
+              } else {
+                offset = newOffset
+                offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+                writeStatePatch(connectionId, { wake_batch_progress: null })
+              }
+              return printed
+            })
+          } catch (e) {
+            // Most likely the lock could not be taken; the cursor and the frozen rest stand
+            // until all of it is out, so it is tried again next lap.
+            process.stderr.write(`devspec-remote-wait: could not hand on waiting wakes (${e instanceof Error ? e.message : String(e)}); trying again\n`)
+            await sleep(pollMs)
+            continue
+          }
+          if (count === null) {
+            process.stderr.write(`devspec-remote-wait: skipped ${frozen.length} waiting wake(s): the connection has ended; never printed\n`)
+            await sleep(pollMs)
+            continue
+          }
+          process.stderr.write(`devspec-remote-wait: handed on ${count} of ${frozen.length} waiting wake(s)\n`)
+          if (args.follow) {
+            args.fromEnd = false
+            args.pending = true
+            continue
+          }
+          return
+        }
         // A directed-question answer is its own event type — it wakes, but it is never
         // a command, so it never goes through the owner-message builder.
-        const events = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
+        const built = (batch.type === INTERACTION_ANSWER_RECORD_TYPE || batch.type === QUESTION_DISMISSAL_RECORD_TYPE)
           ? buildInteractionAnswerEvents(batch, { inboxFile: file })
           : buildOwnerMessageEvents(batch, {
             inboxFile: file,
@@ -1627,8 +1946,71 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
-        // Dequeue only after the entire one-command-turn payload reached stdout.
-        for (const event of events) await emitStdoutEvent(event)
+        // A check job or notice that arrives while Cursor is in a turn waits for the
+        // agent's next step instead (step-delivery.mjs): Cursor would hold the wake
+        // file until the turn ended. Held before the offset moves, so nothing is lost;
+        // if it cannot be held, it goes to the wake file as before.
+        if (args.follow && args.wakeFile && isStepBatch(batch) && (await readTurnState(live?.local_id)) === 'in_turn') {
+          let held = false
+          try {
+            held = holdForNextStep(connectionId, batch, built, { dir: CONNECTIONS_DIR }).held
+          } catch (e) {
+            process.stderr.write(`devspec-remote-wait: hold for the next step failed: ${e instanceof Error ? e.message : String(e)}\n`)
+          }
+          if (held) {
+            for (const event of built) await emitStdoutEvent(event)
+            offset = newOffset
+            offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            process.stderr.write(`devspec-remote-wait: held (${wakeCount} msg) for the agent's next step — follow\n`)
+            continue
+          }
+        }
+        // What goes out, with the project recall DevSpec attached to a command or an
+        // automation run: the wake as it is when Cursor shows it whole, otherwise kept
+        // whole in one sealed note with a short line in its place (turn-recall.mjs). A
+        // wake that needs its note to arrive whole is held when the note cannot be
+        // written: not sent, the inbox cursor not moved, nothing counted as shown. It is
+        // tried again every lap until it goes, with no cap: notes live in the same home
+        // folder as the wake file, so this is a disk problem that clears, and the room is
+        // told once (`tellRoomWakeHeld`).
+        const out = recallWakeOut(built, batch?.turn_recall, { connectionId })
+        if (out.held) {
+          process.stderr.write(
+            `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${out.held instanceof Error ? out.held.message : String(out.held)}); trying again\n`,
+          )
+          await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold })
+          await sleep(pollMs)
+          continue
+        }
+        const events = out.events
+        // Dequeue only after the entire one-command-turn payload reached stdout. In follow
+        // mode what reaches Cursor is the wake file, whose reader sizes each print, and
+        // this process's stdout is its log. A one-shot run's stdout is one Shell result:
+        // it holds whole wakes only while they fit one output together, then a line saying
+        // how many wait; the rest are frozen as built, and the inbox cursor moves past
+        // this delivery only once all its wakes are printed (`printOneShot`,
+        // `wakesForOneOutput`, `frozenWakesOf`).
+        let printedAll = true
+        if (args.follow) {
+          for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
+        } else {
+          const count = await printOneShot(out.wakes)
+          printedAll = count >= out.wakes.length
+          // The rest is frozen as built, for the next re-arm to print as it is: kept only
+          // while the connection is live, under its steps lock (see the frozen wakes above).
+          if (!printedAll) {
+            try {
+              withStepsLock(connectionId, CONNECTIONS_DIR, () => {
+                if (!connectionEnded(connectionId)) {
+                  writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: out.wakes.slice(count) } })
+                }
+              })
+            } catch (e) {
+              // Not kept: the cursor has not moved, so the next re-arm builds this delivery again.
+              process.stderr.write(`devspec-remote-wait: could not keep the rest of this delivery (${e instanceof Error ? e.message : String(e)})\n`)
+            }
+          }
+        }
         if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
           const decision = dismissalDeliveryDecision(batch, readDismissalState(connectionId), connectionId)
           if (decision === 'defer') { await sleep(pollMs); continue }
@@ -1640,6 +2022,9 @@ async function main() {
         }
         if (args.follow && args.wakeFile) {
           appendWakeEvents(args.wakeFile, events)
+          // A recall pointer with no room beside the command follows it as a wake of its
+          // own, so the reader prints each whole, in order (turn-recall.mjs).
+          if (out.recallWake) appendWakeEvents(args.wakeFile, out.recallWake)
           if (batch.type === QUESTION_DISMISSAL_RECORD_TYPE) {
             const current = readDismissalState(connectionId)
             const held = current?.interaction_continuation
@@ -1649,12 +2034,18 @@ async function main() {
             }
           }
         }
-        offset = newOffset
-        offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+        if (printedAll) {
+          offset = newOffset
+          offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+        }
+        // A delivery's bookkeeping is done once, when its first wake is printed.
         recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
-        recordTurnWake(connectionId, turnWakeFromEvents(events), { dir: CONNECTIONS_DIR })
+        recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
+        // Its recall's records count as shown once the agent has read its note whole;
+        // until then the next command's recall can offer them again (turn-recall.mjs).
+        settleRecallHandover(recallConversation(readState(connectionId), connectionId), out, batch)
         if (args.follow) {
           process.stderr.write(
             `devspec-remote-wait: wake (${wakeCount} msg) — follow\n`,

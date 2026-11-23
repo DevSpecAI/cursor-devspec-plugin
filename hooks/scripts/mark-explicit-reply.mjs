@@ -10,6 +10,16 @@
  * A reply to DevSpec notices (notice-reply.mjs) is neither: it answers no command and
  * completes no turn, even when it passes complete_turn, so a command being worked still
  * needs its own answer and keeps showing Working until it gets one.
+ *
+ * On afterMCPExecution it also notes a DevSpec write whose result carries DevSpec's
+ * `tell_person` mark on the turn (`handleTellPersonMark`), for the end-of-turn
+ * backstop that tells the person when the model did not (notice-reply.mjs).
+ * When Stop could not post that message, it left it for the agent's next turn; on
+ * postToolUse this hook hands it over (`tellPersonNoteHook`).
+ *
+ * Run as `mark-explicit-reply.mjs <postToolUse|afterMCPExecution>`: the event decides
+ * whether a left note may be handed over, since Cursor delivers a hook's
+ * `additional_context` on postToolUse.
  */
 
 import fs from 'node:fs'
@@ -24,7 +34,19 @@ import {
 } from './mirror-turn.mjs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
-import { currentTurnNoticeIds, isNoticeReplyPost } from './notice-reply.mjs'
+import {
+  currentTurnNoticeIds,
+  isNoticeReplyPost,
+  leaveTellPersonNote,
+  recordTellPerson,
+  resultCarriesTellPerson,
+  takeTellPersonNotes,
+  TELL_PERSON_NOTE_SUFFIX,
+  tellPersonNoteText,
+} from './notice-reply.mjs'
+import { isDevspecServer, namespacedVerb } from './project-context.mjs'
+import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 function readStdin() {
   try {
@@ -133,15 +155,121 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
   return true
 }
 
+/** Whether a hook event is a call to one of DevSpec's own tools. */
+function isDevspecToolEvent(data) {
+  if (data?.mcp_server_name !== undefined) return isDevspecServer(data.mcp_server_name)
+  return Boolean(namespacedVerb(data?.tool_name ?? data?.toolName))
+}
+
+/**
+ * Note on the turn that a DevSpec write's result carried DevSpec's `tell_person` mark
+ * (`resultCarriesTellPerson`). Cursor hands the result to afterMCPExecution as
+ * `result_json`; an event without one changes nothing. Exported for tests; `dir`
+ * defaults to where the turn record lives.
+ */
+export function handleTellPersonMark(rawInput, env = process.env, { dir } = {}) {
+  let data = {}
+  try {
+    data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
+  } catch {
+    return false
+  }
+  if (!data || typeof data !== 'object' || !isDevspecToolEvent(data)) return false
+  if (!resultCarriesTellPerson(data.result_json ?? data.resultJson)) return false
+  const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
+  const connectionId = loadState(conversationId)?.connection_id
+  if (!connectionId) return false
+  const connDir = dir ?? path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
+  return recordTellPerson(connectionId, { dir: connDir })
+}
+
+/**
+ * The hook output handing the agent a message Stop could not post (notice-reply.mjs,
+ * `leaveTellPersonNote`), or null when there is none. Only the conversation that holds
+ * the connection gets it, never a subagent's tool call.
+ *
+ * The message is the person's, so it must reach the agent, and Cursor gives no sign
+ * that a hook's note did (hook-context-budget.mjs). So it goes whole into a note file,
+ * and a short pointer to it comes back after every step until the agent is seen
+ * reading all of that delivery (`handOver`). A message left while an earlier one is still unread
+ * joins it in one note. If the note cannot be written, the messages are put back for
+ * the next step. Exported for tests; `dir` defaults to where the connection's files
+ * live.
+ */
+export function tellPersonNoteHook(rawInput, env = process.env, { dir, home = os.homedir() } = {}) {
+  let data = {}
+  try {
+    data = typeof rawInput === 'string' ? JSON.parse(rawInput || '{}') : rawInput || {}
+  } catch {
+    return null
+  }
+  if (!data || typeof data !== 'object' || data.agent_id) return null
+  const connDir = dir ?? path.join(home, '.devspec', 'remote-control', 'connections')
+  // This runs after every tool call: two directory reads settle that nothing is waiting.
+  if (!anyTellPersonNote(connDir, home)) return null
+  const conversationId = resolveHookConversationId(typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput), env)
+  const connectionId = loadState(conversationId)?.connection_id
+  if (!connectionId) return null
+  const notes = takeTellPersonNotes(connectionId, { dir: connDir })
+  let context
+  try {
+    // One delivery at a time: new messages join one still unread in a new delivery,
+    // and only a whole read of the current delivery ends it (`handOver`).
+    context = handOver(handOverPrefix('tell', connectionId), data, {
+      add: tellPersonNoteText(notes),
+      what: 'A message your person has not heard, handed back to you by the DevSpec plugin,',
+      also: 'Do what it says.',
+      home,
+    })
+  } catch (error) {
+    // Not handed over, so not taken: every message goes back for the next step.
+    for (const note of notes) leaveTellPersonNote(connectionId, { text: note.text, refusal: note.refusal ?? null, dir: connDir, now: note.at })
+    throw error
+  }
+  return context === null ? null : JSON.stringify(postToolUseOutput(context))
+}
+
+/** Whether any connection has a message waiting (`leaveTellPersonNote`) or handed over and not yet read. */
+function anyTellPersonNote(connDir, home) {
+  const any = (dir, test) => {
+    try {
+      return fs.readdirSync(dir).some(test)
+    } catch {
+      return false
+    }
+  }
+  return any(connDir, (name) => name.endsWith(TELL_PERSON_NOTE_SUFFIX)) ||
+    any(path.join(home, '.devspec', 'notes', 'pending'), (name) => name.startsWith('tell-'))
+}
+
+const MODE = process.argv[2] ?? null
+
 async function main() {
   const raw = readStdin()
+  let output = null
+  try {
+    handleTellPersonMark(raw)
+  } catch {
+    /* non-fatal: an unnoted mark only leaves telling the person to the model */
+  }
   try {
     await handleExplicitReply(raw)
   } catch {
     /* non-fatal */
   }
+  if (MODE === 'postToolUse') {
+    try {
+      output = tellPersonNoteHook(raw)
+    } catch {
+      /* the note stays where it was left, for the next tool call */
+    }
+  }
+  if (output) process.stdout.write(output)
   process.exit(0)
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+if (isMain) {
+  answerCursorAtExit()
+  main()
+}

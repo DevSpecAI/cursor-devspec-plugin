@@ -13,6 +13,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,7 +41,9 @@ import {
   resolveConnectionsDir,
   resolveOwnerPid,
 } from './devspec-remote-wait.mjs'
-import { REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { REMOTE_WAKE_NOTIFY_PATTERN, wakeLines } from './devspec-wake-file.mjs'
+import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { wakeNotice } from './room-unread.mjs'
 import { SYSTEM_NOTICE_CHANNEL_VERSION, remoteIngressNegotiationArgs } from './devspec-remote-poll.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import { automationAcceptanceKey } from './remote-poll-acceptance.mjs'
@@ -260,10 +263,10 @@ describe('canonical one-command-turn wake', () => {
       const line = JSON.stringify(canonicalBatch(delegated)) + '\n'
       fs.writeFileSync(file, line)
       const first = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       const retry = consumeInboxSlice(file, 0, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.deepEqual(retry.batches[0].messages[0].project_scope, first.batches[0].messages[0].project_scope)
       assert.equal(retry.newOffset, Buffer.byteLength(line, 'utf8'))
@@ -287,7 +290,7 @@ describe('canonical one-command-turn wake', () => {
       acceptance_key: automationAcceptanceKey(dispatch),
     }
     assert.equal(parseWakeBatches([JSON.stringify(batch)], {
-      canonicalOnly: true, includeAutomations: true,
+      canonicalOnly: true, includeDispatches: true,
     }).length, 1)
     const events = buildOwnerMessageEvents(batch)
     assert.deepEqual(events.map((event) => event.type), ['automation_dispatch', 'wake'])
@@ -304,11 +307,11 @@ describe('canonical one-command-turn wake', () => {
       const secondMessage = canonicalCommand('99999999-9999-4999-8999-999999999999')
       const second = JSON.stringify(canonicalBatch(secondMessage)) + '\n'
       fs.writeFileSync(file, first + second)
-      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
+      const slice = consumeInboxSlice(file, 0, { canonicalOnly: true, includeDispatches: true, oneCommandTurn: true })
       assert.equal(slice.batches.length, 1)
       assert.equal(slice.batches[0].messages[0].message_id, canonicalCommand().message_id)
       assert.equal(slice.newOffset, Buffer.byteLength(first, 'utf8'))
-      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includeAutomations: true, oneCommandTurn: true })
+      const queued = consumeInboxSlice(file, slice.newOffset, { canonicalOnly: true, includeDispatches: true, oneCommandTurn: true })
       assert.equal(queued.batches[0].messages[0].message_id, secondMessage.message_id)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -737,6 +740,97 @@ describe('notifyWorkingEnded (item cd989606 — immediate report_complete)', () 
   })
 })
 
+// turn-commands.mjs (item a4391300): the reply re-arm ends the turn the way Stop does,
+// naming what it finishes, never with a report that names nothing.
+describe('notifyWorkingEnded names what the turn finishes', () => {
+  const TURN = '55555555-5555-4555-8555-555555555555'
+  const MESSAGE = '66666666-6666-4666-8666-666666666666'
+  const ROOM = '22222222-2222-4222-8222-222222222222'
+  const TYPED = '44444444-4444-4444-8444-444444444444'
+  const completions = async (opts) => {
+    const calls = []
+    const result = await notifyWorkingEnded({
+      connectionId: 'conn-1',
+      call: async (call) => { calls.push(call) },
+      ...opts,
+      state: { token: 'dvs_test', mcp_url: 'https://example.test/api/mcp', ...opts.state },
+    })
+    return { result, args: calls.filter((call) => call.name === 'report_complete').map((call) => call.arguments) }
+  }
+
+  it('names each room command that started the turn, and the typed turn in the same room', async () => {
+    const { result, args } = await completions({
+      commands: [{ turnId: TURN, messageId: MESSAGE }],
+      state: { session_id: ROOM, local_turn: { attempt_id: TYPED, session_id: ROOM } },
+    })
+    assert.equal(result.ok, true)
+    assert.deepEqual(args, [
+      { connection_id: 'conn-1', command_turn_id: TURN, command_message_id: MESSAGE, reason: 'turn_end' },
+      { connection_id: 'conn-1', attempt_id: TYPED, reason: 'turn_end' },
+    ])
+  })
+
+  it('says a turn that started with neither is unbound', async () => {
+    const { args } = await completions({ state: { session_id: ROOM, local_turn: { attempt_id: TYPED, session_id: 'another-room' } } })
+    assert.deepEqual(args, [{ connection_id: 'conn-1', command_turn_unbound: true, reason: 'turn_end' }])
+  })
+
+  it('a reply re-arm reads what started the turn before it clears it, and names it', async () => {
+    const calls = []
+    const server = http.createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => { body += chunk })
+      request.on('end', () => {
+        const parsed = JSON.parse(body)
+        calls.push({ name: parsed.params?.name, args: parsed.params?.arguments ?? {} })
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: parsed.id, result: { content: [{ type: 'text', text: '{}' }] } }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-after-reply-'))
+    const dir = path.join(home, 'connections')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.json`), JSON.stringify({
+      enabled: true,
+      connection_id: CANONICAL_CONNECTION,
+      session_id: null,
+      token: 'dvs_test',
+      mcp_url: `http://127.0.0.1:${server.address().port}/mcp`,
+      inbox_byte_offset: 0,
+    }))
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.inbox.jsonl`), '')
+    const marker = path.join(dir, `${CANONICAL_CONNECTION}.turn`)
+    const record = path.join(dir, `${CANONICAL_CONNECTION}.turn-commands.json`)
+    fs.writeFileSync(marker, JSON.stringify({ startedAt: Date.now() }))
+    fs.writeFileSync(record, JSON.stringify({ version: 1, commands: [{ turn_id: TURN, message_id: MESSAGE }] }))
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url)),
+      '--connection-id', CANONICAL_CONNECTION, '--pending', '--after-reply',
+      '--owner-pid', String(process.pid), '--poll-ms', '20',
+    ], { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir } })
+    child.stdout.resume()
+    const closed = new Promise((resolve) => child.once('close', resolve))
+    try {
+      const deadline = Date.now() + 10_000
+      while (!calls.some((call) => call.name === 'report_complete') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.deepEqual(
+        calls.filter((call) => call.name === 'report_complete').map((call) => call.args),
+        [{ connection_id: CANONICAL_CONNECTION, command_turn_id: TURN, command_message_id: MESSAGE, reason: 'turn_end' }],
+      )
+      assert.equal(fs.existsSync(marker), false)
+      assert.equal(fs.existsSync(record), false)
+    } finally {
+      child.kill('SIGKILL')
+      await closed
+      await new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) })
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued owner_messages)', () => {
   const advisory = (extra = {}) =>
     `${JSON.stringify({ type: 'advisory_context', messages: [{ id: 'a1', ...extra }] })}\n`
@@ -825,7 +919,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].message_id, unreadMessage.message_id)
     } finally {
@@ -858,7 +952,7 @@ describe('offsetAfterAdvisoryHistory (item 1f177af4 — first-arm keeps queued o
       })
       assert.equal(offset, savedOffset)
       const slice = consumeInboxSlice(file, offset, {
-        canonicalOnly: true, includeAutomations: true, oneCommandTurn: true,
+        canonicalOnly: true, includeDispatches: true, oneCommandTurn: true,
       })
       assert.equal(slice.batches[0].messages[0].run_id, unreadDispatch.run_id)
     } finally {
@@ -1337,9 +1431,9 @@ describe('Cursor dismissal reader source gate before stdout and wake-file', () =
 })
 
 describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
-  it('negotiates system_notice_version: 2 and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
-    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 2)
-    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 2)
+  it('negotiates system_notice_version: 3 (DevSpec\'s label on every notice) and includes system_notice in REMOTE_WAKE_NOTIFY_PATTERN', () => {
+    assert.equal(SYSTEM_NOTICE_CHANNEL_VERSION, 3)
+    assert.equal(remoteIngressNegotiationArgs().system_notice_version, 3)
     assert.match(REMOTE_WAKE_NOTIFY_PATTERN, /system_notice/)
   })
 
@@ -1396,3 +1490,81 @@ describe('system notices v2 wake and NOTICE_HANDLING (item e7c23288)', () => {
   })
 })
 
+describe('the one-shot wait freezes a delivery it splits over two results', () => {
+  const ROOM = '66666666-7777-4888-9999-000000000000'
+  const recallBlock = `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, n) => `- [MEMORY · decision] **Decision ${n}** — the settings page keeps its redirect`).join('\n')}`
+
+  /** A home whose room holds unread messages, so the command's wake carries a room_unread note. */
+  function homeWithUnreadRoom() {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-frozen-wakes-'))
+    const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.json`), JSON.stringify({
+      enabled: true, connection_id: CANONICAL_CONNECTION, session_id: ROOM, local_id: 'chat-frozen', agent_name: 'Cursor',
+    }), { mode: 0o600 })
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript-state.json`), JSON.stringify({ version: 1, self_label: 'Cursor · Amber Dolphin' }), { mode: 0o600 })
+    const lines = Array.from({ length: 6 }, (_, n) => ({
+      seq: n + 1, at: `2026-11-21T01:0${n}:00.000Z`, message_id: `m-${n + 1}`, from: { label: `Teammate ${n}`, kind: 'human' },
+      to: null, text: `room message ${n + 1}`, attachments: [], state: 'final',
+    }))
+    fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n', { mode: 0o600 })
+    return { home, dir }
+  }
+
+  function runOnce({ home, dir }) {
+    const child = spawn(process.execPath, [fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url)), '--connection-id', CANONICAL_CONNECTION, '--pending', '--poll-ms', '20'], {
+      env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => child.kill('SIGKILL'), 10_000)
+      child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+    })
+  }
+
+  it('prints the rest of it as frozen when built, even after the room-unread context clears, before the cursor moves', async () => {
+    const room = homeWithUnreadRoom()
+    try {
+      const state = () => JSON.parse(fs.readFileSync(path.join(room.dir, `${CANONICAL_CONNECTION}.json`), 'utf8'))
+      // Size the command so that with the room-unread note its wake needs a pointer wake of
+      // its own, and without it the pointer would fit beside it: a rebuild would differ.
+      const notice = wakeNotice({ connectionId: CANONICAL_CONNECTION, sessionId: ROOM, dir: room.dir })
+      assert.ok(notice, 'the room has unread messages')
+      const inbox = path.join(room.dir, `${CANONICAL_CONNECTION}.inbox.jsonl`)
+      const batchFor = (body) => canonicalBatch(fixtureCommand(body), { session_id: ROOM, turn_recall: { version: 1, formatted_block: recallBlock, seen_keys: ['memory:00000000-0000-4000-8000-000000000001:v1'] } })
+      const sizeWith = (body) => wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: notice, inboxFile: inbox })).length
+      let body = 'a'.repeat(9_000)
+      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - sizeWith(body)) / 2))
+      const sizeWithout = wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: null, inboxFile: inbox })).length
+      assert.ok(sizeWithout < 19_700, `without the note the pointer fits beside it (${sizeWithout})`)
+      const batch = batchFor(body)
+      fs.writeFileSync(inbox, JSON.stringify(batch) + '\n', { mode: 0o600 })
+
+      const first = await runOnce(room)
+      assert.equal(first.code, 0, first.stderr)
+      assert.ok(fitsShellOutput(first.stdout))
+      const one = first.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(one.map((e) => e.type), ['owner_message', 'room_unread', 'wake', 'recall_in_next_wake', 'wakes_waiting'])
+      assert.equal(one[0].body, body)
+      assert.equal(state().inbox_byte_offset ?? 0, 0, 'the cursor stays at the delivery')
+      assert.equal(state().wake_batch_progress.wakes.length, 1, 'the pointer wake is frozen as built')
+
+      // The room-unread context clears: a rebuild would now put the pointer beside the command.
+      fs.rmSync(path.join(room.dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript.jsonl`), { force: true })
+
+      const second = await runOnce(room)
+      assert.equal(second.code, 0, second.stderr)
+      const two = second.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      assert.deepEqual(two.map((e) => e.type), ['turn_recall'], 'the frozen pointer wake, not a rebuilt delivery')
+      assert.equal(two[0].for, one[0].message_id)
+      assert.equal(readNoteText(/notes\/([0-9a-f]{16})\.md$/.exec(two[0].read)[1], { home: room.home }), recallBlock)
+      assert.equal(state().inbox_byte_offset, fs.statSync(inbox).size, 'and only now the cursor moves past it')
+      assert.equal(state().wake_batch_progress, null)
+    } finally {
+      fs.rmSync(room.home, { recursive: true, force: true })
+    }
+  })
+})

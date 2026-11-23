@@ -24,6 +24,7 @@ import {
   turnAmbiguity,
   undecidedTurnMessage,
 } from './requests.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 export function launchGuard(input, { home = os.homedir(), env = process.env } = {}) {
   const toolName = input?.tool_name ?? input?.toolName
@@ -61,6 +62,7 @@ try {
   /* imported */
 }
 if (main) {
+  answerCursorAtExit()
   try {
     const out = launchGuard(JSON.parse(readFileSync(0, 'utf8')))
     if (out && Object.keys(out).length > 0) process.stdout.write(JSON.stringify(out))

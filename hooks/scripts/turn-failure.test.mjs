@@ -8,7 +8,16 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
-import { lastTurnError, parseTurnFailure, postTurnFailure, turnFailureMessage } from './turn-failure.mjs'
+import {
+  answerUnsettledCommands,
+  lastTurnError,
+  parseTurnFailure,
+  postTurnFailure,
+  postTurnNotice,
+  turnFailureMessage,
+  turnNoticeMessage,
+  uncertainTurnFailureMessage,
+} from './turn-failure.mjs'
 import { appendRequestEvent, readRequestState } from './requests.mjs'
 
 // What Cursor CLI 2026.10.19 wrote for an account at its usage limit (2026-10-31).
@@ -148,6 +157,115 @@ describe('answering the room command', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true })
       }
+    }
+  })
+
+  it('with notice, tells the room of a failed turn that answers no command in a post of its own, tied to no turn', async () => {
+    const SESSION = '22222222-2222-4222-8222-222222222222'
+    const cases = [
+      { what: 'no command tracked', setup: () => {} },
+      { what: 'an answered command', setup: (dir) => withCommand(dir, [{ op: 'answered', id: COMMAND }]) },
+      {
+        what: 'a typed prompt',
+        setup: (dir) => {
+          appendRequestEvent(CONN, { op: 'open', id: COMMAND, kind: 'typed_prompt' }, { dir })
+          appendRequestEvent(CONN, { op: 'current', ref: COMMAND }, { dir })
+        },
+      },
+    ]
+    for (const { what, setup } of cases) {
+      const dir = scratch()
+      try {
+        setup(dir)
+        const posts = []
+        const answered = await postTurnFailure({
+          failure: { status: 'error', text: LIMIT }, connectionId: CONN, sessionId: SESSION, dir, agentName: 'Cursor',
+          notice: true, post: async (args) => posts.push(args),
+        })
+        assert.deepEqual(answered, [], what)
+        // By session_id alone: post_session_message ties such a post to no turn, so it
+        // can never become a command's answer (DevSpec 59acf1bfe).
+        assert.deepEqual(Object.keys(posts[0]).sort(), ['agent_name', 'message', 'phase', 'session_id', 'turn_kind'], what)
+        assert.equal(posts[0].session_id, SESSION)
+        assert.equal(posts[0].phase, 'answer')
+        assert.ok(posts[0].message.includes(`> ${LIMIT}`), what)
+        assert.equal(posts.length, 1, what)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  })
+
+  it('with notice but no room, posts nothing', async () => {
+    const dir = scratch()
+    try {
+      const posts = []
+      await postTurnFailure({
+        failure: { status: 'aborted', text: null }, connectionId: CONN, sessionId: null, dir, agentName: 'Cursor',
+        notice: true, post: async (args) => posts.push(args),
+      })
+      assert.equal(posts.length, 0)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('a turn end not tied to a command beyond doubt: only what is certain', () => {
+  const OTHER = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+  const DONE = '88888888-9999-4aaa-8bbb-cccccccccccc'
+  const forbidden = /couldn't finish this|send your message again|was stopped before it finished/i
+
+  it('the notice says a turn ended, in Cursor\'s words, and nothing about which message or sending it again', async () => {
+    assert.equal(turnNoticeMessage({ status: 'aborted', text: null }, 'Cursor'), 'Cursor was stopped at its terminal.')
+    const error = turnNoticeMessage({ status: 'error', text: LIMIT }, 'Cursor')
+    assert.ok(error.startsWith('Cursor ended a turn with an error. It said:') && error.includes(`> ${LIMIT}`))
+    assert.ok(!forbidden.test(error))
+    const posts = []
+    await postTurnNotice({ failure: { status: 'error', text: LIMIT }, sessionId: 'room', agentName: 'Cursor', post: async (args) => posts.push(args) })
+    assert.deepEqual(Object.keys(posts[0]).sort(), ['agent_name', 'message', 'phase', 'session_id', 'turn_kind'])
+    assert.equal(posts[0].message, error)
+  })
+
+  it('the settle point\'s reply says a turn ended before this was answered, and that a later answer will still appear', () => {
+    assert.equal(
+      uncertainTurnFailureMessage({ status: 'aborted', text: null }, 'Cursor'),
+      'Cursor was stopped at its terminal before it answered this. If Cursor runs it later, its answer will appear here.',
+    )
+    const error = uncertainTurnFailureMessage({ status: 'error', text: LIMIT }, 'Cursor')
+    assert.ok(error.startsWith('Cursor ended a turn with an error before it answered this. It said:'))
+    assert.ok(error.includes(`> ${LIMIT}`) && error.endsWith('If Cursor runs it later, its answer will appear here.'))
+    assert.ok(!forbidden.test(error), 'never that the command itself failed')
+    assert.ok(!forbidden.test(uncertainTurnFailureMessage({ status: 'error', text: null }, 'Cursor')))
+  })
+
+  it('answers each command picked up before the end that is still open and unanswered, once, in one post', async () => {
+    const dir = scratch()
+    try {
+      appendRequestEvent(CONN, { op: 'open', id: COMMAND, kind: 'command' }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: COMMAND }, { dir })
+      appendRequestEvent(CONN, { op: 'open', id: OTHER, kind: 'command' }, { dir })
+      appendRequestEvent(CONN, { op: 'joined', id: OTHER }, { dir })
+      appendRequestEvent(CONN, { op: 'open', id: DONE, kind: 'command' }, { dir })
+      appendRequestEvent(CONN, { op: 'answered', id: DONE }, { dir })
+      const posts = []
+      const failure = { status: 'aborted', text: null }
+      const answered = await answerUnsettledCommands({
+        failure, requestIds: [COMMAND, OTHER, DONE, COMMAND], connectionId: CONN, dir, agentName: 'Cursor',
+        post: async (args) => posts.push(args),
+      })
+      assert.deepEqual(answered, [COMMAND, OTHER], 'not the one answered already')
+      assert.equal(posts.length, 1)
+      assert.deepEqual(posts[0], { connection_id: CONN, agent_name: 'Cursor', message: uncertainTurnFailureMessage(failure, 'Cursor'), complete_turn: true })
+      const state = readRequestState(CONN, { dir })
+      assert.equal(state.open.get(COMMAND).answered, true)
+      assert.equal(state.open.get(OTHER).answered, true)
+      assert.deepEqual(await answerUnsettledCommands({
+        failure, requestIds: [COMMAND, OTHER], connectionId: CONN, dir, agentName: 'Cursor', post: async (args) => posts.push(args),
+      }), [], 'once')
+      assert.equal(posts.length, 1, 'nothing posted when nothing is left to answer')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 })

@@ -15,7 +15,7 @@
 import fs from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { readActiveTurnMarker, loadState, resolveHookConversationId } from './mirror-turn.mjs'
 import { handleExplicitReply } from './mark-explicit-reply.mjs'
@@ -28,8 +28,9 @@ import {
   writeTrailState,
 } from './work-trail.mjs'
 import { recordTurnActivity } from './turn-liveness.mjs'
-import { currentTurnNoticeIds } from './notice-reply.mjs'
+import { currentTurnOwnsNoCommand } from './notice-reply.mjs'
 import { recordRuntimeReport } from './agent-telemetry.mjs'
+import { answerCursorAtExit } from './hook-answer.mjs'
 
 const VALID_MODES = new Set([
   'seed',
@@ -116,29 +117,25 @@ export async function runTrailTurn({
       return { ok: false, skipped: true, reason: 'unattached_local_turn' }
     }
   }
-  // A turn woken only by DevSpec notices belongs to no command, so its work is never
-  // posted as a trail, which DevSpec would file under someone's command (notice-reply.mjs).
+  // A turn woken only by DevSpec notices and check jobs belongs to no command, so its
+  // work is never posted as a trail, which DevSpec would file under someone's command
+  // (notice-reply.mjs).
   if (
-    currentTurnNoticeIds(state.connection_id, {
+    currentTurnOwnsNoCommand(state.connection_id, {
       ...(connectionsDir ? { dir: connectionsDir } : {}),
       connectionState: state,
     })
   ) {
-    return { ok: false, skipped: true, reason: 'notice_turn' }
+    return { ok: false, skipped: true, reason: 'no_command_turn' }
   }
   if (mode !== 'seed') {
     recordTurnActivity(state.connection_id, connectionsDir ? { dir: connectionsDir } : undefined)
   }
 
-  let token = state.mcp_token || state.token || null
-  let mcpUrl = state.mcp_url || null
-  if (!token) {
-    const auth = resolveDevspecMcpAuth(state.cwd || process.cwd())
-    token = auth.token
-    mcpUrl = mcpUrl || auth.mcp_url
-  }
-  if (!token) return { ok: false, skipped: true, reason: 'no_token' }
-  mcpUrl = mcpUrl || 'https://api.devspec.ai/api/mcp'
+  const credential = connectionCredential(state)
+  if (!credential.ok) return { ok: false, skipped: true, reason: credential.code === 'no_state' ? 'no_token' : credential.code }
+  const token = credential.token
+  const mcpUrl = credential.mcp_url
 
   const part = mode === 'seed' ? TRAIL_SEED_TEXT : renderHookTrailPart(mode, data)
   let transcriptText = null
@@ -248,4 +245,7 @@ async function main() {
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMain) main()
+if (isMain) {
+  answerCursorAtExit()
+  main()
+}

@@ -10,7 +10,22 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 // The host-owned wake stream and its model notification must include the same events.
-export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|system_notice|question_answer|question_dismissal|session_ended|automation_dispatch'
+export const REMOTE_WAKE_NOTIFY_PATTERN = 'owner_message|system_notice|question_answer|question_dismissal|session_ended|automation_dispatch|check_job'
+
+/**
+ * How many matches of its notify pattern one background command may print before Cursor
+ * stops telling the agent about it. Measured live on Cursor CLI 2026.11.19-f005e9d,
+ * 21 November 2026 (DevSpec task 7cbe5c32; a throwaway profile with no plugin): matches
+ * 1 to 1,000 were notified; at the 1,000th Cursor sent one last notification, "Notification
+ * limit reached (1000)", telling the agent to read the command's output file itself, and
+ * none after it, though the command printed 19,100 more. The number is Cursor's server's:
+ * the CLI's own code falls back to 100 when the server sends none, and the agent cannot
+ * set it (the Shell tool's notify_on_output takes `pattern`, `reason` and `debounce_ms`
+ * only). The command's exit is notified on its own, even past the limit. Cursor counts
+ * every match on stdout and stderr, not lines: a line naming two pattern words counts two.
+ * The wake tail (devspec-wake-tail.mjs) hands over to a new one before it gets there.
+ */
+export const CURSOR_NOTIFY_MATCH_LIMIT = 1_000
 
 const CONNECTION_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -46,6 +61,17 @@ export function resolveSpaceFreeWakeFile(connectionId, opts = {}) {
 }
 
 /**
+ * The connection a wake file belongs to, from its own name (`<connection-id>.jsonl`,
+ * as `resolveSpaceFreeWakeFile` names it), or null for a file named otherwise.
+ * @param {string} file
+ * @returns {string | null}
+ */
+export function wakeFileConnectionId(file) {
+  const id = path.basename(String(file ?? ''), '.jsonl')
+  return CONNECTION_ID_RE.test(id) ? id : null
+}
+
+/**
  * Create an empty wake file so the model tail can open it before the first line.
  * @param {string} file
  * @returns {string}
@@ -59,6 +85,61 @@ export function ensureWakeFile(file) {
 }
 
 /**
+ * One wake's events as they are written to the wake file: one JSON object per line,
+ * then an empty line that closes the wake. JSON never holds a raw line break, so an
+ * empty line can only be that boundary, and the reader (devspec-wake-tail.mjs `read`)
+ * can hand the agent whole wakes, never part of one (`splitWakes`). These are the bytes
+ * the wake file gains for the wake, so what the reader prints for it when it fits.
+ * @param {object[]} events
+ * @returns {string}
+ */
+export function wakeLines(events) {
+  return events.map((event) => JSON.stringify(event) + '\n').join('') + '\n'
+}
+
+/**
+ * What a one-shot wait's result says when some of a delivery's wakes wait for the next
+ * re-arm (devspec-remote-wait.mjs). A delivery is split over results only when room is
+ * kept for this line (turn-recall.mjs), so a result that leaves wakes behind always
+ * says so.
+ * @param {number} left
+ */
+export function wakesWaitingEvent(left) {
+  return { type: 'wakes_waiting', count: left, note: 'Re-arm the wait with --pending now to print the rest.' }
+}
+
+/**
+ * The whole wakes at the start of `text` (wake-file text not yet printed), each as
+ * written, and the text after them, which is a wake still being written. A wake ends at
+ * the empty line `wakeLines` closes it with. Lines with no closing empty line, from a
+ * wait older than that boundary, count as one whole wake once the file has stopped
+ * growing (`settled`), so they are printed together as they always were.
+ * @param {string} text
+ * @param {{ settled?: boolean }} [opts]
+ * @returns {{ wakes: string[], rest: string }}
+ */
+export function splitWakes(text, { settled = false } = {}) {
+  const wakes = []
+  let at = 0
+  for (let end = text.indexOf('\n\n', at); end >= 0; end = text.indexOf('\n\n', at)) {
+    wakes.push(text.slice(at, end + 2))
+    at = end + 2
+  }
+  let rest = text.slice(at)
+  // Stray empty lines between wakes are boundaries too, not wakes of their own.
+  while (rest.startsWith('\n')) {
+    if (wakes.length > 0) wakes[wakes.length - 1] += '\n'
+    else wakes.push('\n')
+    rest = rest.slice(1)
+  }
+  if (settled && rest.endsWith('\n')) {
+    wakes.push(rest)
+    rest = ''
+  }
+  return { wakes, rest }
+}
+
+/**
  * Append one JSON object per line. Used by host follow so a surviving tail
  * can notify after Cursor `turn_ended`.
  * @param {string} file
@@ -67,6 +148,5 @@ export function ensureWakeFile(file) {
 export function appendWakeEvents(file, events) {
   if (!file || !Array.isArray(events) || events.length === 0) return
   const p = ensureWakeFile(file)
-  const chunk = events.map((event) => JSON.stringify(event) + '\n').join('')
-  fs.appendFileSync(p, chunk)
+  fs.appendFileSync(p, wakeLines(events))
 }

@@ -22,8 +22,15 @@
  *   - with one task claimed and no reference, adds ` [devspec:<id>]` to the end of
  *     the subject line (`-m` in place; `-F <file>` through a private copy, never the
  *     person's file; `-F -` by reading the message from standard input) and says so;
- *   - with no task claimed, or several, and no reference, stops the commit before git
- *     runs and says how to recover; the repository is left as it was;
+ *   - with several tasks claimed and no reference, stops the commit before git runs
+ *     and asks which task it belongs to; the repository is left as it was;
+ *   - with no task claimed and no reference, runs it exactly as asked and adds a short
+ *     note once git has made it (item 953ab72e; when a host may refuse a commit is the
+ *     served commit_provenance_contract's to say);
+ *   - while a claim made in this conversation could not be recorded (the envelope's
+ *     `unrecorded`), never tags it with another claim: it stops the commit and asks
+ *     which task it belongs to only when DevSpec confirmed that claim, so the agent
+ *     can be told its reference, and otherwise runs it as asked, with a note;
  *   - anything else (amend, fixup, squash, a reused message, `--no-edit`, an existing
  *     reference, a message it cannot read) runs exactly as asked.
  * - It asks git to describe what it did (Trace2, to a private file), so it learns from
@@ -514,19 +521,31 @@ export function taggedText(id) {
 }
 
 /*
- * The two recovery texts follow the wording of provenance-assistance.mjs's
- * NO_CLAIM_MESSAGE and MULTIPLE_CLAIMS_MESSAGE (the command-text path), said for a
- * commit the stand-in stopped. They are written out here because this file is copied
- * alone and imports nothing of the plugin's.
+ * What the agent is told about a commit it did not get tagged. provenance-assistance.mjs
+ * imports these for the command-text path, so both paths say the same; they live here
+ * because this file is copied alone and imports nothing of the plugin's. A person reads
+ * them as command output, so they name no contract rule and no contract address.
  */
 
-/** Why a commit with no reference was stopped when no task is claimed. */
-export function unclaimedText() {
+/** The note beside a commit that went through with no task claimed (item 953ab72e). */
+export function unlinkedCommitText() {
   return [
-    'DevSpec stopped this commit before git ran, so nothing was changed: it has no [devspec:<uuid>] reference and no task is claimed in this conversation, so it would land unlinked.',
-    'Recover without leaving this turn: search_tasks for the task this work belongs to and claim it (claim_work_item);',
-    'if none covers it, create_task for the smallest adequate task, with a real description of the change and the reason it is needed (the server refuses a thin one), and claim that.',
-    "When to create one is the contract's work_entry_contract. Then retry the same commit: its [devspec:<id>] reference is added for you.",
+    'DevSpec: no task is claimed in this conversation, so this commit carries no [devspec:<uuid>] reference. It was not stopped.',
+    'If the work delivers a task, claim that task (claim_work_item) before your next commit and the reference is added for you;',
+    'if it needs no task, there is nothing to do.',
+  ].join(' ')
+}
+
+/**
+ * The note beside a commit that went through untagged while a claim made in this
+ * conversation could not be recorded and DevSpec could not confirm it (item 953ab72e).
+ * The plugin cannot tell the agent that task's reference, so it neither stops the
+ * commit nor tags it with another claim.
+ */
+export function unrecordedCommitText() {
+  return [
+    'DevSpec: a task claimed in this conversation could not be recorded by the plugin, so no [devspec:<uuid>] reference was added to this commit. It was not stopped.',
+    "If the work delivers a task, put that task's [devspec:<uuid>] reference in your next commit's message; if it needs no task, there is nothing to do.",
   ].join(' ')
 }
 
@@ -535,6 +554,19 @@ export function severalClaimsText(claims) {
   return [
     `DevSpec stopped this commit before git ran, so nothing was changed: it has no [devspec:<uuid>] reference and ${claims.length} tasks are claimed in this conversation, so DevSpec will not guess which reference belongs in the commit.`,
     `Add a [devspec:<uuid>] reference for each task this commit delivers (claimed: ${claims.map((id) => `[devspec:${id}]`).join(', ')}) and retry.`,
+  ].join(' ')
+}
+
+/**
+ * Why a commit with no reference was stopped while a claim DevSpec confirmed could not
+ * be recorded by the plugin (`unrecorded`, full ids), beside the claims it did record:
+ * the commit may be that task's, so the agent names it, as with several claims.
+ */
+export function unrecordedClaimText(claims, unrecorded) {
+  const choices = [...new Set([...unrecorded, ...claims])].map((id) => `[devspec:${id}]`)
+  return [
+    'DevSpec stopped this commit before git ran, so nothing was changed: it has no [devspec:<uuid>] reference, and a task claimed in this conversation could not be recorded by the plugin, so DevSpec will not guess which reference belongs in the commit.',
+    `Add a [devspec:<uuid>] reference for each task this commit delivers (claimed: ${choices.join(', ')}) and retry.`,
   ].join(' ')
 }
 
@@ -564,9 +596,10 @@ function utf8(bytes) {
 
 /**
  * Decide what happens to a commit in the project's repositories before git runs:
- * `{ args, stdin, notice, cleanup }` to run (possibly tagged), or `{ stop }` with the
- * text to show instead of running it. Everything it cannot be sure of runs as asked.
- * `stdin` is 'inherit', or the bytes it had to read, which git gets byte for byte.
+ * `{ args, stdin, notice, cleanup }` to run (possibly tagged, `notice` shown once git
+ * has made it), or `{ stop }` with the text to show instead of running it. Everything it
+ * cannot be sure of runs as asked. `stdin` is 'inherit', or the bytes it had to read,
+ * which git gets byte for byte.
  */
 export function prepareCommit({ args, split, envelope, here, cwd = process.cwd(), readStdin = readAllStdin }) {
   const unchanged = { args, stdin: 'inherit', notice: null, cleanup: null }
@@ -604,8 +637,18 @@ export function prepareCommit({ args, split, envelope, here, cwd = process.cwd()
   if (message === null || ANY_REFERENCE.test(message)) return asked
 
   const claims = (Array.isArray(envelope.claims) ? envelope.claims : []).filter((id) => UUID.test(id ?? '')).map((id) => id.toLowerCase())
-  if (claims.length === 0) return { stop: unclaimedText() }
+  // Claims made in this conversation that the plugin could not record. `confirmed`
+  // means DevSpec said the claim was made and named its task (`id`), so the agent can
+  // be told the reference; one DevSpec could not confirm is never a reason to stop.
+  const unrecorded = (Array.isArray(envelope.unrecorded) ? envelope.unrecorded : []).filter((entry) => entry && typeof entry === 'object')
+  const confirmed = [...new Set(unrecorded.filter((entry) => entry.confirmed === true && UUID.test(entry.id ?? '')).map((entry) => entry.id.toLowerCase()))]
+  if (confirmed.length > 0) return { stop: unrecordedClaimText(claims, confirmed) }
   if (claims.length > 1) return { stop: severalClaimsText(claims) }
+  // Never tag with an older claim while a newer one is unaccounted for: the commit may
+  // be that task's. It runs as written, with a note.
+  if (unrecorded.length > 0) return { ...asked, notice: unrecordedCommitText() }
+  // No task claimed: nothing to add, so nothing to stop. git gets exactly what it was given.
+  if (claims.length === 0) return { ...asked, notice: unlinkedCommitText() }
   const id = claims[0]
 
   const next = [...args]

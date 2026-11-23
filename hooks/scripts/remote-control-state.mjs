@@ -67,6 +67,8 @@
  *   node remote-control-state.mjs manage-question describe|status
  *   printf '%s' '{"action":"list"}' | node remote-control-state.mjs manage-question use
  *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs manage-question respond
+ *   node remote-control-state.mjs tell-person describe
+ *   printf '%s' '{"message":"..."}' | node remote-control-state.mjs tell-person
  *     → capability-bound manage_plan / manage_poll / manage_directed_question for THIS Cursor conversation (no identity args)
  *   node remote-control-state.mjs stop-poller --connection-id <uuid>
  *   node remote-control-state.mjs resolve-auth
@@ -79,10 +81,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  enumerateCredentialPairs,
+  DEFAULT_MCP_URL,
+  credentialIdentity,
+  credentialStateFields,
+  envTokenNotice,
+  envTokenShadowsLogin,
+  handleCredentialRefusal,
   hostTokenFromEnv,
-  noOwningKeyError,
-  proveCredentialPair,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
 import {
@@ -91,7 +96,9 @@ import {
   LOCAL_ID_OVERRIDE_ENV_VAR,
 } from './agent-identity.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
+import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
+import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -1094,11 +1101,26 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     end_reason: prev.end_reason || 'local_stop',
     updated_at: new Date().toISOString(),
   }
-  writeJson(perPath, next)
-  // Update legacy only if it currently points at this connection (or is empty).
-  const legacy = readJson(LEGACY_PATH)
-  if (!legacy || !legacy.connection_id || legacy.connection_id === connectionId) {
-    writeJson(LEGACY_PATH, next)
+  // The disabling write and the discard of the connection's local copies of what it held
+  // for its agent's next step happen under its steps lock (step-delivery.mjs
+  // `endConnectionSteps`, which says why the discard loses nothing), so nothing is
+  // handed to the agent after the stop.
+  let steps = null
+  const markEnded = () => {
+    writeJson(perPath, next)
+    // Update legacy only if it currently points at this connection (or is empty).
+    const legacy = readJson(LEGACY_PATH)
+    if (!legacy || !legacy.connection_id || legacy.connection_id === connectionId) {
+      writeJson(LEGACY_PATH, next)
+    }
+  }
+  try {
+    steps = endConnectionSteps(connectionId, { dir: CONNECTIONS_DIR, markEnded })
+    logDiscarded('remote-control-state', connectionId, steps)
+  } catch {
+    // The lock could not be taken (its folder cannot be written): the stop still stands,
+    // and the next poller start discards what was held (discardEndedSteps).
+    if (readJson(perPath)?.enabled !== false) markEnded()
   }
   // Mark the exact conversation bond stopped (so soft-reconnect can find it).
   if (localId && agent) {
@@ -1123,6 +1145,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
     poller: killResult,
     bonds_stopped: bonds.length,
     capability_cleared,
+    steps_discarded: steps ? { notices: steps.notices, check_jobs: steps.check_jobs } : null,
   }
 }
 
@@ -1441,7 +1464,12 @@ export async function registerConnection(opts) {
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
       : null) || hostTokenFromEnv(process.env)
-  const auth = resolveAuth(cwd, { hostToken })
+  let auth = resolveAuth(cwd, { hostToken })
+  // Registering is where remote control starts: with no sign-in for the background
+  // features yet, start the one browser approval for them (item 95a67ee4).
+  if (!auth.ok && !opts.resolveAuth && ['sign_in_required', 'signed_out'].includes(auth.code)) {
+    auth = await (opts.signIn || authForConnect)(cwd, { hostToken })
+  }
   if (!auth.ok || !auth.token || !auth.mcp_url) {
     await emitPhase({
       phase: 'register_connection',
@@ -1451,9 +1479,14 @@ export async function registerConnection(opts) {
       local_id: localId,
       agent,
       mcpUrl: auth.mcp_url || null,
-      reason: auth.error || 'auth_failed',
+      reason: auth.code || auth.error || 'auth_failed',
     })
-    return { ok: false, error: auth.error || 'auth_failed' }
+    return {
+      ok: false,
+      error: auth.error || 'auth_failed',
+      ...(auth.code ? { code: auth.code } : {}),
+      ...(auth.sign_in_url ? { sign_in_url: auth.sign_in_url } : {}),
+    }
   }
 
   try {
@@ -1547,6 +1580,8 @@ export async function registerConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
+    const refused = await handleCredentialRefusal(err, auth)
+    if (refused) return { ok: false, code: refused.code, error: refused.message }
     const choice = choiceFromFailure(err)
     if (choice || projectId) {
       try { blockProjectContext(localId, auth.mcp_url, 'Choose a project explicitly with fast-connect --project <name-or-id>.', opts.projectHome, Boolean(projectId)) } catch {}
@@ -1640,6 +1675,8 @@ export async function attachConnection(opts) {
       mcpUrl: auth.mcp_url,
       reason,
     })
+    const refused = await handleCredentialRefusal(err, auth)
+    if (refused) return { ok: false, code: refused.code, error: refused.message }
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
@@ -1664,16 +1701,6 @@ export async function attachConnection(opts) {
  *   emitPhase?: typeof emitConnectPhase,
  * }} opts
  */
-async function heartbeatOwnsConnection(pair, connectionId) {
-  await mcpToolsCall({
-    mcpUrl: pair.mcp_url,
-    token: pair.token,
-    name: 'heartbeat_connection',
-    arguments: { connection_id: connectionId, status: 'live' },
-    timeoutMs: 15_000,
-  })
-}
-
 export async function writeConnectionState(opts) {
   const writeStarted = Date.now()
   const connectionId = opts.connectionId
@@ -1686,40 +1713,10 @@ export async function writeConnectionState(opts) {
     (typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
       : null) || hostTokenFromEnv(process.env)
-  let auth
-  let warning_tokens = null
-  if (resolveAuth !== resolveDevspecMcpAuth) {
-    auth = resolveAuth(cwd, { hostToken })
-  } else {
-    const { pairs } = enumerateCredentialPairs(cwd, { hostToken })
-    const proven = await proveCredentialPair(pairs, {
-      connectionId,
-      probe: opts.probe || heartbeatOwnsConnection,
-    })
-    warning_tokens = proven.warning
-    if (proven.pair) {
-      auth = {
-        ok: true,
-        token: proven.pair.token,
-        mcp_url: proven.pair.mcp_url,
-        source: proven.pair.source,
-      }
-    } else {
-      const fallback = resolveAuth(cwd, { hostToken })
-      auth = {
-        ok: false,
-        token: null,
-        mcp_url: fallback.mcp_url,
-        source: fallback.source || fallback.error || null,
-        error:
-          proven.error === 'no_proven_pair'
-            ? noOwningKeyError(pairs)
-            : proven.error === 'unproven'
-              ? 'This machine has more than one DevSpec key; the poller will not start until one is proven to own this connection.'
-              : fallback.error,
-      }
-    }
-  }
+  // One credential: DEVSPEC_MCP_TOKEN, or the plugin's own browser sign-in for its
+  // server. A browser login is recorded by its stable identity, never its token,
+  // which changes daily; every later use takes the current one (item 95a67ee4).
+  const auth = resolveAuth(cwd, { hostToken })
   const prev = readJson(connectionPath(connectionId)) || {}
   const agentName = opts.agent || prev.agent_name || AGENT_NAME
   const localId =
@@ -1741,9 +1738,8 @@ export async function writeConnectionState(opts) {
     owner_pid: ownerPid,
     mcp_url: auth.ok
       ? auth.mcp_url
-      : (auth.mcp_url || prev.mcp_url || 'https://api.devspec.ai/api/mcp'),
-    token: auth.ok ? auth.token : undefined,
-    auth_source: auth.source || auth.error || prev.auth_source || null,
+      : (auth.mcp_url || prev.mcp_url || DEFAULT_MCP_URL),
+    ...credentialStateFields(auth),
     auth_ok: !!auth.ok,
     auth_proven: !!auth.ok,
     cwd,
@@ -1782,15 +1778,17 @@ export async function writeConnectionState(opts) {
     mcp_url: state.mcp_url,
     auth_ok: state.auth_ok,
     auth_source: state.auth_source,
-    token_present: !!state.token,
+    token_present: !!auth.ok,
     local_id: localId,
     bond_path: bond ? localBondPath(agentName, localId) : null,
   }
   if (!state.auth_ok) {
     result.warning = auth.error
     result.error = auth.error || 'auth_failed'
+    if (auth.code) result.code = auth.code
+  } else if (auth.source === 'env' && envTokenShadowsLogin()) {
+    result.warning_env_token = envTokenNotice()
   }
-  if (warning_tokens) result.warning_tokens = warning_tokens
   if (!localId) {
     result.warning_local =
       'No --local-id / conversation env; soft-reconnect and already_live will not work until write is called with a local id.'
@@ -1800,8 +1798,8 @@ export async function writeConnectionState(opts) {
   if (wantPoller) {
     // Only THIS connection's poller is touched here — never another's (item 2b840556).
     const reuseRunning =
-      !!prev.token &&
-      prev.token === state.token &&
+      !!credentialIdentity(prev) &&
+      credentialIdentity(prev) === credentialIdentity(state) &&
       (prev.mcp_url || null) === (state.mcp_url || null) &&
       (Number(prev.owner_pid) || null) === (Number(state.owner_pid) || null)
     const poller = ensurePollerForConnection(connectionId, {
@@ -1959,6 +1957,32 @@ async function runCli() {
         agent: AGENT_NAME,
         hostToken: hostTokenFromEnv(process.env),
       })
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.exit(result.ok ? 0 : 1)
+  }
+
+  if (cmd === 'tell-person') {
+    const { describeTellPersonBridge, useTellPersonBridge } = await import('./tell-person-bridge.mjs')
+    if (args._[1] === 'describe') {
+      process.stdout.write(JSON.stringify(describeTellPersonBridge(), null, 2) + '\n')
+      process.exit(0)
+    }
+    if (args._[1] !== undefined) {
+      process.stderr.write('Usage: remote-control-state.mjs tell-person [describe]  (one {"message": "…"} object on stdin)\n')
+      process.exit(2)
+    }
+    let input
+    try {
+      if (process.stdin.isTTY) throw new Error('stdin required')
+      input = JSON.parse(fs.readFileSync(0, 'utf8'))
+    } catch {
+      process.stderr.write('tell-person requires one JSON object on stdin: {"message": "…"}\n')
+      process.exit(2)
+    }
+    // Identity is host-derived only, as for the other bridges: no --connection-id /
+    // --local-id / --capability escape hatch.
+    const localId = detectLocalId({}, process.env).local_id
+    const result = await useTellPersonBridge(input, { localId, agent: AGENT_NAME })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
   }
@@ -2335,9 +2359,6 @@ async function runCli() {
     })
     if (result.warning_poller) {
       process.stderr.write(`remote-control-state: ensure-poller failed — ${result.warning_poller}\n`)
-    }
-    if (result.warning_tokens) {
-      process.stderr.write(`remote-control-state: ${result.warning_tokens}\n`)
     }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)

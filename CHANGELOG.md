@@ -1,5 +1,173 @@
 # Changelog
 
+## 0.33.0
+
+- **The plugin reads DevSpec's answers correctly while your project is paused or your organisation is out of funds.** In those cases DevSpec adds a short notice after its answer, as it does when an agent uses DevSpec without the plugin. The plugin read the answer and the notice together as one, so it could read neither: connecting remote control failed as though DevSpec had not answered, and the conversation did not take the project you chose. The plugin now reads DevSpec's answer on its own and keeps the notice beside it, so a notice is never dropped and a refusal is still a refusal.
+- **Ending your agent from DevSpec now stops the commands it was running too.** When you press End, the plugin closes Cursor, but a command Cursor had started, such as a long test run or a server, kept running on your computer afterwards. Now every command that Cursor process started is asked to stop, and anything still running five seconds later is stopped outright. Nothing else on your computer is touched, and End still closes only the Cursor session that was connected, and only when you press End.
+- **Cursor no longer logs the plugin's hooks as failed.** Cursor counted a hook that had nothing to say as a failure, so its hook log filled with hundreds of them a session; every hook now gives Cursor an explicit answer. If your shell is zsh (the default on macOS), the hooks that check for waiting work also failed outright after every tool call whenever nothing was waiting; they now behave the same in every shell.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.32.0
+
+- **Your Cursor agent keeps hearing from DevSpec however long its session runs.** Cursor stops telling the agent about a background command once that command has printed a thousand matches of what the agent asked to be told about. The command the agent keeps running to hear about your messages from a room, DevSpec's notices and the checks it asks the agent to rule is one of those, so after about a thousand of them in one session the agent stopped hearing about anything new, and nothing anywhere said so. The plugin now hands over to a new command before Cursor's limit: from halfway there, each time the agent reads what has arrived it is asked to start a new one, which takes over, and the old one stops by itself just short of the limit, after which the agent is told to start the new one straight away.
+- **Nothing is missed or handed over twice across the switch.** Whatever arrives while the new command starts is announced by the new one, nothing the old one announced is announced again, and the two never run at once.
+- When several things arrive within a few seconds, Cursor tells the agent once and names only the last of them. The agent reads everything that has arrived each time it is told, so nothing is missed this way either.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.31.0
+
+- **A long message you send your Cursor agent from a DevSpec room is no longer cut when it arrives alongside another.** When the agent was told something had arrived from DevSpec, it read everything the plugin had received since it connected from one file. Each delivery fitted what Cursor shows the agent from one command, but two of them together, such as a long message and the line pointing to its project records, could add up to more than that, and Cursor then left out the middle, which could be the middle of your message. It could also hand the agent again messages it had already acted on.
+- **The agent now gets what arrived through one plugin command, and never reads that file itself.** When Cursor lets the agent know something has arrived, what it passes on names the command to run. That command shows exactly what the agent hasn't seen yet, oldest first, each whole, and never more than Cursor shows from one command. If more is waiting, it says how many, and the agent runs it again before acting. Anything too long to show whole is saved complete to a file the agent is pointed to, so nothing is cut. Something counts as seen only once the command has shown it: if showing it fails, it is shown again next time.
+- The background command that listens for DevSpec now only announces that something has arrived; it no longer copies what arrived into its own output.
+- **When a message from the room can't reach the agent yet, the room is told in plain words.** The room hears that the message couldn't be saved on the computer the agent runs on, that this usually means a full disk or a DevSpec folder that can't be written to, and that the agent keeps trying and nothing is lost. The system's own error, which names folders on that computer, now stays in the agent's local log and no longer appears in the room.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.30.0
+
+- **Messages you send your Cursor agent from a DevSpec room now arrive with what your project has already decided.** For each message you send from a room, and each automation run, DevSpec looks up the project's records that bear on it (requirements, decisions, conventions, documents, plans and past work) and the agent receives them together with your message, before it starts. It is the same recall the other DevSpec agents get. A record the agent has already been shown in the conversation is not repeated until someone changes it, and after Cursor compacts the conversation it can be shown again.
+- **Nothing is cut, your message least of all.** The records always go to a file the agent is pointed to, right after your message, and they count as seen only once the agent has read that file. Your message itself arrives whole whenever Cursor can show it whole; only a message too long for that goes, with its records, into one file the agent is told to read before it does anything, so a long message is no longer cut in the middle. If that file can't be saved on your computer, the message waits and the plugin keeps trying, and the room is told once that the agent hasn't received it yet; a message short enough to show whole is never held up this way, and arrives with a line saying its records come next time. If DevSpec can't look the records up within a few seconds, your message is delivered without them.
+- Prompts you type in the terminal don't get this yet. Cursor skips the plugin's step before a typed prompt unless you have a Cursor hooks file of your own, which Cursor is tracking as a bug; typed prompts will get it once Cursor fixes that. Checks DevSpec asks the agent to rule, and DevSpec's notices about the agent's work, don't get it either.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.29.0
+
+- **Your Cursor agent now hears about checks and problems with its own work while it is still working, not only once it has finished.** When DevSpec asks the agent to rule a check, or tells it something about its own work (a conflict with a decision, a held change, a failed check), the agent gets it after the step it is on finishes, never in the middle of one. Everything that arrived meanwhile comes together, so the agent deals with all of it in one pause and then carries on with what you asked. Until now it ran on to the end of its task first, however long that took.
+- **Nothing reaches the agent twice, and nothing is lost.** The agent reads what arrived from a short file the plugin points it to, and the plugin keeps pointing until the agent has read all of it. Anything it hasn't read by the time it stops, for example because it finished without another step, reaches it once it stops, as a short message pointing it to the same file, and keeps coming back until the agent has read it. A check that DevSpec has already settled in the meantime is dropped instead of being handed over.
+- **If remote control ends while something is still waiting**, the plugin lets its copy go. DevSpec keeps the check and the notice, and you still see them in the project's Review.
+- **Helper agents are left alone.** When your agent hands part of its work to a helper agent, the helper doesn't receive any of this; your agent gets it at its own next step.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.28.0
+
+- **The room stops showing your Cursor agent as Working once it has finished.** Cursor's command-line agent currently skips the plugin's end-of-turn step unless you have a Cursor hooks file of your own, which most people don't. Until now that left the room showing the agent as Working for up to an hour after it had answered. The plugin now notices the end of each turn in the conversation Cursor keeps on your machine, and tells DevSpec within a few seconds which of your messages the turn finished.
+- **When a turn ends in an error, or someone stops it, the room is told.** It quotes Cursor's own message, such as a usage limit, so you can see from your phone why the agent didn't finish, even though Cursor skipped the end-of-turn step. When the turn that ended was one you typed in the terminal, the room is told straight away and stops showing the agent as Working. Your messages from the room that are still waiting are left as they are. Cursor runs a waiting message once you send your next prompt, and when it does, the room shows Working again until the agent has answered. When the turn was working on one of your messages, that message gets the reply. When the plugin can't see which kind of turn it was, for example when Cursor stopped before writing anything, it tells the room straight away. If Cursor then stays idle for 15 seconds, it replies to each waiting message, saying only what is certain: that Cursor stopped or hit an error before answering, and that if Cursor runs the message later, its answer will still appear here. If you have a Cursor hooks file of your own, Cursor's end-of-turn step replies straight away instead.
+- **Each turn's end is reported once.** If you do have a Cursor hooks file of your own, or once Cursor fixes this on its side, the end-of-turn step and the plugin's own check never both report the same turn. If DevSpec can't be reached just then, the plugin tries again shortly, without telling the room twice. If the conversation can't be read for a moment, the plugin reads it again rather than missing that turn.
+- **Nothing in your Cursor settings is changed.** If Cursor changes how it records a conversation, the plugin stops noticing turn ends rather than guessing, and the room behaves as it did before this release. It never reports a turn as finished while it is still running.
+- Prompts you type in the terminal still aren't shown in the room; that waits for Cursor's fix.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.27.0
+
+- **Your Cursor agent now follows DevSpec's own rules for work that has to wait, rather than the plugin's copy of them.** Work waiting for someone's OK, or for its checks, stays on its own branch, and the agent does what DevSpec's message about that wait says. It no longer holds out for an OK when fixing the work is what clears it, and it stays right when DevSpec's rules change.
+- **Keeping work that undoes an earlier decision follows DevSpec's rule too.** When DevSpec turns an answer down, the agent does what DevSpec says to do instead.
+- **Checks go where DevSpec sends them.** The agent no longer assumes every check on its own work comes back to it. When it hands work in while checks on it are still waiting for it, it deals with them as DevSpec asks, and before it rules a check it reads DevSpec's instructions on how, including when to hand the check to a helper agent.
+- **The agent no longer records decisions or writes documents on its own initiative while connected.** It records a decision only once you confirm it was deliberate and say why, and it keeps plans and status notes out of your documents.
+- **Smaller corrections.** A room started with `--new` is shared with your project unless you ask for a private one, and the agent no longer treats sharing as something to avoid. It describes the room updates it actually receives. It links a task to the ticket, issue or error it resolves from another tool. A Dependabot or Renovate update that changes only dependencies is reviewed with DevSpec's dependency review instead of a task. When DevSpec's tools are missing, it tells you to start a new `cursor-agent` session.
+- **Nothing the plugin hands your agent is cut or silently lost.** Cursor passes on at most 10,000 characters from all of the plugin's notes after a step together, and drops all of them when they run over. Each note now keeps to its share and puts anything longer in a file the agent is told to read. Because other hooks on the same step can still push it over, and Cursor gives no sign either way, your project's rules, a message for you, unread room messages, a note about a commit that went untracked, a problem with the project pin, and a repository you need to link are offered again after every step until the agent has read them, and rules that change and then change back, or a chat you resume or that Cursor compacts, are offered again too; the rules now always arrive as a file the agent reads, with the same short line each time. When several notes wait at once, each gets a short line of the same length, the ones the agent can read come first, and a count of all of them always arrives; if part of a note cannot be read back from disk, the note is kept, and a small status file beside it says which parts and how to retry. A file longer than one command's output comes in numbered parts, cut only between whole lines or whole characters so emoji and accented or non-Latin text survive intact, and each part carries its own length and checksum, so it counts as read only once every part came back whole, never when Cursor kept just its beginning and end. Reading the room's unread messages prints no more than Cursor shows the agent from one command (20,000 characters, and 40,000 bytes, past which Cursor shows a file path instead of the output), so a long backlog, in any language, arrives in whole pages instead of losing its middle; a page, or a long message handed over as a file, counts as read only once it came back whole, and a message too long for a page, attachments and all, is handed over whole as a file.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.25.1
+
+- **Your Cursor agent no longer posts its working notes to the room after dealing with a DevSpec notice.** When DevSpec wakes the agent with a notice about its own work and the agent settles it with nothing left for you to decide, the room now shows only DevSpec's own quiet note that it was handled. Until now, when the agent finished such a turn without posting, the plugin took whatever the agent last wrote in its terminal, including sign-off notes and internal references, and posted it into the room as the agent's reply to the notice.
+- **When a notice still needs you, the agent tells you itself**, as a reply to that notice, exactly once. The plugin no longer posts anything on its behalf.
+- **You still hear when the agent changes someone else's work while handling a notice or a check.** When something it does then changes another person's record or marks a task blocked, DevSpec asks the agent to tell you, and the agent now does so with its own message in the room, even when it was woken only by the notice or check. If it does not, the plugin posts the agent's final message for it where Cursor runs the plugin's end-of-turn step; and if DevSpec cannot take that message, it is handed back to the agent at its next step rather than lost.
+- Messages you send from DevSpec and prompts you type in the terminal are answered as before.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.25.0
+
+- **When Cursor stops your connected agent because you've hit a usage limit, DevSpec now knows.** The plugin tells DevSpec as soon as it sees Cursor's usage-limit message, so DevSpec can send that agent's checks to another agent instead of leaving them waiting on one that cannot run. If Cursor says when the limit lifts, DevSpec is told that time; otherwise it is told for 15 minutes from the stop, and again each time Cursor stops the agent.
+- **The agent is offered checks again after its next turn that runs normally.**
+- **Only Cursor's own usage-limit message counts.** Any other error, such as a service throttling requests, a full disk, a dropped connection, a model your plan doesn't include, or you stopping the turn yourself, is never reported as a usage limit. If Cursor changes the wording of that message, the plugin stops reporting usage limits rather than guessing.
+- This works whether or not Cursor runs the plugin's end-of-turn step, because the plugin also reads how each turn ended from the conversation itself.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.24.0
+
+- **A message you send from DevSpec while the agent is busy now shows as started.** Each time the plugin hands your Cursor agent a message from a DevSpec room, it tells DevSpec exactly which message it has started, including one that arrives while the agent is already working on something else. Before, a message sent mid-task could show as never picked up, even though the agent went on to answer it.
+- **A check or an automation run never marks one of your messages as started.** When DevSpec sends the agent a check to rule or an automation run to carry out, the plugin no longer reports picking anything up, so it can no longer mark whichever message you sent last as started. The agent still shows as working while it rules the check or does the run.
+- **When a turn ends, the plugin says which messages it finished.** It names each message the turn started with, or says the turn started with none, so a message that arrives just as a turn ends is never marked finished before the agent has seen it. A message that arrives while the agent is busy is finished by the agent's own answer to it.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.23.0
+
+- **Your Cursor agent now writes a task's reason the way you gave it.** Before, it was told to write its own summary of why a task exists. Now it records the reason you actually gave, in your everyday words, and never one you did not give.
+- **How it keeps your decisions now follows DevSpec's own rules directly**, rather than the plugin's copy of them, so it stays in step when those rules change. As before, it records a decision only once you confirm it was deliberate and say why.
+- **It suggests a requirement when one comes up, and never saves one without your yes.** When you point out a mistake that keeps coming back across tasks, or state a project-wide "always" or "never" rule, the agent explains what a requirement is and how it differs from a recorded decision, and asks whether you want one.
+- **It works to the decisions, conventions and requirements that come with a task,** and when it hands the work in it records which of your requirements the work was seen to meet.
+- **When something it is about to save overlaps a record you already have, it prefers updating that record** to adding a near-duplicate, and checks your existing documents before writing a new guide or runbook.
+- **What it records is easier to find later:** a record's summary says when to reach for it, and a runbook is linked to the decision it carries out.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.22.2
+
+- **Connecting and disconnecting remote control now always run the newest copy of the plugin you have installed.** Cursor keeps the older copies of a plugin on disk after you update it. Until now, the agent could pick whichever copy it came across first, so after an update it could still start the old version's background helper. It now picks the copy with the highest version, and among copies of the same version, the one that arrived most recently.
+- **When no installed copy can be found, the agent tells you so** and asks you to reinstall the plugin, instead of carrying on and failing with a confusing error.
+- **You can name the agent when you connect it.** `--name "…"` gives this agent the name you choose on the Agents page instead of a made-up one. The agent now recognises it alongside the other connect options.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.22.1
+
+- **DevSpec now records who asked for the requirement, inventory and dependency-review changes your Cursor agent makes.** When the agent records, updates, replaces or retracts a requirement, records, revises or retracts an inventory entry, or records a dependency review, the plugin tells DevSpec which request the change serves, as it already did for tasks, memories and documents. Until now DevSpec had to work these out for itself.
+- **Those changes also wait when one turn carries two people's requests**, until the agent says which one it is working on, like every other change that records who asked, so none is credited to the wrong person.
+- **A change is no longer refused because the command it came from has closed.** On a change that records who asked, the plugin used to send the room command the request came from beside the request itself. DevSpec refused the change once that command had closed, for example when a helper agent was still working after the agent had posted its answer, although the request said exactly who asked. The plugin now sends only the request on those changes, and never a command it remembered from earlier.
+- Unchanged: reserving and claiming a task, asking a directed question and previewing a replacement still carry the command, because DevSpec takes no request on those. There is nothing to set.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.22.0
+
+- **A commit the agent makes with no task claimed now goes through, with a note, instead of being stopped.** Work that needs no task, such as a dependency update or an automation run, commits normally. The note tells the agent the commit carries no task reference, and that if the work does belong to a task, claiming it before the next commit gets the reference added automatically. This holds both while connected and without a connection, including on native Windows.
+- **With several tasks claimed, a commit is still stopped and the agent is asked which task it belongs to.** With exactly one claimed, its reference is still added for the agent.
+- **A commit is never linked to the wrong task when the agent's newest claim could not be read.** Before, if the plugin could not read back a task the agent had just claimed, it could add an older claim's reference to the next commit. Now it never does: when DevSpec has confirmed the newer claim and the repository is certainly the project's, the commit is stopped and the agent is asked which task it belongs to, naming both; otherwise, for example when DevSpec cannot be reached, the commit goes through untagged with a note.
+- **Claiming a task by its short code works like claiming it by its full id.** The plugin now records the claim against the task's full id, so the agent's commits are tagged with it.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.21.0
+
+- **A connected Cursor agent that is waiting for work now listens instead of asking.** With remote control on, the plugin keeps one connection open to DevSpec, and DevSpec tells it the moment something arrives for it. While nothing is happening, it no longer asks DevSpec every 25 to 30 seconds whether anything has changed. It checks in once every 45 seconds, so DevSpec can keep showing it as connected. This cuts the work DevSpec does for every agent that sits connected and idle.
+- **Messages still arrive straight away.** When DevSpec pushes something, the plugin fetches it at once. When you start working, or a turn ends, the plugin tells DevSpec within about a second, as before.
+- **Nothing is missed if the open connection drops.** The plugin reconnects. If it cannot, it goes back to asking DevSpec every 25 to 30 seconds, the way earlier versions did.
+- Start a new `cursor-agent` session to pick this up. A session that is already connected keeps the earlier behaviour until it is restarted.
+
+## 0.20.3
+
+- **Align commit provenance and notice guidance with `unlinked_work` incidents.** Updated `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, and commit-provenance hook comments to point at `devspec://product/implementation-contract` (`commit_provenance_contract`, mechanical unlinked-work accountability with no automatic task creation) and removed retired auto-made task ownership wording.
+- **Passive project incident awareness and incident tools.** `devspec-remote-poll.mjs` and `devspec-remote-wait.mjs` validate and materialize `project_incidents` in `.room.json` and on canonical command / automation wakes without waking idle connections, `request-ref.mjs` stamps `report_incident` and `manage_incident`, and `rules/devspec.mdc` plus `skills/devspec-remote/SKILL.md` point to the served `semantics.project_incidents` and `core.respect-incidents-and-escalate-delivery-blockers` contract rules.
+
+## 0.20.2
+
+- **Post-action room silence on settled notices.** `rules/devspec.mdc`, `skills/devspec-remote/SKILL.md`, `NOTICE_HANDLING`, and `noticeReplyInstruction` now align with `semantics.notice_audience` and `semantics.notice_reply` in `devspec://product/remote-ingress-contract`: findings covered by explicit conversation intent are settled quietly in place without posting a room acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`). `isForTheRecordRefusal` also treats settled-housekeeping receipts as quiet outcomes.
+
+## 0.20.1
+
+- **Browser sign-in polish.** The local browser callback page now renders with the DevSpec logo and adapts cleanly to light and dark mode, the login helper places the browser link on its own line with a clearer remote-machine `--code` hint, sign-in confirmation prompts you to restart Cursor to finish connecting, and the Quick Start copy no longer mentions the retired token setup to new users.
+
+## 0.20.0
+
+DevSpec for Cursor signs in through your browser. There is no token to create, copy or paste any more.
+
+- **The agent's DevSpec tools sign in with Cursor's own sign-in.** In `cursor-agent`, type `/mcp`, open DevSpec and choose **Login**: your browser opens DevSpec's approval page for Cursor, and one click on **Allow** gives the agent its tools. The plugin's settings no longer ask for a token.
+- **Remote control and commit tracking ask once more, the first time.** They run in the background, where Cursor can't share its sign-in, so the first `/devspec-remote` opens DevSpec's approval page again, for the same Cursor app, and connects once you click **Allow**. Several things asking at once still open one approval. On a machine your browser can't reach, such as one you work on over SSH, you get a link instead and paste back the code the page shows.
+- **You stay signed in.** Both sign-ins renew themselves until you sign out or disconnect Cursor on DevSpec's Agent setup page. If remote control's sign-in stops working, it stops and tells you why, in DevSpec's own words, and how to sign in again, instead of going quiet.
+- **No second copy of a token in Cursor's settings.** The plugin no longer reads `~/.cursor/mcp.json` or any other tool's settings, and the step that pasted a token there is gone, with the helper that wrote it. If you added a `devspec` entry with a token there for an earlier version, remove it: while it is there, Cursor uses that token instead of signing in.
+- **Pointing at another DevSpec server needs no settings file.** Start `cursor-agent` with `DEVSPEC_API_URL` and `DEVSPEC_CURSOR_CLIENT_ID` set, and both the agent's tools and the background features use that server. Each server keeps its own sign-in, so switching back needs no new approval.
+- **Machines with no browser** still use `DEVSPEC_MCP_TOKEN` for the background features. It takes precedence over a browser sign-in, and the plugin says so, and how to remove it, whenever both are present.
+
+## 0.19.0
+
+Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.
+
+- **More checks come to the agent.** The plugin now takes check jobs in DevSpec's version 2. Besides tasks, decisions, documents and pending versions, a check can now be about a settled discussion point, a Goal, or the whole backlog: when a discussion point settles or a Goal changes, the agent can check which open tasks it leaves out of date, and the Tasks page's out-of-date scan of the whole backlog can come to the agent too. The wake line says which it is. Check jobs no longer carry a high-risk count.
+- **Only what needs you reaches the room.** DevSpec now labels every notice it sends the agent: it needs a person, or it is for the record. The agent replies in the room only to notices that need a person. A notice for the record, such as a pending edit going live or which task its own commit belongs to, gets no reply: any tidying it asks for is done quietly, and a turn woken only by such notices posts nothing. If tidying up ever changes someone else's record, DevSpec says so and the agent tells you what it changed.
+- **Ruling checks stays out of the room.** The agent's instructions now say never to post about ruling a check job. Rulings show on the record and in Review, and anything that needs you arrives afterwards as its own notice.
+- **A duplicate of your own task is folded in quietly.** When a check finds that a task the agent wrote duplicates one of yours, the agent adds anything new to yours and closes its own without a word in the room. The rule the agent follows now points at DevSpec's own rule for duplicates instead of restating it, so it can no longer fall out of step with DevSpec.
+
+## 0.18.2
+
+- When DevSpec's check finds that a task your Cursor agent just wrote duplicates one that already exists, the agent now sorts it out there and then instead of leaving a flag for later. If the existing task is yours, or one you're allowed to change, it adds anything new to it, closes the new one as its duplicate and tells you. If it's someone else's, it asks you whether to add to it, which waits for that person's OK, or to keep yours separate, recorded as not a duplicate with your reason.
+
+## 0.18.1
+
+When your agent revises a decision, convention or requirement, DevSpec may now accept the change and hold it until its checks are ruled. The remote skill now tells the agent what that result means: accepted but not in effect yet, taking effect by itself once checked or waiting for the OK of the person it names, with DevSpec's own note on the result saying where it stands.
+
+## 0.18.0
+
+Your Cursor agent can now rule DevSpec's checks itself, starting with the checks on its own changes.
+
+- **Checks arrive as check jobs.** When the agent is connected to DevSpec, the plugin tells DevSpec it can take check jobs. Each check DevSpec runs on a change (a conflict, a clash with a decision, a duplicate, something out of date) can then come to the agent as a check job, beside automation runs. The agent is woken with one line naming the record. It takes the job, rules every entry with the definition the job carries, and carries on with what it was doing.
+- **Only the two shapes DevSpec sends.** The plugin accepts an automation run exactly as before, or a check job, and still refuses anything else. A check job is kept once, however often DevSpec lists it.
+- **Working while it rules.** The agent shows as working while it rules a job, and stops when the turn ends. DevSpec uses this to hand a job nobody took to the next agent in line. Ruling a check posts nothing to the room unless the agent has something to tell you.
+
 ## 0.17.1
 
 The install page now reads like DevSpec's other plugin pages, for the Cursor Marketplace listing.

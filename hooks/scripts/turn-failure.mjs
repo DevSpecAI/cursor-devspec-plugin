@@ -20,49 +20,29 @@
  *
  * This is the one case a hook answers a room command (ADR b98a39a9 keeps answers
  * agent-canonical): only a command the turn carries and nobody has answered yet.
+ *
+ * A turn the room saw working that carries no such command (a check job, an
+ * automation run, a prompt typed at the terminal, or a command that was answered before
+ * Cursor stopped) is told the same words as a room message of its own (`notice`, item
+ * 45eb0708): otherwise Working would clear with no explanation. It is posted to the room
+ * by `session_id`, without `connection_id`, which `post_session_message` documents as a
+ * post tied to no turn: it joins no command's turn and answers nothing (DevSpec
+ * 59acf1bfe). A connection post would join the connection's current turn, or, with none
+ * open, be bound to the last command's attempt even after that was answered, and the
+ * assistant-speech lane is annotated with the open turn and quotes the current command.
  */
 
-import fs from 'node:fs'
 import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
 import { fitRoomMessage } from './room-message.mjs'
+import { lastTurnEnd } from './transcript-turn-end.mjs'
 
-// How much of the transcript's end is read to find the turn's turn_ended line. Cursor
-// writes it as the turn's final line, so it sits within the last few hundred bytes;
-// this bound only stops a huge transcript being read whole on every failed turn.
-const TRANSCRIPT_TAIL_BYTES = 256 * 1024
-
-/** Cursor's own error text for the turn that just ended, or null. */
+/**
+ * Cursor's own error text for the turn that just ended, or null: the transcript's last
+ * turn end (transcript-turn-end.mjs), when it is an error.
+ */
 export function lastTurnError(transcriptPath) {
-  if (typeof transcriptPath !== 'string' || !transcriptPath) return null
-  let tail
-  try {
-    const fd = fs.openSync(transcriptPath, 'r')
-    try {
-      const size = fs.fstatSync(fd).size
-      const length = Math.min(size, TRANSCRIPT_TAIL_BYTES)
-      const buffer = Buffer.alloc(length)
-      fs.readSync(fd, buffer, 0, length, size - length)
-      tail = buffer.toString('utf8')
-    } finally {
-      fs.closeSync(fd)
-    }
-  } catch {
-    return null
-  }
-  const lines = tail.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    let entry
-    try {
-      entry = JSON.parse(lines[i])
-    } catch {
-      continue // blank, or the partial first line of the tail
-    }
-    if (entry?.type !== 'turn_ended') continue
-    // Only this turn's end counts: a completed turn_ended means no error was written.
-    if (entry.status !== 'error') return null
-    return typeof entry.error === 'string' && entry.error.trim() ? entry.error.trim() : null
-  }
-  return null
+  const end = lastTurnEnd(transcriptPath)
+  return end?.status === 'error' ? end.error : null
 }
 
 /**
@@ -82,9 +62,96 @@ export function parseTurnFailure(raw) {
   return { status: 'error', text: lastTurnError(data.transcript_path) }
 }
 
+/**
+ * The room message for a failed turn that answers no command: by `session_id` alone, so
+ * DevSpec ties it to no turn (see the header).
+ */
+export function turnFailureNotice({ sessionId, agentName, message }) {
+  return { session_id: sessionId, agent_name: agentName, message, turn_kind: 'agent', phase: 'answer' }
+}
+
+/**
+ * Tell the room about a failed turn in a message of its own, answering nothing: for a
+ * turn end that cannot be tied to the room command beyond doubt (transcript-turn-end.mjs).
+ * It says only what is certain (turnNoticeMessage); the commands are answered at the
+ * settle point. `post(args)` posts with post_session_message.
+ */
+export async function postTurnNotice({ failure, sessionId, agentName, post }) {
+  if (!failure || !sessionId) return false
+  const message = fitRoomMessage(turnNoticeMessage(failure, agentName), {
+    whereRest: `The full error is in ${agentName}'s terminal.`,
+  })
+  await post(turnFailureNotice({ sessionId, agentName, message }))
+  return true
+}
+
+/**
+ * The notice for a turn end not tied to a command beyond doubt: that a turn ended in an
+ * error, in Cursor's own words, or was stopped at the terminal. Nothing about which
+ * message it was working on, nor to send one again: Cursor may still run it.
+ */
+export function turnNoticeMessage(failure, agentName) {
+  if (failure.status === 'aborted') return `${agentName} was stopped at its terminal.`
+  const lead = failure.text
+    ? `${agentName} ended a turn with an error. It said:\n\n${quote(failure.text)}`
+    : `${agentName} ended a turn with an error; its terminal shows what went wrong.`
+  return `${lead}\n\nAnything it asks you to do happens in ${agentName} on the computer it's running on.`
+}
+
+/** The failure in the room's words, quoted whole up to the room's own limit, then cut visibly. */
+function failureRoomMessage(failure, agentName) {
+  return fitRoomMessage(turnFailureMessage(failure, agentName), {
+    whereRest: `The full error is in ${agentName}'s terminal.`,
+  })
+}
+
 /** Quote text as a Markdown block, line by line, so Cursor's words stand apart from ours. */
 function quote(text) {
   return text.split(/\r?\n/).map((line) => `> ${line}`.trimEnd()).join('\n')
+}
+
+/**
+ * What a room command is told when the turn that ended cannot be tied to it beyond
+ * doubt (transcript-turn-end.mjs, the settle point): only what is certain. A turn ended,
+ * in an error (in Cursor's own words) or stopped at the terminal, before the command was
+ * answered, and if Cursor runs the command later its answer still reaches the room. It
+ * never says the command itself failed or was stopped: Cursor may hold it and run it
+ * after the person's next turn (measured after Ctrl+C).
+ */
+export function uncertainTurnFailureMessage(failure, agentName) {
+  const later = `If ${agentName} runs it later, its answer will appear here.`
+  if (failure.status === 'aborted') {
+    return `${agentName} was stopped at its terminal before it answered this. ${later}`
+  }
+  const lead = failure.text
+    ? `${agentName} ended a turn with an error before it answered this. It said:\n\n${quote(failure.text)}`
+    : `${agentName} ended a turn with an error before it answered this; its terminal shows what went wrong.`
+  return `${lead}\n\nAnything it asks you to do happens in ${agentName} on the computer it's running on. ${later}`
+}
+
+/**
+ * Answer the room commands a settled turn end left unanswered (`requestIds`, the ones
+ * picked up before it), once, with uncertainTurnFailureMessage, and mark them answered
+ * so the turn end's request bookkeeping closes them. Posted with the connection, as a
+ * failure reply is: DevSpec binds it to the connection's last command even once that
+ * turn has closed. Returns the request ids answered; none when every one was already
+ * answered or closed (nothing is posted then).
+ */
+export async function answerUnsettledCommands({ failure, requestIds = [], connectionId, post, dir, agentName }) {
+  if (!failure || !connectionId) return []
+  const state = readRequestState(connectionId, { dir })
+  const ids = [...new Set(requestIds)].filter((id) => state.open.get(id)?.kind === 'command' && !state.open.get(id)?.answered)
+  if (ids.length === 0) return []
+  await post({
+    connection_id: connectionId,
+    agent_name: agentName,
+    message: fitRoomMessage(uncertainTurnFailureMessage(failure, agentName), {
+      whereRest: `The full error is in ${agentName}'s terminal.`,
+    }),
+    complete_turn: true,
+  })
+  for (const id of ids) appendRequestEvent(connectionId, { op: 'answered', id }, { dir })
+  return ids
 }
 
 /** What the room is told. */
@@ -100,22 +167,40 @@ export function turnFailureMessage(failure, agentName) {
 
 /**
  * Answer the room commands a failed turn carries, once, and mark them answered so the
- * stop's request bookkeeping closes them. Returns the command ids answered; none when
- * the turn completed, was typed at the terminal, or was already answered.
- * `post(args)` posts with post_session_message.
+ * turn end's request bookkeeping closes them. Returns the command ids answered; none
+ * when the turn completed, carried no unanswered command, or was already answered.
+ * With `notice` and the room's `sessionId`, a failed turn that carries no unanswered
+ * command is told to the room in a message of its own (turnFailureNotice). The failure is the stop hook's input (`raw`), or one
+ * the caller already read from the transcript (`failure`, as parseTurnFailure returns
+ * it: the poller, when Cursor runs no stop hook, transcript-turn-end.mjs). `post(args)`
+ * posts with post_session_message.
  */
-export async function postTurnFailure({ raw, connectionId, post, dir, agentName }) {
-  const failure = parseTurnFailure(raw)
+export async function postTurnFailure({
+  raw = null,
+  failure: given = undefined,
+  connectionId,
+  sessionId = null,
+  post,
+  dir,
+  agentName,
+  notice = false,
+  requestIds = null,
+}) {
+  const failure = given === undefined ? parseTurnFailure(raw) : given
   if (!failure || !connectionId) return []
+  // `requestIds`, when given, are the only commands the turn may answer: the poller's,
+  // for the commands that started a room command's turn (transcript-turn-end.mjs).
   const commands = commandsAnsweredNow(readRequestState(connectionId, { dir }))
-  if (commands.length === 0) return []
+    .filter((id) => !Array.isArray(requestIds) || requestIds.includes(id))
+  const message = failureRoomMessage(failure, agentName)
+  if (commands.length === 0) {
+    if (notice && sessionId) await post(turnFailureNotice({ sessionId, agentName, message }))
+    return []
+  }
   await post({
     connection_id: connectionId,
     agent_name: agentName,
-    // Cursor's error text is quoted whole; only past the room's own limit is it cut, visibly.
-    message: fitRoomMessage(turnFailureMessage(failure, agentName), {
-      whereRest: `The full error is in ${agentName}'s terminal.`,
-    }),
+    message,
     complete_turn: true,
   })
   for (const id of commands) appendRequestEvent(connectionId, { op: 'answered', id }, { dir })

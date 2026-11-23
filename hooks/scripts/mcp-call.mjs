@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { activeDiagnostics, appendDiagnostic } from './local-diagnostics.mjs'
 import { classifyProgressFailure } from './progress-diagnostics.mjs'
+import { readToolReply, REPLY_NOTICES_KEY } from './tool-reply.mjs'
 
 /** Ceiling for MCP tools/call when the caller does not pass timeoutMs. */
 export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
@@ -31,7 +32,7 @@ export const DEFAULT_MCP_CALL_TIMEOUT_MS = 30_000
  * Every MCP request the plugin's own scripts make (poller, wait, mirror-turn,
  * connect, plan/question bridges, trail) goes through here, so this is where they
  * all say which plugin they are. Cursor's own MCP client sends the same header from
- * ~/.cursor/mcp.json, which scripts/setup-cursor.mjs writes (item f6566758).
+ * the plugin's mcp.json, beside its own browser sign-in (items f6566758, 95a67ee4).
  */
 export function mcpRequestHeaders({ token, connectionCapability = null }) {
   return {
@@ -150,8 +151,18 @@ export async function mcpToolsCallWithRetry(args = {}, retryOptions = {}) {
   }
 }
 
+/**
+ * DevSpec refused a tool call (`isError`). `message` is DevSpec's answer (the first text
+ * block), `details` its structured refusal, and `notices` whatever DevSpec appended
+ * after the answer, as tool-reply.mjs reads them (an empty list when nothing was).
+ */
 export class CursorMcpRefusal extends Error {
-  constructor(text, details) { super(text); this.name = 'CursorMcpRefusal'; this.details = details }
+  constructor(text, details, notices = []) {
+    super(text)
+    this.name = 'CursorMcpRefusal'
+    this.details = details
+    this.notices = notices
+  }
 }
 
 export async function mcpToolsCall(options) {
@@ -276,26 +287,29 @@ async function performMcpToolsCall({
     throw new Error(payload.error.message || JSON.stringify(payload.error))
   }
 
-  // tools/call result content is usually { content: [{ type:'text', text:'...' }], isError? }
+  // tools/call result content is usually { content: [{ type:'text', text:'...' }], isError? }.
+  // DevSpec's answer is the first text block; anything it appended after it (an account,
+  // plugin or health notice, a tell_person mark) travels beside the answer under
+  // REPLY_NOTICES_KEY, or on the refusal's `notices`, and is never dropped (tool-reply.mjs).
   const content = payload.result?.content
   if (Array.isArray(content)) {
-    const textParts = content
-      .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
-      .map((c) => c.text)
-    const joined = textParts.join('\n')
+    const reply = readToolReply(payload.result)
+    const { notices } = reply
     if (payload.result?.isError) {
       let details = payload.result.structuredContent
-      if (!details) { try { details = JSON.parse(joined) } catch {} }
-      throw new CursorMcpRefusal(joined || 'MCP tool error', details)
+      if (!details && reply.readable) details = reply.answer
+      throw new CursorMcpRefusal(reply.answerText || 'MCP tool error', details, notices)
     }
+    const { _meta: _hiddenMeta, ...publicResult } = payload.result ?? {}
     let data
-    try {
-      data = JSON.parse(joined)
-    } catch {
-      const { _meta: _hiddenMeta, ...publicResult } = payload.result ?? {}
-      data = { raw: joined, result: publicResult }
+    if (reply.readable && (notices.length === 0 || (reply.answer && typeof reply.answer === 'object' && !Array.isArray(reply.answer)))) {
+      data = notices.length > 0 ? { ...reply.answer, [REPLY_NOTICES_KEY]: notices } : reply.answer
+    } else {
+      // An answer that is no JSON, or no object that can carry the notices beside it:
+      // the reply whole (every block is in `result`), with the notices read out too.
+      data = { raw: reply.answerText ?? '', result: publicResult, ...(notices.length > 0 ? { [REPLY_NOTICES_KEY]: notices } : {}) }
     }
-    return includeMeta ? { data, meta: payload.result?._meta ?? null } : data
+    return includeMeta ? { data, meta: payload.result?._meta ?? null, notices } : data
   }
   const source = payload.result ?? payload
   const hiddenMeta = source && typeof source === 'object' && !Array.isArray(source)
