@@ -67,13 +67,14 @@ jobs:
         run: |
           TMPHOME="$(mktemp -d)"
           trap 'rm -rf "$TMPHOME"' EXIT
-          # --test-concurrency=2 matches the 2-vCPU ubuntu-latest runner; uncapped
-          # default concurrency starved child-process timers in room-command-recall.test.mjs
+          # TEST_CONCURRENCY=2 is defined once and matches the 2-vCPU ubuntu-latest runner;
+          # uncapped default concurrency starved child-process timers in room-command-recall.test.mjs
           # (run 45418068651), while concurrency=2 passed all 1,320 tests in 5m31s.
+          TEST_CONCURRENCY=2
+          ENV_ARGS=(HOME="$TMPHOME" PATH="$PATH")
           if [ "$HAS_SERVER" = "true" ]; then
             SERVER_DIR="$RUNNER_TEMP/devspecv2-server"
             mv "$PWD/.devspecv2-server" "$SERVER_DIR"
-            env -i HOME="$TMPHOME" PATH="$PATH" DEVSPEC_V2_ROOT="$SERVER_DIR" node --test --test-concurrency=2 hooks/scripts/*.test.mjs scripts/*.test.mjs
-          else
-            env -i HOME="$TMPHOME" PATH="$PATH" node --test --test-concurrency=2 hooks/scripts/*.test.mjs scripts/*.test.mjs
+            ENV_ARGS+=(DEVSPEC_V2_ROOT="$SERVER_DIR")
           fi
+          env -i "${ENV_ARGS[@]}" node --test --test-concurrency="$TEST_CONCURRENCY" hooks/scripts/*.test.mjs scripts/*.test.mjs
