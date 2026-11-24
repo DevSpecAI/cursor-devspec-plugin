@@ -1,0 +1,72 @@
+name: Cursor plugin checks
+
+on:
+  pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cursor-plugin-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Check whether DevSpecV2 read token is configured
+        id: server-token
+        env:
+          TOKEN: ${{ secrets.DEVSPEC_V2_READ_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEVSPEC_V2_READ_TOKEN is not configured; server-source parity tests in server-tool-names.test.mjs will skip until a read-only DevSpecV2 token secret is added."
+          fi
+
+      - name: Checkout DevSpecV2 staging for server-surface checks
+        if: steps.server-token.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: DevSpecAI/DevSpecV2
+          ref: staging
+          token: ${{ secrets.DEVSPEC_V2_READ_TOKEN }}
+          persist-credentials: false
+          path: .devspecv2-server
+
+      - name: Install DevSpecV2 dependencies for server-surface checks
+        if: steps.server-token.outputs.available == 'true'
+        working-directory: .devspecv2-server
+        run: npm ci --ignore-scripts
+
+      - name: Run full Cursor plugin test suite in clean environment
+        env:
+          HAS_SERVER: ${{ steps.server-token.outputs.available }}
+        run: |
+          TMPHOME="$(mktemp -d)"
+          trap 'rm -rf "$TMPHOME"' EXIT
+          if [ "$HAS_SERVER" = "true" ]; then
+            SERVER_DIR="$RUNNER_TEMP/devspecv2-server"
+            mv "$PWD/.devspecv2-server" "$SERVER_DIR"
+            env -i HOME="$TMPHOME" PATH="$PATH" DEVSPEC_V2_ROOT="$SERVER_DIR" node --test hooks/scripts/*.test.mjs scripts/*.test.mjs
+          else
+            env -i HOME="$TMPHOME" PATH="$PATH" node --test hooks/scripts/*.test.mjs scripts/*.test.mjs
+          fi
