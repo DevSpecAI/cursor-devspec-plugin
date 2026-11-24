@@ -66,7 +66,7 @@ jobs:
           if [ "$HAS_SERVER" = "true" ]; then
             SERVER_DIR="$RUNNER_TEMP/devspecv2-server"
             mv "$PWD/.devspecv2-server" "$SERVER_DIR"
-            env -i HOME="$TMPHOME" PATH="$PATH" DEVSPEC_V2_ROOT="$SERVER_DIR" node --test hooks/scripts/*.test.mjs scripts/*.test.mjs
+            env -i HOME="$TMPHOME" PATH="$PATH" DEVSPEC_V2_ROOT="$SERVER_DIR" node --test --test-concurrency=2 hooks/scripts/*.test.mjs scripts/*.test.mjs
           else
-            env -i HOME="$TMPHOME" PATH="$PATH" node --test hooks/scripts/*.test.mjs scripts/*.test.mjs
+            env -i HOME="$TMPHOME" PATH="$PATH" node --test --test-concurrency=2 hooks/scripts/*.test.mjs scripts/*.test.mjs
           fi

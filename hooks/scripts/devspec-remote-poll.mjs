@@ -471,7 +471,9 @@ function writeState(state, connectionId) {
   }
   for (const p of paths) {
     fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    fs.renameSync(tmp, p)
   }
 }
 
