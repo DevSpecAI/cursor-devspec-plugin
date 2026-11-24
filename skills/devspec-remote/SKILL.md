@@ -104,8 +104,6 @@ Remote control and commit tracking run in helpers outside Cursor, so they hold t
 | `sign_in_code_required` | This machine is reached over SSH, so the browser cannot answer it directly. Give the person `sign_in_url`, ask them to click Allow and paste the code the page shows into the chat. Then run the `--paste` command named in `error` with their code, quoted (for example `node "$PLUGIN/scripts/devspec-login.mjs" --paste "<code>"`), and run the connect command again. |
 | `sign_in_failed`, `signed_out`, `sign_in_unavailable` | Show `error` to the person verbatim; it says what happened and how to sign in again. |
 
-If a result carries `warning_env_token`, show it to the person verbatim: `DEVSPEC_MCP_TOKEN` is set, and it overrides their browser sign-in.
-
 When the person asks to sign remote control out of DevSpec, or to see which account it uses, run `node "$PLUGIN/scripts/devspec-login.mjs" --sign-out` or `--status` and relay what it prints.
 
 ### 4. Decide the action, then register the connection
@@ -197,9 +195,9 @@ node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
 
 **Owner PID (Windows):** prefer omit, or pass `"$PPID"` / parent — the write path self-resolves up to `Cursor.exe` / CLI `agent.exe`. **Never** pass the tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`): those exit when the tool call ends and the poller dies with `owner_gone`. On POSIX, `"$PPID"` remains the correct cheap anchor.
 
-This uses the plugin's own DevSpec sign-in for the configured server (or `DEVSPEC_MCP_TOKEN` on a machine with no browser), writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
+This uses the plugin's own DevSpec browser sign-in for the configured server, writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
 
-If `auth_ok: false`, show the `warning` to the person verbatim: it says how to sign in. If the write JSON includes `warning_env_token`, show that text **verbatim** too. If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
+If `auth_ok: false`, show the `warning` to the person verbatim: it says how to sign in. If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
 
 Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
 

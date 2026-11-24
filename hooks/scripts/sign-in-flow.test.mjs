@@ -198,7 +198,7 @@ test('an approval whose helper died is not joined: the next caller starts a fres
   assert.equal(spawned, 1)
 })
 
-test('with DEVSPEC_MCP_TOKEN set, connect uses it and says it overrides the browser sign-in', async () => {
+test('DEVSPEC_MCP_TOKEN in the environment is ignored and does not override browser sign-in', async () => {
   await saveLogin({
     mcpUrl: fake.mcpUrl,
     tokens: { accessToken: 'oat_x', refreshToken: 'rt_x', issuedAt: Date.now(), expiresAt: Date.now() + 86_400_000 },
@@ -208,17 +208,10 @@ test('with DEVSPEC_MCP_TOKEN set, connect uses it and says it overrides the brow
     resource: `${fake.base}/api/mcp`,
   }, { home })
   const auth = await authForConnect(home, { env: { ...envFor(), DEVSPEC_MCP_TOKEN: 'dvs_ci' }, home, begin: () => assert.fail('no approval') })
-  assert.equal(auth.source, 'env')
-  assert.equal(auth.token, 'dvs_ci')
-  assert.match(auth.warning_env_token, /DEVSPEC_MCP_TOKEN is set/)
-})
-
-test('the login command refuses to sign in while DEVSPEC_MCP_TOKEN is set, instead of reporting a success it would ignore', async () => {
-  const outcome = await run(process.execPath, [LOGIN_SCRIPT], { env: { PATH: process.env.PATH, HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_ci' } })
-    .then(() => assert.fail('it should refuse'), (err) => err)
-  assert.equal(outcome.code, 1)
-  assert.match(outcome.stdout, /DEVSPEC_MCP_TOKEN is set in this environment/)
-  assert.equal(fs.existsSync(path.join(home, '.devspec', 'cursor', 'auth.json')), false)
+  assert.equal(auth.ok, true)
+  assert.equal(auth.source, 'login')
+  assert.equal(auth.token, 'oat_x')
+  assert.equal(auth.warning_env_token, undefined)
 })
 
 test('the login command says where things stand, and signs out of one server only', async () => {

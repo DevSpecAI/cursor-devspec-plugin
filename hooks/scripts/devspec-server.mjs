@@ -14,8 +14,7 @@
  * DEVSPEC_API_URL (and DEVSPEC_CURSOR_CLIENT_ID for that server's sign-in app), both
  * use that server, with no settings file edited by hand (item 95a67ee4).
  *
- * DEVSPEC_MCP_URL stays the full-address override for runs with no browser, beside
- * DEVSPEC_MCP_TOKEN.
+ * DEVSPEC_MCP_URL stays the full-address override for testing against another server.
  */
 
 import fs from 'node:fs'

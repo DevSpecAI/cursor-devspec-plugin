@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { saveLogin } from './auth-store.mjs'
 
 const SCRIPT = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
 const PROJECT = '11111111-1111-4111-8111-111111111111'
@@ -93,6 +94,14 @@ describe('manual Cursor manage-plan CLI lifecycle', () => {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const address = server.address()
     url = `http://127.0.0.1:${address.port}/api/mcp`
+    await saveLogin({
+      mcpUrl: url,
+      tokens: { accessToken: 'oat_e2e_token', refreshToken: 'rt_e2e_token', issuedAt: Date.now(), expiresAt: Date.now() + 86_400_000 },
+      issuer: `http://127.0.0.1:${address.port}`,
+      tokenEndpoint: `http://127.0.0.1:${address.port}/oauth/token`,
+      clientId: 'cursor-test-client',
+      resource: url,
+    }, { home })
   })
 
   after(async () => {
@@ -105,7 +114,6 @@ describe('manual Cursor manage-plan CLI lifecycle', () => {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
-      DEVSPEC_MCP_TOKEN: 'dvs_e2e_token',
       DEVSPEC_MCP_URL: url,
     }
     for (const key of [

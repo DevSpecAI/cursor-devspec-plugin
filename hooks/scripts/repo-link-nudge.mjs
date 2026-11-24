@@ -31,7 +31,7 @@ import { findProjectPin, gitRemoteOrigin } from './devspec-scope.mjs'
 import { withoutStandInPrefix } from './git-observer.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readProjectContext } from './project-context.mjs'
-import { hostTokenFromEnv, resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { handOver, handOverPrefix, postToolUseOutput } from './hook-context-budget.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
 
@@ -140,7 +140,7 @@ async function nudgeFor(input, sessionId, deps) {
   const marker = markerPath(sessionId, pinId, remote, env)
   if (alreadySaid(marker)) return null
 
-  const auth = (deps.resolveAuth ?? resolveDevspecMcpAuth)(repoDir, { hostToken: hostTokenFromEnv(env), env })
+  const auth = (deps.resolveAuth ?? resolveDevspecMcpAuth)(repoDir, { env })
   if (!auth?.ok || !auth.token) return null
   try {
     const selected = (deps.readProject ?? defaultReadProject)(sessionId, { endpoint: auth.mcp_url })

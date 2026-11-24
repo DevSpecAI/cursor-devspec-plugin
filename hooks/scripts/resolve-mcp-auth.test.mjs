@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * The credential the background features use (item 95a67ee4): DEVSPEC_MCP_TOKEN for a
- * machine with no browser, otherwise the plugin's own browser sign-in for the server
- * its mcp.json names, and nothing else. A connection keeps the identity it connected
- * with across a browser login's daily token change.
+ * The credential the background features use (item 95a67ee4): the plugin's own
+ * browser sign-in for the server its mcp.json names, and nothing else (no env token
+ * fallback). A connection keeps the identity it connected with across a browser
+ * login's daily token change.
  */
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
@@ -18,8 +18,6 @@ import {
   credentialIdentity,
   credentialRefusal,
   credentialStateFields,
-  envTokenNotice,
-  envTokenShadowsLogin,
   handleCredentialRefusal,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
@@ -100,18 +98,17 @@ describe('which credential the background features use', () => {
     assert.equal(resolveDevspecMcpAuth(home, { env: { HOME: home } }).token, 'oat_prod')
   })
 
-  it('DEVSPEC_MCP_TOKEN wins for a machine with no browser, keeps its old fingerprint, and is called out', async () => {
-    const env = { HOME: home, DEVSPEC_MCP_TOKEN: ' dvs_ci ', DEVSPEC_MCP_URL: 'https://devspec.example/api/mcp' }
-    assert.equal(envTokenShadowsLogin({ env }), false, 'nothing to call out without a browser login')
+  it('ignores DEVSPEC_MCP_TOKEN in the environment and uses browser sign-in only', async () => {
+    const env = { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_ci' }
+    const unsigned = resolveDevspecMcpAuth(home, { env })
+    assert.equal(unsigned.ok, false)
+    assert.equal(unsigned.code, 'sign_in_required')
+
     await save(PROD, 'prod')
-    const auth = resolveDevspecMcpAuth(home, { env })
-    assert.deepEqual(auth, { ok: true, token: 'dvs_ci', mcp_url: 'https://devspec.example/api/mcp', source: 'env', principal: sha('dvs_ci') })
-    assert.equal(envTokenShadowsLogin({ env: { HOME: home, DEVSPEC_MCP_TOKEN: 'dvs_ci' } }), true)
-    const notice = envTokenNotice('linux')
-    assert.match(notice, /DEVSPEC_MCP_TOKEN is set/)
-    assert.match(notice, /ignore your browser sign-in/)
-    assert.match(notice, /unset DEVSPEC_MCP_TOKEN/)
-    assert.match(notice, /restart cursor-agent/)
+    const signed = resolveDevspecMcpAuth(home, { env })
+    assert.equal(signed.ok, true)
+    assert.equal(signed.source, 'login')
+    assert.equal(signed.token, 'oat_prod')
   })
 
   it('a login that has ended is reported with where to reconnect and how to sign in again', async () => {
@@ -156,11 +153,11 @@ describe("a connection's credential", () => {
     assert.match(other.error, /Run \/devspec-remote/)
   })
 
-  it('a connection made with DEVSPEC_MCP_TOKEN keeps that token and its exact binding', () => {
-    const state = { connection_id: 'c', mcp_url: PROD, ...credentialStateFields({ ok: true, token: 'dvs_ci', source: 'env', mcp_url: PROD }) }
-    assert.equal(state.token, 'dvs_ci')
-    assert.equal(connectionCredential(state, { home }).token, 'dvs_ci')
-    assert.equal(credentialIdentity(state), 'dvs_ci')
+  it('a connection created with an injected token keeps that token and its exact binding', () => {
+    const state = { connection_id: 'c', mcp_url: PROD, ...credentialStateFields({ ok: true, token: 'dvs_injected', source: 'injected', mcp_url: PROD }) }
+    assert.equal(state.token, 'dvs_injected')
+    assert.equal(connectionCredential(state, { home }).token, 'dvs_injected')
+    assert.equal(credentialIdentity(state), 'dvs_injected')
   })
 
   it('a connection whose login was signed out says so', async () => {
@@ -189,7 +186,6 @@ describe("DevSpec's refusals", () => {
   it('an unknown token is refused plainly, and a passing outage is not a refusal', () => {
     const invalid = refusal(401, { error: 'Invalid or revoked API token', code: 'invalid_api_token', retryable: false })
     assert.match(credentialRefusal(invalid, { mcpUrl: PROD }).message, /no longer accepts Cursor's sign-in/)
-    assert.match(credentialRefusal(invalid, { mcpUrl: PROD, source: 'env' }).message, /DEVSPEC_MCP_TOKEN/)
     assert.equal(credentialRefusal(refusal(503, { code: 'auth_validation_unavailable', retryable: true }, true)), null)
     assert.equal(credentialRefusal(new Error('fetch failed')), null)
   })

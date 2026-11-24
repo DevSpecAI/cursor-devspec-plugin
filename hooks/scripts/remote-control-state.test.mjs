@@ -12,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isPushStreamRequest, refusePushStream } from './fixtures/push-stream.mjs'
+import { saveLogin } from './auth-store.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
 import {
   detectLocalId,
@@ -501,10 +502,19 @@ describe('a connect never touches another connection (item 2b840556, parity with
     const otherPoller = spawn(process.execPath, [fakePoller, '--connection-id', OTHER], { stdio: 'ignore' })
     let minePollerPid = null
     try {
+      const parsedUrl = new URL(mcpUrl)
+      await saveLogin({
+        mcpUrl,
+        tokens: { accessToken: 'oat_mine', refreshToken: 'rt_mine', issuedAt: Date.now(), expiresAt: Date.now() + 86_400_000 },
+        issuer: parsedUrl.origin,
+        tokenEndpoint: `${parsedUrl.origin}/oauth/token`,
+        clientId: 'cursor-test-client',
+        resource: `${parsedUrl.origin}${parsedUrl.pathname}`,
+      }, { home })
       // Window 2 connects.
       await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [STATE_SCRIPT, 'write', '--connection-id', MINE, '--agent', 'Cursor', '--owner-pid', String(process.pid), '--cwd', home], {
-          env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, DEVSPEC_MCP_TOKEN: 'dvs_mine', DEVSPEC_MCP_URL: mcpUrl },
+          env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, DEVSPEC_MCP_URL: mcpUrl },
         })
         child.on('error', reject)
         child.on('close', resolve)

@@ -29,7 +29,7 @@ try{
  fs.mkdirSync(path.join(home,'.cursor'))
  fs.writeFileSync(path.join(home,'.cursor','mcp.json'),JSON.stringify({mcpServers:{devspec:{url:`${base}/api/mcp?tool_namespace=devspec`,headers:{Authorization:'Bearer fixture-only'}}}}))
  const result=await new Promise((resolve,reject)=>{
-  const child=spawn(binary,['--plugin-dir',root,'mcp','list-tools','devspec'],{cwd:home,env:{...process.env,HOME:home,USERPROFILE:home,CURSOR_CONFIG_DIR:path.join(home,'.cursor'),CURSOR_DATA_DIR:path.join(home,'data'),CURSOR_API_KEY:'fixture-only',CURSOR_API_ENDPOINT:base,DEVSPEC_API_URL:base,DEVSPEC_MCP_TOKEN:'fixture-only'},stdio:['ignore','pipe','pipe']})
+  const child=spawn(binary,['--plugin-dir',root,'mcp','list-tools','devspec'],{cwd:home,env:{...process.env,HOME:home,USERPROFILE:home,CURSOR_CONFIG_DIR:path.join(home,'.cursor'),CURSOR_DATA_DIR:path.join(home,'data'),CURSOR_API_KEY:'fixture-only',CURSOR_API_ENDPOINT:base,DEVSPEC_API_URL:base},stdio:['ignore','pipe','pipe']})
   let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGTERM'),30000)
   child.stdout.on('data',data=>stdout+=data);child.stderr.on('data',data=>stderr+=data)
   child.on('error',error=>{clearTimeout(timer);reject(error)})
