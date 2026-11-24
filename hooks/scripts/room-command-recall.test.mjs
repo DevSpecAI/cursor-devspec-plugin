@@ -238,7 +238,9 @@ async function startPoller({ beforeStart } = {}) {
     state: () => JSON.parse(fs.readFileSync(path.join(dir, `${CONNECTION}.json`), 'utf8')),
     patchState: (patch) => {
       const file = path.join(dir, `${CONNECTION}.json`)
-      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), ...patch }), { mode: 0o600 })
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+      fs.writeFileSync(tmp, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), ...patch }), { mode: 0o600 })
+      fs.renameSync(tmp, file)
     },
     /** What the wait hands Cursor for the next wake in the inbox, as the events it writes. */
     async nextWake() {
@@ -633,7 +635,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.equal(printed.some((e) => e.type === 'turn_recall'), false)
 
       const wakeFile = path.join(run.home, 'wake-after-manual.jsonl')
-      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall'))
+      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall') && run.state().wake_batch_progress === null)
       const lines = text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
       assert.deepEqual(lines.map((e) => e.type), ['turn_recall'], 'only the remaining pointer wake')
       assert.equal(lines[0].for, printed[0].message_id)
@@ -653,7 +655,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
 
       const wakeFile = path.join(run.home, 'wake-first.jsonl')
-      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall'))
+      const text = await followOnce(run, wakeFile, (t) => t.includes('turn_recall') && (run.state().inbox_byte_offset ?? 0) > 0)
       const lines = text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
       assert.deepEqual(lines.map((e) => e.type), ['owner_message', 'wake', 'recall_in_next_wake', 'turn_recall'])
 
