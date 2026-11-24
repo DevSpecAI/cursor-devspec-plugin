@@ -18,6 +18,10 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # Measured full suite runtime on ubuntu-latest is ~5m30s (run 45419793893,
+    # dominated by real-timer settle waits in transcript-turn-end.test.mjs),
+    # plus ~1-2 min for DevSpecV2 npm ci when DEVSPEC_V2_READ_TOKEN is set.
+    # 15 minutes gives ~2x headroom while bounding a hung child process.
     timeout-minutes: 15
     steps:
       - name: Checkout plugin
@@ -63,6 +67,9 @@ jobs:
         run: |
           TMPHOME="$(mktemp -d)"
           trap 'rm -rf "$TMPHOME"' EXIT
+          # --test-concurrency=2 matches the 2-vCPU ubuntu-latest runner; uncapped
+          # default concurrency starved child-process timers in room-command-recall.test.mjs
+          # (run 45418068651), while concurrency=2 passed all 1,320 tests in 5m31s.
           if [ "$HAS_SERVER" = "true" ]; then
             SERVER_DIR="$RUNNER_TEMP/devspecv2-server"
             mv "$PWD/.devspecv2-server" "$SERVER_DIR"
