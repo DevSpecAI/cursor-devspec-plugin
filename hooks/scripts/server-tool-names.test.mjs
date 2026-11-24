@@ -18,6 +18,9 @@ import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 import { PROVENANCE_REF_TOOLS, REQUEST_REF_TOOLS } from './request-ref.mjs'
 import { recallPollArguments } from './turn-recall.mjs'
+import { MANAGE_PLAN_INPUT_SCHEMA } from './manage-plan-bridge.mjs'
+import { MANAGE_POLL_INPUT_SCHEMA } from './manage-poll-bridge.mjs'
+import { MANAGE_QUESTION_INPUT_SCHEMA } from './manage-question-bridge.mjs'
 
 const SELF = fileURLToPath(import.meta.url)
 const ROOT = path.resolve(path.dirname(SELF), '../..')
@@ -88,6 +91,7 @@ process.stdout.write(JSON.stringify(getMcpAllTools().map((tool) => ({
   name: tool.name,
   params: Object.keys(tool.inputSchema?.properties ?? {}),
   requestRef: Boolean(tool.inputSchema?.properties?.request_ref),
+  inputSchema: tool.inputSchema ?? null,
 }))))`
   const out = execFileSync(tsx, ['--tsconfig=apps/web/tsconfig.json', '-e', script], {
     cwd: root,
@@ -332,6 +336,58 @@ describe('the project recall the poller asks poll_connection for', () => {
       assert.ok(poll.params.includes('seen_recall_versions'), 'the seen versions the poller sends once there are some')
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('the embedded input schemas for capability-bridged room tools', () => {
+  // Capability bridges intentionally forbid identity/routing fields supplied by trusted host
+  // state; every other domain parameter and enum must stay in lockstep with the server.
+  const HOST_SUPPLIED_FIELDS = new Set([
+    'project_id',
+    'git_remote',
+    'pinned_project_id',
+    'connection_id',
+    'session_id',
+    'request_ref',
+    'provenance_ref',
+  ])
+
+  const BRIDGED_TOOLS = [
+    ['manage_plan', MANAGE_PLAN_INPUT_SCHEMA],
+    ['manage_poll', MANAGE_POLL_INPUT_SCHEMA],
+    ['manage_directed_question', MANAGE_QUESTION_INPUT_SCHEMA],
+  ]
+
+  it('match the server domain parameters, types, and enums for manage_plan, manage_poll and manage_directed_question', (t) => {
+    const tools = pairedServer(t, serverToolList)
+    if (!tools) return
+    const byName = new Map(tools.map((tool) => [tool.name, tool.inputSchema]))
+    for (const [toolName, pluginSchema] of BRIDGED_TOOLS) {
+      const serverSchema = byName.get(toolName)
+      assert.ok(serverSchema, `the server has no ${toolName}`)
+      const serverProps = serverSchema.properties ?? {}
+      const pluginProps = pluginSchema.properties ?? {}
+      const expectedKeys = Object.keys(serverProps).filter((key) => !HOST_SUPPLIED_FIELDS.has(key)).sort()
+      const actualKeys = Object.keys(pluginProps).filter((key) => !HOST_SUPPLIED_FIELDS.has(key)).sort()
+      assert.deepEqual(actualKeys, expectedKeys, `${toolName} domain properties diverged from server`)
+      for (const key of actualKeys) {
+        const sp = serverProps[key]
+        const pp = pluginProps[key]
+        const serverType = sp.type === 'integer' ? 'number' : sp.type
+        const pluginType = pp.type === 'integer' ? 'number' : pp.type
+        assert.equal(pluginType, serverType, `${toolName}.${key} type diverged: plugin=${pp.type} server=${sp.type}`)
+        if (sp.enum || pp.enum) {
+          assert.deepEqual(pp.enum ?? null, sp.enum ?? null, `${toolName}.${key} enum diverged from server`)
+        }
+        if (sp.items?.properties && pp.items?.properties) {
+          assert.deepEqual(
+            Object.keys(pp.items.properties).sort(),
+            Object.keys(sp.items.properties).sort(),
+            `${toolName}.${key}.items properties diverged from server`,
+          )
+        }
+      }
     }
   })
 })
