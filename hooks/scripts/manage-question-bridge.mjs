@@ -21,7 +21,7 @@
  */
 
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { resolveConnectionBridgeContext } from './manage-plan-bridge.mjs'
 import {
   activeContinuation,
@@ -221,7 +221,7 @@ function redact(error) {
 
 async function callWithCapability(bound, { name, args, hostToken, mcpCall, resolveAuth }) {
   const auth = resolveAuth(bound.state.cwd || process.cwd(), {
-    hostToken: hostToken || hostTokenFromEnv(process.env),
+    hostToken,
   })
   if (!auth.ok || !auth.token || !auth.mcp_url) return { ok: false, error: auth.error || 'DevSpec MCP auth unavailable' }
   try {

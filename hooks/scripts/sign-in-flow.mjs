@@ -29,13 +29,9 @@ import {
 import { codePageUrl, configuredMcpUrl, mcpUrlForServer, serverLabel } from './devspec-server.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import {
-  envTokenNotice,
-  envTokenShadowsLogin,
-  hostTokenFromEnv,
   loginCommandFor,
   loginEndedMessage,
   resolveDevspecMcpAuth,
-  TOKEN_ENV_VAR,
 } from './resolve-mcp-auth.mjs'
 import {
   CURSOR_CLIENT_IDS,
@@ -173,8 +169,7 @@ export async function authForConnect(cwd, {
   const opts = { env, ...(home ? { home } : {}), ...(hostToken ? { hostToken } : {}) }
   const storeOpts = home ? { home } : {}
   let auth = resolveDevspecMcpAuth(cwd, opts)
-  const withNotice = (result) => (envTokenShadowsLogin(opts) ? { ...result, warning_env_token: envTokenNotice() } : result)
-  if (auth.ok || !['sign_in_required', 'signed_out'].includes(auth.code)) return withNotice(auth)
+  if (auth.ok || !['sign_in_required', 'signed_out'].includes(auth.code)) return auth
   const mcpUrl = auth.mcp_url
   const label = serverLabel(mcpUrl)
 
@@ -211,7 +206,7 @@ export async function authForConnect(cwd, {
     }
   }
   auth = resolveDevspecMcpAuth(cwd, opts)
-  return auth.ok ? { ...withNotice(auth), signed_in_now: true } : auth
+  return auth.ok ? { ...auth, signed_in_now: true } : auth
 }
 
 // --- The login command -----------------------------------------------------------
@@ -258,10 +253,9 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
   if (flags.has('--status')) {
     const state = loginState(mcpUrl)
     const lines = [`DevSpec server: ${label} (${mcpUrl})`]
-    if (hostTokenFromEnv(env)) lines.push(`Using the token in ${TOKEN_ENV_VAR}.`, envTokenNotice())
     if (state.kind === 'active') lines.push(`Signed in through the browser${state.login.signedInAs ? ` as ${state.login.signedInAs}` : ''}.`)
     else if (state.kind === 'ended') lines.push(loginEndedMessage(mcpUrl))
-    else if (!hostTokenFromEnv(env)) lines.push(`Not signed in. Run ${loginCommandFor(mcpUrl)} to sign in.`)
+    else lines.push(`Not signed in. Run ${loginCommandFor(mcpUrl)} to sign in.`)
     const pending = livePendingSignIn(mcpUrl)
     if (pending?.url) lines.push(`A browser approval is waiting: ${pending.url}`)
     out(lines.join('\n'))
@@ -270,16 +264,8 @@ export async function loginCommandMain(argv = process.argv.slice(2), { env = pro
 
   if (flags.has('--sign-out')) {
     const removed = await signOut(mcpUrl)
-    out(`${removed ? `Signed Cursor's background features out of DevSpec (${label}).` : `Cursor's background features were not signed in to DevSpec (${label}).`}` +
-      (hostTokenFromEnv(env) ? ` ${envTokenNotice()}` : ''))
+    out(removed ? `Signed Cursor's background features out of DevSpec (${label}).` : `Cursor's background features were not signed in to DevSpec (${label}).`)
     return 0
-  }
-
-  // Signing in. A token in the environment would win over the new login on the very
-  // next start, so refuse rather than report a success that would be ignored.
-  if (hostTokenFromEnv(env)) {
-    out(envTokenNotice())
-    return 1
   }
 
   const pasted = valueOf('--paste')

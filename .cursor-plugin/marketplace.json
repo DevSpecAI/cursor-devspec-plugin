@@ -5,15 +5,15 @@
     "email": "hello@devspec.ai"
   },
   "metadata": {
-    "description": "DevSpec for Cursor's command-line agent (cursor-agent)."
+    "description": "DevSpec for Cursor CLI (cursor-agent) — for developers who already have a Cursor subscription."
   },
   "plugins": [
     {
       "name": "devspec",
-      "displayName": "DevSpec",
+      "displayName": "DevSpec for Cursor CLI",
       "source": "./",
-      "description": "DevSpec for Cursor's command-line agent (cursor-agent). Work your team's DevSpec tasks with its decisions and documents to hand, and steer the agent from DevSpec in your browser or on your phone. The Cursor editor is not supported yet.",
-      "version": "0.33.0",
+      "description": "DevSpec for Cursor CLI (cursor-agent). Built for developers who already have a Cursor subscription and want to connect it to DevSpec for shared team memory, structured tasks, automatic commit tracking, and live remote control. The Cursor editor is not supported.",
+      "version": "0.34.0",
       "keywords": [
         "devspec",
         "cursor-cli",

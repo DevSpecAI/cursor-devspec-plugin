@@ -84,10 +84,7 @@ import {
   DEFAULT_MCP_URL,
   credentialIdentity,
   credentialStateFields,
-  envTokenNotice,
-  envTokenShadowsLogin,
   handleCredentialRefusal,
-  hostTokenFromEnv,
   resolveDevspecMcpAuth,
 } from './resolve-mcp-auth.mjs'
 import {
@@ -1461,9 +1458,9 @@ export async function registerConnection(opts) {
   const persistCapability = opts.persistCapability || persistConnectionCapability
 
   const hostToken =
-    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+    typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
-      : null) || hostTokenFromEnv(process.env)
+      : null
   let auth = resolveAuth(cwd, { hostToken })
   // Registering is where remote control starts: with no sign-in for the background
   // features yet, start the one browser approval for them (item 95a67ee4).
@@ -1616,9 +1613,9 @@ export async function attachConnection(opts) {
   const emitPhase = opts.emitPhase || emitConnectPhase
 
   const hostToken =
-    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+    typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
-      : null) || hostTokenFromEnv(process.env)
+      : null
   const auth = resolveAuth(cwd, { hostToken })
   if (!auth.ok || !auth.token || !auth.mcp_url) {
     await emitPhase({
@@ -1710,12 +1707,12 @@ export async function writeConnectionState(opts) {
   const emitPhase = opts.emitPhase || emitConnectPhase
 
   const hostToken =
-    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+    typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
-      : null) || hostTokenFromEnv(process.env)
-  // One credential: DEVSPEC_MCP_TOKEN, or the plugin's own browser sign-in for its
-  // server. A browser login is recorded by its stable identity, never its token,
-  // which changes daily; every later use takes the current one (item 95a67ee4).
+      : null
+  // One credential: the plugin's own browser sign-in for its server. A browser login
+  // is recorded by its stable identity, never its token, which changes daily; every
+  // later use takes the current one (item 95a67ee4).
   const auth = resolveAuth(cwd, { hostToken })
   const prev = readJson(connectionPath(connectionId)) || {}
   const agentName = opts.agent || prev.agent_name || AGENT_NAME
@@ -1786,8 +1783,6 @@ export async function writeConnectionState(opts) {
     result.warning = auth.error
     result.error = auth.error || 'auth_failed'
     if (auth.code) result.code = auth.code
-  } else if (auth.source === 'env' && envTokenShadowsLogin()) {
-    result.warning_env_token = envTokenNotice()
   }
   if (!localId) {
     result.warning_local =
@@ -1883,7 +1878,6 @@ async function runCli() {
     const result = await useManagePlanBridge(input, {
       localId,
       agent: AGENT_NAME,
-      hostToken: hostTokenFromEnv(process.env),
     })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
@@ -1913,7 +1907,6 @@ async function runCli() {
     const result = await useManagePollBridge(input, {
       localId,
       agent: AGENT_NAME,
-      hostToken: hostTokenFromEnv(process.env),
     })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
@@ -1949,13 +1942,11 @@ async function runCli() {
       ? await respondToQuestion(input, {
         localId,
         agent: AGENT_NAME,
-        hostToken: hostTokenFromEnv(process.env),
         clearContinuation: clearInteractionContinuation,
       })
       : await useManageQuestionBridge(input, {
         localId,
         agent: AGENT_NAME,
-        hostToken: hostTokenFromEnv(process.env),
       })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
@@ -1989,9 +1980,9 @@ async function runCli() {
 
   if (cmd === 'resolve-auth') {
     const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+      typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
+        : null
     const auth = resolveDevspecMcpAuth(args.cwd || process.cwd(), { hostToken })
     if (process.argv.includes('--mask') && auth.token) {
       auth.token_preview = auth.token.slice(0, 8) + '…' + auth.token.slice(-4)
@@ -2340,9 +2331,9 @@ async function runCli() {
     }
     const localId = detectLocalId(args, process.env).local_id
     const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+      typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
+        : null
     const result = await writeConnectionState({
       connectionId,
       sessionId: args.session || null,
@@ -2374,9 +2365,9 @@ async function runCli() {
       process.exit(2)
     }
     const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+      typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
+        : null
     const result = await registerConnection({
       localId,
       projectId,
@@ -2402,9 +2393,9 @@ async function runCli() {
       process.exit(2)
     }
     const hostToken =
-      (typeof args['host-token'] === 'string' && args['host-token'].trim()
+      typeof args['host-token'] === 'string' && args['host-token'].trim()
         ? args['host-token'].trim()
-        : null) || hostTokenFromEnv(process.env)
+        : null
     const result = await attachConnection({
       connectionId,
       sessionId,

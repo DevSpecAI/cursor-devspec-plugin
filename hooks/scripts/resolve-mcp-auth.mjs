@@ -8,29 +8,26 @@
  * processes cannot use Cursor's sign-in, so they hold their own browser sign-in
  * through the same Cursor app (item 95a67ee4):
  *
- * 1. DEVSPEC_MCP_TOKEN — for a machine with no browser (CI, a cloud worker), paired
- *    with DEVSPEC_MCP_URL. It wins outright, and whoever sets it interactively is
- *    told so (envTokenNotice).
- * 2. The plugin's own browser sign-in for the configured server, from
- *    ~/.devspec/cursor/auth.json (auth-store.mjs), renewed before it expires.
+ * - The plugin's own browser sign-in for the configured server, from
+ *   ~/.devspec/cursor/auth.json (auth-store.mjs), renewed before it expires.
  *
- * Nothing else. No other tool's file is read for a token any more: not Cursor's
- * ~/.cursor/mcp.json, not a project .cursor/mcp.json or .mcp.json, and not another
- * DevSpec plugin's login. The server is the one the plugin's mcp.json names, filled
- * from the environment exactly as Cursor fills it (devspec-server.mjs).
+ * Nothing else. No environment token fallback, no other tool's file is read for a
+ * token: not Cursor's ~/.cursor/mcp.json, not a project .cursor/mcp.json or
+ * .mcp.json, and not another DevSpec plugin's login. The server is the one the
+ * plugin's mcp.json names, filled from the environment exactly as Cursor fills it
+ * (devspec-server.mjs).
  *
  * A connection keeps the identity it connected with. Its state records which login
  * (`principal`) and never a browser login's token, which changes daily; every use
  * takes that login's current token (connectionCredential), and refuses rather than
- * switch to a different login. A token from the environment is stored and
- * fingerprinted exactly as before.
+ * switch to a different login.
  *
  * CLI: prints `{ ok, token?, mcp_url, source, code?, error? }` as JSON for piping.
  */
 
 import os from 'node:os'
 import { agentsPageUrl } from './app-pages.mjs'
-import { currentLoginSync, loginPrincipal, loginState, markLoginEnded, sha256 } from './auth-store.mjs'
+import { currentLoginSync, loginPrincipal, markLoginEnded, sha256 } from './auth-store.mjs'
 import {
   DEFAULT_MCP_URL as BUNDLED_DEFAULT_MCP_URL,
   configuredMcpUrl,
@@ -42,16 +39,8 @@ import {
 
 export const DEFAULT_MCP_URL = BUNDLED_DEFAULT_MCP_URL
 
-/** The one environment variable for a machine with no browser. */
-export const TOKEN_ENV_VAR = 'DEVSPEC_MCP_TOKEN'
-
 function trimmed(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
-}
-
-/** The token set in the environment for a machine with no browser, if any. */
-export function hostTokenFromEnv(env = process.env) {
-  return trimmed(env?.[TOKEN_ENV_VAR])
 }
 
 function envOf(opts) {
@@ -108,19 +97,10 @@ export function signedInAgainMessage() {
     'Run /devspec-remote to connect it with the new sign-in.'
 }
 
-/** Plain words for a token in the environment, which always wins over a browser sign-in. */
-export function envTokenNotice(platform = process.platform) {
-  const where = platform === 'win32'
-    ? 'System Properties → Environment Variables, and any terminal profile that sets it'
-    : `your shell profile (for example ~/.zshrc or ~/.bashrc) and run \`unset ${TOKEN_ENV_VAR}\` in this terminal`
-  return `${TOKEN_ENV_VAR} is set in this environment, so the DevSpec plugin's background features use that token and ignore your browser sign-in. ` +
-    `To use your browser sign-in, remove ${TOKEN_ENV_VAR} from ${where}, then restart cursor-agent.`
-}
-
 /**
  * The credential for one call, resolved now.
  *
- * `{ ok: true, token, mcp_url, source: 'env' | 'login', principal }`, or
+ * `{ ok: true, token, mcp_url, source: 'login', principal }`, or
  * `{ ok: false, code, mcp_url, error }` where code is `sign_in_required` (never signed
  * in to this server), `signed_out` (the login ended) or `sign_in_unavailable` (it has
  * expired and could not be renewed just now). `error` is the sentence to show.
@@ -128,9 +108,9 @@ export function envTokenNotice(platform = process.platform) {
 export function resolveDevspecMcpAuth(_cwd = process.cwd(), opts = {}) {
   const env = envOf(opts)
   const mcpUrl = configuredMcpUrl(env)
-  const envToken = trimmed(opts.hostToken) || hostTokenFromEnv(env)
-  if (envToken) {
-    return { ok: true, token: envToken, mcp_url: mcpUrl, source: 'env', principal: sha256(envToken) }
+  const injectedToken = trimmed(opts.hostToken)
+  if (injectedToken) {
+    return { ok: true, token: injectedToken, mcp_url: mcpUrl, source: 'injected', principal: sha256(injectedToken) }
   }
   const store = storeOpts(opts)
   const state = store ? currentLoginSync(mcpUrl, store) : { kind: 'none' }
@@ -146,25 +126,13 @@ export function resolveDevspecMcpAuth(_cwd = process.cwd(), opts = {}) {
   }
   if (state.kind === 'ended') return { ok: false, code: 'signed_out', mcp_url: mcpUrl, source: 'login', error: loginEndedMessage(mcpUrl) }
   if (state.kind === 'expired') return { ok: false, code: 'sign_in_unavailable', mcp_url: mcpUrl, source: 'login', error: renewalUnavailableMessage(mcpUrl) }
-  return { ok: false, code: 'sign_in_required', mcp_url: mcpUrl, error: notSignedInMessage(mcpUrl) }
-}
-
-/**
- * Whether a browser login for the configured server sits unused because
- * DEVSPEC_MCP_TOKEN is set: then the person is told the token takes precedence.
- */
-export function envTokenShadowsLogin(opts = {}) {
-  const env = envOf(opts)
-  if (!hostTokenFromEnv(env)) return false
-  const store = storeOpts(opts)
-  return !!store && loginState(configuredMcpUrl(env), store).kind !== 'none'
+  return { ok: false, code: 'sign_in_required', mcp_url: mcpUrl, source: 'login', error: notSignedInMessage(mcpUrl) }
 }
 
 /**
  * The current credential for a connection, from its state file. A connection made
  * with a browser login takes that login's current token on every use (it changes
- * daily) and refuses rather than switch to a different login; one made with a token
- * from the environment keeps using that token, exactly as before.
+ * daily) and refuses rather than switch to a different login.
  */
 export function connectionCredential(state, opts = {}) {
   if (!state || typeof state !== 'object') return { ok: false, code: 'no_state', error: 'No DevSpec connection state.' }
@@ -235,7 +203,7 @@ function serverSentence(err) {
  * show, or null for any other failure. `signed_out` is DevSpec saying the person
  * disconnected this tool; its own sentence is shown, followed by how to sign in again.
  */
-export function credentialRefusal(err, { mcpUrl = DEFAULT_MCP_URL, source = 'login' } = {}) {
+export function credentialRefusal(err, { mcpUrl = DEFAULT_MCP_URL } = {}) {
   if (!err || err.status !== 401 || err.retryable === true) return null
   if (err.serverCode === 'signed_out') {
     const said = serverSentence(err) ||
@@ -245,9 +213,7 @@ export function credentialRefusal(err, { mcpUrl = DEFAULT_MCP_URL, source = 'log
   if (err.serverCode === 'invalid_api_token') {
     return {
       code: 'invalid_api_token',
-      message: source === 'env'
-        ? `DevSpec rejected the token in ${TOKEN_ENV_VAR} (invalid or revoked). Set a current token, or remove ${TOKEN_ENV_VAR} to use your browser sign-in.`
-        : `DevSpec no longer accepts Cursor's sign-in. ${signInAgainHint(mcpUrl)}`,
+      message: `DevSpec no longer accepts Cursor's sign-in. ${signInAgainHint(mcpUrl)}`,
     }
   }
   return null

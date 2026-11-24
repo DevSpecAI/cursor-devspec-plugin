@@ -70,7 +70,7 @@
  *   node devspec-remote-poll.mjs --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *
  * Uses the connection's own credential: the plugin's browser sign-in it connected with
- * (its current token, taken afresh every lap) or the DEVSPEC_MCP_TOKEN it connected with.
+ * (its current token, taken afresh every lap).
  * When DevSpec refuses that sign-in, the poller stands the connection down and says so
  * plainly (`end_reason: 'signed_out'`, with the sentence to show), never failing silently.
  */

@@ -19,7 +19,7 @@ import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import {
   durationMs,
@@ -314,9 +314,9 @@ export async function fastConnect(opts = {}) {
   const detectLocalIdFn = opts.detectLocalIdFn || detectLocalId
 
   const hostToken =
-    (typeof opts.hostToken === 'string' && opts.hostToken.trim()
+    typeof opts.hostToken === 'string' && opts.hostToken.trim()
       ? opts.hostToken.trim()
-      : null) || hostTokenFromEnv(process.env)
+      : null
 
   let sessionId =
     typeof opts.sessionId === 'string' && opts.sessionId.length >= 8
@@ -692,7 +692,6 @@ export async function fastConnect(opts = {}) {
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
-    ...(auth.warning_env_token ? { warning_env_token: auth.warning_env_token } : {}),
     ...(auth.signed_in_now ? { signed_in_now: true } : {}),
   }
 }
