@@ -598,14 +598,17 @@ function writeStatePatch(connectionId, patch) {
       updated_at: new Date().toISOString(),
     }
     fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-    fs.writeFileSync(statePath(connectionId), JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+    const ownTmp = `${ownPath}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(ownTmp, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+    fs.renameSync(ownTmp, ownPath)
     // Mirror offset into legacy only if it points at this connection.
     try {
       if (fs.existsSync(LEGACY_STATE_PATH)) {
         const leg = JSON.parse(fs.readFileSync(LEGACY_STATE_PATH, 'utf8'))
         if (!leg.connection_id || leg.connection_id === connectionId) {
+          const legTmp = `${LEGACY_STATE_PATH}.${process.pid}.${Date.now()}.tmp`
           fs.writeFileSync(
-            LEGACY_STATE_PATH,
+            legTmp,
             JSON.stringify(
               { ...leg, ...patch, connection_id: connectionId, updated_at: next.updated_at },
               null,
@@ -613,6 +616,7 @@ function writeStatePatch(connectionId, patch) {
             ) + '\n',
             { mode: 0o600 },
           )
+          fs.renameSync(legTmp, LEGACY_STATE_PATH)
         }
       }
     } catch {
