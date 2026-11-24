@@ -19,9 +19,8 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     # Measured full suite runtime on ubuntu-latest is ~5m30s (run 45419793893,
-    # dominated by real-timer settle waits in transcript-turn-end.test.mjs),
-    # plus ~1-2 min for DevSpecV2 npm ci when DEVSPEC_V2_READ_TOKEN is set.
-    # 15 minutes gives ~2x headroom while bounding a hung child process.
+    # dominated by real-timer settle waits in transcript-turn-end.test.mjs).
+    # 15 minutes gives ~2.5x headroom while bounding any wedged child process.
     timeout-minutes: 15
     steps:
       - name: Checkout plugin
@@ -34,36 +33,10 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Check whether DevSpecV2 read token is configured
-        id: server-token
-        env:
-          TOKEN: ${{ secrets.DEVSPEC_V2_READ_TOKEN }}
-        run: |
-          if [ -n "$TOKEN" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::DEVSPEC_V2_READ_TOKEN is not configured; server-source parity tests in server-tool-names.test.mjs will skip until a read-only DevSpecV2 token secret is added."
-          fi
-
-      - name: Checkout DevSpecV2 staging for server-surface checks
-        if: steps.server-token.outputs.available == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: DevSpecAI/DevSpecV2
-          ref: staging
-          token: ${{ secrets.DEVSPEC_V2_READ_TOKEN }}
-          persist-credentials: false
-          path: .devspecv2-server
-
-      - name: Install DevSpecV2 dependencies for server-surface checks
-        if: steps.server-token.outputs.available == 'true'
-        working-directory: .devspecv2-server
-        run: npm ci --ignore-scripts
-
+      # No private-repository credentials on public PR runners (matches DevSpec-Pi).
+      # Server-source parity tests in server-tool-names.test.mjs run locally against
+      # a clean DevSpecV2 checkout until the cross-plugin mechanism (task a14f4a6c) lands.
       - name: Run full Cursor plugin test suite in clean environment
-        env:
-          HAS_SERVER: ${{ steps.server-token.outputs.available }}
         run: |
           TMPHOME="$(mktemp -d)"
           trap 'rm -rf "$TMPHOME"' EXIT
@@ -71,10 +44,4 @@ jobs:
           # uncapped default concurrency starved child-process timers in room-command-recall.test.mjs
           # (run 45418068651), while concurrency=2 passed all 1,320 tests in 5m31s.
           TEST_CONCURRENCY=2
-          ENV_ARGS=(HOME="$TMPHOME" PATH="$PATH")
-          if [ "$HAS_SERVER" = "true" ]; then
-            SERVER_DIR="$RUNNER_TEMP/devspecv2-server"
-            mv "$PWD/.devspecv2-server" "$SERVER_DIR"
-            ENV_ARGS+=(DEVSPEC_V2_ROOT="$SERVER_DIR")
-          fi
-          env -i "${ENV_ARGS[@]}" node --test --test-concurrency="$TEST_CONCURRENCY" hooks/scripts/*.test.mjs scripts/*.test.mjs
+          env -i HOME="$TMPHOME" PATH="$PATH" node --test --test-concurrency="$TEST_CONCURRENCY" hooks/scripts/*.test.mjs scripts/*.test.mjs
