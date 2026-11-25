@@ -153,8 +153,12 @@ export function looksLikeCursor(name, cmdline = '') {
   }
   if (typeof cmdline === 'string' && cmdline.trim()) {
     const trimmed = cmdline.trim()
+    // Check argv[0] for direct cursor/cursor-agent/claude executables, or a cursor-agent
+    // runtime path (such as `node .../cursor-agent/versions/.../index.js`). Never match
+    // a folder name like `.../Cursor plugin/...` inside another script's arguments, or
+    // ephemeral hook processes get mistaken for the host Cursor process (item 083422dd).
     if (
-      /(^|[\s/\\])(cursor|cursor-agent|claude)(\.exe)?(\s|$)/i.test(trimmed) ||
+      /^(?:["'])?(?:[^\s"']*[/\\])?(cursor|cursor-agent|claude)(\.exe)?(?:["'])?(?:\s|$)/i.test(trimmed) ||
       (/(?:^|[\s/\\])cursor-agent(?:[\s/\\]|$)/i.test(trimmed) && !/\bworker-server\b/i.test(trimmed))
     ) {
       return true

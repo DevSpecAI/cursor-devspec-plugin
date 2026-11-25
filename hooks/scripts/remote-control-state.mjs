@@ -1588,6 +1588,38 @@ export async function registerConnection(opts) {
 }
 
 /**
+ * Short CLI summary for `register` and `attach` commands (item 083422dd): drops
+ * the full run-wide rules and repository list from stdout because they are persisted
+ * via `storeRepositorySnapshot` / `refreshRepositoryRules` and delivered whole once
+ * through the `repository-context.mjs` note channel. Preserves `project_selection`
+ * when a choice is required so the caller can ask the person which project to pick.
+ */
+export function summarizeConnectCliOutput(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result
+  const {
+    project_custom_instructions: _pci,
+    project_agent_rules: _par,
+    owner_agent_rules: _oar,
+    owner_custom_instructions: _oci,
+    owner_custom_instructions_note: _ocin,
+    repository_context: repoCtx,
+    project_context: _pctx,
+    project_selection: selection,
+    ...rest
+  } = result
+  const summary = { ...rest }
+  if (selection?.status === 'choice_required' || result.code === 'project_choice_required') {
+    summary.project_selection = selection
+  } else if (selection?.project?.name && !summary.project_name) {
+    summary.project_name = selection.project.name
+  }
+  if (Array.isArray(repoCtx?.repositories)) {
+    summary.repository_count = repoCtx.repositories.length
+  }
+  return summary
+}
+
+/**
  * Node-measured attach_connection.
  * @param {{
  *   connectionId: string,
@@ -2379,7 +2411,7 @@ async function runCli() {
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.stdout.write(JSON.stringify(summarizeConnectCliOutput(result), null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2404,7 +2436,7 @@ async function runCli() {
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    process.stdout.write(JSON.stringify(summarizeConnectCliOutput(result), null, 2) + '\n')
     process.exit(result.ok ? 0 : 1)
   }
 

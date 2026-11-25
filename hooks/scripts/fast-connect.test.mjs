@@ -12,7 +12,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { parseArgs } from './remote-control-state.mjs'
+import { parseArgs, summarizeConnectCliOutput } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -540,6 +540,81 @@ describe('fastConnect', () => {
     assert.equal(r.ok, false)
     assert.match(r.error, /owner-pid/)
     assert.equal(r.connection_id, connectionId)
+  })
+  it('returns a short connect summary without rules or full repository list while keeping the full snapshot on disk (item 083422dd)', async () => {
+    const bigRules = `Never skip checks. ${'Detail line. '.repeat(400)}RULES-WHOLE-END`
+    const repos = Array.from({ length: 12 }, (_, i) => ({
+      id: `repo-${i}`,
+      full_name: `org/repo-${i}`,
+      provider: 'github',
+      git_url: `https://github.com/org/repo-${i}.git`,
+      target_branch: 'staging',
+      default_branch: 'main',
+    }))
+    const r = await fastConnect({
+      localId,
+      cwd: process.cwd(),
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => 'https://github.com/org/repo-0.git',
+      resolveLocalFn: () => ({ action: 'register', connection_id: null }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async () => {},
+      registerFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        codename: 'Brave Otter',
+        project_id: projectId,
+        project_selection: { version: 1, status: 'resolved', source: 'explicit', project: { id: projectId, name: 'DevSpec' } },
+        repository_context: { version: 1, project_id: projectId, status: 'available', repositories: repos },
+        project_custom_instructions: 'Project principles whole.',
+        project_agent_rules: bigRules,
+        owner_agent_rules: 'Owner rules whole.',
+        github_identity: { status: 'linked', logins: ['octocat'] },
+      }),
+      writeFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        session_id: null,
+        session_codename: 'Brave Otter',
+        auth_ok: true,
+        poller: { ok: true, pid: 123 },
+      }),
+    })
+
+    assert.equal(r.ok, true)
+    assert.equal(r.project_id, projectId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 12)
+    assert.equal(r.github_status, 'linked as @octocat')
+    assert.equal('project_context' in r, false, 'connect output must not dump project_context')
+    assert.equal('project_selection' in r, false, 'connect output must not dump verbose project_selection')
+    assert.equal('project_context_file' in r, false, 'connect output must not duplicate context via another file path')
+    const serialized = JSON.stringify(r)
+    assert.doesNotMatch(serialized, /RULES-WHOLE-END|Project principles whole|Owner rules whole|org\/repo-11/)
+    assert.ok(serialized.length < 1_000, `short connect summary expected (<1000 chars), got ${serialized.length}`)
+
+    // CLI register/attach summarizer strips rules and repo list while preserving choice_required.
+    const cliSummary = summarizeConnectCliOutput({
+      ok: true,
+      connection_id: connectionId,
+      project_id: projectId,
+      project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+      repository_context: { status: 'available', repositories: repos },
+      project_agent_rules: bigRules,
+      owner_agent_rules: 'Owner rules',
+    })
+    assert.equal(cliSummary.project_name, 'DevSpec')
+    assert.equal(cliSummary.repository_count, 12)
+    assert.equal('project_agent_rules' in cliSummary, false)
+    assert.equal('repository_context' in cliSummary, false)
+    const choiceSummary = summarizeConnectCliOutput({
+      ok: false,
+      code: 'project_choice_required',
+      project_selection: { status: 'choice_required', candidates: [{ id: projectId, name: 'DevSpec' }] },
+    })
+    assert.equal(choiceSummary.project_selection?.status, 'choice_required')
   })
 })
 

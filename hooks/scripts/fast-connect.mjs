@@ -676,6 +676,12 @@ export async function fastConnect(opts = {}) {
 
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
+  const repoCount = Array.isArray(projectSnapshot?.repository_context?.repositories)
+    ? projectSnapshot.repository_context.repositories.length
+    : null
+  // Return a short connect summary only (item 083422dd): the complete project rules
+  // and repository inventory are already persisted via storeRepositorySnapshot and
+  // delivered whole once through the repository-context note channel.
   return {
     ok: true,
     connection_id: connectionId,
@@ -685,10 +691,9 @@ export async function fastConnect(opts = {}) {
     launch_id: launchId,
     action: localAction.action,
     ...(createdRoom ? { new_session: true, session_url: createdRoom.session_url, title: createdRoom.title, access: makePrivate ? 'private' : 'shared' } : {}),
-    project_id: projectContext?.project.id,
-    project_selection: projectContext,
-    project_context: projectSnapshot,
-    project_context_file: repositoryContextTextFile(localId, opts.projectHome),
+    project_id: projectContext?.project.id ?? null,
+    ...(projectContext?.project?.name ? { project_name: projectContext.project.name } : {}),
+    ...(repoCount !== null ? { repository_count: repoCount } : {}),
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
