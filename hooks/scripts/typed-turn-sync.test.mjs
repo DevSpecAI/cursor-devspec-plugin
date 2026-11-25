@@ -1901,4 +1901,92 @@ describe('typed-turn-sync (item da03801e)', () => {
       fs.rmSync(reqLog, { recursive: true, force: true })
     }
   })
+
+  it('queues and registers a typed turn first seen after turn_ended rather than marking synced while skipped (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    // Transcript already contains an unseen typed turn followed immediately by turn_ended.
+    fs.writeFileSync(transcriptPath, `${typedRow('Fast typed turn that ended before first poll')}\n${turnEndedRow('success')}\n`)
+    const memo = {}
+
+    // Pass 1 without capability/callRequest: MUST NOT mark transcript synced; must stay queued and pending!
+    const skipped = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: null,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(skipped.action, 'cleared_stale')
+    assert.equal(memo.synced, false, 'must NOT mark transcript synced when ended typed turn was not registered')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true, 'typedTurnSyncPending must report pending work')
+    assert.equal(readRequestState(CONN, { dir }).failedTranscriptTurns.size, 1)
+
+    // Pass 2 with capability + callRequest: registers the ended typed turn, persists open+started+transcript_turn, and marks synced!
+    const opened = []
+    const recovered = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        opened.push(args)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(recovered.action, 'opened')
+    assert.equal(recovered.ended, true)
+    assert.equal(memo.synced, true)
+    assert.equal(opened.length, 1)
+    const state = readRequestState(CONN, { dir })
+    assert.equal(state.open.has(recovered.requestId), true)
+    assert.equal(state.started.has(recovered.requestId), true)
+    assert.equal(state.failedTranscriptTurns.size, 0)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+  })
+
+  it('preserves live room command and two-person ambiguity when replaying a background notification already joined by the prompt hook (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111aa'
+    const REQ_BOB = '22222222-2222-4222-8222-2222222222bb'
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_BOB, kind: 'typed_prompt', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bob-bg-1', kind: 'shell', notifies: true, request: REQ_BOB, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    // Prompt hook already joined Bob's completing background job into Alice's live room command turn:
+    appendRequestEvent(CONN, { op: 'joined', id: REQ_BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'notified', key: 'bob-bg-1' }, { dir })
+    assert.ok(turnAmbiguity(readRequestState(CONN, { dir })), 'precondition: two-person ambiguity must exist')
+
+    const notifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>bob-bg-1</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${notifRow}\n`)
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'already_carried_wake')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'must NOT overwrite live room command with already-joined launcher request')
+    assert.equal(after.joined.has(REQ_BOB), true, 'must keep joined launcher request distinct')
+    assert.ok(turnAmbiguity(after), 'two-person ambiguity must remain intact so writes ask which person they serve')
+  })
 })

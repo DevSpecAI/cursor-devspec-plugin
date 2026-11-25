@@ -171,7 +171,7 @@ export function typedTurnSyncPending({ transcriptPath, memo = null } = {}) {
 export function recordConnectTurnBaseline(connectionId, transcriptPath, { dir = DEFAULT_DIR, attempts = STABLE_READ_ATTEMPTS } = {}) {
   if (!connectionId || !transcriptPath) return false
   const active = activeTranscriptTurn(transcriptPath, { attempts })
-  if (!active || active.kind !== 'typed' || active.ended || !active.key) return false
+  if (!active || active.kind !== 'typed' || !active.key) return false
   const reqState = readRequestState(connectionId, { dir })
   if (reqState.seenTranscriptTurns.has(active.key)) return false
   return appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })
@@ -858,6 +858,19 @@ export async function syncTypedTurnFromTranscript({
     memo.synced = false
   }
   if (active.ended || !active.key) {
+    // If the poller first observes a typed turn AFTER turn_ended and it was never
+    // registered (nor baselined at connect), queue it so it is registered now or
+    // remains queued for retry — never marking the transcript synced while skipped
+    // work is unregistered (requirement 3ea2b201).
+    if (active.ended && active.kind === 'typed' && active.key) {
+      const endedState = readRequestState(connectionId, { dir })
+      if (
+        !endedState.seenTranscriptTurns.has(active.key) &&
+        !getPendingLocalOpen(dir, connectionId, active.key)
+      ) {
+        recordFailedTypedTurn(dir, connectionId, active.key)
+      }
+    }
     const flush = await retryQueuedFailedTurn({ excludeKey: null })
     if (flush.ran) {
       if (memo && flush.ok) memo.synced = true
@@ -908,24 +921,42 @@ export async function syncTypedTurnFromTranscript({
         }
         const wake = resolveTranscriptWake(reqState)
         if (!wake) return { action: 'not_a_wake' }
+        const wakeRef = wake.match.ref === UNSTATED ? null : wake.match.ref
+        const alreadyCarried =
+          wakeRef !== null &&
+          reqState.current !== null &&
+          (reqState.joined.has(wakeRef) ||
+            (reqState.current === wakeRef && (reqState.joined.size > 0 || reqState.chosen)))
+        if (alreadyCarried) {
+          // Prompt hook (or an explicit serve choice) already carried this wake into the
+          // running turn: preserve current, joined, and chosen intact so two people's
+          // requests stay distinct rather than replacing a live room command (ce71a72b).
+          if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
+            return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
+          }
+          return { action: 'already_carried_wake', requestId: reqState.current, key: active.key, active }
+        }
+        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
         const events = wake.direct
           ? promptArrival({
               fromAPerson: false,
               origin: wake.origin,
               text: wake.text,
-              midTurn: false,
+              midTurn,
               state: reqState,
             }).events
-          : [
-              { op: 'current', ref: wake.match.ref, from_wake: true },
-              ...wake.match.also.map((id) => ({ op: 'joined', id })),
-            ]
+          : midTurn
+            ? [wake.match.ref, ...wake.match.also].map((id) => ({ op: 'joined', id }))
+            : [
+                { op: 'current', ref: wake.match.ref, from_wake: true },
+                ...wake.match.also.map((id) => ({ op: 'joined', id })),
+              ]
         for (const event of events) {
           if (!appendRequestEvent(connectionId, event, { dir })) {
             return { action: 'binding_write_failed', key: active.key, active }
           }
         }
-        const ref = wake.match.ref === UNSTATED ? null : wake.match.ref
+        const ref = midTurn ? reqState.current : wakeRef
         if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref }, { dir })) {
           return { action: 'binding_write_failed', requestId: ref, key: active.key, active }
         }
@@ -935,7 +966,11 @@ export async function syncTypedTurnFromTranscript({
     )
     if (!restored) return { action: 'lock_busy' }
     if (restored.action !== 'not_a_wake') {
-      if (restored.action === 'restored_wake_request' || restored.action === 'already_synced') {
+      if (
+        restored.action === 'restored_wake_request' ||
+        restored.action === 'already_carried_wake' ||
+        restored.action === 'already_synced'
+      ) {
         const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
         if (memo && flush.ok && canMarkSynced()) memo.synced = true
         if (flush.ran) return { ...restored, retriedFailedTurn: flush.result }
