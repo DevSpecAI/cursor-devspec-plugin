@@ -95,7 +95,12 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
-import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, writeNote } from './hook-context-budget.mjs'
+import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitsShellOutput,
+  writeNote,
+} from './hook-context-budget.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
@@ -1740,6 +1745,8 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
     field: 'reserve',
     reserveLength: String(reserve ?? '').length,
     requiredLength: tightReceipt.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(tightReceipt),
     fullTextLength,
     note: noteRef,
     candidateCount,
@@ -1939,6 +1946,8 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
     field: 'reserve',
     reserveLength: String(reserve ?? '').length,
     requiredLength: compactFallbackFit.text.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(compactFallbackFit.text),
     fullTextLength,
     noteFailed: true,
     candidateCount: allCandidates ? allCandidates.length : null,
@@ -1969,26 +1978,46 @@ export function shellBudgetExceededError({
   field = 'reserve',
   reserveLength,
   requiredLength,
+  reserveBytes = null,
+  requiredBytes = null,
   fullTextLength,
   note = null,
   noteFailed = false,
   candidateCount = null,
   recovery = null,
 }) {
-  const actualLength = reserveLength + requiredLength
-  const msg =
-    recovery ||
-    (note
-      ? `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char receipt (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, actual_length: ${actualLength}); full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
-      : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, actual_length: ${actualLength}, total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`)
+  const actualChars = reserveLength + requiredLength
+  const resBytes = typeof reserveBytes === 'number' ? reserveBytes : reserveLength
+  const reqBytes = typeof requiredBytes === 'number' ? requiredBytes : requiredLength
+  const actualBytes = resBytes + reqBytes
+  const exceededByBytesOnly =
+    actualChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS && actualBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const limit = exceededByBytesOnly ? CURSOR_SHELL_OUTPUT_MAX_BYTES : CURSOR_SHELL_OUTPUT_MAX_CHARS
+  const limitUnit = exceededByBytesOnly ? 'bytes' : 'chars'
+  const actualLength = exceededByBytesOnly ? actualBytes : actualChars
+  const boundSummary = exceededByBytesOnly
+    ? `Prior stderr (${resBytes} bytes / ${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling for the ${reqBytes}-byte output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_BYTES} bytes, actual_length: ${actualBytes} bytes, actual_chars: ${actualChars})`
+    : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS} chars, actual_length: ${actualChars} chars)`
+  const msg = recovery
+    ? `${boundSummary}. ${recovery}`
+    : note
+      ? `${boundSummary}; full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
+      : `${boundSummary} (total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`
   const err = new RangeError(msg)
   Object.assign(err, {
     code: 'shell_output_limit_exceeded',
     field,
-    limit: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    limit,
+    limit_unit: limitUnit,
     actual_length: actualLength,
+    limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+    actual_chars: actualChars,
+    actual_bytes: actualBytes,
     reserve_chars: reserveLength,
+    reserve_bytes: resBytes,
     required_chars: requiredLength,
+    required_bytes: reqBytes,
     total_chars: fullTextLength,
     ...(note ? { note: { id: note.id, command: note.command, parts: note.parts } } : {}),
     ...(noteFailed ? { complete_output_note_failed: true } : {}),
@@ -2301,6 +2330,14 @@ export function formatBoundedCliStderr(
   const text = String(rawMessage ?? '')
   const prior = String(reserve ?? '')
   if (fitsShellOutput(`${prior}${text}`)) return text
+  const textBytes = Buffer.byteLength(text)
+  const priorBytes = Buffer.byteLength(prior)
+  const exceededBytesOnly =
+    prior.length + text.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const boundDesc = exceededBytesOnly
+    ? `${textBytes} bytes / ${text.length} chars > Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling`
+    : `${text.length} chars > Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling`
   const meta = summary ? `${summary}; ` : ''
   let savedNote = null
   try {
@@ -2309,7 +2346,7 @@ export function formatBoundedCliStderr(
     savedNote = null
   }
   if (savedNote) {
-    const pointer = `${label}: ${meta}diagnostic (${text.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling; full text saved in note ${savedNote.id} — read with \`${savedNote.command}\`.\n`
+    const pointer = `${label}: ${meta}diagnostic (${boundDesc}); full text saved in note ${savedNote.id} — read with \`${savedNote.command}\`.\n`
     if (fitsShellOutput(`${prior}${pointer}`)) return pointer
     const compactPointer = `${label}: diagnostic in note ${savedNote.id} (${savedNote.command})\n`
     if (fitsShellOutput(`${prior}${compactPointer}`)) return compactPointer
@@ -2317,6 +2354,8 @@ export function formatBoundedCliStderr(
       field: 'reserve',
       reserveLength: prior.length,
       requiredLength: compactPointer.length,
+      reserveBytes: priorBytes,
+      requiredBytes: Buffer.byteLength(compactPointer),
       fullTextLength: text.length,
       note: savedNote,
     })
@@ -2324,14 +2363,18 @@ export function formatBoundedCliStderr(
   const fb =
     typeof fallback === 'string' && fallback
       ? fallback
-      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
+      : `${label}: ${meta}diagnostic (${boundDesc}) and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
   if (fitsShellOutput(`${prior}${fb}`)) return fb
-  const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+  const omitted = exceededBytesOnly
+    ? `${label}: diagnostic omitted (${textBytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+    : `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
   if (fitsShellOutput(`${prior}${omitted}`)) return omitted
   throw shellBudgetExceededError({
     field: 'reserve',
     reserveLength: prior.length,
     requiredLength: omitted.length,
+    reserveBytes: priorBytes,
+    requiredBytes: Buffer.byteLength(omitted),
     fullTextLength: text.length,
     noteFailed: true,
   })
