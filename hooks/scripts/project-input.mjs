@@ -32,7 +32,7 @@ import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { currentTurnNoticeIds, normalizeNoticeIds, prepareNoticeReply, recordNoticeReply } from './notice-reply.mjs'
 import { readToolReply } from './tool-reply.mjs'
-import { syncTypedTurnFromTranscript, TYPED_SYNC_HOOK_TIMEOUT_MS } from './typed-turn-sync.mjs'
+import { syncTypedTurnFromTranscript, TYPED_SYNC_HOOK_BUDGET_MS } from './typed-turn-sync.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
@@ -310,26 +310,27 @@ async function syncTypedTurnForHook(rawInput, { home = os.homedir(), env = proce
     transcriptPath,
     state: connState,
     connectionCapability: credential.ok ? capability : null,
+    budgetMs: TYPED_SYNC_HOOK_BUDGET_MS,
     callRequest: credential.ok
-      ? (args) =>
+      ? (args, timeoutMs) =>
           mcpToolsCall({
             mcpUrl: credential.mcp_url,
             token: credential.token,
             connectionCapability: capability,
             name: 'report_request',
             arguments: args,
-            timeoutMs: TYPED_SYNC_HOOK_TIMEOUT_MS,
+            timeoutMs,
           })
       : null,
     callPickup: credential.ok
-      ? (args) =>
+      ? (args, timeoutMs) =>
           mcpToolsCall({
             mcpUrl: credential.mcp_url,
             token: credential.token,
             connectionCapability: capability,
             name: 'report_pickup',
             arguments: args,
-            timeoutMs: TYPED_SYNC_HOOK_TIMEOUT_MS,
+            timeoutMs,
           })
       : null,
     patchState: (patch) => patchConnectionStateFile(connState.connection_id, patch, home),

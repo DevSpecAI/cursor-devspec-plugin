@@ -34,11 +34,13 @@ import { completionArguments } from './turn-commands.mjs'
 const DEFAULT_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
 /**
- * Shared timeout for synchronous `preToolUse` typed-turn sync (`project-input.mjs`).
- * Half of `project-input.mjs`'s 5-second `preToolUse` timeout in `hooks/hooks.json`,
- * leaving headroom for lock acquisition and stdout flushing before Cursor fails closed.
+ * Total wall-clock budget for synchronous `preToolUse` typed-turn sync (`project-input.mjs`).
+ * Enforced as one shared deadline across lock wait, `report_request`, and `report_pickup`
+ * (including its single retry) so the entire sync stays safely inside `project-input.mjs`'s
+ * 5-second fail-closed timeout in `hooks/hooks.json` with 1.5 s headroom for Node startup
+ * and hook stdout flushing.
  */
-export const TYPED_SYNC_HOOK_TIMEOUT_MS = 2_500
+export const TYPED_SYNC_HOOK_BUDGET_MS = 3_500
 
 /**
  * Shared timeout for background typed-turn sync and idle request close calls
@@ -93,12 +95,13 @@ function lockPath(connectionId, dir) {
   return path.join(dir, `${connectionId}.typed-sync.lock`)
 }
 
-async function withTypedSyncLock(connectionId, dir, work) {
+async function withTypedSyncLock(connectionId, dir, work, { deadlineMs = null } = {}) {
   const target = lockPath(connectionId, dir)
   const mine = `${target}.${process.pid}-${randomBytes(4).toString('hex')}`
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(mine, String(process.pid), { mode: 0o600 })
-  const deadline = Date.now() + TYPED_SYNC_LOCK_WAIT_MS
+  const maxDeadline = Date.now() + TYPED_SYNC_LOCK_WAIT_MS
+  const deadline = typeof deadlineMs === 'number' ? Math.min(maxDeadline, deadlineMs) : maxDeadline
   let acquired = false
   try {
     while (Date.now() < deadline) {
@@ -230,6 +233,10 @@ async function admitLocalTurnPreservingRefusal({ scope, previousAttemptId, callP
   let lastResponse = null
   let lastError = null
   const wrappedCall = async (args) => {
+    // Clear prior attempt state on every call so a retry refusal (returned or thrown)
+    // is never shadowed by an earlier attempt's response (requirement 4e32d1a5).
+    lastResponse = null
+    lastError = null
     try {
       const res = await callPickup(args)
       lastResponse = res
@@ -258,9 +265,10 @@ async function admitLocalTurnPreservingRefusal({ scope, previousAttemptId, callP
  * Ensure a live terminal-typed turn in `transcriptPath` is recorded as a `typed_prompt`
  * request in `<connectionId>.requests.jsonl` (and admitted via `startLocalTurn` when
  * attached to a room). Advances `seenTranscriptTurns` and `memo.synced` only after
- * request opening, room admission (when required), and local log writes all succeed.
- * Also clears any lingering earlier `typed_prompt` from foreground `current` when a
- * non-typed wake (such as a timestamp-only wake) starts before idle cleanup.
+ * request opening, room admission (when required), state persistence, and binding write
+ * all succeed. Also clears any lingering unrelated `typed_prompt` from foreground
+ * `current` on a non-typed wake (preserving any `typed_prompt` with pending background
+ * or scheduled-wake continuations).
  */
 export async function syncTypedTurnFromTranscript({
   connectionId,
@@ -273,9 +281,26 @@ export async function syncTypedTurnFromTranscript({
   dir = DEFAULT_DIR,
   memo = null,
   attempts = STABLE_READ_ATTEMPTS,
+  budgetMs = null,
   log = (line) => process.stderr.write(line),
 } = {}) {
   if (!connectionId || !transcriptPath) return { action: 'none' }
+  const deadlineMs = typeof budgetMs === 'number' && budgetMs > 0 ? Date.now() + budgetMs : null
+  const remainingMs = () => (deadlineMs === null ? null : deadlineMs - Date.now())
+  const boundedCall = (fn) => {
+    if (typeof fn !== 'function') return null
+    if (deadlineMs === null) return fn
+    return async (args) => {
+      const rem = remainingMs()
+      if (rem <= 0) {
+        throw Object.assign(new Error('typed-turn sync budget exhausted'), { code: 'sync_budget_exhausted', budget_ms: budgetMs })
+      }
+      return fn(args, rem)
+    }
+  }
+  const effectiveCallRequest = boundedCall(callRequest)
+  const effectiveCallPickup = boundedCall(callPickup)
+
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return { action: 'none' }
   if (memo && memo.stamp === stamp && memo.synced) return { action: 'unchanged' }
@@ -297,126 +322,156 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
-  // A live non-typed turn (timestamp-only wake or room command wake) must never inherit
-  // an earlier typed_prompt as foreground current if it arrived before idle cleanup.
+  // A live non-typed turn (timestamp-only wake or room command wake) must not inherit an
+  // unrelated earlier typed_prompt if it arrived before idle cleanup — EXCEPT when that
+  // typed_prompt has a pending background/scheduled continuation (decision ce71a72b / 2fcd26bd).
   if (active.kind !== 'typed') {
+    const initialPending = requestsWithWorkPending(initial, { sessionCrons: recordedSessionCrons(initial) })
     const staleTypedCurrent =
-      initial.current && initial.open.get(initial.current)?.kind === 'typed_prompt'
+      initial.current &&
+      initial.open.get(initial.current)?.kind === 'typed_prompt' &&
+      !initialPending.has(initial.current)
         ? initial.current
         : null
     if (!staleTypedCurrent) {
       if (memo) memo.synced = true
       return { action: 'not_typed_live', active }
     }
-    const cleared = await withTypedSyncLock(connectionId, dir, async () => {
-      const reqState = readRequestState(connectionId, { dir })
-      if (reqState.seenTranscriptTurns.has(active.key)) {
-        return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
-      }
-      if (reqState.current && reqState.open.get(reqState.current)?.kind === 'typed_prompt') {
-        if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
+    const cleared = await withTypedSyncLock(
+      connectionId,
+      dir,
+      async () => {
+        const reqState = readRequestState(connectionId, { dir })
+        if (reqState.seenTranscriptTurns.has(active.key)) {
+          return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
+        }
+        const pending = requestsWithWorkPending(reqState, { sessionCrons: recordedSessionCrons(reqState) })
+        if (
+          reqState.current &&
+          reqState.open.get(reqState.current)?.kind === 'typed_prompt' &&
+          !pending.has(reqState.current)
+        ) {
+          if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
+            return { action: 'binding_write_failed', key: active.key, active }
+          }
+        }
+        if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })) {
           return { action: 'binding_write_failed', key: active.key, active }
         }
-      }
-      if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })) {
-        return { action: 'binding_write_failed', key: active.key, active }
-      }
-      return { action: 'cleared_for_wake', key: active.key, active }
-    })
+        return { action: 'cleared_for_wake', key: active.key, active }
+      },
+      { deadlineMs },
+    )
     if (memo && cleared && (cleared.action === 'cleared_for_wake' || cleared.action === 'already_synced')) {
       memo.synced = true
     }
     return cleared ?? { action: 'lock_busy' }
   }
 
-  const result = await withTypedSyncLock(connectionId, dir, async () => {
-    const reqState = readRequestState(connectionId, { dir })
-    if (reqState.seenTranscriptTurns.has(active.key)) {
-      return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
-    }
+  const result = await withTypedSyncLock(
+    connectionId,
+    dir,
+    async () => {
+      const reqState = readRequestState(connectionId, { dir })
+      if (reqState.seenTranscriptTurns.has(active.key)) {
+        return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
+      }
 
-    const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
-    const existingTyped = unboundOpenTypedPrompt(reqState)
-    let requestId = existingTyped
-    let openedNow = false
+      const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
+      const existingTyped = unboundOpenTypedPrompt(reqState)
+      let requestId = existingTyped
+      let openedNow = false
 
-    if (!requestId && connectionCapability && typeof callRequest === 'function') {
-      requestId = await openRequest({
-        connectionId,
-        kind: 'typed_prompt',
-        call: callRequest,
-        dir,
-      }).catch(() => null)
-      if (requestId) {
-        openedNow = true
-        const currentWritten = appendRequestEvent(
+      if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
+        requestId = await openRequest({
           connectionId,
-          midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-          { dir },
-        )
-        if (!currentWritten) {
-          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
+          kind: 'typed_prompt',
+          call: effectiveCallRequest,
+          dir,
+        }).catch(() => null)
+        if (requestId) {
+          openedNow = true
+          const currentWritten = appendRequestEvent(
+            connectionId,
+            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+            { dir },
+          )
+          if (!currentWritten) {
+            return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
+          }
         }
       }
-    }
 
-    if (requestId) {
-      // Admit the terminal turn with the connection capability when attached, matching
-      // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
-      // Only mark the transcript turn synced once admission and binding write succeed; on
-      // refusal, preserve structured refusal details and leave unsynced so the next tick retries.
-      const sessionId = state?.session_id || null
-      const scope =
-        !midTurn && sessionId && connectionCapability && typeof callPickup === 'function' && !state?.local_turn
-          ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
-          : null
+      if (requestId) {
+        // Admit the terminal turn with the connection capability when attached, matching
+        // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
+        // Only mark the transcript turn synced once admission, state persistence, and binding
+        // write all succeed; on refusal or write failure, preserve details and retry next tick.
+        const sessionId = state?.session_id || null
+        const scope =
+          !midTurn && sessionId && connectionCapability && typeof effectiveCallPickup === 'function' && !state?.local_turn
+            ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
+            : null
 
-      if (scope) {
-        const admission = await admitLocalTurnPreservingRefusal({
-          scope,
-          previousAttemptId: state?.local_turn?.attempt_id ?? null,
-          callPickup,
-        })
-        if (!admission.ok) {
-          log(
-            `typed-turn-sync: local turn admission failed for ${connectionId} (${active.key}): ${JSON.stringify(admission.refusal)}\n`,
-          )
+        if (scope) {
+          const admission = await admitLocalTurnPreservingRefusal({
+            scope,
+            previousAttemptId: state?.local_turn?.attempt_id ?? null,
+            callPickup: effectiveCallPickup,
+          })
+          if (!admission.ok) {
+            log(
+              `typed-turn-sync: local turn admission failed for ${connectionId} (${active.key}): ${JSON.stringify(admission.refusal)}\n`,
+            )
+            return {
+              action: 'admission_failed',
+              requestId,
+              key: active.key,
+              midTurn,
+              refusal: admission.refusal,
+            }
+          }
+          if (typeof patchState === 'function') {
+            const saved = patchState({ local_turn: admission.admitted })
+            if (saved === false) {
+              log(`typed-turn-sync: failed to persist local_turn state for ${connectionId} (${active.key})\n`)
+              return {
+                action: 'state_write_failed',
+                requestId,
+                key: active.key,
+                midTurn,
+              }
+            }
+          }
+        }
+
+        const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: requestId }, { dir })
+        if (!bound) {
           return {
-            action: 'admission_failed',
+            action: 'binding_write_failed',
             requestId,
             key: active.key,
             midTurn,
-            refusal: admission.refusal,
           }
         }
-        if (typeof patchState === 'function') patchState({ local_turn: admission.admitted })
-      }
-
-      const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: requestId }, { dir })
-      if (!bound) {
         return {
-          action: 'binding_write_failed',
+          action: openedNow ? 'opened' : 'adopted_hook_request',
           requestId,
           key: active.key,
           midTurn,
         }
       }
-      return {
-        action: openedNow ? 'opened' : 'adopted_hook_request',
-        requestId,
-        key: active.key,
-        midTurn,
-      }
-    }
 
-    // Could not open a typed_prompt right now (offline / no capability / DevSpec refused):
-    // still clear any stale foreground request so writes go out unstamped and DevSpec
-    // resolves who asked from the connection rather than stamping a closed command.
-    if (!midTurn && reqState.current !== null) {
-      appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
-    }
-    return { action: 'cleared_stale', key: active.key }
-  })
+      // Could not open a typed_prompt right now (offline / no capability / DevSpec refused):
+      // still clear any stale foreground request so writes go out unstamped and DevSpec
+      // resolves who asked from the connection rather than stamping a closed command.
+      if (!midTurn && reqState.current !== null) {
+        appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+      }
+      return { action: 'cleared_stale', key: active.key }
+    },
+    { deadlineMs },
+  )
 
   if (
     memo &&

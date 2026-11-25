@@ -442,4 +442,90 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.ok(patched?.local_turn?.attempt_id)
     assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
+
+  it('preserves a typed_prompt that has a recorded scheduled wake continuation on a non-typed wake (ce71a72b / 2fcd26bd)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: HOOK_TYPED, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    const timestampOnly = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Schedule deploy check')}\n${timestampOnly}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'not_typed_live')
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED, 'scheduled-wake continuation must keep typed_prompt attribution')
+  })
+
+  it('leaves turn unsynced when patchState fails to persist admitted local_turn (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Persist state check')}\n`)
+    const memo = { stamp: null, synced: false }
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async (args) => ({ status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: ROOM }),
+      patchState: () => false,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(res.action, 'state_write_failed')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0)
+  })
+
+  it('preserves a retry thrown refusal instead of returning the earlier attempt response (4e32d1a5)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Retry refusal check')}\n`)
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    let attempt = 0
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async (args) => {
+        attempt += 1
+        if (attempt === 1) {
+          return {
+            connection_id: CONN,
+            attempt_id: args.attempt_id,
+            expected_session_id: ROOM,
+            status: 'predecessor_changed',
+            previous_attempt_id: '77777777-7777-4777-8777-777777777777',
+          }
+        }
+        throw Object.assign(new Error('Final retry refused'), { code: 'retry_blocked', details: { blocker: 'room_locked' } })
+      },
+      dir,
+      log: () => {},
+    })
+    assert.equal(attempt, 2)
+    assert.equal(res.action, 'admission_failed')
+    assert.equal(res.refusal.code, 'retry_blocked')
+    assert.deepEqual(res.refusal.details, { blocker: 'room_locked' })
+  })
 })
