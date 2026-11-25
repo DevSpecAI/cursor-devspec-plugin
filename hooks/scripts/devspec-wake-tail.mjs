@@ -647,14 +647,16 @@ export async function readWakes({
     let earliestDeferredStart = null
     let deferredEntries = []
     let inlineCommands = []
+    let inlineCommandSpans = []
     let inlineMessages = []
     let noteRefusals = []
     let extractedSessionId = null
     if (resolvedConnectionId && page.printed > 0) {
-      // Inspect each printed wake individually so every `wake_in_note` command records its
-      // OWN exact `[wakeStart, wakeEnd]` byte span instead of the whole page's end offset:
-      // reading one note out of order can never advance the cursor past another unread or
-      // failed note on the same page (requirement 3ea2b201).
+      // Inspect each printed wake individually so every `wake_in_note` command AND every
+      // inline room command records its OWN exact `[wakeStart, wakeEnd]` byte span instead
+      // of the whole page's end offset: reading one note out of order or picking up only
+      // the newest command on a multi-command page can never advance the cursor past an
+      // unstarted or unread command (requirement 3ea2b201).
       const printedItems = Array.isArray(page.printedWakes)
         ? page.printedWakes
         : [{ text: page.text, sourceIndex: Math.max(0, page.through - 1) }]
@@ -664,6 +666,9 @@ export async function readWakes({
         const extracted = extractRoomCommandsFromWake(item.text, { home })
         if (!extractedSessionId && extracted.sessionId) extractedSessionId = extracted.sessionId
         inlineCommands.push(...extracted.inlineCommands)
+        for (const cmd of extracted.inlineCommands) {
+          inlineCommandSpans.push({ messageId: cmd.messageId, wakeStart, wakeEnd })
+        }
         inlineMessages.push(...extracted.inlineMessages)
         for (const note of extracted.unreadableNotes) {
           noteRefusals.push({
@@ -686,6 +691,7 @@ export async function readWakes({
     }
 
     let rawDiag = ''
+    let unstartedCommands = []
     if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
       const capturedDiag = []
       let pickupResult = null
@@ -710,6 +716,9 @@ export async function readWakes({
             refusals: [structuredRefusalFromError(error)],
           }
         }
+      }
+      if (Array.isArray(pickupResult?.unstarted) && pickupResult.unstarted.length > 0) {
+        unstartedCommands = pickupResult.unstarted
       }
       const combinedRefusals = [
         ...noteRefusals,
@@ -745,6 +754,7 @@ export async function readWakes({
             prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
             stdoutText: page.text,
             noteError,
+            allowMinimalEnvelope: false,
           }),
         requireStructuredFallback: true,
       })
@@ -819,27 +829,40 @@ export async function readWakes({
         error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
       }
     }
-    // When the printed page delivered one or more `wake_in_note` pointers for oversized room
-    // commands, never advance past the earliest unread deferred note (any completed inline wakes
-    // strictly before `earliestDeferredStart` may advance up to `earliestDeferredStart`, leaving
-    // every deferred note queued until the agent reads it whole via `stepDeliveryHook`, req 3ea2b201).
-    if (pendingNoteReads.length > 0) {
-      if (typeof earliestDeferredStart === 'number' && earliestDeferredStart > position) {
+    // Never advance past either an unread deferred `wake_in_note` command OR an older
+    // inline room command returned in `unstarted` because only the newest command on this
+    // page received a `report_pickup` (requirement 3ea2b201). Completed wakes strictly
+    // before the earliest held start may advance up to `holdAt`, leaving every unstarted
+    // or unread command queued for the next read.
+    const unstartedIds = new Set(unstartedCommands.map((cmd) => cmd?.messageId).filter(Boolean))
+    let earliestUnstartedStart = null
+    for (const span of inlineCommandSpans) {
+      if (unstartedIds.has(span.messageId)) {
+        if (earliestUnstartedStart === null || span.wakeStart < earliestUnstartedStart) {
+          earliestUnstartedStart = span.wakeStart
+        }
+      }
+    }
+    if (pendingNoteReads.length > 0 || unstartedCommands.length > 0) {
+      const holdCandidates = [earliestDeferredStart, earliestUnstartedStart].filter((n) => typeof n === 'number')
+      const holdAt = holdCandidates.length > 0 ? Math.min(...holdCandidates) : null
+      if (holdAt !== null && holdAt > position) {
         try {
           writePrivateJson(readPositionPath(key, dir), {
             version: POSITION_VERSION,
             file: resolved,
-            offset: earliestDeferredStart,
+            offset: holdAt,
             at: new Date().toISOString(),
           })
         } catch {
-          /* non-fatal: deferred notes stay queued from earlier offset */
+          /* non-fatal: deferred/unstarted wakes stay queued from earlier offset */
         }
       }
       return {
         ...page,
         marked: false,
-        pending_note_reads: pendingNoteReads,
+        ...(pendingNoteReads.length > 0 ? { pending_note_reads: pendingNoteReads } : {}),
+        ...(unstartedCommands.length > 0 ? { unstarted_commands: unstartedCommands } : {}),
         ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
         ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
         ...(pickupDiagnosticWritten ? { pickup_diagnostic_written: true } : {}),
@@ -898,10 +921,19 @@ async function main() {
   if (!page.marked) {
     // Said only when no pickup diagnostic was already emitted and it keeps output within Cursor's ceiling.
     if (!page.pickup_diagnostic_written) {
-      const said = `devspec-wake-tail: the wakes above could not be marked read (${page.error?.message ?? 'unknown error'}); they print again next time.\n`
+      let said = ''
+      if (page.error) {
+        said = `devspec-wake-tail: the wakes above could not be marked read (${page.error.message ?? 'unknown error'}); they print again next time.\n`
+      } else if (Array.isArray(page.unstarted_commands) && page.unstarted_commands.length > 0) {
+        said = `devspec-wake-tail: ${page.unstarted_commands.length} older room command(s) remain queued for pickup on the next read.\n`
+      } else if (Array.isArray(page.pending_note_reads) && page.pending_note_reads.length > 0) {
+        said = `devspec-wake-tail: ${page.pending_note_reads.length} wake note(s) remain pending read before advancing the cursor.\n`
+      } else {
+        said = 'devspec-wake-tail: the wakes above could not be marked read (unknown error); they print again next time.\n'
+      }
       if (fitsShellOutput(page.text + said)) process.stderr.write(said)
     }
-    process.exitCode = 1
+    if (page.error || page.pickup_refusals) process.exitCode = 1
   }
 }
 

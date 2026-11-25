@@ -377,6 +377,7 @@ export function formatStructuredRefusalsFallback(
     stdoutText = '',
     noteError = null,
     recovery = 'Fix write permissions on ~/.devspec/notes and retry so the complete structured refusal can be saved whole and read back.',
+    allowMinimalEnvelope = true,
   } = {},
 ) {
   const list = Array.isArray(refusals) ? refusals.map((item) => cloneJsonSafe(item)) : []
@@ -464,10 +465,54 @@ export function formatStructuredRefusalsFallback(
   const singleFitted = wrap([first])
   if (fits(singleFitted)) return singleFitted
 
-  const countOnly = wrap([], {
-    codes: list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean),
-  })
-  return fits(countOnly) ? countOnly : null
+  if (!allowMinimalEnvelope) return null
+
+  const allCodes = list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
+  const fitCodes = (build) => {
+    let clo = 0
+    let chi = allCodes.length
+    while (clo < chi) {
+      const cmid = Math.ceil((clo + chi) / 2)
+      if (fits(build(allCodes.slice(0, cmid)))) {
+        clo = cmid
+      } else {
+        chi = cmid - 1
+      }
+    }
+    const candidate = build(allCodes.slice(0, clo))
+    return fits(candidate) ? candidate : null
+  }
+
+  // Tier 1: full prefix + full metadata + as many refusal codes as fit.
+  const tier1 = fitCodes((codes) => wrap([], { codes }))
+  if (tier1) return tier1
+
+  // Tier 2: compact structured JSON envelope preserving refusal status, counts,
+  // shell limit, note-write failure, refusal codes, and concrete recovery steps
+  // for tight remaining budgets (e.g. ~200-350 chars left after prior stderr).
+  const tier2 = fitCodes(
+    (codes) =>
+      `${JSON.stringify({
+        refused: 'report_pickup',
+        note_write_failed: true,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        total_count: list.length,
+        omitted_count: list.length,
+        ...(codes.length > 0 ? { codes } : {}),
+        recovery: 'Fix ~/.devspec/notes permissions and retry.',
+      })}\n`,
+  )
+  if (tier2) return tier2
+
+  // Tier 3: minimal structured JSON omission + recovery notice that fits inside
+  // `shellDiagnosticReserve('devspec-remote-wait')` (~119 chars).
+  const tier3 = `${JSON.stringify({
+    refused: 'report_pickup',
+    omitted_count: list.length,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    recovery: 'Fix ~/.devspec/notes & retry.',
+  })}\n`
+  return fits(tier3) ? tier3 : null
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */
@@ -590,6 +635,7 @@ export async function startRoomCommands({
     now() - prevMarker.startedAt >= TURN_SILENCE_MS &&
     !prevActivity
   const prevLive = !staleBySilence && turnIsLive(prevMarker, { activity: prevActivity })
+  const staleCompleteRefusals = []
   if (prevMarker && !prevLive && token && mcpUrl) {
     const staleCommands = readTurnCommands(connectionId, { dir })
     const completeArgs =
@@ -602,22 +648,70 @@ export async function startRoomCommands({
           }
         : attemptEndArguments({ connectionId, reason: 'max_turn_ms' })
     const completeTimeout = remainingBudgetMs()
+    let staleCompleteCleared = false
     if (completeTimeout > 0) {
       try {
-        await call({
+        const completeRes = await call({
           mcpUrl,
           token,
           name: 'report_complete',
           arguments: completeArgs,
           timeoutMs: completeTimeout,
         })
+        const completeRefused = pickupRefusalFromResponse(completeRes)
+        if (completeRefused) {
+          staleCompleteRefusals.push({
+            step: 'stale_turn_report_complete',
+            ...completeArgs,
+            refusal: completeRefused,
+          })
+          log(
+            `command-start: stale-turn report_complete refused for ${connectionId}: ${JSON.stringify(completeRefused)}\n`,
+          )
+        } else {
+          staleCompleteCleared = true
+        }
       } catch (error) {
+        const structured = structuredRefusalFromError(error)
+        staleCompleteRefusals.push({
+          step: 'stale_turn_report_complete',
+          ...completeArgs,
+          refusal: structured,
+        })
         log(
-          `command-start: stale-turn report_complete failed for ${connectionId}: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
+          `command-start: stale-turn report_complete failed for ${connectionId}: ${JSON.stringify(structured)}\n`,
         )
       }
+    } else {
+      const budgetRefusal = {
+        code: 'budget_exhausted',
+        retryable: true,
+        budget_ms: timeoutMs,
+        error: 'Command start hook budget exhausted before stale-turn report_complete.',
+      }
+      staleCompleteRefusals.push({
+        step: 'stale_turn_report_complete',
+        ...completeArgs,
+        refusal: budgetRefusal,
+      })
+      log(
+        `command-start: stale-turn report_complete budget exhausted for ${connectionId}: ${JSON.stringify(budgetRefusal)}\n`,
+      )
     }
-    clearTurnMarker(connectionId, dir)
+    if (staleCompleteCleared) {
+      clearTurnMarker(connectionId, dir)
+    }
+  }
+
+  if (staleCompleteRefusals.length > 0) {
+    return {
+      ok: false,
+      outcome: 'refused',
+      started: [],
+      pickedUp: 0,
+      startsTurn: false,
+      refusals: staleCompleteRefusals,
+    }
   }
 
   const effectiveStartsTurn = typeof startsTurn === 'boolean' ? startsTurn : !prevLive

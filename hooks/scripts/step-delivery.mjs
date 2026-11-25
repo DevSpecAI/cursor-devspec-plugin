@@ -951,9 +951,49 @@ export async function stepDeliveryHook(
             `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
           )
         }
+        const unstartedIds = new Set(
+          (Array.isArray(pickupResult?.unstarted) ? pickupResult.unstarted : [])
+            .map((cmd) => cmd?.messageId)
+            .filter(Boolean),
+        )
+        if (unstartedIds.size > 0 && !record && keptForPickupRetry) {
+          const remainingOwnerItems = completedOwnerItems.filter((item) => {
+            const cmds =
+              Array.isArray(item.commands) && item.commands.length > 0
+                ? item.commands
+                : commandsHandedOver(
+                    Array.isArray(item.messages) && item.messages.length > 0
+                      ? item.messages
+                      : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+                  )
+            return cmds.some((cmd) => unstartedIds.has(cmd?.messageId))
+          })
+          if (remainingOwnerItems.length > 0) {
+            record = {
+              ...keptForPickupRetry,
+              items: remainingOwnerItems,
+              pickup_pending: true,
+            }
+            readChanged = true
+          }
+        }
         let hasPositionTrackedCompleted = false
         for (const { taken: noteTaken, entry } of completedWakeNotes) {
-          if (typeof entry.wake_position_path === 'string' && typeof entry.wake_through === 'number') {
+          const noteHasUnstarted =
+            unstartedIds.size > 0 &&
+            Array.isArray(entry.commands) &&
+            entry.commands.some((cmd) => unstartedIds.has(cmd?.messageId))
+          if (noteHasUnstarted) {
+            try {
+              writePrivateJson(noteTaken.original, {
+                ...entry,
+                pickup_pending: true,
+              })
+              drop(noteTaken)
+            } catch {
+              giveBack(noteTaken)
+            }
+          } else if (typeof entry.wake_position_path === 'string' && typeof entry.wake_through === 'number') {
             hasPositionTrackedCompleted = true
             try {
               writePrivateJson(noteTaken.original, {

@@ -1623,4 +1623,158 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(stderr2, /"recovery":/)
     assert.doesNotMatch(stderr2, /diagnostic omitted/, 'must surface structured refusal counts & recovery, never generic omission line')
   })
+
+  it('emits a structured omission and recovery diagnostic even with only 350 chars left in the Shell budget and note-write failure (3c5147a7 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const notesPath = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(notesPath), { recursive: true })
+    fs.writeFileSync(notesPath, 'blocked')
+    const wake = buildOwnerMessageEvents(ownerBatch('Tight budget refusal test'))
+    const priorStderr = 'w'.repeat(20_000 - 350)
+    let capturedStderr = ''
+    const res = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [wake],
+      printedStdout: '',
+      priorStderr,
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: (chunk) => { capturedStderr += chunk },
+      startCommands: async () => ({
+        ok: false,
+        outcome: 'refused',
+        refusals: [
+          {
+            command_message_id: MSG_ID,
+            command_turn_id: TURN_ID,
+            refusal: {
+              code: 'turn_busy',
+              retryable: true,
+              blocking_turn_id: '88888888-8888-4888-8888-888888888888',
+              detail: 'x'.repeat(25_000),
+            },
+          },
+        ],
+      }),
+    })
+    assert.equal(res.ok, false)
+    assert.ok(capturedStderr.length > 0, 'must NOT silently drop the refusal when 350 chars remain')
+    assert.equal(fitsShellOutput(priorStderr + capturedStderr), true, 'combined output must stay within Shell limit')
+    const parsed = JSON.parse(capturedStderr.trim())
+    assert.equal(parsed.omitted_count, 1)
+    assert.equal(parsed.shell_limit_chars, 20_000)
+    assert.deepEqual(parsed.codes, ['turn_busy'])
+    assert.ok(typeof parsed.recovery === 'string' && parsed.recovery.includes('~/.devspec/notes'))
+  })
+
+  it('readWakes does not advance cursor past an older unstarted inline room command when two commands fit on one page (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    const turn1 = '11111111-1111-4111-8111-111111111111'
+    const msg1 = '22222222-2222-4222-8222-222222222222'
+    const turn2 = TURN_ID
+    const msg2 = MSG_ID
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Older command 1', { messageId: msg1, turnId: turn1 })))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Newer command 2', { messageId: msg2, turnId: turn2 })))
+
+    const pickups = []
+    const call = async (req) => {
+      if (req.name === 'report_pickup') pickups.push(req.arguments.command_message_id)
+      return { outcome: 'picked_up' }
+    }
+
+    // Read 1: both commands fit on the page; only msg2 receives report_pickup, so cursor MUST NOT advance past msg1.
+    const read1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read1.printed, 2)
+    assert.equal(read1.marked, false, 'cursor must not advance past unstarted older command')
+    assert.deepEqual(pickups, [msg2])
+    assert.deepEqual(read1.unstarted_commands, [{ turnId: turn1, messageId: msg1 }])
+
+    // Read 2: older command msg1 is still unread, receives its own report_pickup, and NOW cursor advances to EOF!
+    const read2 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read2.marked, true)
+    assert.deepEqual(pickups, [msg2, msg1])
+
+    // Read 3: both commands picked up -> cursor is now at EOF (0 wakes).
+    const read3 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read3.printed, 0)
+    assert.equal(read3.marked, true)
+  })
+
+  it('preserves and surfaces a normal structured refusal from stale-turn report_complete without clearing the local turn marker (4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const turnPath = path.join(dir, `${CONN}.turn`)
+    fs.writeFileSync(turnPath, JSON.stringify({ startedAt: Date.now() - 120_000, connection_id: CONN }))
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('New command after stale turn')))
+
+    const calls = []
+    let capturedStderr = ''
+    const res = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: (chunk) => { capturedStderr += chunk },
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async (req) => {
+            calls.push(req.name)
+            if (req.name === 'report_complete') {
+              return {
+                ok: false,
+                refused: true,
+                code: 'attempt_blocked',
+                blocking_attempt: {
+                  attempt_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                  reason: 'active_tool_call',
+                },
+              }
+            }
+            return { outcome: 'picked_up' }
+          },
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.deepEqual(calls, ['report_complete'], 'must not proceed to report_pickup when stale-turn report_complete is refused')
+    assert.equal(fs.existsSync(turnPath), true, 'must not clear the local turn marker when report_complete is refused')
+    assert.equal(res.marked, false, 'must not advance wake cursor when stale-turn cleanup was refused')
+    assert.equal(res.pickup_refusals?.[0]?.step, 'stale_turn_report_complete')
+    assert.equal(res.pickup_refusals?.[0]?.refusal?.blocking_attempt?.attempt_id, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    assert.match(capturedStderr, /attempt_blocked/)
+    assert.match(capturedStderr, /aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/)
+    assert.match(capturedStderr, /active_tool_call/)
+  })
 })

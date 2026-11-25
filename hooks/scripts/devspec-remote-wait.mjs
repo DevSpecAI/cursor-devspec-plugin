@@ -1976,6 +1976,9 @@ export async function runOneShotRoomCommandPickup({
     hadCommands: true,
     ...(refusals ? { refusals } : {}),
     ...(nothingOpen ? { nothingOpen } : {}),
+    ...(Array.isArray(startResult?.unstarted) && startResult.unstarted.length > 0
+      ? { unstarted: startResult.unstarted }
+      : {}),
     stderrText,
     diagnosticNote,
   }
@@ -2303,7 +2306,10 @@ async function main() {
                 shot = { count: plan.count, text: finalText, printedWakes: plan.printedWakes }
                 printed = plan.count
               }
-              if (printed < frozen.length) {
+              if (Array.isArray(pickup?.unstarted) && pickup.unstarted.length > 0) {
+                // Older commands in this batch were not yet picked up; keep frozen state
+                // and inbox cursor untouched so the next run picks them up (req 3ea2b201).
+              } else if (printed < frozen.length) {
                 writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(printed) } })
               } else {
                 offset = newOffset
@@ -2491,10 +2497,11 @@ async function main() {
             process.stdout.write(finalText, (error) => (error ? reject(error) : resolve())),
           )
           oneShot = { count: plan.count, text: finalText, printedWakes: plan.printedWakes }
-          printedAll = plan.count >= out.wakes.length
+          const hasUnstartedCommands = Array.isArray(oneShotPickup?.unstarted) && oneShotPickup.unstarted.length > 0
+          printedAll = plan.count >= out.wakes.length && !hasUnstartedCommands
           // The rest is frozen as built, for the next re-arm to print as it is: kept only
           // while the connection is live, under its steps lock (see the frozen wakes above).
-          if (!printedAll) {
+          if (!printedAll && !hasUnstartedCommands) {
             try {
               withStepsLock(connectionId, CONNECTIONS_DIR, () => {
                 if (!connectionEnded(connectionId)) {
