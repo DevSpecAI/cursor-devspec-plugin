@@ -615,6 +615,82 @@ function persistOwnerPidOnConnection(connectionId, ownerPid) {
  * fake log and pid file in the developer's real `~/.devspec` — where a stray pid file
  * is not inert, since `findWakeFollowPidForConnection` reads exactly those (76e1affb).
  */
+/**
+ * Exclusive lock retry cadence for `ensureWakeFollowForConnection`, matching
+ * `private-state.mjs` and `step-delivery.mjs` (`LOCK_RETRY_MS = 20`) so concurrent
+ * connection setup and poller startup serialize without busy-spinning.
+ */
+export const WAKE_FOLLOW_LOCK_RETRY_MS = 20
+
+/**
+ * Maximum wait for the per-connection wake-follow spawn lock. Bounded well below
+ * connect timeouts so a wedged lock never stalls `fast-connect`, while comfortably
+ * exceeding a single detached `spawn()` + `.follow.pid` write (<50 ms).
+ */
+export const WAKE_FOLLOW_LOCK_WAIT_MS = 2_000
+
+function wakeFollowLockPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.follow.lock`)
+}
+
+function sleepSyncMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Serialize wake-follow check-and-spawn across concurrent callers (for example
+ * `writeConnectionState` and the newly spawned `devspec-remote-poll.mjs`), keeping
+ * strictly one inbox follower per connection (decision 2df26cd2).
+ */
+function withWakeFollowLock(connectionId, io, work) {
+  if (io !== fs) return work()
+  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
+  const lockFile = wakeFollowLockPath(connectionId)
+  const deadline = Date.now() + WAKE_FOLLOW_LOCK_WAIT_MS
+  let acquired = false
+  while (Date.now() < deadline) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx', 0o600)
+      try {
+        fs.writeSync(fd, `${process.pid}\n`)
+      } finally {
+        fs.closeSync(fd)
+      }
+      acquired = true
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+    let holder = null
+    try {
+      holder = Number.parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10)
+    } catch {
+      continue
+    }
+    if (Number.isInteger(holder) && holder > 1 && !ownerAlive(holder)) {
+      try {
+        fs.unlinkSync(lockFile)
+      } catch {
+        /* another caller cleared it */
+      }
+      continue
+    }
+    sleepSyncMs(WAKE_FOLLOW_LOCK_RETRY_MS)
+  }
+  if (!acquired) {
+    return { ok: false, error: 'wake-follow startup lock busy; retry shortly' }
+  }
+  try {
+    return work()
+  } finally {
+    try {
+      fs.unlinkSync(lockFile)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   const io = opts.io || fs
   if (!connectionId || connectionId.length < 8) {
@@ -625,6 +701,11 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   if (!io.existsSync(WAIT_SCRIPT)) {
     return { ok: false, error: `wait script missing: ${WAIT_SCRIPT}` }
   }
+
+  return withWakeFollowLock(connectionId, io, () => ensureWakeFollowLocked(connectionId, wakeFile, io, opts))
+}
+
+function ensureWakeFollowLocked(connectionId, wakeFile, io, opts) {
 
   const findPid = opts.findPid || findWakeFollowPidForConnection
   const running = findPid(connectionId)

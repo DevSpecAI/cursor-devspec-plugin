@@ -335,4 +335,114 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(ok.wake_listener.active, false)
     assert.equal(ok.wake_listener.follow_pid, 101)
   })
+
+  it('does not mark command started when report_pickup refuses or throws, preserves structured refusal, and retries on next call', async () => {
+    const { home, dir } = mkHome()
+    const logs = []
+    let calls = 0
+
+    const first = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async () => {
+        calls += 1
+        return { ok: false, status: 'refused', code: 'turn_busy', blocking_turn_id: '99999999-9999-4999-8999-999999999999' }
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+      log: (line) => logs.push(line),
+    })
+    assert.equal(first.ok, false)
+    assert.equal(first.pickedUp, 0)
+    assert.equal(first.started.length, 0)
+    assert.equal(first.refusals.length, 1)
+    assert.equal(first.refusals[0].refusal.code, 'turn_busy')
+    assert.equal(first.refusals[0].refusal.blocking_turn_id, '99999999-9999-4999-8999-999999999999')
+
+    const second = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async () => {
+        calls += 1
+        throw Object.assign(new Error('Refused'), { code: 'connection_busy', retryable: true, details: { wait_ms: 500 } })
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+      log: (line) => logs.push(line),
+    })
+    assert.equal(second.ok, false)
+    assert.equal(second.duplicate, undefined)
+    assert.equal(second.refusals[0].refusal.code, 'connection_busy')
+    assert.equal(second.refusals[0].refusal.retryable, true)
+    assert.deepEqual(second.refusals[0].refusal.details, { wait_ms: 500 })
+
+    const third = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async () => {
+        calls += 1
+        return { outcome: 'picked_up' }
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+      log: (line) => logs.push(line),
+    })
+    assert.equal(third.ok, true)
+    assert.equal(third.pickedUp, 1)
+    assert.equal(calls, 3)
+    assert.equal(logs.length, 2)
+  })
+
+  it('hands over an over-budget wake-listener reminder as a sealed note rather than slicing the command', async () => {
+    const { home, dir } = mkHome()
+    markWakeListenerNeeded(CONN, dir)
+    const raw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '' },
+      { home, dir, share: 200, listenerActive: () => false },
+    )
+    assert.ok(raw)
+    const ctx = JSON.parse(raw).additional_context
+    const noteId = noteIdIn(ctx)
+    assert.ok(noteId, 'over-budget reminder must go to a note instead of being sliced')
+    const full = readNoteText(noteId, { home })
+    assert.match(full, /devspec-wake-tail\.mjs/)
+    assert.match(full, /block_until_ms: 0/)
+  })
+
+  it('finishes a stale abandoned turn with one single report_complete call rather than looping per saved command', async () => {
+    const { home, dir } = mkHome()
+    fs.writeFileSync(path.join(dir, `${CONN}.turn`), JSON.stringify({ startedAt: Date.now() - 120_000, connection_id: CONN }))
+    fs.writeFileSync(
+      path.join(dir, `${CONN}.turn-commands.json`),
+      JSON.stringify({
+        version: 1,
+        commands: [
+          { turn_id: '11111111-1111-4111-8111-111111111111', message_id: '22222222-2222-4222-8222-222222222222' },
+          { turn_id: '33333333-3333-4333-8333-333333333333', message_id: '44444444-4444-4444-8444-444444444444' },
+        ],
+      }),
+    )
+    const completeCalls = []
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async (req) => {
+        if (req.name === 'report_complete') completeCalls.push(req.arguments)
+        return { outcome: 'picked_up' }
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+    })
+    assert.equal(res.ok, true)
+    assert.equal(completeCalls.length, 1, 'stale turn cleanup must issue one single attempt-end report_complete call')
+    assert.deepEqual(completeCalls[0], { connection_id: CONN, reason: 'max_turn_ms' })
+  })
 })

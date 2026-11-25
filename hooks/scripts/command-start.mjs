@@ -30,14 +30,14 @@ import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { seedWorkTrailForConnection } from './seed-work-trail.mjs'
 import { recordTurnBaseline } from './transcript-turn-end.mjs'
 import {
+  attemptEndArguments,
   clearTurnCommands,
   commandsHandedOver,
-  completionArguments,
   pickupArguments,
   readTurnCommands,
   recordTurnCommands,
 } from './turn-commands.mjs'
-import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.mjs'
+import { readTurnActivity, turnActivityPath, turnIsLive, TURN_SILENCE_MS } from './turn-liveness.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -55,12 +55,6 @@ export const MAX_STARTED_COMMAND_IDS = 200
  * and `hooks/hooks.json` (`step-delivery.mjs` 15 s hook budget).
  */
 export const COMMAND_START_TIMEOUT_MS = 15_000
-/**
- * Silence window before a lingering `.turn` marker with no recorded activity is treated
- * as abandoned and completed before starting the next room command. Matches
- * `TURN_SILENCE_MS` (3 minutes) in `devspec-remote-poll.mjs`.
- */
-export const STALE_TURN_SILENCE_MS = 3 * 60_000
 const LEASE_VERSION = 1
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
 
@@ -219,12 +213,48 @@ export function extractRoomCommandsFromWake(wakeText) {
   }
 }
 
+/** Extract structured refusal details from a thrown MCP / transport error without flattening. */
+function structuredRefusalFromError(error) {
+  if (!error || typeof error !== 'object') {
+    return { error: String(error ?? 'refused') }
+  }
+  const refusal = {
+    error: error instanceof Error ? error.message : String(error.message ?? error),
+  }
+  for (const field of ['code', 'status', 'details', 'data', 'refusal', 'body', 'retryable']) {
+    if (error[field] !== undefined) refusal[field] = error[field]
+  }
+  for (const [key, value] of Object.entries(error)) {
+    if (key in refusal || typeof value === 'function' || key === 'stack') continue
+    refusal[key] = value
+  }
+  if (error.cause && typeof error.cause === 'object') {
+    refusal.cause = structuredRefusalFromError(error.cause)
+  }
+  return refusal
+}
+
+/** Whether a `report_pickup` response carries a refusal rather than a successful pickup. */
+function pickupRefusalFromResponse(res) {
+  if (!res || typeof res !== 'object') return null
+  if (
+    res.ok === false ||
+    res.refused === true ||
+    res.status === 'refused' ||
+    res.outcome === 'refused' ||
+    typeof res.error === 'string'
+  ) {
+    return res
+  }
+  return null
+}
+
 /**
  * Mark room commands as actually started by the agent:
- *  - deduplicates by `messageId` so each command is picked up once,
- *  - finishes any stale abandoned turn first,
- *  - sends `report_pickup` naming each command,
- *  - writes `.turn` marker, records `turn-commands` + transcript baseline when starting a new turn,
+ *  - deduplicates by `messageId` only after `report_pickup` succeeds (never before),
+ *  - finishes any stale abandoned working attempt with one `report_complete` call,
+ *  - sends `report_pickup` naming each command, preserving any structured refusal details,
+ *  - writes `.turn` marker, records `turn-commands` + transcript baseline when starting a turn,
  *  - seeds Working trail + starts CLI trail watcher when attached,
  *  - records delivered requests in `.requests.jsonl` when `batch` is provided.
  */
@@ -242,8 +272,9 @@ export async function startRoomCommands({
   seedFn = seedWorkTrailForConnection,
   ensureWatch = ensureCliTrailWatch,
   timeoutMs = COMMAND_START_TIMEOUT_MS,
+  log = (line) => process.stderr.write(line),
 } = {}) {
-  if (!connectionId) return { ok: false, started: [] }
+  if (!connectionId) return { ok: false, started: [], pickedUp: 0, refusals: [{ code: 'missing_connection_id', error: 'missing connectionId' }] }
   const resolvedState = state ?? readPrivateJson(path.join(dir, `${connectionId}.json`))
   const rawCommands = Array.isArray(commands)
     ? commands
@@ -252,58 +283,52 @@ export async function startRoomCommands({
       : []
   const already = new Set(readStartedCommandIds(connectionId, dir))
   const toStart = rawCommands.filter((cmd) => cmd?.turnId && cmd?.messageId && !already.has(cmd.messageId))
-  if (toStart.length === 0) return { ok: true, started: [], duplicate: true }
+  if (toStart.length === 0) return { ok: true, started: [], pickedUp: 0, duplicate: true }
 
   const credential = resolvedState ? connectionCredential(resolvedState) : { ok: false }
   const token = credential.ok ? credential.token : (resolvedState?.token || resolvedState?.mcp_token || null)
   const mcpUrl = credential.mcp_url || resolvedState?.mcp_url || null
   const attachedSessionId = sessionId ?? batch?.session_id ?? resolvedState?.session_id ?? null
 
-  // If a previous turn marker is stale (abandoned: no activity past STALE_TURN_SILENCE_MS,
-  // or no longer live), finish it by name before starting the next.
+  // If a previous turn marker is stale (abandoned: no activity past TURN_SILENCE_MS,
+  // or no longer live), finish the abandoned working attempt in one single report_complete
+  // call (attemptEndArguments — never looping once per saved command, requirement c900f599).
   const prevMarker = readTurnMarker(connectionId, dir)
   const prevActivity = readTurnActivity(connectionId, dir)
   const staleBySilence =
     prevMarker &&
     typeof prevMarker.startedAt === 'number' &&
-    Date.now() - prevMarker.startedAt >= STALE_TURN_SILENCE_MS &&
+    Date.now() - prevMarker.startedAt >= TURN_SILENCE_MS &&
     !prevActivity
   const prevLive = !staleBySilence && turnIsLive(prevMarker, { activity: prevActivity })
   if (prevMarker && !prevLive && token && mcpUrl) {
     const staleCommands = readTurnCommands(connectionId, { dir })
-    for (const args of completionArguments({ connectionId, commands: staleCommands, reason: 'max_turn_ms' })) {
-      try {
-        await call({ mcpUrl, token, name: 'report_complete', arguments: args, timeoutMs })
-      } catch {
-        /* best effort */
-      }
+    const completeArgs =
+      staleCommands.length === 1
+        ? {
+            connection_id: connectionId,
+            command_turn_id: staleCommands[0].turnId,
+            command_message_id: staleCommands[0].messageId,
+            reason: 'max_turn_ms',
+          }
+        : attemptEndArguments({ connectionId, reason: 'max_turn_ms' })
+    try {
+      await call({
+        mcpUrl,
+        token,
+        name: 'report_complete',
+        arguments: completeArgs,
+        timeoutMs,
+      })
+    } catch (error) {
+      log(
+        `command-start: stale-turn report_complete failed for ${connectionId}: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
+      )
     }
     clearTurnMarker(connectionId, dir)
   }
 
   const effectiveStartsTurn = typeof startsTurn === 'boolean' ? startsTurn : !prevLive
-
-  // Mark started before network calls finish so concurrent readers never double-pickup,
-  // and roll back only if every report_pickup fails? Actually record after at least one
-  // attempt or immediately to guarantee at-most-once pickup per message.
-  recordStartedCommandIds(connectionId, toStart.map((cmd) => cmd.messageId), dir)
-
-  // Write the turn marker + turn-commands + transcript baseline when starting a turn.
-  const marker = writeTurnMarker(connectionId, dir)
-  if (effectiveStartsTurn) {
-    recordTurnCommands(connectionId, toStart, { dir })
-    const conversationId = resolvedState?.local_id || null
-    if (conversationId && marker?.startedAt) {
-      const transcriptPath = resolveAgentTranscriptPath(conversationId, { home })
-      recordTurnBaseline(connectionId, {
-        turn: marker.startedAt,
-        conversationId,
-        transcriptPath,
-        dir,
-        beforeCurrentCommandTurn: fromWakeTurn,
-      })
-    }
-  }
 
   if (batch) {
     try {
@@ -313,24 +338,60 @@ export async function startRoomCommands({
     }
   }
 
-  // Report pickup by name to DevSpec (this is what flips the room from waiting to Working).
-  let pickedUp = 0
-  if (token && mcpUrl) {
+  // Report pickup by name to DevSpec BEFORE recording IDs as started (requirement 3ea2b201)
+  // and preserve full structured refusal payloads if DevSpec refuses or throws (requirement 4e32d1a5).
+  const succeeded = []
+  const refusals = []
+  if (!token || !mcpUrl) {
+    const refusal = { code: 'missing_credentials', error: 'No DevSpec credentials available for report_pickup.' }
+    refusals.push(refusal)
+    log(`command-start: report_pickup skipped for ${connectionId}: ${JSON.stringify(refusal)}\n`)
+  } else {
     for (const command of toStart) {
       try {
-        await call({
+        const res = await call({
           mcpUrl,
           token,
           name: 'report_pickup',
           arguments: pickupArguments(connectionId, command),
           timeoutMs,
         })
-        pickedUp += 1
-      } catch {
-        /* best effort — never blocks delivering the command to the agent */
+        const refused = pickupRefusalFromResponse(res)
+        if (refused) {
+          const entry = { command_message_id: command.messageId, command_turn_id: command.turnId, refusal: refused }
+          refusals.push(entry)
+          log(`command-start: report_pickup refused for ${connectionId} (${command.messageId}): ${JSON.stringify(refused)}\n`)
+        } else {
+          succeeded.push(command)
+        }
+      } catch (error) {
+        const structured = structuredRefusalFromError(error)
+        const entry = { command_message_id: command.messageId, command_turn_id: command.turnId, refusal: structured }
+        refusals.push(entry)
+        log(`command-start: report_pickup failed for ${connectionId} (${command.messageId}): ${JSON.stringify(structured)}\n`)
       }
     }
-    if (attachedSessionId) {
+  }
+
+  // Advance started-command state ONLY for commands whose report_pickup actually succeeded.
+  if (succeeded.length > 0) {
+    recordStartedCommandIds(connectionId, succeeded.map((cmd) => cmd.messageId), dir)
+    const marker = writeTurnMarker(connectionId, dir)
+    if (effectiveStartsTurn) {
+      recordTurnCommands(connectionId, succeeded, { dir })
+      const conversationId = resolvedState?.local_id || null
+      if (conversationId && marker?.startedAt) {
+        const transcriptPath = resolveAgentTranscriptPath(conversationId, { home })
+        recordTurnBaseline(connectionId, {
+          turn: marker.startedAt,
+          conversationId,
+          transcriptPath,
+          dir,
+          beforeCurrentCommandTurn: fromWakeTurn,
+        })
+      }
+    }
+    if (attachedSessionId && token && mcpUrl) {
       try {
         await seedFn({
           connectionId,
@@ -342,15 +403,20 @@ export async function startRoomCommands({
         /* ignore */
       }
     }
-  }
-
-  if (attachedSessionId) {
-    try {
-      ensureWatch({ connectionId })
-    } catch {
-      /* ignore */
+    if (attachedSessionId) {
+      try {
+        ensureWatch({ connectionId })
+      } catch {
+        /* ignore */
+      }
     }
   }
 
-  return { ok: true, started: toStart, pickedUp, startsTurn: effectiveStartsTurn }
+  return {
+    ok: refusals.length === 0,
+    started: succeeded,
+    pickedUp: succeeded.length,
+    startsTurn: effectiveStartsTurn,
+    ...(refusals.length > 0 ? { refusals } : {}),
+  }
 }

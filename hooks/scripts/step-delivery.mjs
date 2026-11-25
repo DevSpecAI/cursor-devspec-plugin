@@ -103,6 +103,7 @@ import path from 'node:path'
 
 import { appendWakeEvents, splitWakes, wakeLines } from './devspec-wake-file.mjs'
 import {
+  fitHookContext,
   fitsShellOutput,
   noteCommand,
   pointToNote,
@@ -624,7 +625,12 @@ export async function stepDeliveryHook(
 
   if (!hasSteps) {
     if (!needsListenerReminder) return null
-    const reminder = wakeListenerReminder(connectionId, { dir: connDir }).slice(0, share)
+    const reminder = fitHookContext(wakeListenerReminder(connectionId, { dir: connDir }), {
+      share,
+      what: 'A DevSpec wake-listener setup notice',
+      home,
+    })
+    if (!reminder) return null
     const output = JSON.stringify(postToolUseOutput(reminder))
     await emit(output)
     return output
@@ -731,11 +737,15 @@ export async function stepDeliveryHook(
       ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
       : null
     if (needsListenerReminder) {
-      const reminder = wakeListenerReminder(connectionId, { dir: connDir })
+      const rawReminder = wakeListenerReminder(connectionId, { dir: connDir })
       if (!context) {
-        context = reminder.slice(0, share)
-      } else if (context.length + 2 + reminder.length <= share) {
-        context = `${context}\n\n${reminder}`
+        context = fitHookContext(rawReminder, {
+          share,
+          what: 'A DevSpec wake-listener setup notice',
+          home,
+        })
+      } else if (context.length + 2 + rawReminder.length <= share) {
+        context = `${context}\n\n${rawReminder}`
       }
     }
     const output = context ? JSON.stringify(postToolUseOutput(context)) : null

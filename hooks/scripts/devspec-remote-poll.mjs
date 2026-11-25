@@ -169,6 +169,7 @@ import {
   readTurnActivity,
   turnActivityPath,
   turnIsLive,
+  TURN_SILENCE_MS,
 } from './turn-liveness.mjs'
 import {
   attemptEndArguments,
@@ -258,8 +259,7 @@ const IDLE_CADENCE = { waitMs: 30_000, tier: 'idle', checkTier: 'responsive' }
 // never make this deadline cut the command off.
 export const POLL_HTTP_GRACE_MS = 15_000
 const MAX_TURN_MS = 60 * 60 * 1000
-/** Hung-turn window. Independent of MAX_TURN_MS (1h). Host injects a new owner command after this. */
-export const TURN_SILENCE_MS = 90_000
+export { TURN_SILENCE_MS }
 
 function turnMarkerPath(connectionId, dir = CONNECTIONS_DIR) {
   return path.join(dir, `${connectionId}.turn`)
