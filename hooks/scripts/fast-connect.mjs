@@ -14,8 +14,18 @@
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitsShellOutput,
+  writeNote,
+} from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
+
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
@@ -32,6 +42,10 @@ import {
   registerConnection,
   attachConnection,
   writeConnectionState,
+  formatBoundedCliStderr,
+  installBoundedCliStderr,
+  shellBudgetExceededError,
+  writePagedStderrNotesManifest,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -94,6 +108,7 @@ export function resolveGitRemote(cwd, { execFileSyncImpl = execFileSync } = {}) 
       encoding: 'utf8',
       windowsHide: true,
       timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const url = String(out || '').trim()
     return url || null
@@ -525,10 +540,16 @@ export async function fastConnect(opts = {}) {
     connectionId = registered.connection_id
     codename = registered.codename || registered.session_codename || null
 
-    if (sessionId) {
+    const attachTarget =
+      sessionId ||
+      (localAction.action === 'reconnect' && !newSession && localAction.session_id && registered.session_id !== localAction.session_id
+        ? localAction.session_id
+        : null)
+
+    if (attachTarget) {
       const attached = await attachFn({
         connectionId,
-        sessionId,
+        sessionId: attachTarget,
         cwd,
         launchId,
         agent,
@@ -544,11 +565,11 @@ export async function fastConnect(opts = {}) {
           local_id: localId,
           launch_id: launchId,
           connection_id: connectionId,
-          session_id: sessionId,
+          session_id: attachTarget,
           codename,
         }
       }
-      attachedSessionId = attached.session_id || sessionId
+      attachedSessionId = attached.session_id || attachTarget
     } else {
       // Registration also refreshes existing native conversations. Its attachment
       // snapshot is authoritative; hydration must not erase a live room bond.
@@ -676,6 +697,9 @@ export async function fastConnect(opts = {}) {
 
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
+  const repoCount = Array.isArray(projectSnapshot?.repository_context?.repositories)
+    ? projectSnapshot.repository_context.repositories.length
+    : null
   return {
     ok: true,
     connection_id: connectionId,
@@ -684,11 +708,11 @@ export async function fastConnect(opts = {}) {
     local_id: localId,
     launch_id: launchId,
     action: localAction.action,
+    plugin_root: PLUGIN_ROOT,
     ...(createdRoom ? { new_session: true, session_url: createdRoom.session_url, title: createdRoom.title, access: makePrivate ? 'private' : 'shared' } : {}),
-    project_id: projectContext?.project.id,
-    project_selection: projectContext,
-    project_context: projectSnapshot,
-    project_context_file: repositoryContextTextFile(localId, opts.projectHome),
+    project_id: projectContext?.project.id ?? null,
+    ...(projectContext?.project?.name ? { project_name: projectContext.project.name } : {}),
+    ...(repoCount !== null ? { repository_count: repoCount } : {}),
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
@@ -696,12 +720,13 @@ export async function fastConnect(opts = {}) {
   }
 }
 
-export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid> [options]
+export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --owner-pid <pid> [options]
 
-Connect this Cursor conversation to DevSpec in one command: register it, attach
-it to a room if asked, write its state and start its poller.
+Connect this Cursor conversation to DevSpec in one command: read its conversation
+id from CURSOR_CONVERSATION_ID, check existing connection state, register or
+reconnect, attach to a room if asked, write its state and start its poller.
 
-  --local-id <id>          This conversation's id (CURSOR_CONVERSATION_ID).
+  --local-id <id>          Optional override for CURSOR_CONVERSATION_ID.
   --agent <name>           Agent name shown in DevSpec. Default: Cursor.
   --cwd <path>             The working folder. Default: the current directory.
   --owner-pid <pid>        The Cursor process this connection belongs to; pass "$PPID".
@@ -713,53 +738,606 @@ it to a room if asked, write its state and start its poller.
   --title <text>           With --new: the new room's title.
   --project <name-or-id>   Choose this conversation's project. --project-id is the same.
   --launch-id <uuid>       The launch id stamped in the prompt, for local diagnostics.
-  --codename <name>        This agent's codename instead of a minted one.
+  --codename <name>        This agent's codename instead of a minted one. --name is the same.
   -h, --help               Print this help and exit. Connects nothing.
 
-Prints one JSON result; exits 0 when connected, 1 when not.
+Prints one short JSON result; exits 0 when connected, 1 when not.
 `
+
+/**
+ * Format fast-connect CLI JSON within Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`). Drops the duplicate top-level `candidates` ID array when
+ * `project_selection.candidates` already carries the structured candidates, and when a
+ * large choice list still exceeds Cursor's ceiling, writes the complete, uncut JSON to
+ * a sealed note (`writeNote`) and returns a compact structured refusal naming that note
+ * so Cursor never slices the choices in half (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
+ */
+function buildBoundedFastConnectNoteReceipt(
+  normalized,
+  noteRef,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
+  const base =
+    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? { ...normalized }
+      : { ok: false }
+  const selection = base.project_selection
+  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
+  if (selection && typeof selection === 'object') {
+    const { candidates: _omit, ...selectionRest } = selection
+    base.project_selection = {
+      ...selectionRest,
+      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+      omitted_inline: true,
+      complete_in_note: noteRef,
+    }
+  }
+  if (Array.isArray(base.candidates)) {
+    base.candidate_count = base.candidates.length
+    delete base.candidates
+  }
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const combinedChars = prior.length + fullTextLength
+  const combinedBytes = priorBytes + textBytes
+  const exceededByBytesOnly =
+    combinedChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    combinedBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const noteMsg = exceededByBytesOnly
+    ? `Full connect output (${textBytes} bytes / ${fullTextLength} chars${priorBytes ? `, ${combinedBytes} bytes with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+    : `Full connect output (${fullTextLength} chars${prior.length ? `, ${combinedChars} chars with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+  base.complete_output_note = noteRef
+  base.note = noteMsg
+  const richText = JSON.stringify(base, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${richText}`)) return richText
+
+  const compactStderrOmitted = base.stderr_diagnostics_omitted
+    ? {
+        omitted_count: base.stderr_diagnostics_omitted.omitted_count,
+        omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(typeof base.stderr_diagnostics_omitted.omitted_bytes === 'number'
+          ? { omitted_bytes: base.stderr_diagnostics_omitted.omitted_bytes }
+          : {}),
+        ...(Array.isArray(base.stderr_diagnostics_omitted.notes) &&
+        base.stderr_diagnostics_omitted.notes.length > 0
+          ? { saved_note_count: base.stderr_diagnostics_omitted.notes.length }
+          : {}),
+        ...(base.stderr_diagnostics_omitted.note_write_failed_count
+          ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
+          : {}),
+        complete_in_note: noteRef.id,
+        read: noteRef.command,
+      }
+    : null
+  const minimal = {
+    ok: Boolean(base.ok),
+    ...(typeof base.code === 'string' ? { code: base.code } : {}),
+    ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+    ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+    ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+    ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+    ...(selection && typeof selection === 'object'
+      ? {
+          project_selection: {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+            ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+            omitted_inline: true,
+            complete_in_note: noteRef,
+          },
+        }
+      : {}),
+    omitted_fields_in_note: true,
+    ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
+    complete_output_note: noteRef,
+    note: noteMsg,
+  }
+  const minimalText = JSON.stringify(minimal, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
+
+  // Final guaranteed-bounded receipt when caller-supplied identifier fields or prior stderr
+  // leave minimal room inside Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c). Never drop
+  // the note pointer or return an empty string silently: refuse explicitly if reserve itself
+  // leaves too little room for the smallest visible pointer.
+  const compactReceipt =
+    JSON.stringify(
+      {
+        ok: Boolean(base.ok),
+        ...(candidateCount !== null
+          ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+          : {}),
+        ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
+        omitted_fields_in_note: true,
+        complete_output_note: noteRef,
+        note: noteMsg,
+      },
+      null,
+      2,
+    ) + '\n'
+  if (fitsShellOutput(`${reserve}${compactReceipt}`)) return compactReceipt
+  const tightReceipt = `${JSON.stringify({
+    ok: Boolean(base.ok),
+    ...(candidateCount !== null
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    ...(base.stderr_diagnostics_omitted
+      ? { stderr_omitted_count: base.stderr_diagnostics_omitted.omitted_count }
+      : {}),
+    note: noteRef.id,
+    read: noteRef.command,
+    parts: noteRef.parts,
+  })}\n`
+  if (fitsShellOutput(`${reserve}${tightReceipt}`)) return tightReceipt
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: tightReceipt.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(tightReceipt),
+    fullTextLength,
+    note: noteRef,
+    candidateCount,
+  })
+}
+
+function trimStderrOmittedNotes(omitted, notesSlice, { manifest = null } = {}) {
+  if (!omitted || typeof omitted !== 'object' || !Array.isArray(omitted.notes)) return omitted
+  const total = omitted.notes.length
+  const returned = notesSlice.length
+  if (returned >= total) return omitted
+  const omittedCount = total - returned
+  const baseRecovery = typeof omitted.recovery === 'string' && omitted.recovery ? `${omitted.recovery} ` : ''
+  if (manifest) {
+    const nextPartsHint =
+      manifest.parts > 1 ? ` (and every further part it names — ${manifest.parts} parts total)` : ''
+    return {
+      ...omitted,
+      notes: notesSlice,
+      notes_total_count: total,
+      notes_returned_count: returned,
+      notes_omitted_count: omittedCount,
+      notes_continuation: {
+        omitted_count: omittedCount,
+        manifest_id: manifest.id,
+        parts: manifest.parts,
+        command: manifest.command,
+        how_to_fetch_rest: `Run \`${manifest.command}\`${nextPartsHint} to read the exact commands for all ${total} saved stderr diagnostic note(s) from this connect attempt (including the ${omittedCount} omitted from this receipt).`,
+      },
+      recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit in this receipt: run \`${manifest.command}\`${nextPartsHint} to read all ${total} saved stderr note commands for this connect attempt.`,
+    }
+  }
+  const remainingNotes = omitted.notes.slice(returned)
+  const remainingIds = remainingNotes.every((n) => typeof n?.id === 'string' && n.id)
+    ? remainingNotes.map((n) => n.id)
+    : null
+  if (!remainingIds) return null
+  return {
+    ...omitted,
+    notes: notesSlice,
+    notes_total_count: total,
+    notes_returned_count: returned,
+    notes_omitted_count: omittedCount,
+    notes_continuation: {
+      omitted_count: omittedCount,
+      omitted_note_ids: remainingIds,
+      command_template: 'cat ~/.devspec/notes/<id>.md',
+      how_to_fetch_rest: `Read each of the ${omittedCount} omitted stderr diagnostic note ID(s) in notes_continuation.omitted_note_ids for this connect attempt with \`cat ~/.devspec/notes/<id>.md\`.`,
+    },
+    recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit inline: read each ID in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`,
+  }
+}
+
+function fitStderrOmittedForReceipt(
+  omitted,
+  buildText,
+  reserve,
+  { tmpDir = os.tmpdir(), manifestCache = null } = {},
+) {
+  if (!omitted || typeof omitted !== 'object') {
+    const text = buildText(null)
+    return fitsShellOutput(`${reserve}${text}`) ? { fitted: true, stderrOmitted: null, text } : { fitted: false, stderrOmitted: null, text }
+  }
+  const fullText = buildText(omitted)
+  if (fitsShellOutput(`${reserve}${fullText}`)) {
+    return { fitted: true, stderrOmitted: omitted, text: fullText }
+  }
+  if (!Array.isArray(omitted.notes) || omitted.notes.length === 0) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
+  let manifest = null
+  if (manifestCache) {
+    if (!manifestCache.computed) {
+      manifestCache.value = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+      manifestCache.computed = true
+    }
+    manifest = manifestCache.value
+  } else {
+    manifest = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+  }
+  const zeroObj = trimStderrOmittedNotes(omitted, [], { manifest })
+  if (!zeroObj) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
+  const zeroText = buildText(zeroObj)
+  if (!fitsShellOutput(`${reserve}${zeroText}`)) {
+    return { fitted: false, stderrOmitted: zeroObj, text: zeroText }
+  }
+  let lo = 0
+  let hi = omitted.notes.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    const candidate = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, mid), { manifest })
+    if (candidate && fitsShellOutput(`${reserve}${buildText(candidate)}`)) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  const fittedObj = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, lo), { manifest })
+  return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
+}
+
+function buildFastConnectNoteFailureFallback(
+  normalized,
+  noteError,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null, tmpDir = os.tmpdir() } = {},
+) {
+  const base =
+    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? { ...normalized }
+      : { ok: false }
+  const selection =
+    base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
+  const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
+  const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const exceededByBytesOnly =
+    prior.length + fullTextLength <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const manifestCache = { computed: false, value: null }
+  const stderrReadHintFor = (stderrOmitted) => {
+    const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
+      ? base.stderr_diagnostics_omitted.notes.length
+      : 0
+    if (total === 0) return ''
+    const omittedNotesCount = Number(stderrOmitted?.notes_omitted_count) || 0
+    if (omittedNotesCount > 0) {
+      const returnedNotesCount = Number(stderrOmitted?.notes_returned_count) || 0
+      const cont = stderrOmitted?.notes_continuation
+      if (typeof cont?.command === 'string' && cont.command) {
+        const nextHint = cont.parts > 1 ? ` (and every further part it names — ${cont.parts} parts total)` : ''
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run \`${cont.command}\`${nextHint} to read the remaining ${omittedNotesCount} of ${total} saved stderr note(s) for this connect attempt.`
+      }
+      if (Array.isArray(cont?.omitted_note_ids)) {
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes and the remaining ${omittedNotesCount} of ${total} ID(s) in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`
+      }
+      return ` ${omittedNotesCount} of ${total} saved stderr diagnostic note(s) did not fit in this receipt.`
+    }
+    return ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
+  }
+  const recoveryFor = (stderrOmitted) => {
+    const hint = stderrReadHintFor(stderrOmitted)
+    const sizeDesc = exceededByBytesOnly
+      ? `${textBytes}-byte (${fullTextLength}-char)`
+      : `${fullTextLength}-char`
+    return allCandidates
+      ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${hint}`
+      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${sizeDesc} output.${hint}`
+  }
+
+  const makePayload = (
+    candidateSlice,
+    { minimal = false, stderrOmitted = base.stderr_diagnostics_omitted ?? null } = {},
+  ) => {
+    const out = minimal
+      ? {
+          ok: Boolean(base.ok),
+          ...(typeof base.code === 'string' ? { code: base.code } : {}),
+          ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+          ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+          ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+          ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+          omitted_fields_due_to_shell_limit: true,
+        }
+      : { ...base }
+    if (stderrOmitted) {
+      out.stderr_diagnostics_omitted = stderrOmitted
+    } else {
+      delete out.stderr_diagnostics_omitted
+    }
+    if (Array.isArray(out.candidates)) {
+      out.candidate_count = out.candidates.length
+      delete out.candidates
+    }
+    if (selection) {
+      const { candidates: _omit, ...selectionRest } = selection
+      const selBase = minimal
+        ? {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+          }
+        : selectionRest
+      out.project_selection = {
+        ...selBase,
+        ...(allCandidates
+          ? {
+              candidates: candidateSlice,
+              candidate_count: allCandidates.length,
+              returned_count: candidateSlice.length,
+              omitted_count: allCandidates.length - candidateSlice.length,
+              truncated_due_to_shell_limit: candidateSlice.length < allCandidates.length,
+              omitted_candidates_require_writable_notes: candidateSlice.length < allCandidates.length,
+            }
+          : {}),
+      }
+    }
+    out.complete_output_note_error = errMsg
+    out.total_chars = fullTextLength
+    out.total_bytes = textBytes
+    out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
+    out.shell_limit_bytes = CURSOR_SHELL_OUTPUT_MAX_BYTES
+    out.recovery = recoveryFor(stderrOmitted)
+    return JSON.stringify(out, null, 2) + '\n'
+  }
+
+  const fullFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => makePayload([], { minimal: false, stderrOmitted }),
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  const useMinimal = !fullFit.fitted
+  const chosenFit = useMinimal
+    ? fitStderrOmittedForReceipt(
+        base.stderr_diagnostics_omitted ?? null,
+        (stderrOmitted) => makePayload([], { minimal: true, stderrOmitted }),
+        reserve,
+        { tmpDir, manifestCache },
+      )
+    : fullFit
+  if (chosenFit.fitted) {
+    if (allCandidates && allCandidates.length > 0) {
+      let lo = 0
+      let hi = allCandidates.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        if (
+          fitsShellOutput(
+            `${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal, stderrOmitted: chosenFit.stderrOmitted })}`,
+          )
+        ) {
+          lo = mid
+        } else {
+          hi = mid - 1
+        }
+      }
+      const text = makePayload(allCandidates.slice(0, lo), {
+        minimal: useMinimal,
+        stderrOmitted: chosenFit.stderrOmitted,
+      })
+      if (fitsShellOutput(`${reserve}${text}`)) return text
+    } else {
+      return chosenFit.text
+    }
+  }
+
+  const buildFallbackObj = (stderrOmitted) => ({
+    ok: Boolean(base.ok),
+    ...(allCandidates
+      ? {
+          candidate_count: allCandidates.length,
+          returned_count: 0,
+          omitted_count: allCandidates.length,
+          omitted_candidates_require_writable_notes: true,
+        }
+      : {}),
+    complete_output_note_failed: true,
+    ...(stderrOmitted ? { stderr_diagnostics_omitted: stderrOmitted } : {}),
+    total_chars: fullTextLength,
+    total_bytes: textBytes,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+    recovery: allCandidates
+      ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHintFor(stderrOmitted)}`
+      : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHintFor(stderrOmitted)}`,
+  })
+  const prettyFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => JSON.stringify(buildFallbackObj(stderrOmitted), null, 2) + '\n',
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  if (prettyFallbackFit.fitted) return prettyFallbackFit.text
+  // Single-line compact form preserves every required count, limit, saved stderr note pointers,
+  // and recovery field (requirements 3c5147a7 / 91d7b47c). If reserve leaves too little room
+  // even for that, refuse explicitly with field, limit, actual length, counts, and recovery.
+  const compactFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => `${JSON.stringify(buildFallbackObj(stderrOmitted))}\n`,
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  if (compactFallbackFit.fitted) return compactFallbackFit.text
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: compactFallbackFit.text.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(compactFallbackFit.text),
+    fullTextLength,
+    noteFailed: true,
+    candidateCount: allCandidates ? allCandidates.length : null,
+    recovery: buildFallbackObj(compactFallbackFit.stderrOmitted).recovery,
+  })
+}
+
+export function formatFastConnectCliOutput(
+  result,
+  { home = os.homedir(), reserve = '', suppressedDiagnostics = null, tmpDir = os.tmpdir() } = {},
+) {
+  const normalized =
+    result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
+  if (
+    suppressedDiagnostics &&
+    normalized &&
+    typeof normalized === 'object' &&
+    !Array.isArray(normalized)
+  ) {
+    normalized.stderr_diagnostics_omitted = suppressedDiagnostics
+  }
+  if (
+    normalized &&
+    typeof normalized === 'object' &&
+    Array.isArray(normalized.project_selection?.candidates) &&
+    Array.isArray(normalized.candidates)
+  ) {
+    delete normalized.candidates
+  }
+  const fullText = JSON.stringify(normalized, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
+
+  const fullTextBytes = Buffer.byteLength(fullText)
+  let note = null
+  let noteError = null
+  try {
+    note = writeNote(fullText, { home })
+  } catch (error) {
+    noteError = error
+  }
+  if (!note) {
+    return buildFastConnectNoteFailureFallback(normalized, noteError, fullText.length, {
+      reserve,
+      fullTextBytes,
+      tmpDir,
+    })
+  }
+  const noteRef = {
+    id: note.id,
+    command: note.command,
+    parts: note.parts,
+    total_chars: fullText.length,
+    total_bytes: fullTextBytes,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  }
+  return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, {
+    reserve,
+    fullTextBytes,
+  })
+}
+
+/**
+ * Write `text` to `stream` and wait for Node to flush every byte to the underlying
+ * file descriptor before returning (so `process.exit()` never truncates output on a
+ * backpressured pipe — requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeStreamAndFlush(stream, text) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      stream.off('error', done)
+      resolve()
+    }
+    stream.once('error', done)
+    stream.write(text, done)
+  })
+}
 
 /**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
+ * @param {{ getEmittedStderr?: () => string }} [opts]
  */
-export async function runFastConnectCli(args) {
-  // Help is read before anything else: it registers, writes and calls nothing.
-  if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    process.stdout.write(FAST_CONNECT_USAGE)
-    process.exit(0)
+export async function runFastConnectCli(
+  args,
+  { getEmittedStderr = null, getSuppressedDiagnostics = null, flushStderr = null } = {},
+) {
+  const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
+  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
+  const currentSuppressed = () =>
+    getSuppressedDiagnostics
+      ? getSuppressedDiagnostics()
+      : localStderrGuard
+        ? localStderrGuard.getSuppressedDiagnostics()
+        : null
+  const drainStderr = async () => {
+    if (typeof flushStderr === 'function') await flushStderr()
+    else if (localStderrGuard) await localStderrGuard.flushStderr()
   }
-
-  let promptText = null
-  if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
-    try {
-      promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
-    } catch (err) {
-      process.stderr.write(
-        `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
-      )
-      process.exit(1)
+  try {
+    // Help is read before anything else: it registers, writes and calls nothing.
+    if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
+      await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
+      await drainStderr()
+      process.exit(0)
     }
+
+    let promptText = null
+    if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
+      const rawPromptFile = String(args['prompt-file'])
+      try {
+        promptText = fs.readFileSync(path.resolve(rawPromptFile), 'utf8')
+      } catch (err) {
+        const errCode = err && typeof err === 'object' && 'code' in err ? String(err.code) : 'read_failed'
+        const detail = err instanceof Error ? err.message : String(err)
+        const rawDiag = `fast-connect: could not read --prompt-file: ${detail}\n`
+        const priorStderr = currentStderr()
+        const rawDiagBytes = Buffer.byteLength(rawDiag)
+        const exceededBytesOnly =
+          priorStderr.length + rawDiag.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(priorStderr) + rawDiagBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        const summary = exceededBytesOnly
+          ? `could not read --prompt-file (field --prompt-file, actual_bytes ${Buffer.byteLength(rawPromptFile)}, actual_chars ${rawPromptFile.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}, code ${errCode})`
+          : `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
+        const bounded = formatBoundedCliStderr(rawDiag, {
+          label: 'fast-connect',
+          reserve: priorStderr,
+          summary,
+          fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback failed — fix write permissions on ~/.devspec/notes or pass a shorter --prompt-file path and retry.\n`,
+        })
+        await writeStreamAndFlush(process.stderr, bounded)
+        await drainStderr()
+        process.exit(1)
+      }
+    }
+
+    const result = await fastConnect({
+      localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
+      cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+      sessionId: typeof args.session === 'string' ? args.session : null,
+      newSession: !!args.new,
+      title: typeof args.title === 'string' ? args.title : null,
+      private: !!args.private,
+      launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
+      projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
+      agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
+      ownerPid: args['owner-pid'] ?? null,
+      noPoller: !!args.noPoller,
+      hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
+      codename: typeof args.codename === 'string' ? args.codename : null,
+      forceNew: !!args.forceNew,
+      promptText,
+    })
+
+    await writeStreamAndFlush(
+      process.stdout,
+      formatFastConnectCliOutput(result, {
+        reserve: currentStderr(),
+        suppressedDiagnostics: currentSuppressed(),
+      }),
+    )
+    await drainStderr()
+    process.exit(result.ok ? 0 : 1)
+  } finally {
+    if (localStderrGuard) localStderrGuard.restore()
   }
-
-  const result = await fastConnect({
-    localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
-    cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
-    sessionId: typeof args.session === 'string' ? args.session : null,
-    newSession: !!args.new,
-    title: typeof args.title === 'string' ? args.title : null,
-    private: !!args.private,
-    launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
-    projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
-    agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
-    ownerPid: args['owner-pid'] ?? null,
-    noPoller: !!args.noPoller,
-    hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
-    codename: typeof args.codename === 'string' ? args.codename : null,
-    forceNew: !!args.forceNew,
-    promptText,
-  })
-
-  process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-  process.exit(result.ok ? 0 : 1)
 }

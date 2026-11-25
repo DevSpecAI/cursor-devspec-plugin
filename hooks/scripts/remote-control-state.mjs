@@ -95,6 +95,15 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
+import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitsShellOutput,
+  seal,
+  splitText,
+  writeNote,
+} from './hook-context-budget.mjs'
+import { writePrivateText } from './private-state.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
@@ -183,11 +192,11 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const projectEquals = /^--project(?:-id|_id)?=(.*)$/.exec(a)
-    const valueEquals = /^--(session|title)=(.*)$/.exec(a)
+    const valueEquals = /^--(session|title|codename|name)=(.*)$/.exec(a)
     if (projectEquals) {
       if (out['project-id'] || !projectEquals[1].trim()) throw new Error('Pass one non-empty project name or full ID.')
       out['project-id'] = projectEquals[1]
-    } else if (valueEquals) out[valueEquals[1]] = valueEquals[2]
+    } else if (valueEquals) out[valueEquals[1] === 'name' ? 'codename' : valueEquals[1]] = valueEquals[2]
     else if (a === '--help' || a === '-h') {
       // Kept positional too, so every other command reads it exactly as before.
       out.help = true
@@ -198,7 +207,7 @@ export function parseArgs(argv) {
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
     else if (a === '--url') out.url = argv[++i]
-    else if (a === '--codename' || a === '--session_codename') out.codename = argv[++i]
+    else if (a === '--codename' || a === '--session_codename' || a === '--name') out.codename = argv[++i]
     else if (a === '--title') out.title = argv[++i]
     else if (a === '--local-id' || a === '--local_id' || a === '--conversation-id') {
       out['local-id'] = argv[++i]
@@ -502,6 +511,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
       timeout: Math.max(timeout + 4000, 5000),
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -758,6 +768,7 @@ export function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
@@ -823,6 +834,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -1831,26 +1843,500 @@ export async function writeConnectionState(opts) {
   return result
 }
 
+/**
+ * Keep a CLI stderr diagnostic inside Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`): return `rawMessage` unchanged when it fits together with
+ * `reserve`, otherwise preserve the full diagnostic in a sealed note (`writeNote`) and
+ * emit a compact bounded pointer (or bounded structured fallback if note writing fails)
+ * so overlong CLI arguments or error paths never exceed 20,000 characters on stderr
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+function shellQuotePath(filePath) {
+  return /^[A-Za-z0-9_./:-]+$/.test(filePath)
+    ? filePath
+    : `'${String(filePath).replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Write a private, paged manifest listing ONLY this connect attempt's saved stderr
+ * diagnostic note commands under an owner-only temp folder, split with `splitText`
+ * (`NOTE_PART_CHARS` / `NOTE_PART_BYTES`) and sealed with `seal` so every part fits
+ * Cursor's Shell output ceiling even when hundreds of diagnostics were saved
+ * (requirements 3c5147a7 / 91d7b47c). Returns null if the temp folder is unwritable.
+ */
+export function writePagedStderrNotesManifest(notes, { tmpDir = os.tmpdir() } = {}) {
+  if (!Array.isArray(notes) || notes.length === 0) return null
+  try {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
+    const baseDir = path.join(tmpDir, `devspec-connect-stderr-${uid}`)
+    fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 })
+    try {
+      fs.chmodSync(baseDir, 0o700)
+    } catch {
+      /* best-effort on platforms without POSIX modes */
+    }
+    const stat = fs.lstatSync(baseDir)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
+
+    const body =
+      `# Saved stderr diagnostic notes for this connect attempt (${notes.length} total)\n` +
+      notes
+        .map((n, idx) => {
+          const id = typeof n?.id === 'string' ? n.id : ''
+          const cmd =
+            typeof n?.command === 'string'
+              ? n.command
+              : id
+                ? `cat ~/.devspec/notes/${id}.md`
+                : '(missing command)'
+          const parts = typeof n?.parts === 'number' && n.parts > 1 ? ` (${n.parts} parts)` : ''
+          return `${idx + 1}. ${cmd}${id ? ` [id=${id}]` : ''}${parts}`
+        })
+        .join('\n') +
+      '\n'
+    const id = crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16)
+    const pieces = splitText(body)
+    const partPath = (part) => path.join(baseDir, part === 1 ? `${id}.md` : `${id}.${part}.md`)
+    const partCmd = (part) => `cat ${shellQuotePath(partPath(part))}`
+    const first = partPath(1)
+    if (!fs.existsSync(first)) {
+      for (let part = pieces.length; part >= 1; part -= 1) {
+        const label = `${part === pieces.length ? 'End of DevSpec connect stderr manifest' : 'DevSpec connect stderr manifest'} ${id}: part ${part} of ${pieces.length}`
+        const after = part < pieces.length ? `read on with \`${partCmd(part + 1)}\`` : ''
+        const sealed = seal(label, pieces[part - 1], after)
+        if (!fitsShellOutput(sealed)) return null
+        writePrivateText(partPath(part), sealed)
+      }
+    }
+    return {
+      id,
+      file: first,
+      command: partCmd(1),
+      parts: pieces.length,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function shellBudgetExceededError({
+  field = 'reserve',
+  reserveLength,
+  requiredLength,
+  reserveBytes = null,
+  requiredBytes = null,
+  fullTextLength,
+  note = null,
+  noteFailed = false,
+  candidateCount = null,
+  recovery = null,
+}) {
+  const actualChars = reserveLength + requiredLength
+  const resBytes = typeof reserveBytes === 'number' ? reserveBytes : reserveLength
+  const reqBytes = typeof requiredBytes === 'number' ? requiredBytes : requiredLength
+  const actualBytes = resBytes + reqBytes
+  const exceededByBytesOnly =
+    actualChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS && actualBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const limit = exceededByBytesOnly ? CURSOR_SHELL_OUTPUT_MAX_BYTES : CURSOR_SHELL_OUTPUT_MAX_CHARS
+  const limitUnit = exceededByBytesOnly ? 'bytes' : 'chars'
+  const actualLength = exceededByBytesOnly ? actualBytes : actualChars
+  const boundSummary = exceededByBytesOnly
+    ? `Prior stderr (${resBytes} bytes / ${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling for the ${reqBytes}-byte output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_BYTES} bytes, actual_length: ${actualBytes} bytes, actual_chars: ${actualChars})`
+    : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS} chars, actual_length: ${actualChars} chars)`
+  const msg = recovery
+    ? `${boundSummary}. ${recovery}`
+    : note
+      ? `${boundSummary}; full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
+      : `${boundSummary} (total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`
+  const err = new RangeError(msg)
+  Object.assign(err, {
+    code: 'shell_output_limit_exceeded',
+    field,
+    limit,
+    limit_unit: limitUnit,
+    actual_length: actualLength,
+    limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+    actual_chars: actualChars,
+    actual_bytes: actualBytes,
+    reserve_chars: reserveLength,
+    reserve_bytes: resBytes,
+    required_chars: requiredLength,
+    required_bytes: reqBytes,
+    total_chars: fullTextLength,
+    ...(note ? { note: { id: note.id, command: note.command, parts: note.parts } } : {}),
+    ...(noteFailed ? { complete_output_note_failed: true } : {}),
+    ...(typeof candidateCount === 'number'
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    recovery: msg,
+  })
+  return err
+}
+
+export function formatBoundedCliStderr(
+  rawMessage,
+  {
+    label = 'remote-control-state',
+    home = os.homedir(),
+    reserve = '',
+    summary = null,
+    fallback = null,
+    onOmitted = null,
+  } = {},
+) {
+  const text = String(rawMessage ?? '')
+  const prior = String(reserve ?? '')
+  if (fitsShellOutput(`${prior}${text}`)) return text
+  const textBytes = Buffer.byteLength(text)
+  const priorBytes = Buffer.byteLength(prior)
+  const exceededBytesOnly =
+    prior.length + text.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const boundDesc = exceededBytesOnly
+    ? `${textBytes} bytes / ${text.length} chars > Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling`
+    : `${text.length} chars > Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling`
+  const meta = summary ? `${summary}; ` : ''
+  let savedNote = null
+  try {
+    savedNote = writeNote(text, { home })
+  } catch {
+    savedNote = null
+  }
+  if (savedNote) {
+    const pointer = `${label}: ${meta}diagnostic (${boundDesc}); full text saved in note ${savedNote.id} — read with \`${savedNote.command}\`.\n`
+    if (fitsShellOutput(`${prior}${pointer}`)) return pointer
+    const compactPointer = `${label}: diagnostic in note ${savedNote.id} (${savedNote.command})\n`
+    if (fitsShellOutput(`${prior}${compactPointer}`)) return compactPointer
+    throw shellBudgetExceededError({
+      field: 'reserve',
+      reserveLength: prior.length,
+      requiredLength: compactPointer.length,
+      reserveBytes: priorBytes,
+      requiredBytes: Buffer.byteLength(compactPointer),
+      fullTextLength: text.length,
+      note: savedNote,
+    })
+  }
+  const fb =
+    typeof fallback === 'string' && fallback
+      ? fallback
+      : `${label}: ${meta}diagnostic (${boundDesc}) and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
+  if (fitsShellOutput(`${prior}${fb}`)) {
+    if (typeof onOmitted === 'function') onOmitted({ savedNote: null, length: text.length, bytes: textBytes, exceededBytesOnly })
+    return fb
+  }
+  const omitted = exceededBytesOnly
+    ? `${label}: diagnostic omitted (${textBytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+    : `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+  if (fitsShellOutput(`${prior}${omitted}`)) {
+    if (typeof onOmitted === 'function') onOmitted({ savedNote: null, length: text.length, bytes: textBytes, exceededBytesOnly })
+    return omitted
+  }
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: prior.length,
+    requiredLength: omitted.length,
+    reserveBytes: priorBytes,
+    requiredBytes: Buffer.byteLength(omitted),
+    fullTextLength: text.length,
+    noteFailed: true,
+  })
+}
+
+/**
+ * Visible omission notice emitted on stderr when earlier diagnostics exhaust the stderr
+ * allowance beside `CLI_STDOUT_RECEIPT_HEADROOM`, so no subsequent stderr write is ever
+ * dropped silently without a visible disclosure and recovery path (reqs 3c5147a7 / 91d7b47c).
+ */
+function buildStderrOmissionNotice(label, { length, bytes = length, note = null } = {}) {
+  const bound =
+    length <= CURSOR_SHELL_OUTPUT_MAX_CHARS && bytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+      ? `${bytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit`
+      : `${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit`
+  return note
+    ? `${label}: diagnostic omitted (${bound}; saved in note ${note.id}: ${note.command}); further stderr suppressed.\n`
+    : `${label}: diagnostic omitted (${bound}; note write failed — fix ~/.devspec/notes permissions and retry); further stderr suppressed.\n`
+}
+
+/**
+ * Headroom reserved on CLI stderr so the final stdout connect receipt (or note-failure
+ * refusal, including any `stderr_diagnostics_omitted` disclosure and saved note command)
+ * always fits inside Cursor's combined Shell output ceiling (`fitsShellOutput`,
+ * reqs 3c5147a7 / 91d7b47c). Derived from the actual fallback receipt structure rather
+ * than a bare constant.
+ */
+const CLI_STDOUT_RECEIPT_HEADROOM =
+  JSON.stringify(
+    {
+      ok: false,
+      candidate_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      returned_count: 0,
+      omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      omitted_candidates_require_writable_notes: true,
+      complete_output_note_failed: true,
+      total_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+      total_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES * 10,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+      stderr_diagnostics_omitted: {
+        omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes: [
+          {
+            id: '0'.repeat(16),
+            command: 'cat ~/.devspec/notes/0000000000000000.md',
+            length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+          },
+        ],
+        notes_total_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes_returned_count: 1,
+        notes_omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes_continuation: {
+          omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+          manifest_id: '0'.repeat(16),
+          parts: 99,
+          command: 'cat /tmp/devspec-connect-stderr-100000/0000000000000000.md',
+          how_to_fetch_rest:
+            'Run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read the exact commands for all 20000 saved stderr diagnostic note(s) from this connect attempt (including the 20000 omitted from this receipt).',
+        },
+        note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        recovery:
+          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back. 20000 of 20000 saved stderr note command(s) did not fit in this receipt: run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read all 20000 saved stderr note commands for this connect attempt.',
+      },
+      recovery:
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read the 1 listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read the remaining 20000 of 20000 saved stderr note(s) for this connect attempt.',
+    },
+    null,
+    2,
+  ) + '\n'
+
+/**
+ * Intercept `process.stderr.write` for a CLI run so EVERY stderr diagnostic (including
+ * browser-approval URLs from `authForConnect`) passes through the shared Shell output
+ * ceiling (`formatBoundedCliStderr` + `fitsShellOutput`) while keeping headroom free
+ * for BOTH a visible stderr omission notice AND the final stdout connect receipt.
+ * Any oversized stderr write is saved WHOLE in a sealed note before emitting its short
+ * pointer; if earlier diagnostics fill the stderr allowance, the reserved omission slot
+ * discloses what was omitted (with its note pointer or recovery path) and records
+ * `getSuppressedDiagnostics()` so the final stdout receipt also discloses it
+ * (reqs 3c5147a7 / 91d7b47c).
+ */
+export function installBoundedCliStderr({
+  label = 'remote-control-state',
+  home = os.homedir(),
+  reserveHeadroom = CLI_STDOUT_RECEIPT_HEADROOM,
+} = {}) {
+  const withNoteSample = buildStderrOmissionNotice(label, {
+    length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 100,
+    note: { id: '0'.repeat(16), command: 'cat ~/.devspec/notes/0000000000000000.md' },
+  })
+  const noNoteSample = buildStderrOmissionNotice(label, {
+    length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 100,
+    note: null,
+  })
+  const omissionReserve = withNoteSample.length >= noNoteSample.length ? withNoteSample : noNoteSample
+
+  let emittedStderr = ''
+  let omissionNoticeEmitted = false
+  let omittedCount = 0
+  let omittedChars = 0
+  let omittedBytes = 0
+  let omittedNoteFailedCount = 0
+  const omittedNotes = []
+  const pendingWrites = new Set()
+  const rawStderrWrite = process.stderr.write.bind(process.stderr)
+
+  const writeTracked = (text, encoding, callback) => {
+    let settled = false
+    let resolveWrite
+    const promise = new Promise((resolve) => {
+      resolveWrite = resolve
+    })
+    pendingWrites.add(promise)
+    const finish = (err) => {
+      if (settled) return
+      settled = true
+      process.stderr.off('error', onErr)
+      pendingWrites.delete(promise)
+      resolveWrite()
+      if (typeof callback === 'function') callback(err)
+    }
+    const onErr = (err) => finish(err)
+    process.stderr.once('error', onErr)
+    return typeof encoding === 'string'
+      ? rawStderrWrite(text, encoding, finish)
+      : rawStderrWrite(text, finish)
+  }
+
+  const flushStderr = async () => {
+    while (pendingWrites.size > 0) {
+      await Promise.all([...pendingWrites])
+    }
+    if (process.stderr.writableNeedDrain || (process.stderr.writableLength ?? 0) > 0) {
+      await new Promise((resolve) => {
+        let settled = false
+        const done = () => {
+          if (settled) return
+          settled = true
+          process.stderr.off('drain', done)
+          process.stderr.off('error', done)
+          process.stderr.off('close', done)
+          resolve()
+        }
+        process.stderr.once('drain', done)
+        process.stderr.once('error', done)
+        process.stderr.once('close', done)
+      })
+    }
+  }
+
+  const recordOmitted = (text, note) => {
+    omittedCount += 1
+    omittedChars += text.length
+    omittedBytes += Buffer.byteLength(text)
+    if (note) {
+      omittedNotes.push({ id: note.id, command: note.command, parts: note.parts })
+    } else {
+      omittedNoteFailedCount += 1
+    }
+  }
+
+  process.stderr.write = (chunk, encoding, callback) => {
+    const cb = typeof encoding === 'function' ? encoding : callback
+    const enc = typeof encoding === 'string' ? encoding : undefined
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    let toWrite = ''
+    if (omissionNoticeEmitted) {
+      let saved = null
+      try {
+        saved = writeNote(text, { home })
+      } catch {
+        saved = null
+      }
+      recordOmitted(text, saved)
+    } else {
+      const guardReserve = `${emittedStderr}${reserveHeadroom}${omissionReserve}`
+      if (fitsShellOutput(`${guardReserve}${text}`)) {
+        toWrite = text
+      } else {
+        const textBytes = Buffer.byteLength(text)
+        const exceededBytesOnly =
+          guardReserve.length + text.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(guardReserve) + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        try {
+          toWrite = formatBoundedCliStderr(text, {
+            label,
+            home,
+            reserve: guardReserve,
+            summary: exceededBytesOnly
+              ? `stderr_bytes ${textBytes}, stderr_chars ${text.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+              : `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+            onOmitted: ({ savedNote }) => recordOmitted(text, savedNote),
+          })
+        } catch (err) {
+          const savedNote = err?.note ?? null
+          recordOmitted(text, savedNote)
+          const notice = buildStderrOmissionNotice(label, { length: text.length, bytes: textBytes, note: savedNote })
+          if (fitsShellOutput(`${emittedStderr}${notice}${reserveHeadroom}`)) {
+            toWrite = notice
+            omissionNoticeEmitted = true
+          } else {
+            const shortNotice = `${label}: stderr omitted (${exceededBytesOnly ? `${textBytes} bytes` : `${text.length} chars`}; ${savedNote ? savedNote.command : 'fix ~/.devspec/notes & retry'}).\n`
+            if (fitsShellOutput(`${emittedStderr}${shortNotice}${reserveHeadroom}`)) {
+              toWrite = shortNotice
+              omissionNoticeEmitted = true
+            }
+          }
+        }
+      }
+    }
+    emittedStderr += toWrite
+    if (!toWrite) {
+      if (typeof cb === 'function') queueMicrotask(cb)
+      return true
+    }
+    return writeTracked(toWrite, enc, cb)
+  }
+  return {
+    getEmittedStderr: () => emittedStderr,
+    flushStderr,
+    getSuppressedDiagnostics: () => {
+      if (omittedCount === 0) return null
+      const recovery =
+        omittedNotes.length > 0 && omittedNoteFailedCount === 0
+          ? 'Read the saved note command(s) in stderr_diagnostics_omitted.notes to inspect the omitted stderr diagnostics.'
+          : omittedNotes.length > 0
+            ? 'Read the saved note command(s) in stderr_diagnostics_omitted.notes and fix ~/.devspec/notes write permissions to capture the remaining diagnostics.'
+            : 'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.'
+      return {
+        omitted_count: omittedCount,
+        omitted_chars: omittedChars,
+        omitted_bytes: omittedBytes,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+        ...(omittedNotes.length > 0 ? { notes: omittedNotes.map((n) => ({ ...n })) } : {}),
+        ...(omittedNoteFailedCount > 0 ? { note_write_failed_count: omittedNoteFailedCount } : {}),
+        recovery,
+      }
+    },
+    writeFinalError: (raw, done) => {
+      let bounded = ''
+      try {
+        const rawBytes = Buffer.byteLength(raw)
+        const exceededBytesOnly =
+          emittedStderr.length + raw.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(emittedStderr) + rawBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        bounded = formatBoundedCliStderr(raw, {
+          label,
+          home,
+          reserve: emittedStderr,
+          summary: exceededBytesOnly
+            ? `error_bytes ${rawBytes}, error_chars ${raw.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+            : `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+        })
+      } catch {
+        void flushStderr().finally(done)
+        return
+      }
+      emittedStderr += bounded
+      writeTracked(bounded, undefined, () => {
+        void flushStderr().finally(done)
+      })
+    },
+    restore: () => {
+      process.stderr.write = rawStderrWrite
+    },
+  }
+}
+
 // --- CLI entry (skipped when imported for tests) ---
 const isMain =
   Boolean(process.argv[1]) &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
 if (isMain) {
-  void runCli().catch((err) => {
-    process.stderr.write(`remote-control-state: ${err?.message || err}\n`)
-    process.exit(1)
+  const cliStderr = installBoundedCliStderr({ label: 'remote-control-state' })
+  void runCli(cliStderr).catch((err) => {
+    const raw = `remote-control-state: ${err?.message || err}\n`
+    cliStderr.writeFinalError(raw, () => process.exit(1))
   })
 }
 
-async function runCli() {
+async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-control-state' })) {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
 
-  if (cmd === 'fast-connect') {
+  if (cmd === 'fast-connect' || cmd === 'connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
-    await runFastConnectCli(args)
+    await runFastConnectCli(args, {
+      getEmittedStderr: cliStderr.getEmittedStderr,
+      getSuppressedDiagnostics: cliStderr.getSuppressedDiagnostics,
+      flushStderr: cliStderr.flushStderr,
+    })
     return
   }
 
@@ -2405,9 +2891,23 @@ async function runCli() {
       hostToken,
     })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    await cliStderr.flushStderr()
     process.exit(result.ok ? 0 : 1)
   }
 
-  process.stderr.write(`Unknown command: ${cmd}\n`)
+  const rawUnknown = `Unknown command: ${cmd}\n`
+  const priorUnknownStderr = cliStderr.getEmittedStderr()
+  const unknownBytesOnly =
+    priorUnknownStderr.length + rawUnknown.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    Buffer.byteLength(priorUnknownStderr) + Buffer.byteLength(rawUnknown) > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const boundedUnknown = formatBoundedCliStderr(rawUnknown, {
+    label: 'remote-control-state',
+    reserve: priorUnknownStderr,
+    summary: unknownBytesOnly
+      ? `field command, actual_bytes ${Buffer.byteLength(String(cmd ?? ''))}, actual_chars ${String(cmd ?? '').length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+      : `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+  })
+  await new Promise((resolve) => process.stderr.write(boundedUnknown, resolve))
+  await cliStderr.flushStderr()
   process.exit(2)
 }
