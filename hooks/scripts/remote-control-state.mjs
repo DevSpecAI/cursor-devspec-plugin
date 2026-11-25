@@ -183,11 +183,11 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const projectEquals = /^--project(?:-id|_id)?=(.*)$/.exec(a)
-    const valueEquals = /^--(session|title)=(.*)$/.exec(a)
+    const valueEquals = /^--(session|title|codename|name)=(.*)$/.exec(a)
     if (projectEquals) {
       if (out['project-id'] || !projectEquals[1].trim()) throw new Error('Pass one non-empty project name or full ID.')
       out['project-id'] = projectEquals[1]
-    } else if (valueEquals) out[valueEquals[1]] = valueEquals[2]
+    } else if (valueEquals) out[valueEquals[1] === 'name' ? 'codename' : valueEquals[1]] = valueEquals[2]
     else if (a === '--help' || a === '-h') {
       // Kept positional too, so every other command reads it exactly as before.
       out.help = true
@@ -198,7 +198,7 @@ export function parseArgs(argv) {
     } else if (a === '--agent' || a === '--agent_name') out.agent = argv[++i]
     else if (a === '--cwd') out.cwd = argv[++i]
     else if (a === '--url') out.url = argv[++i]
-    else if (a === '--codename' || a === '--session_codename') out.codename = argv[++i]
+    else if (a === '--codename' || a === '--session_codename' || a === '--name') out.codename = argv[++i]
     else if (a === '--title') out.title = argv[++i]
     else if (a === '--local-id' || a === '--local_id' || a === '--conversation-id') {
       out['local-id'] = argv[++i]
@@ -1848,7 +1848,7 @@ async function runCli() {
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
 
-  if (cmd === 'fast-connect') {
+  if (cmd === 'fast-connect' || cmd === 'connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
     await runFastConnectCli(args)
     return

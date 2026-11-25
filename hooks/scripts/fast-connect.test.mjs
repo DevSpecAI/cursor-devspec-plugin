@@ -541,6 +541,69 @@ describe('fastConnect', () => {
     assert.match(r.error, /owner-pid/)
     assert.equal(r.connection_id, connectionId)
   })
+  it('reconnect reattaches the prior session when no --session or --new is passed, returns short summary with plugin_root, and refuses missing conversation id (item 66ad4866)', async () => {
+    const calls = []
+    const r = await fastConnect({
+      localId,
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({
+        action: 'reconnect',
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: 'Quiet Fox',
+      }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'env:CURSOR_CONVERSATION_ID' }),
+      emitPhase: async () => {},
+      registerFn: async () => {
+        calls.push('register')
+        return {
+          ok: true,
+          connection_id: connectionId,
+          project_id: projectId,
+          session_id: null,
+          codename: 'Quiet Fox',
+          project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+          repository_context: { version: 1, project_id: projectId, status: 'available', repositories: [] },
+          project_agent_rules: 'Long rules that must not be dumped inline',
+          github_identity: { status: 'link_required', url: 'https://app.devspec.ai/api/github/link?state=xyz' },
+        }
+      },
+      attachFn: async (opts) => {
+        calls.push(['attach', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId }
+      },
+      writeFn: async (opts) => {
+        calls.push(['write', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId, session_codename: 'Quiet Fox', auth_ok: true, poller: { ok: true, pid: 11 } }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.action, 'reconnect')
+    assert.equal(r.session_id, sessionId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 0)
+    assert.ok(typeof r.plugin_root === 'string' && r.plugin_root.length > 0)
+    assert.equal(r.github_identity?.status, 'link_required')
+    assert.match(r.github_status, /NOT LINKED/)
+    assert.equal('project_context' in r, false)
+    assert.doesNotMatch(JSON.stringify(r), /Long rules that must not be dumped inline/)
+    assert.deepEqual(calls, ['register', ['attach', sessionId], ['write', sessionId]])
+
+    // Never guesses or fabricates a conversation id when missing.
+    const missing = await fastConnect({
+      detectLocalIdFn: () => ({ local_id: null, source: null }),
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error, /conversation ID/)
+    assert.equal(missing.local_id, null)
+
+    // --name and --name=... map to codename.
+    assert.equal(parseArgs(['fast-connect', '--name', 'My Agent']).codename, 'My Agent')
+    assert.equal(parseArgs(['connect', '--name=My Agent']).codename, 'My Agent')
+  })
 })
 
 describe('fastConnect --new (item e707e925)', () => {

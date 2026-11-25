@@ -17,31 +17,19 @@ This is **DevSpec** remote control — distinct from any built-in remote-control
 
 **Requirement:** remote control needs **Node.js 18+** (`node` on PATH) for the packaged scripts. Idle polling is mechanical MCP HTTP — it does **not** consume LLM tokens.
 
-## Prefer the fast path (read this first)
+## Connect in one command (read this first)
 
-| Situation | What to do |
-|---|---|
-| **`resolve-local` → `already_live`** | Re-arm wait only (attach only if `--session` changed). |
-| **Manual cold Connect** (this skill in an open chat, no Live bond) | Prefer one-shot `remote-control-state.mjs fast-connect …`, or Node `register` / `attach` / `write` helpers. |
+Connect with **one single Shell command** — do **not** run separate preliminary `plugin-root.mjs`, `resolve-local-id`, or `resolve-local` commands first. `fast-connect` resolves `CURSOR_CONVERSATION_ID` from the environment itself (never guess or fabricate a conversation ID; it fails clearly if absent), checks whether this conversation is already live or reconnecting, registers or reconnects, attaches or opens a new room when asked, writes state, starts the poller, and prints **one short JSON result** (including `plugin_root` for any later helper call).
 
-An optional standalone launcher starts Cursor normally; it does not authenticate or register this connection. Use this installed skill's mechanical Connect helper, just as when Cursor was started manually. The plugin never installs the DevSpec Launcher.
+```bash
+PLUGIN="${CLAUDE_PLUGIN_ROOT:-}"; [ -f "$PLUGIN/hooks/scripts/remote-control-state.mjs" ] || PLUGIN=$(FINDER=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/plugin-root.mjs' 2>/dev/null | head -1) && [ -n "$FINDER" ] && node "$FINDER"); [ -n "$PLUGIN" ] || { echo "No installed DevSpec plugin for Cursor was found under $HOME/.cursor/plugins. Reinstall the DevSpec plugin in Cursor and try again." >&2; exit 1; }; node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect --owner-pid "$PPID" [--session "<uuid>" | --new [--private] [--title "…"]] [--project "<name-or-id>"] [--codename "<--name>"] [--launch-id "<launch_id>"]
+```
 
-## Plugin root (non-negotiable)
-
-All poller / state scripts come from the **installed Cursor DevSpec plugin** — never from Claude Code or another agent's plugin cache.
-
-1. Use the installed Cursor plugin location supplied by the host when available; verify the helper below belongs to that plugin.
-2. Otherwise ask the plugin for its newest installed copy under Cursor's plugin directory — `~/.cursor/plugins` (Windows: `%USERPROFILE%\.cursor\plugins`). An installed copy lives in a folder named after its commit (for example `plugins/cache/devspec/devspec/<commit-sha>/`), a local one at `plugins/local/<name>/`, and older commits can stay on disk beside the current one. `plugin-root.mjs` prints the newest copy's folder (highest plugin version, then most recently modified); any copy of it gives the same answer, because it checks every copy:
-
-   ```bash
-   FINDER=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/plugin-root.mjs' 2>/dev/null | head -1)
-   PLUGIN=$([ -n "$FINDER" ] && node "$FINDER")
-   ```
-
-   If `PLUGIN` is empty, no installed copy was found: tell the person so in plain words (with the message it printed, if any), say that reinstalling the DevSpec plugin in Cursor fixes it, and stop. Never run a helper with an empty `PLUGIN`.
-3. Confirm `PLUGIN/hooks/scripts/remote-control-state.mjs` exists before running anything.
-4. **Never** use scripts under `~/.claude/plugins/**` or any other agent's plugin folder, even one named `devspec`: those lack Cursor's auth-smoke + `ensure-poller` path and cause slow/broken attaches.
-5. Always **quote** `"$PLUGIN"` in shell commands (Windows usernames often contain spaces).
+- Always use the installed **Cursor** DevSpec plugin (or `CLAUDE_PLUGIN_ROOT` when supplied by the host) — **never** scripts under `~/.claude/plugins/**` or another agent's plugin folder, and always quote `"$PLUGIN"` (Windows usernames often contain spaces).
+- If `PLUGIN` is empty and the command fails, tell the person in plain words that reinstalling the DevSpec plugin in Cursor fixes it, and stop.
+- Pass `--owner-pid "$PPID"` on POSIX (on Windows, omit or pass `"$PPID"` so self-resolve walks to `Cursor.exe` / `agent.exe`; never pass a tool-shell `$PID`).
+- If the stamped prompt carries `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass `--launch-id "<launch_id>"` (or let `fast-connect` read `DEVSPEC_LAUNCH_ID`).
+- An optional standalone launcher starts Cursor normally; it does not authenticate or register this connection. Use this single command just as when Cursor was started manually. The plugin never installs the DevSpec Launcher.
 
 ## Security (non-negotiable)
 
@@ -86,17 +74,19 @@ A project choice is for this local Cursor conversation and its resume. It is app
 
 Remembering a folder is a separate opt-in: use `/devspec-project remember`'s preview/confirm helper. Forget changes future folder-based connections, not current ones. To work in another project, `/devspec-project prepare` gives a verified bare-Cursor launch command and the first project-selection message for a fresh terminal; it does not launch a chat itself; do not reuse old model context.
 
-### 3. Resolve local conversation id (bond key)
+### 3. Run the single connect command (replaces separate local-id, resolve-local, register, attach, and write calls)
 
-```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Cursor" [--launch-id "<launch_id>"]
-```
-
-Uses Cursor CLI's own `CURSOR_CONVERSATION_ID`. If unavailable, stop rather than minting a substitute for an existing chat; the native `create-chat` command is the source of IDs for fresh chats. Keep `local_id` in working memory; pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass that same id as `--launch-id` on resolve/register/attach/write/wait so local diagnostics (`devspec-debug`, when the person has turned them on) can join the launcher and connect phases.
+Run the one command under **Connect in one command** above with the parsed flags (`--session`, `--new`, `--private`, `--title`, `--project`, `--codename`, `--launch-id`). Do **not** run `resolve-local-id`, `resolve-local`, `register`, `attach`, or `write` separately first — `fast-connect` handles every case in one call:
+- **`action: "already_live"`** — keeps this conversation's live connection (attaches only if `--session` or `--new` was given) and reuses its poller.
+- **`action: "reconnect"`** — resumes a recent recoverable stop of this conversation's connection and reattaches its prior session if any.
+- **`action: "register"`** — registers a fresh connection (sessionless if bare, or attaches `--session` / creates+attaches `--new`).
+- Never guess or fabricate a conversation ID if `CURSOR_CONVERSATION_ID` is absent; stop and report the error returned by `fast-connect`. Never scan by cwd; other agents' files under `~/.devspec` are irrelevant.
+- `fast-connect` negotiates `connection_capability_version: 1`, retains the raw capability only in a mode-0600 file, and never prints it. Do not request, read, paste, or pass that value yourself.
+- Keep `plugin_root`, `connection_id`, `session_id`, and `codename` from the short JSON result. The project's full repository list and run-wide rules (`project_custom_instructions`, `project_agent_rules`, `owner_agent_rules`) arrive whole once through the plugin's project-context note hook (reply style is not one of them; see "Account + project instructions").
 
 ### Sign-in (the first connect only)
 
-Remote control and commit tracking run in helpers outside Cursor, so they hold their own DevSpec sign-in, approved once in the browser through the same Cursor app. The connect helpers start that approval by themselves and wait up to two minutes for the person to click Allow. You never ask for, read or paste a token. Act on the result's `code`:
+Remote control and commit tracking run in helpers outside Cursor, so they hold their own DevSpec sign-in, approved once in the browser through the same Cursor app. `fast-connect` starts that approval by itself and waits up to two minutes for the person to click Allow. You never ask for, read or paste a token. Act on the result's `code`:
 
 | `code` | What to do |
 |---|---|
@@ -106,58 +96,7 @@ Remote control and commit tracking run in helpers outside Cursor, so they hold t
 
 When the person asks to sign remote control out of DevSpec, or to see which account it uses, run `node "$PLUGIN/scripts/devspec-login.mjs" --sign-out` or `--status` and relay what it prints.
 
-### 4. Decide the action, then register the connection
-
-First check whether THIS conversation already has a connection:
-
-```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local \
-  --agent "Cursor" --local-id "<local_id>" [--force-new if --new]
-```
-
-| `action` | Meaning |
-|---|---|
-| `already_live` | This conversation already owns a live connection (`connection_id` in the result). Skip re-registering; just re-arm the wait (step 7). If args change the attachment (a new `--session`), attach as below. |
-| `reconnect` | Recent recoverable stop of this conversation's connection — resume it (re-register the same conversation; reattach its prior session only if it had one). |
-| `register` | Register a fresh **sessionless** connection. |
-| `create_and_attach` | `--new`: create a session, then attach — the single `fast-connect … --new` command under **`--new`** below. |
-
-**One-shot (preferred for cold manual Connect):**
-
-```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
-  --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" \
-  [--session "<uuid>"] [--project "<name-or-id>"] [--launch-id "<launch_id>"]
-```
-
-`--owner-pid "$PPID"` anchors the poller to this Cursor process; without it the poller does not start. For `--new`, use the command under **`--new`** below. `fast-connect --help` lists its flags and connects nothing.
-
-Or **register** via the Node helper:
-
-```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" register \
-  --local-id "<local_id>" --project-id "<project_id>" --agent "Cursor" \
-  --cwd "$(pwd)" [--git-remote "<url>"] [--codename "<--name>"] [--launch-id "<launch_id>"]
-```
-
-The Node register helper automatically negotiates `connection_capability_version: 1`, retains the raw capability only in a mode-0600 connection file, and never prints it. Do not request, read, paste, or pass that value yourself.
-
-Store the returned **`connection_id`** (full UUID) **and the returned `codename`** — this agent's own adjective-animal identity (e.g. `Brave Otter`), auto-minted server-side so two of your Cursor agents are never confused. If `--name "…"` was passed, that becomes the codename instead. **Tell the user which agent this terminal is** (see the status block), so a phone/web driver can pick the right one. Apply the run-wide instruction tiers returned in the JSON (`project_custom_instructions`, `project_agent_rules`, `owner_agent_rules`); reply style is not one of them (see "Account + project instructions").
-
-Now handle the session attachment by invocation:
-- **bare** → nothing more; the connection is available and sessionless.
-- **`--session <uuid>`** → prefer Node-measured attach:
-  ```bash
-  node "$PLUGIN/hooks/scripts/remote-control-state.mjs" attach \
-    --connection-id "<connection_id>" --session "<uuid>" [--launch-id "<launch_id>"]
-  ```
-- **`--new`** → one command registers the connection, creates the session and attaches to it; do not run `register`, `create_session` or `attach` yourself. The session is shared with the project; add `--private` only when the person asked for a private one:
-  ```bash
-  node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" --new [--private] [--title "…"]
-  ```
-  It returns the new session's `session_id` and `session_url`. If it fails, `code` names the step (`create_session_failed` or `attach_failed`) and the connection is not in a new session.
-
-Never scan by cwd. Other agents' files under `~/.devspec` are irrelevant.
+### 4. Print the local status block
 
 Print **in this local terminal only** (never into the session transcript):
 
@@ -173,33 +112,13 @@ Stop with:  devspec-remote-stop
 ─────────────────────────────
 ```
 
-When `register_connection` / `fast-connect` returns `github_identity` with `status: "link_required"` (a verified `https://` URL), tell the person once in plain words at your next reply that linking their GitHub account makes their pull requests and commits show as theirs in DevSpec (one click in their browser; DevSpec keeps no access to their GitHub account), and give them the link to open themselves. Never open it for them, and carry on with the work either way.
+When `fast-connect` returns `github_identity` with `status: "link_required"` (a verified `https://` URL), tell the person once in plain words at your next reply that linking their GitHub account makes their pull requests and commits show as theirs in DevSpec (one click in their browser; DevSpec keeps no access to their GitHub account), and give them the link to open themselves. Never open it for them, and carry on with the work either way.
 
 **TERMINAL ONLY — non-negotiable.** Never `devspec__post_session_message` this status block, any fragment of it, or any connect / reconnect / "you're connected" / "waiting for your next command" spiel. Presence is the Agents page + connection strip (and server attach markers). The session transcript must not double as a status console.
 
-### 5. Write state file (token resolution + poller — required)
+### 5. Poller verification (already started by `fast-connect`)
 
-If you used `fast-connect`, state + poller are already done — skip to step 6/7. Otherwise run **exactly** (never hand-write JSON with a hardcoded prod URL). Pass `--session` only when attached:
-
-```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" write \
-  --connection-id '<connection_id>' \
-  [--session '<session_id>' when attached] \
-  --agent "Cursor" \
-  --cwd "$(pwd)" \
-  --local-id '<local_id>' \
-  --owner-pid "$PPID" \
-  [--launch-id '<launch_id>'] \
-  [--codename '<session_codename if any>'] [--title '<title>']
-```
-
-**Owner PID (Windows):** prefer omit, or pass `"$PPID"` / parent — the write path self-resolves up to `Cursor.exe` / CLI `agent.exe`. **Never** pass the tool-shell `$PID` (`powershell` / `pwsh` / `cmd` / `bash`): those exit when the tool call ends and the poller dies with `owner_gone`. On POSIX, `"$PPID"` remains the correct cheap anchor.
-
-This uses the plugin's own DevSpec browser sign-in for the configured server, writes connection state + the conversation bond (mode 0600) with the configured `mcp_url` (staging vs prod), and **auto-starts the continuous poller** (detached, `--owner-pid`-anchored to the owning Cursor process, keyed to this connection, polling the attached session's room only when `--session` was given). It also reaps provably-dead pollers for this agent. Confirm `poller.ok` / `poller.pid` in the JSON stdout. Opt out with `--no-poller` (tests only).
-
-If `auth_ok: false`, show the `warning` to the person verbatim: it says how to sign in. If `poller.ok` is false, show `warning_poller` and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`.
-
-Never spawn a second poller with plain shell `&` / `nohup` after a successful write — that multiplies orphans. Prefer `write` / `ensure-poller`.
+`fast-connect` already wrote state and started the detached, `--owner-pid`-anchored continuous poller (reaping provably-dead pollers for this agent). Confirm `poller.ok` / `poller.pid` in the JSON result; if `poller.ok` is false, show the error and check `~/.devspec/remote-control/connections/<connection_id>.poll.log`. Never spawn a second poller with plain shell `&` / `nohup` — that multiplies orphans.
 
 ### 6. Read the room for context (ONLY when attached)
 

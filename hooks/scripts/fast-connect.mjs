@@ -15,7 +15,10 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
+
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
@@ -525,10 +528,16 @@ export async function fastConnect(opts = {}) {
     connectionId = registered.connection_id
     codename = registered.codename || registered.session_codename || null
 
-    if (sessionId) {
+    const attachTarget =
+      sessionId ||
+      (localAction.action === 'reconnect' && !newSession && localAction.session_id && registered.session_id !== localAction.session_id
+        ? localAction.session_id
+        : null)
+
+    if (attachTarget) {
       const attached = await attachFn({
         connectionId,
-        sessionId,
+        sessionId: attachTarget,
         cwd,
         launchId,
         agent,
@@ -544,11 +553,11 @@ export async function fastConnect(opts = {}) {
           local_id: localId,
           launch_id: launchId,
           connection_id: connectionId,
-          session_id: sessionId,
+          session_id: attachTarget,
           codename,
         }
       }
-      attachedSessionId = attached.session_id || sessionId
+      attachedSessionId = attached.session_id || attachTarget
     } else {
       // Registration also refreshes existing native conversations. Its attachment
       // snapshot is authoritative; hydration must not erase a live room bond.
@@ -676,6 +685,9 @@ export async function fastConnect(opts = {}) {
 
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
+  const repoCount = Array.isArray(projectSnapshot?.repository_context?.repositories)
+    ? projectSnapshot.repository_context.repositories.length
+    : null
   return {
     ok: true,
     connection_id: connectionId,
@@ -684,11 +696,11 @@ export async function fastConnect(opts = {}) {
     local_id: localId,
     launch_id: launchId,
     action: localAction.action,
+    plugin_root: PLUGIN_ROOT,
     ...(createdRoom ? { new_session: true, session_url: createdRoom.session_url, title: createdRoom.title, access: makePrivate ? 'private' : 'shared' } : {}),
-    project_id: projectContext?.project.id,
-    project_selection: projectContext,
-    project_context: projectSnapshot,
-    project_context_file: repositoryContextTextFile(localId, opts.projectHome),
+    project_id: projectContext?.project.id ?? null,
+    ...(projectContext?.project?.name ? { project_name: projectContext.project.name } : {}),
+    ...(repoCount !== null ? { repository_count: repoCount } : {}),
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
@@ -696,12 +708,13 @@ export async function fastConnect(opts = {}) {
   }
 }
 
-export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid> [options]
+export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --owner-pid <pid> [options]
 
-Connect this Cursor conversation to DevSpec in one command: register it, attach
-it to a room if asked, write its state and start its poller.
+Connect this Cursor conversation to DevSpec in one command: read its conversation
+id from CURSOR_CONVERSATION_ID, check existing connection state, register or
+reconnect, attach to a room if asked, write its state and start its poller.
 
-  --local-id <id>          This conversation's id (CURSOR_CONVERSATION_ID).
+  --local-id <id>          Optional override for CURSOR_CONVERSATION_ID.
   --agent <name>           Agent name shown in DevSpec. Default: Cursor.
   --cwd <path>             The working folder. Default: the current directory.
   --owner-pid <pid>        The Cursor process this connection belongs to; pass "$PPID".
@@ -713,10 +726,10 @@ it to a room if asked, write its state and start its poller.
   --title <text>           With --new: the new room's title.
   --project <name-or-id>   Choose this conversation's project. --project-id is the same.
   --launch-id <uuid>       The launch id stamped in the prompt, for local diagnostics.
-  --codename <name>        This agent's codename instead of a minted one.
+  --codename <name>        This agent's codename instead of a minted one. --name is the same.
   -h, --help               Print this help and exit. Connects nothing.
 
-Prints one JSON result; exits 0 when connected, 1 when not.
+Prints one short JSON result; exits 0 when connected, 1 when not.
 `
 
 /**
