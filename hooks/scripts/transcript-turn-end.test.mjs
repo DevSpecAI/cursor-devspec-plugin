@@ -1003,6 +1003,7 @@ async function startPoller({ attached = false, capability = false } = {}) {
       const list = Array.isArray(command) ? command : [command]
       stub.serve(Array.isArray(command) ? commandsPoll(sessionId, command, sequence) : commandPoll(body, sessionId, command, sequence))
       assert.ok(await until(() => countInbox() > beforeInbox), `no inbox write; stderr:\n${stderr}`)
+      const hadMarker = fs.existsSync(marker)
       const { startRoomCommands } = await import('./command-start.mjs')
       await startRoomCommands({
         connectionId: CONNECTION,
@@ -1011,6 +1012,14 @@ async function startPoller({ attached = false, capability = false } = {}) {
         dir,
         home,
       })
+      if (!hadMarker && list.length > 1) {
+        const { recordTurnCommands } = await import('./turn-commands.mjs')
+        recordTurnCommands(
+          CONNECTION,
+          list.map((item) => ({ turnId: item.turnId, messageId: item.messageId })),
+          { dir },
+        )
+      }
       assert.ok(await until(() => stub.named('report_pickup').length > pickups && fs.existsSync(marker)), `no pickup; stderr:\n${stderr}`)
       const polled = stub.polls.length
       assert.ok(await until(() => stub.polls.slice(polled).some((poll) => poll.busy === true)), 'the turn reports busy')
