@@ -2073,7 +2073,7 @@ async function main() {
               connectionId,
               commands: commandsHandedOver(batch.messages),
               batch,
-              sessionId: batch.session_id || live?.session_id || null,
+              sessionId: batch.session_id ?? null,
               dir: CONNECTIONS_DIR,
               state: live,
             })

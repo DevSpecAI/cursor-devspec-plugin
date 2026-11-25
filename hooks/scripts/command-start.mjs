@@ -288,7 +288,12 @@ export async function startRoomCommands({
   const credential = resolvedState ? connectionCredential(resolvedState) : { ok: false }
   const token = credential.ok ? credential.token : (resolvedState?.token || resolvedState?.mcp_token || null)
   const mcpUrl = credential.mcp_url || resolvedState?.mcp_url || null
-  const attachedSessionId = sessionId ?? batch?.session_id ?? resolvedState?.session_id ?? null
+  const attachedSessionId =
+    sessionId !== undefined
+      ? sessionId
+      : batch && Object.hasOwn(batch, 'session_id')
+        ? batch.session_id
+        : (resolvedState?.session_id ?? null)
 
   // If a previous turn marker is stale (abandoned: no activity past TURN_SILENCE_MS,
   // or no longer live), finish the abandoned working attempt in one single report_complete
@@ -376,8 +381,8 @@ export async function startRoomCommands({
   // Advance started-command state ONLY for commands whose report_pickup actually succeeded.
   if (succeeded.length > 0) {
     recordStartedCommandIds(connectionId, succeeded.map((cmd) => cmd.messageId), dir)
-    const marker = writeTurnMarker(connectionId, dir)
     if (effectiveStartsTurn) {
+      const marker = writeTurnMarker(connectionId, dir)
       recordTurnCommands(connectionId, succeeded, { dir })
       const conversationId = resolvedState?.local_id || null
       if (conversationId && marker?.startedAt) {
