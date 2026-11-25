@@ -2325,6 +2325,7 @@ export function formatBoundedCliStderr(
     reserve = '',
     summary = null,
     fallback = null,
+    onOmitted = null,
   } = {},
 ) {
   const text = String(rawMessage ?? '')
@@ -2364,11 +2365,17 @@ export function formatBoundedCliStderr(
     typeof fallback === 'string' && fallback
       ? fallback
       : `${label}: ${meta}diagnostic (${boundDesc}) and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
-  if (fitsShellOutput(`${prior}${fb}`)) return fb
+  if (fitsShellOutput(`${prior}${fb}`)) {
+    if (typeof onOmitted === 'function') onOmitted({ savedNote: null, length: text.length, bytes: textBytes, exceededBytesOnly })
+    return fb
+  }
   const omitted = exceededBytesOnly
-    ? `${label}: diagnostic omitted (${textBytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+    ? `${label}: diagnostic omitted (${textBytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit); note write failed — fix ~/.devspec/notes permissions and retry.\n`
     : `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
-  if (fitsShellOutput(`${prior}${omitted}`)) return omitted
+  if (fitsShellOutput(`${prior}${omitted}`)) {
+    if (typeof onOmitted === 'function') onOmitted({ savedNote: null, length: text.length, bytes: textBytes, exceededBytesOnly })
+    return omitted
+  }
   throw shellBudgetExceededError({
     field: 'reserve',
     reserveLength: prior.length,
@@ -2385,10 +2392,14 @@ export function formatBoundedCliStderr(
  * allowance beside `CLI_STDOUT_RECEIPT_HEADROOM`, so no subsequent stderr write is ever
  * dropped silently without a visible disclosure and recovery path (reqs 3c5147a7 / 91d7b47c).
  */
-function buildStderrOmissionNotice(label, { length, note = null } = {}) {
+function buildStderrOmissionNotice(label, { length, bytes = length, note = null } = {}) {
+  const bound =
+    length <= CURSOR_SHELL_OUTPUT_MAX_CHARS && bytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+      ? `${bytes} bytes > ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit`
+      : `${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit`
   return note
-    ? `${label}: diagnostic omitted (${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit; saved in note ${note.id}: ${note.command}); further stderr suppressed.\n`
-    : `${label}: diagnostic omitted (${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit; note write failed — fix ~/.devspec/notes permissions and retry); further stderr suppressed.\n`
+    ? `${label}: diagnostic omitted (${bound}; saved in note ${note.id}: ${note.command}); further stderr suppressed.\n`
+    : `${label}: diagnostic omitted (${bound}; note write failed — fix ~/.devspec/notes permissions and retry); further stderr suppressed.\n`
 }
 
 /**
@@ -2464,6 +2475,7 @@ export function installBoundedCliStderr({
   let omissionNoticeEmitted = false
   let omittedCount = 0
   let omittedChars = 0
+  let omittedBytes = 0
   let omittedNoteFailedCount = 0
   const omittedNotes = []
   const pendingWrites = new Set()
@@ -2516,6 +2528,7 @@ export function installBoundedCliStderr({
   const recordOmitted = (text, note) => {
     omittedCount += 1
     omittedChars += text.length
+    omittedBytes += Buffer.byteLength(text)
     if (note) {
       omittedNotes.push({ id: note.id, command: note.command, parts: note.parts })
     } else {
@@ -2541,22 +2554,29 @@ export function installBoundedCliStderr({
       if (fitsShellOutput(`${guardReserve}${text}`)) {
         toWrite = text
       } else {
+        const textBytes = Buffer.byteLength(text)
+        const exceededBytesOnly =
+          guardReserve.length + text.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(guardReserve) + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
         try {
           toWrite = formatBoundedCliStderr(text, {
             label,
             home,
             reserve: guardReserve,
-            summary: `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+            summary: exceededBytesOnly
+              ? `stderr_bytes ${textBytes}, stderr_chars ${text.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+              : `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+            onOmitted: ({ savedNote }) => recordOmitted(text, savedNote),
           })
         } catch (err) {
           const savedNote = err?.note ?? null
           recordOmitted(text, savedNote)
-          const notice = buildStderrOmissionNotice(label, { length: text.length, note: savedNote })
+          const notice = buildStderrOmissionNotice(label, { length: text.length, bytes: textBytes, note: savedNote })
           if (fitsShellOutput(`${emittedStderr}${notice}${reserveHeadroom}`)) {
             toWrite = notice
             omissionNoticeEmitted = true
           } else {
-            const shortNotice = `${label}: stderr omitted (${text.length} chars; ${savedNote ? savedNote.command : 'fix ~/.devspec/notes & retry'}).\n`
+            const shortNotice = `${label}: stderr omitted (${exceededBytesOnly ? `${textBytes} bytes` : `${text.length} chars`}; ${savedNote ? savedNote.command : 'fix ~/.devspec/notes & retry'}).\n`
             if (fitsShellOutput(`${emittedStderr}${shortNotice}${reserveHeadroom}`)) {
               toWrite = shortNotice
               omissionNoticeEmitted = true
@@ -2586,7 +2606,9 @@ export function installBoundedCliStderr({
       return {
         omitted_count: omittedCount,
         omitted_chars: omittedChars,
+        omitted_bytes: omittedBytes,
         shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
         ...(omittedNotes.length > 0 ? { notes: omittedNotes.map((n) => ({ ...n })) } : {}),
         ...(omittedNoteFailedCount > 0 ? { note_write_failed_count: omittedNoteFailedCount } : {}),
         recovery,
