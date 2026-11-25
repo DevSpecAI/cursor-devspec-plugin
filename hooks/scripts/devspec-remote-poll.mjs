@@ -3074,9 +3074,10 @@ async function main() {
     // A turn end the poller could only notice settles (transcript-turn-end.mjs
     // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
     await lapSettle(marker, transcriptPath)
-    // When no tracked turn marker is active and Cursor is between turns, close any
-    // finished typed_prompt or answered room commands that missed a stop hook (item da03801e).
-    if (!marker && transcriptPath) {
+    // When no tracked turn marker or pending turn-end settle is active and Cursor is
+    // between turns, close any finished typed_prompt or answered room commands that
+    // missed a stop hook (item da03801e), without racing an in-flight settle / stop hook.
+    if (!marker && transcriptPath && !readSettle(connectionId, { dir: CONNECTIONS_DIR })) {
       const capability = readConnectionCapability(connectionId)
       try {
         await finishIdleRequests({
