@@ -20,6 +20,7 @@ import { appendWakeEvents, REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-fil
 import { readWakes } from './devspec-wake-tail.mjs'
 import {
   buildOwnerMessageEvents,
+  planOneShot,
   printedRoomCommands,
   printOneShot,
   runOneShotRoomCommandPickup,
@@ -986,7 +987,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     }
   })
 
-  it('picks up oversized owner_message commands wrapped in wake_in_note in both one-shot wait and readWakes (3ea2b201)', async () => {
+  it('defers pickup and wake cursor advance for oversized wake_in_note commands until the agent reads the sealed note whole (3ea2b201)', async () => {
     const { home, dir } = mkHome()
     const batch = ownerBatch('Huge command ' + 'h'.repeat(21_000))
     const built = buildOwnerMessageEvents(batch)
@@ -994,44 +995,72 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(wrapped.events[0].type, 'wake_in_note')
     assert.ok(wrapped.events[0].carries.includes('owner_message'))
 
-    // 1. One-shot printedRoomCommands + runOneShotRoomCommandPickup must expand wake_in_note.
-    const extracted = printedRoomCommands([wrapped.events], ROOM, { home })
-    assert.deepEqual(
-      extracted.commands.map((c) => c.messageId),
-      [MSG_ID],
-    )
-    const picked = []
-    const pickup = await runOneShotRoomCommandPickup({
-      connectionId: CONN,
-      printedWakes: [wrapped.events],
-      printedStdout: JSON.stringify(wrapped.events[0]) + '\n',
-      fallbackSessionId: ROOM,
-      dir,
-      home,
-      writeStderr: () => {},
-      startCommands: (opts) =>
-        startRoomCommands({
-          ...opts,
-          call: async (req) => {
-            picked.push(req.arguments.command_message_id)
-            return { outcome: 'picked_up' }
-          },
-          seedFn: async () => {},
-          ensureWatch: () => ({ started: false }),
-        }),
-    })
-    assert.equal(pickup.ok, true)
-    assert.deepEqual(picked, [MSG_ID])
-
-    // 2. readWakes must also expand wake_in_note and refuse to advance offset on pickup refusal.
+    // 1. readWakes prints only the pointer, calls startCommands 0 times, and does NOT advance
+    // the read cursor before the agent reads the note body whole.
     const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
     appendWakeEvents(wakeFile, wrapped.events)
-    const msg2 = '33333333-3333-4333-8333-333333333399'
-    const turn2 = '77777777-7777-4777-8777-777777777799'
-    const wrapped2 = wakeInNote(buildOwnerMessageEvents(ownerBatch('Huge 2 ' + 'k'.repeat(21_000), { messageId: msg2, turnId: turn2 })), { home })
-    fs.writeFileSync(wakeFile, '')
-    appendWakeEvents(wakeFile, wrapped2.events)
-    const readRes = await readWakes({
+    let wakePickupCalls = 0
+    let firstOut = ''
+    const firstRead = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { firstOut = text },
+      writeStderr: () => {},
+      startCommands: async () => {
+        wakePickupCalls += 1
+        return { ok: true }
+      },
+    })
+    assert.equal(wakePickupCalls, 0, 'must not call report_pickup while only the wake_in_note pointer was printed')
+    assert.equal(firstRead.marked, false, 'must not advance wake position before agent reads the note body')
+    assert.equal(firstRead.pending_note_reads?.length, 1)
+    assert.match(firstOut, /"type":"wake_in_note"/)
+
+    // A second readWakes before the agent reads the note STILL returns the wake pointer (not 0 wakes).
+    let secondOut = ''
+    const secondRead = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { secondOut = text },
+      writeStderr: () => {},
+      startCommands: async () => {
+        wakePickupCalls += 1
+        return { ok: true }
+      },
+    })
+    assert.equal(wakePickupCalls, 0)
+    assert.equal(secondRead.printed, 1, 'unread note-backed wake must remain visible on retry read')
+    assert.match(secondOut, /"type":"wake_in_note"/)
+
+    // 2. Once the agent reads every part of the sealed note whole, stepDeliveryHook triggers
+    // report_pickup ONCE and advances the wake read cursor so the next read returns 0 wakes.
+    const noteId = firstRead.pending_note_reads[0]
+    const picked = []
+    for (const file of noteFiles(home, noteId)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        startCommands: (opts) =>
+          startRoomCommands({
+            ...opts,
+            call: async (req) => {
+              picked.push(req.arguments.command_message_id)
+              return { outcome: 'picked_up' }
+            },
+            seedFn: async () => {},
+            ensureWatch: () => ({ started: false }),
+          }),
+      })
+    }
+    assert.deepEqual(picked, [MSG_ID], 'report_pickup runs once the agent finishes reading the note whole')
+
+    const thirdRead = await readWakes({
       file: wakeFile,
       connectionId: CONN,
       home,
@@ -1039,16 +1068,8 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       settleMs: 10,
       write: async () => {},
       writeStderr: () => {},
-      startCommands: (opts) =>
-        startRoomCommands({
-          ...opts,
-          call: async () => ({ ok: false, code: 'refused_huge', error: 'Try again' }),
-          seedFn: async () => {},
-          ensureWatch: () => ({ started: false }),
-        }),
     })
-    assert.equal(readRes.marked, false, 'must not advance wake position when note-wrapped command pickup refuses')
-    assert.equal(readRes.pickup_refusals[0].command_message_id, msg2)
+    assert.equal(thirdRead.printed, 0, 'after full note read + pickup, wake cursor has advanced')
   })
 
   it('one-shot CLI wait counts startup stderr in combined stdout + stderr Shell ceiling on near-limit wake with pickup refusal (3c5147a7 / 91d7b47c)', async () => {
@@ -1086,7 +1107,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       }),
       { mode: 0o600 },
     )
-    const batch = ownerBatch('Near limit body ' + 'm'.repeat(18_500))
+    const batch = ownerBatch('Near limit body ' + 'm'.repeat(8_800))
     batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
     const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
     fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
@@ -1155,7 +1176,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       }),
       { mode: 0o600 },
     )
-    const batch = ownerBatch('Near limit nothing_open ' + 'm'.repeat(19_400))
+    const batch = ownerBatch('Near limit nothing_open ' + 'm'.repeat(8_900))
     batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
     const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
     fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
@@ -1339,19 +1360,68 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         child.on('error', (e) => { clearTimeout(timer); clearTimeout(fallbackUnblock); reject(e) })
         child.on('close', (code) => { clearTimeout(timer); clearTimeout(fallbackUnblock); resolve({ stdout, stderr, code }) })
       })
-      assert.equal(code, 1)
+      assert.equal(code, 0)
       assert.match(stderr, /further retry warnings suppressed/)
       assert.ok(
         fitsShellOutput(stdout + stderr),
         `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
       )
-      // The structured refusal must be surfaced either inline or via a sealed diagnostic note.
-      const noteMatch = /notes\/([0-9a-f]{16})\.md/.exec(stderr)
-      const refusalSource = noteMatch ? readNoteText(noteMatch[1], { home }) : stderr
-      assert.match(refusalSource, /turn_busy_after_hold/)
-      assert.match(refusalSource, /99999999-9999-4999-8999-999999999999/)
+      assert.match(stdout, /"type":"wake_in_note"/)
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }
+  })
+
+  it('planOneShot holds instead of emitting an oversized wake when stderr reserve leaves no room and note write fails (3c5147a7 / 91d7b47c)', () => {
+    const { home } = mkHome()
+    const notesPath = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(notesPath), { recursive: true })
+    fs.writeFileSync(notesPath, 'blocked')
+    const nearLimitWake = buildOwnerMessageEvents(ownerBatch('b'.repeat(19_400)))
+    const reserve = 'devspec-remote-wait: retry warning\n'.repeat(30)
+    const plan = planOneShot([nearLimitWake], { reserve, home })
+    assert.equal(plan.held, true, 'must hold instead of emitting > 20,000 combined characters')
+    assert.equal(plan.count, 0)
+    assert.equal(plan.text, '')
+    assert.ok(plan.error)
+  })
+
+  it('surfaces structured refusal code and blocking_turn_id even when refusal exceeds Shell ceiling and notes dir is unwritable (4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const notesPath = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(notesPath), { recursive: true })
+    fs.writeFileSync(notesPath, 'blocked')
+    const wake = buildOwnerMessageEvents(ownerBatch('Inline command'))
+    let capturedStderr = ''
+    const res = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [wake],
+      printedStdout: '',
+      priorStderr: '',
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: (chunk) => { capturedStderr += chunk },
+      startCommands: async () => ({
+        ok: false,
+        outcome: 'refused',
+        refusals: [
+          {
+            command_message_id: MSG_ID,
+            command_turn_id: TURN_ID,
+            refusal: {
+              code: 'turn_busy',
+              retryable: true,
+              blocking_turn_id: '88888888-8888-4888-8888-888888888888',
+              detail: 'x'.repeat(25_000),
+            },
+          },
+        ],
+      }),
+    })
+    assert.equal(res.ok, false)
+    assert.ok(fitsShellOutput(capturedStderr), `fallback stderr (${capturedStderr.length}) must fit fitsShellOutput`)
+    assert.match(capturedStderr, /turn_busy/)
+    assert.match(capturedStderr, /88888888-8888-4888-8888-888888888888/)
   })
 })

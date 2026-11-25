@@ -203,6 +203,8 @@ const NOTE_ID_IN_READ_RE = /notes\/([0-9a-f]{16})\.md\b/
  */
 export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), visitedNotes = null } = {}) {
   const rawMessages = []
+  const inlineMessages = []
+  const deferredNoteCommands = []
   const unreadableNotes = []
   let sessionId = null
   const seenNotes = visitedNotes ?? new Set()
@@ -217,6 +219,7 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
     }
     if (event?.type === 'owner_message' && event.message && typeof event.message === 'object') {
       rawMessages.push(event.message)
+      inlineMessages.push(event.message)
       if (!sessionId && typeof event.session_id === 'string') sessionId = event.session_id
     } else if (
       event?.type === 'wake_in_note' &&
@@ -241,6 +244,15 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
             rawMessages.push(...nested.messages)
             unreadableNotes.push(...nested.unreadableNotes)
             if (!sessionId && nested.sessionId) sessionId = nested.sessionId
+            if (nested.commands.length > 0) {
+              deferredNoteCommands.push({
+                noteId,
+                read: event.read ?? null,
+                commands: nested.commands,
+                messages: nested.messages,
+                sessionId: nested.sessionId ?? sessionId,
+              })
+            }
           } else {
             unreadableNotes.push({
               code: 'unreadable_command_note',
@@ -263,9 +275,50 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
   return {
     commands: commandsHandedOver(rawMessages),
     messages: rawMessages,
+    inlineCommands: commandsHandedOver(inlineMessages),
+    inlineMessages,
+    deferredNoteCommands,
     sessionId,
     unreadableNotes,
   }
+}
+
+/**
+ * Compact structured summary of pickup refusals for Shell stderr fallback when a refusal
+ * payload exceeds Cursor's Shell ceiling AND `~/.devspec/notes` cannot be written.
+ * Preserves every structured refusal identifier/code/blocking field while replacing only
+ * oversized string blobs (> 200 chars, sized so a refusal object stays a few hundred chars
+ * inside the 20,000-char Shell ceiling) with explicit omission metadata (req 4e32d1a5).
+ */
+const COMPACT_REFUSAL_FIELD_MAX_CHARS = 200
+
+function compactRefusalValue(value, depth = 0) {
+  if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number') {
+    return value
+  }
+  if (typeof value === 'string') {
+    return value.length <= COMPACT_REFUSAL_FIELD_MAX_CHARS
+      ? value
+      : { omitted_large_text: true, chars: value.length, note_write_failed: true }
+  }
+  if (depth >= 4) return { omitted_nested: true }
+  if (Array.isArray(value)) {
+    return value.slice(0, 10).map((item) => compactRefusalValue(item, depth + 1))
+  }
+  if (typeof value === 'object') {
+    const out = {}
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v === 'function' || k === 'stack') continue
+      out[k] = compactRefusalValue(v, depth + 1)
+    }
+    return out
+  }
+  return String(value)
+}
+
+export function compactStructuredRefusals(refusals) {
+  if (!Array.isArray(refusals)) return []
+  return refusals.map((item) => compactRefusalValue(item, 0))
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */

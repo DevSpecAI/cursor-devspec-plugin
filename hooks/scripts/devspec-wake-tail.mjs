@@ -109,9 +109,10 @@ import {
 } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { connectionsDirFor, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import { connectionsDirFor, registerPendingWakeNote, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
 import {
   clearWakeListenerNeeded,
+  compactStructuredRefusals,
   extractRoomCommandsFromWake,
   markWakeListenerNeeded,
   startRoomCommands,
@@ -633,23 +634,45 @@ export async function readWakes({
     let pickupNothingOpen = null
     let pickupDiagnosticNote = null
     let pickupDiagnosticWritten = false
+    const pendingNoteReads = []
+    const through = page.through > 0 ? wakes[page.through - 1].end : start
     if (resolvedConnectionId && page.printed > 0) {
-      const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
-      const extracted = extractRoomCommandsFromWake(printedSlice, { home })
+      // Inspect what actually reached the agent (`page.text`), not raw unread wakes:
+      // inline `owner_message` commands are picked up immediately; oversized commands
+      // handed over only as a `wake_in_note` pointer defer pickup and cursor advance
+      // until the agent reads the sealed note whole via `stepDeliveryHook` (req 3ea2b201).
+      const extracted = extractRoomCommandsFromWake(page.text, { home })
       const noteRefusals = extracted.unreadableNotes.map((note) => ({
         command_message_id: null,
         command_turn_id: null,
         refusal: note,
       }))
-      if (extracted.commands.length > 0 || noteRefusals.length > 0) {
+      for (const deferred of extracted.deferredNoteCommands) {
+        registerPendingWakeNote(
+          resolvedConnectionId,
+          {
+            noteId: deferred.noteId,
+            commands: deferred.commands,
+            messages: deferred.messages,
+            sessionId: deferred.sessionId,
+            wakeFile: resolved,
+            wakePositionPath: readPositionPath(key, dir),
+            wakePositionVersion: POSITION_VERSION,
+            wakeThrough: through,
+          },
+          { dir },
+        )
+        pendingNoteReads.push(deferred.noteId)
+      }
+      if (extracted.inlineCommands.length > 0 || noteRefusals.length > 0) {
         const capturedDiag = []
         let pickupResult = null
-        if (extracted.commands.length > 0) {
+        if (extracted.inlineCommands.length > 0) {
           try {
             pickupResult = await startCommands({
               connectionId: resolvedConnectionId,
-              commands: extracted.commands,
-              batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
+              commands: extracted.inlineCommands,
+              batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.inlineMessages },
               sessionId: extracted.sessionId,
               dir,
               home,
@@ -685,7 +708,10 @@ export async function readWakes({
           rawDiag = capturedDiag.join('')
         }
         if (rawDiag) {
-          const fitted = fitShellDiagnostic(page.text, rawDiag, { home, label: 'devspec-wake-tail' })
+          const fallback = pickupRefusals
+            ? `devspec-wake-tail: report_pickup refused (note write failed; structured summary): ${JSON.stringify(compactStructuredRefusals(pickupRefusals))}\n`
+            : null
+          const fitted = fitShellDiagnostic(page.text, rawDiag, { home, label: 'devspec-wake-tail', fallback })
           pickupDiagnosticNote = fitted.note
           if (fitted.text) {
             writeStderr(fitted.text)
@@ -701,12 +727,25 @@ export async function readWakes({
         ...page,
         marked: false,
         pickup_refusals: pickupRefusals,
+        ...(pendingNoteReads.length > 0 ? { pending_note_reads: pendingNoteReads } : {}),
         ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
         pickup_diagnostic_written: pickupDiagnosticWritten,
         error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
       }
     }
-    const through = page.through > 0 ? wakes[page.through - 1].end : start
+    // When the printed page only delivered a `wake_in_note` pointer for an oversized room
+    // command, keep the wake cursor unadvanced until the agent reads the sealed note whole
+    // and `stepDeliveryHook` completes `report_pickup` (requirement 3ea2b201).
+    if (pendingNoteReads.length > 0) {
+      return {
+        ...page,
+        marked: false,
+        pending_note_reads: pendingNoteReads,
+        ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        ...(pickupDiagnosticWritten ? { pickup_diagnostic_written: true } : {}),
+      }
+    }
     const extra = {
       ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
       ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),

@@ -855,7 +855,7 @@ export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
 export function fitShellDiagnostic(
   stdoutText,
   diagnosticText,
-  { home = os.homedir(), label = 'devspec-wake-tail' } = {},
+  { home = os.homedir(), label = 'devspec-wake-tail', fallback = null } = {},
 ) {
   const stdout = String(stdoutText ?? '')
   const diag = String(diagnosticText ?? '')
@@ -870,9 +870,15 @@ export function fitShellDiagnostic(
     if (fitsShellOutput(stdout + pointer)) {
       return { text: pointer, note }
     }
+    if (typeof fallback === 'string' && fallback && fitsShellOutput(stdout + fallback)) {
+      return { text: fallback, note, overflow: true, usedFallback: true }
+    }
     return { text: '', note, overflow: true }
   } catch (error) {
     noteError = error
+  }
+  if (typeof fallback === 'string' && fallback && fitsShellOutput(stdout + fallback)) {
+    return { text: fallback, note: null, noteError, usedFallback: true }
   }
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
   const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).\n`

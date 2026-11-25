@@ -145,7 +145,75 @@ const RECORD_VERSION = 1
 const HANDED = 'handed.json'
 const STEPS_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
+const WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json$/
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
+
+/**
+ * Record a `wake_in_note` carrying canonical room command(s) as awaiting full agent read
+ * before calling `report_pickup` or advancing the wake reader cursor (requirement 3ea2b201).
+ * Stored inside `<connectionId>.steps/` so the existing `postToolUse` glob wakes
+ * `stepDeliveryHook` automatically once the agent runs `cat ~/.devspec/notes/<noteId>.md`.
+ */
+export function registerPendingWakeNote(
+  connectionId,
+  {
+    noteId,
+    commands = [],
+    messages = [],
+    sessionId = null,
+    wakeFile = null,
+    wakePositionPath = null,
+    wakePositionVersion = 1,
+    wakeThrough = null,
+  },
+  { dir = connectionsDirFor() } = {},
+) {
+  if (!connectionId || !/^[0-9a-f]{16}$/.test(String(noteId ?? '')) || !Array.isArray(commands) || commands.length === 0) {
+    return null
+  }
+  const steps = stepsDir(connectionId, dir)
+  fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
+  const target = path.join(steps, `wake-note-${noteId}.json`)
+  const existing = readPrivateJson(target)
+  if (existing && existing.note === noteId) {
+    if (wakePositionPath && typeof wakeThrough === 'number' && wakeThrough > (existing.wake_through ?? 0)) {
+      writePrivateJson(target, {
+        ...existing,
+        wake_file: wakeFile ?? existing.wake_file ?? null,
+        wake_position_path: wakePositionPath,
+        wake_position_version: wakePositionVersion,
+        wake_through: wakeThrough,
+      })
+    }
+    return target
+  }
+  writePrivateJson(target, {
+    version: RECORD_VERSION,
+    note: noteId,
+    parts: [],
+    commands,
+    messages,
+    session_id: sessionId,
+    wake_file: wakeFile,
+    wake_position_path: wakePositionPath,
+    wake_position_version: wakePositionVersion,
+    wake_through: typeof wakeThrough === 'number' ? wakeThrough : null,
+    at: new Date().toISOString(),
+  })
+  return target
+}
+
+function pendingWakeNoteFiles(steps) {
+  try {
+    return fs
+      .readdirSync(steps)
+      .filter((name) => WAKE_NOTE.test(name))
+      .sort()
+      .map((name) => path.join(steps, name))
+  } catch {
+    return []
+  }
+}
 
 /**
  * One check job's lookup on DevSpec: the budget the plugin's other postToolUse hook that
@@ -668,6 +736,36 @@ export async function stepDeliveryHook(
     }
   }
 
+  // Also track any oversized `wake_in_note` command pointers handed over via wake-tail
+  // or one-shot wait: trigger `report_pickup` and advance the wake reader offset ONLY once
+  // the agent has actually read the sealed note whole (`readThrough`, req 3ea2b201).
+  const takenWakeNotes = pendingWakeNoteFiles(steps).map(take).filter(Boolean)
+  const completedWakeNotes = []
+  for (const each of takenWakeNotes) {
+    const entry = readPrivateJson(each.file)
+    if (!entry || typeof entry.note !== 'string' || !Array.isArray(entry.commands)) {
+      drop(each)
+      continue
+    }
+    if (entry.pickup_pending === true) {
+      completedWakeNotes.push({ taken: each, entry })
+      continue
+    }
+    const { record: next, done } = readThrough({ note: entry.note, parts: Array.isArray(entry.parts) ? entry.parts : [] }, input, { home })
+    if (done) {
+      completedWakeNotes.push({ taken: each, entry: { ...entry, parts: next.parts } })
+    } else if (next.parts.length !== (entry.parts?.length ?? 0)) {
+      try {
+        writePrivateJson(each.original, { ...entry, parts: next.parts })
+        drop(each)
+      } catch {
+        giveBack(each)
+      }
+    } else {
+      giveBack(each)
+    }
+  }
+
   // Everything newly waiting; a check job DevSpec has settled meanwhile is dropped.
   const taken = waitingFiles(steps).map(take).filter(Boolean)
   const fresh = []
@@ -681,29 +779,36 @@ export async function stepDeliveryHook(
   )
   const adding = checked.filter((each) => each.open)
 
-  // The agent just finished reading a step note holding room message(s) (or a previous
+  // The agent just finished reading a step note or wake_in_note holding room message(s) (or a previous
   // pickup refused and is retrying): combine all owner items into ONE single startCommands
   // call (no per-item loop, req c900f599). If report_pickup refuses, keep the record as
   // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
   // preserve/surface the full structured refusal details (req 4e32d1a5).
   let pickupRefusals = null
-  if (completedOwnerItems.length > 0) {
-    const combinedMessages = completedOwnerItems.flatMap((item) =>
-      Array.isArray(item.messages) && item.messages.length > 0
-        ? item.messages
-        : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
-    )
-    const combinedCommands = completedOwnerItems.flatMap((item) =>
-      Array.isArray(item.commands) && item.commands.length > 0
-        ? item.commands
-        : commandsHandedOver(
-            Array.isArray(item.messages) && item.messages.length > 0
-              ? item.messages
-              : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
-          ),
-    )
+  if (completedOwnerItems.length > 0 || completedWakeNotes.length > 0) {
+    const combinedMessages = [
+      ...completedOwnerItems.flatMap((item) =>
+        Array.isArray(item.messages) && item.messages.length > 0
+          ? item.messages
+          : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+      ),
+      ...completedWakeNotes.flatMap(({ entry }) => (Array.isArray(entry.messages) ? entry.messages : [])),
+    ]
+    const combinedCommands = [
+      ...completedOwnerItems.flatMap((item) =>
+        Array.isArray(item.commands) && item.commands.length > 0
+          ? item.commands
+          : commandsHandedOver(
+              Array.isArray(item.messages) && item.messages.length > 0
+                ? item.messages
+                : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+            ),
+      ),
+      ...completedWakeNotes.flatMap(({ entry }) => (Array.isArray(entry.commands) ? entry.commands : [])),
+    ]
     const firstSessionId =
       completedOwnerItems.find((item) => typeof item.session_id === 'string' && item.session_id)?.session_id ??
+      completedWakeNotes.find(({ entry }) => typeof entry.session_id === 'string' && entry.session_id)?.entry.session_id ??
       state.session_id ??
       null
     if (combinedCommands.length > 0) {
@@ -739,11 +844,46 @@ export async function stepDeliveryHook(
           }
           readChanged = true
         }
-      } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
-        process.stderr.write(
-          `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
-        )
+        for (const { taken: noteTaken, entry } of completedWakeNotes) {
+          try {
+            writePrivateJson(noteTaken.original, {
+              ...entry,
+              pickup_pending: true,
+              pickup_refusals: pickupRefusals,
+            })
+            drop(noteTaken)
+          } catch {
+            giveBack(noteTaken)
+          }
+        }
+      } else {
+        if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+          process.stderr.write(
+            `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
+          )
+        }
+        for (const { taken: noteTaken, entry } of completedWakeNotes) {
+          drop(noteTaken)
+          if (typeof entry.wake_position_path === 'string' && typeof entry.wake_through === 'number') {
+            try {
+              const cur = readPrivateJson(entry.wake_position_path)
+              const prevOffset = typeof cur?.offset === 'number' ? cur.offset : 0
+              if (entry.wake_through > prevOffset) {
+                writePrivateJson(entry.wake_position_path, {
+                  version: entry.wake_position_version ?? 1,
+                  file: entry.wake_file ?? cur?.file ?? null,
+                  offset: entry.wake_through,
+                  at: new Date().toISOString(),
+                })
+              }
+            } catch {
+              /* non-fatal: next wake read sees the file already picked up */
+            }
+          }
+        }
       }
+    } else {
+      for (const { taken: noteTaken } of completedWakeNotes) drop(noteTaken)
     }
   }
 
