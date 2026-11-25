@@ -794,13 +794,34 @@ export async function stepDeliveryHook(
     if (pickupRefusals) {
       const refusalNotice =
         `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
-      const fittedRefusal = fitHookContext(refusalNotice, {
-        share,
-        what: 'DevSpec room-command pickup refusal details',
-        home,
-      })
-      if (fittedRefusal) {
-        context = context && context.length + 2 + fittedRefusal.length <= share ? `${context}\n\n${fittedRefusal}` : (context ?? fittedRefusal)
+      if (!context) {
+        context = fitHookContext(refusalNotice, {
+          share,
+          what: 'DevSpec room-command pickup refusal details',
+          home,
+        })
+      } else {
+        const remainingShare = share - context.length - 2
+        const fittedInlineOrPointer =
+          remainingShare > 0
+            ? fitHookContext(refusalNotice, {
+                share: remainingShare,
+                what: 'DevSpec room-command pickup refusal details',
+                home,
+              })
+            : null
+        if (fittedInlineOrPointer && context.length + 2 + fittedInlineOrPointer.length <= share) {
+          context = `${context}\n\n${fittedInlineOrPointer}`
+        } else {
+          // Never drop the structured pickup refusal when a concurrent delivery note
+          // fills the hook share: combine both into one sealed note (req 4e32d1a5).
+          const combined = fitHookContext(`${context}\n\n${refusalNotice}`, {
+            share,
+            what: 'DevSpec pending delivery and room-command pickup refusal details',
+            home,
+          })
+          if (combined) context = combined
+        }
       }
     }
     if (needsListenerReminder) {

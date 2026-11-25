@@ -100,7 +100,13 @@ import {
   wakeFileConnectionId,
   wakeLines,
 } from './devspec-wake-file.mjs'
-import { fitsShellOutput, wakeInNote, wakesForOneOutput, writeNote } from './hook-context-budget.mjs'
+import {
+  fitShellDiagnostic,
+  fitsShellOutput,
+  shellDiagnosticReserve,
+  wakeInNote,
+  wakesForOneOutput,
+} from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { connectionsDirFor, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
@@ -509,33 +515,7 @@ function eventsOf(wake) {
  * cannot write just now stops the read before it: the wakes before it go out, and when
  * it is the first, the header alone says so, so it is tried again on the next read.
  */
-/** Fixed-shape stderr pointer emitted when pickup diagnostics would push stdout + stderr past Cursor's Shell ceiling. */
-function pickupDiagnosticPointer(command) {
-  return `devspec-wake-tail: pickup details saved whole — run \`${command}\` (and any further parts).\n`
-}
-
-/**
- * Exact ceiling reservation for `pickupDiagnosticPointer` (16-hex note id), derived
- * directly from the pointer format so `stdout + stderr` always fits `fitsShellOutput`
- * even when pickup emits a large refusal or nothing_open payload (reqs 3c5147a7 / 91d7b47c).
- */
-const PICKUP_DIAGNOSTIC_RESERVE = pickupDiagnosticPointer('cat ~/.devspec/notes/0000000000000000.md')
-
-function formatPickupDiagnosticForShell(pageText, diagnosticText, { home = os.homedir() } = {}) {
-  if (fitsShellOutput(pageText + diagnosticText)) {
-    return { text: diagnosticText, note: null }
-  }
-  try {
-    const note = writeNote(diagnosticText, { home })
-    const pointer = pickupDiagnosticPointer(note.command)
-    if (fitsShellOutput(pageText + pointer)) {
-      return { text: pointer, note }
-    }
-    return { text: '', note }
-  } catch {
-    return { text: '', note: null }
-  }
-}
+const PICKUP_DIAGNOSTIC_RESERVE = shellDiagnosticReserve('devspec-wake-tail')
 
 export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null, reserve = '' } = {}) {
   const kept = []
@@ -654,6 +634,7 @@ export async function readWakes({
       const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
       const extracted = extractRoomCommandsFromWake(printedSlice)
       if (extracted.commands.length > 0) {
+        const capturedDiag = []
         let pickupResult = null
         try {
           pickupResult = await startCommands({
@@ -664,6 +645,9 @@ export async function readWakes({
             dir,
             home,
             fromWakeTurn: true,
+            // Capture command-start stderr so ALL stderr for this Shell call passes
+            // once through the shared Shell output ceiling (`fitShellDiagnostic`).
+            log: (line) => capturedDiag.push(String(line ?? '')),
           })
         } catch (error) {
           pickupResult = {
@@ -672,19 +656,22 @@ export async function readWakes({
             refusals: [structuredRefusalFromError(error)],
           }
         }
+        let rawDiag = ''
         if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
           pickupRefusals = pickupResult.refusals
-          const rawDiag = `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
-          const fitted = formatPickupDiagnosticForShell(page.text, rawDiag, { home })
-          pickupDiagnosticNote = fitted.note
-          if (fitted.text) {
-            writeStderr(fitted.text)
-            pickupDiagnosticWritten = true
-          }
+          rawDiag =
+            `${capturedDiag.join('')}` +
+            `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
         } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
           pickupNothingOpen = pickupResult.nothingOpen
-          const rawDiag = `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`
-          const fitted = formatPickupDiagnosticForShell(page.text, rawDiag, { home })
+          rawDiag =
+            `${capturedDiag.join('')}` +
+            `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`
+        } else if (capturedDiag.length > 0) {
+          rawDiag = capturedDiag.join('')
+        }
+        if (rawDiag) {
+          const fitted = fitShellDiagnostic(page.text, rawDiag, { home, label: 'devspec-wake-tail' })
           pickupDiagnosticNote = fitted.note
           if (fitted.text) {
             writeStderr(fitted.text)

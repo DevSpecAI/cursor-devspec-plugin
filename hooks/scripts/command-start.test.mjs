@@ -15,9 +15,15 @@ import {
 } from './command-start.mjs'
 import { appendWakeEvents, REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
 import { readWakes } from './devspec-wake-tail.mjs'
-import { buildOwnerMessageEvents } from './devspec-remote-wait.mjs'
+import {
+  buildOwnerMessageEvents,
+  printedRoomCommands,
+  printOneShot,
+  runOneShotRoomCommandPickup,
+} from './devspec-remote-wait.mjs'
 import { fastConnect } from './fast-connect.mjs'
-import { readNoteText } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText, shellDiagnosticReserve } from './hook-context-budget.mjs'
+import { withWakeFollowLock } from './remote-control-state.mjs'
 import { readRequestState } from './requests.mjs'
 import {
   FIXTURE_ID,
@@ -77,8 +83,15 @@ function mkHome() {
   return { home, dir }
 }
 
-function ownerBatch(body = 'Please check the failing build') {
+function ownerBatch(body = 'Please check the failing build', { messageId = null, turnId = null } = {}) {
   const cmd = fixtureCommand(body)
+  if (messageId) {
+    cmd.message_id = messageId
+    cmd.order = { ...cmd.order, message_id: messageId }
+  }
+  if (turnId) {
+    cmd.delivery = { ...cmd.delivery, turn_id: turnId }
+  }
   const envelope = fixtureEnvelope({ commands: [cmd] })
   return {
     type: 'owner_messages',
@@ -701,5 +714,212 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     )
     assert.equal(attempts, 2)
     assert.equal(retryRaw, null)
+  })
+
+  it('stepDeliveryHook preserves structured pickup refusal alongside a concurrent delivery note even under a tight share (4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const batch1 = ownerBatch('First mid-turn room message')
+    holdForNextStep(CONN, batch1, buildOwnerMessageEvents(batch1), { dir })
+    const raw1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '' },
+      { home, dir, listenerActive: () => true },
+    )
+    const noteId = noteIdIn(JSON.parse(raw1).additional_context)
+    const parts = noteFiles(home, noteId)
+
+    // Queue a second concurrent delivery right before the agent finishes reading the first note.
+    const msg2 = '33333333-3333-4333-8333-333333333344'
+    const turn2 = '77777777-7777-4777-8777-777777777744'
+    const batch2 = ownerBatch('Concurrent second room message', { messageId: msg2, turnId: turn2 })
+    holdForNextStep(CONN, batch2, buildOwnerMessageEvents(batch2), { dir })
+
+    const startCommands = async () => ({
+      ok: false,
+      outcome: 'refused',
+      started: [],
+      pickedUp: 0,
+      refusals: [
+        {
+          command_message_id: MSG_ID,
+          command_turn_id: TURN_ID,
+          refusal: {
+            code: 'turn_busy',
+            retryable: true,
+            blocking_turn_id: '88888888-8888-4888-8888-888888888888',
+            detail: 'x'.repeat(600),
+          },
+        },
+      ],
+    })
+
+    // Tight share big enough for a note pointer (~350 chars) but NOT both pointers inline.
+    const tightShare = 420
+    let refusalRaw = null
+    for (const part of parts) {
+      refusalRaw = await stepDeliveryHook(catCall(home, part, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        share: tightShare,
+        startCommands,
+        listenerActive: () => true,
+      })
+    }
+    assert.ok(refusalRaw)
+    const ctx = JSON.parse(refusalRaw).additional_context
+    assert.ok(ctx.length <= tightShare, `additional_context (${ctx.length}) must stay within share (${tightShare})`)
+    const combinedNoteId = noteIdIn(ctx)
+    assert.ok(combinedNoteId, 'combined delivery + refusal must point to a sealed note')
+    const saved = readNoteText(combinedNoteId, { home })
+    assert.match(saved, /turn_busy/)
+    assert.match(saved, /88888888-8888-4888-8888-888888888888/)
+    assert.match(saved, /notes\/[0-9a-f]{16}\.md/, 'concurrent delivery note pointer must also be preserved')
+  })
+
+  it('readWakes captures startRoomCommands internal logs so near-limit stdout + stderr never crosses fitsShellOutput (3c5147a7 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    for (let i = 0; i < 6; i += 1) {
+      const mId = `33333333-3333-4333-8333-33333333335${i}`
+      const tId = `77777777-7777-4777-8777-77777777775${i}`
+      const b = ownerBatch(`near-limit-${i} ${'z'.repeat(450)}`, { messageId: mId, turnId: tId })
+      appendWakeEvents(wakeFile, buildOwnerMessageEvents(b))
+    }
+    const bigRefusal = {
+      ok: false,
+      code: 'pickup_conflict',
+      retryable: true,
+      error: 'refused with large payload',
+      detail: 'd'.repeat(6000),
+    }
+    let stdout = ''
+    let stderr = ''
+    let leakedRawStderr = ''
+    const origWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk) => {
+      leakedRawStderr += String(chunk)
+      return true
+    }
+    let result
+    try {
+      result = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 10,
+        write: async (text) => { stdout += text },
+        writeStderr: (text) => { stderr += text },
+        // Deliberately do NOT override opts.log so readWakes's own capture is exercised!
+        startCommands: (opts) =>
+          startRoomCommands({
+            ...opts,
+            call: async () => bigRefusal,
+            seedFn: async () => {},
+            ensureWatch: () => ({ started: false }),
+          }),
+      })
+    } finally {
+      process.stderr.write = origWrite
+    }
+    assert.equal(leakedRawStderr, '', 'command-start must not bypass readWakes by writing raw stderr directly')
+    assert.equal(result.marked, false)
+    assert.ok(fitsShellOutput(stdout + stderr), `combined stdout+stderr (${(stdout + stderr).length}) must fit fitsShellOutput`)
+    assert.ok(result.pickup_diagnostic_note?.id)
+    const saved = readNoteText(result.pickup_diagnostic_note.id, { home })
+    assert.match(saved, /pickup_conflict/)
+    assert.match(saved, /d{100}/)
+  })
+
+  it('one-shot printOneShot + runOneShotRoomCommandPickup only picks up printed wakes and bounds refusal stderr (3ea2b201 / 3c5147a7 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const msg1 = '33333333-3333-4333-8333-333333333361'
+    const turn1 = '77777777-7777-4777-8777-777777777761'
+    const msg2 = '33333333-3333-4333-8333-333333333362'
+    const turn2 = '77777777-7777-4777-8777-777777777762'
+    const wake1 = buildOwnerMessageEvents(ownerBatch('Printed wake ' + 'a'.repeat(400), { messageId: msg1, turnId: turn1 }))
+    // Add padding events so wake1 + wake2 exceed 20,000 chars and split into two pages.
+    const padWake = [
+      ...wake1,
+      { type: 'context', body: 'p'.repeat(12_000) },
+    ]
+    const wake2 = [
+      ...buildOwnerMessageEvents(ownerBatch('Remainder wake ' + 'b'.repeat(400), { messageId: msg2, turnId: turn2 })),
+      { type: 'context', body: 'q'.repeat(12_000) },
+    ]
+    let stdout = ''
+    const shot = await printOneShot([padWake, wake2], {
+      reserve: shellDiagnosticReserve('devspec-remote-wait'),
+      home,
+      write: async (text) => { stdout += text },
+    })
+    assert.equal(shot.count, 1, 'second wake must remain in the unprinted remainder')
+    const extracted = printedRoomCommands(shot.printedWakes, ROOM)
+    assert.deepEqual(
+      extracted.commands.map((c) => c.messageId),
+      [msg1],
+      'must select only the printed command, never the unprinted remainder',
+    )
+
+    const pickedUpArgs = []
+    let stderr = ''
+    const pickup = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: shot.printedWakes,
+      printedStdout: shot.text,
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: (text) => { stderr += text },
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async (req) => {
+            pickedUpArgs.push(req.arguments)
+            return {
+              ok: false,
+              code: 'one_shot_refused',
+              retryable: true,
+              error: 'refused',
+              detail: 'r'.repeat(9000),
+            }
+          },
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.equal(pickup.ok, false, 'pickup refusal must fail so one-shot wait leaves offset untouched and exits non-zero')
+    assert.equal(pickedUpArgs.length, 1)
+    assert.equal(pickedUpArgs[0].command_message_id, msg1)
+    assert.ok(fitsShellOutput(stdout + stderr), `one-shot stdout+stderr (${(stdout + stderr).length}) must fit fitsShellOutput`)
+    assert.ok(pickup.diagnosticNote?.id)
+    const saved = readNoteText(pickup.diagnosticNote.id, { home })
+    assert.match(saved, /one_shot_refused/)
+    assert.match(saved, /r{100}/)
+  })
+
+  it('withWakeFollowLock chains past a dead reclaim guard without unlinking live guards (2df26cd2)', () => {
+    const { dir } = mkHome()
+    const lockFile = path.join(dir, `${CONN}.follow.lock`)
+    const deadToken = 'aaaa1111aaaa1111'
+    const deadGuardToken = 'bbbb2222bbbb2222'
+    const deadGuardFile = `${lockFile}.reclaim.${deadToken}`
+    fs.writeFileSync(lockFile, `${JSON.stringify({ pid: 999999999, token: deadToken })}\n`, { mode: 0o600 })
+    fs.writeFileSync(deadGuardFile, `${JSON.stringify({ pid: 999999998, token: deadGuardToken })}\n`, { mode: 0o600 })
+
+    let ran = false
+    const res = withWakeFollowLock(
+      CONN,
+      fs,
+      () => {
+        ran = true
+        // Dead predecessor guard is cleaned up after stale lock unlink.
+        assert.equal(fs.existsSync(deadGuardFile), false)
+        return { ok: true }
+      },
+      { dir },
+    )
+    assert.equal(ran, true)
+    assert.equal(res.ok, true)
+    assert.equal(fs.existsSync(lockFile), false)
   })
 })

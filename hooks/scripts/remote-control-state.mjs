@@ -692,53 +692,97 @@ function sameLockIdentity(a, b) {
 }
 
 /**
+ * Bounded chain length when stepping past crashed reclaimers' dead guard files.
+ * Sixteen hops comfortably outlasts repeated crashes without scanning unbounded
+ * files on disk (requirements 3c5147a7 / 91d7b47c).
+ */
+const WAKE_FOLLOW_RECLAIM_MAX_HOPS = 16
+
+/**
  * Reclaim a stale lock file without racing another caller that already replaced it
- * with a live lock (decision 2df26cd2). Takes an exclusive guard keyed to the exact
- * stale lock's token/inode, re-verifies the lock file still has that identical
- * identity, and only then unlinks it.
+ * with a live lock (decision 2df26cd2).
+ *
+ * Uses an immutable reclaim chain (`<lock>.reclaim.<token>`) keyed first to the exact
+ * stale lock's token/inode and, if a prior reclaimer died mid-reclaim, chained onto
+ * that dead guard's own unique token instead of unlinking the dead guard in place.
+ * Because no caller ever unlinks a live or dead guard while acquiring the chain,
+ * two callers can never race to remove a replacement guard; at most one live reclaimer
+ * reaches `unlinkSync(lockFile)`, and dead predecessor guards are cleaned up only
+ * after the stale lock is gone.
  */
 function tryReclaimStaleWakeFollowLock(lockFile, staleInfo) {
-  const key = staleInfo.token || `ino-${staleInfo.ino}-${Math.trunc(staleInfo.mtimeMs)}`
-  const reclaimFile = `${lockFile}.reclaim.${key}`
-  const reclaimTemp = `${reclaimFile}.${process.pid}-${crypto.randomBytes(4).toString('hex')}`
-  let claimedReclaim = false
+  const myGuardToken = crypto.randomBytes(8).toString('hex')
+  const reclaimTemp = `${lockFile}.reclaim.tmp.${process.pid}-${myGuardToken}`
+  let claimedFile = null
+  const deadPredecessors = []
   try {
-    fs.writeFileSync(reclaimTemp, JSON.stringify({ pid: process.pid }), { mode: 0o600 })
-    try {
-      fs.linkSync(reclaimTemp, reclaimFile)
-      claimedReclaim = true
-    } catch (error) {
-      if (error?.code !== 'EEXIST') return false
-      // If a prior reclaimer crashed mid-reclaim, only clear the guard when its PID is dead.
-      const guard = readWakeFollowLockInfo(reclaimFile)
-      if (guard && Number.isInteger(guard.pid) && guard.pid > 1 && !ownerAlive(guard.pid)) {
-        try {
-          fs.unlinkSync(reclaimFile)
-        } catch {
-          /* another caller cleared it */
+    fs.writeFileSync(reclaimTemp, `${JSON.stringify({ pid: process.pid, token: myGuardToken })}\n`, { mode: 0o600 })
+    let currKey = staleInfo.token || `ino-${staleInfo.ino}-${Math.trunc(staleInfo.mtimeMs)}`
+    const visitedKeys = new Set()
+    for (let hop = 0; hop < WAKE_FOLLOW_RECLAIM_MAX_HOPS; hop += 1) {
+      if (visitedKeys.has(currKey)) return false
+      visitedKeys.add(currKey)
+      const reclaimFile = `${lockFile}.reclaim.${currKey}`
+      try {
+        fs.linkSync(reclaimTemp, reclaimFile)
+        claimedFile = reclaimFile
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') return false
+        const guard = readWakeFollowLockInfo(reclaimFile)
+        if (!guard) return false
+        const liveGuard = Number.isInteger(guard.pid) && guard.pid > 1 && ownerAlive(guard.pid)
+        if (liveGuard) return false
+        if (!guard.token) {
+          // A guard created without a token (or mid-write) must not be stepped past
+          // until the empty-lock grace window expires.
+          const expired =
+            typeof guard.mtimeMs === 'number' &&
+            Date.now() - guard.mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
+          if (!expired) return false
+          const fallbackKey = `ino-${guard.ino}-${Math.trunc(guard.mtimeMs)}`
+          deadPredecessors.push({ file: reclaimFile, info: guard })
+          currKey = fallbackKey
+          continue
         }
+        deadPredecessors.push({ file: reclaimFile, info: guard })
+        currKey = guard.token
       }
-      return false
     }
+    if (!claimedFile) return false
     const current = readWakeFollowLockInfo(lockFile)
     if (!sameLockIdentity(staleInfo, current)) return false
     try {
       fs.unlinkSync(lockFile)
-      return true
     } catch {
       return false
     }
+    // Stale lock is now gone; clean up dead predecessor guards whose identity still matches.
+    for (const pred of deadPredecessors) {
+      const still = readWakeFollowLockInfo(pred.file)
+      if (sameLockIdentity(pred.info, still)) {
+        try {
+          fs.unlinkSync(pred.file)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return true
   } finally {
     try {
       fs.unlinkSync(reclaimTemp)
     } catch {
       /* ignore */
     }
-    if (claimedReclaim) {
-      try {
-        fs.unlinkSync(reclaimFile)
-      } catch {
-        /* ignore */
+    if (claimedFile) {
+      const stillMine = readWakeFollowLockInfo(claimedFile)
+      if (stillMine?.token === myGuardToken) {
+        try {
+          fs.unlinkSync(claimedFile)
+        } catch {
+          /* ignore */
+        }
       }
     }
   }

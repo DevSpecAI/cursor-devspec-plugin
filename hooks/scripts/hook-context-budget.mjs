@@ -802,29 +802,85 @@ export function postToolUseOutput(context, extra = {}) {
  * first) and the one-shot wait, each of whose output is one Shell result
  * (devspec-remote-wait.mjs). Of `wakes` (whole wakes
  * waiting, oldest first, each as `wakeLines` wrote it), as many as fit Cursor's rules
- * on one output together (`fitsShellOutput`), never part of one. When some are left and
- * `waiting(left)` is given, the line it returns goes after them, and room is kept for
- * it; it is left out only when the first wake alone leaves no room for it. The first
- * wake always goes, so a single wake over the rules on its own is printed as it always
- * was.
+ * on one output together (`fitsShellOutput`), never part of one. Optional `reserve`
+ * keeps room for stderr diagnostics emitted in the same Shell invocation so combined
+ * `stdout + stderr` stays inside Cursor's Shell ceiling (requirements 3c5147a7 / 91d7b47c).
+ * When some are left and `waiting(left)` is given, the line it returns goes after them,
+ * and room is kept for it; it is left out only when the first wake alone leaves no room
+ * for it. The first wake always goes, so a single wake over the rules on its own is
+ * printed as it always was.
  * @param {string[]} wakes
- * @param {{ waiting?: (left: number) => string }} [opts]
+ * @param {{ waiting?: (left: number) => string, reserve?: string }} [opts]
  * @returns {{ count: number, text: string }}
  */
-export function wakesForOneOutput(wakes, { waiting = null } = {}) {
+export function wakesForOneOutput(wakes, { waiting = null, reserve = '' } = {}) {
+  const pad = typeof reserve === 'string' ? reserve : ''
   let count = 0
   let text = ''
   for (const wake of wakes) {
-    if (count > 0 && !fitsShellOutput(text + wake)) break
+    if (count > 0 && !fitsShellOutput(pad + text + wake)) break
     text += wake
     count += 1
   }
   if (count === wakes.length || typeof waiting !== 'function') return { count, text }
   // Some are left: make room for the line that says so, giving back wakes (never the first).
-  while (count > 1 && !fitsShellOutput(wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
+  while (count > 1 && !fitsShellOutput(pad + wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
   const taken = wakes.slice(0, count).join('')
   const line = waiting(wakes.length - count)
-  return { count, text: fitsShellOutput(taken + line) ? taken + line : taken }
+  return { count, text: fitsShellOutput(pad + taken + line) ? taken + line : taken }
+}
+
+/** Fixed-shape stderr pointer emitted when a Shell diagnostic would push stdout + stderr past Cursor's Shell ceiling. */
+export function shellDiagnosticPointer(label, command) {
+  return `${label}: full details saved whole — run \`${command}\` (and any further parts).\n`
+}
+
+/**
+ * Exact ceiling reservation for `shellDiagnosticPointer` (16-hex note id), derived
+ * directly from the pointer format so `stdout + stderr` always fits `fitsShellOutput`
+ * at the shared Shell boundary (requirements 3c5147a7 / 91d7b47c).
+ */
+export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
+  return shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
+}
+
+/**
+ * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`, stdout + stderr)
+ * at one shared boundary for stderr diagnostics (requirements 3c5147a7 / 91d7b47c).
+ * Returns the diagnostic verbatim when `stdoutText + diagnosticText` fits; otherwise
+ * saves the full diagnostic whole in a sealed note (`writeNote`) and returns the
+ * fixed-shape pointer. If the note cannot be written (disk error), emits a visibly
+ * marked shortened notice with the write error rather than letting Cursor truncate silently.
+ */
+export function fitShellDiagnostic(
+  stdoutText,
+  diagnosticText,
+  { home = os.homedir(), label = 'devspec-wake-tail' } = {},
+) {
+  const stdout = String(stdoutText ?? '')
+  const diag = String(diagnosticText ?? '')
+  if (!diag) return { text: '', note: null }
+  if (fitsShellOutput(stdout + diag)) {
+    return { text: diag, note: null }
+  }
+  let noteError = null
+  try {
+    const note = writeNote(diag, { home })
+    const pointer = shellDiagnosticPointer(label, note.command)
+    if (fitsShellOutput(stdout + pointer)) {
+      return { text: pointer, note }
+    }
+    return { text: '', note, overflow: true }
+  } catch (error) {
+    noteError = error
+  }
+  const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
+  const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).\n`
+  if (fitsShellOutput(stdout + short)) {
+    return { text: short, note: null, noteError }
+  }
+  const bare = `${label}: diagnostic omitted (note write failed).\n`
+  return { text: fitsShellOutput(stdout + bare) ? bare : '', note: null, noteError }
 }
 
 /** What a wake kept whole in a note says about itself: one fixed sentence. */

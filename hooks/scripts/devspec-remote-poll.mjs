@@ -161,7 +161,12 @@ import {
   ensureWakeFile,
 } from './devspec-wake-file.mjs'
 import { ensureWakeFollowForConnection } from './remote-control-state.mjs'
-import { clearWakeListenerNeeded, isWakeListenerActive, markWakeListenerNeeded } from './command-start.mjs'
+import {
+  clearWakeListenerNeeded,
+  isWakeListenerActive,
+  markWakeListenerNeeded,
+  structuredRefusalFromError,
+} from './command-start.mjs'
 import { commandsAnsweredNow, finishTurnRequests, openRequest, readRequestState } from './requests.mjs'
 import { attachmentFromPoll, localTurnToComplete } from './local-turn.mjs'
 import {
@@ -390,7 +395,7 @@ function ensureHostWakeFollow(connectionId, ownerPid, opts = {}) {
       ...(opts.fromEnd === true ? { fromEnd: true } : {}),
     })
     if (!follow.ok) {
-      process.stderr.write(`devspec-remote-poll: host wake follow not armed: ${follow.error}\n`)
+      process.stderr.write(`devspec-remote-poll: host wake follow not armed: ${JSON.stringify(follow)}\n`)
     } else if (follow.reused) {
       process.stderr.write(
         `devspec-remote-poll: host wake follow reused pid=${follow.pid} connection=${connectionId}\n`,
@@ -399,7 +404,7 @@ function ensureHostWakeFollow(connectionId, ownerPid, opts = {}) {
     return wakeFile
   } catch (e) {
     process.stderr.write(
-      `devspec-remote-poll: host wake follow failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      `devspec-remote-poll: host wake follow failed: ${JSON.stringify(structuredRefusalFromError(e))}\n`,
     )
     return null
   }
