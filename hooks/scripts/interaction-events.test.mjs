@@ -753,9 +753,13 @@ describe('poller round trip', () => {
 
 describe('Cursor directed-question policy surfaces', () => {
   it('teaches asking and the reply that closes the turn', () => {
-    const skill = source('skills/devspec-remote/SKILL.md')
-    assert.match(skill, /manage-question/)
-    assert.match(skill, /question_answer/)
+    const core = source('skills/devspec-remote/SKILL.md')
+    const interactions = source('skills/devspec-remote/interactions.md')
+    assert.match(core, /interactions\.md/)
+    assert.match(core, /manage-question/)
+    assert.match(core, /question_answer/)
+    assert.match(interactions, /manage-question/)
+    assert.match(interactions, /question_answer/)
   })
 })
 
@@ -792,6 +796,7 @@ describe('Cursor dismissal boundaries', () => {
     const { REMOTE_WAKE_NOTIFY_PATTERN } = await import('./devspec-wake-file.mjs')
     assert.match('question_dismissal', new RegExp(REMOTE_WAKE_NOTIFY_PATTERN))
     assert.match(source('skills/devspec-remote/SKILL.md'), /question_dismissal/)
+    assert.match(source('skills/devspec-remote/interactions.md'), /question_dismissal/)
     assert.match(source('hooks/scripts/devspec-remote-wait.mjs'), /appendWakeEvents\(args.wakeFile, events\)[^]*dismissalWakeDeliveryContinuation\(held, batch, fs.statSync\(args.wakeFile\).size\)/)
   })
 })

@@ -2,8 +2,14 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { describe, it } from 'node:test'
 
+const remoteSkillDir = new URL('../skills/devspec-remote/', import.meta.url)
+const remoteSkillFiles = fs.readdirSync(remoteSkillDir)
+  .filter((name) => name.endsWith('.md'))
+  .sort((a, b) => (a === 'SKILL.md' ? -1 : b === 'SKILL.md' ? 1 : a.localeCompare(b)))
+  .map((name) => `skills/devspec-remote/${name}`)
+
 const operationalFiles = [
-  'skills/devspec-remote/SKILL.md',
+  ...remoteSkillFiles,
   'hooks/scripts/devspec-remote-poll.mjs',
   'hooks/scripts/devspec-remote-wait.mjs',
   'hooks/scripts/resolve-mcp-auth.mjs',
@@ -16,7 +22,8 @@ const contents = new Map(
   ]),
 )
 
-const primers = ['skills/devspec-remote/SKILL.md']
+const remoteSkillBundle = remoteSkillFiles.map((file) => contents.get(file)).join('\n\n')
+const primers = [{ name: 'skills/devspec-remote (core + parts)', content: remoteSkillBundle }]
 
 function assertInOrder(content, first, second, file) {
   const firstIndex = content.indexOf(first)
@@ -65,8 +72,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
   })
 
   it('points primers to served contracts and teaches reserve then claim', () => {
-    for (const file of primers) {
-      const content = contents.get(file)
+    for (const { name: file, content } of primers) {
       assert.match(content, /devspec:\/\/product\/remote-ingress-contract/, file)
       assert.match(content, /devspec:\/\/product\/implementation-contract/, file)
       assertInOrder(content, 'reserve_work_items', 'claim_work_item', file)
@@ -75,8 +81,10 @@ describe('current Cursor authority and work-acquisition prose', () => {
   })
 
   it('keeps canonical authority, controls, and automations distinct', () => {
-    for (const file of primers) {
-      const content = contents.get(file)
+    for (const { name: file, content } of [
+      ...primers,
+      { name: 'skills/devspec-remote/SKILL.md', content: contents.get('skills/devspec-remote/SKILL.md') },
+    ]) {
       assert.match(content, /(?:exactly addressed|exact-target)/i, file)
       assert.match(content, /owner[\s\S]{0,80}delegated/i, file)
       assert.match(content, /immutable[\s\S]{0,80}requester[^\n]*provenance/i, file)
@@ -91,10 +99,16 @@ describe('current Cursor authority and work-acquisition prose', () => {
   // Prose guard for item 5f8fe76a; the behaviour is tested in
   // hooks/scripts/notice-reply.test.mjs, which runs the hooks themselves.
   it('teaches a notice reply by pointing at the served rules, never as a command answer', () => {
-    for (const file of ['skills/devspec-remote/SKILL.md', 'rules/devspec.mdc']) {
-      const content = fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+    const surfaces = [
+      { name: 'skills/devspec-remote (core + parts)', content: remoteSkillBundle },
+      { name: 'rules/devspec.mdc', content: fs.readFileSync(new URL('../rules/devspec.mdc', import.meta.url), 'utf8') },
+    ]
+    for (const { name: file, content } of surfaces) {
       assert.match(content, /semantics\.notice_reply/, file)
       assert.match(content, /system_notice_ids/, file)
+    }
+    for (const file of [...remoteSkillFiles, 'rules/devspec.mdc']) {
+      const content = contents.get(file) ?? fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
       for (const sentence of content.split(/(?<=[.!?|])\s+/).filter((text) => /notice/i.test(text))) {
         assert.doesNotMatch(sentence, /complete_turn:\s*true/, `${file} pairs a notice with complete_turn: ${sentence.slice(0, 160)}`)
       }
@@ -105,11 +119,17 @@ describe('current Cursor authority and work-acquisition prose', () => {
   // a notice is talked about in the room, and ruling a check job is never talked
   // about there. The text points at the served rules rather than restating them.
   it('points at notice_audience and check_job.room, and never asks for a post about ruling checks', () => {
-    for (const file of ['skills/devspec-remote/SKILL.md', 'rules/devspec.mdc']) {
-      const content = fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+    const surfaces = [
+      { name: 'skills/devspec-remote (core + parts)', content: remoteSkillBundle },
+      { name: 'rules/devspec.mdc', content: fs.readFileSync(new URL('../rules/devspec.mdc', import.meta.url), 'utf8') },
+    ]
+    for (const { name: file, content } of surfaces) {
       assert.match(content, /semantics\.notice_audience/, file)
       assert.match(content, /check_job\.room/, file)
       assert.match(content, /tell_person/, file)
+    }
+    for (const file of [...remoteSkillFiles, 'rules/devspec.mdc']) {
+      const content = contents.get(file) ?? fs.readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
       assert.doesNotMatch(content, /post what happened/i, file)
       // Whose duplicate it is, and who is told, are core.resolve-duplicates-on-the-spot's:
       // a restatement here contradicted the server the moment that rule changed.
@@ -123,8 +143,7 @@ describe('current Cursor authority and work-acquisition prose', () => {
   })
 
   it('keeps interaction policy item-scoped on every work surface', () => {
-    for (const file of ['skills/devspec-remote/SKILL.md']) {
-      const content = contents.get(file)
+    for (const { name: file, content } of primers) {
       assert.match(content, /multiple items do not change (?:that )?interaction policy/i, file)
       assert.match(content, /each claimed item[^\n]*served[^\n]*implementation(?:-| )contract/i, file)
       assert.match(content, /item(?:’s|'s)? intent[^\n]*(?:acceptance )?criteria/i, file)
