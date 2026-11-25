@@ -1473,6 +1473,13 @@ describe('fast-connect CLI flags', () => {
               ),
             (err) => {
               assert.equal(err.code, 'shell_output_limit_exceeded')
+              assert.doesNotMatch(
+                err.message,
+                /omitted_note_ids|stderr_diagnostics_omitted\.notes/,
+                'thrown refusal must not direct reader to unprinted JSON fields',
+              )
+              assert.match(err.message, /300 saved stderr diagnostic note\(s\)/)
+              assert.match(err.message, /temporary directory/)
               return true
             },
           )

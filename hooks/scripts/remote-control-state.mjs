@@ -2124,6 +2124,21 @@ function buildConnectNoteFailureFallback(
     { tmpDir, manifestCache },
   )
   if (compactFallbackFit.fitted) return compactFallbackFit.text
+  const totalSavedStderrNotes = Array.isArray(base.stderr_diagnostics_omitted?.notes)
+    ? base.stderr_diagnostics_omitted.notes.length
+    : 0
+  const manifestForThrow = manifestCache.value
+  const stderrThrowHint =
+    totalSavedStderrNotes === 0
+      ? ''
+      : manifestForThrow?.command
+        ? ` Run \`${manifestForThrow.command}\`${manifestForThrow.parts > 1 ? ` (and every further part it names — ${manifestForThrow.parts} parts total)` : ''} to read all ${totalSavedStderrNotes} saved stderr diagnostic note(s) from this connect attempt.`
+        : ` Could not emit the receipt or write a paged manifest for the ${totalSavedStderrNotes} saved stderr diagnostic note(s) because both ~/.devspec/notes and the temporary directory are unwritable; fix write permissions on ~/.devspec/notes or your temporary directory and re-run connect.`
+  const throwRecovery =
+    (allCandidates
+      ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
+      : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.') +
+    stderrThrowHint
   throw shellBudgetExceededError({
     field: 'reserve',
     reserveLength: String(reserve ?? '').length,
@@ -2133,7 +2148,7 @@ function buildConnectNoteFailureFallback(
     fullTextLength,
     noteFailed: true,
     candidateCount: allCandidates ? allCandidates.length : null,
-    recovery: buildFallbackObj(compactFallbackFit.stderrOmitted).recovery,
+    recovery: throwRecovery,
   })
 }
 
