@@ -1485,5 +1485,152 @@ describe('typed-turn-sync (item da03801e)', () => {
       HOOK_TYPED,
       'monitor wake after idle cleanup must still resolve to the launching request',
     )
+
+    // Event 1 from the recorded monitor restores HOOK_TYPED (and promptArrival marks mon-1 notified),
+    // then Event 1 finishes and idle cleanup runs: HOOK_TYPED MUST STILL STAY OPEN so Event 2 from
+    // the same monitor also resolves to HOOK_TYPED (decision ce71a72b).
+    const monEvent1 = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<task-notification><task-id>mon-1</task-id><event>disk usage 95%</event></task-notification>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Start monitor')}\n${turnEndedRow('success')}\n${monEvent1}\n`)
+    const wake1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake1.action, 'restored_wake_request')
+    assert.equal(wake1.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).launches.get('mon-1')?.notified, true)
+
+    // Event 1 turn ends -> idle cleanup runs.
+    fs.writeFileSync(
+      transcriptPath,
+      `${typedRow('Start monitor')}\n${turnEndedRow('success')}\n${monEvent1}\n${turnEndedRow('success')}\n`,
+    )
+    const idleAfterEvent1 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        closeCalled = true
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+    assert.equal(closeCalled, false, 'finishIdleRequests must NOT close the request after a monitor fires its first event')
+    assert.deepEqual(idleAfterEvent1.closed, [])
+    assert.equal(readRequestState(CONN, { dir }).open.has(HOOK_TYPED), true)
+
+    // Event 2 from the same recorded monitor MUST still resolve to HOOK_TYPED!
+    const monEvent2 = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<task-notification><task-id>mon-1</task-id><event>disk usage 98%</event></task-notification>' }] },
+    })
+    fs.writeFileSync(
+      transcriptPath,
+      `${typedRow('Start monitor')}\n${turnEndedRow('success')}\n${monEvent1}\n${turnEndedRow('success')}\n${monEvent2}\n`,
+    )
+    const wake2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake2.action, 'restored_wake_request')
+    assert.equal(wake2.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+  })
+
+  it('retries an earlier refused typed turn even after a second typed turn succeeds, and only marks synced once both complete (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending, deterministicTypedTurnRequestId } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const row1 = typedRow('First typed turn that hits a retryable refusal')
+    const row2 = typedRow('Second typed turn that succeeds immediately')
+    fs.writeFileSync(transcriptPath, `${row1}\n`)
+    const key1 = activeTranscriptTurn(transcriptPath, { attempts: 1 }).key
+    const req1Id = deterministicTypedTurnRequestId(CONN, key1)
+    const memo = { stamp: null, synced: false }
+    const openedIds = []
+    let failReq1Count = 2
+
+    // Tick 1: Turn 1 fails with a retryable refusal -> stays queued, memo.synced stays false.
+    const t1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.request_id === req1Id && failReq1Count > 0) {
+          failReq1Count -= 1
+          return { ok: false, error: 'temporary outage', retryable: true }
+        }
+        openedIds.push(args.request_id)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(t1.action, 'cleared_stale')
+    assert.equal(memo.synced, false)
+
+    // Tick 2: Turn 2 arrives and succeeds, while retrying Turn 1 STILL hits its second refusal.
+    // Turn 2 must become foreground current, Turn 1 must be retried, AND memo.synced MUST STAY FALSE!
+    fs.writeFileSync(transcriptPath, `${row1}\n${row2}\n`)
+    const key2 = activeTranscriptTurn(transcriptPath, { attempts: 1 }).key
+    const req2Id = deterministicTypedTurnRequestId(CONN, key2)
+    const t2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.request_id === req1Id && failReq1Count > 0) {
+          failReq1Count -= 1
+          return { ok: false, error: 'still temporary outage', retryable: true }
+        }
+        openedIds.push(args.request_id)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(t2.action, 'opened')
+    assert.equal(t2.requestId, req2Id)
+    assert.equal(t2.retriedFailedTurn?.action, 'cleared_stale', 'must actually attempt to retry Turn 1')
+    assert.equal(t2.retriedFailedTurn?.key, key1)
+    assert.equal(memo.synced, false, 'must NOT mark transcript synced while Turn 1 is still failed')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+    assert.equal(readRequestState(CONN, { dir }).current, req2Id, 'Turn 2 stays foreground current')
+
+    // Tick 3 (same unchanged transcript file): poller retries Turn 1, DevSpec accepts it,
+    // foreground current stays Turn 2, Turn 1 is open + started + bound, and memo.synced turns true.
+    const t3 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        openedIds.push(args.request_id)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(t3.action, 'opened')
+    assert.equal(t3.requestId, req1Id)
+    assert.equal(t3.key, key1)
+    assert.equal(memo.synced, true, 'memo.synced turns true once BOTH Turn 1 and Turn 2 succeed')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+    assert.deepEqual(openedIds, [req2Id, req1Id])
+    const finalState = readRequestState(CONN, { dir })
+    assert.equal(finalState.current, req2Id, 'retrying Turn 1 must preserve Turn 2 as foreground current')
+    assert.equal(finalState.open.has(req1Id), true)
+    assert.equal(finalState.started.has(req1Id), true)
+    assert.equal(finalState.seenTranscriptTurns.get(key1), req1Id)
+    assert.equal(finalState.seenTranscriptTurns.get(key2), req2Id)
   })
 })

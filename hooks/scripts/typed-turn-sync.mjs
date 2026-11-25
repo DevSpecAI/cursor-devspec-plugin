@@ -254,10 +254,11 @@ export function refusalFromResponse(res) {
  */
 const pendingLocalOpens = new Map()
 /**
- * Tracks the latest typed turn key whose registration failed/was refused per
- * `<resolvedDir>|<connectionId>`, so if the turn ends before a retry succeeds, the
- * poller retries registration rather than marking the ended transcript synced without
- * completing the refused work (requirement 3ea2b201).
+ * Tracks all typed turn keys whose registration failed/was refused per
+ * `<resolvedDir>|<connectionId>` in FIFO order, so neither turn_ended nor a
+ * subsequent successful typed turn ever drops an earlier failed turn or marks
+ * the transcript synced before every failed turn has been retried and completed
+ * (requirement 3ea2b201).
  */
 const failedTypedTurnKeys = new Map()
 
@@ -267,6 +268,50 @@ function pendingOpenKey(dir, connectionId, turnKey) {
 
 function failedTurnKey(dir, connectionId) {
   return `${path.resolve(dir)}|${connectionId}`
+}
+
+function recordFailedTypedTurn(dir, connectionId, turnKey) {
+  if (!turnKey) return
+  const fKey = failedTurnKey(dir, connectionId)
+  let set = failedTypedTurnKeys.get(fKey)
+  if (!set) {
+    set = new Set()
+    failedTypedTurnKeys.set(fKey, set)
+  }
+  set.add(turnKey)
+}
+
+function clearFailedTypedTurn(dir, connectionId, turnKey) {
+  const fKey = failedTurnKey(dir, connectionId)
+  const set = failedTypedTurnKeys.get(fKey)
+  if (!set) return
+  set.delete(turnKey)
+  if (set.size === 0) failedTypedTurnKeys.delete(fKey)
+}
+
+function hasPendingFailedTypedTurns(dir, connectionId) {
+  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
+  return Boolean(set && set.size > 0)
+}
+
+function nextQueuedFailedTypedTurn(dir, connectionId, excludeKey = null) {
+  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
+  if (!set || set.size === 0) return null
+  for (const key of set) {
+    if (key !== excludeKey) return key
+  }
+  return null
+}
+
+function isFailedTurnDeterministicId(dir, connectionId, requestId, excludeKey) {
+  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
+  if (!set || set.size === 0) return false
+  for (const key of set) {
+    if (key !== excludeKey && deterministicTypedTurnRequestId(connectionId, key) === requestId) {
+      return true
+    }
+  }
+  return false
 }
 
 function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
@@ -351,15 +396,15 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
  * Pending requests when the caller has NO host `background_tasks` or `session_crons`
  * list (e.g. poller idle cleanup or explicit-reply hook): preserves both recorded
  * schedules (`recordedSessionCrons`) AND recorded `Monitor` launches (`kind: 'monitor'`,
- * which emit event wakes without completion notices, `notifies: false`), so idle cleanup
- * never closes a request while its monitor or schedule can still wake the agent
- * (decision ce71a72b).
+ * which emit recurring event wakes without a terminal completion notice, `notifies: false`),
+ * so idle cleanup never closes a request after a monitor's first event while the monitor
+ * can still fire again (decision ce71a72b).
  */
 export function pendingWorkWithoutHostLists(reqState) {
   const sessionCrons = recordedSessionCrons(reqState)
   const pending = requestsWithWorkPending(reqState, { sessionCrons })
   for (const launch of new Set(reqState.launches.values())) {
-    if (launch.kind === 'monitor' && !launch.notified) {
+    if (launch.kind === 'monitor') {
       for (const id of [launch.request, ...(launch.also ?? [])]) {
         if (reqState.open.has(id)) pending.add(id)
       }
@@ -518,22 +563,13 @@ export async function syncTypedTurnFromTranscript({
   const effectiveCallRequest = boundedCall(callRequest)
   const effectiveCallPickup = boundedCall(callPickup)
 
-  const stamp = fileStamp(transcriptPath)
-  if (!stamp) return { action: 'none' }
-  if (memo && memo.stamp === stamp && memo.synced) return { action: 'unchanged' }
+  const canMarkSynced = () =>
+    !hasPendingFailedTypedTurns(dir, connectionId) && pendingOpensForConnection(dir, connectionId).length === 0
 
-  const active = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
-  if (active?.budgetExhausted) {
-    log(`typed-turn-sync: transcript read budget (${budgetMs} ms) exhausted for ${connectionId}\n`)
-    return { action: 'budget_exhausted', budget_ms: budgetMs }
-  }
-  if (!active) return { action: 'unreadable' }
-  if (memo) {
-    memo.stamp = active.stamp
-    memo.synced = false
-  }
-  if (active.ended || !active.key) {
-    const pendingEntries = pendingOpensForConnection(dir, connectionId)
+  const retryQueuedFailedTurn = async ({ excludeKey = null } = {}) => {
+    const pendingEntries = pendingOpensForConnection(dir, connectionId).filter(
+      ([, entry]) => !excludeKey || entry.turnKey !== excludeKey,
+    )
     if (pendingEntries.length > 0) {
       const flushed = await withTypedSyncLock(
         connectionId,
@@ -551,110 +587,155 @@ export async function syncTypedTurnFromTranscript({
       )
       if (!flushed) {
         return {
-          action: 'open_write_failed',
-          requestId: pendingEntries[0][1].requestId,
-          active,
-        }
-      }
-    }
-    const fKey = failedTurnKey(dir, connectionId)
-    if (active.ended && active.kind === 'typed' && active.key && failedTypedTurnKeys.get(fKey) === active.key) {
-      const reqState = readRequestState(connectionId, { dir })
-      if (reqState.seenTranscriptTurns.has(active.key)) {
-        failedTypedTurnKeys.delete(fKey)
-      } else {
-        if (!connectionCapability || typeof effectiveCallRequest !== 'function') {
-          return { action: 'cleared_stale', key: active.key, ended: true }
-        }
-        const retryResult = await withTypedSyncLock(
-          connectionId,
-          dir,
-          async () => {
-            const lockedState = readRequestState(connectionId, { dir })
-            if (lockedState.seenTranscriptTurns.has(active.key)) {
-              failedTypedTurnKeys.delete(fKey)
-              return {
-                action: 'already_synced',
-                key: active.key,
-                ref: lockedState.seenTranscriptTurns.get(active.key),
-              }
-            }
-            const deterministicId = deterministicTypedTurnRequestId(connectionId, active.key)
-            let requestId =
-              lockedState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
-            let requestedBy = null
-            if (!requestId) {
-              const opened = await openTypedRequestPreservingRefusal({
-                connectionId,
-                callRequest: effectiveCallRequest,
-                dir,
-                id: deterministicId,
-              })
-              if (opened.ok) {
-                requestId = opened.requestId
-                requestedBy = opened.requestedBy ?? null
-              } else if (opened.localPersistFailed) {
-                if (opened.requestId) {
-                  pendingLocalOpens.set(pendingOpenKey(dir, connectionId, active.key), {
-                    requestId: opened.requestId,
-                    requestedBy: opened.requestedBy ?? null,
-                    turnKey: active.key,
-                  })
-                  failedTypedTurnKeys.delete(fKey)
-                }
-                log(
-                  `typed-turn-sync: ended-turn local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
-                )
-                return {
-                  action: 'open_write_failed',
-                  requestId: opened.requestId,
-                  key: active.key,
-                  ended: true,
-                  refusal: opened.refusal,
-                }
-              } else {
-                log(
-                  `typed-turn-sync: ended-turn open_request retry failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
-                )
-                return {
-                  action: 'cleared_stale',
-                  key: active.key,
-                  ended: true,
-                  refusal: opened.refusal,
-                }
-              }
-            }
-            const pKey = pendingOpenKey(dir, connectionId, active.key)
-            const entry = { requestId, requestedBy, turnKey: active.key }
-            pendingLocalOpens.set(pKey, entry)
-            const persisted = flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)
-            failedTypedTurnKeys.delete(fKey)
-            if (!persisted) {
-              return {
-                action: 'open_write_failed',
-                requestId,
-                key: active.key,
-                ended: true,
-              }
-            }
-            return { action: 'opened', requestId, key: active.key, ended: true }
+          ran: true,
+          ok: false,
+          result: {
+            action: 'open_write_failed',
+            requestId: pendingEntries[0][1].requestId,
+            key: pendingEntries[0][1].turnKey ?? null,
           },
-          { deadlineMs },
-        )
-        if (!retryResult) return { action: 'lock_busy' }
-        if (memo && (retryResult.action === 'opened' || retryResult.action === 'already_synced')) {
-          memo.synced = true
         }
-        return retryResult
       }
     }
-    if (memo) memo.synced = true
+
+    const queuedKey = nextQueuedFailedTypedTurn(dir, connectionId, excludeKey)
+    if (!queuedKey) return { ran: false, ok: canMarkSynced(), result: null }
+
+    const reqState = readRequestState(connectionId, { dir })
+    if (reqState.seenTranscriptTurns.has(queuedKey)) {
+      clearFailedTypedTurn(dir, connectionId, queuedKey)
+      return {
+        ran: true,
+        ok: canMarkSynced(),
+        result: {
+          action: 'already_synced',
+          key: queuedKey,
+          ref: reqState.seenTranscriptTurns.get(queuedKey),
+        },
+      }
+    }
+    if (!connectionCapability || typeof effectiveCallRequest !== 'function') {
+      return {
+        ran: true,
+        ok: false,
+        result: { action: 'cleared_stale', key: queuedKey },
+      }
+    }
+    const retryResult = await withTypedSyncLock(
+      connectionId,
+      dir,
+      async () => {
+        const lockedState = readRequestState(connectionId, { dir })
+        if (lockedState.seenTranscriptTurns.has(queuedKey)) {
+          clearFailedTypedTurn(dir, connectionId, queuedKey)
+          return {
+            action: 'already_synced',
+            key: queuedKey,
+            ref: lockedState.seenTranscriptTurns.get(queuedKey),
+          }
+        }
+        const deterministicId = deterministicTypedTurnRequestId(connectionId, queuedKey)
+        let requestId =
+          lockedState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
+        let requestedBy = null
+        if (!requestId) {
+          const opened = await openTypedRequestPreservingRefusal({
+            connectionId,
+            callRequest: effectiveCallRequest,
+            dir,
+            id: deterministicId,
+          })
+          if (opened.ok) {
+            requestId = opened.requestId
+            requestedBy = opened.requestedBy ?? null
+          } else if (opened.localPersistFailed) {
+            if (opened.requestId) {
+              pendingLocalOpens.set(pendingOpenKey(dir, connectionId, queuedKey), {
+                requestId: opened.requestId,
+                requestedBy: opened.requestedBy ?? null,
+                turnKey: queuedKey,
+              })
+              clearFailedTypedTurn(dir, connectionId, queuedKey)
+            }
+            log(
+              `typed-turn-sync: queued local open_request persistence failed for ${connectionId} (${queuedKey}): ${JSON.stringify(opened.refusal)}\n`,
+            )
+            return {
+              action: 'open_write_failed',
+              requestId: opened.requestId,
+              key: queuedKey,
+              refusal: opened.refusal,
+            }
+          } else {
+            log(
+              `typed-turn-sync: queued open_request retry failed for ${connectionId} (${queuedKey}): ${JSON.stringify(opened.refusal)}\n`,
+            )
+            return {
+              action: 'cleared_stale',
+              key: queuedKey,
+              refusal: opened.refusal,
+            }
+          }
+        }
+        const pKey = pendingOpenKey(dir, connectionId, queuedKey)
+        const entry = { requestId, requestedBy, turnKey: queuedKey }
+        pendingLocalOpens.set(pKey, entry)
+        const persisted = flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)
+        clearFailedTypedTurn(dir, connectionId, queuedKey)
+        if (!persisted) {
+          return {
+            action: 'open_write_failed',
+            requestId,
+            key: queuedKey,
+          }
+        }
+        return { action: 'opened', requestId, key: queuedKey }
+      },
+      { deadlineMs },
+    )
+    if (!retryResult) {
+      return { ran: true, ok: false, result: { action: 'lock_busy', key: queuedKey } }
+    }
+    const succeeded = retryResult.action === 'opened' || retryResult.action === 'already_synced'
+    return { ran: true, ok: succeeded && canMarkSynced(), result: retryResult }
+  }
+
+  const stamp = fileStamp(transcriptPath)
+  if (!stamp) return { action: 'none' }
+  if (memo && memo.stamp === stamp && memo.synced && canMarkSynced()) return { action: 'unchanged' }
+
+  const active = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
+  if (active?.budgetExhausted) {
+    log(`typed-turn-sync: transcript read budget (${budgetMs} ms) exhausted for ${connectionId}\n`)
+    return { action: 'budget_exhausted', budget_ms: budgetMs }
+  }
+  if (!active) return { action: 'unreadable' }
+  if (memo) {
+    memo.stamp = active.stamp
+    memo.synced = false
+  }
+  if (active.ended || !active.key) {
+    const flush = await retryQueuedFailedTurn({ excludeKey: null })
+    if (flush.ran) {
+      if (memo && flush.ok) memo.synced = true
+      return {
+        ...flush.result,
+        ...(active.ended ? { ended: true } : {}),
+        active,
+      }
+    }
+    if (memo && canMarkSynced()) memo.synced = true
     return { action: 'not_typed_live', active }
   }
 
   const initial = readRequestState(connectionId, { dir })
   if (initial.seenTranscriptTurns.has(active.key)) {
-    if (memo) memo.synced = true
+    const flush = await retryQueuedFailedTurn({ excludeKey: null })
+    if (flush.ran) {
+      if (memo && flush.ok) memo.synced = true
+      return flush.result
+    }
+    if (memo && canMarkSynced()) memo.synced = true
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
@@ -711,8 +792,10 @@ export async function syncTypedTurnFromTranscript({
     )
     if (!restored) return { action: 'lock_busy' }
     if (restored.action !== 'not_a_wake') {
-      if (memo && (restored.action === 'restored_wake_request' || restored.action === 'already_synced')) {
-        memo.synced = true
+      if (restored.action === 'restored_wake_request' || restored.action === 'already_synced') {
+        const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+        if (memo && flush.ok && canMarkSynced()) memo.synced = true
+        if (flush.ran) return { ...restored, retriedFailedTurn: flush.result }
       }
       return restored
     }
@@ -732,7 +815,9 @@ export async function syncTypedTurnFromTranscript({
 
   if (active.kind !== 'typed') {
     if (!isClearableForUnrelatedWake(initial)) {
-      if (memo) memo.synced = true
+      const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (flush.ran) return { action: 'not_typed_live', active, retriedFailedTurn: flush.result }
       return { action: 'not_typed_live', active }
     }
     const outcome = await withTypedSyncLock(
@@ -764,14 +849,15 @@ export async function syncTypedTurnFromTranscript({
       { deadlineMs },
     )
     if (
-      memo &&
       outcome &&
       (outcome.action === 'cleared_for_wake' ||
         outcome.action === 'preserved_wake_request' ||
         outcome.action === 'already_synced' ||
         outcome.action === 'not_typed_live')
     ) {
-      memo.synced = true
+      const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (flush.ran) return { ...outcome, retriedFailedTurn: flush.result }
     }
     return outcome ?? { action: 'lock_busy' }
   }
@@ -789,11 +875,16 @@ export async function syncTypedTurnFromTranscript({
       const deterministicId = deterministicTypedTurnRequestId(connectionId, active.key)
       const alreadyOpenForTurn =
         reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
-      const existingTyped = unboundOpenTypedPrompt(reqState) ?? alreadyOpenForTurn
+      const unboundHook = unboundOpenTypedPrompt(reqState)
+      const safeUnboundHook =
+        unboundHook && !isFailedTurnDeterministicId(dir, connectionId, unboundHook, active.key)
+          ? unboundHook
+          : null
+      const existingTyped = safeUnboundHook ?? alreadyOpenForTurn
       let requestId = existingTyped
       let openedNow = false
       let openRefusal = null
-      if (alreadyOpenForTurn && !unboundOpenTypedPrompt(reqState)) {
+      if (alreadyOpenForTurn && !safeUnboundHook) {
         const currentWritten = appendRequestEvent(
           connectionId,
           midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
@@ -980,13 +1071,14 @@ export async function syncTypedTurnFromTranscript({
     { deadlineMs },
   )
 
-  const fKey = failedTurnKey(dir, connectionId)
   if (
     result &&
     (result.action === 'opened' || result.action === 'already_synced' || result.action === 'adopted_hook_request')
   ) {
-    if (failedTypedTurnKeys.get(fKey) === active.key) failedTypedTurnKeys.delete(fKey)
-    if (memo) memo.synced = true
+    clearFailedTypedTurn(dir, connectionId, active.key)
+    const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+    if (memo && flush.ok && canMarkSynced()) memo.synced = true
+    if (flush.ran) return { ...result, retriedFailedTurn: flush.result }
   } else if (
     result &&
     (result.action === 'cleared_stale' ||
@@ -994,7 +1086,7 @@ export async function syncTypedTurnFromTranscript({
       result.action === 'state_write_failed' ||
       result.action === 'binding_write_failed')
   ) {
-    failedTypedTurnKeys.set(fKey, active.key)
+    recordFailedTypedTurn(dir, connectionId, active.key)
   }
   return result ?? { action: 'lock_busy' }
 }
