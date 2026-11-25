@@ -1133,4 +1133,58 @@ describe('fast-connect CLI flags', () => {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
+
+  it('bounds stderr within fitsShellOutput when --prompt-file or unknown CLI args exceed 20,000 characters (3c5147a7 / 91d7b47c)', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-promptfile-long-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    const runCliChild = (cliArgs, customHome = home) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [script, ...cliArgs], {
+          cwd: customHome,
+          env: { ...process.env, HOME: customHome },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        child.on('error', reject)
+        child.on('close', (code) => resolve({ stdout, stderr, code }))
+      })
+    try {
+      const longPath = 'x'.repeat(24_000)
+      const r1 = await runCliChild(['fast-connect', '--prompt-file', longPath])
+      assert.equal(r1.code, 1)
+      assert.ok(
+        fitsShellOutput(r1.stdout + r1.stderr),
+        `overlong --prompt-file combined output (${(r1.stdout + r1.stderr).length}) must fit fitsShellOutput`,
+      )
+      assert.match(r1.stderr, /--prompt-file/)
+      assert.match(r1.stderr, /actual_length 24000/)
+      assert.match(r1.stderr, /shell_limit_chars 20000/)
+      assert.match(r1.stderr, /cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md/)
+
+      // Even when ~/.devspec/notes cannot be written, stderr still stays inside fitsShellOutput.
+      const brokenHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-promptfile-broken-'))
+      try {
+        fs.mkdirSync(path.join(brokenHome, '.devspec'), { recursive: true })
+        fs.writeFileSync(path.join(brokenHome, '.devspec', 'notes'), 'file blocking notes dir')
+        const r2 = await runCliChild(['fast-connect', '--prompt-file', longPath], brokenHome)
+        assert.equal(r2.code, 1)
+        assert.ok(fitsShellOutput(r2.stdout + r2.stderr))
+        assert.match(r2.stderr, /actual_length 24000/)
+        assert.match(r2.stderr, /shell_limit_chars 20000/)
+      } finally {
+        fs.rmSync(brokenHome, { recursive: true, force: true })
+      }
+
+      // Overlong unknown CLI command is also bounded.
+      const r3 = await runCliChild(['z'.repeat(24_000)])
+      assert.equal(r3.code, 2)
+      assert.ok(fitsShellOutput(r3.stdout + r3.stderr))
+      assert.match(r3.stderr, /actual_length 24000/)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
 })

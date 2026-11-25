@@ -15,6 +15,7 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS } from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
@@ -33,6 +34,7 @@ import {
   attachConnection,
   writeConnectionState,
   formatConnectCliOutput,
+  formatBoundedCliStderr,
   writeStreamAndFlush,
 } from './remote-control-state.mjs'
 
@@ -750,13 +752,21 @@ export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) 
 
     let promptText = null
     if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
+      const rawPromptFile = String(args['prompt-file'])
       try {
-        promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
+        promptText = fs.readFileSync(path.resolve(rawPromptFile), 'utf8')
       } catch (err) {
-        await writeStreamAndFlush(
-          process.stderr,
-          `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
-        )
+        const errCode = err && typeof err === 'object' && 'code' in err ? String(err.code) : 'read_failed'
+        const detail = err instanceof Error ? err.message : String(err)
+        const rawDiag = `fast-connect: could not read --prompt-file: ${detail}\n`
+        const summary = `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
+        const bounded = formatBoundedCliStderr(rawDiag, {
+          label: 'fast-connect',
+          reserve: currentStderr(),
+          summary,
+          fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback could not fit Cursor's Shell ceiling.\n`,
+        })
+        await writeStreamAndFlush(process.stderr, bounded)
         process.exit(1)
       }
     }

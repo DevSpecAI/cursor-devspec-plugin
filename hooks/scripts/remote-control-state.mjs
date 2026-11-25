@@ -2088,6 +2088,45 @@ export async function writeConnectionState(opts) {
   return result
 }
 
+/**
+ * Keep a CLI stderr diagnostic inside Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`): return `rawMessage` unchanged when it fits together with
+ * `reserve`, otherwise preserve the full diagnostic in a sealed note (`writeNote`) and
+ * emit a compact bounded pointer (or bounded structured fallback if note writing fails)
+ * so overlong CLI arguments or error paths never exceed 20,000 characters on stderr
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+export function formatBoundedCliStderr(
+  rawMessage,
+  {
+    label = 'remote-control-state',
+    home = os.homedir(),
+    reserve = '',
+    summary = null,
+    fallback = null,
+  } = {},
+) {
+  const text = String(rawMessage ?? '')
+  const prior = String(reserve ?? '')
+  if (fitsShellOutput(`${prior}${text}`)) return text
+  const meta = summary ? `${summary}; ` : ''
+  try {
+    const note = writeNote(text, { home })
+    const pointer = `${label}: ${meta}diagnostic (${text.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling; full text saved in note ${note.id} — read with \`${note.command}\`.\n`
+    if (fitsShellOutput(`${prior}${pointer}`)) return pointer
+    const compactPointer = `${label}: diagnostic in note ${note.id} (${note.command})\n`
+    if (fitsShellOutput(`${prior}${compactPointer}`)) return compactPointer
+  } catch {
+    /* fall through to bounded fallback below */
+  }
+  const fb =
+    typeof fallback === 'string' && fallback
+      ? fallback
+      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed.\n`
+  if (fitsShellOutput(`${prior}${fb}`)) return fb
+  return `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`
+}
+
 // --- CLI entry (skipped when imported for tests) ---
 const isMain =
   Boolean(process.argv[1]) &&
@@ -2095,8 +2134,12 @@ const isMain =
 
 if (isMain) {
   void runCli().catch((err) => {
-    process.stderr.write(`remote-control-state: ${err?.message || err}\n`)
-    process.exit(1)
+    const raw = `remote-control-state: ${err?.message || err}\n`
+    const bounded = formatBoundedCliStderr(raw, {
+      label: 'remote-control-state',
+      summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+    })
+    process.stderr.write(bounded, () => process.exit(1))
   })
 }
 
@@ -2672,6 +2715,11 @@ async function runCli() {
     process.exit(result.ok ? 0 : 1)
   }
 
-  process.stderr.write(`Unknown command: ${cmd}\n`)
+  const boundedUnknown = formatBoundedCliStderr(`Unknown command: ${cmd}\n`, {
+    label: 'remote-control-state',
+    reserve: emittedStderr,
+    summary: `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+  })
+  await writeStreamAndFlush(process.stderr, boundedUnknown)
   process.exit(2)
 }
