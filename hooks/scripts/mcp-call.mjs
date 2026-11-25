@@ -233,6 +233,7 @@ async function performMcpToolsCall({
   }
 
   let res
+  let text
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
@@ -240,6 +241,7 @@ async function performMcpToolsCall({
       body: bodyText,
       signal: controller.signal,
     })
+    text = await res.text()
   } catch (e) {
     if (abortCode) {
       const err = new Error(`MCP call ${name} aborted: ${abortCode}`)
@@ -252,7 +254,6 @@ async function performMcpToolsCall({
     if (aliveTimer) clearInterval(aliveTimer)
   }
 
-  const text = await res.text()
   if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
     // The message keeps its `MCP HTTP <status>: …` shape — logs and existing matching read it.

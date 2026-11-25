@@ -17,6 +17,7 @@ import {
 } from './typed-turn-sync.mjs'
 import {
   appendRequestEvent,
+  promptArrival,
   provenanceRefForWrite,
   readRequestState,
   requestRefForWrite,
@@ -105,7 +106,7 @@ describe('typed-turn-sync (item da03801e)', () => {
           expected_session_id: ROOM,
         }
       },
-      patchState: (patch) => { patched = patch },
+      patchState: (patch) => { patched = patch; return true },
       dir,
     })
 
@@ -245,7 +246,7 @@ describe('typed-turn-sync (item da03801e)', () => {
         completed.push(args)
         return { ok: true }
       },
-      patchState: (patch) => { patched = patch },
+      patchState: (patch) => { patched = patch; return true },
       dir,
     })
 
@@ -428,7 +429,7 @@ describe('typed-turn-sync (item da03801e)', () => {
           status: 'working',
         }
       },
-      patchState: (patch) => { patched = patch },
+      patchState: (patch) => { patched = patch; return true },
       dir,
       memo,
       log: (line) => logs.push(line),
@@ -443,52 +444,178 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
 
-  it('preserves a typed_prompt that has a recorded scheduled wake continuation on a non-typed wake (ce71a72b / 2fcd26bd)', async () => {
-    const { dir, transcriptPath } = makeEnv()
+  it('clears an earlier typed_prompt on an unrelated timestamp-only wake even when it has a future scheduled run, then restores it when the schedule fires (2fcd26bd / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
     appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
-    appendRequestEvent(CONN, { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: HOOK_TYPED, also: [] }, { dir })
     appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: HOOK_TYPED, also: [] }, { dir })
     const timestampOnly = JSON.stringify({
       role: 'user',
       message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
     })
     fs.writeFileSync(transcriptPath, `${typedRow('Schedule deploy check')}\n${timestampOnly}\n`)
 
-    const res = await syncTypedTurnFromTranscript({
+    const unrelated = await syncTypedTurnFromTranscript({
       connectionId: CONN,
       transcriptPath,
       connectionCapability: 'cap-secret',
       dir,
     })
-    assert.equal(res.action, 'not_typed_live')
-    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED, 'scheduled-wake continuation must keep typed_prompt attribution')
+    assert.equal(unrelated.action, 'cleared_for_wake')
+    const afterUnrelated = readRequestState(CONN, { dir })
+    assert.equal(afterUnrelated.current, null, 'unrelated timestamp-only wake must not inherit earlier typed_prompt')
+    assert.equal(afterUnrelated.open.has(HOOK_TYPED), true, 'scheduled typed_prompt stays open for its future firing')
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x' },
+    })
+
+    // Later, the real scheduled wake fires via promptArrival and restores HOOK_TYPED.
+    const arrival = promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'Check deploy',
+      state: afterUnrelated,
+    })
+    for (const event of arrival.events) appendRequestEvent(CONN, event, { dir })
+    const scheduledRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:20 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Schedule deploy check')}\n${timestampOnly}\n${scheduledRow}\n`)
+
+    const scheduledSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(scheduledSync.action, 'preserved_wake_request')
+    assert.equal(scheduledSync.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x', request_ref: HOOK_TYPED },
+    })
   })
 
-  it('leaves turn unsynced when patchState fails to persist admitted local_turn (3ea2b201)', async () => {
-    const { dir, transcriptPath } = makeEnv()
-    fs.writeFileSync(transcriptPath, `${typedRow('Persist state check')}\n`)
-    const memo = { stamp: null, synced: false }
-    const state = {
-      connection_id: CONN,
-      session_id: ROOM,
-      speech_attachment_id: ATTACH,
-      attached_at: '2026-11-25T17:00:00.000Z',
+  it('preserves a typed_prompt restored by a real background completion wake even after the launch is marked notified, and still clears a later unrelated wake (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bg-job-1', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
+
+    // Real wake bookkeeping: background job completes, restores HOOK_TYPED and marks bg-job-1 notified.
+    const arrival = promptArrival({
+      fromAPerson: false,
+      origin: 'task-notification',
+      text: '<task-notification><task-id>bg-job-1</task-id><status>completed</status></task-notification>',
+      state: readRequestState(CONN, { dir }),
+    })
+    for (const event of arrival.events) appendRequestEvent(CONN, event, { dir })
+    const afterWake = readRequestState(CONN, { dir })
+    assert.equal(afterWake.launches.get('bg-job-1').notified, true)
+    assert.equal(afterWake.current, HOOK_TYPED)
+    assert.equal(afterWake.currentFromWake, true)
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Run background job')}\n${commandRow()}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wakeSync.action, 'preserved_wake_request')
+    assert.equal(wakeSync.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x', request_ref: HOOK_TYPED },
+    })
+
+    // A later unrelated timestamp-only wake does NOT inherit the already-consumed wake request.
+    const laterUnrelated = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:30 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Run background job')}\n${commandRow()}\n${laterUnrelated}\n`)
+    const thirdSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(thirdSync.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+  })
+
+  it('leaves turn unsynced when patchState fails, returns undefined (swallowed write error), or throws (3ea2b201)', async () => {
+    for (const [label, patchState] of [
+      ['returns false', () => false],
+      ['returns undefined (swallowed error)', () => {}],
+      ['throws error', () => { throw new Error('EACCES') }],
+    ]) {
+      const { dir, transcriptPath } = makeEnv()
+      fs.writeFileSync(transcriptPath, `${typedRow(`Persist state check: ${label}`)}\n`)
+      const memo = { stamp: null, synced: false }
+      const state = {
+        connection_id: CONN,
+        session_id: ROOM,
+        speech_attachment_id: ATTACH,
+        attached_at: '2026-11-25T17:00:00.000Z',
+      }
+      const res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        state,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+        callPickup: async (args) => ({ status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: ROOM }),
+        patchState,
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(res.action, 'state_write_failed', label)
+      assert.equal(memo.synced, false, label)
+      assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0, label)
     }
+  })
+
+  it('preserves and logs structured refusals from report_request instead of dropping them on cleared_stale (4e32d1a5)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Open request refusal check')}\n`)
+    const logs = []
+    const memo = { stamp: null, synced: false }
+
     const res = await syncTypedTurnFromTranscript({
       connectionId: CONN,
       transcriptPath,
-      state,
       connectionCapability: 'cap-secret',
-      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
-      callPickup: async (args) => ({ status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: ROOM }),
-      patchState: () => false,
+      callRequest: async () => {
+        throw Object.assign(new Error('MCP HTTP 401: invalid connection capability'), {
+          status: 401,
+          serverCode: 'invalid_connection_capability',
+          retryable: false,
+          credentialType: 'connection_capability',
+        })
+      },
       dir,
       memo,
-      log: () => {},
+      log: (line) => logs.push(line),
     })
-    assert.equal(res.action, 'state_write_failed')
+
+    assert.equal(res.action, 'cleared_stale')
+    assert.equal(res.refusal.status, 401)
+    assert.equal(res.refusal.serverCode, 'invalid_connection_capability')
+    assert.equal(res.refusal.retryable, false)
+    assert.equal(res.refusal.credentialType, 'connection_capability')
     assert.equal(memo.synced, false)
-    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0)
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /invalid_connection_capability/)
+    assert.match(logs[0], /"retryable":false/)
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
   })
 
   it('preserves a retry thrown refusal instead of returning the earlier attempt response (4e32d1a5)', async () => {

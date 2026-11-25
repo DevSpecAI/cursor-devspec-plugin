@@ -101,6 +101,7 @@ function uuids(value) {
  *   launches: Map<string, { key: string, request: string, also: string[], kind: string, notifies: boolean, notified: boolean, absent: number }>,
  *   schedules: Array<{ prompt: string, request: string, also: string[], id: string|null }>,
  *   current: string|null,
+ *   currentFromWake: boolean,
  *   joined: Set<string>,
  *   chosen: boolean,
  *   seenTranscriptTurns: Map<string, string|null>,
@@ -114,6 +115,7 @@ export function reduceRequestLog(text) {
   const schedules = []
   const seenTranscriptTurns = new Map()
   let current = null
+  let currentFromWake = false
   let joined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
@@ -139,11 +141,15 @@ export function reduceRequestLog(text) {
         open.delete(event.id)
         started.delete(event.id)
         joined.delete(event.id)
-        if (current === event.id) current = null
+        if (current === event.id) {
+          current = null
+          currentFromWake = false
+        }
         break
       case 'current':
         // A new turn: what it carries starts again from what woke it.
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
+        currentFromWake = Boolean(event.from_wake && current !== null)
         joined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
@@ -167,6 +173,7 @@ export function reduceRequestLog(text) {
           if (previous !== (next ?? UNSTATED)) joined.add(previous)
           joined.delete(next ?? UNSTATED)
           current = next
+          currentFromWake = false
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
@@ -180,13 +187,21 @@ export function reduceRequestLog(text) {
         // work runs on (item 984ca8b4).
         const info = open.get(event.id)
         if (info) info.answered = true
-        if (current === event.id) current = null
+        if (current === event.id) {
+          current = null
+          currentFromWake = false
+        }
         joined.delete(event.id)
         break
       }
       case 'transcript_turn':
         if (typeof event.key === 'string' && event.key) {
-          seenTranscriptTurns.set(event.key, UUID.test(event.ref ?? '') ? event.ref : null)
+          const boundRef = UUID.test(event.ref ?? '') ? event.ref : null
+          seenTranscriptTurns.set(event.key, boundRef)
+          // Once a transcript turn binds the wake-restored current request, a
+          // subsequent unrelated wake must not also treat that stale current as
+          // freshly restored for itself.
+          if (current !== null && boundRef === current) currentFromWake = false
         }
         break
       case 'launch':
@@ -231,7 +246,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, joined, chosen, seenTranscriptTurns }
+  return { open, started, launches, schedules, current, currentFromWake, joined, chosen, seenTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
@@ -434,7 +449,12 @@ export function promptArrival({ fromAPerson, origin, text, midTurn = false, stat
   if (midTurn) {
     for (const id of [ref, ...also]) events.push({ op: 'joined', id })
   } else {
-    events.push({ op: 'current', ref: ref === UNSTATED ? null : ref })
+    const resolvedRef = ref === UNSTATED ? null : ref
+    events.push({
+      op: 'current',
+      ref: resolvedRef,
+      ...(resolvedRef !== null ? { from_wake: true } : {}),
+    })
     for (const id of also) events.push({ op: 'joined', id })
   }
   const kind = typeof origin === 'string' ? origin : origin?.kind

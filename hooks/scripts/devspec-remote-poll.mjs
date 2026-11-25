@@ -2212,14 +2212,15 @@ async function main() {
   })
   let pendingInteractionAck = null
 
-  /** Persist a state patch without clobbering concurrent fields. Best-effort. */
+  /** Persist a state patch without clobbering concurrent fields. Returns true only when written. */
   function patchState(patch) {
     try {
       const s = readState(connectionId) || {}
       Object.assign(s, patch, { connection_id: connectionId, updated_at: new Date().toISOString() })
       writeState(s, connectionId)
+      return true
     } catch {
-      /* ignore */
+      return false
     }
   }
 

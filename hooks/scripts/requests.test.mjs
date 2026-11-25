@@ -555,7 +555,9 @@ describe('what reaches a running turn joins it', () => {
 
   it('the same delivered as a new turn starts from it', () => {
     const state = reduceRequestLog(log(openA, openB, { op: 'current', ref: A }))
-    assert.deepEqual(promptArrival({ origin: 'task-notification', text: wakeFor(MSG_B), midTurn: false, state }).events, [{ op: 'current', ref: B }])
+    assert.deepEqual(promptArrival({ origin: 'task-notification', text: wakeFor(MSG_B), midTurn: false, state }).events, [
+      { op: 'current', ref: B, from_wake: true },
+    ])
   })
 
   it('a prompt typed over a running turn joins it as the owner\'s typed request', () => {
@@ -583,7 +585,7 @@ describe('what reaches a running turn joins it', () => {
   it('marks the jobs a wake reports as notified', () => {
     const state = reduceRequestLog(log(openT, { op: 'launch', key: 'job', kind: 'shell', notifies: true, request: T, also: [] }))
     assert.deepEqual(promptArrival({ origin: 'task-notification', text: notification('job'), midTurn: false, state }).events,
-      [{ op: 'current', ref: T }, { op: 'notified', key: 'job' }])
+      [{ op: 'current', ref: T, from_wake: true }, { op: 'notified', key: 'job' }])
   })
 })
 

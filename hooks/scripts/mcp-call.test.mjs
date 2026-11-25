@@ -227,4 +227,40 @@ describe('a failed response in an error', () => {
       await new Promise((resolve) => server.close(resolve))
     }
   })
+
+  it('aborts a slow response body after quick headers within timeoutMs (3c5147a7 / 91d7b47c)', async () => {
+    let bodyTimer = null
+    const server = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.flushHeaders()
+      bodyTimer = setTimeout(() => {
+        if (!res.writableEnded) {
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }))
+        }
+      }, 600)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    const started = Date.now()
+    try {
+      const error = await mcpToolsCall({
+        mcpUrl,
+        token: 'dvs_fixture',
+        name: 'report_request',
+        arguments: {},
+        timeoutMs: 80,
+      }).then(
+        () => assert.fail('slow body must abort on timeout'),
+        (e) => e,
+      )
+      const elapsed = Date.now() - started
+      assert.equal(error.code, 'timeout')
+      assert.ok(elapsed < 450, `expected abort near 80ms timeout, took ${elapsed}ms`)
+    } finally {
+      if (bodyTimer) clearTimeout(bodyTimer)
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
 })
