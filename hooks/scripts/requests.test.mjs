@@ -679,3 +679,38 @@ describe('offering nobody\'s request', () => {
     assert.equal(requestRefForWrite(readRequestState(CONN, { dir })), null)
   })
 })
+
+describe('scheduled wake continuation after room command answer (ce71a72b)', () => {
+  it('clears answered command from foreground current, then restores request_ref (not closed provenance_ref) on scheduled wake', () => {
+    const afterAnswer = reduceRequestLog(
+      log(
+        openA,
+        { op: 'current', ref: A },
+        { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: A, also: [] },
+        { op: 'answered', id: A },
+      ),
+    )
+    assert.equal(afterAnswer.current, null)
+    assert.equal(requestRefForWrite(afterAnswer), null)
+    assert.equal(provenanceRefForWrite(afterAnswer), null)
+
+    const arrival = promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'Check deploy',
+      state: afterAnswer,
+    })
+    const duringWake = reduceRequestLog(
+      log(
+        openA,
+        { op: 'current', ref: A },
+        { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: A, also: [] },
+        { op: 'answered', id: A },
+        ...arrival.events,
+      ),
+    )
+    assert.equal(duringWake.current, A)
+    assert.equal(requestRefForWrite(duringWake), A)
+    assert.equal(provenanceRefForWrite(duringWake), null)
+  })
+})

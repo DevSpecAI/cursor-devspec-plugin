@@ -3098,7 +3098,7 @@ async function main() {
               token,
               name: 'report_complete',
               arguments: completeArgs,
-              timeoutMs: 5_000,
+              timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
             }),
           patchState,
           dir: CONNECTIONS_DIR,

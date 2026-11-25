@@ -34,11 +34,12 @@ import {
 } from './mirror-turn.mjs'
 import {
   appendRequestEvent,
+  closeRequest,
   commandsAnsweredNow,
-  finishTurnRequests,
   readRequestState,
   requestFinished,
   requestsWithWorkPending,
+  rotateRequestLog,
 } from './requests.mjs'
 import { recordedSessionCrons, TYPED_SYNC_BACKGROUND_TIMEOUT_MS } from './typed-turn-sync.mjs'
 import { connectionCredential } from './resolve-mcp-auth.mjs'
@@ -156,39 +157,46 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
   }
 
   // If the message completed the turn (or was marked complete), clear the .turn marker immediately,
-  // mark the turn's room commands answered, and close any finished requests on DevSpec right away
-  // so an answered command does not linger open when Cursor CLI skips the stop hook (item da03801e).
+  // mark the turn's room commands answered, and close the turn's single primary answered command on
+  // DevSpec when it has no pending background work (no dynamic multi-record loop; item da03801e).
   const isCompleteTurn = args?.complete_turn === true || args?.completeTurn === true
   if (isCompleteTurn) {
     clearTurnMarker(connectionId)
+    const beforeState = readRequestState(connectionId, { dir: connDir })
+    const primaryAnsweredId =
+      beforeState.current && beforeState.open.get(beforeState.current)?.kind === 'command'
+        ? beforeState.current
+        : null
     markCommandsAnswered(connectionId, dir ? { dir } : {})
-    try {
-      const reqState = readRequestState(connectionId, { dir: connDir })
-      const sessionCrons = recordedSessionCrons(reqState)
-      const pending = requestsWithWorkPending(reqState, { sessionCrons })
-      const hasFinished = [...reqState.open.keys()].some((id) => requestFinished(reqState, id, pending))
-      if (hasFinished && state) {
-        const credential = connectionCredential(state)
-        const capability = state.connection_capability || readConnectionCapability(connectionId)
-        if (credential.ok && capability) {
-          await finishTurnRequests({
-            connectionId,
-            dir: connDir,
-            sessionCrons,
-            call: (reqArgs) =>
-              mcpToolsCall({
-                mcpUrl: credential.mcp_url,
-                token: credential.token,
-                connectionCapability: capability,
-                name: 'report_request',
-                arguments: reqArgs,
-                timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
-              }),
-          })
+    if (primaryAnsweredId && state) {
+      try {
+        const reqState = readRequestState(connectionId, { dir: connDir })
+        const sessionCrons = recordedSessionCrons(reqState)
+        const pending = requestsWithWorkPending(reqState, { sessionCrons })
+        if (requestFinished(reqState, primaryAnsweredId, pending)) {
+          const credential = connectionCredential(state)
+          const capability = state.connection_capability || readConnectionCapability(connectionId)
+          if (credential.ok && capability) {
+            await closeRequest({
+              connectionId,
+              requestId: primaryAnsweredId,
+              dir: connDir,
+              call: (reqArgs) =>
+                mcpToolsCall({
+                  mcpUrl: credential.mcp_url,
+                  token: credential.token,
+                  connectionCapability: capability,
+                  name: 'report_request',
+                  arguments: reqArgs,
+                  timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+                }),
+            })
+            rotateRequestLog(connectionId, { dir: connDir })
+          }
         }
+      } catch {
+        /* non-fatal: answered command is already cleared from current */
       }
-    } catch {
-      /* non-fatal: answered command is already cleared from current and the poller retries close */
     }
   }
 

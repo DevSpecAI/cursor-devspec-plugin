@@ -223,11 +223,8 @@ describe('typed-turn-sync (item da03801e)', () => {
     })
   })
 
-  it('closes finished typed_prompt and answered room commands and completes local_turn once turn_ended is written', async () => {
+  it('closes the ended turn\'s finished typed_prompt and completes local_turn once turn_ended is written', async () => {
     const { dir, transcriptPath } = makeEnv()
-    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
-    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
-    appendRequestEvent(CONN, { op: 'answered', id: CMD_A }, { dir })
     appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
     appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
     fs.writeFileSync(transcriptPath, `${typedRow('Done')}\n${turnEndedRow('success')}\n`)
@@ -252,15 +249,18 @@ describe('typed-turn-sync (item da03801e)', () => {
       dir,
     })
 
-    assert.deepEqual(closedIds.sort(), [CMD_A, HOOK_TYPED].sort())
+    assert.deepEqual(closedIds, [HOOK_TYPED])
+    assert.deepEqual(res.closed, [HOOK_TYPED])
     assert.equal(res.localCompleted, true)
     assert.equal(completed.length, 1)
     assert.deepEqual(patched, { local_turn: null })
     assert.equal(readRequestState(CONN, { dir }).open.size, 0)
   })
 
-  it('does not fall back to an earlier typed prompt when the latest user row is a timestamp-only wake', async () => {
-    const { dir, transcriptPath } = makeEnv()
+  it('clears earlier typed_prompt from foreground current when a timestamp-only wake arrives before idle cleanup', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
     const timestampOnly = JSON.stringify({
       role: 'user',
       message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:05 PM (UTC)</timestamp>' }] },
@@ -275,9 +275,74 @@ describe('typed-turn-sync (item da03801e)', () => {
       callRequest: async () => { opened += 1; return { request_id: HOOK_TYPED } },
       dir,
     })
-    assert.equal(res.action, 'not_typed_live')
+    assert.equal(res.action, 'cleared_for_wake')
     assert.equal(res.active.kind, 'timestamp')
     assert.equal(opened, 0, 'timestamp-only wake must not reuse earlier typed prompt')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x' },
+    })
+  })
+
+  it('preserves structured refusal fields when callPickup throws a structured MCP error', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Start task thrown refusal')}\n`)
+    const memo = { stamp: null, synced: false }
+    const logs = []
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: '55555555-5555-4555-8555-555555555555',
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async () => {
+        throw Object.assign(new Error('Refused by server'), {
+          code: 'turn_conflict',
+          details: { blocking_request_id: CMD_A, reason: 'active_room_turn' },
+        })
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+
+    assert.equal(res.action, 'admission_failed')
+    assert.equal(res.refusal.code, 'turn_conflict')
+    assert.deepEqual(res.refusal.details, { blocking_request_id: CMD_A, reason: 'active_room_turn' })
+    assert.equal(memo.synced, false)
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /blocking_request_id/)
+  })
+
+  it('leaves memo unsynced when writing the transcript binding fails', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Write failure check')}\n`)
+    const logFile = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.chmodSync(logFile, 0o400)
+    const memo = { stamp: null, synced: false }
+    try {
+      const res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { throw new Error('must not open') },
+        dir,
+        memo,
+      })
+      assert.equal(res.action, 'binding_write_failed')
+      assert.equal(memo.synced, false, 'memo must stay unsynced when binding write fails')
+    } finally {
+      fs.chmodSync(logFile, 0o600)
+    }
   })
 
   it('keeps an open request with a recorded scheduled wake from closing in finishIdleRequests', async () => {

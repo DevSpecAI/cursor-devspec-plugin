@@ -20,13 +20,14 @@ import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import {
   appendRequestEvent,
-  finishTurnRequests,
+  closeRequest,
   openRequest,
   readRequestState,
   requestFinished,
   requestsWithWorkPending,
+  rotateRequestLog,
 } from './requests.mjs'
-import { activeTranscriptTurn } from './transcript-turn-end.mjs'
+import { activeTranscriptTurn, STABLE_READ_ATTEMPTS } from './transcript-turn-end.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
 import { completionArguments } from './turn-commands.mjs'
 
@@ -156,7 +157,7 @@ export function typedTurnSyncPending({ transcriptPath, memo = null } = {}) {
  * Record the connect turn's own typed prompt as already observed so `/devspec-remote`
  * itself does not open a stray `typed_prompt` request right as the connection starts.
  */
-export function recordConnectTurnBaseline(connectionId, transcriptPath, { dir = DEFAULT_DIR, attempts = 2 } = {}) {
+export function recordConnectTurnBaseline(connectionId, transcriptPath, { dir = DEFAULT_DIR, attempts = STABLE_READ_ATTEMPTS } = {}) {
   if (!connectionId || !transcriptPath) return false
   const active = activeTranscriptTurn(transcriptPath, { attempts })
   if (!active || active.kind !== 'typed' || active.ended || !active.key) return false
@@ -197,8 +198,33 @@ function hasActiveRemoteCommandTurn(connectionId, reqState, dir) {
 }
 
 /**
+ * Extract structured refusal details from a thrown MCP / transport error without
+ * flattening them to a plain sentence (requirement 4e32d1a5).
+ */
+function structuredRefusalFromError(error) {
+  if (!error || typeof error !== 'object') {
+    return { error: String(error ?? 'refused') }
+  }
+  const refusal = {
+    error: error instanceof Error ? error.message : String(error.message ?? error),
+  }
+  for (const field of ['code', 'status', 'details', 'data', 'refusal', 'body']) {
+    if (error[field] !== undefined) refusal[field] = error[field]
+  }
+  for (const [key, value] of Object.entries(error)) {
+    if (key in refusal || typeof value === 'function' || key === 'stack') continue
+    refusal[key] = value
+  }
+  if (error.cause && typeof error.cause === 'object') {
+    refusal.cause = structuredRefusalFromError(error.cause)
+  }
+  return refusal
+}
+
+/**
  * Admit the terminal turn while preserving any structured refusal payload from
- * `report_pickup` (never flattening refusals to null or plain sentences).
+ * `report_pickup` — whether returned normally or thrown as a structured MCP error
+ * (never flattening refusals to null or plain sentences).
  */
 async function admitLocalTurnPreservingRefusal({ scope, previousAttemptId, callPickup }) {
   let lastResponse = null
@@ -222,8 +248,8 @@ async function admitLocalTurnPreservingRefusal({ scope, previousAttemptId, callP
   const refusal =
     lastResponse && typeof lastResponse === 'object'
       ? lastResponse
-      : lastError
-        ? { error: lastError instanceof Error ? lastError.message : String(lastError) }
+      : lastError !== null
+        ? structuredRefusalFromError(lastError)
         : { status: 'refused' }
   return { ok: false, admitted: null, refusal }
 }
@@ -232,7 +258,9 @@ async function admitLocalTurnPreservingRefusal({ scope, previousAttemptId, callP
  * Ensure a live terminal-typed turn in `transcriptPath` is recorded as a `typed_prompt`
  * request in `<connectionId>.requests.jsonl` (and admitted via `startLocalTurn` when
  * attached to a room). Advances `seenTranscriptTurns` and `memo.synced` only after
- * both request opening and (when required) room admission succeed.
+ * request opening, room admission (when required), and local log writes all succeed.
+ * Also clears any lingering earlier `typed_prompt` from foreground `current` when a
+ * non-typed wake (such as a timestamp-only wake) starts before idle cleanup.
  */
 export async function syncTypedTurnFromTranscript({
   connectionId,
@@ -244,7 +272,7 @@ export async function syncTypedTurnFromTranscript({
   patchState = null,
   dir = DEFAULT_DIR,
   memo = null,
-  attempts = 3,
+  attempts = STABLE_READ_ATTEMPTS,
   log = (line) => process.stderr.write(line),
 } = {}) {
   if (!connectionId || !transcriptPath) return { action: 'none' }
@@ -258,7 +286,7 @@ export async function syncTypedTurnFromTranscript({
     memo.stamp = active.stamp
     memo.synced = false
   }
-  if (active.kind !== 'typed' || active.ended || !active.key) {
+  if (active.ended || !active.key) {
     if (memo) memo.synced = true
     return { action: 'not_typed_live', active }
   }
@@ -267,6 +295,38 @@ export async function syncTypedTurnFromTranscript({
   if (initial.seenTranscriptTurns.has(active.key)) {
     if (memo) memo.synced = true
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
+  }
+
+  // A live non-typed turn (timestamp-only wake or room command wake) must never inherit
+  // an earlier typed_prompt as foreground current if it arrived before idle cleanup.
+  if (active.kind !== 'typed') {
+    const staleTypedCurrent =
+      initial.current && initial.open.get(initial.current)?.kind === 'typed_prompt'
+        ? initial.current
+        : null
+    if (!staleTypedCurrent) {
+      if (memo) memo.synced = true
+      return { action: 'not_typed_live', active }
+    }
+    const cleared = await withTypedSyncLock(connectionId, dir, async () => {
+      const reqState = readRequestState(connectionId, { dir })
+      if (reqState.seenTranscriptTurns.has(active.key)) {
+        return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
+      }
+      if (reqState.current && reqState.open.get(reqState.current)?.kind === 'typed_prompt') {
+        if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
+          return { action: 'binding_write_failed', key: active.key, active }
+        }
+      }
+      if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })) {
+        return { action: 'binding_write_failed', key: active.key, active }
+      }
+      return { action: 'cleared_for_wake', key: active.key, active }
+    })
+    if (memo && cleared && (cleared.action === 'cleared_for_wake' || cleared.action === 'already_synced')) {
+      memo.synced = true
+    }
+    return cleared ?? { action: 'lock_busy' }
   }
 
   const result = await withTypedSyncLock(connectionId, dir, async () => {
@@ -289,19 +349,22 @@ export async function syncTypedTurnFromTranscript({
       }).catch(() => null)
       if (requestId) {
         openedNow = true
-        appendRequestEvent(
+        const currentWritten = appendRequestEvent(
           connectionId,
           midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
           { dir },
         )
+        if (!currentWritten) {
+          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
+        }
       }
     }
 
     if (requestId) {
       // Admit the terminal turn with the connection capability when attached, matching
       // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
-      // Only mark the transcript turn synced once admission succeeds; on refusal, preserve
-      // the structured refusal details and leave the turn unsynced so the next tick retries.
+      // Only mark the transcript turn synced once admission and binding write succeed; on
+      // refusal, preserve structured refusal details and leave unsynced so the next tick retries.
       const sessionId = state?.session_id || null
       const scope =
         !midTurn && sessionId && connectionCapability && typeof callPickup === 'function' && !state?.local_turn
@@ -329,7 +392,15 @@ export async function syncTypedTurnFromTranscript({
         if (typeof patchState === 'function') patchState({ local_turn: admission.admitted })
       }
 
-      appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: requestId }, { dir })
+      const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: requestId }, { dir })
+      if (!bound) {
+        return {
+          action: 'binding_write_failed',
+          requestId,
+          key: active.key,
+          midTurn,
+        }
+      }
       return {
         action: openedNow ? 'opened' : 'adopted_hook_request',
         requestId,
@@ -358,10 +429,11 @@ export async function syncTypedTurnFromTranscript({
 }
 
 /**
- * When Cursor is between turns (`ended: true`), close any finished open requests
- * (completed `typed_prompt` or answered room commands with no pending work) and
- * complete any lingering `local_turn` admission. Covers Cursor CLI where the plugin's
- * `stop` hook does not fire.
+ * When Cursor is between turns (`ended: true`), close the single finished request
+ * belonging to the ended turn (if it has no pending background work or recorded
+ * schedules) and complete any lingering `local_turn` admission. Covers Cursor CLI
+ * where the plugin's `stop` hook does not fire, without iterating over a variable-length
+ * set of database close calls (requirement c900f599).
  */
 export async function finishIdleRequests({
   connectionId,
@@ -372,7 +444,7 @@ export async function finishIdleRequests({
   callComplete = null,
   patchState = null,
   dir = DEFAULT_DIR,
-  attempts = 2,
+  attempts = STABLE_READ_ATTEMPTS,
 } = {}) {
   if (!connectionId || !transcriptPath) return { closed: [], localCompleted: false }
   const reqState = readRequestState(connectionId, { dir })
@@ -380,40 +452,47 @@ export async function finishIdleRequests({
   const localAttemptId = localTurnToComplete(state?.local_turn, sessionId)
   const sessionCrons = recordedSessionCrons(reqState)
   const pending = requestsWithWorkPending(reqState, { sessionCrons })
-  const hasFinished = [...reqState.open.keys()].some((id) => requestFinished(reqState, id, pending))
-  if (!hasFinished && !localAttemptId) return { closed: [], localCompleted: false }
-
   const active = activeTranscriptTurn(transcriptPath, { attempts })
   if (!active || !active.ended) return { closed: [], localCompleted: false }
 
+  // Identify the single request finished by this ended turn: either the request bound
+  // to this transcript turn key, or the foreground current request when finished.
+  const boundId = active.key ? reqState.seenTranscriptTurns.get(active.key) ?? null : null
+  const candidateId =
+    boundId && requestFinished(reqState, boundId, pending)
+      ? boundId
+      : reqState.current && requestFinished(reqState, reqState.current, pending)
+        ? reqState.current
+        : null
+
+  if (!candidateId && !localAttemptId) return { closed: [], localCompleted: false }
+
   let localCompleted = false
   if (localAttemptId && typeof callComplete === 'function') {
-    const calls = completionArguments({ connectionId, commands: [], localAttemptId, reason: 'turn_end' })
-    let ok = true
-    for (const args of calls) {
+    const [completeArgs] = completionArguments({ connectionId, commands: [], localAttemptId, reason: 'turn_end' })
+    if (completeArgs) {
       try {
-        await callComplete(args)
+        await callComplete(completeArgs)
+        localCompleted = true
+        if (typeof patchState === 'function') patchState({ local_turn: null })
       } catch {
-        ok = false
+        /* leave local_turn in place so the next idle tick retries */
       }
-    }
-    if (ok) {
-      localCompleted = true
-      if (typeof patchState === 'function') patchState({ local_turn: null })
     }
   }
 
-  let closed = []
-  if (hasFinished && connectionCapability && typeof callRequest === 'function') {
-    // DevSpec's report_request MCP tool accepts one request_id per close call
-    // (single-item API; server changes are outside this plugin's scope).
-    const res = await finishTurnRequests({
+  const closed = []
+  if (candidateId && connectionCapability && typeof callRequest === 'function') {
+    const ok = await closeRequest({
       connectionId,
+      requestId: candidateId,
       call: callRequest,
       dir,
-      sessionCrons,
-    }).catch(() => ({ closed: [] }))
-    closed = res.closed ?? []
+    }).catch(() => false)
+    if (ok) {
+      closed.push(candidateId)
+      rotateRequestLog(connectionId, { dir })
+    }
   }
 
   return { closed, localCompleted }

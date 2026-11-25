@@ -452,8 +452,7 @@ export function recordDeliveredBatchRequests(connectionId, batch, { dir = DEFAUL
   if (!connectionId || !batch || typeof batch !== 'object') return []
   const events = []
   const state = readRequestState(connectionId, { dir })
-  const currentOpen = state.current && state.current !== NO_REQUEST ? state.open.get(state.current) : null
-  const activeTurn = midTurn || state.current === NO_REQUEST || Boolean(currentOpen && !currentOpen.answered)
+  const activeTurn = midTurn || (state.current !== null && (state.current === NO_REQUEST || state.open.has(state.current)))
   if (batch.type === 'owner_messages' || batch.type === 'canonical_commands') {
     const executeIds = Array.isArray(batch.execute_message_ids)
       ? batch.execute_message_ids
@@ -497,8 +496,7 @@ export function requestRefForWrite(state, agentId = null) {
     if (launch) return state.open.has(launch.request) || launch.request === NO_REQUEST ? launch.request : null
   }
   if (state.current === NO_REQUEST) return NO_REQUEST
-  const info = state.current ? state.open.get(state.current) : null
-  return info && !info.answered ? state.current : null
+  return state.current && state.open.has(state.current) ? state.current : null
 }
 
 /**
@@ -544,7 +542,7 @@ function carriedEntries(state) {
     if (entries.some((entry) => entry.id === (ref ?? UNSTATED))) return
     if (ref === NO_REQUEST) entries.push({ id: NO_REQUEST, kind: 'none', current, attribution: 'nobody' })
     else if (ref === UNSTATED || ref === null) entries.push({ id: UNSTATED, kind: 'unstated', current, attribution: 'unknown' })
-    else if (state.open.has(ref) && !state.open.get(ref).answered) entries.push(openEntry(ref, state.open.get(ref), current))
+    else if (state.open.has(ref)) entries.push(openEntry(ref, state.open.get(ref), current))
   }
   add(state.current, true)
   for (const id of state.joined) add(id, false)
