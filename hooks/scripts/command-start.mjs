@@ -370,71 +370,80 @@ function findLargestRawArray(node, currentPath = [], best = null) {
  *  3. Returns `null` if `stdoutText` itself leaves too little room even for a structured
  *     refusal envelope with counts and recovery (never flattening to a generic sentence).
  */
-function compactBlockingFields(entry) {
-  if (!entry || typeof entry !== 'object') return null
-  const inner = entry.refusal && typeof entry.refusal === 'object' ? entry.refusal : entry
-  const out = {}
-  const copySmall = (target, key, val) => {
-    if (val === undefined || val === null) return
-    if (typeof val === 'boolean' || typeof val === 'number') {
-      target[key] = val
-    } else if (typeof val === 'string') {
-      if (val.length <= 160) target[key] = val
-    } else if (Array.isArray(val)) {
-      const compactItems = val
-        .slice(0, 3)
-        .map((item) => {
-          if (item && typeof item === 'object') {
-            const picked = {}
-            for (const f of ['id', 'turn_id', 'attempt_id', 'task_id', 'code', 'reason', 'title']) {
-              if (typeof item[f] === 'string' && item[f].length <= 80) picked[f] = item[f]
-            }
-            return Object.keys(picked).length > 0 ? picked : null
-          }
-          return typeof item === 'string' && item.length <= 80 ? item : null
-        })
-        .filter(Boolean)
-      if (compactItems.length > 0) {
-        target[key] = compactItems.length < val.length
-          ? { items: compactItems, total_count: val.length, returned_count: compactItems.length }
-          : compactItems
-      }
-    } else if (typeof val === 'object') {
-      const sub = {}
-      for (const [sk, sv] of Object.entries(val)) {
-        if (typeof sv === 'boolean' || typeof sv === 'number') sub[sk] = sv
-        else if (typeof sv === 'string' && sv.length <= 120) sub[sk] = sv
-      }
-      if (Object.keys(sub).length > 0) target[key] = sub
+function shrinkObjectToFit(obj, buildCandidate, fits, limitChars, effectiveRecovery) {
+  const working = cloneJsonSafe(obj)
+  const stringReplacement = (len) => ({
+    omitted_large_text: true,
+    actual_length: len,
+  })
+  const minShrinkableStringLen = JSON.stringify(stringReplacement(limitChars)).length
+
+  while (!fits(buildCandidate(working))) {
+    const bigStr = findLargestShrinkableString(working, minShrinkableStringLen)
+    const bigArr = findLargestRawArray(working)
+    if (bigStr && bigStr.path.length > 0 && (!bigArr || bigStr.length >= bigArr.size)) {
+      setAtPath(working, bigStr.path, stringReplacement(bigStr.length))
+      continue
     }
+    if (bigArr && bigArr.path.length > 0) {
+      const originalArr = getAtPath(working, bigArr.path)
+      const makeBoundedArr = (count) => ({
+        items: originalArr.slice(0, count),
+        total_count: originalArr.length,
+        returned_count: count,
+        omitted_count: originalArr.length - count,
+        omitted_due_to_shell_limit: true,
+        recovery: effectiveRecovery,
+      })
+      let alo = 0
+      let ahi = originalArr.length
+      while (alo < ahi) {
+        const amid = Math.ceil((alo + ahi) / 2)
+        setAtPath(working, bigArr.path, makeBoundedArr(amid))
+        if (fits(buildCandidate(working))) {
+          alo = amid
+        } else {
+          ahi = amid - 1
+        }
+      }
+      setAtPath(working, bigArr.path, makeBoundedArr(alo))
+      if (fits(buildCandidate(working))) break
+      continue
+    }
+    if (bigStr && bigStr.path.length > 0) {
+      setAtPath(working, bigStr.path, stringReplacement(bigStr.length))
+      continue
+    }
+    break
   }
-  for (const key of ['step', 'command_message_id', 'command_turn_id']) {
-    if (typeof entry[key] === 'string' && entry[key].length <= 120) out[key] = entry[key]
-  }
-  const priorityKeys = [
-    'code',
-    'blocking_turn_id',
-    'blocking_attempt_id',
-    'blocking_attempt',
-    'blocking_items',
-    'blocking',
-    'conflicting_records',
-    'conflicts',
-    'details',
-    'retryable',
-    'status',
-  ]
-  for (const key of priorityKeys) {
-    if (key in inner) copySmall(out, key, inner[key])
-  }
-  for (const [k, v] of Object.entries(inner)) {
-    if (k in out || k === 'error' || k === 'detail' || k === 'message') continue
-    if (typeof v === 'string' && v.length <= 80) out[k] = v
-    else if (typeof v === 'boolean' || typeof v === 'number') out[k] = v
-  }
-  return Object.keys(out).length > 0 ? out : null
+
+  const candidate = buildCandidate(working)
+  return fits(candidate) ? candidate : null
 }
 
+/**
+ * Budget-fitted structured refusal fallback when a pickup refusal payload exceeds
+ * Cursor's Shell output ceiling AND `~/.devspec/notes` cannot be written
+ * (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+ *
+ * Uses `fitsShellOutput` / `maxChars` directly with ZERO arbitrary item or character caps
+ * and ZERO silent field discarding inside retained objects:
+ *  1. Binary-searches the largest prefix of completely unmodified refusal objects that
+ *     fits beside `stdoutText`, reporting `total_count`, `returned_count`, `omitted_count`,
+ *     `read` (when a fallback note was saved), and `recovery`.
+ *  2. When even the first refusal object exceeds remaining budget, preserves every
+ *     structured field at every depth by replacing only the largest oversized string(s)
+ *     with explicit omission metadata (only when that actually shrinks JSON) and
+ *     binary-searching any oversized nested array to keep the maximum COMPLETE items
+ *     with `{ items, total_count, returned_count, omitted_count, omitted_due_to_shell_limit, recovery }`.
+ *  3. Under tight budgets, uses a compact JSON envelope (no verbose prefix), keeping
+ *     priority actionable fields greedily against `fits(...)` with explicit
+ *     `omitted_field_count` whenever fields are omitted, and ALWAYS preserving `read`
+ *     when `savedNote` succeeded.
+ *  4. Returns `null` if the remaining budget cannot fit either `read` (when saved) or
+ *     at least one actionable structured refusal detail — never emitting a generic
+ *     omission count that drops both blocking details and the saved-note read command.
+ */
 export function formatStructuredRefusalsFallback(
   refusals,
   {
@@ -491,181 +500,129 @@ export function formatStructuredRefusalsFallback(
   if (lo > 0) return wrap(list.slice(0, lo))
 
   // 2. Single first refusal exceeds remaining budget: shrink only oversized string
-  // leaves (using a concise marker so actionable structured fields stay intact) and/or
-  // binary-search oversized nested arrays while keeping counts, saved original pointer,
-  // and recovery at every depth.
-  const first = cloneJsonSafe(list[0])
-  const stringReplacement = (len) => ({
-    omitted_large_text: true,
-    actual_length: len,
-  })
-  const minShrinkableStringLen = JSON.stringify(stringReplacement(limitChars)).length
-
-  while (!fits(wrap([first]))) {
-    const bigStr = findLargestShrinkableString(first, minShrinkableStringLen)
-    const bigArr = findLargestRawArray(first)
-    if (bigStr && bigStr.path.length > 0 && (!bigArr || bigStr.length >= bigArr.size)) {
-      setAtPath(first, bigStr.path, stringReplacement(bigStr.length))
-      continue
-    }
-    if (bigArr && bigArr.path.length > 0) {
-      const originalArr = getAtPath(first, bigArr.path)
-      const makeBoundedArr = (count) => ({
-        items: originalArr.slice(0, count),
-        total_count: originalArr.length,
-        returned_count: count,
-        omitted_count: originalArr.length - count,
-        omitted_due_to_shell_limit: true,
-        recovery: effectiveRecovery,
-      })
-      let alo = 0
-      let ahi = originalArr.length
-      while (alo < ahi) {
-        const amid = Math.ceil((alo + ahi) / 2)
-        setAtPath(first, bigArr.path, makeBoundedArr(amid))
-        if (fits(wrap([first]))) {
-          alo = amid
-        } else {
-          ahi = amid - 1
-        }
-      }
-      setAtPath(first, bigArr.path, makeBoundedArr(alo))
-      if (fits(wrap([first]))) break
-      continue
-    }
-    if (bigStr && bigStr.path.length > 0) {
-      setAtPath(first, bigStr.path, stringReplacement(bigStr.length))
-      continue
-    }
-    break
-  }
-
-  const singleFitted = wrap([first])
-  if (fits(singleFitted)) return singleFitted
+  // leaves and/or binary-search oversized nested arrays while keeping every field and
+  // retained item complete with explicit omission counts, saved pointer, and recovery.
+  const singleFitted = shrinkObjectToFit(list[0], (item) => wrap([item]), fits, limitChars, effectiveRecovery)
+  if (singleFitted) return singleFitted
 
   if (!allowMinimalEnvelope) return null
 
+  // 3. Compact JSON envelope (drops verbose text prefix) with the exact same zero-cap
+  // budget-driven shrinker so every structured field and retained item stays complete.
+  const compactRecovery = savedCmd
+    ? 'Read full original via `read`; fix ~/.devspec/notes.'
+    : 'Fix ~/.devspec/notes permissions and retry.'
+  const compactWrap = (item) =>
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      note_write_failed: true,
+      shell_limit_chars: limitChars,
+      total_count: list.length,
+      returned_count: 1,
+      omitted_count: list.length - 1,
+      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
+      refusal: item,
+      recovery: compactRecovery,
+    })}\n`
+  const compactFitted = shrinkObjectToFit(list[0], compactWrap, fits, limitChars, compactRecovery)
+  if (compactFitted) return compactFitted
+
+  // 4. Tight budget envelope: greedily pack priority top-level structured refusal fields
+  // directly against `fits(...)` (no hard-coded item/char caps; retained items are never
+  // stripped silently; omitted top-level keys are disclosed via `omitted_field_count`),
+  // ALWAYS keeping `read: savedCmd` when a fallback note was saved.
+  const primaryEntry = list[0] && typeof list[0] === 'object' ? list[0] : {}
+  const primaryInner =
+    primaryEntry.refusal && typeof primaryEntry.refusal === 'object' ? primaryEntry.refusal : primaryEntry
+  const priorityOrder = [
+    'code',
+    'blocking_turn_id',
+    'blocking_attempt_id',
+    'blocking_attempt',
+    'blocking_items',
+    'blocking',
+    'conflicting_records',
+    'conflicts',
+    'details',
+    'retryable',
+    'status',
+  ]
+  const orderedKeys = [
+    ...priorityOrder.filter((k) => k in primaryInner),
+    ...Object.keys(primaryInner).filter((k) => !priorityOrder.includes(k)),
+  ]
   const allCodes = list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
-  const blockingDetails = list.map(compactBlockingFields).filter(Boolean)
-  const fitCodes = (build) => {
+  const tightRecovery = savedCmd ? 'Read `read`; fix ~/.devspec/notes.' : 'Fix ~/.devspec/notes & retry.'
+  const buildTight = (fieldsObj, omittedFieldsCount, codesSlice = []) =>
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      ...(codesSlice.length > 0 ? { codes: codesSlice } : {}),
+      ...fieldsObj,
+      ...(omittedFieldsCount > 0 ? { omitted_field_count: omittedFieldsCount } : {}),
+      omitted_count: list.length,
+      shell_limit_chars: limitChars,
+      ...(savedCmd ? { read: savedCmd } : {}),
+      recovery: tightRecovery,
+    })}\n`
+
+  let fittedCodes = []
+  if (allCodes.length > 0) {
     let clo = 0
     let chi = allCodes.length
     while (clo < chi) {
       const cmid = Math.ceil((clo + chi) / 2)
-      if (fits(build(allCodes.slice(0, cmid)))) {
+      if (fits(buildTight({}, orderedKeys.length, allCodes.slice(0, cmid)))) {
         clo = cmid
       } else {
         chi = cmid - 1
       }
     }
-    const candidate = build(allCodes.slice(0, clo))
-    return fits(candidate) ? candidate : null
+    fittedCodes = allCodes.slice(0, clo)
   }
-  const fitBlocking = (build) => {
-    if (blockingDetails.length === 0) return null
-    let blo = 0
-    let bhi = blockingDetails.length
-    while (blo < bhi) {
-      const bmid = Math.ceil((blo + bhi) / 2)
-      if (fits(build(blockingDetails.slice(0, bmid)))) {
-        blo = bmid
-      } else {
-        bhi = bmid - 1
+
+  const pickedFields = {}
+  let pickedCount = 0
+  for (const key of orderedKeys) {
+    const val = primaryInner[key]
+    if (val === undefined) continue
+    const nextRemaining = Math.max(0, orderedKeys.length - (pickedCount + 1))
+    const directCandidate = buildTight({ ...pickedFields, [key]: val }, nextRemaining, fittedCodes)
+    if (fits(directCandidate)) {
+      pickedFields[key] = val
+      pickedCount += 1
+      continue
+    }
+    if (val && typeof val === 'object') {
+      const fittedSub = shrinkObjectToFit(
+        { [key]: val },
+        (sub) => buildTight({ ...pickedFields, ...sub }, nextRemaining, fittedCodes),
+        fits,
+        limitChars,
+        tightRecovery,
+      )
+      if (fittedSub) {
+        const parsedSub = JSON.parse(fittedSub)
+        if (key in parsedSub) {
+          pickedFields[key] = parsedSub[key]
+          pickedCount += 1
+        }
       }
     }
-    if (blo === 0) return null
-    const candidate = build(blockingDetails.slice(0, blo))
-    return fits(candidate) ? candidate : null
   }
 
-  // Tier 1: full prefix + full metadata + compact actionable blocking fields + codes.
-  const tier1WithBlocking = fitBlocking((blocking) =>
-    wrap([], {
-      ...(allCodes.length > 0 ? { codes: allCodes } : {}),
-      ...(blocking.length > 0 ? { blocking } : {}),
-    }),
-  )
-  if (tier1WithBlocking) return tier1WithBlocking
-  const tier1 = fitCodes((codes) => wrap([], { codes }))
-  if (tier1) return tier1
-
-  // Tier 2: compact structured JSON envelope preserving actionable blocking fields,
-  // saved original-response `read` command (when fallback storage succeeded), counts,
-  // limit, refusal codes, and concrete recovery steps for tight ~250-350 char budgets.
-  const tier2Recovery = savedCmd
-    ? 'Read full original via `read`; fix ~/.devspec/notes.'
-    : 'Fix ~/.devspec/notes permissions and retry.'
-  const tier2Full = fitBlocking(
-    (blocking) =>
-      `${JSON.stringify({
-        refused: 'report_pickup',
-        note_write_failed: true,
-        shell_limit_chars: limitChars,
-        total_count: list.length,
-        omitted_count: list.length,
-        ...(allCodes.length > 0 ? { codes: allCodes } : {}),
-        ...(blocking.length > 0 ? { blocking } : {}),
-        ...(savedCmd ? { read: savedCmd } : {}),
-        recovery: tier2Recovery,
-      })}\n`,
-  )
-  if (tier2Full) return tier2Full
-
-  // Tier 2b: keep primary actionable blocking identifiers (e.g. blocking_turn_id /
-  // blocking_attempt / code) + `read` pointer even under a tight ~300-350 char budget.
-  const primaryInner = list[0]?.refusal && typeof list[0].refusal === 'object' ? list[0].refusal : list[0]
-  const tightBlocking = {}
-  for (const key of ['blocking_turn_id', 'blocking_attempt_id', 'blocking_attempt', 'retryable']) {
-    if (primaryInner && primaryInner[key] !== undefined && JSON.stringify(primaryInner[key]).length <= 120) {
-      tightBlocking[key] = primaryInner[key]
-    }
+  const omittedFieldsCount = Math.max(0, orderedKeys.length - pickedCount)
+  if (savedCmd) {
+    // When original was saved, ALWAYS preserve `read` (plus any structured fields that fit).
+    const withRead = buildTight(pickedFields, omittedFieldsCount, fittedCodes)
+    if (fits(withRead)) return withRead
+    const readOnly = buildTight({}, orderedKeys.length, [])
+    return fits(readOnly) ? readOnly : null
   }
-  const tier2Tight = fitCodes(
-    (codes) =>
-      `${JSON.stringify({
-        refused: 'report_pickup',
-        note_write_failed: true,
-        shell_limit_chars: limitChars,
-        total_count: list.length,
-        omitted_count: list.length,
-        ...(codes.length > 0 ? { codes } : {}),
-        ...tightBlocking,
-        ...(savedCmd ? { read: savedCmd } : {}),
-        recovery: tier2Recovery,
-      })}\n`,
-  )
-  if (tier2Tight) return tier2Tight
-
-  // Tier 3: minimal structured JSON omission + saved original pointer + recovery notice
-  // that fits inside `shellDiagnosticReserve('devspec-remote-wait')` (~119-200 chars).
-  const tier3WithRead = savedCmd
-    ? `${JSON.stringify({
-        refused: 'report_pickup',
-        ...tightBlocking,
-        ...(allCodes.length > 0 ? { codes: allCodes.slice(0, 1) } : {}),
-        omitted_count: list.length,
-        shell_limit_chars: limitChars,
-        read: savedCmd,
-        recovery: 'Read `read`; fix ~/.devspec/notes.',
-      })}\n`
-    : null
-  if (tier3WithRead && fits(tier3WithRead)) return tier3WithRead
-  const tier3 = `${JSON.stringify({
-    refused: 'report_pickup',
-    ...tightBlocking,
-    omitted_count: list.length,
-    shell_limit_chars: limitChars,
-    ...(savedCmd ? { read: savedCmd } : {}),
-    recovery: 'Fix ~/.devspec/notes & retry.',
-  })}\n`
-  if (fits(tier3)) return tier3
-  const tier3Bare = `${JSON.stringify({
-    refused: 'report_pickup',
-    omitted_count: list.length,
-    shell_limit_chars: limitChars,
-    recovery: 'Fix ~/.devspec/notes & retry.',
-  })}\n`
-  return fits(tier3Bare) ? tier3Bare : null
+  // When no fallback note could be saved, require at least one actionable structured field
+  // rather than returning a bare omission count with no actionable details or read path.
+  if (pickedCount === 0 && fittedCodes.length === 0) return null
+  const withoutRead = buildTight(pickedFields, omittedFieldsCount, fittedCodes)
+  return fits(withoutRead) ? withoutRead : null
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */

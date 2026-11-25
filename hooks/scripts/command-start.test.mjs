@@ -10,6 +10,7 @@ import { after, describe, it } from 'node:test'
 import {
   clearWakeListenerNeeded,
   extractRoomCommandsFromWake,
+  formatStructuredRefusalsFallback,
   isWakeListenerActive,
   markWakeListenerNeeded,
   startRoomCommands,
@@ -26,7 +27,7 @@ import {
   runOneShotRoomCommandPickup,
 } from './devspec-remote-wait.mjs'
 import { fastConnect } from './fast-connect.mjs'
-import { fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote, writeNote } from './hook-context-budget.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { ensureWakeFollowForConnection, withWakeFollowLock } from './remote-control-state.mjs'
 import { readRequestState } from './requests.mjs'
@@ -39,6 +40,7 @@ import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import {
   holdForNextStep,
   isStepBatch,
+  registerPendingWakeNote,
   releaseAtIdle,
   stepDeliveryHook,
 } from './step-delivery.mjs'
@@ -2110,5 +2112,129 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     })
     assert.equal(read2.marked, true)
     assert.deepEqual(pickups, [MSG_ID])
+  })
+
+  it('does NOT advance wake cursor past an earlier wake-note currently renamed to .taken-... by a concurrent hook (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    const posFile = path.join(dir, `${CONN}.wake-pos.json`)
+    fs.writeFileSync(posFile, JSON.stringify({ version: 1, file: wakeFile, offset: 0 }), { mode: 0o600 })
+
+    const noteA = writeNote('First oversized command note', { home })
+    const noteB = writeNote('Second oversized command note', { home })
+    const msgA = '11111111-1111-4111-8111-1111111111aa'
+    const turnA = '22222222-2222-4222-8222-2222222222aa'
+    const msgB = '33333333-3333-4333-8333-3333333333bb'
+    const turnB = '44444444-4444-4444-8444-4444444444bb'
+
+    registerPendingWakeNote(
+      CONN,
+      {
+        noteId: noteA.id,
+        commands: [{ turnId: turnA, messageId: msgA }],
+        messages: [{ message_id: msgA }],
+        sessionId: ROOM,
+        wakeFile,
+        wakePositionPath: posFile,
+        wakeStart: 0,
+        wakeThrough: 100,
+      },
+      { dir },
+    )
+    registerPendingWakeNote(
+      CONN,
+      {
+        noteId: noteB.id,
+        commands: [{ turnId: turnB, messageId: msgB }],
+        messages: [{ message_id: msgB }],
+        sessionId: ROOM,
+        wakeFile,
+        wakePositionPath: posFile,
+        wakeStart: 100,
+        wakeThrough: 200,
+      },
+      { dir },
+    )
+
+    // Simulate Hook 1 currently holding Note A as `.taken-<livePid>-<hex>` while awaiting report_pickup.
+    const steps = path.join(dir, `${CONN}.steps`)
+    const noteAFile = path.join(steps, `wake-note-${noteA.id}.json`)
+    const noteATaken = `${noteAFile}.taken-${process.pid}-deadbeef`
+    fs.renameSync(noteAFile, noteATaken)
+
+    // Hook 2 finishes reading and picking up Note B concurrently.
+    const noteBParts = noteFiles(home, noteB.id)
+    for (const part of noteBParts) {
+      await stepDeliveryHook(catCall(home, part, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async (opts) => ({ ok: true, outcome: 'picked_up', started: opts.commands, pickedUp: 1 }),
+      })
+    }
+
+    // Wake cursor MUST STILL BE 0 because Note A (0..100) is still in-flight (.taken-...).
+    const posAfterB = JSON.parse(fs.readFileSync(posFile, 'utf8'))
+    assert.equal(posAfterB.offset, 0, 'completing Note B must NOT advance wake cursor past in-flight .taken Note A')
+
+    // Now Hook 1 returns Note A and completes it -> cursor advances cleanly to 200!
+    fs.renameSync(noteATaken, noteAFile)
+    const noteAParts = noteFiles(home, noteA.id)
+    for (const part of noteAParts) {
+      await stepDeliveryHook(catCall(home, part, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async (opts) => ({ ok: true, outcome: 'picked_up', started: opts.commands, pickedUp: 1 }),
+      })
+    }
+    const posAfterA = JSON.parse(fs.readFileSync(posFile, 'utf8'))
+    assert.equal(posAfterA.offset, 200, 'wake cursor must advance to 200 once both Note A and Note B complete')
+  })
+
+  it('formatStructuredRefusalsFallback never strips fields inside retained blocking items, never drops read when saved, and returns null instead of bare omission without details (3c5147a7 / 4e32d1a5 / 91d7b47c)', () => {
+    const refusal = [
+      {
+        command_message_id: MSG_ID,
+        command_turn_id: TURN_ID,
+        refusal: {
+          code: 'turn_busy',
+          blocking_turn_id: '99999999-9999-4999-8999-999999999999',
+          blocking_items: [
+            {
+              id: 'item-1',
+              owner: 'Ali Price',
+              extra_context: 'must-not-be-silently-discarded',
+            },
+            {
+              id: 'item-2',
+              owner: 'Ali Price',
+              extra_context: 'second-item-full-fields',
+            },
+          ],
+          error: 'e'.repeat(10_000),
+        },
+      },
+    ]
+    const saved = { command: "cat '/tmp/devspec-notes-1000/0123456789abcdef.md'", parts: 1 }
+
+    // 1. Medium budget: retained blocking_items keep ALL their fields (owner + extra_context) intact!
+    const med = formatStructuredRefusalsFallback(refusal, { maxChars: 900, savedNote: saved })
+    assert.ok(med && med.length <= 900)
+    assert.match(med, /must-not-be-silently-discarded/)
+    assert.match(med, /0123456789abcdef\.md/)
+
+    // 2. Tight budget (~200 chars) WITH savedNote: MUST preserve `read` (never drop `read` for bare omission).
+    const tightWithSaved = formatStructuredRefusalsFallback(refusal, { maxChars: 240, savedNote: saved })
+    assert.ok(tightWithSaved && tightWithSaved.length <= 240)
+    const parsedTight = JSON.parse(tightWithSaved)
+    assert.equal(parsedTight.read, saved.command)
+    assert.ok(parsedTight.omitted_field_count >= 1, 'omitted top-level fields must be disclosed explicitly')
+
+    // 3. Ultra-tight budget (100 chars) WITH savedNote: returns null (so fitShellDiagnostic emits shellDiagnosticPointer), NEVER drops `read`.
+    assert.equal(formatStructuredRefusalsFallback(refusal, { maxChars: 100, savedNote: saved }), null)
+
+    // 4. Ultra-tight budget (110 chars) WITHOUT savedNote: returns null rather than a bare omission count with neither blocking fields nor read!
+    assert.equal(formatStructuredRefusalsFallback(refusal, { maxChars: 110, savedNote: null }), null)
   })
 })

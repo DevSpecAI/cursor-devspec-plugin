@@ -841,7 +841,11 @@ export function shellDiagnosticPointer(label, command) {
  * at the shared Shell boundary (requirements 3c5147a7 / 91d7b47c).
  */
 export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
-  return shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
+  const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
+  const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
+  return fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
 }
 
 function shellQuotePath(value) {

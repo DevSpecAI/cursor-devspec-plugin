@@ -148,6 +148,7 @@ const HANDED = 'handed.json'
 const STEPS_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
 const WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json$/
+const TAKEN_WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json\.taken-(\d+)-[0-9a-f]{8}$/
 const WAKE_INLINE_HOLD = 'wake-inline-hold.json'
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
 
@@ -296,16 +297,38 @@ export function registerPendingWakeNote(
  */
 function advanceCompletedWakeNotePositions(steps) {
   const files = pendingWakeNoteFiles(steps)
+  const takenFiles = takenWakeNoteFiles(steps)
   if (files.length === 0) return
   const byPosPath = new Map()
   for (const file of files) {
     const entry = readPrivateJson(file)
     if (!entry || typeof entry.wake_position_path !== 'string') continue
     if (!byPosPath.has(entry.wake_position_path)) byPosPath.set(entry.wake_position_path, [])
-    byPosPath.get(entry.wake_position_path).push({ file, entry })
+    byPosPath.get(entry.wake_position_path).push({ file, entry, taken: false })
+  }
+  // Include in-flight wake-note markers currently renamed to `.taken-...` by a concurrent
+  // hook awaiting pickup so a later note completing out of order can NEVER advance the wake
+  // cursor past an earlier in-flight note (requirement 3ea2b201).
+  let unknownTakenPresent = false
+  const takenIncompleteMinByPos = new Map()
+  for (const takenFile of takenFiles) {
+    const entry = readPrivateJson(takenFile)
+    if (!entry || typeof entry.wake_position_path !== 'string') {
+      unknownTakenPresent = true
+      continue
+    }
+    const start = typeof entry.wake_start === 'number' ? entry.wake_start : 0
+    const prevMin = takenIncompleteMinByPos.get(entry.wake_position_path)
+    if (prevMin === undefined || start < prevMin) {
+      takenIncompleteMinByPos.set(entry.wake_position_path, start)
+    }
   }
   for (const [posPath, group] of byPosPath) {
-    let minIncompleteStart = Number.POSITIVE_INFINITY
+    let minIncompleteStart = unknownTakenPresent ? 0 : Number.POSITIVE_INFINITY
+    const takenMin = takenIncompleteMinByPos.get(posPath)
+    if (typeof takenMin === 'number' && takenMin < minIncompleteStart) {
+      minIncompleteStart = takenMin
+    }
     const inlineHoldOffset = readWakeInlineHoldOffset(steps, posPath)
     if (typeof inlineHoldOffset === 'number' && inlineHoldOffset < minIncompleteStart) {
       minIncompleteStart = inlineHoldOffset
@@ -363,6 +386,18 @@ function pendingWakeNoteFiles(steps) {
     return fs
       .readdirSync(steps)
       .filter((name) => WAKE_NOTE.test(name))
+      .sort()
+      .map((name) => path.join(steps, name))
+  } catch {
+    return []
+  }
+}
+
+function takenWakeNoteFiles(steps) {
+  try {
+    return fs
+      .readdirSync(steps)
+      .filter((name) => TAKEN_WAKE_NOTE.test(name))
       .sort()
       .map((name) => path.join(steps, name))
   } catch {
