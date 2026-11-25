@@ -796,9 +796,9 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
   const minimalText = JSON.stringify(minimal, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
 
-  // Final guaranteed-bounded receipt when caller-supplied identifier fields (such as an
-  // unbounded --session or --local-id argument) exceed Cursor's Shell ceiling on their own.
-  return (
+  // Final guaranteed-bounded receipt when caller-supplied identifier fields or prior stderr
+  // leave minimal room inside Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c).
+  const compactReceipt =
     JSON.stringify(
       {
         ok: Boolean(base.ok),
@@ -809,7 +809,12 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
       null,
       2,
     ) + '\n'
-  )
+  if (fitsShellOutput(`${reserve}${compactReceipt}`)) return compactReceipt
+  const tightReceipt = `${JSON.stringify({ ok: Boolean(base.ok), note: noteRef.id, read: noteRef.command })}\n`
+  if (fitsShellOutput(`${reserve}${tightReceipt}`)) return tightReceipt
+  const bareReceipt = `${JSON.stringify({ ok: Boolean(base.ok), note: noteRef.id })}\n`
+  if (fitsShellOutput(`${reserve}${bareReceipt}`)) return bareReceipt
+  return ''
 }
 
 function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength, { reserve = '' } = {}) {
@@ -890,7 +895,7 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     if (fitsShellOutput(`${reserve}${text}`)) return text
   }
 
-  return (
+  const fallbackReceipt =
     JSON.stringify(
       {
         ok: Boolean(base.ok),
@@ -912,7 +917,12 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
       null,
       2,
     ) + '\n'
-  )
+  if (fitsShellOutput(`${reserve}${fallbackReceipt}`)) return fallbackReceipt
+  const tightFallback = `${JSON.stringify({ ok: Boolean(base.ok), note_failed: true, total_chars: fullTextLength, limit: CURSOR_SHELL_OUTPUT_MAX_CHARS })}\n`
+  if (fitsShellOutput(`${reserve}${tightFallback}`)) return tightFallback
+  const bareFallback = `${JSON.stringify({ ok: Boolean(base.ok), note_failed: true })}\n`
+  if (fitsShellOutput(`${reserve}${bareFallback}`)) return bareFallback
+  return ''
 }
 
 export function formatFastConnectCliOutput(result, { home = os.homedir(), reserve = '' } = {}) {

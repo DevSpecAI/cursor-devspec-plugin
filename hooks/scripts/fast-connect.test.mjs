@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { fitsShellOutput } from './hook-context-budget.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { parseArgs } from './remote-control-state.mjs'
+import { formatBoundedCliStderr, parseArgs } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -1174,6 +1174,23 @@ describe('fast-connect CLI flags', () => {
       assert.equal(r3.code, 2)
       assert.ok(fitsShellOutput(r3.stdout + r3.stderr))
       assert.match(r3.stderr, /actual_length 24000/)
+
+      // Even when prior stderr already occupies 19,980 characters, neither connect receipt nor stderr fallback crosses fitsShellOutput.
+      const tightReserve = 'e'.repeat(19_980)
+      const withNote = formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve })
+      assert.ok(fitsShellOutput(tightReserve + withNote), `tightReserve + withNote (${(tightReserve + withNote).length}) must fit fitsShellOutput`)
+
+      const brokenHome2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-tight-broken-'))
+      try {
+        fs.mkdirSync(path.join(brokenHome2, '.devspec'), { recursive: true })
+        fs.writeFileSync(path.join(brokenHome2, '.devspec', 'notes'), 'file blocking notes dir')
+        const withoutNote = formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home: brokenHome2, reserve: tightReserve })
+        assert.ok(fitsShellOutput(tightReserve + withoutNote), `tightReserve + withoutNote (${(tightReserve + withoutNote).length}) must fit fitsShellOutput`)
+        const stderrOut = formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: tightReserve })
+        assert.ok(fitsShellOutput(tightReserve + stderrOut), `tightReserve + stderrOut (${(tightReserve + stderrOut).length}) must fit fitsShellOutput`)
+      } finally {
+        fs.rmSync(brokenHome2, { recursive: true, force: true })
+      }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

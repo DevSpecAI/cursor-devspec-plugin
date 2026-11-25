@@ -1871,7 +1871,8 @@ export function formatBoundedCliStderr(
       ? fallback
       : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed.\n`
   if (fitsShellOutput(`${prior}${fb}`)) return fb
-  return `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`
+  const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`
+  return fitsShellOutput(`${prior}${omitted}`) ? omitted : ''
 }
 
 // --- CLI entry (skipped when imported for tests) ---
