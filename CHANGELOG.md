@@ -3,7 +3,8 @@
 ## 0.34.0
 
 - **Browser sign-in only.** Removed the legacy `DEVSPEC_MCP_TOKEN` environment-variable fallback from the plugin and its docs. Both Cursor's DevSpec tools and background features sign in through browser approval (with the copy-a-code flow over SSH).
-- **Clearer Cursor CLI documentation and transparent data handling.** The README and plugin manifests now name and describe the plugin consistently as **DevSpec for Cursor CLI** for developers who already have a Cursor subscription, explain plainly that the Cursor editor is not supported, and document everything the plugin sends to DevSpec when connected — including typed prompts, shell commands and output, file edits, agent thinking, telemetry, and commit tracking.
+- **Accurate live model reporting after switching models.** Fixed stale tool hooks overwriting the active model on DevSpec's Agents page after you switch models mid-session.
+- **Clearer Cursor CLI documentation and transparent data handling.** The README and plugin manifests now name and describe the plugin consistently as **DevSpec for Cursor CLI** for developers who already have a Cursor subscription, explain plainly that the Cursor editor is not supported, call out selecting `Devspec-cursor (plugin)` in `/mcp` when Claude Code's DevSpec plugin is also installed, and document everything the plugin sends to DevSpec when connected — including typed prompts, shell commands and output, file edits, agent thinking, telemetry, and commit tracking.
 - **Package cleanup.** Aligned author, owner, and description metadata across all manifest files and removed developer-only sync scripts from the plugin package.
 - Start a new `cursor-agent` session to pick this up.
 
