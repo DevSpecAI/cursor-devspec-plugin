@@ -12,9 +12,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { fitsShellOutput } from './hook-context-budget.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { parseArgs, summarizeConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
+import { formatConnectCliOutput, parseArgs, summarizeConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -976,7 +977,7 @@ describe('fast-connect CLI flags', () => {
         path.join(home, '.cursor', 'mcp.json'),
         JSON.stringify({ mcpServers: { devspec: { url: `http://127.0.0.1:${port}/api/mcp` } } }),
       )
-      const { stdout, code } = await new Promise((resolve, reject) => {
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
         const child = spawn(
           process.execPath,
           [
@@ -1011,15 +1012,122 @@ describe('fast-connect CLI flags', () => {
         child.on('close', (code) => {
           const out = Buffer.concat(chunks).toString('utf8')
           if (!out) return reject(new Error(`empty stdout (code=${code}, stderr=${stderr})`))
-          resolve({ stdout: out, code })
+          resolve({ stdout: out, stderr, code })
         })
       })
       assert.equal(code, 1)
+      assert.equal(stderr, '', 'non-Git cwd must not leak git stderr into Cursor Shell output')
       assert.ok(Buffer.byteLength(stdout, 'utf8') > 8192, `expected > 8 KB JSON, got ${Buffer.byteLength(stdout, 'utf8')}`)
+      assert.ok(fitsShellOutput(stdout + stderr))
       const parsed = JSON.parse(stdout)
       assert.equal(parsed.code, 'project_choice_required')
       assert.equal(parsed.project_selection.candidates.length, 50)
       assert.equal(parsed.project_selection.candidates[49].name, 'Pipe Project 49')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps combined stdout + stderr within fitsShellOutput in a non-Git folder with near-limit 80-candidate project choices and respects stderr reserve (3c5147a7 / 91d7b47c / 4e32d1a5)', async () => {
+    const candidates = Array.from({ length: 80 }, (_, idx) => ({
+      project_id: `00000000-0000-4000-8000-${String(idx + 1).padStart(12, '0')}`,
+      name: `Near Limit Project ${idx}`,
+      organization_id: `10000000-0000-4000-8000-${String(idx + 1).padStart(12, '0')}`,
+      organization_name: `Org ${idx}`,
+    }))
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'project_choice_required',
+                error: 'Several accessible projects match. Choose a project and organisation.',
+                project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-nongit-80-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true })
+      fs.writeFileSync(
+        path.join(home, '.cursor', 'mcp.json'),
+        JSON.stringify({ mcpServers: { devspec: { url: `http://127.0.0.1:${port}/api/mcp` } } }),
+      )
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [
+            script,
+            'fast-connect',
+            '--local-id', 'nongit-80-conv',
+            '--owner-pid', String(process.pid),
+            '--cwd', home,
+            '--host-token', 'dvs_pipe_test_token',
+            '--no-poller',
+          ],
+          {
+            cwd: home,
+            env: {
+              ...process.env,
+              HOME: home,
+              DEVSPEC_MCP_URL: `http://127.0.0.1:${port}/api/mcp`,
+              DEVSPEC_MCP_TOKEN: 'dvs_pipe_test_token',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        child.on('error', reject)
+        child.on('close', (code) => resolve({ stdout, stderr, code }))
+      })
+      assert.equal(code, 1)
+      assert.equal(stderr, '', 'git remote probe in a non-Git folder must not write to stderr')
+      assert.ok(
+        fitsShellOutput(stdout + stderr),
+        `combined stdout (${stdout.length}) + stderr (${stderr.length}) must fit fitsShellOutput`,
+      )
+      const parsed = JSON.parse(stdout)
+      assert.equal(parsed.code, 'project_choice_required')
+      if (parsed.project_selection?.omitted_inline) {
+        assert.ok(parsed.complete_output_note?.command)
+      } else {
+        assert.equal(parsed.project_selection.candidates.length, 80)
+      }
+
+      // Also verify that explicit stderr reserve pushes a near-limit result into a sealed note.
+      const reserve = 'stderr diagnostic '.repeat(25)
+      const nearLimit = {
+        ok: false,
+        code: 'project_choice_required',
+        error: 'Choose a project.',
+        project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+      }
+      const baseLen = (JSON.stringify(nearLimit, null, 2) + '\n').length
+      if (baseLen < 19_900) {
+        nearLimit.project_selection.candidates[0].description = 'd'.repeat(19_900 - baseLen)
+      }
+      const formatted = formatConnectCliOutput(nearLimit, { home, reserve })
+      assert.ok(fitsShellOutput(reserve + formatted), 'reserve + formatted stdout must fit fitsShellOutput')
+      const receipt = JSON.parse(formatted)
+      assert.equal(receipt.project_selection.omitted_inline, true)
+      assert.ok(receipt.complete_output_note?.command)
     } finally {
       await new Promise((resolve) => server.close(resolve))
       fs.rmSync(home, { recursive: true, force: true })

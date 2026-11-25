@@ -503,6 +503,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
       timeout: Math.max(timeout + 4000, 5000),
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -759,6 +760,7 @@ export function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
@@ -824,6 +826,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -1632,7 +1635,7 @@ export function summarizeConnectCliOutput(result) {
  * receipt naming the note command so Cursor never clips the middle of the choices
  * (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
  */
-function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength) {
+function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { reserve = '' } = {}) {
   const base =
     summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
   const selection = base.project_selection
@@ -1654,7 +1657,7 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength) {
   base.complete_output_note = noteRef
   base.note = noteMsg
   const richText = JSON.stringify(base, null, 2) + '\n'
-  if (fitsShellOutput(richText)) return richText
+  if (fitsShellOutput(`${reserve}${richText}`)) return richText
 
   // Strict fixed-shape receipt when variable-length fields (e.g. an oversized `error`
   // string) pushed the rich receipt past Cursor's Shell ceiling. Every omitted field is
@@ -1683,7 +1686,7 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength) {
     note: noteMsg,
   }
   const minimalText = JSON.stringify(minimal, null, 2) + '\n'
-  if (fitsShellOutput(minimalText)) return minimalText
+  if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
 
   // Final guaranteed-bounded receipt when caller-supplied identifier fields (such as an
   // unbounded --session or --local-id argument) exceed Cursor's Shell ceiling on their own.
@@ -1701,7 +1704,7 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength) {
   )
 }
 
-function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
+function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { reserve = '' } = {}) {
   const base =
     summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
   const selection =
@@ -1758,23 +1761,23 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
     return JSON.stringify(out, null, 2) + '\n'
   }
 
-  const useMinimal = !fitsShellOutput(makePayload([], { minimal: false }))
+  const useMinimal = !fitsShellOutput(`${reserve}${makePayload([], { minimal: false })}`)
   if (allCandidates && allCandidates.length > 0) {
     let lo = 0
     let hi = allCandidates.length
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2)
-      if (fitsShellOutput(makePayload(allCandidates.slice(0, mid), { minimal: useMinimal }))) {
+      if (fitsShellOutput(`${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal })}`)) {
         lo = mid
       } else {
         hi = mid - 1
       }
     }
     const text = makePayload(allCandidates.slice(0, lo), { minimal: useMinimal })
-    if (fitsShellOutput(text)) return text
+    if (fitsShellOutput(`${reserve}${text}`)) return text
   } else {
     const text = makePayload([], { minimal: useMinimal })
-    if (fitsShellOutput(text)) return text
+    if (fitsShellOutput(`${reserve}${text}`)) return text
   }
 
   return (
@@ -1821,10 +1824,10 @@ export function writeStreamAndFlush(stream, text) {
   })
 }
 
-export function formatConnectCliOutput(result, { home = os.homedir() } = {}) {
+export function formatConnectCliOutput(result, { home = os.homedir(), reserve = '' } = {}) {
   const summary = summarizeConnectCliOutput(result)
   const fullText = JSON.stringify(summary, null, 2) + '\n'
-  if (fitsShellOutput(fullText)) return fullText
+  if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
 
   try {
     const note = writeNote(fullText, { home })
@@ -1835,9 +1838,9 @@ export function formatConnectCliOutput(result, { home = os.homedir() } = {}) {
       total_chars: fullText.length,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     }
-    return buildBoundedConnectNoteReceipt(summary, noteRef, fullText.length)
+    return buildBoundedConnectNoteReceipt(summary, noteRef, fullText.length, { reserve })
   } catch (error) {
-    return buildConnectNoteFailureFallback(summary, error, fullText.length)
+    return buildConnectNoteFailureFallback(summary, error, fullText.length, { reserve })
   }
 }
 
@@ -2098,13 +2101,19 @@ if (isMain) {
 }
 
 async function runCli() {
+  let emittedStderr = ''
+  const rawStderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = (chunk, ...rest) => {
+    emittedStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    return rawStderrWrite(chunk, ...rest)
+  }
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
 
   if (cmd === 'fast-connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
-    await runFastConnectCli(args)
+    await runFastConnectCli(args, { getEmittedStderr: () => emittedStderr })
     return
   }
 
@@ -2633,7 +2642,7 @@ async function runCli() {
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: emittedStderr }))
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2659,7 +2668,7 @@ async function runCli() {
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: emittedStderr }))
     process.exit(result.ok ? 0 : 1)
   }
 

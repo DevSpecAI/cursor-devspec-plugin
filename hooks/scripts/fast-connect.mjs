@@ -96,6 +96,7 @@ export function resolveGitRemote(cwd, { execFileSyncImpl = execFileSync } = {}) 
       encoding: 'utf8',
       windowsHide: true,
       timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const url = String(out || '').trim()
     return url || null
@@ -730,44 +731,60 @@ Prints one JSON result; exits 0 when connected, 1 when not.
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
  */
-export async function runFastConnectCli(args) {
-  // Help is read before anything else: it registers, writes and calls nothing.
-  if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
-    process.exit(0)
-  }
-
-  let promptText = null
-  if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
-    try {
-      promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
-    } catch (err) {
-      await writeStreamAndFlush(
-        process.stderr,
-        `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
-      )
-      process.exit(1)
+export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) {
+  let localStderr = ''
+  const origStderrWrite = getEmittedStderr ? null : process.stderr.write.bind(process.stderr)
+  if (origStderrWrite) {
+    process.stderr.write = (chunk, ...rest) => {
+      localStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+      return origStderrWrite(chunk, ...rest)
     }
   }
+  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderr)
+  try {
+    // Help is read before anything else: it registers, writes and calls nothing.
+    if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
+      await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
+      process.exit(0)
+    }
 
-  const result = await fastConnect({
-    localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
-    cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
-    sessionId: typeof args.session === 'string' ? args.session : null,
-    newSession: !!args.new,
-    title: typeof args.title === 'string' ? args.title : null,
-    private: !!args.private,
-    launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
-    projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
-    agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
-    ownerPid: args['owner-pid'] ?? null,
-    noPoller: !!args.noPoller,
-    hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
-    codename: typeof args.codename === 'string' ? args.codename : null,
-    forceNew: !!args.forceNew,
-    promptText,
-  })
+    let promptText = null
+    if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
+      try {
+        promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
+      } catch (err) {
+        await writeStreamAndFlush(
+          process.stderr,
+          `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
+        )
+        process.exit(1)
+      }
+    }
 
-  await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
-  process.exit(result.ok ? 0 : 1)
+    const result = await fastConnect({
+      localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
+      cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+      sessionId: typeof args.session === 'string' ? args.session : null,
+      newSession: !!args.new,
+      title: typeof args.title === 'string' ? args.title : null,
+      private: !!args.private,
+      launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
+      projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
+      agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
+      ownerPid: args['owner-pid'] ?? null,
+      noPoller: !!args.noPoller,
+      hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
+      codename: typeof args.codename === 'string' ? args.codename : null,
+      forceNew: !!args.forceNew,
+      promptText,
+    })
+
+    await writeStreamAndFlush(
+      process.stdout,
+      formatConnectCliOutput(result, { reserve: currentStderr() }),
+    )
+    process.exit(result.ok ? 0 : 1)
+  } finally {
+    if (origStderrWrite) process.stderr.write = origStderrWrite
+  }
 }
