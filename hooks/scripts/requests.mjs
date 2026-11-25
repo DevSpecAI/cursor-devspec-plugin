@@ -105,6 +105,7 @@ function uuids(value) {
  *   joined: Set<string>,
  *   chosen: boolean,
  *   seenTranscriptTurns: Map<string, string|null>,
+ *   failedTranscriptTurns: Set<string>,
  * }}
  */
 export function reduceRequestLog(text) {
@@ -114,6 +115,7 @@ export function reduceRequestLog(text) {
   const aliases = new Map()
   const schedules = []
   const seenTranscriptTurns = new Map()
+  const failedTranscriptTurns = new Set()
   let current = null
   let currentFromWake = false
   let joined = new Set()
@@ -196,12 +198,18 @@ export function reduceRequestLog(text) {
       }
       case 'transcript_turn':
         if (typeof event.key === 'string' && event.key) {
-          const boundRef = UUID.test(event.ref ?? '') ? event.ref : null
+          const boundRef = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
           seenTranscriptTurns.set(event.key, boundRef)
+          failedTranscriptTurns.delete(event.key)
           // Once a transcript turn binds the wake-restored current request, a
           // subsequent unrelated wake must not also treat that stale current as
           // freshly restored for itself.
           if (current !== null && boundRef === current) currentFromWake = false
+        }
+        break
+      case 'typed_turn_failed':
+        if (typeof event.key === 'string' && event.key && !seenTranscriptTurns.has(event.key)) {
+          failedTranscriptTurns.add(event.key)
         }
         break
       case 'launch':
@@ -246,7 +254,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, currentFromWake, joined, chosen, seenTranscriptTurns }
+  return { open, started, launches, schedules, current, currentFromWake, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
@@ -731,7 +739,7 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
   try {
     if (fs.statSync(file).size < minBytes) return false
     const state = reduceRequestLog(fs.readFileSync(file, 'utf8'))
-    if (state.open.size > 0) return false
+    if (state.open.size > 0 || state.failedTranscriptTurns.size > 0) return false
     fs.renameSync(file, `${file}.1`)
     for (const launch of new Set(state.launches.values())) {
       if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {

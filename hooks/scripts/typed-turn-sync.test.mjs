@@ -1633,4 +1633,116 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(finalState.seenTranscriptTurns.get(key1), req1Id)
     assert.equal(finalState.seenTranscriptTurns.get(key2), req2Id)
   })
+
+  it('persists refused typed-turn registration across processes so the poller retries after a hook refusal and turn_ended (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { deterministicTypedTurnRequestId } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const row = typedRow('Hook refused then separate poller process runs after turn_ended')
+    fs.writeFileSync(transcriptPath, `${row}\n`)
+    const key = activeTranscriptTurn(transcriptPath, { attempts: 1 }).key
+    const expectedId = deterministicTypedTurnRequestId(CONN, key)
+
+    // Simulate Process 1 (preToolUse hook) failing open_request and exiting: writes typed_turn_failed to disk.
+    const hookRes = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ ok: false, error: 'temporary outage', retryable: true }),
+      dir,
+      log: () => {},
+    })
+    assert.equal(hookRes.action, 'cleared_stale')
+    assert.equal(readRequestState(CONN, { dir }).failedTranscriptTurns.has(key), true)
+
+    // Turn ends before Process 2 (fresh poller process with zero shared in-memory state) runs.
+    fs.writeFileSync(transcriptPath, `${row}\n${turnEndedRow('success')}\n`)
+    const { spawnSync } = await import('node:child_process')
+    const syncModuleUrl = new URL('./typed-turn-sync.mjs', import.meta.url).href
+    const probeScript = `
+      import { syncTypedTurnFromTranscript } from ${JSON.stringify(syncModuleUrl)};
+      const memo = { stamp: null, synced: false };
+      let attempts = 0;
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: ${JSON.stringify(CONN)},
+        transcriptPath: ${JSON.stringify(transcriptPath)},
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { attempts += 1; return { ok: false, error: 'still refused', retryable: true }; },
+        dir: ${JSON.stringify(dir)},
+        memo,
+        log: () => {},
+      });
+      const firstSynced = memo.synced;
+      const second = await syncTypedTurnFromTranscript({
+        connectionId: ${JSON.stringify(CONN)},
+        transcriptPath: ${JSON.stringify(transcriptPath)},
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => { attempts += 1; return { request_id: args.request_id, status: 'open', requested_by_user_id: ${JSON.stringify(ALI)} }; },
+        dir: ${JSON.stringify(dir)},
+        memo,
+        log: () => {},
+      });
+      console.log(JSON.stringify({ attempts, firstAction: first.action, firstSynced, secondAction: second.action, secondId: second.requestId, secondSynced: memo.synced }));
+    `
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', probeScript], { encoding: 'utf8' })
+    assert.equal(child.status, 0, child.stderr)
+    const out = JSON.parse(child.stdout.trim())
+    assert.equal(out.attempts, 2, 'fresh poller process must retry the hook-refused turn even after turn_ended')
+    assert.equal(out.firstAction, 'cleared_stale')
+    assert.equal(out.firstSynced, false, 'fresh poller process must NOT mark transcript synced while refused')
+    assert.equal(out.secondAction, 'opened')
+    assert.equal(out.secondId, expectedId)
+    assert.equal(out.secondSynced, true)
+    assert.equal(readRequestState(CONN, { dir }).failedTranscriptTurns.size, 0)
+  })
+
+  it('clears NO_REQUEST (none) after a recognized automation wake ends so a subsequent timestamp-only wake stays unstated (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const autoWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>auto-1</task-id><event>{"type":"automation_run","session_id":null,"authoritative":true}</event></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${autoWake}\n`)
+    const wake1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake1.action, 'restored_wake_request')
+    assert.equal(wake1.requestId, 'none')
+    assert.deepEqual(stampRequest('create_task', { title: 'Automation write' }, CONN, null, { home }), {
+      args: { title: 'Automation write', request_ref: 'none' },
+    })
+
+    // Automation turn ends, then a separate unrelated timestamp-only wake arrives:
+    // it MUST clear `none` so writes go out unstamped (unknown requester) instead of stamping `none`.
+    const tsWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 10:45 PM (UTC)</timestamp>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${autoWake}\n${turnEndedRow('success')}\n${tsWake}\n`)
+    const wake2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake2.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(
+      stampRequest('create_task', { title: 'Unrelated timestamp wake write' }, CONN, null, { home }),
+      { args: { title: 'Unrelated timestamp wake write' } },
+      'unrelated timestamp-only wake after an automation wake must remain unstated, never stamped none',
+    )
+  })
 })

@@ -279,6 +279,13 @@ function recordFailedTypedTurn(dir, connectionId, turnKey) {
     failedTypedTurnKeys.set(fKey, set)
   }
   set.add(turnKey)
+  // Persist the failed typed turn key in the shared per-connection request log so
+  // separate processes (e.g. a refused preToolUse hook followed by the continuous poller
+  // after turn_ended) still see and retry the refused turn (requirement 3ea2b201).
+  const reqState = readRequestState(connectionId, { dir })
+  if (!reqState.seenTranscriptTurns.has(turnKey) && !reqState.failedTranscriptTurns.has(turnKey)) {
+    appendRequestEvent(connectionId, { op: 'typed_turn_failed', key: turnKey }, { dir })
+  }
 }
 
 function clearFailedTypedTurn(dir, connectionId, turnKey) {
@@ -289,24 +296,34 @@ function clearFailedTypedTurn(dir, connectionId, turnKey) {
   if (set.size === 0) failedTypedTurnKeys.delete(fKey)
 }
 
+function allPendingFailedTypedTurns(dir, connectionId) {
+  const combined = new Set()
+  const reqState = readRequestState(connectionId, { dir })
+  for (const key of reqState.failedTranscriptTurns) {
+    if (!reqState.seenTranscriptTurns.has(key)) combined.add(key)
+  }
+  const mem = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
+  if (mem) {
+    for (const key of mem) {
+      if (!reqState.seenTranscriptTurns.has(key)) combined.add(key)
+    }
+  }
+  return combined
+}
+
 function hasPendingFailedTypedTurns(dir, connectionId) {
-  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
-  return Boolean(set && set.size > 0)
+  return allPendingFailedTypedTurns(dir, connectionId).size > 0
 }
 
 function nextQueuedFailedTypedTurn(dir, connectionId, excludeKey = null) {
-  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
-  if (!set || set.size === 0) return null
-  for (const key of set) {
+  for (const key of allPendingFailedTypedTurns(dir, connectionId)) {
     if (key !== excludeKey) return key
   }
   return null
 }
 
 function isFailedTurnDeterministicId(dir, connectionId, requestId, excludeKey) {
-  const set = failedTypedTurnKeys.get(failedTurnKey(dir, connectionId))
-  if (!set || set.size === 0) return false
-  for (const key of set) {
+  for (const key of allPendingFailedTypedTurns(dir, connectionId)) {
     if (key !== excludeKey && deterministicTypedTurnRequestId(connectionId, key) === requestId) {
       return true
     }
@@ -808,6 +825,7 @@ export async function syncTypedTurnFromTranscript({
   // an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
+    if (reqState.current === NO_REQUEST) return true
     const info = reqState.open.get(reqState.current)
     if (!info) return false
     return info.kind === 'typed_prompt' || (info.kind === 'command' && info.answered === true)
