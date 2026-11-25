@@ -12,10 +12,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
-import { fitsShellOutput } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { formatBoundedCliStderr, parseArgs } from './remote-control-state.mjs'
+import { formatBoundedCliStderr, installBoundedCliStderr, parseArgs } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -1247,6 +1247,47 @@ describe('fast-connect CLI flags', () => {
         )
       } finally {
         fs.rmSync(brokenHome2, { recursive: true, force: true })
+      }
+
+      // Oversized browser-approval stderr (19,900-char URL) during connect is saved whole in a sealed note
+      // via installBoundedCliStderr, leaving headroom so combined stdout + stderr always fits fitsShellOutput
+      // and neither the approval URL nor the final sign_in_pending result is cut (reqs 3c5147a7 / 91d7b47c).
+      const hugeApprovalUrl = `https://app.devspec.ai/approve?token=${'u'.repeat(19_900)}`
+      const approvalLine = `DevSpec: approve Cursor in your browser to turn on remote control and commit tracking (staging). If it did not open, open this link: ${hugeApprovalUrl}\n`
+      const origWrite = process.stderr.write
+      let capturedRawStderr = ''
+      process.stderr.write = (chunk, enc, cb) => {
+        capturedRawStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        const done = typeof enc === 'function' ? enc : cb
+        if (typeof done === 'function') done()
+        return true
+      }
+      const guard = installBoundedCliStderr({ label: 'remote-control-state', home })
+      try {
+        process.stderr.write(approvalLine)
+        const pendingResult = {
+          ok: false,
+          code: 'sign_in_pending',
+          sign_in_url: hugeApprovalUrl,
+          error: `Still waiting for your OK in the browser (${hugeApprovalUrl}).`,
+        }
+        const stdoutOut = formatFastConnectCliOutput(pendingResult, {
+          home,
+          reserve: guard.getEmittedStderr(),
+        })
+        assert.ok(
+          fitsShellOutput(capturedRawStderr + stdoutOut),
+          `combined browser-approval stderr (${capturedRawStderr.length}) + stdout (${stdoutOut.length}) must fit fitsShellOutput`,
+        )
+        assert.match(capturedRawStderr, /notes\/[0-9a-f]{16}\.md/, 'oversized browser-approval message must be saved whole in a sealed note')
+        const noteMatch = /notes\/([0-9a-f]{16})\.md/.exec(capturedRawStderr)
+        const savedApproval = readNoteText(noteMatch[1], { home })
+        assert.ok(savedApproval && savedApproval.includes(hugeApprovalUrl), 'sealed stderr note must preserve the complete 19,900-char approval URL')
+        const parsedStdout = JSON.parse(stdoutOut)
+        assert.ok(parsedStdout.complete_output_note?.id, 'oversized sign_in_pending stdout must also be saved whole in a sealed note')
+      } finally {
+        guard.restore()
+        process.stderr.write = origWrite
       }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
