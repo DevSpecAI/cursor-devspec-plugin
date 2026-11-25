@@ -409,6 +409,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { STATE_ABSENT, STATE_OK, readPrivateJson, readPrivateJsonResult, writePrivateJson } from './private-state.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -832,17 +833,22 @@ function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
   const readString = () => {
     pos += 1 // opening '"'
     const parts = []
+    const decoder = new StringDecoder('utf8')
     let segStart = pos
     while (pos < end) {
       const b = bytes[pos]
       if (b === 0x22) {
-        if (pos > segStart) parts.push(bytes.toString('utf8', segStart, pos))
+        if (pos > segStart) parts.push(decoder.write(bytes.subarray(segStart, pos)))
+        const tail = decoder.end()
+        if (tail) parts.push(tail)
         pos += 1
         if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
         return parts.length <= 1 ? (parts[0] ?? '') : parts.join('')
       }
       if (b === 0x5c) {
-        if (pos > segStart) parts.push(bytes.toString('utf8', segStart, pos))
+        if (pos > segStart) parts.push(decoder.write(bytes.subarray(segStart, pos)))
+        const tail = decoder.end()
+        if (tail) parts.push(tail)
         pos += 1
         if (pos >= end) throw new SyntaxError('Unterminated escape')
         const esc = bytes[pos++]
@@ -870,7 +876,7 @@ function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
       pos += 1
       if (pos >= nextCheck) {
         if (pos > segStart) {
-          parts.push(bytes.toString('utf8', segStart, pos))
+          parts.push(decoder.write(bytes.subarray(segStart, pos)))
           segStart = pos
         }
         nextCheck = pos + BOUNDED_STEP_BYTES

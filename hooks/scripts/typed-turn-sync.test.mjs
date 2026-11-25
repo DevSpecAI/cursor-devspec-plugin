@@ -1024,7 +1024,7 @@ describe('typed-turn-sync (item da03801e)', () => {
     }
   })
 
-  it('restores the launching request on a documented Cursor background-completion row without a notification ID (ce71a72b)', async () => {
+  it('leaves a generic ID-less Cursor completion row unstated rather than guessing from an unrelated pending launch (ce71a72b)', async () => {
     const { home, dir, transcriptPath } = makeEnv()
     appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
     appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
@@ -1048,14 +1048,77 @@ describe('typed-turn-sync (item da03801e)', () => {
       connectionCapability: 'cap-secret',
       dir,
     })
-    assert.equal(res.action, 'restored_wake_request')
-    assert.equal(res.requestId, HOOK_TYPED)
-    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.equal(res.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
     assert.deepEqual(
       stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }),
-      { args: { task_id: 'x', request_ref: HOOK_TYPED } },
-      'documented Cursor completion row must preserve launching request attribution even without a notification ID',
+      { args: { task_id: 'x' } },
+      'generic ID-less completion row must leave requester unstated instead of guessing from pending launches',
     )
+  })
+
+  it('preserves multi-byte UTF-8 characters split across the 64 KiB bounded-parser step boundary (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    // Craft a user row so 'é' (2-byte UTF-8) and '😀' (4-byte UTF-8) straddle 65,536-byte boundaries.
+    const prefix = 'a'.repeat(65_450)
+    const prompt = `${prefix}é${'b'.repeat(65_530)}😀end`
+    const row = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: `<timestamp>Wed, Nov 25, 2026, 8:42 PM (UTC)</timestamp>\n<user_query>\n${prompt}\n</user_query>`,
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${row}\n`)
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const unbounded = activeTranscriptTurn(transcriptPath, { attempts: 1 })
+    const bounded = activeTranscriptTurn(transcriptPath, { attempts: 1, deadlineMs: Date.now() + 5_000 })
+    assert.equal(bounded.kind, 'typed')
+    assert.equal(bounded.rawText, unbounded.rawText, 'bounded UTF-8 decoding must match unbounded read identically')
+    assert.ok(!bounded.rawText.includes('\uFFFD'), 'must not introduce UTF-8 replacement characters')
+    assert.ok(bounded.rawText.includes('é'))
+    assert.ok(bounded.rawText.includes('😀'))
+  })
+
+  it('typedTurnSyncPending stays true after a refused open_request so the poller keeps retrying (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    fs.writeFileSync(transcriptPath, `${typedRow('Refused open retry')}\n`)
+    const memo = { stamp: null, synced: false }
+    const first = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ ok: false, error: 'temporary outage', retryable: true }),
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(first.action, 'cleared_stale')
+    assert.equal(memo.synced, false)
+    assert.equal(
+      typedTurnSyncPending({ transcriptPath, memo }),
+      true,
+      'poller must still see this transcript turn as pending retry after a failed open_request',
+    )
+
+    // Once a retry succeeds, memo.synced becomes true and typedTurnSyncPending turns false.
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(second.action, 'opened')
+    assert.equal(memo.synced, true)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
   })
 
   it('bounds a valid large transcript row with a multi-megabyte numeric field at deadlineMs (3c5147a7 / 91d7b47c)', async () => {

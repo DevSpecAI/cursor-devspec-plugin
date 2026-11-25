@@ -153,12 +153,13 @@ function fileStamp(file) {
 
 /**
  * Cheap stat check for the poller's `shouldWakeImmediately`: true when the transcript
- * has changed since the last check and may hold a new typed turn or turn end.
+ * has changed since the last completed sync OR when the previous sync attempt did not
+ * finish cleanly (`memo.synced !== true`, e.g. refused open/admission/write — req 3ea2b201).
  */
 export function typedTurnSyncPending({ transcriptPath, memo = null } = {}) {
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return false
-  if (memo && memo.stamp === stamp) return false
+  if (memo && memo.stamp === stamp && memo.synced === true) return false
   return true
 }
 
@@ -523,48 +524,19 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
-  // Resolve explicit host-injected `<task-notification>` wake rows AND documented Cursor
-  // CLI background-task completion rows (`command_turn`, which omit `<task-id>` when Cursor
-  // skips beforeSubmitPrompt) back to the recorded launching request(s) (decision ce71a72b).
-  // Never restore from an unrelated timestamp-only wake (decision 2fcd26bd), never overwrite
-  // a live unanswered room command, and never infer a scheduled wake from typed `<user_query>` text.
+  // Resolve explicit host-injected `<task-notification>` wakes whose `<task-id>` /
+  // `<tool-use-id>` / `owner_message` / `automation_run` positively matches a recorded
+  // launch or command in `requests.mjs` (`requestForWake`, decision ce71a72b).
+  // Never guess from pending launches when a generic `command_turn` row or ID-less
+  // notification carries no matching job ID: leaving the requester unstated prevents
+  // misattributing another person's or unrelated background work (decisions ce71a72b / 2fcd26bd).
   const resolveTranscriptWake = (reqState) => {
     if (active.kind === 'typed') return null
     const rawText = typeof active.rawText === 'string' ? active.rawText : ''
-    if (rawText) {
-      const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
-      if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
-      // When a notification explicitly names a task/tool-use ID that did not match any
-      // recorded launch, it belongs to a different (or already-closed) job — never borrow
-      // unrelated pending launches (decision ce71a72b).
-      if (/<(?:task-id|tool-use-id)\b[^>]*>\s*[^<\s][\s\S]*?<\/(?:task-id|tool-use-id)\s*>/i.test(rawText)) {
-        return null
-      }
-    }
-    const isDocumentedCompletionRow =
-      active.kind === 'command_turn' || (rawText && /<task-notification\b/i.test(rawText))
-    if (!isDocumentedCompletionRow) return null
-    // Never steal attribution from a live unanswered room command or an owner_message wake.
-    const currentInfo = reqState.current ? reqState.open.get(reqState.current) : null
-    if (currentInfo?.kind === 'command' && !currentInfo.answered) return null
-    if (rawText && /"type"\s*:\s*"owner_message"/.test(rawText)) return null
-    const refs = []
-    for (const launch of new Set(reqState.launches.values())) {
-      if (!launch.notifies || launch.notified) continue
-      const candidates = [launch.request, ...(launch.also ?? [])]
-      for (const candidate of candidates) {
-        if ((reqState.open.has(candidate) || candidate === NO_REQUEST) && !refs.includes(candidate)) {
-          refs.push(candidate)
-        }
-      }
-    }
-    if (refs.length === 0) return null
-    return {
-      origin: 'task-notification',
-      text: rawText,
-      match: { ref: refs.at(-1), also: refs.slice(0, -1) },
-      direct: false,
-    }
+    if (!rawText) return null
+    const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
+    if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
+    return null
   }
 
   if (resolveTranscriptWake(initial)) {
