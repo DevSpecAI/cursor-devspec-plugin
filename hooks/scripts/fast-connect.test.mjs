@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { formatBoundedCliStderr, installBoundedCliStderr, parseArgs } from './remote-control-state.mjs'
+import { formatBoundedCliStderr, formatConnectCliOutput, installBoundedCliStderr, parseArgs, summarizeConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -24,7 +24,6 @@ import {
   formatFastConnectCliOutput,
   parseSessionIdFromPrompt,
   resolveProjectForConnect,
-  writeStreamAndFlush,
 } from './fast-connect.mjs'
 const fastConnect = opts => connectImpl({ ...opts, projectHome })
 
@@ -546,6 +545,83 @@ describe('fastConnect', () => {
     assert.match(r.error, /owner-pid/)
     assert.equal(r.connection_id, connectionId)
   })
+  it('returns a short connect summary without rules or full repository list while keeping the full snapshot on disk (item 083422dd)', async () => {
+    assert.equal(formatFastConnectCliOutput, formatConnectCliOutput)
+    const bigRules = `Never skip checks. ${'Detail line. '.repeat(400)}RULES-WHOLE-END`
+    const repos = Array.from({ length: 12 }, (_, i) => ({
+      id: `repo-${i}`,
+      full_name: `org/repo-${i}`,
+      provider: 'github',
+      git_url: `https://github.com/org/repo-${i}.git`,
+      target_branch: 'staging',
+      default_branch: 'main',
+    }))
+    const r = await fastConnect({
+      localId,
+      cwd: process.cwd(),
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => 'https://github.com/org/repo-0.git',
+      resolveLocalFn: () => ({ action: 'register', connection_id: null }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async () => {},
+      registerFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        codename: 'Brave Otter',
+        project_id: projectId,
+        project_selection: { version: 1, status: 'resolved', source: 'explicit', project: { id: projectId, name: 'DevSpec' } },
+        repository_context: { version: 1, project_id: projectId, status: 'available', repositories: repos },
+        project_custom_instructions: 'Project principles whole.',
+        project_agent_rules: bigRules,
+        owner_agent_rules: 'Owner rules whole.',
+        github_identity: { status: 'linked', logins: ['octocat'] },
+      }),
+      writeFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        session_id: null,
+        session_codename: 'Brave Otter',
+        auth_ok: true,
+        poller: { ok: true, pid: 123 },
+      }),
+    })
+
+    assert.equal(r.ok, true)
+    assert.equal(r.project_id, projectId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 12)
+    assert.equal(r.github_status, 'linked as @octocat')
+    assert.equal('project_context' in r, false, 'connect output must not dump project_context')
+    assert.equal('project_selection' in r, false, 'connect output must not dump verbose project_selection')
+    assert.equal('project_context_file' in r, false, 'connect output must not duplicate context via another file path')
+    const serialized = JSON.stringify(r)
+    assert.doesNotMatch(serialized, /RULES-WHOLE-END|Project principles whole|Owner rules whole|org\/repo-11/)
+    assert.ok(serialized.length < 1_000, `short connect summary expected (<1000 chars), got ${serialized.length}`)
+
+    // CLI register/attach summarizer strips rules and repo list while preserving choice_required.
+    const cliSummary = summarizeConnectCliOutput({
+      ok: true,
+      connection_id: connectionId,
+      project_id: projectId,
+      project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+      repository_context: { status: 'available', repositories: repos },
+      project_agent_rules: bigRules,
+      owner_agent_rules: 'Owner rules',
+    })
+    assert.equal(cliSummary.project_name, 'DevSpec')
+    assert.equal(cliSummary.repository_count, 12)
+    assert.equal('project_agent_rules' in cliSummary, false)
+    assert.equal('repository_context' in cliSummary, false)
+    const choiceSummary = summarizeConnectCliOutput({
+      ok: false,
+      code: 'project_choice_required',
+      project_selection: { status: 'choice_required', candidates: [{ id: projectId, name: 'DevSpec' }] },
+    })
+    assert.equal(choiceSummary.project_selection?.status, 'choice_required')
+  })
+
   it('reconnect reattaches the prior session when no --session or --new is passed, returns short summary with plugin_root, and refuses missing conversation id (item 66ad4866)', async () => {
     const calls = []
     const r = await fastConnect({
@@ -812,9 +888,9 @@ describe('fast-connect CLI flags', () => {
   }
 
   it('writes an oversized 100-candidate project_choice_required refusal whole to a note instead of exceeding Cursor Shell ceiling', async () => {
-    const { formatFastConnectCliOutput } = await import('./fast-connect.mjs')
+    const { formatConnectCliOutput } = await import('./remote-control-state.mjs')
     const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc60-100-choices-'))
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc-100-choices-'))
     try {
       const candidates = Array.from({ length: 150 }, (_, i) => ({
         id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
@@ -828,7 +904,7 @@ describe('fast-connect CLI flags', () => {
         project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_name', candidates },
         candidates: candidates.map((c) => c.id),
       }
-      const out = formatFastConnectCliOutput(refusal, { home })
+      const out = formatConnectCliOutput(refusal, { home })
       assert.equal(fitsShellOutput(out), true, `CLI output must fit Cursor Shell ceiling, got ${out.length} chars`)
       const parsed = JSON.parse(out)
       assert.equal(parsed.ok, false)
@@ -847,14 +923,14 @@ describe('fast-connect CLI flags', () => {
   })
 
   it('bounds the note receipt even when error text itself exceeds the Shell ceiling, and keeps structured candidates + recovery when note write fails', async () => {
-    const { formatFastConnectCliOutput } = await import('./fast-connect.mjs')
+    const { formatConnectCliOutput } = await import('./remote-control-state.mjs')
     const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc60-bounds-'))
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc59-bounds-'))
     const blockedHome = path.join(home, 'not-a-dir')
     fs.writeFileSync(blockedHome, 'file blocking mkdir', 'utf8')
     try {
       const hugeError = `Server refusal: ${'E'.repeat(25_000)}`
-      const outHuge = formatFastConnectCliOutput(
+      const outHuge = formatConnectCliOutput(
         { ok: false, code: 'register_failed', error: hugeError },
         { home },
       )
@@ -866,7 +942,7 @@ describe('fast-connect CLI flags', () => {
       assert.equal(fullHuge.error, hugeError)
 
       const hugeSession = 'S'.repeat(25_000)
-      const outHugeSession = formatFastConnectCliOutput(
+      const outHugeSession = formatConnectCliOutput(
         { ok: false, code: 'project_choice_required', session_id: hugeSession, error: 'Choose project' },
         { home },
       )
@@ -881,7 +957,7 @@ describe('fast-connect CLI flags', () => {
         name: `Project Number ${i} — Organization Workspace Candidate`,
         organization_name: `Acme Organization ${i}`,
       }))
-      const outFailedWrite = formatFastConnectCliOutput(
+      const outFailedWrite = formatConnectCliOutput(
         {
           ok: false,
           code: 'project_choice_required',
@@ -1114,7 +1190,7 @@ describe('fast-connect CLI flags', () => {
       if (baseLen < 19_900) {
         nearLimit.project_selection.candidates[0].description = 'd'.repeat(19_900 - baseLen)
       }
-      const formatted = formatFastConnectCliOutput(nearLimit, { home, reserve })
+      const formatted = formatConnectCliOutput(nearLimit, { home, reserve })
       assert.ok(fitsShellOutput(reserve + formatted), 'reserve + formatted stdout must fit fitsShellOutput')
       const receipt = JSON.parse(formatted)
       assert.equal(receipt.project_selection.omitted_inline, true)
@@ -1181,7 +1257,7 @@ describe('fast-connect CLI flags', () => {
       // instead of overflowing fitsShellOutput or silently returning an empty string (reqs 3c5147a7 / 91d7b47c).
       const tightReserve = 'e'.repeat(19_980)
       assert.throws(
-        () => formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve }),
+        () => formatConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve }),
         (err) => {
           assert.equal(err.code, 'shell_output_limit_exceeded')
           assert.equal(err.field, 'reserve')
@@ -1212,7 +1288,7 @@ describe('fast-connect CLI flags', () => {
         }
         // When moderate reserve still fits the compact fallback, candidate counts and recovery are preserved whole.
         const modReserve = 'e'.repeat(19_400)
-        const compactFallbackOut = formatFastConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: modReserve })
+        const compactFallbackOut = formatConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: modReserve })
         assert.ok(fitsShellOutput(modReserve + compactFallbackOut))
         const parsedFallback = JSON.parse(compactFallbackOut)
         assert.equal(parsedFallback.candidate_count, 3)
@@ -1223,7 +1299,7 @@ describe('fast-connect CLI flags', () => {
 
         // When tight reserve cannot fit even the compact refusal with counts and recovery, refuse explicitly.
         assert.throws(
-          () => formatFastConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: tightReserve }),
+          () => formatConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: tightReserve }),
           (err) => {
             assert.equal(err.code, 'shell_output_limit_exceeded')
             assert.equal(err.field, 'reserve')
@@ -1251,7 +1327,7 @@ describe('fast-connect CLI flags', () => {
         // rather than misreporting a 20,000-character limit with ~13,432 chars (3c5147a7 / 91d7b47c).
         const utf8ByteReserve = '中'.repeat(13_330) // 13,330 chars, 39,990 UTF-8 bytes
         assert.throws(
-          () => formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: utf8ByteReserve }),
+          () => formatConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: utf8ByteReserve }),
           (err) => {
             assert.equal(err.code, 'shell_output_limit_exceeded')
             assert.equal(err.field, 'reserve')
@@ -1304,7 +1380,7 @@ describe('fast-connect CLI flags', () => {
             assert.equal(suppressed?.omitted_bytes, 42_001)
             assert.equal(suppressed?.shell_limit_bytes, 40_000)
             assert.equal(suppressed?.note_write_failed_count, 1)
-            const receiptOut = formatFastConnectCliOutput(
+            const receiptOut = formatConnectCliOutput(
               { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
               { home: brokenHome2, reserve: utf8Guard.getEmittedStderr(), suppressedDiagnostics: suppressed },
             )
@@ -1334,7 +1410,7 @@ describe('fast-connect CLI flags', () => {
           notes: savedNotes,
           recovery: 'Read saved stderr notes using the cat commands above.',
         }
-        const minimalNoteFailOut = formatFastConnectCliOutput(
+        const minimalNoteFailOut = formatConnectCliOutput(
           { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
           { home: brokenHome2, suppressedDiagnostics: suppressedWithSavedNotes },
         )
@@ -1354,7 +1430,7 @@ describe('fast-connect CLI flags', () => {
         fs.writeFileSync(blockedTmpFile, 'blocked')
         try {
           const tightStderrReserve = 'e'.repeat(18_200)
-          const trimmedFallbackOut = formatFastConnectCliOutput(
+          const trimmedFallbackOut = formatConnectCliOutput(
             { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
             {
               home: brokenHome2,
@@ -1399,7 +1475,7 @@ describe('fast-connect CLI flags', () => {
             notes: savedNotes300,
             recovery: 'Read saved stderr notes using the cat commands above.',
           }
-          const trimmed300Out = formatFastConnectCliOutput(
+          const trimmed300Out = formatConnectCliOutput(
             { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
             {
               home: brokenHome2,
@@ -1432,7 +1508,7 @@ describe('fast-connect CLI flags', () => {
 
           // When tmpDir is also unwritable: small omitted list falls back to exact omitted_note_ids;
           // 300 notes that cannot fit inline refuse explicitly instead of silently cutting.
-          const inlineIdsFallbackOut = formatFastConnectCliOutput(
+          const inlineIdsFallbackOut = formatConnectCliOutput(
             { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
             {
               home: brokenHome2,
@@ -1453,7 +1529,7 @@ describe('fast-connect CLI flags', () => {
 
           assert.throws(
             () =>
-              formatFastConnectCliOutput(
+              formatConnectCliOutput(
                 { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
                 {
                   home: brokenHome2,
@@ -1464,6 +1540,13 @@ describe('fast-connect CLI flags', () => {
               ),
             (err) => {
               assert.equal(err.code, 'shell_output_limit_exceeded')
+              assert.doesNotMatch(
+                err.message,
+                /omitted_note_ids|stderr_diagnostics_omitted\.notes/,
+                'thrown refusal must not direct reader to unprinted JSON fields',
+              )
+              assert.match(err.message, /300 saved stderr diagnostic note\(s\)/)
+              assert.match(err.message, /temporary directory/)
               return true
             },
           )
@@ -1475,7 +1558,7 @@ describe('fast-connect CLI flags', () => {
         // 40,000-byte UTF-8 Shell limit accurately in both the saved-note receipt and the
         // unwritable-note fallback rather than misclaiming the 20,000-char limit (3c5147a7 / 91d7b47c).
         const utf8ByteOnlyPayload = { ok: false, error: '中'.repeat(14_000) }
-        const utf8ByteOnlyReceiptOut = formatFastConnectCliOutput(utf8ByteOnlyPayload, { home })
+        const utf8ByteOnlyReceiptOut = formatConnectCliOutput(utf8ByteOnlyPayload, { home })
         assert.ok(fitsShellOutput(utf8ByteOnlyReceiptOut))
         const parsedUtf8ByteOnlyReceipt = JSON.parse(utf8ByteOnlyReceiptOut)
         assert.ok(parsedUtf8ByteOnlyReceipt.complete_output_note?.total_chars <= 20_000)
@@ -1486,7 +1569,7 @@ describe('fast-connect CLI flags', () => {
         const savedUtf8ByteOnly = readNoteText(parsedUtf8ByteOnlyReceipt.complete_output_note.id, { home })
         assert.ok(savedUtf8ByteOnly && savedUtf8ByteOnly.includes('中'.repeat(14_000)))
 
-        const utf8ByteOnlyNoteFailOut = formatFastConnectCliOutput(utf8ByteOnlyPayload, { home: brokenHome2 })
+        const utf8ByteOnlyNoteFailOut = formatConnectCliOutput(utf8ByteOnlyPayload, { home: brokenHome2 })
         assert.ok(fitsShellOutput(utf8ByteOnlyNoteFailOut))
         const parsedUtf8ByteOnlyNoteFail = JSON.parse(utf8ByteOnlyNoteFailOut)
         assert.ok(parsedUtf8ByteOnlyNoteFail.total_chars <= 20_000)
@@ -1519,7 +1602,7 @@ describe('fast-connect CLI flags', () => {
           sign_in_url: hugeApprovalUrl,
           error: `Still waiting for your OK in the browser (${hugeApprovalUrl}).`,
         }
-        const stdoutOut = formatFastConnectCliOutput(pendingResult, {
+        const stdoutOut = formatConnectCliOutput(pendingResult, {
           home,
           reserve: guard.getEmittedStderr(),
         })
@@ -1576,7 +1659,7 @@ describe('fast-connect CLI flags', () => {
             assert.match(rawStderr, /fix ~\/\.devspec\/notes permissions and retry/i, 'unwritable omission notice must include recovery')
             assert.ok(suppressed.note_write_failed_count >= 1)
           }
-          const receipt = formatFastConnectCliOutput(
+          const receipt = formatConnectCliOutput(
             { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
             { home: testHome, reserve: fullGuard.getEmittedStderr(), suppressedDiagnostics: suppressed },
           )

@@ -1600,6 +1600,679 @@ export async function registerConnection(opts) {
 }
 
 /**
+ * Short CLI summary for `register` and `attach` commands (item 083422dd): drops
+ * the full run-wide rules and repository list from stdout because they are persisted
+ * via `storeRepositorySnapshot` / `refreshRepositoryRules` and delivered whole once
+ * through the `repository-context.mjs` note channel. Preserves `project_selection`
+ * when a choice is required so the caller can ask the person which project to pick.
+ */
+export function summarizeConnectCliOutput(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result
+  const {
+    project_custom_instructions: _pci,
+    project_agent_rules: _par,
+    owner_agent_rules: _oar,
+    owner_custom_instructions: _oci,
+    owner_custom_instructions_note: _ocin,
+    repository_context: repoCtx,
+    project_context: _pctx,
+    project_selection: selection,
+    ...rest
+  } = result
+  const summary = { ...rest }
+  if (selection?.status === 'choice_required' || result.code === 'project_choice_required') {
+    summary.project_selection = selection
+    // Do not duplicate candidate IDs alongside `project_selection.candidates` in CLI output.
+    if (Array.isArray(selection?.candidates) && Array.isArray(summary.candidates)) {
+      delete summary.candidates
+    }
+  } else if (selection?.project?.name && !summary.project_name) {
+    summary.project_name = selection.project.name
+  }
+  if (Array.isArray(repoCtx?.repositories)) {
+    summary.repository_count = repoCtx.repositories.length
+  }
+  return summary
+}
+
+/**
+ * Format connect CLI JSON within Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`). When a variable-length payload (such as a large
+ * `project_selection.candidates` refusal list) exceeds Cursor's ceiling, write the
+ * complete, uncut JSON to a sealed note (`writeNote`) and emit a compact structured
+ * receipt naming the note command so Cursor never clips the middle of the choices
+ * (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
+ */
+function buildBoundedConnectNoteReceipt(
+  summary,
+  noteRef,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
+  const base =
+    summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
+  const selection = base.project_selection
+  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
+  if (selection && typeof selection === 'object') {
+    const { candidates: _omit, ...selectionRest } = selection
+    base.project_selection = {
+      ...selectionRest,
+      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+      omitted_inline: true,
+      complete_in_note: noteRef,
+    }
+  }
+  if (Array.isArray(base.candidates)) {
+    base.candidate_count = base.candidates.length
+    delete base.candidates
+  }
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const combinedChars = prior.length + fullTextLength
+  const combinedBytes = priorBytes + textBytes
+  const exceededByBytesOnly =
+    combinedChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    combinedBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const noteMsg = exceededByBytesOnly
+    ? `Full connect output (${textBytes} bytes / ${fullTextLength} chars${priorBytes ? `, ${combinedBytes} bytes with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+    : `Full connect output (${fullTextLength} chars${prior.length ? `, ${combinedChars} chars with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+  base.complete_output_note = noteRef
+  base.note = noteMsg
+  const richText = JSON.stringify(base, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${richText}`)) return richText
+
+  // Strict fixed-shape receipt when variable-length fields (e.g. an oversized `error`
+  // string) pushed the rich receipt past Cursor's Shell ceiling. Every omitted field is
+  // preserved whole in the sealed note.
+  const compactStderrOmitted = base.stderr_diagnostics_omitted
+    ? {
+        omitted_count: base.stderr_diagnostics_omitted.omitted_count,
+        omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(typeof base.stderr_diagnostics_omitted.omitted_bytes === 'number'
+          ? { omitted_bytes: base.stderr_diagnostics_omitted.omitted_bytes }
+          : {}),
+        ...(Array.isArray(base.stderr_diagnostics_omitted.notes) &&
+        base.stderr_diagnostics_omitted.notes.length > 0
+          ? { saved_note_count: base.stderr_diagnostics_omitted.notes.length }
+          : {}),
+        ...(base.stderr_diagnostics_omitted.note_write_failed_count
+          ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
+          : {}),
+        complete_in_note: noteRef.id,
+        read: noteRef.command,
+      }
+    : null
+  const minimal = {
+    ok: Boolean(base.ok),
+    ...(typeof base.code === 'string' ? { code: base.code } : {}),
+    ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+    ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+    ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+    ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+    ...(selection && typeof selection === 'object'
+      ? {
+          project_selection: {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+            ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+            omitted_inline: true,
+            complete_in_note: noteRef,
+          },
+        }
+      : {}),
+    omitted_fields_in_note: true,
+    ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
+    complete_output_note: noteRef,
+    note: noteMsg,
+  }
+  const minimalText = JSON.stringify(minimal, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
+
+  // Final guaranteed-bounded receipt when caller-supplied identifier fields or prior stderr
+  // leave minimal room inside Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c). Never drop
+  // the note pointer or return an empty string silently: refuse explicitly if reserve itself
+  // leaves too little room for the smallest visible pointer.
+  const compactReceipt =
+    JSON.stringify(
+      {
+        ok: Boolean(base.ok),
+        ...(candidateCount !== null
+          ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+          : {}),
+        ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
+        omitted_fields_in_note: true,
+        complete_output_note: noteRef,
+        note: noteMsg,
+      },
+      null,
+      2,
+    ) + '\n'
+  if (fitsShellOutput(`${reserve}${compactReceipt}`)) return compactReceipt
+  const tightReceipt = `${JSON.stringify({
+    ok: Boolean(base.ok),
+    ...(candidateCount !== null
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    ...(base.stderr_diagnostics_omitted
+      ? { stderr_omitted_count: base.stderr_diagnostics_omitted.omitted_count }
+      : {}),
+    note: noteRef.id,
+    read: noteRef.command,
+    parts: noteRef.parts,
+  })}\n`
+  if (fitsShellOutput(`${reserve}${tightReceipt}`)) return tightReceipt
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: tightReceipt.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(tightReceipt),
+    fullTextLength,
+    note: noteRef,
+    candidateCount,
+  })
+}
+
+function shellQuotePath(filePath) {
+  return /^[A-Za-z0-9_./:-]+$/.test(filePath)
+    ? filePath
+    : `'${String(filePath).replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Write a private, paged manifest listing ONLY this connect attempt's saved stderr
+ * diagnostic note commands under an owner-only temp folder, split with `splitText`
+ * (`NOTE_PART_CHARS` / `NOTE_PART_BYTES`) and sealed with `seal` so every part fits
+ * Cursor's Shell output ceiling even when hundreds of diagnostics were saved
+ * (requirements 3c5147a7 / 91d7b47c). Returns null if the temp folder is unwritable.
+ */
+export function writePagedStderrNotesManifest(notes, { tmpDir = os.tmpdir() } = {}) {
+  if (!Array.isArray(notes) || notes.length === 0) return null
+  try {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
+    const baseDir = path.join(tmpDir, `devspec-connect-stderr-${uid}`)
+    fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 })
+    try {
+      fs.chmodSync(baseDir, 0o700)
+    } catch {
+      /* best-effort on platforms without POSIX modes */
+    }
+    const stat = fs.lstatSync(baseDir)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
+
+    const body =
+      `# Saved stderr diagnostic notes for this connect attempt (${notes.length} total)\n` +
+      notes
+        .map((n, idx) => {
+          const id = typeof n?.id === 'string' ? n.id : ''
+          const cmd =
+            typeof n?.command === 'string'
+              ? n.command
+              : id
+                ? `cat ~/.devspec/notes/${id}.md`
+                : '(missing command)'
+          const parts = typeof n?.parts === 'number' && n.parts > 1 ? ` (${n.parts} parts)` : ''
+          return `${idx + 1}. ${cmd}${id ? ` [id=${id}]` : ''}${parts}`
+        })
+        .join('\n') +
+      '\n'
+    const id = crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16)
+    const pieces = splitText(body)
+    const partPath = (part) => path.join(baseDir, part === 1 ? `${id}.md` : `${id}.${part}.md`)
+    const partCmd = (part) => `cat ${shellQuotePath(partPath(part))}`
+    const first = partPath(1)
+    if (!fs.existsSync(first)) {
+      for (let part = pieces.length; part >= 1; part -= 1) {
+        const label = `${part === pieces.length ? 'End of DevSpec connect stderr manifest' : 'DevSpec connect stderr manifest'} ${id}: part ${part} of ${pieces.length}`
+        const after = part < pieces.length ? `read on with \`${partCmd(part + 1)}\`` : ''
+        const sealed = seal(label, pieces[part - 1], after)
+        if (!fitsShellOutput(sealed)) return null
+        writePrivateText(partPath(part), sealed)
+      }
+    }
+    return {
+      id,
+      file: first,
+      command: partCmd(1),
+      parts: pieces.length,
+    }
+  } catch {
+    return null
+  }
+}
+
+function trimStderrOmittedNotes(omitted, notesSlice, { manifest = null } = {}) {
+  if (!omitted || typeof omitted !== 'object' || !Array.isArray(omitted.notes)) return omitted
+  const total = omitted.notes.length
+  const returned = notesSlice.length
+  if (returned >= total) return omitted
+  const omittedCount = total - returned
+  const baseRecovery = typeof omitted.recovery === 'string' && omitted.recovery ? `${omitted.recovery} ` : ''
+  if (manifest) {
+    const nextPartsHint =
+      manifest.parts > 1 ? ` (and every further part it names — ${manifest.parts} parts total)` : ''
+    return {
+      ...omitted,
+      notes: notesSlice,
+      notes_total_count: total,
+      notes_returned_count: returned,
+      notes_omitted_count: omittedCount,
+      notes_continuation: {
+        omitted_count: omittedCount,
+        manifest_id: manifest.id,
+        parts: manifest.parts,
+        command: manifest.command,
+        how_to_fetch_rest: `Run \`${manifest.command}\`${nextPartsHint} to read the exact commands for all ${total} saved stderr diagnostic note(s) from this connect attempt (including the ${omittedCount} omitted from this receipt).`,
+      },
+      recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit in this receipt: run \`${manifest.command}\`${nextPartsHint} to read all ${total} saved stderr note commands for this connect attempt.`,
+    }
+  }
+  const remainingNotes = omitted.notes.slice(returned)
+  const remainingIds = remainingNotes.every((n) => typeof n?.id === 'string' && n.id)
+    ? remainingNotes.map((n) => n.id)
+    : null
+  if (!remainingIds) return null
+  return {
+    ...omitted,
+    notes: notesSlice,
+    notes_total_count: total,
+    notes_returned_count: returned,
+    notes_omitted_count: omittedCount,
+    notes_continuation: {
+      omitted_count: omittedCount,
+      omitted_note_ids: remainingIds,
+      command_template: 'cat ~/.devspec/notes/<id>.md',
+      how_to_fetch_rest: `Read each of the ${omittedCount} omitted stderr diagnostic note ID(s) in notes_continuation.omitted_note_ids for this connect attempt with \`cat ~/.devspec/notes/<id>.md\`.`,
+    },
+    recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit inline: read each ID in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`,
+  }
+}
+
+function fitStderrOmittedForReceipt(
+  omitted,
+  buildText,
+  reserve,
+  { tmpDir = os.tmpdir(), manifestCache = null } = {},
+) {
+  if (!omitted || typeof omitted !== 'object') {
+    const text = buildText(null)
+    return fitsShellOutput(`${reserve}${text}`) ? { fitted: true, stderrOmitted: null, text } : { fitted: false, stderrOmitted: null, text }
+  }
+  const fullText = buildText(omitted)
+  if (fitsShellOutput(`${reserve}${fullText}`)) {
+    return { fitted: true, stderrOmitted: omitted, text: fullText }
+  }
+  if (!Array.isArray(omitted.notes) || omitted.notes.length === 0) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
+  let manifest = null
+  if (manifestCache) {
+    if (!manifestCache.computed) {
+      manifestCache.value = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+      manifestCache.computed = true
+    }
+    manifest = manifestCache.value
+  } else {
+    manifest = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+  }
+  const zeroObj = trimStderrOmittedNotes(omitted, [], { manifest })
+  if (!zeroObj) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
+  const zeroText = buildText(zeroObj)
+  if (!fitsShellOutput(`${reserve}${zeroText}`)) {
+    return { fitted: false, stderrOmitted: zeroObj, text: zeroText }
+  }
+  let lo = 0
+  let hi = omitted.notes.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    const candidate = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, mid), { manifest })
+    if (candidate && fitsShellOutput(`${reserve}${buildText(candidate)}`)) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  const fittedObj = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, lo), { manifest })
+  return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
+}
+
+function buildConnectNoteFailureFallback(
+  summary,
+  noteError,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null, tmpDir = os.tmpdir() } = {},
+) {
+  const base =
+    summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
+  const selection =
+    base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
+  const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
+  const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const exceededByBytesOnly =
+    prior.length + fullTextLength <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const manifestCache = { computed: false, value: null }
+  const stderrReadHintFor = (stderrOmitted) => {
+    const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
+      ? base.stderr_diagnostics_omitted.notes.length
+      : 0
+    if (total === 0) return ''
+    const omittedNotesCount = Number(stderrOmitted?.notes_omitted_count) || 0
+    if (omittedNotesCount > 0) {
+      const returnedNotesCount = Number(stderrOmitted?.notes_returned_count) || 0
+      const cont = stderrOmitted?.notes_continuation
+      if (typeof cont?.command === 'string' && cont.command) {
+        const nextHint = cont.parts > 1 ? ` (and every further part it names — ${cont.parts} parts total)` : ''
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run \`${cont.command}\`${nextHint} to read the remaining ${omittedNotesCount} of ${total} saved stderr note(s) for this connect attempt.`
+      }
+      if (Array.isArray(cont?.omitted_note_ids)) {
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes and the remaining ${omittedNotesCount} of ${total} ID(s) in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`
+      }
+      return ` ${omittedNotesCount} of ${total} saved stderr diagnostic note(s) did not fit in this receipt.`
+    }
+    return ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
+  }
+  const recoveryFor = (stderrOmitted) => {
+    const hint = stderrReadHintFor(stderrOmitted)
+    const sizeDesc = exceededByBytesOnly
+      ? `${textBytes}-byte (${fullTextLength}-char)`
+      : `${fullTextLength}-char`
+    return allCandidates
+      ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${hint}`
+      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${sizeDesc} output.${hint}`
+  }
+
+  const makePayload = (
+    candidateSlice,
+    { minimal = false, stderrOmitted = base.stderr_diagnostics_omitted ?? null } = {},
+  ) => {
+    const out = minimal
+      ? {
+          ok: Boolean(base.ok),
+          ...(typeof base.code === 'string' ? { code: base.code } : {}),
+          ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+          ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+          ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+          ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+          omitted_fields_due_to_shell_limit: true,
+        }
+      : { ...base }
+    if (stderrOmitted) {
+      out.stderr_diagnostics_omitted = stderrOmitted
+    } else {
+      delete out.stderr_diagnostics_omitted
+    }
+    if (Array.isArray(out.candidates)) {
+      out.candidate_count = out.candidates.length
+      delete out.candidates
+    }
+    if (selection) {
+      const { candidates: _omit, ...selectionRest } = selection
+      const selBase = minimal
+        ? {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+          }
+        : selectionRest
+      out.project_selection = {
+        ...selBase,
+        ...(allCandidates
+          ? {
+              candidates: candidateSlice,
+              candidate_count: allCandidates.length,
+              returned_count: candidateSlice.length,
+              omitted_count: allCandidates.length - candidateSlice.length,
+              truncated_due_to_shell_limit: candidateSlice.length < allCandidates.length,
+              omitted_candidates_require_writable_notes: candidateSlice.length < allCandidates.length,
+            }
+          : {}),
+      }
+    }
+    out.complete_output_note_error = errMsg
+    out.total_chars = fullTextLength
+    out.total_bytes = textBytes
+    out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
+    out.shell_limit_bytes = CURSOR_SHELL_OUTPUT_MAX_BYTES
+    out.recovery = recoveryFor(stderrOmitted)
+    return JSON.stringify(out, null, 2) + '\n'
+  }
+
+  const fullFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => makePayload([], { minimal: false, stderrOmitted }),
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  const useMinimal = !fullFit.fitted
+  const chosenFit = useMinimal
+    ? fitStderrOmittedForReceipt(
+        base.stderr_diagnostics_omitted ?? null,
+        (stderrOmitted) => makePayload([], { minimal: true, stderrOmitted }),
+        reserve,
+        { tmpDir, manifestCache },
+      )
+    : fullFit
+  if (chosenFit.fitted) {
+    if (allCandidates && allCandidates.length > 0) {
+      let lo = 0
+      let hi = allCandidates.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        if (
+          fitsShellOutput(
+            `${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal, stderrOmitted: chosenFit.stderrOmitted })}`,
+          )
+        ) {
+          lo = mid
+        } else {
+          hi = mid - 1
+        }
+      }
+      const text = makePayload(allCandidates.slice(0, lo), {
+        minimal: useMinimal,
+        stderrOmitted: chosenFit.stderrOmitted,
+      })
+      if (fitsShellOutput(`${reserve}${text}`)) return text
+    } else {
+      return chosenFit.text
+    }
+  }
+
+  const buildFallbackObj = (stderrOmitted) => ({
+    ok: Boolean(base.ok),
+    ...(allCandidates
+      ? {
+          candidate_count: allCandidates.length,
+          returned_count: 0,
+          omitted_count: allCandidates.length,
+          omitted_candidates_require_writable_notes: true,
+        }
+      : {}),
+    complete_output_note_failed: true,
+    ...(stderrOmitted ? { stderr_diagnostics_omitted: stderrOmitted } : {}),
+    total_chars: fullTextLength,
+    total_bytes: textBytes,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+    recovery: allCandidates
+      ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHintFor(stderrOmitted)}`
+      : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHintFor(stderrOmitted)}`,
+  })
+  const prettyFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => JSON.stringify(buildFallbackObj(stderrOmitted), null, 2) + '\n',
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  if (prettyFallbackFit.fitted) return prettyFallbackFit.text
+  // Single-line compact form preserves every required count, limit, saved stderr note pointers,
+  // and recovery field (requirements 3c5147a7 / 91d7b47c). If reserve leaves too little room
+  // even for that, refuse explicitly with field, limit, actual length, counts, and recovery.
+  const compactFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => `${JSON.stringify(buildFallbackObj(stderrOmitted))}\n`,
+    reserve,
+    { tmpDir, manifestCache },
+  )
+  if (compactFallbackFit.fitted) return compactFallbackFit.text
+  const totalSavedStderrNotes = Array.isArray(base.stderr_diagnostics_omitted?.notes)
+    ? base.stderr_diagnostics_omitted.notes.length
+    : 0
+  const manifestForThrow = manifestCache.value
+  const stderrThrowHint =
+    totalSavedStderrNotes === 0
+      ? ''
+      : manifestForThrow?.command
+        ? ` Run \`${manifestForThrow.command}\`${manifestForThrow.parts > 1 ? ` (and every further part it names — ${manifestForThrow.parts} parts total)` : ''} to read all ${totalSavedStderrNotes} saved stderr diagnostic note(s) from this connect attempt.`
+        : ` Could not emit the receipt or write a paged manifest for the ${totalSavedStderrNotes} saved stderr diagnostic note(s) because both ~/.devspec/notes and the temporary directory are unwritable; fix write permissions on ~/.devspec/notes or your temporary directory and re-run connect.`
+  const throwRecovery =
+    (allCandidates
+      ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
+      : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.') +
+    stderrThrowHint
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: compactFallbackFit.text.length,
+    reserveBytes: Buffer.byteLength(String(reserve ?? '')),
+    requiredBytes: Buffer.byteLength(compactFallbackFit.text),
+    fullTextLength,
+    noteFailed: true,
+    candidateCount: allCandidates ? allCandidates.length : null,
+    recovery: throwRecovery,
+  })
+}
+
+/**
+ * Write `text` to `stream` and wait for Node to flush every byte to the underlying
+ * file descriptor before returning (so `process.exit()` never truncates output on a
+ * backpressured pipe — requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeStreamAndFlush(stream, text) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      stream.off('error', done)
+      resolve()
+    }
+    stream.once('error', done)
+    stream.write(text, done)
+  })
+}
+
+export function shellBudgetExceededError({
+  field = 'reserve',
+  reserveLength,
+  requiredLength,
+  reserveBytes = null,
+  requiredBytes = null,
+  fullTextLength,
+  note = null,
+  noteFailed = false,
+  candidateCount = null,
+  recovery = null,
+}) {
+  const actualChars = reserveLength + requiredLength
+  const resBytes = typeof reserveBytes === 'number' ? reserveBytes : reserveLength
+  const reqBytes = typeof requiredBytes === 'number' ? requiredBytes : requiredLength
+  const actualBytes = resBytes + reqBytes
+  const exceededByBytesOnly =
+    actualChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS && actualBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const limit = exceededByBytesOnly ? CURSOR_SHELL_OUTPUT_MAX_BYTES : CURSOR_SHELL_OUTPUT_MAX_CHARS
+  const limitUnit = exceededByBytesOnly ? 'bytes' : 'chars'
+  const actualLength = exceededByBytesOnly ? actualBytes : actualChars
+  const boundSummary = exceededByBytesOnly
+    ? `Prior stderr (${resBytes} bytes / ${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling for the ${reqBytes}-byte output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_BYTES} bytes, actual_length: ${actualBytes} bytes, actual_chars: ${actualChars})`
+    : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS} chars, actual_length: ${actualChars} chars)`
+  const msg = recovery
+    ? `${boundSummary}. ${recovery}`
+    : note
+      ? `${boundSummary}; full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
+      : `${boundSummary} (total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`
+  const err = new RangeError(msg)
+  Object.assign(err, {
+    code: 'shell_output_limit_exceeded',
+    field,
+    limit,
+    limit_unit: limitUnit,
+    actual_length: actualLength,
+    limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+    actual_chars: actualChars,
+    actual_bytes: actualBytes,
+    reserve_chars: reserveLength,
+    reserve_bytes: resBytes,
+    required_chars: requiredLength,
+    required_bytes: reqBytes,
+    total_chars: fullTextLength,
+    ...(note ? { note: { id: note.id, command: note.command, parts: note.parts } } : {}),
+    ...(noteFailed ? { complete_output_note_failed: true } : {}),
+    ...(typeof candidateCount === 'number'
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    recovery: msg,
+  })
+  return err
+}
+
+export function formatConnectCliOutput(
+  result,
+  { home = os.homedir(), reserve = '', suppressedDiagnostics = null, tmpDir = os.tmpdir() } = {},
+) {
+  const summary = summarizeConnectCliOutput(result)
+  if (
+    suppressedDiagnostics &&
+    summary &&
+    typeof summary === 'object' &&
+    !Array.isArray(summary)
+  ) {
+    summary.stderr_diagnostics_omitted = suppressedDiagnostics
+  }
+  const fullText = JSON.stringify(summary, null, 2) + '\n'
+  if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
+
+  const fullTextBytes = Buffer.byteLength(fullText)
+  let note = null
+  let noteError = null
+  try {
+    note = writeNote(fullText, { home })
+  } catch (error) {
+    noteError = error
+  }
+  if (!note) {
+    return buildConnectNoteFailureFallback(summary, noteError, fullText.length, {
+      reserve,
+      fullTextBytes,
+      tmpDir,
+    })
+  }
+  const noteRef = {
+    id: note.id,
+    command: note.command,
+    parts: note.parts,
+    total_chars: fullText.length,
+    total_bytes: fullTextBytes,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  }
+  return buildBoundedConnectNoteReceipt(summary, noteRef, fullText.length, {
+    reserve,
+    fullTextBytes,
+  })
+}
+
+/**
  * Node-measured attach_connection.
  * @param {{
  *   connectionId: string,
@@ -1851,130 +2524,6 @@ export async function writeConnectionState(opts) {
  * so overlong CLI arguments or error paths never exceed 20,000 characters on stderr
  * (requirements 3c5147a7 / 91d7b47c).
  */
-function shellQuotePath(filePath) {
-  return /^[A-Za-z0-9_./:-]+$/.test(filePath)
-    ? filePath
-    : `'${String(filePath).replace(/'/g, "'\\''")}'`
-}
-
-/**
- * Write a private, paged manifest listing ONLY this connect attempt's saved stderr
- * diagnostic note commands under an owner-only temp folder, split with `splitText`
- * (`NOTE_PART_CHARS` / `NOTE_PART_BYTES`) and sealed with `seal` so every part fits
- * Cursor's Shell output ceiling even when hundreds of diagnostics were saved
- * (requirements 3c5147a7 / 91d7b47c). Returns null if the temp folder is unwritable.
- */
-export function writePagedStderrNotesManifest(notes, { tmpDir = os.tmpdir() } = {}) {
-  if (!Array.isArray(notes) || notes.length === 0) return null
-  try {
-    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
-    const baseDir = path.join(tmpDir, `devspec-connect-stderr-${uid}`)
-    fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 })
-    try {
-      fs.chmodSync(baseDir, 0o700)
-    } catch {
-      /* best-effort on platforms without POSIX modes */
-    }
-    const stat = fs.lstatSync(baseDir)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return null
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
-
-    const body =
-      `# Saved stderr diagnostic notes for this connect attempt (${notes.length} total)\n` +
-      notes
-        .map((n, idx) => {
-          const id = typeof n?.id === 'string' ? n.id : ''
-          const cmd =
-            typeof n?.command === 'string'
-              ? n.command
-              : id
-                ? `cat ~/.devspec/notes/${id}.md`
-                : '(missing command)'
-          const parts = typeof n?.parts === 'number' && n.parts > 1 ? ` (${n.parts} parts)` : ''
-          return `${idx + 1}. ${cmd}${id ? ` [id=${id}]` : ''}${parts}`
-        })
-        .join('\n') +
-      '\n'
-    const id = crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16)
-    const pieces = splitText(body)
-    const partPath = (part) => path.join(baseDir, part === 1 ? `${id}.md` : `${id}.${part}.md`)
-    const partCmd = (part) => `cat ${shellQuotePath(partPath(part))}`
-    const first = partPath(1)
-    if (!fs.existsSync(first)) {
-      for (let part = pieces.length; part >= 1; part -= 1) {
-        const label = `${part === pieces.length ? 'End of DevSpec connect stderr manifest' : 'DevSpec connect stderr manifest'} ${id}: part ${part} of ${pieces.length}`
-        const after = part < pieces.length ? `read on with \`${partCmd(part + 1)}\`` : ''
-        const sealed = seal(label, pieces[part - 1], after)
-        if (!fitsShellOutput(sealed)) return null
-        writePrivateText(partPath(part), sealed)
-      }
-    }
-    return {
-      id,
-      file: first,
-      command: partCmd(1),
-      parts: pieces.length,
-    }
-  } catch {
-    return null
-  }
-}
-
-export function shellBudgetExceededError({
-  field = 'reserve',
-  reserveLength,
-  requiredLength,
-  reserveBytes = null,
-  requiredBytes = null,
-  fullTextLength,
-  note = null,
-  noteFailed = false,
-  candidateCount = null,
-  recovery = null,
-}) {
-  const actualChars = reserveLength + requiredLength
-  const resBytes = typeof reserveBytes === 'number' ? reserveBytes : reserveLength
-  const reqBytes = typeof requiredBytes === 'number' ? requiredBytes : requiredLength
-  const actualBytes = resBytes + reqBytes
-  const exceededByBytesOnly =
-    actualChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS && actualBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
-  const limit = exceededByBytesOnly ? CURSOR_SHELL_OUTPUT_MAX_BYTES : CURSOR_SHELL_OUTPUT_MAX_CHARS
-  const limitUnit = exceededByBytesOnly ? 'bytes' : 'chars'
-  const actualLength = exceededByBytesOnly ? actualBytes : actualChars
-  const boundSummary = exceededByBytesOnly
-    ? `Prior stderr (${resBytes} bytes / ${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell output ceiling for the ${reqBytes}-byte output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_BYTES} bytes, actual_length: ${actualBytes} bytes, actual_chars: ${actualChars})`
-    : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS} chars, actual_length: ${actualChars} chars)`
-  const msg = recovery
-    ? `${boundSummary}. ${recovery}`
-    : note
-      ? `${boundSummary}; full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
-      : `${boundSummary} (total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`
-  const err = new RangeError(msg)
-  Object.assign(err, {
-    code: 'shell_output_limit_exceeded',
-    field,
-    limit,
-    limit_unit: limitUnit,
-    actual_length: actualLength,
-    limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
-    limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
-    actual_chars: actualChars,
-    actual_bytes: actualBytes,
-    reserve_chars: reserveLength,
-    reserve_bytes: resBytes,
-    required_chars: requiredLength,
-    required_bytes: reqBytes,
-    total_chars: fullTextLength,
-    ...(note ? { note: { id: note.id, command: note.command, parts: note.parts } } : {}),
-    ...(noteFailed ? { complete_output_note_failed: true } : {}),
-    ...(typeof candidateCount === 'number'
-      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
-      : {}),
-    recovery: msg,
-  })
-  return err
-}
-
 export function formatBoundedCliStderr(
   rawMessage,
   {
@@ -2865,7 +3414,14 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    await writeStreamAndFlush(
+      process.stdout,
+      formatConnectCliOutput(result, {
+        reserve: cliStderr.getEmittedStderr(),
+        suppressedDiagnostics: cliStderr.getSuppressedDiagnostics(),
+      }),
+    )
+    await cliStderr.flushStderr()
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2873,9 +3429,11 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
     const connectionId = args['connection-id']
     const sessionId = args.session
     if (!connectionId || !sessionId) {
-      process.stderr.write(
+      await writeStreamAndFlush(
+        process.stderr,
         'Usage: remote-control-state.mjs attach --connection-id <uuid> --session <uuid> [--launch-id <uuid>]\n',
       )
+      await cliStderr.flushStderr()
       process.exit(2)
     }
     const hostToken =
@@ -2890,7 +3448,13 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    await writeStreamAndFlush(
+      process.stdout,
+      formatConnectCliOutput(result, {
+        reserve: cliStderr.getEmittedStderr(),
+        suppressedDiagnostics: cliStderr.getSuppressedDiagnostics(),
+      }),
+    )
     await cliStderr.flushStderr()
     process.exit(result.ok ? 0 : 1)
   }
@@ -2907,7 +3471,7 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
       ? `field command, actual_bytes ${Buffer.byteLength(String(cmd ?? ''))}, actual_chars ${String(cmd ?? '').length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
       : `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
   })
-  await new Promise((resolve) => process.stderr.write(boundedUnknown, resolve))
+  await writeStreamAndFlush(process.stderr, boundedUnknown)
   await cliStderr.flushStderr()
   process.exit(2)
 }

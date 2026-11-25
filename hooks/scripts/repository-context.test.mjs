@@ -234,3 +234,25 @@ test("the run-wide project context never carries the owner's reply style",()=>se
  assert.doesNotMatch(repositoryContextHook({conversation_id:'style'},{home,force:true}).additional_context,/haiku/)
  assert.equal(refreshRepositoryRules('style',{project_id:A.id,owner_custom_instructions:'Answer me in limericks.'},home),null,'a style-only refresh changes no run-wide tier')
 }))
+
+test('multi-part project context advances pointer to next unread part and stops once all parts are read (item 083422dd)',()=>setup(home=>{
+ selectProjectContext('multi',endpoint,A,'explicit',home)
+ const reg=registration()
+ reg.project_agent_rules='Rule sentence for context test. '.repeat(700)+'FINAL-RULE-MARKER'
+ storeRepositorySnapshot('multi',reg,home)
+ const firstLine=repositoryContextHook({conversation_id:'multi'},{home,host:'999:1'}).additional_context
+ const id=noteIdIn(firstLine)
+ const files=noteFiles(home,id)
+ assert.ok(files.length>=2,`expected multi-part note, got ${files.length}`)
+ assert.match(readNoteText(id,{home}),/FINAL-RULE-MARKER/)
+ // After reading part 1, the reminder points directly at part 2 (never repeating part 1).
+ const afterPart1=repositoryContextHook(catCall(home,files[0],{conversation:'multi'}),{home,host:'999:1'})?.additional_context
+ assert.ok(afterPart1)
+ assert.match(afterPart1,new RegExp(`cat ~/.devspec/notes/${id}\\.2\\.md`))
+ assert.doesNotMatch(afterPart1,new RegExp(`cat ~/.devspec/notes/${id}\\.md`))
+ // After reading the remaining part(s), the reminder stops coming back.
+ let last=afterPart1
+ for(const file of files.slice(1)) last=repositoryContextHook(catCall(home,file,{conversation:'multi'}),{home,host:'999:1'})?.additional_context ?? null
+ assert.equal(last,null)
+ assert.equal(repositoryContextHook({conversation_id:'multi',tool_name:'Shell',tool_input:{command:'ls'}},{home,host:'999:1'}),null)
+}))

@@ -495,16 +495,26 @@ export function readThrough(record, input, { home = os.homedir() } = {}) {
  * The delivery kept at `file`, identified by `key` (its note and whatever else marks
  * this delivery: a change counter, the session, the host process), brought up to date
  * with this tool call. A key that differs in anything starts a new delivery with
- * nothing read. Returns whether this delivery has been read through. A record that
- * cannot be read starts the delivery again (more reading, never less).
+ * nothing read. Returns `{ done, readParts, nextPart }` when `details` is true, or
+ * boolean `done` by default. A record that cannot be read starts the delivery again
+ * (more reading, never less).
  */
-export function deliveryReadThrough(file, input, key, { home = os.homedir() } = {}) {
+export function deliveryReadThrough(file, input, key, { home = os.homedir(), details = false } = {}) {
   const kept = readPrivateJson(file)
   const same = kept && Object.entries(key).every(([field, value]) => kept[field] === value)
   const current = same ? kept : { ...key, parts: [] }
   const { record, done } = readThrough(current, input, { home })
   if (!same || (kept?.parts?.length ?? 0) !== record.parts.length) writePrivateJson(file, record)
-  return done
+  if (!details) return done
+  const totalParts = noteParts(record.note, { home })
+  let nextPart = 1
+  for (let p = 1; p <= totalParts; p += 1) {
+    if (!record.parts.includes(p)) {
+      nextPart = p
+      break
+    }
+  }
+  return { done, readParts: record.parts, nextPart, totalParts }
 }
 
 const PENDING_DIR = path.join(NOTES_DIR, 'pending')
