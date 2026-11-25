@@ -1,5 +1,5 @@
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 import { resolveConnectionBridgeContext } from './manage-plan-bridge.mjs'
 import { SESSION_POLL_MAX_OPTIONS } from './remote-ingress-v1.mjs'
 
@@ -184,7 +184,7 @@ export async function useManagePollBridge(
   )
   if (!bound.ok) return bound
   const auth = resolveAuth(bound.state.cwd || process.cwd(), {
-    hostToken: hostToken || hostTokenFromEnv(process.env),
+    hostToken,
   })
   if (!auth.ok || !auth.token || !auth.mcp_url) return { ok: false, error: auth.error || 'DevSpec MCP auth unavailable' }
   try {

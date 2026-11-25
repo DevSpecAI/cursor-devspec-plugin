@@ -57,6 +57,7 @@ export async function runTrailTurn({
   raw = '',
   env = process.env,
   connectionsDir,
+  chatsDir,
   loadStateFn = loadState,
   call = mcpToolsCall,
   now = Date.now(),
@@ -91,13 +92,19 @@ export async function runTrailTurn({
   if (!state?.enabled || !state.connection_id) {
     return { ok: false, skipped: true, reason: 'disabled_or_unbound' }
   }
-  // The model this tool call runs, for the Agents page (item 30cd0424). Every Cursor hook
-  // names it. The prompt-submit and stop hooks also report it, but neither is dependable
-  // for a connected conversation (measured on cursor-agent 2026.10.22): prompt-submit runs
-  // only for a prompt typed in the terminal, never for a room command, and stop is skipped
-  // whenever Cursor ends a turn on its own "WritableIterable is closed" error, which it did
-  // after nearly every turn of a long remote-driven session. So no model ever arrived.
-  recordRuntimeReport(state.connection_id, raw, connectionsDir ? { dir: connectionsDir, now: new Date(now) } : { now: new Date(now) })
+  // The model this turn runs, for the Agents page (items 30cd0424, c2ddefb6).
+  // `afterAgentThought` comes from Cursor's live model manager (authoritative), while
+  // tool hooks carry the startup-frozen model in cursor-agent so `recordRuntimeReport`
+  // checks Cursor's local SQLite chat store and never lets a stale tool hook overwrite
+  // a live-hook or chat-store model.
+  recordRuntimeReport(state.connection_id, raw, {
+    ...(connectionsDir ? { dir: connectionsDir } : {}),
+    ...(chatsDir ? { chatsDir } : {}),
+    now: new Date(now),
+    authoritative: mode === 'afterAgentThought',
+    conversationId: bondId || state.local_id,
+    cwd: state.cwd,
+  })
   if (mode === 'seed' && !state.session_id) {
     return { ok: false, skipped: true, reason: 'seed_requires_session' }
   }

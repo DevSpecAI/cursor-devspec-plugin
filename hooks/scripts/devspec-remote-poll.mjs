@@ -70,7 +70,7 @@
  *   node devspec-remote-poll.mjs --connection-id <uuid> [--session <uuid>] [--owner-pid <pid>]
  *
  * Uses the connection's own credential: the plugin's browser sign-in it connected with
- * (its current token, taken afresh every lap) or the DEVSPEC_MCP_TOKEN it connected with.
+ * (its current token, taken afresh every lap).
  * When DevSpec refuses that sign-in, the poller stands the connection down and says so
  * plainly (`end_reason: 'signed_out'`, with the sentence to show), never failing silently.
  */
@@ -471,7 +471,9 @@ function writeState(state, connectionId) {
   }
   for (const p of paths) {
     fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.writeFileSync(p, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    const tmp = `${p}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    fs.renameSync(tmp, p)
   }
 }
 
@@ -2257,8 +2259,8 @@ async function main() {
         }),
         ...(busy !== null && busy !== undefined ? { busy } : {}),
         ...(checkTier ? { check_tier: checkTier } : {}),
-        // The model Cursor last ran, written by the prompt and stop hooks (item cc47378e).
-        ...agentStatsArgs(connectionId),
+        // The model Cursor last ran, from live hooks / local chat store (items cc47378e, c2ddefb6).
+        ...agentStatsArgs(connectionId, { localId: tierState?.local_id, cwd: tierState?.cwd }),
         ...usageRefusal,
         // The project recall DevSpec attaches to a delivered command or automation
         // run, leaving out what this conversation has already been shown (turn-recall.mjs).

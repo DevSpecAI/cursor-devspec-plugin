@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { resolveDevspecMcpAuth, hostTokenFromEnv } from './resolve-mcp-auth.mjs'
+import { resolveDevspecMcpAuth } from './resolve-mcp-auth.mjs'
 
 export const CONNECTION_CAPABILITY_VERSION = 1
 export const MANAGE_PLAN_DESCRIPTION =
@@ -257,7 +257,7 @@ export async function useManagePlanBridge(
   const bound = resolveManagePlanBridgeContext({ localId, agent }, { root })
   if (!bound.ok) return bound
   const auth = resolveAuth(bound.state.cwd || process.cwd(), {
-    hostToken: hostToken || hostTokenFromEnv(process.env),
+    hostToken,
   })
   if (!auth.ok || !auth.token || !auth.mcp_url) return { ok: false, error: auth.error || 'DevSpec MCP auth unavailable' }
   try {
