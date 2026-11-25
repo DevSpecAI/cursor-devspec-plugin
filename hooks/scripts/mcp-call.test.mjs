@@ -263,4 +263,41 @@ describe('a failed response in an error', () => {
       await new Promise((resolve) => server.close(resolve))
     }
   })
+
+  it('preserves JSON-RPC error code and structured data on thrown errors (4e32d1a5)', async () => {
+    const server = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          error: {
+            code: -32001,
+            message: 'Connection capability refused',
+            data: { retryable: false, reason: 'invalid_connection_capability' },
+          },
+        }),
+      )
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    try {
+      const error = await mcpToolsCall({
+        mcpUrl,
+        token: 'dvs_fixture',
+        name: 'report_request',
+        arguments: {},
+      }).then(
+        () => assert.fail('JSON-RPC error must reject'),
+        (e) => e,
+      )
+      assert.equal(error.code, -32001)
+      assert.deepEqual(error.data, { retryable: false, reason: 'invalid_connection_capability' })
+      assert.equal(error.rpcError.code, -32001)
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
 })

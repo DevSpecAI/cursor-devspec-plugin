@@ -565,7 +565,8 @@ export function turnEndFailure(end) {
  * changed under the read. An empty file is Cursor's rewrite caught between truncating
  * it and writing it: Cursor never leaves a transcript empty.
  */
-function readWholeOnce(transcriptPath) {
+function readWholeOnce(transcriptPath, { deadlineMs = null } = {}) {
+  if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
   let fd
   try {
     fd = fs.openSync(transcriptPath, 'r')
@@ -578,6 +579,7 @@ function readWholeOnce(transcriptPath) {
     const chunks = []
     let offset = 0
     while (offset < before.size) {
+      if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
       const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, before.size - offset))
       const read = fs.readSync(fd, chunk, 0, chunk.length, offset)
       if (read <= 0) break
@@ -673,18 +675,25 @@ function userRowText(row) {
  * and `userRows` each user row's byte offset and kind (userRowKind). `{ missing: true }`
  * when there is no transcript yet, or null when no clean read could be had.
  */
-export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
+export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS, deadlineMs = null } = {}) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0) sleepSync(STABLE_READ_GAP_MS)
-    const whole = readWholeOnce(transcriptPath)
+    if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
+    if (attempt > 0) {
+      if (deadlineMs !== null && Date.now() + STABLE_READ_GAP_MS > deadlineMs) return { budgetExhausted: true }
+      sleepSync(STABLE_READ_GAP_MS)
+    }
+    const whole = readWholeOnce(transcriptPath, { deadlineMs })
+    if (whole?.budgetExhausted) return { budgetExhausted: true }
     if (whole?.missing) return { missing: true }
     if (!whole) continue
     // Still the same file a moment later: not a piece of a rewrite in progress.
+    if (deadlineMs !== null && Date.now() + STABLE_READ_GAP_MS > deadlineMs) return { budgetExhausted: true }
     sleepSync(STABLE_READ_GAP_MS)
     if (fileStamp(transcriptPath) !== whole.stamp) continue
     const bytes = Buffer.concat(whole.chunks)
-    const parsed = scanTranscript(bytes)
+    const parsed = scanTranscript(bytes, { deadlineMs })
+    if (parsed?.budgetExhausted) return { budgetExhausted: true }
     if (parsed) return { ...parsed, bytes, size: bytes.length, stamp: whole.stamp, atMs: whole.atMs }
   }
   return null
@@ -695,16 +704,22 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
  * is a line whose top-level `role` is "user"; the substring test only skips parsing lines
  * that cannot be one.
  */
-function scanTranscript(bytes) {
+function scanTranscript(bytes, { deadlineMs = null } = {}) {
   // Cursor ends every row with a newline: anything after the last one is half written.
   if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) return null
   let turns = 0
   let lastUser = null
   let last = null
   let lastStart = 0
+  let lastNonResumedText = null
   const userRows = []
   let start = 0
+  let lineCount = 0
   while (start < bytes.length) {
+    if (deadlineMs !== null && (lineCount & 63) === 0 && Date.now() >= deadlineMs) {
+      return { budgetExhausted: true }
+    }
+    lineCount += 1
     const newline = bytes.indexOf(0x0a, start)
     const text = bytes.toString('utf8', start, newline).trim()
     if (text) {
@@ -720,7 +735,10 @@ function scanTranscript(bytes) {
         if (row?.role === 'user') {
           turns += 1
           lastUser = digest(text)
-          userRows.push({ start, kind: userRowKind(userRowText(row)), digest: lastUser })
+          const rawText = userRowText(row)
+          const kind = userRowKind(rawText)
+          if (kind !== 'resumed') lastNonResumedText = rawText
+          userRows.push({ start, kind, digest: lastUser })
         }
       }
     }
@@ -741,11 +759,17 @@ function scanTranscript(bytes) {
       }
     }
   }
-  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest: last ? digest(last) : null, userRows }
+  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest: last ? digest(last) : null, userRows, lastNonResumedText }
 }
 
 function digest(text) {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)
+}
+
+function extractUserQueryText(rawText) {
+  if (typeof rawText !== 'string' || !rawText) return null
+  const match = rawText.match(/<user_query>([\s\S]*?)<\/user_query>/)
+  return match ? match[1].trim() : null
 }
 
 /**
@@ -753,12 +777,14 @@ function digest(text) {
  * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
  * Only intra-turn `resumed` rows are skipped; a `timestamp`-only wake row is returned
  * as `kind: 'timestamp'` so it never falls back to an earlier typed prompt.
- * Returns null when the transcript cannot be read or does not exist yet.
+ * Returns `{ budgetExhausted: true }` when `deadlineMs` expires before a clean read
+ * completes, or null when the transcript cannot be read or does not exist yet.
  */
-export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
+export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_ATTEMPTS, deadlineMs = null } = {}) {
   const conversation = transcriptConversation(transcriptPath)
   if (!conversation) return null
-  const read = readTranscriptTurns(transcriptPath, { attempts })
+  const read = readTranscriptTurns(transcriptPath, { attempts, deadlineMs })
+  if (read?.budgetExhausted) return { budgetExhausted: true }
   if (!read || read.missing) return null
   let lastIndex = -1
   let lastRow = null
@@ -769,12 +795,15 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
       break
     }
   }
+  const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
   return {
     kind: lastRow ? lastRow.kind : 'none',
     ended: Boolean(read.end),
     key: lastRow ? `${conversation}#${lastIndex}#${lastRow.digest}` : null,
     stamp: read.stamp,
     turns: read.turns,
+    rawText,
+    queryText: extractUserQueryText(rawText),
   }
 }
 

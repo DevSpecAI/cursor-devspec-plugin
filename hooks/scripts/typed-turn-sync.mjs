@@ -22,10 +22,13 @@ import {
   appendRequestEvent,
   closeRequest,
   openRequest,
+  promptArrival,
   readRequestState,
   requestFinished,
+  requestForWake,
   requestsWithWorkPending,
   rotateRequestLog,
+  UNSTATED,
 } from './requests.mjs'
 import { activeTranscriptTurn, STABLE_READ_ATTEMPTS } from './transcript-turn-end.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
@@ -341,7 +344,11 @@ export async function syncTypedTurnFromTranscript({
   if (!stamp) return { action: 'none' }
   if (memo && memo.stamp === stamp && memo.synced) return { action: 'unchanged' }
 
-  const active = activeTranscriptTurn(transcriptPath, { attempts })
+  const active = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
+  if (active?.budgetExhausted) {
+    log(`typed-turn-sync: transcript read budget (${budgetMs} ms) exhausted for ${connectionId}\n`)
+    return { action: 'budget_exhausted', budget_ms: budgetMs }
+  }
   if (!active) return { action: 'unreadable' }
   if (memo) {
     memo.stamp = active.stamp
@@ -358,10 +365,77 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
-  // A live non-typed turn (timestamp-only wake or room command wake) must not inherit an
-  // unrelated earlier typed_prompt — even if that typed_prompt has a future scheduled run
-  // or still-running background job — UNLESS this wake itself explicitly restored that
-  // typed_prompt via `promptArrival` (`currentFromWake`, decisions 2fcd26bd / ce71a72b).
+  // Resolve explicit background/scheduled wake rows directly from transcript content so
+  // Cursor CLI (which skips beforeSubmitPrompt) still restores the launching request
+  // instead of dropping attribution or opening a duplicate typed_prompt (ce71a72b / 2fcd26bd).
+  const resolveTranscriptWake = (reqState) => {
+    const rawText = typeof active.rawText === 'string' ? active.rawText : ''
+    const queryText = typeof active.queryText === 'string' ? active.queryText : rawText
+    if (rawText) {
+      const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
+      if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch }
+    }
+    if (queryText) {
+      const schedMatch = requestForWake({ origin: 'scheduled-trigger', text: queryText, state: reqState })
+      if (schedMatch.ref !== UNSTATED) return { origin: 'scheduled-trigger', text: queryText, match: schedMatch }
+    }
+    return null
+  }
+  const hasUnnotifiedLaunchFor = (reqState, requestId) => {
+    if (!requestId) return false
+    for (const launch of new Set(reqState.launches.values())) {
+      if (launch.notifies && !launch.notified && (launch.request === requestId || launch.also.includes(requestId))) {
+        return true
+      }
+    }
+    return false
+  }
+
+  if (resolveTranscriptWake(initial)) {
+    const restored = await withTypedSyncLock(
+      connectionId,
+      dir,
+      async () => {
+        const reqState = readRequestState(connectionId, { dir })
+        if (reqState.seenTranscriptTurns.has(active.key)) {
+          return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
+        }
+        const wake = resolveTranscriptWake(reqState)
+        if (!wake) return { action: 'not_a_wake' }
+        const arrival = promptArrival({
+          fromAPerson: false,
+          origin: wake.origin,
+          text: wake.text,
+          midTurn: false,
+          state: reqState,
+        })
+        for (const event of arrival.events) {
+          if (!appendRequestEvent(connectionId, event, { dir })) {
+            return { action: 'binding_write_failed', key: active.key, active }
+          }
+        }
+        const ref = wake.match.ref === UNSTATED ? null : wake.match.ref
+        if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref }, { dir })) {
+          return { action: 'binding_write_failed', requestId: ref, key: active.key, active }
+        }
+        return { action: 'restored_wake_request', requestId: ref, key: active.key, active }
+      },
+      { deadlineMs },
+    )
+    if (!restored) return { action: 'lock_busy' }
+    if (restored.action !== 'not_a_wake') {
+      if (memo && (restored.action === 'restored_wake_request' || restored.action === 'already_synced')) {
+        memo.synced = true
+      }
+      return restored
+    }
+  }
+
+  // A live non-typed turn (timestamp-only wake or command_turn wake) must not inherit an
+  // unrelated earlier typed_prompt (even if it has a future scheduled run that did not
+  // fire here), while preserving attribution when this wake restored it via promptArrival
+  // (`currentFromWake`) or when an un-notified background launch for it is still pending
+  // on Cursor CLI without beforeSubmitPrompt (decisions 2fcd26bd / ce71a72b).
   if (active.kind !== 'typed') {
     const isTypedCurrent = Boolean(
       initial.current && initial.open.get(initial.current)?.kind === 'typed_prompt',
@@ -384,11 +458,10 @@ export async function syncTypedTurnFromTranscript({
         if (!stillTyped) {
           return { action: 'not_typed_live', active }
         }
-        if (reqState.currentFromWake) {
-          // This wake (background job completion or scheduled trigger) explicitly restored
-          // the typed_prompt. Bind this transcript turn to it so attribution stays intact
-          // even after the launch is marked notified, and so a LATER unrelated wake will
-          // not also inherit this restored current.
+        if (reqState.currentFromWake || hasUnnotifiedLaunchFor(reqState, reqState.current)) {
+          // Preserve attribution for a wake-restored request (even after its launch was
+          // marked notified) or a Cursor CLI background-launch wake where beforeSubmitPrompt
+          // did not fire and Cursor stripped <task-notification> from the transcript row.
           if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
             return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
           }
@@ -578,14 +651,16 @@ export async function finishIdleRequests({
   if (!active || !active.ended) return { closed: [], localCompleted: false }
 
   // Identify the single request finished by this ended turn: either the request bound
-  // to this transcript turn key, or the foreground current request when finished.
+  // to this transcript turn key, the foreground current request, or (when an explicit
+  // reply already cleared `current` before `closeRequest` failed) the first finished open
+  // request so one idle lap retries it without issuing a loop of close calls.
   const boundId = active.key ? reqState.seenTranscriptTurns.get(active.key) ?? null : null
   const candidateId =
     boundId && requestFinished(reqState, boundId, pending)
       ? boundId
       : reqState.current && requestFinished(reqState, reqState.current, pending)
         ? reqState.current
-        : null
+        : ([...reqState.open.keys()].find((id) => requestFinished(reqState, id, pending)) ?? null)
 
   if (!candidateId && !localAttemptId) return { closed: [], localCompleted: false }
 

@@ -546,6 +546,98 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(readRequestState(CONN, { dir }).current, null)
   })
 
+  it('restores a scheduled wake directly from transcript text on Cursor CLI without beforeSubmitPrompt (ce71a72b / 2fcd26bd)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'cron-cli', prompt: 'Check deploy health', request: HOOK_TYPED, also: [] }, { dir })
+    // Simulate current cleared earlier by an unrelated wake, then the scheduled prompt arrives without promptArrival.
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Check deploy health')}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must restore scheduled request instead of opening a new typed_prompt') },
+      dir,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x', request_ref: HOOK_TYPED },
+    })
+  })
+
+  it('preserves a typed_prompt with an un-notified background launch on Cursor CLI when beforeSubmitPrompt does not fire (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bg-cli-1', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
+    // Cursor CLI strips <task-notification> leaving a bare timestamp / command_turn row without running promptArrival.
+    fs.writeFileSync(transcriptPath, `${typedRow('Start background build')}\n${commandRow()}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'preserved_wake_request')
+    assert.equal(res.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x', request_ref: HOOK_TYPED },
+    })
+  })
+
+  it('enforces budgetMs during synchronous transcript reading so a half-written transcript cannot overrun the hook timeout (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    // Half-written line without trailing newline forces readTranscriptTurns retries.
+    fs.writeFileSync(transcriptPath, '{"role":"user","message":')
+    const logs = []
+    const started = Date.now()
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      budgetMs: 40,
+      dir,
+      log: (line) => logs.push(line),
+    })
+    const elapsed = Date.now() - started
+    assert.equal(res.action, 'budget_exhausted')
+    assert.equal(res.budget_ms, 40)
+    assert.ok(elapsed < 200, `transcript read must stop within budgetMs=40, took ${elapsed}ms`)
+    assert.equal(logs.length, 1)
+  })
+
+  it('retries closing an answered room command in finishIdleRequests even after mark-explicit-reply cleared current (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    // mark-explicit-reply marked CMD_A answered (clearing current to null) and its immediate closeRequest failed.
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_A }, { dir })
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.equal(readRequestState(CONN, { dir }).open.has(CMD_A), true)
+
+    fs.writeFileSync(transcriptPath, `${commandRow()}\n${turnEndedRow('success')}\n`)
+    const closedIds = []
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.action === 'close') closedIds.push(args.request_id)
+        return { status: 'closed' }
+      },
+      dir,
+    })
+    assert.deepEqual(closedIds, [CMD_A])
+    assert.deepEqual(res.closed, [CMD_A])
+    assert.equal(readRequestState(CONN, { dir }).open.size, 0)
+  })
+
   it('leaves turn unsynced when patchState fails, returns undefined (swallowed write error), or throws (3ea2b201)', async () => {
     for (const [label, patchState] of [
       ['returns false', () => false],

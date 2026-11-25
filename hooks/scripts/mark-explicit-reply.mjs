@@ -177,7 +177,7 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
           const credential = connectionCredential(state)
           const capability = state.connection_capability || readConnectionCapability(connectionId)
           if (credential.ok && capability) {
-            await closeRequest({
+            const closed = await closeRequest({
               connectionId,
               requestId: primaryAnsweredId,
               dir: connDir,
@@ -191,11 +191,19 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
                   timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
                 }),
             })
-            rotateRequestLog(connectionId, { dir: connDir })
+            if (closed) {
+              rotateRequestLog(connectionId, { dir: connDir })
+            } else {
+              process.stderr.write(
+                `mark-explicit-reply: closeRequest did not complete for answered command ${primaryAnsweredId}; leaving open for idle retry\n`,
+              )
+            }
           }
         }
-      } catch {
-        /* non-fatal: answered command is already cleared from current */
+      } catch (error) {
+        process.stderr.write(
+          `mark-explicit-reply: closeRequest failed for answered command ${primaryAnsweredId}: ${error instanceof Error ? error.message : String(error)}; leaving open for idle retry\n`,
+        )
       }
     }
   }
