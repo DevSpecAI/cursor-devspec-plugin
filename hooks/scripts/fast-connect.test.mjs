@@ -1175,19 +1175,76 @@ describe('fast-connect CLI flags', () => {
       assert.ok(fitsShellOutput(r3.stdout + r3.stderr))
       assert.match(r3.stderr, /actual_length 24000/)
 
-      // Even when prior stderr already occupies 19,980 characters, neither connect receipt nor stderr fallback crosses fitsShellOutput.
+      // When prior stderr leaves too little room (only 20 chars) for the smallest visible note pointer or
+      // refusal, formatters explicitly refuse with field, limit, actual_length, note/counts, and recovery
+      // instead of overflowing fitsShellOutput or silently returning an empty string (reqs 3c5147a7 / 91d7b47c).
       const tightReserve = 'e'.repeat(19_980)
-      const withNote = formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve })
-      assert.ok(fitsShellOutput(tightReserve + withNote), `tightReserve + withNote (${(tightReserve + withNote).length}) must fit fitsShellOutput`)
+      assert.throws(
+        () => formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve }),
+        (err) => {
+          assert.equal(err.code, 'shell_output_limit_exceeded')
+          assert.equal(err.field, 'reserve')
+          assert.equal(err.limit, 20_000)
+          assert.ok(err.actual_length > 20_000)
+          assert.ok(err.note?.id && err.note?.command, 'must still surface the saved note pointer')
+          return true
+        },
+      )
 
       const brokenHome2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-tight-broken-'))
       try {
         fs.mkdirSync(path.join(brokenHome2, '.devspec'), { recursive: true })
         fs.writeFileSync(path.join(brokenHome2, '.devspec', 'notes'), 'file blocking notes dir')
-        const withoutNote = formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home: brokenHome2, reserve: tightReserve })
-        assert.ok(fitsShellOutput(tightReserve + withoutNote), `tightReserve + withoutNote (${(tightReserve + withoutNote).length}) must fit fitsShellOutput`)
-        const stderrOut = formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: tightReserve })
-        assert.ok(fitsShellOutput(tightReserve + stderrOut), `tightReserve + stderrOut (${(tightReserve + stderrOut).length}) must fit fitsShellOutput`)
+        const candidatePayload = {
+          ok: false,
+          code: 'project_choice_required',
+          error: 'Multiple projects matched',
+          project_selection: {
+            version: 1,
+            status: 'multiple_matches',
+            candidates: [
+              { id: '1', name: 'A', detail: 'd'.repeat(10_000) },
+              { id: '2', name: 'B', detail: 'd'.repeat(10_000) },
+              { id: '3', name: 'C', detail: 'd'.repeat(10_000) },
+            ],
+          },
+        }
+        // When moderate reserve still fits the compact fallback, candidate counts and recovery are preserved whole.
+        const modReserve = 'e'.repeat(19_400)
+        const compactFallbackOut = formatFastConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: modReserve })
+        assert.ok(fitsShellOutput(modReserve + compactFallbackOut))
+        const parsedFallback = JSON.parse(compactFallbackOut)
+        assert.equal(parsedFallback.candidate_count, 3)
+        assert.equal(parsedFallback.returned_count, 0)
+        assert.equal(parsedFallback.omitted_count, 3)
+        assert.equal(parsedFallback.complete_output_note_failed, true)
+        assert.match(parsedFallback.recovery, /--project/)
+
+        // When tight reserve cannot fit even the compact refusal with counts and recovery, refuse explicitly.
+        assert.throws(
+          () => formatFastConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: tightReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 20_000)
+            assert.equal(err.complete_output_note_failed, true)
+            assert.equal(err.candidate_count, 3)
+            assert.equal(err.returned_count, 0)
+            assert.equal(err.omitted_count, 3)
+            assert.match(err.recovery, /--project/)
+            return true
+          },
+        )
+        assert.throws(
+          () => formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: tightReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 20_000)
+            assert.equal(err.complete_output_note_failed, true)
+            return true
+          },
+        )
       } finally {
         fs.rmSync(brokenHome2, { recursive: true, force: true })
       }

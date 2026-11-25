@@ -1843,6 +1843,41 @@ export async function writeConnectionState(opts) {
  * so overlong CLI arguments or error paths never exceed 20,000 characters on stderr
  * (requirements 3c5147a7 / 91d7b47c).
  */
+export function shellBudgetExceededError({
+  field = 'reserve',
+  reserveLength,
+  requiredLength,
+  fullTextLength,
+  note = null,
+  noteFailed = false,
+  candidateCount = null,
+  recovery = null,
+}) {
+  const actualLength = reserveLength + requiredLength
+  const msg =
+    recovery ||
+    (note
+      ? `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char receipt (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, actual_length: ${actualLength}); full output (${fullTextLength} chars) saved in note ${note.id} — read with \`${note.command}\`.`
+      : `Prior stderr (${reserveLength} chars) left too little room inside Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell output ceiling for the ${requiredLength}-char output (field: ${field}, limit: ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, actual_length: ${actualLength}, total_chars: ${fullTextLength}). Fix write permissions on ~/.devspec/notes or reduce prior stderr and re-run.`)
+  const err = new RangeError(msg)
+  Object.assign(err, {
+    code: 'shell_output_limit_exceeded',
+    field,
+    limit: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    actual_length: actualLength,
+    reserve_chars: reserveLength,
+    required_chars: requiredLength,
+    total_chars: fullTextLength,
+    ...(note ? { note: { id: note.id, command: note.command, parts: note.parts } } : {}),
+    ...(noteFailed ? { complete_output_note_failed: true } : {}),
+    ...(typeof candidateCount === 'number'
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    recovery: msg,
+  })
+  return err
+}
+
 export function formatBoundedCliStderr(
   rawMessage,
   {
@@ -1857,22 +1892,39 @@ export function formatBoundedCliStderr(
   const prior = String(reserve ?? '')
   if (fitsShellOutput(`${prior}${text}`)) return text
   const meta = summary ? `${summary}; ` : ''
+  let savedNote = null
   try {
-    const note = writeNote(text, { home })
-    const pointer = `${label}: ${meta}diagnostic (${text.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling; full text saved in note ${note.id} — read with \`${note.command}\`.\n`
-    if (fitsShellOutput(`${prior}${pointer}`)) return pointer
-    const compactPointer = `${label}: diagnostic in note ${note.id} (${note.command})\n`
-    if (fitsShellOutput(`${prior}${compactPointer}`)) return compactPointer
+    savedNote = writeNote(text, { home })
   } catch {
-    /* fall through to bounded fallback below */
+    savedNote = null
+  }
+  if (savedNote) {
+    const pointer = `${label}: ${meta}diagnostic (${text.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling; full text saved in note ${savedNote.id} — read with \`${savedNote.command}\`.\n`
+    if (fitsShellOutput(`${prior}${pointer}`)) return pointer
+    const compactPointer = `${label}: diagnostic in note ${savedNote.id} (${savedNote.command})\n`
+    if (fitsShellOutput(`${prior}${compactPointer}`)) return compactPointer
+    throw shellBudgetExceededError({
+      field: 'reserve',
+      reserveLength: prior.length,
+      requiredLength: compactPointer.length,
+      fullTextLength: text.length,
+      note: savedNote,
+    })
   }
   const fb =
     typeof fallback === 'string' && fallback
       ? fallback
       : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed.\n`
   if (fitsShellOutput(`${prior}${fb}`)) return fb
-  const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`
-  return fitsShellOutput(`${prior}${omitted}`) ? omitted : ''
+  const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
+  if (fitsShellOutput(`${prior}${omitted}`)) return omitted
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: prior.length,
+    requiredLength: omitted.length,
+    fullTextLength: text.length,
+    noteFailed: true,
+  })
 }
 
 // --- CLI entry (skipped when imported for tests) ---
@@ -1883,10 +1935,16 @@ const isMain =
 if (isMain) {
   void runCli().catch((err) => {
     const raw = `remote-control-state: ${err?.message || err}\n`
-    const bounded = formatBoundedCliStderr(raw, {
-      label: 'remote-control-state',
-      summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
-    })
+    let bounded = ''
+    try {
+      bounded = formatBoundedCliStderr(raw, {
+        label: 'remote-control-state',
+        summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+      })
+    } catch {
+      process.exit(1)
+      return
+    }
     process.stderr.write(bounded, () => process.exit(1))
   })
 }

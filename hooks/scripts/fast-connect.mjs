@@ -38,6 +38,7 @@ import {
   attachConnection,
   writeConnectionState,
   formatBoundedCliStderr,
+  shellBudgetExceededError,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -797,11 +798,16 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
   if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
 
   // Final guaranteed-bounded receipt when caller-supplied identifier fields or prior stderr
-  // leave minimal room inside Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c).
+  // leave minimal room inside Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c). Never drop
+  // the note pointer or return an empty string silently: refuse explicitly if reserve itself
+  // leaves too little room for the smallest visible pointer.
   const compactReceipt =
     JSON.stringify(
       {
         ok: Boolean(base.ok),
+        ...(candidateCount !== null
+          ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+          : {}),
         omitted_fields_in_note: true,
         complete_output_note: noteRef,
         note: noteMsg,
@@ -810,11 +816,24 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
       2,
     ) + '\n'
   if (fitsShellOutput(`${reserve}${compactReceipt}`)) return compactReceipt
-  const tightReceipt = `${JSON.stringify({ ok: Boolean(base.ok), note: noteRef.id, read: noteRef.command })}\n`
+  const tightReceipt = `${JSON.stringify({
+    ok: Boolean(base.ok),
+    ...(candidateCount !== null
+      ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    note: noteRef.id,
+    read: noteRef.command,
+    parts: noteRef.parts,
+  })}\n`
   if (fitsShellOutput(`${reserve}${tightReceipt}`)) return tightReceipt
-  const bareReceipt = `${JSON.stringify({ ok: Boolean(base.ok), note: noteRef.id })}\n`
-  if (fitsShellOutput(`${reserve}${bareReceipt}`)) return bareReceipt
-  return ''
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: tightReceipt.length,
+    fullTextLength,
+    note: noteRef,
+    candidateCount,
+  })
 }
 
 function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength, { reserve = '' } = {}) {
@@ -895,34 +914,39 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     if (fitsShellOutput(`${reserve}${text}`)) return text
   }
 
-  const fallbackReceipt =
-    JSON.stringify(
-      {
-        ok: Boolean(base.ok),
-        ...(allCandidates
-          ? {
-              candidate_count: allCandidates.length,
-              returned_count: 0,
-              omitted_count: allCandidates.length,
-              omitted_candidates_require_writable_notes: true,
-            }
-          : {}),
-        complete_output_note_failed: true,
-        total_chars: fullTextLength,
-        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
-        recovery: allCandidates
-          ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
-          : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.',
-      },
-      null,
-      2,
-    ) + '\n'
+  const fallbackObj = {
+    ok: Boolean(base.ok),
+    ...(allCandidates
+      ? {
+          candidate_count: allCandidates.length,
+          returned_count: 0,
+          omitted_count: allCandidates.length,
+          omitted_candidates_require_writable_notes: true,
+        }
+      : {}),
+    complete_output_note_failed: true,
+    total_chars: fullTextLength,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    recovery: allCandidates
+      ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
+      : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.',
+  }
+  const fallbackReceipt = JSON.stringify(fallbackObj, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${fallbackReceipt}`)) return fallbackReceipt
-  const tightFallback = `${JSON.stringify({ ok: Boolean(base.ok), note_failed: true, total_chars: fullTextLength, limit: CURSOR_SHELL_OUTPUT_MAX_CHARS })}\n`
-  if (fitsShellOutput(`${reserve}${tightFallback}`)) return tightFallback
-  const bareFallback = `${JSON.stringify({ ok: Boolean(base.ok), note_failed: true })}\n`
-  if (fitsShellOutput(`${reserve}${bareFallback}`)) return bareFallback
-  return ''
+  // Single-line compact form preserves every required count, limit, and recovery field
+  // (requirements 3c5147a7 / 91d7b47c). If reserve leaves too little room even for that,
+  // refuse explicitly with field, limit, actual length, counts, and recovery.
+  const compactFallback = `${JSON.stringify(fallbackObj)}\n`
+  if (fitsShellOutput(`${reserve}${compactFallback}`)) return compactFallback
+  throw shellBudgetExceededError({
+    field: 'reserve',
+    reserveLength: String(reserve ?? '').length,
+    requiredLength: compactFallback.length,
+    fullTextLength,
+    noteFailed: true,
+    candidateCount: allCandidates ? allCandidates.length : null,
+    recovery: fallbackObj.recovery,
+  })
 }
 
 export function formatFastConnectCliOutput(result, { home = os.homedir(), reserve = '' } = {}) {
@@ -939,19 +963,24 @@ export function formatFastConnectCliOutput(result, { home = os.homedir(), reserv
   const fullText = JSON.stringify(normalized, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
 
+  let note = null
+  let noteError = null
   try {
-    const note = writeNote(fullText, { home })
-    const noteRef = {
-      id: note.id,
-      command: note.command,
-      parts: note.parts,
-      total_chars: fullText.length,
-      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
-    }
-    return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, { reserve })
+    note = writeNote(fullText, { home })
   } catch (error) {
-    return buildFastConnectNoteFailureFallback(normalized, error, fullText.length, { reserve })
+    noteError = error
   }
+  if (!note) {
+    return buildFastConnectNoteFailureFallback(normalized, noteError, fullText.length, { reserve })
+  }
+  const noteRef = {
+    id: note.id,
+    command: note.command,
+    parts: note.parts,
+    total_chars: fullText.length,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  }
+  return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, { reserve })
 }
 
 /**
