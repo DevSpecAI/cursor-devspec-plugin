@@ -1777,4 +1777,138 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(capturedStderr, /aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/)
     assert.match(capturedStderr, /active_tool_call/)
   })
+
+  it('stepDeliveryHook surfaces a budget-fitted structured refusal in agent-facing additional_context when refusal exceeds hook share and notes dir is unwritable (3c5147a7 / 91d7b47c / 4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Mid-turn refusal with broken notes')
+    holdForNextStep(CONN, batch, buildOwnerMessageEvents(batch), { dir })
+    const raw1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '' },
+      { home, dir, listenerActive: () => true },
+    )
+    const noteId = noteIdIn(JSON.parse(raw1).additional_context)
+    const parts = noteFiles(home, noteId)
+    const partContents = parts.map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    // Now make ~/.devspec/notes read-only so readThrough still sees the note parts
+    // while writeNote fails with EACCES when stepDeliveryHook tries to save the refusal.
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.chmodSync(notesDir, 0o555)
+    let refusalRaw = null
+    try {
+      for (const callInput of partContents) {
+        refusalRaw = await stepDeliveryHook(callInput, {
+          home,
+          dir,
+          share: 1200,
+          listenerActive: () => true,
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy',
+                  retryable: true,
+                  blocking_turn_id: '88888888-8888-4888-8888-888888888888',
+                  detail: 'x'.repeat(5_000),
+                },
+              },
+            ],
+          }),
+        })
+      }
+    } finally {
+      fs.chmodSync(notesDir, 0o700)
+    }
+    assert.ok(refusalRaw, 'hook must NOT silently drop the refusal when note saving fails')
+    const ctx = JSON.parse(refusalRaw).additional_context
+    assert.ok(ctx.length <= 1200, `additional_context (${ctx.length}) must stay within hook share (1200)`)
+    assert.match(ctx, /turn_busy/)
+    assert.match(ctx, /88888888-8888-4888-8888-888888888888/)
+    assert.match(ctx, /~\/\.devspec\/notes/)
+  })
+
+  it('completing a later wake_in_note via stepDeliveryHook never advances wake cursor past an earlier unstarted inline command (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    const turn1 = '11111111-1111-4111-8111-111111111111'
+    const msg1 = '22222222-2222-4222-8222-222222222222'
+    const turn2 = '33333333-3333-4333-8333-333333333333'
+    const msg2 = '44444444-4444-4444-8444-444444444444'
+    const turn3 = TURN_ID
+    const msg3 = MSG_ID
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Inline cmd 1 (older)', { messageId: msg1, turnId: turn1 })))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Inline cmd 2 (newer)', { messageId: msg2, turnId: turn2 })))
+    // Oversized 3rd command goes into a sealed note (`wake_in_note`).
+    const bigBatch3 = ownerBatch('Oversized note cmd 3 ' + 'N'.repeat(21_000), { messageId: msg3, turnId: turn3 })
+    const noteWrapped3 = wakeInNote(buildOwnerMessageEvents(bigBatch3), { home })
+    appendWakeEvents(wakeFile, noteWrapped3.events)
+
+    const pickups = []
+    const call = async (req) => {
+      if (req.name === 'report_pickup') pickups.push(req.arguments.command_message_id)
+      return { outcome: 'picked_up' }
+    }
+
+    // Read 1: picks up inline cmd 2, leaves inline cmd 1 unstarted AND registers note cmd 3 pending.
+    const read1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read1.marked, false)
+    assert.deepEqual(pickups, [msg2])
+    assert.equal(read1.pending_note_reads?.length, 1)
+    const noteId3 = read1.pending_note_reads[0]
+
+    // Agent reads later note cmd 3 BEFORE Read 2 runs: cmd 3 gets picked up,
+    // BUT cursor MUST NOT advance past unstarted inline cmd 1!
+    for (const file of noteFiles(home, noteId3)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+      })
+    }
+    assert.deepEqual(pickups, [msg2, msg3])
+
+    // Read 2: unstarted inline cmd 1 MUST STILL BE PRESENT, receives its pickup, and cursor now advances to EOF!
+    const read2 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read2.marked, true, 'once cmd 1 is picked up and cmd 3 was already completed, cursor advances to EOF')
+    assert.deepEqual(pickups, [msg2, msg3, msg1])
+
+    // Read 3: cursor is at EOF (0 wakes).
+    const read3 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read3.printed, 0)
+    assert.equal(read3.marked, true)
+  })
 })

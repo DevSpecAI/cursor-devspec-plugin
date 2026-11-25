@@ -375,6 +375,7 @@ export function formatStructuredRefusalsFallback(
   {
     prefix = 'report_pickup refused (note write failed; structured refusal): ',
     stdoutText = '',
+    maxChars = null,
     noteError = null,
     recovery = 'Fix write permissions on ~/.devspec/notes and retry so the complete structured refusal can be saved whole and read back.',
     allowMinimalEnvelope = true,
@@ -382,12 +383,16 @@ export function formatStructuredRefusalsFallback(
 ) {
   const list = Array.isArray(refusals) ? refusals.map((item) => cloneJsonSafe(item)) : []
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
-  const fits = (candidate) => fitsShellOutput(`${stdoutText}${candidate}`)
+  const limitChars = typeof maxChars === 'number' && maxChars > 0 ? maxChars : CURSOR_SHELL_OUTPUT_MAX_CHARS
+  const fits = (candidate) =>
+    typeof maxChars === 'number' && maxChars > 0
+      ? candidate.length <= maxChars
+      : fitsShellOutput(`${stdoutText}${candidate}`)
   const wrap = (slice, extra = {}) =>
     `${prefix}${JSON.stringify({
       note_write_failed: true,
       note_write_error: why,
-      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      shell_limit_chars: limitChars,
       total_count: list.length,
       returned_count: slice.length,
       omitted_count: list.length - slice.length,
@@ -401,7 +406,7 @@ export function formatStructuredRefusalsFallback(
     return fits(emptyLine) ? emptyLine : null
   }
 
-  // 1. Keep as many completely unmodified refusal objects as fit inside fitsShellOutput.
+  // 1. Keep as many completely unmodified refusal objects as fit inside the budget.
   let lo = 0
   let hi = list.length
   while (lo < hi) {
@@ -414,18 +419,18 @@ export function formatStructuredRefusalsFallback(
   }
   if (lo > 0) return wrap(list.slice(0, lo))
 
-  // 2. Single first refusal exceeds remaining Shell budget: shrink only oversized string
+  // 2. Single first refusal exceeds remaining budget: shrink only oversized string
   // leaves and/or binary-search oversized nested arrays while keeping all structured
   // fields, counts, and recovery intact at every depth.
   const first = cloneJsonSafe(list[0])
   const stringReplacement = (len) => ({
     omitted_large_text: true,
     actual_length: len,
-    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_chars: limitChars,
     note_write_failed: true,
     recovery,
   })
-  const minShrinkableStringLen = JSON.stringify(stringReplacement(CURSOR_SHELL_OUTPUT_MAX_CHARS)).length
+  const minShrinkableStringLen = JSON.stringify(stringReplacement(limitChars)).length
 
   while (!fits(wrap([first]))) {
     const bigStr = findLargestShrinkableString(first, minShrinkableStringLen)
@@ -488,14 +493,14 @@ export function formatStructuredRefusalsFallback(
   if (tier1) return tier1
 
   // Tier 2: compact structured JSON envelope preserving refusal status, counts,
-  // shell limit, note-write failure, refusal codes, and concrete recovery steps
-  // for tight remaining budgets (e.g. ~200-350 chars left after prior stderr).
+  // limit, note-write failure, refusal codes, and concrete recovery steps
+  // for tight remaining budgets (e.g. ~200-350 chars left after prior stderr or hook share).
   const tier2 = fitCodes(
     (codes) =>
       `${JSON.stringify({
         refused: 'report_pickup',
         note_write_failed: true,
-        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        shell_limit_chars: limitChars,
         total_count: list.length,
         omitted_count: list.length,
         ...(codes.length > 0 ? { codes } : {}),
@@ -509,7 +514,7 @@ export function formatStructuredRefusalsFallback(
   const tier3 = `${JSON.stringify({
     refused: 'report_pickup',
     omitted_count: list.length,
-    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_chars: limitChars,
     recovery: 'Fix ~/.devspec/notes & retry.',
   })}\n`
   return fits(tier3) ? tier3 : null

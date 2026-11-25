@@ -109,7 +109,17 @@ import {
 } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { connectionsDirFor, registerPendingWakeNote, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import {
+  cleanupCompletedWakeNotesBefore,
+  clearWakeInlineHold,
+  connectionsDirFor,
+  isWakeNoteCompleted,
+  registerPendingWakeNote,
+  setWakeInlineHold,
+  withoutEndedConnectionWakes,
+  withStepsLock,
+  withStepsLockAsync,
+} from './step-delivery.mjs'
 import {
   clearWakeListenerNeeded,
   extractRoomCommandsFromWake,
@@ -678,6 +688,9 @@ export async function readWakes({
           })
         }
         for (const deferred of extracted.deferredNoteCommands) {
+          if (isWakeNoteCompleted(resolvedConnectionId, deferred.noteId, { dir })) {
+            continue
+          }
           if (earliestDeferredStart === null || wakeStart < earliestDeferredStart) {
             earliestDeferredStart = wakeStart
           }
@@ -843,17 +856,28 @@ export async function readWakes({
         }
       }
     }
+    const posFile = readPositionPath(key, dir)
+    if (resolvedConnectionId) {
+      if (typeof earliestUnstartedStart === 'number') {
+        setWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile, holdOffset: earliestUnstartedStart }, { dir })
+      } else {
+        clearWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile }, { dir })
+      }
+    }
     if (pendingNoteReads.length > 0 || unstartedCommands.length > 0) {
       const holdCandidates = [earliestDeferredStart, earliestUnstartedStart].filter((n) => typeof n === 'number')
       const holdAt = holdCandidates.length > 0 ? Math.min(...holdCandidates) : null
       if (holdAt !== null && holdAt > position) {
         try {
-          writePrivateJson(readPositionPath(key, dir), {
+          writePrivateJson(posFile, {
             version: POSITION_VERSION,
             file: resolved,
             offset: holdAt,
             at: new Date().toISOString(),
           })
+          if (resolvedConnectionId) {
+            cleanupCompletedWakeNotesBefore(resolvedConnectionId, { wakePositionPath: posFile, offset: holdAt }, { dir })
+          }
         } catch {
           /* non-fatal: deferred/unstarted wakes stay queued from earlier offset */
         }
@@ -875,7 +899,10 @@ export async function readWakes({
     }
     if (through === position) return { ...page, ...extra, marked: true }
     try {
-      writePrivateJson(readPositionPath(key, dir), { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
+      writePrivateJson(posFile, { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
+      if (resolvedConnectionId) {
+        cleanupCompletedWakeNotesBefore(resolvedConnectionId, { wakePositionPath: posFile, offset: through }, { dir })
+      }
       return { ...page, ...extra, marked: true }
     } catch (error) {
       return { ...page, ...extra, marked: false, error }

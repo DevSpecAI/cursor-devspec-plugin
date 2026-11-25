@@ -122,6 +122,7 @@ import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
 import {
   clearWakeListenerNeeded,
+  formatStructuredRefusalsFallback,
   isWakeListenerActive,
   startRoomCommands,
   structuredRefusalFromError,
@@ -146,7 +147,72 @@ const HANDED = 'handed.json'
 const STEPS_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
 const WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json$/
+const WAKE_INLINE_HOLD = 'wake-inline-hold.json'
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
+
+/**
+ * Record an active unstarted-inline-command cursor barrier for `wakePositionPath` so
+ * completing a later `wake_in_note` via `stepDeliveryHook` can NEVER advance the wake
+ * cursor past an earlier unstarted inline command on the same wake file (req 3ea2b201).
+ */
+export function setWakeInlineHold(connectionId, { wakePositionPath, holdOffset }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string' || typeof holdOffset !== 'number') return false
+  const steps = stepsDir(connectionId, dir)
+  fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
+  const target = path.join(steps, WAKE_INLINE_HOLD)
+  const current = readPrivateJson(target)
+  const holds = current && typeof current.holds === 'object' && !Array.isArray(current.holds) ? { ...current.holds } : {}
+  holds[wakePositionPath] = holdOffset
+  writePrivateJson(target, { version: RECORD_VERSION, holds, at: new Date().toISOString() })
+  return true
+}
+
+/** Clear the unstarted-inline-command cursor barrier once all inline commands are started. */
+export function clearWakeInlineHold(connectionId, { wakePositionPath }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string') return false
+  const steps = stepsDir(connectionId, dir)
+  const target = path.join(steps, WAKE_INLINE_HOLD)
+  const current = readPrivateJson(target)
+  if (!current || typeof current.holds !== 'object' || !(wakePositionPath in current.holds)) return false
+  const holds = { ...current.holds }
+  delete holds[wakePositionPath]
+  if (Object.keys(holds).length === 0) {
+    try { fs.rmSync(target, { force: true }) } catch { /* ignore */ }
+  } else {
+    writePrivateJson(target, { version: RECORD_VERSION, holds, at: new Date().toISOString() })
+  }
+  return true
+}
+
+function readWakeInlineHoldOffset(steps, wakePositionPath) {
+  const data = readPrivateJson(path.join(steps, WAKE_INLINE_HOLD))
+  const offset = data?.holds?.[wakePositionPath]
+  return typeof offset === 'number' ? offset : null
+}
+
+/** Whether a deferred `wake_in_note` has already been read whole and picked up. */
+export function isWakeNoteCompleted(connectionId, noteId, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || !/^[0-9a-f]{16}$/.test(String(noteId ?? ''))) return false
+  const entry = readPrivateJson(path.join(stepsDir(connectionId, dir), `wake-note-${noteId}.json`))
+  return entry?.note === noteId && entry?.completed === true
+}
+
+/** Remove completed wake-note markers whose byte span has already been passed by `offset`. */
+export function cleanupCompletedWakeNotesBefore(connectionId, { wakePositionPath, offset }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string' || typeof offset !== 'number') return
+  const steps = stepsDir(connectionId, dir)
+  for (const file of pendingWakeNoteFiles(steps)) {
+    const entry = readPrivateJson(file)
+    if (
+      entry?.completed === true &&
+      entry.wake_position_path === wakePositionPath &&
+      typeof entry.wake_through === 'number' &&
+      entry.wake_through <= offset
+    ) {
+      try { fs.rmSync(file, { force: true }) } catch { /* ignore */ }
+    }
+  }
+}
 
 /**
  * Record a `wake_in_note` carrying canonical room command(s) as awaiting full agent read
@@ -239,6 +305,10 @@ function advanceCompletedWakeNotePositions(steps) {
   }
   for (const [posPath, group] of byPosPath) {
     let minIncompleteStart = Number.POSITIVE_INFINITY
+    const inlineHoldOffset = readWakeInlineHoldOffset(steps, posPath)
+    if (typeof inlineHoldOffset === 'number' && inlineHoldOffset < minIncompleteStart) {
+      minIncompleteStart = inlineHoldOffset
+    }
     for (const { entry } of group) {
       if (entry.completed !== true) {
         const start = typeof entry.wake_start === 'number' ? entry.wake_start : 0
@@ -1066,44 +1136,82 @@ export async function stepDeliveryHook(
     if (pickupRefusals) {
       const refusalNotice =
         `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
-      if (!context) {
-        context = fitHookContext(refusalNotice, {
-          share,
-          what: 'DevSpec room-command pickup refusal details',
-          home,
+      const buildFallback = (budget, noteError) => {
+        const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
+          prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
+          maxChars: budget,
+          noteError,
         })
+        return formatted ? formatted.trimEnd() : null
+      }
+      if (!context) {
+        try {
+          context = fitHookContext(refusalNotice, {
+            share,
+            what: 'DevSpec room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          context = buildFallback(share, noteError)
+        }
       } else {
         const remainingShare = share - context.length - 2
-        const fittedInlineOrPointer =
-          remainingShare > 0
-            ? fitHookContext(refusalNotice, {
-                share: remainingShare,
-                what: 'DevSpec room-command pickup refusal details',
-                home,
-              })
-            : null
+        let fittedInlineOrPointer = null
+        let inlineNoteError = null
+        if (remainingShare > 0) {
+          try {
+            fittedInlineOrPointer = fitHookContext(refusalNotice, {
+              share: remainingShare,
+              what: 'DevSpec room-command pickup refusal details',
+              home,
+            })
+          } catch (noteError) {
+            inlineNoteError = noteError
+          }
+        }
         if (fittedInlineOrPointer && context.length + 2 + fittedInlineOrPointer.length <= share) {
           context = `${context}\n\n${fittedInlineOrPointer}`
         } else {
           // Never drop the structured pickup refusal when a concurrent delivery note
-          // fills the hook share: combine both into one sealed note (req 4e32d1a5).
-          const combined = fitHookContext(`${context}\n\n${refusalNotice}`, {
-            share,
-            what: 'DevSpec pending delivery and room-command pickup refusal details',
-            home,
-          })
-          if (combined) context = combined
+          // fills the hook share: combine both into one sealed note, or if note writing
+          // fails, surface a budget-fitted structured refusal fallback inline (req 4e32d1a5 / 3c5147a7).
+          let combined = null
+          let combinedNoteError = inlineNoteError
+          try {
+            combined = fitHookContext(`${context}\n\n${refusalNotice}`, {
+              share,
+              what: 'DevSpec pending delivery and room-command pickup refusal details',
+              home,
+            })
+          } catch (noteError) {
+            combinedNoteError = noteError
+          }
+          if (combined) {
+            context = combined
+          } else {
+            const fbWithContext = remainingShare > 0 ? buildFallback(remainingShare, combinedNoteError) : null
+            if (fbWithContext && context.length + 2 + fbWithContext.length <= share) {
+              context = `${context}\n\n${fbWithContext}`
+            } else {
+              const fbFull = buildFallback(share, combinedNoteError)
+              if (fbFull) context = fbFull
+            }
+          }
         }
       }
     }
     if (needsListenerReminder) {
       const rawReminder = wakeListenerReminder(connectionId, { dir: connDir })
       if (!context) {
-        context = fitHookContext(rawReminder, {
-          share,
-          what: 'A DevSpec wake-listener setup notice',
-          home,
-        })
+        try {
+          context = fitHookContext(rawReminder, {
+            share,
+            what: 'A DevSpec wake-listener setup notice',
+            home,
+          })
+        } catch {
+          context = rawReminder.length <= share ? rawReminder : null
+        }
       } else if (context.length + 2 + rawReminder.length <= share) {
         context = `${context}\n\n${rawReminder}`
       }
