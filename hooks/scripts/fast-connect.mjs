@@ -14,8 +14,10 @@
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, writeNote } from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
@@ -733,6 +735,67 @@ Prints one short JSON result; exits 0 when connected, 1 when not.
 `
 
 /**
+ * Format fast-connect CLI JSON within Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`). Drops the duplicate top-level `candidates` ID array when
+ * `project_selection.candidates` already carries the structured candidates, and when a
+ * large choice list still exceeds Cursor's ceiling, writes the complete, uncut JSON to
+ * a sealed note (`writeNote`) and returns a compact structured refusal naming that note
+ * so Cursor never slices the choices in half (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
+ */
+export function formatFastConnectCliOutput(result, { home = os.homedir() } = {}) {
+  const normalized =
+    result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
+  if (
+    normalized &&
+    typeof normalized === 'object' &&
+    Array.isArray(normalized.project_selection?.candidates) &&
+    Array.isArray(normalized.candidates)
+  ) {
+    delete normalized.candidates
+  }
+  const fullText = JSON.stringify(normalized, null, 2) + '\n'
+  if (fitsShellOutput(fullText)) return fullText
+
+  const compact =
+    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? { ...normalized }
+      : { ok: false }
+  const selection = compact.project_selection
+  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
+  if (selection && typeof selection === 'object') {
+    const { candidates: _omit, ...selectionRest } = selection
+    compact.project_selection = {
+      ...selectionRest,
+      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+      omitted_inline: true,
+    }
+  }
+  if (Array.isArray(compact.candidates)) {
+    compact.candidate_count = compact.candidates.length
+    delete compact.candidates
+  }
+
+  try {
+    const note = writeNote(fullText, { home })
+    const noteRef = {
+      id: note.id,
+      command: note.command,
+      parts: note.parts,
+      total_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    }
+    if (compact.project_selection && typeof compact.project_selection === 'object') {
+      compact.project_selection.complete_in_note = noteRef
+    }
+    compact.complete_output_note = noteRef
+    compact.note = `Full connect output (${fullText.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${note.command}\` (and every further part it names) to read all choices.`
+  } catch (error) {
+    compact.complete_output_note_error = error instanceof Error ? error.message : String(error)
+  }
+  return JSON.stringify(compact, null, 2) + '\n'
+}
+
+/**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
  */
@@ -773,6 +836,6 @@ export async function runFastConnectCli(args) {
     promptText,
   })
 
-  process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+  process.stdout.write(formatFastConnectCliOutput(result))
   process.exit(result.ok ? 0 : 1)
 }
