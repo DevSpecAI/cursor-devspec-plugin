@@ -15,7 +15,7 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { CURSOR_SHELL_OUTPUT_MAX_CHARS } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_BYTES, CURSOR_SHELL_OUTPUT_MAX_CHARS } from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
@@ -767,10 +767,17 @@ export async function runFastConnectCli(
         const errCode = err && typeof err === 'object' && 'code' in err ? String(err.code) : 'read_failed'
         const detail = err instanceof Error ? err.message : String(err)
         const rawDiag = `fast-connect: could not read --prompt-file: ${detail}\n`
-        const summary = `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
+        const priorStderr = currentStderr()
+        const rawDiagBytes = Buffer.byteLength(rawDiag)
+        const exceededBytesOnly =
+          priorStderr.length + rawDiag.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(priorStderr) + rawDiagBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        const summary = exceededBytesOnly
+          ? `could not read --prompt-file (field --prompt-file, actual_bytes ${Buffer.byteLength(rawPromptFile)}, actual_chars ${rawPromptFile.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}, code ${errCode})`
+          : `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
         const bounded = formatBoundedCliStderr(rawDiag, {
           label: 'fast-connect',
-          reserve: currentStderr(),
+          reserve: priorStderr,
           summary,
           fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback failed — fix write permissions on ~/.devspec/notes or pass a shorter --prompt-file path and retry.\n`,
         })

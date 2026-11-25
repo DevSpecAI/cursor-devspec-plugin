@@ -1640,7 +1640,12 @@ export function summarizeConnectCliOutput(result) {
  * receipt naming the note command so Cursor never clips the middle of the choices
  * (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
  */
-function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { reserve = '' } = {}) {
+function buildBoundedConnectNoteReceipt(
+  summary,
+  noteRef,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
   const base =
     summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
   const selection = base.project_selection
@@ -1658,7 +1663,17 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
     base.candidate_count = base.candidates.length
     delete base.candidates
   }
-  const noteMsg = `Full connect output (${fullTextLength} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const combinedChars = prior.length + fullTextLength
+  const combinedBytes = priorBytes + textBytes
+  const exceededByBytesOnly =
+    combinedChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    combinedBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const noteMsg = exceededByBytesOnly
+    ? `Full connect output (${textBytes} bytes / ${fullTextLength} chars${priorBytes ? `, ${combinedBytes} bytes with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+    : `Full connect output (${fullTextLength} chars${prior.length ? `, ${combinedChars} chars with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
   base.complete_output_note = noteRef
   base.note = noteMsg
   const richText = JSON.stringify(base, null, 2) + '\n'
@@ -1671,6 +1686,9 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
     ? {
         omitted_count: base.stderr_diagnostics_omitted.omitted_count,
         omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(typeof base.stderr_diagnostics_omitted.omitted_bytes === 'number'
+          ? { omitted_bytes: base.stderr_diagnostics_omitted.omitted_bytes }
+          : {}),
         ...(Array.isArray(base.stderr_diagnostics_omitted.notes) &&
         base.stderr_diagnostics_omitted.notes.length > 0
           ? { saved_note_count: base.stderr_diagnostics_omitted.notes.length }
@@ -1679,6 +1697,7 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
           ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
           : {}),
         complete_in_note: noteRef.id,
+        read: noteRef.command,
       }
     : null
   const minimal = {
@@ -1808,13 +1827,24 @@ function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
   return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
 }
 
-function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { reserve = '' } = {}) {
+function buildConnectNoteFailureFallback(
+  summary,
+  noteError,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
   const base =
     summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
   const selection =
     base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
   const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
   const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const exceededByBytesOnly =
+    prior.length + fullTextLength <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
   const stderrReadHintFor = (stderrOmitted) => {
     const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
       ? base.stderr_diagnostics_omitted.notes.length
@@ -1829,9 +1859,12 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
   }
   const recoveryFor = (stderrOmitted) => {
     const hint = stderrReadHintFor(stderrOmitted)
+    const sizeDesc = exceededByBytesOnly
+      ? `${textBytes}-byte (${fullTextLength}-char)`
+      : `${fullTextLength}-char`
     return allCandidates
       ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${hint}`
-      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.${hint}`
+      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${sizeDesc} output.${hint}`
   }
 
   const makePayload = (
@@ -1883,7 +1916,9 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
     }
     out.complete_output_note_error = errMsg
     out.total_chars = fullTextLength
+    out.total_bytes = textBytes
     out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
+    out.shell_limit_bytes = CURSOR_SHELL_OUTPUT_MAX_BYTES
     out.recovery = recoveryFor(stderrOmitted)
     return JSON.stringify(out, null, 2) + '\n'
   }
@@ -1940,7 +1975,9 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
     complete_output_note_failed: true,
     ...(stderrOmitted ? { stderr_diagnostics_omitted: stderrOmitted } : {}),
     total_chars: fullTextLength,
+    total_bytes: textBytes,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
     recovery: allCandidates
       ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHintFor(stderrOmitted)}`
       : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHintFor(stderrOmitted)}`,
@@ -2063,6 +2100,7 @@ export function formatConnectCliOutput(
   const fullText = JSON.stringify(summary, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
 
+  const fullTextBytes = Buffer.byteLength(fullText)
   let note = null
   let noteError = null
   try {
@@ -2071,16 +2109,24 @@ export function formatConnectCliOutput(
     noteError = error
   }
   if (!note) {
-    return buildConnectNoteFailureFallback(summary, noteError, fullText.length, { reserve })
+    return buildConnectNoteFailureFallback(summary, noteError, fullText.length, {
+      reserve,
+      fullTextBytes,
+    })
   }
   const noteRef = {
     id: note.id,
     command: note.command,
     parts: note.parts,
     total_chars: fullText.length,
+    total_bytes: fullTextBytes,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
   }
-  return buildBoundedConnectNoteReceipt(summary, noteRef, fullText.length, { reserve })
+  return buildBoundedConnectNoteReceipt(summary, noteRef, fullText.length, {
+    reserve,
+    fullTextBytes,
+  })
 }
 
 /**
@@ -2437,7 +2483,9 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
       omitted_candidates_require_writable_notes: true,
       complete_output_note_failed: true,
       total_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+      total_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES * 10,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
       stderr_diagnostics_omitted: {
         omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
@@ -2641,11 +2689,17 @@ export function installBoundedCliStderr({
     writeFinalError: (raw, done) => {
       let bounded = ''
       try {
+        const rawBytes = Buffer.byteLength(raw)
+        const exceededBytesOnly =
+          emittedStderr.length + raw.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(emittedStderr) + rawBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
         bounded = formatBoundedCliStderr(raw, {
           label,
           home,
           reserve: emittedStderr,
-          summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+          summary: exceededBytesOnly
+            ? `error_bytes ${rawBytes}, error_chars ${raw.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+            : `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
         })
       } catch {
         void flushStderr().finally(done)
@@ -3260,10 +3314,17 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
     process.exit(result.ok ? 0 : 1)
   }
 
-  const boundedUnknown = formatBoundedCliStderr(`Unknown command: ${cmd}\n`, {
+  const rawUnknown = `Unknown command: ${cmd}\n`
+  const priorUnknownStderr = cliStderr.getEmittedStderr()
+  const unknownBytesOnly =
+    priorUnknownStderr.length + rawUnknown.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    Buffer.byteLength(priorUnknownStderr) + Buffer.byteLength(rawUnknown) > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const boundedUnknown = formatBoundedCliStderr(rawUnknown, {
     label: 'remote-control-state',
-    reserve: cliStderr.getEmittedStderr(),
-    summary: `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+    reserve: priorUnknownStderr,
+    summary: unknownBytesOnly
+      ? `field command, actual_bytes ${Buffer.byteLength(String(cmd ?? ''))}, actual_chars ${String(cmd ?? '').length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+      : `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
   })
   await writeStreamAndFlush(process.stderr, boundedUnknown)
   await cliStderr.flushStderr()
