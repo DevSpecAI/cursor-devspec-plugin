@@ -546,20 +546,54 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(readRequestState(CONN, { dir }).current, null)
   })
 
-  it('restores a scheduled wake directly from transcript text on Cursor CLI without beforeSubmitPrompt (ce71a72b / 2fcd26bd)', async () => {
+  it('opens a new typed_prompt when a human types a recorded schedule prompt verbatim in the terminal (2fcd26bd / ce71a72b)', async () => {
     const { home, dir, transcriptPath } = makeEnv()
     appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
     appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
     appendRequestEvent(CONN, { op: 'schedule', id: 'cron-cli', prompt: 'Check deploy health', request: HOOK_TYPED, also: [] }, { dir })
-    // Simulate current cleared earlier by an unrelated wake, then the scheduled prompt arrives without promptArrival.
+    // Simulate current cleared earlier, then the human types the exact same text at the terminal.
     appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
     fs.writeFileSync(transcriptPath, `${typedRow('Check deploy health')}\n`)
+
+    const opened = []
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        opened.push(args)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+    })
+    assert.equal(res.action, 'opened')
+    assert.equal(opened.length, 1, 'must open a new typed_prompt for human terminal input')
+    assert.notEqual(res.requestId, HOOK_TYPED, 'must never hijack a human typed turn to an earlier scheduled request')
+    assert.equal(readRequestState(CONN, { dir }).current, res.requestId)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x', request_ref: res.requestId },
+    })
+  })
+
+  it('restores a host-injected non-typed <task-notification> wake row on Cursor CLI without beforeSubmitPrompt (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bg-task-9', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+    const taskNotifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>bg-task-9</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${taskNotifRow}\n`)
 
     const res = await syncTypedTurnFromTranscript({
       connectionId: CONN,
       transcriptPath,
       connectionCapability: 'cap-secret',
-      callRequest: async () => { throw new Error('must restore scheduled request instead of opening a new typed_prompt') },
+      callRequest: async () => { throw new Error('must restore launching request for host task-notification') },
       dir,
     })
     assert.equal(res.action, 'restored_wake_request')
@@ -568,6 +602,136 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
       args: { task_id: 'x', request_ref: HOOK_TYPED },
     })
+  })
+
+  it('bounds lock retry sleep by remaining budgetMs so a held lock cannot overrun the deadline (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Lock budget check')}\n`)
+    // Hold the typed-sync lock with our own live PID.
+    const lockFile = path.join(dir, `${CONN}.typed-sync.lock`)
+    fs.writeFileSync(lockFile, String(process.pid), { mode: 0o600 })
+    try {
+      const started = Date.now()
+      const res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        budgetMs: 60,
+        attempts: 1,
+        dir,
+      })
+      const elapsed = Date.now() - started
+      assert.equal(res.action, 'lock_busy')
+      // Allow modest scheduling jitter, but must NOT sleep a full extra retry interval past 60ms.
+      assert.ok(elapsed < 120, `held lock must stop at budgetMs=60, took ${elapsed}ms`)
+    } finally {
+      fs.rmSync(lockFile, { force: true })
+    }
+  })
+
+  it('does not bind or mark synced when local open record fails to persist after DevSpec accepts open (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Transient local open persist failure')}\n`)
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    // Make requests.jsonl a directory so appendFileSync fails transiently with EISDIR.
+    fs.mkdirSync(reqLog, { recursive: true })
+    const memo = { stamp: null, synced: false }
+    const logs = []
+    let openCalls = 0
+    try {
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openCalls += 1
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+        log: (line) => logs.push(line),
+      })
+      assert.equal(first.action, 'open_write_failed')
+      assert.equal(first.refusal?.code, 'local_open_persist_failed')
+      assert.equal(memo.synced, false, 'memo must stay unsynced so next pass retries')
+      assert.equal(openCalls, 1)
+    } finally {
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+
+    // Once transient write failure clears, the next pass syncs cleanly.
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        openCalls += 1
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(second.action, 'opened')
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).open.has(second.requestId), true)
+    assert.equal(openCalls, 2)
+  })
+
+  it('preserves structured completion and close refusals in finishIdleRequests without dropping details (4e32d1a5)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Idle refusal check')}\n${turnEndedRow('success')}\n`)
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      local_turn: { attempt_id: '99999999-9999-4999-8999-999999999999', session_id: ROOM },
+    }
+    let closeCalled = false
+    const logs = []
+    const completeRefused = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async () => ({
+        ok: false,
+        code: 'attempt_mismatch',
+        blocking_attempt_id: '88888888-8888-4888-8888-888888888888',
+        error: 'Another attempt owns Working',
+      }),
+      callRequest: async () => {
+        closeCalled = true
+        return { status: 'closed' }
+      },
+      dir,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(completeRefused.localCompleted, false)
+    assert.equal(completeRefused.localCompleteRefusal?.code, 'attempt_mismatch')
+    assert.equal(completeRefused.localCompleteRefusal?.blocking_attempt_id, '88888888-8888-4888-8888-888888888888')
+    assert.equal(closeCalled, false, 'must not continue silently to close requests after a structured completion refusal')
+    assert.match(logs.join(''), /attempt_mismatch/)
+
+    // When completion succeeds but closeRequest returns a structured refusal, surface it too.
+    const closeRefused = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state: { connection_id: CONN, session_id: ROOM, local_turn: null },
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({
+        ok: false,
+        code: 'request_locked',
+        blocking_turn_id: '77777777-7777-4777-8777-777777777777',
+        error: 'Request cannot close right now',
+      }),
+      dir,
+      log: (line) => logs.push(line),
+    })
+    assert.deepEqual(closeRefused.closed, [])
+    assert.equal(closeRefused.closeRefusal?.code, 'request_locked')
+    assert.equal(closeRefused.closeRefusal?.blocking_turn_id, '77777777-7777-4777-8777-777777777777')
+    assert.match(logs.join(''), /request_locked/)
   })
 
   it('preserves a typed_prompt with an un-notified background launch on Cursor CLI when beforeSubmitPrompt does not fire (ce71a72b)', async () => {

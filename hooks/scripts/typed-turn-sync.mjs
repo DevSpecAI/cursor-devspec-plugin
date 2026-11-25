@@ -125,7 +125,9 @@ async function withTypedSyncLock(connectionId, dir, work, { deadlineMs = null } 
         fs.rmSync(target, { force: true })
         continue
       }
-      sleepSync(TYPED_SYNC_LOCK_RETRY_MS)
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      sleepSync(Math.min(TYPED_SYNC_LOCK_RETRY_MS, remaining))
     }
   } finally {
     fs.rmSync(mine, { force: true })
@@ -207,7 +209,7 @@ function hasActiveRemoteCommandTurn(connectionId, reqState, dir) {
  * Extract structured refusal details from a thrown MCP / transport error without
  * flattening them to a plain sentence (requirement 4e32d1a5).
  */
-function structuredRefusalFromError(error) {
+export function structuredRefusalFromError(error) {
   if (!error || typeof error !== 'object') {
     return { error: String(error ?? 'refused') }
   }
@@ -227,10 +229,26 @@ function structuredRefusalFromError(error) {
   return refusal
 }
 
+/** Whether an MCP tool result object carries a structured refusal rather than success. */
+export function refusalFromResponse(res) {
+  if (!res || typeof res !== 'object') return null
+  if (
+    res.ok === false ||
+    res.refused === true ||
+    res.status === 'refused' ||
+    res.outcome === 'refused' ||
+    typeof res.error === 'string'
+  ) {
+    return res
+  }
+  return null
+}
+
 /**
  * Open a `typed_prompt` request while preserving any structured refusal payload from
  * `report_request` — whether returned as a non-open object or thrown as an MCP/HTTP
- * error (requirement 4e32d1a5).
+ * error (requirement 4e32d1a5). Distinguishes local persistence failure after DevSpec
+ * accepted the open so callers never mark the turn synced (requirement 3ea2b201).
  */
 async function openTypedRequestPreservingRefusal({ connectionId, callRequest, dir }) {
   let lastResponse = null
@@ -253,14 +271,26 @@ async function openTypedRequestPreservingRefusal({ connectionId, callRequest, di
     call: wrappedCall,
     dir,
   })
-  if (requestId) return { ok: true, requestId, refusal: null }
+  if (requestId) return { ok: true, requestId, refusal: null, localPersistFailed: false }
+  if (lastResponse && typeof lastResponse === 'object' && lastResponse.status === 'open') {
+    return {
+      ok: false,
+      requestId: lastResponse.request_id ?? null,
+      localPersistFailed: true,
+      refusal: {
+        code: 'local_open_persist_failed',
+        error: 'DevSpec opened request but local open record failed to persist',
+        request_id: lastResponse.request_id ?? null,
+      },
+    }
+  }
   const refusal =
     lastResponse && typeof lastResponse === 'object'
       ? lastResponse
       : lastError !== null
         ? structuredRefusalFromError(lastError)
         : { status: 'refused' }
-  return { ok: false, requestId: null, refusal }
+  return { ok: false, requestId: null, refusal, localPersistFailed: false }
 }
 
 /**
@@ -365,19 +395,17 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
-  // Resolve explicit background/scheduled wake rows directly from transcript content so
-  // Cursor CLI (which skips beforeSubmitPrompt) still restores the launching request
-  // instead of dropping attribution or opening a duplicate typed_prompt (ce71a72b / 2fcd26bd).
+  // Resolve explicit host-injected `<task-notification>` wake rows directly from
+  // non-typed transcript rows so Cursor CLI (which skips beforeSubmitPrompt) still
+  // restores the launching request. Never infer a scheduled wake from an ordinary
+  // typed `<user_query>` row (decisions 2fcd26bd / ce71a72b): if a human types text
+  // that happens to match a recorded schedule, it is still a new terminal-typed request.
   const resolveTranscriptWake = (reqState) => {
+    if (active.kind === 'typed') return null
     const rawText = typeof active.rawText === 'string' ? active.rawText : ''
-    const queryText = typeof active.queryText === 'string' ? active.queryText : rawText
     if (rawText) {
       const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
       if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch }
-    }
-    if (queryText) {
-      const schedMatch = requestForWake({ origin: 'scheduled-trigger', text: queryText, state: reqState })
-      if (schedMatch.ref !== UNSTATED) return { origin: 'scheduled-trigger', text: queryText, match: schedMatch }
     }
     return null
   }
@@ -522,6 +550,17 @@ export async function syncTypedTurnFromTranscript({
           if (!currentWritten) {
             return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
           }
+        } else if (opened.localPersistFailed) {
+          log(
+            `typed-turn-sync: local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
+          )
+          return {
+            action: 'open_write_failed',
+            requestId: opened.requestId,
+            key: active.key,
+            midTurn,
+            refusal: opened.refusal,
+          }
         } else {
           openRefusal = opened.refusal
           log(
@@ -531,6 +570,16 @@ export async function syncTypedTurnFromTranscript({
       }
 
       if (requestId) {
+        // Verify the request actually exists in local open state before admitting or
+        // binding the transcript turn (requirement 3ea2b201).
+        if (!readRequestState(connectionId, { dir }).open.has(requestId)) {
+          return {
+            action: 'open_write_failed',
+            requestId,
+            key: active.key,
+            midTurn,
+          }
+        }
         // Admit the terminal turn with the connection capability when attached, matching
         // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
         // Only mark the transcript turn synced once admission, state persistence, and binding
@@ -640,6 +689,7 @@ export async function finishIdleRequests({
   patchState = null,
   dir = DEFAULT_DIR,
   attempts = STABLE_READ_ATTEMPTS,
+  log = (line) => process.stderr.write(line),
 } = {}) {
   if (!connectionId || !transcriptPath) return { closed: [], localCompleted: false }
   const reqState = readRequestState(connectionId, { dir })
@@ -665,32 +715,72 @@ export async function finishIdleRequests({
   if (!candidateId && !localAttemptId) return { closed: [], localCompleted: false }
 
   let localCompleted = false
+  let localCompleteRefusal = null
   if (localAttemptId && typeof callComplete === 'function') {
     const [completeArgs] = completionArguments({ connectionId, commands: [], localAttemptId, reason: 'turn_end' })
     if (completeArgs) {
       try {
-        await callComplete(completeArgs)
-        localCompleted = true
-        if (typeof patchState === 'function') patchState({ local_turn: null })
-      } catch {
-        /* leave local_turn in place so the next idle tick retries */
+        const res = await callComplete(completeArgs)
+        const refused = refusalFromResponse(res)
+        if (refused) {
+          localCompleteRefusal = refused
+          log(`typed-turn-sync: idle report_complete refused for ${connectionId}: ${JSON.stringify(refused)}\n`)
+        } else {
+          localCompleted = true
+          if (typeof patchState === 'function') patchState({ local_turn: null })
+        }
+      } catch (error) {
+        localCompleteRefusal = structuredRefusalFromError(error)
+        log(`typed-turn-sync: idle report_complete failed for ${connectionId}: ${JSON.stringify(localCompleteRefusal)}\n`)
       }
     }
   }
+  // Surface structured local-turn completion refusals directly rather than dropping them
+  // and proceeding with request cleanup (requirement 4e32d1a5).
+  if (localCompleteRefusal) {
+    return { closed: [], localCompleted: false, localCompleteRefusal }
+  }
 
   const closed = []
+  let closeRefusal = null
   if (candidateId && connectionCapability && typeof callRequest === 'function') {
+    let lastCloseResponse = null
+    let lastCloseError = null
     const ok = await closeRequest({
       connectionId,
       requestId: candidateId,
-      call: callRequest,
+      call: async (reqArgs) => {
+        lastCloseResponse = null
+        lastCloseError = null
+        try {
+          const res = await callRequest(reqArgs)
+          lastCloseResponse = res
+          return res
+        } catch (err) {
+          lastCloseError = err
+          throw err
+        }
+      },
       dir,
-    }).catch(() => false)
+    }).catch((err) => {
+      lastCloseError = err
+      return false
+    })
     if (ok) {
       closed.push(candidateId)
       rotateRequestLog(connectionId, { dir })
+    } else {
+      closeRefusal =
+        refusalFromResponse(lastCloseResponse) ??
+        (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+        (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+      log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
     }
   }
 
-  return { closed, localCompleted }
+  return {
+    closed,
+    localCompleted,
+    ...(closeRefusal ? { closeRefusal } : {}),
+  }
 }

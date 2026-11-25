@@ -714,12 +714,10 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let lastNonResumedText = null
   const userRows = []
   let start = 0
-  let lineCount = 0
   while (start < bytes.length) {
-    if (deadlineMs !== null && (lineCount & 63) === 0 && Date.now() >= deadlineMs) {
+    if (deadlineMs !== null && Date.now() >= deadlineMs) {
       return { budgetExhausted: true }
     }
-    lineCount += 1
     const newline = bytes.indexOf(0x0a, start)
     const text = bytes.toString('utf8', start, newline).trim()
     if (text) {
@@ -744,6 +742,9 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     }
     start = newline + 1
   }
+  if (deadlineMs !== null && Date.now() >= deadlineMs) {
+    return { budgetExhausted: true }
+  }
   let end = null
   if (last) {
     let row = null
@@ -758,6 +759,9 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
         error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
       }
     }
+  }
+  if (deadlineMs !== null && Date.now() >= deadlineMs) {
+    return { budgetExhausted: true }
   }
   return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest: last ? digest(last) : null, userRows, lastNonResumedText }
 }

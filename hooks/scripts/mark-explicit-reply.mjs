@@ -41,7 +41,12 @@ import {
   requestsWithWorkPending,
   rotateRequestLog,
 } from './requests.mjs'
-import { recordedSessionCrons, TYPED_SYNC_BACKGROUND_TIMEOUT_MS } from './typed-turn-sync.mjs'
+import {
+  recordedSessionCrons,
+  refusalFromResponse,
+  structuredRefusalFromError,
+  TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+} from './typed-turn-sync.mjs'
 import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
@@ -177,32 +182,48 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
           const credential = connectionCredential(state)
           const capability = state.connection_capability || readConnectionCapability(connectionId)
           if (credential.ok && capability) {
+            let lastCloseResponse = null
+            let lastCloseError = null
             const closed = await closeRequest({
               connectionId,
               requestId: primaryAnsweredId,
               dir: connDir,
-              call: (reqArgs) =>
-                mcpToolsCall({
-                  mcpUrl: credential.mcp_url,
-                  token: credential.token,
-                  connectionCapability: capability,
-                  name: 'report_request',
-                  arguments: reqArgs,
-                  timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
-                }),
+              call: async (reqArgs) => {
+                lastCloseResponse = null
+                lastCloseError = null
+                try {
+                  const res = await mcpToolsCall({
+                    mcpUrl: credential.mcp_url,
+                    token: credential.token,
+                    connectionCapability: capability,
+                    name: 'report_request',
+                    arguments: reqArgs,
+                    timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+                  })
+                  lastCloseResponse = res
+                  return res
+                } catch (err) {
+                  lastCloseError = err
+                  throw err
+                }
+              },
             })
             if (closed) {
               rotateRequestLog(connectionId, { dir: connDir })
             } else {
+              const closeRefusal =
+                refusalFromResponse(lastCloseResponse) ??
+                (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+                (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
               process.stderr.write(
-                `mark-explicit-reply: closeRequest did not complete for answered command ${primaryAnsweredId}; leaving open for idle retry\n`,
+                `mark-explicit-reply: closeRequest refused/incomplete for answered command ${primaryAnsweredId}; leaving open for idle retry: ${JSON.stringify(closeRefusal)}\n`,
               )
             }
           }
         }
       } catch (error) {
         process.stderr.write(
-          `mark-explicit-reply: closeRequest failed for answered command ${primaryAnsweredId}: ${error instanceof Error ? error.message : String(error)}; leaving open for idle retry\n`,
+          `mark-explicit-reply: closeRequest failed for answered command ${primaryAnsweredId}; leaving open for idle retry: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
         )
       }
     }

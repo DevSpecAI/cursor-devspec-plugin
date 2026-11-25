@@ -296,7 +296,7 @@ export async function openRequest({
   }
   const requestId = UUID.test(result?.request_id ?? '') ? result.request_id : null
   if (!requestId || result.status !== 'open') return null
-  appendRequestEvent(
+  const persisted = appendRequestEvent(
     connectionId,
     {
       op: 'open',
@@ -308,7 +308,7 @@ export async function openRequest({
     },
     { dir },
   )
-  return requestId
+  return persisted ? requestId : null
 }
 
 /**
