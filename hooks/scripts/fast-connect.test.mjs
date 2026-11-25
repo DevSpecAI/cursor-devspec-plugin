@@ -1281,6 +1281,45 @@ describe('fast-connect CLI flags', () => {
         assert.ok(fitsShellOutput(defaultUnwritableDiag))
         assert.match(defaultUnwritableDiag, /fix write permissions on ~\/\.devspec\/notes and retry/i)
 
+        // Under-20,000-char multi-byte UTF-8 diagnostic (> 40,000 bytes) with unwritable notes
+        // under installBoundedCliStderr MUST cite the 40,000-byte ceiling on stderr AND record
+        // suppressedDiagnostics so the connect receipt discloses the omitted diagnostic (3c5147a7 / 91d7b47c).
+        {
+          let capturedUtf8Stderr = ''
+          const prevWrite = process.stderr.write
+          process.stderr.write = (chunk, enc, cb) => {
+            capturedUtf8Stderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+            const done = typeof enc === 'function' ? enc : cb
+            if (typeof done === 'function') done()
+            return true
+          }
+          const utf8Guard = installBoundedCliStderr({ label: 'remote-control-state', home: brokenHome2 })
+          try {
+            process.stderr.write(`${'中'.repeat(14_000)}\n`) // 14,001 chars (< 20,000), 42,001 bytes (> 40,000)
+            assert.match(capturedUtf8Stderr, /40000/)
+            assert.match(capturedUtf8Stderr, /bytes/)
+            assert.match(capturedUtf8Stderr, /fix write permissions on ~\/\.devspec\/notes and retry/i)
+            const suppressed = utf8Guard.getSuppressedDiagnostics()
+            assert.equal(suppressed?.omitted_count, 1)
+            assert.equal(suppressed?.omitted_bytes, 42_001)
+            assert.equal(suppressed?.shell_limit_bytes, 40_000)
+            assert.equal(suppressed?.note_write_failed_count, 1)
+            const receiptOut = formatFastConnectCliOutput(
+              { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
+              { home: brokenHome2, reserve: utf8Guard.getEmittedStderr(), suppressedDiagnostics: suppressed },
+            )
+            assert.ok(fitsShellOutput(capturedUtf8Stderr + receiptOut))
+            const parsedUtf8Receipt = JSON.parse(receiptOut)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.omitted_count, 1)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.omitted_bytes, 42_001)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.shell_limit_bytes, 40_000)
+            assert.match(parsedUtf8Receipt.stderr_diagnostics_omitted?.recovery, /~\/\.devspec\/notes/)
+          } finally {
+            utf8Guard.restore()
+            process.stderr.write = prevWrite
+          }
+        }
+
         // When connect note writing fails after earlier stderr diagnostics were saved in notes,
         // both the minimal fallback (oversized error field) AND tight-reserve fallbackObj MUST
         // preserve stderr_diagnostics_omitted counts and saved note read commands (3c5147a7 / 91d7b47c).
