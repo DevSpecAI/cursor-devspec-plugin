@@ -149,7 +149,7 @@ function startedCommandsPath(connectionId, dir) {
   return path.join(dir, `${connectionId}.started-commands.json`)
 }
 
-function readStartedCommandIds(connectionId, dir) {
+export function readStartedCommandIds(connectionId, dir = defaultConnectionsDir()) {
   const data = readPrivateJson(startedCommandsPath(connectionId, dir))
   return Array.isArray(data?.message_ids) ? data.message_ids.filter((id) => typeof id === 'string') : []
 }
@@ -345,7 +345,12 @@ function findLargestRawArray(node, currentPath = [], best = null) {
     return best
   }
   if (node && typeof node === 'object') {
-    if (node.omitted_due_to_shell_limit === true) return best
+    if (
+      node.omitted_due_to_shell_limit === true ||
+      (Array.isArray(node.items) && typeof node.total_count === 'number' && typeof node.omitted_count === 'number')
+    ) {
+      return best
+    }
     for (const [k, v] of Object.entries(node)) {
       best = findLargestRawArray(v, [...currentPath, k], best)
     }
@@ -370,7 +375,13 @@ function findLargestRawArray(node, currentPath = [], best = null) {
  *  3. Returns `null` if `stdoutText` itself leaves too little room even for a structured
  *     refusal envelope with counts and recovery (never flattening to a generic sentence).
  */
-function shrinkObjectToFit(obj, buildCandidate, fits, limitChars, effectiveRecovery) {
+function shrinkObjectToFit(
+  obj,
+  buildCandidate,
+  fits,
+  limitChars,
+  { requireNonEmptyArrays = false, compactArrays = false } = {},
+) {
   const working = cloneJsonSafe(obj)
   const stringReplacement = (len) => ({
     omitted_large_text: true,
@@ -392,11 +403,19 @@ function shrinkObjectToFit(obj, buildCandidate, fits, limitChars, effectiveRecov
         total_count: originalArr.length,
         returned_count: count,
         omitted_count: originalArr.length - count,
-        omitted_due_to_shell_limit: true,
-        recovery: effectiveRecovery,
+        ...(compactArrays ? {} : { omitted_due_to_shell_limit: true }),
       })
-      let alo = 0
+      const minCount = requireNonEmptyArrays && originalArr.length > 0 ? 1 : 0
+      let alo = minCount
       let ahi = originalArr.length
+      if (minCount > 0) {
+        setAtPath(working, bigArr.path, makeBoundedArr(minCount))
+        if (!fits(buildCandidate(working))) {
+          // Keep 1 item in place so the next iteration can shrink any oversized string
+          // inside that retained item without collapsing a non-empty array to `items: []`.
+          continue
+        }
+      }
       while (alo < ahi) {
         const amid = Math.ceil((alo + ahi) / 2)
         setAtPath(working, bigArr.path, makeBoundedArr(amid))
@@ -419,6 +438,31 @@ function shrinkObjectToFit(obj, buildCandidate, fits, limitChars, effectiveRecov
 
   const candidate = buildCandidate(working)
   return fits(candidate) ? candidate : null
+}
+
+const BLOCKING_DETAIL_KEYS = new Set([
+  'blocking_turn_id',
+  'blocking_attempt_id',
+  'blocking_attempt',
+  'blocking_items',
+  'blocking',
+  'conflicting_records',
+  'conflicts',
+  'details',
+])
+
+function hasNonEmptyBlockingValue(val) {
+  if (val === undefined || val === null) return false
+  if (typeof val === 'string') return val.length > 0
+  if (typeof val === 'number' || typeof val === 'boolean') return true
+  if (Array.isArray(val)) return val.length > 0
+  if (typeof val === 'object') {
+    if (Array.isArray(val.items) && typeof val.total_count === 'number') {
+      return val.items.length > 0
+    }
+    return Object.keys(val).length > 0
+  }
+  return false
 }
 
 /**
@@ -502,7 +546,9 @@ export function formatStructuredRefusalsFallback(
   // 2. Single first refusal exceeds remaining budget: shrink only oversized string
   // leaves and/or binary-search oversized nested arrays while keeping every field and
   // retained item complete with explicit omission counts, saved pointer, and recovery.
-  const singleFitted = shrinkObjectToFit(list[0], (item) => wrap([item]), fits, limitChars, effectiveRecovery)
+  const singleFitted = shrinkObjectToFit(list[0], (item) => wrap([item]), fits, limitChars, {
+    requireNonEmptyArrays: true,
+  })
   if (singleFitted) return singleFitted
 
   if (!allowMinimalEnvelope) return null
@@ -524,18 +570,24 @@ export function formatStructuredRefusalsFallback(
       refusal: item,
       recovery: compactRecovery,
     })}\n`
-  const compactFitted = shrinkObjectToFit(list[0], compactWrap, fits, limitChars, compactRecovery)
+  const compactFitted = shrinkObjectToFit(list[0], compactWrap, fits, limitChars, {
+    requireNonEmptyArrays: true,
+  })
   if (compactFitted) return compactFitted
 
   // 4. Tight budget envelope: greedily pack priority top-level structured refusal fields
   // directly against `fits(...)` (no hard-coded item/char caps; retained items are never
   // stripped silently; omitted top-level keys are disclosed via `omitted_field_count`),
-  // ALWAYS keeping `read: savedCmd` when a fallback note was saved.
+  // ALWAYS keeping `read: savedCmd` when a fallback note was saved. When no note store
+  // was writable (`savedCmd === null`) and the refusal carried blocking details, never
+  // return a code-only or empty-blocking-items shell (requirement 4e32d1a5).
   const primaryEntry = list[0] && typeof list[0] === 'object' ? list[0] : {}
   const primaryInner =
     primaryEntry.refusal && typeof primaryEntry.refusal === 'object' ? primaryEntry.refusal : primaryEntry
+  const hasOriginalBlockingDetails = [...BLOCKING_DETAIL_KEYS].some(
+    (k) => k in primaryInner && hasNonEmptyBlockingValue(primaryInner[k]),
+  )
   const priorityOrder = [
-    'code',
     'blocking_turn_id',
     'blocking_attempt_id',
     'blocking_attempt',
@@ -544,6 +596,7 @@ export function formatStructuredRefusalsFallback(
     'conflicting_records',
     'conflicts',
     'details',
+    'code',
     'retryable',
     'status',
   ]
@@ -552,11 +605,12 @@ export function formatStructuredRefusalsFallback(
     ...Object.keys(primaryInner).filter((k) => !priorityOrder.includes(k)),
   ]
   const allCodes = list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
+  const needTopLevelCodes = Boolean(savedCmd) || list.length > 1 || !('code' in primaryInner)
   const tightRecovery = savedCmd ? 'Read `read`; fix ~/.devspec/notes.' : 'Fix ~/.devspec/notes & retry.'
   const buildTight = (fieldsObj, omittedFieldsCount, codesSlice = []) =>
     `${JSON.stringify({
       refused: 'report_pickup',
-      ...(codesSlice.length > 0 ? { codes: codesSlice } : {}),
+      ...(needTopLevelCodes && codesSlice.length > 0 ? { codes: codesSlice } : {}),
       ...fieldsObj,
       ...(omittedFieldsCount > 0 ? { omitted_field_count: omittedFieldsCount } : {}),
       omitted_count: list.length,
@@ -566,7 +620,7 @@ export function formatStructuredRefusalsFallback(
     })}\n`
 
   let fittedCodes = []
-  if (allCodes.length > 0) {
+  if (needTopLevelCodes && allCodes.length > 0) {
     let clo = 0
     let chi = allCodes.length
     while (clo < chi) {
@@ -598,11 +652,11 @@ export function formatStructuredRefusalsFallback(
         (sub) => buildTight({ ...pickedFields, ...sub }, nextRemaining, fittedCodes),
         fits,
         limitChars,
-        tightRecovery,
+        { requireNonEmptyArrays: !savedCmd, compactArrays: true },
       )
       if (fittedSub) {
         const parsedSub = JSON.parse(fittedSub)
-        if (key in parsedSub) {
+        if (key in parsedSub && (!BLOCKING_DETAIL_KEYS.has(key) || !savedCmd ? hasNonEmptyBlockingValue(parsedSub[key]) : true)) {
           pickedFields[key] = parsedSub[key]
           pickedCount += 1
         }
@@ -618,8 +672,15 @@ export function formatStructuredRefusalsFallback(
     const readOnly = buildTight({}, orderedKeys.length, [])
     return fits(readOnly) ? readOnly : null
   }
-  // When no fallback note could be saved, require at least one actionable structured field
-  // rather than returning a bare omission count with no actionable details or read path.
+  // When no fallback note could be saved AND the refusal carried blocking details, require
+  // at least one non-empty blocking detail to survive rather than returning a code-only
+  // shell or empty blocking list with no way to read the original blocker (req 4e32d1a5).
+  if (hasOriginalBlockingDetails) {
+    const keptBlocking = [...BLOCKING_DETAIL_KEYS].some(
+      (k) => k in pickedFields && hasNonEmptyBlockingValue(pickedFields[k]),
+    )
+    if (!keptBlocking) return null
+  }
   if (pickedCount === 0 && fittedCodes.length === 0) return null
   const withoutRead = buildTight(pickedFields, omittedFieldsCount, fittedCodes)
   return fits(withoutRead) ? withoutRead : null

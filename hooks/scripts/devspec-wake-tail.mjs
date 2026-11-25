@@ -125,6 +125,7 @@ import {
   extractRoomCommandsFromWake,
   formatStructuredRefusalsFallback,
   markWakeListenerNeeded,
+  readStartedCommandIds,
   startRoomCommands,
   structuredRefusalFromError,
 } from './command-start.mjs'
@@ -703,6 +704,115 @@ export async function readWakes({
       }
     }
 
+    // If local note reads already failed before stdout (unreadable wake_in_note), refuse
+    // without calling startCommands or marking anything started.
+    if (noteRefusals.length > 0 && inlineCommands.length === 0) {
+      pickupRefusals = noteRefusals
+      const noteDiag = `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
+      const fittedWithStdout = fitShellDiagnostic(page.text, noteDiag, {
+        home,
+        label: 'devspec-wake-tail',
+        fallback: (noteError, savedNote) =>
+          formatStructuredRefusalsFallback(pickupRefusals, {
+            prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: page.text,
+            noteError,
+            savedNote,
+            allowMinimalEnvelope: false,
+          }),
+        requireStructuredFallback: true,
+      })
+      if (fittedWithStdout.text) {
+        await write(page.text)
+        pickupDiagnosticNote = fittedWithStdout.note
+        writeStderr(fittedWithStdout.text)
+        pickupDiagnosticWritten = true
+      } else {
+        const fittedFullBudget = fitShellDiagnostic('', noteDiag, {
+          home,
+          label: 'devspec-wake-tail',
+          fallback: (noteError, savedNote) =>
+            formatStructuredRefusalsFallback(pickupRefusals, {
+              prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+              stdoutText: '',
+              noteError,
+              savedNote,
+            }),
+          requireStructuredFallback: true,
+        })
+        pickupDiagnosticNote = fittedFullBudget.note
+        if (fittedFullBudget.text) {
+          writeStderr(fittedFullBudget.text)
+          pickupDiagnosticWritten = true
+        }
+      }
+      return {
+        ...page,
+        marked: false,
+        pickup_refusals: pickupRefusals,
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        pickup_diagnostic_written: pickupDiagnosticWritten,
+        error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
+      }
+    }
+
+    // Preview whether multiple unstarted inline commands sit on this page BEFORE writing
+    // stdout so the header discloses queued pickup work upfront while strictly ensuring
+    // `await write(pageText)` completes BEFORE calling `startCommands` (`report_pickup`,
+    // started-command persistence, and `.turn` Working marker — requirement 3ea2b201).
+    let pageText = page.text
+    let effectiveRemaining = page.remaining
+    if (resolvedConnectionId && page.printed > 0 && inlineCommands.length > 1) {
+      const alreadyStarted = new Set(readStartedCommandIds(resolvedConnectionId, dir))
+      const seen = new Set()
+      const unstartedPreview = []
+      for (const cmd of inlineCommands) {
+        if (!cmd?.messageId || seen.has(cmd.messageId) || alreadyStarted.has(cmd.messageId)) continue
+        seen.add(cmd.messageId)
+        unstartedPreview.push(cmd)
+      }
+      if (unstartedPreview.length > 1) {
+        const previewOlder = unstartedPreview.slice(0, -1)
+        const previewOlderIds = new Set(previewOlder.map((cmd) => cmd.messageId))
+        let earliestPreviewStart = null
+        for (const span of inlineCommandSpans) {
+          if (previewOlderIds.has(span.messageId)) {
+            if (earliestPreviewStart === null || span.wakeStart < earliestPreviewStart) {
+              earliestPreviewStart = span.wakeStart
+            }
+          }
+        }
+        const heldWakeCount = Math.max(
+          1,
+          Array.isArray(page.printedWakes)
+            ? page.printedWakes.filter((item) => {
+                const wStart = item.sourceIndex === 0 ? start : wakes[item.sourceIndex - 1].end
+                return typeof earliestPreviewStart === 'number' && wStart >= earliestPreviewStart
+              }).length
+            : 1,
+        )
+        effectiveRemaining = page.remaining + heldWakeCount
+        const nlIdx = pageText.indexOf('\n')
+        if (nlIdx >= 0) {
+          const body = pageText.slice(nlIdx + 1)
+          const detailedNote = `${previewOlder.length} of ${inlineCommands.length} room command(s) remain queued for pickup (${previewOlder.map((cmd) => cmd.messageId).join(', ')}); run this wake reader again to pick up the rest.`
+          const shortNote = `${previewOlder.length} older room command(s) remain queued for pickup; run this wake reader again.`
+          const candidateDetailed = readerHeader(page.printed, effectiveRemaining, detailedNote, listener) + body
+          const candidateShort = readerHeader(page.printed, effectiveRemaining, shortNote, listener) + body
+          const candidateCounts = readerHeader(page.printed, effectiveRemaining, null, listener) + body
+          if (fitsShellOutput(`${candidateDetailed}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateDetailed
+          else if (fitsShellOutput(`${candidateShort}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateShort
+          else if (fitsShellOutput(`${candidateCounts}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateCounts
+        }
+      }
+    }
+
+    // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / write error),
+    // throw immediately with zero report_pickup calls, zero started-command writes, zero
+    // Working marker writes, and zero wake-cursor movement (requirement 3ea2b201).
+    await write(pageText)
+    const printedStdout = pageText
+
     let rawDiag = ''
     let unstartedCommands = []
     if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
@@ -758,10 +868,6 @@ export async function readWakes({
       }
     }
 
-    // Compute any unstarted inline command hold offset BEFORE printing stdout so the
-    // reader header visibly discloses remaining queued pickup work (never reporting
-    // `remaining: 0` when older commands were left unchecked for the next read —
-    // requirements 3c5147a7 / 91d7b47c / 3ea2b201).
     const unstartedIds = new Set(unstartedCommands.map((cmd) => cmd?.messageId).filter(Boolean))
     let earliestUnstartedStart = null
     for (const span of inlineCommandSpans) {
@@ -771,88 +877,31 @@ export async function readWakes({
         }
       }
     }
-    let pageText = page.text
-    let effectiveRemaining = page.remaining
-    if (unstartedCommands.length > 0 && !pickupRefusals) {
-      const heldWakeCount = Math.max(
-        1,
-        Array.isArray(page.printedWakes)
-          ? page.printedWakes.filter((item) => {
-              const wStart = item.sourceIndex === 0 ? start : wakes[item.sourceIndex - 1].end
-              return typeof earliestUnstartedStart === 'number' && wStart >= earliestUnstartedStart
-            }).length
-          : 1,
-      )
-      effectiveRemaining = page.remaining + heldWakeCount
-      const nlIdx = pageText.indexOf('\n')
-      if (nlIdx >= 0) {
-        const body = pageText.slice(nlIdx + 1)
-        const detailedNote = `${unstartedCommands.length} of ${inlineCommands.length} room command(s) remain queued for pickup (${unstartedCommands.map((cmd) => cmd?.messageId).filter(Boolean).join(', ')}); run this wake reader again to pick up the rest.`
-        const shortNote = `${unstartedCommands.length} older room command(s) remain queued for pickup; run this wake reader again.`
-        const candidateDetailed = readerHeader(page.printed, effectiveRemaining, detailedNote, listener) + body
-        const candidateShort = readerHeader(page.printed, effectiveRemaining, shortNote, listener) + body
-        const candidateCounts = readerHeader(page.printed, effectiveRemaining, null, listener) + body
-        if (fitsShellOutput(candidateDetailed)) pageText = candidateDetailed
-        else if (fitsShellOutput(candidateShort)) pageText = candidateShort
-        else if (fitsShellOutput(candidateCounts)) pageText = candidateCounts
-      }
-    }
 
-    // Decide stdout vs stderr budget on pickup refusals: if `pageText` + refusal/note-pointer
-    // fits inside Cursor's Shell ceiling, write `pageText` as usual; if a huge refusal could
-    // not be saved to a note and needs the Shell budget to preserve structured refusal details
-    // (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c), keep stdout empty on this refused read
-    // (the wake stays unread for retry) so the full 20,000-char ceiling holds the refusal.
-    let printedStdout = ''
     if (pickupRefusals && rawDiag) {
-      const fittedWithStdout = fitShellDiagnostic(pageText, rawDiag, {
+      const fittedWithStdout = fitShellDiagnostic(printedStdout, rawDiag, {
         home,
         label: 'devspec-wake-tail',
         fallback: (noteError, savedNote) =>
           formatStructuredRefusalsFallback(pickupRefusals, {
             prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
-            stdoutText: pageText,
+            stdoutText: printedStdout,
             noteError,
             savedNote,
-            allowMinimalEnvelope: false,
           }),
         requireStructuredFallback: true,
       })
+      pickupDiagnosticNote = fittedWithStdout.note
       if (fittedWithStdout.text) {
-        await write(pageText)
-        printedStdout = pageText
-        pickupDiagnosticNote = fittedWithStdout.note
         writeStderr(fittedWithStdout.text)
         pickupDiagnosticWritten = true
-      } else {
-        const fittedFullBudget = fitShellDiagnostic('', rawDiag, {
-          home,
-          label: 'devspec-wake-tail',
-          fallback: (noteError, savedNote) =>
-            formatStructuredRefusalsFallback(pickupRefusals, {
-              prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
-              stdoutText: '',
-              noteError,
-              savedNote,
-            }),
-          requireStructuredFallback: true,
-        })
-        pickupDiagnosticNote = fittedFullBudget.note
-        if (fittedFullBudget.text) {
-          writeStderr(fittedFullBudget.text)
-          pickupDiagnosticWritten = true
-        }
       }
-    } else {
-      await write(pageText)
-      printedStdout = pageText
-      if (rawDiag) {
-        const fitted = fitShellDiagnostic(printedStdout, rawDiag, { home, label: 'devspec-wake-tail' })
-        pickupDiagnosticNote = fitted.note
-        if (fitted.text) {
-          writeStderr(fitted.text)
-          pickupDiagnosticWritten = true
-        }
+    } else if (rawDiag) {
+      const fitted = fitShellDiagnostic(printedStdout, rawDiag, { home, label: 'devspec-wake-tail' })
+      pickupDiagnosticNote = fitted.note
+      if (fitted.text) {
+        writeStderr(fitted.text)
+        pickupDiagnosticWritten = true
       }
     }
 

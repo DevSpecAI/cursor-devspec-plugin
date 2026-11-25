@@ -88,9 +88,12 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
+  shellDiagnosticPointer,
   shellDiagnosticReserve,
   wakeInNote,
   wakesForOneOutput,
+  writeFallbackDiagnosticNote,
+  writeNote,
 } from './hook-context-budget.mjs'
 import {
   buildInteractionAnswerEvents,
@@ -1992,6 +1995,136 @@ export async function runOneShotRoomCommandPickup({
   }
 }
 
+/**
+ * Bounded one-shot retry stderr writer that NEVER silently drops retry diagnostics when
+ * stderr approaches Cursor's combined Shell output ceiling (requirements 3c5147a7 / 91d7b47c).
+ * Every retry diagnostic beyond the inline allowance is buffered whole in memory and saved
+ * to a sealed note (`writeNote` -> private `writeFallbackDiagnosticNote` under `tmpDir`) on
+ * `flush()`, emitting the exact `cat` continuation command inside the reserved headroom
+ * (or explicit omission counts + recovery if neither note store is writable).
+ */
+export function createOneShotRetryStderrWriter({
+  follow = false,
+  writeStderr = (chunk) => process.stderr.write(chunk),
+  getEmittedStderr = () => '',
+  home = os.homedir(),
+  tmpDir = null,
+  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait'),
+  headroom = null,
+} = {}) {
+  const transitionLine =
+    'devspec-remote-wait: retry stderr allowance reached; buffering further retry warnings to a saved diagnostic note on exit\n'
+  const effectiveHeadroom =
+    typeof headroom === 'string'
+      ? headroom
+      : wakeLines([
+          {
+            type: 'wake_in_note',
+            carries: ['owner_message'],
+            read: 'cat ~/.devspec/notes/0000000000000000.md',
+            note: RECALL_WHOLE_NOTE,
+          },
+          wakesWaitingEvent(CURSOR_SHELL_OUTPUT_MAX_CHARS),
+        ]) +
+        diagnosticReserve +
+        diagnosticReserve +
+        transitionLine
+  const suppressedLines = []
+  let buffering = false
+  let flushed = false
+
+  const write = (line) => {
+    const text = String(line ?? '')
+    if (!text) return
+    if (follow) {
+      writeStderr(text)
+      return
+    }
+    const emitted = String(getEmittedStderr() ?? '')
+    if (!buffering && fitsShellOutput(`${emitted}${text}${effectiveHeadroom}`)) {
+      writeStderr(text)
+      return
+    }
+    suppressedLines.push(text)
+    if (!buffering) {
+      buffering = true
+      if (fitsShellOutput(`${emitted}${transitionLine}${diagnosticReserve}`)) {
+        writeStderr(transitionLine)
+      }
+    }
+  }
+
+  const flush = ({ stdoutText = '' } = {}) => {
+    if (follow || flushed || suppressedLines.length === 0) return { savedNote: null, omittedCount: 0, line: '' }
+    flushed = true
+    const omittedCount = suppressedLines.length
+    const fullText =
+      `# Omitted one-shot retry diagnostics (${omittedCount} message(s))\n` +
+      suppressedLines.join('')
+    const emitted = String(getEmittedStderr() ?? '')
+    const stdout = String(stdoutText ?? '')
+    let savedNote = null
+    let primaryErr = null
+    let fallbackErr = null
+    try {
+      savedNote = writeNote(fullText, { home })
+    } catch (error) {
+      primaryErr = error
+    }
+    if (!savedNote) {
+      try {
+        const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+        const baseDir = tmpDir ? path.join(tmpDir, `devspec-notes-${uid}`) : null
+        savedNote = writeFallbackDiagnosticNote(fullText, { baseDir })
+      } catch (error) {
+        fallbackErr = error
+      }
+    }
+    if (savedNote) {
+      const detailedLine = `devspec-remote-wait: saved ${omittedCount} omitted retry diagnostic(s) (${fullText.length} chars) whole — run \`${savedNote.command}\`${savedNote.parts > 1 ? ` (${savedNote.parts} parts)` : ''}.\n`
+      const pointerLine = shellDiagnosticPointer('devspec-remote-wait', savedNote.command)
+      const chosen = fitsShellOutput(`${emitted}${stdout}${detailedLine}`)
+        ? detailedLine
+        : fitsShellOutput(`${emitted}${stdout}${pointerLine}`)
+          ? pointerLine
+          : ''
+      if (chosen) writeStderr(chosen)
+      return { savedNote, omittedCount, line: chosen }
+    }
+    const errMsg =
+      (primaryErr instanceof Error ? primaryErr.message : String(primaryErr ?? 'notes unwritable')) +
+      (fallbackErr ? `; tmp fallback: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}` : '')
+    const detailedUnwritable = `devspec-remote-wait: ${JSON.stringify({
+      retry_diagnostics_omitted: true,
+      omitted_count: omittedCount,
+      omitted_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      note_write_error: errMsg,
+      recovery: 'Fix write permissions on ~/.devspec/notes or temp dir and retry so omitted retry diagnostics can be saved whole.',
+    })}\n`
+    const compactUnwritable = `devspec-remote-wait: ${JSON.stringify({
+      retry_diagnostics_omitted: true,
+      omitted_count: omittedCount,
+      omitted_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry.',
+    })}\n`
+    const chosen = fitsShellOutput(`${emitted}${stdout}${detailedUnwritable}`)
+      ? detailedUnwritable
+      : fitsShellOutput(`${emitted}${stdout}${compactUnwritable}`)
+        ? compactUnwritable
+        : ''
+    if (chosen) writeStderr(chosen)
+    return { savedNote: null, omittedCount, line: chosen }
+  }
+
+  return {
+    write,
+    flush,
+    suppressedCount: () => suppressedLines.length,
+  }
+}
+
 async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
@@ -2000,41 +2133,14 @@ async function main() {
   // diagnostics) so stdout sizing and fitShellDiagnostic enforce Cursor's combined
   // stdout + stderr Shell ceiling across the entire process (reqs 3c5147a7 / 91d7b47c).
   let emittedStderr = ''
-  let retryStderrSuppressed = false
-  // Minimum headroom kept free in one-shot stderr during retry loops so the eventual
-  // wake_in_note pointer plus a structured pickup refusal or diagnostic note pointer
-  // always fit inside Cursor's combined stdout + stderr Shell ceiling (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
-  const oneShotSuppressedLine =
-    'devspec-remote-wait: further retry warnings suppressed to keep combined output within Cursor Shell limit\n'
   const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait')
-  const oneShotRetryHeadroom =
-    wakeLines([
-      {
-        type: 'wake_in_note',
-        carries: ['owner_message'],
-        read: 'cat ~/.devspec/notes/0000000000000000.md',
-        note: RECALL_WHOLE_NOTE,
-      },
-      wakesWaitingEvent(CURSOR_SHELL_OUTPUT_MAX_CHARS),
-    ]) +
-    oneShotDiagnosticReserve +
-    oneShotSuppressedLine
-  const writeRetryStderr = (line) => {
-    if (args.follow) {
-      process.stderr.write(line)
-      return
-    }
-    if (!retryStderrSuppressed && fitsShellOutput(`${emittedStderr}${line}${oneShotRetryHeadroom}`)) {
-      process.stderr.write(line)
-      return
-    }
-    if (!retryStderrSuppressed) {
-      retryStderrSuppressed = true
-      if (fitsShellOutput(`${emittedStderr}${oneShotSuppressedLine}${oneShotDiagnosticReserve}`)) {
-        process.stderr.write(oneShotSuppressedLine)
-      }
-    }
-  }
+  const retryStderr = createOneShotRetryStderrWriter({
+    follow: Boolean(args.follow),
+    writeStderr: (chunk) => process.stderr.write(chunk),
+    getEmittedStderr: () => emittedStderr,
+    diagnosticReserve: oneShotDiagnosticReserve,
+  })
+  const writeRetryStderr = (line) => retryStderr.write(line)
   if (!args.follow) {
     const rawStderrWrite = process.stderr.write.bind(process.stderr)
     process.stderr.write = (chunk, ...rest) => {
@@ -2159,11 +2265,13 @@ async function main() {
         { type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId },
         args.wakeFile,
       )
+      retryStderr.flush()
       process.exit(1)
     }
     if (live && live.enabled === false) {
       discardOnEnd()
       if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
+      retryStderr.flush()
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
@@ -2173,6 +2281,7 @@ async function main() {
         { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
         args.wakeFile,
       )
+      retryStderr.flush()
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
@@ -2489,6 +2598,7 @@ async function main() {
               state: live,
             })
             if (!oneShotPickup.ok) {
+              retryStderr.flush()
               process.exitCode = 1
               return
             }
@@ -2574,6 +2684,7 @@ async function main() {
           args.pending = true
           continue
         }
+        retryStderr.flush({ stdoutText: oneShot?.text ?? '' })
         const exitLine = `devspec-remote-wait: wake (${wakeCount} msg) — exit 0\n`
         if (fitsShellOutput(`${emittedStderr}${oneShot?.text ?? ''}${exitLine}`)) {
           process.stderr.write(exitLine)
@@ -2587,6 +2698,7 @@ async function main() {
     await sleep(pollMs)
   }
 
+  retryStderr.flush()
   process.stderr.write('devspec-remote-wait: max wait elapsed — exit 1\n')
   process.exit(1)
 }

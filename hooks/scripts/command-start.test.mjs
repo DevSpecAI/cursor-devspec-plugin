@@ -1347,7 +1347,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         child.stdout.on('data', (c) => { stdout += c.toString() })
         child.stderr.on('data', (c) => {
           stderr += c.toString()
-          if (!unblocked && stderr.includes('further retry warnings suppressed')) {
+          if (!unblocked && stderr.includes('buffering further retry warnings')) {
             unblocked = true
             fs.rmSync(notesPath, { force: true })
           }
@@ -1363,7 +1363,12 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         child.on('close', (code) => { clearTimeout(timer); clearTimeout(fallbackUnblock); resolve({ stdout, stderr, code }) })
       })
       assert.equal(code, 0)
-      assert.match(stderr, /further retry warnings suppressed/)
+      assert.match(stderr, /buffering further retry warnings/)
+      assert.match(stderr, /saved \d+ omitted retry diagnostic\(s\).*cat /)
+      const noteIdMatch = /notes\/([0-9a-f]{16})\.md/.exec(stderr)
+      assert.ok(noteIdMatch, `stderr must name saved retry diagnostic note, got:\n${stderr}`)
+      const savedRetryText = readNoteText(noteIdMatch[1], { home })
+      assert.ok(savedRetryText && savedRetryText.includes('holding a wake:'), 'saved retry note must preserve omitted retry warnings whole')
       assert.ok(
         fitsShellOutput(stdout + stderr),
         `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
@@ -2236,5 +2241,163 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
 
     // 4. Ultra-tight budget (110 chars) WITHOUT savedNote: returns null rather than a bare omission count with neither blocking fields nor read!
     assert.equal(formatStructuredRefusalsFallback(refusal, { maxChars: 110, savedNote: null }), null)
+
+    // 5. 350-char budget WITHOUT savedNote (neither note store writable): MUST keep real
+    // non-empty blocking_items (NEVER `items: []` and NEVER code-only without blockers!) (4e32d1a5).
+    const blockingOnlyRefusal = [
+      {
+        command_message_id: MSG_ID,
+        command_turn_id: TURN_ID,
+        refusal: {
+          code: 'turn_busy',
+          blocking_items: [
+            { id: 'blk-1', reason: 'active_edit' },
+            { id: 'blk-2', reason: 'pending_review' },
+            { id: 'blk-3', reason: 'lock_held' },
+          ],
+          error: 'e'.repeat(10_000),
+        },
+      },
+    ]
+    const at350 = formatStructuredRefusalsFallback(blockingOnlyRefusal, { maxChars: 350, savedNote: null })
+    assert.ok(at350 && at350.length <= 350, `expected <= 350 chars, got ${at350?.length}`)
+    const parsed350 = JSON.parse(at350)
+    const items350 = Array.isArray(parsed350.blocking_items)
+      ? parsed350.blocking_items
+      : parsed350.blocking_items?.items
+    assert.ok(Array.isArray(items350) && items350.length >= 1, `must keep >= 1 real blocking item at 350 chars, got: ${at350}`)
+    assert.equal(items350[0].id, 'blk-1')
+    assert.equal(items350[0].reason, 'active_edit')
+
+    // When a tight budget WITHOUT savedNote cannot fit even 1 blocking item, return null
+    // instead of returning `blocking_items: []` or code-only omission counts (4e32d1a5).
+    const hugeItemRefusal = [
+      {
+        command_message_id: MSG_ID,
+        command_turn_id: TURN_ID,
+        refusal: {
+          code: 'turn_busy',
+          blocking_items: [
+            { id: 'b1', a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20 },
+          ],
+        },
+      },
+    ]
+    assert.equal(
+      formatStructuredRefusalsFallback(hugeItemRefusal, { maxChars: 220, savedNote: null }),
+      null,
+      'must return null rather than dropping all blocking items to empty list when no note store is writable',
+    )
+  })
+
+  it('readWakes does NOT call report_pickup, persist started-command, or write .turn if stdout write fails (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Wake whose stdout fails')))
+
+    let pickupCalls = 0
+    await assert.rejects(
+      () =>
+        readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 10,
+          write: async () => {
+            throw new Error('simulated EPIPE on stdout')
+          },
+          writeStderr: () => {},
+          startCommands: (opts) =>
+            startRoomCommands({
+              ...opts,
+              call: async () => {
+                pickupCalls += 1
+                return { outcome: 'picked_up' }
+              },
+              seedFn: async () => {},
+              ensureWatch: () => ({ started: false }),
+            }),
+        }),
+      /simulated EPIPE/,
+    )
+    assert.equal(pickupCalls, 0, 'must NOT call report_pickup when stdout write fails')
+    assert.equal(fs.existsSync(path.join(dir, `${CONN}.started-commands.json`)), false, 'must NOT persist started command on stdout failure')
+    assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false, 'must NOT write Working .turn marker on stdout failure')
+
+    // Subsequent successful read hands the wake over, starts the command once, and advances the cursor.
+    let delivered = ''
+    const okRead = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { delivered += text },
+      writeStderr: () => {},
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async () => {
+            pickupCalls += 1
+            return { outcome: 'picked_up' }
+          },
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.equal(okRead.marked, true)
+    assert.equal(pickupCalls, 1, 'next read must start the previously undelivered command cleanly')
+    assert.match(delivered, /Wake whose stdout fails/)
+  })
+
+  it('createOneShotRetryStderrWriter saves omitted retry diagnostics whole to a sealed note (and tmpDir fallback) with continuation command (3c5147a7 / 91d7b47c)', async () => {
+    const { createOneShotRetryStderrWriter } = await import('./devspec-remote-wait.mjs')
+    const { home } = mkHome()
+    const blockedHome = path.join(home, 'blocked-home')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'blocked')
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-retry-diag-tmp-'))
+    const blockedTmp = path.join(tmpDir, 'not-a-dir')
+    fs.writeFileSync(blockedTmp, 'blocked')
+    try {
+      // 1. Primary ~/.devspec/notes unwritable -> saves all omitted retry lines to tmpDir private note!
+      let emitted = ''
+      const writer = createOneShotRetryStderrWriter({
+        writeStderr: (chunk) => { emitted += chunk },
+        getEmittedStderr: () => emitted,
+        home: blockedHome,
+        tmpDir,
+      })
+      for (let i = 0; i < 120; i += 1) {
+        writer.write(`devspec-remote-wait: retry error #${i}: EACCES detail-${'d'.repeat(160)}\n`)
+      }
+      assert.ok(writer.suppressedCount() > 0)
+      const flushed = writer.flush()
+      assert.ok(flushed.savedNote?.command?.startsWith('cat '))
+      assert.ok(fitsShellOutput(emitted), `emitted stderr (${emitted.length}) must fit fitsShellOutput`)
+      const savedContent = fs.readFileSync(flushed.savedNote.file, 'utf8')
+      assert.match(savedContent, /retry error #119: EACCES/)
+
+      // 2. Neither ~/.devspec/notes nor tmpDir writable -> emits explicit omission count + recovery, never silent drop!
+      let emitted2 = ''
+      const writer2 = createOneShotRetryStderrWriter({
+        writeStderr: (chunk) => { emitted2 += chunk },
+        getEmittedStderr: () => emitted2,
+        home: blockedHome,
+        tmpDir: blockedTmp,
+      })
+      for (let i = 0; i < 120; i += 1) {
+        writer2.write(`devspec-remote-wait: retry error #${i}: EROFS detail-${'e'.repeat(160)}\n`)
+      }
+      const flushed2 = writer2.flush()
+      assert.equal(flushed2.savedNote, null)
+      assert.ok(flushed2.omittedCount > 0)
+      assert.ok(fitsShellOutput(emitted2))
+      assert.match(emitted2, /"retry_diagnostics_omitted":true/)
+      assert.match(emitted2, /Fix .*~\/\.devspec\/notes/)
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
   })
 })
