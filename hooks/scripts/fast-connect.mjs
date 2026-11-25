@@ -736,7 +736,7 @@ Prints one JSON result; exits 0 when connected, 1 when not.
  */
 export async function runFastConnectCli(
   args,
-  { getEmittedStderr = null, getSuppressedDiagnostics = null } = {},
+  { getEmittedStderr = null, getSuppressedDiagnostics = null, flushStderr = null } = {},
 ) {
   const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
   const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
@@ -746,10 +746,15 @@ export async function runFastConnectCli(
       : localStderrGuard
         ? localStderrGuard.getSuppressedDiagnostics()
         : null
+  const drainStderr = async () => {
+    if (typeof flushStderr === 'function') await flushStderr()
+    else if (localStderrGuard) await localStderrGuard.flushStderr()
+  }
   try {
     // Help is read before anything else: it registers, writes and calls nothing.
     if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
       await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
+      await drainStderr()
       process.exit(0)
     }
 
@@ -770,6 +775,7 @@ export async function runFastConnectCli(
           fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback could not fit Cursor's Shell ceiling.\n`,
         })
         await writeStreamAndFlush(process.stderr, bounded)
+        await drainStderr()
         process.exit(1)
       }
     }
@@ -799,6 +805,7 @@ export async function runFastConnectCli(
         suppressedDiagnostics: currentSuppressed(),
       }),
     )
+    await drainStderr()
     process.exit(result.ok ? 0 : 1)
   } finally {
     if (localStderrGuard) localStderrGuard.restore()

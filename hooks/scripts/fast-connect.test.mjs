@@ -1357,6 +1357,37 @@ describe('fast-connect CLI flags', () => {
           fs.rmSync(testHome, { recursive: true, force: true })
         }
       }
+
+      // Backpressured stderr pipe: a 12,019-char diagnostic below the Shell ceiling must
+      // flush completely via flushStderr() before process.exit() rather than losing bytes
+      // past the first 4,096-byte chunk (3c5147a7 / 91d7b47c).
+      {
+        const diag12k = `backpressure-diag:${'z'.repeat(12_000)}\n`
+        assert.equal(diag12k.length, 12_019)
+        let delivered = ''
+        const prevWrite = process.stderr.write
+        process.stderr.write = (chunk, enc, cb) => {
+          const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+          const done = typeof enc === 'function' ? enc : cb
+          delivered += text.slice(0, 4096)
+          setTimeout(() => {
+            delivered += text.slice(4096)
+            if (typeof done === 'function') done()
+          }, 20)
+          return false
+        }
+        const bpGuard = installBoundedCliStderr({ label: 'remote-control-state', home })
+        try {
+          process.stderr.write(diag12k)
+          assert.equal(delivered.length, 4096, 'before flushStderr, backpressured pipe only drained first 4,096 chars')
+          await bpGuard.flushStderr()
+          assert.equal(delivered.length, 12_019, 'flushStderr must wait until every byte of stderr has drained')
+          assert.equal(delivered, diag12k)
+        } finally {
+          bpGuard.restore()
+          process.stderr.write = prevWrite
+        }
+      }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }
