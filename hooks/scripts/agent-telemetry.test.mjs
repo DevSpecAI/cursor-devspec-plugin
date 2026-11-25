@@ -370,4 +370,53 @@ describe('stale tool hooks never revert a live model switch (item c2ddefb6)', ()
     assert.equal(typeof CHAT_STORE_BUSY_TIMEOUT_MS, 'number')
     assert.ok(CHAT_STORE_BUSY_TIMEOUT_MS > 0)
   })
+
+  it('enriches effort from a matching tool hook after a newer live hook that omitted effort', () => {
+    const conn = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+    const convId = 'conv-enrich-effort'
+    const t0 = NOW.getTime()
+
+    // Chat store at t0 agrees on gemini-4-neon; live hook at t0 + 5s names gemini-4-neon without effort
+    writeCursorChatStore(chatsDir, CWD, convId, { lastUsedModel: 'gemini-4-neon' }, { mtimeMs: t0 })
+    assert.equal(
+      recordRuntimeReport(conn, JSON.stringify({ conversation_id: convId, model: 'gemini-4-neon' }), {
+        dir,
+        chatsDir,
+        cwd: CWD,
+        now: new Date(t0 + 5_000),
+        authoritative: true,
+      }),
+      true,
+    )
+
+    // Tool hook at t0 + 6s names the SAME model with valid effort -> must enrich thinkingLevel
+    assert.equal(
+      recordRuntimeReport(
+        conn,
+        JSON.stringify({
+          conversation_id: convId,
+          model: 'gemini-4-neon',
+          model_params: [{ id: 'reasoning_effort', value: 'high' }],
+        }),
+        { dir, chatsDir, cwd: CWD, now: new Date(t0 + 6_000), authoritative: false },
+      ),
+      true,
+    )
+    const stats = agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats
+    assert.equal(stats.model.id, 'gemini-4-neon')
+    assert.equal(stats.thinkingLevel, 'high')
+
+    // Subsequent live hook on the SAME model without effort preserves thinkingLevel
+    assert.equal(
+      recordRuntimeReport(conn, JSON.stringify({ conversation_id: convId, model: 'gemini-4-neon' }), {
+        dir,
+        chatsDir,
+        cwd: CWD,
+        now: new Date(t0 + 7_000),
+        authoritative: true,
+      }),
+      true,
+    )
+    assert.equal(agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats.thinkingLevel, 'high')
+  })
 })

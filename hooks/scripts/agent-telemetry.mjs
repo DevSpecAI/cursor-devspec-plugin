@@ -296,24 +296,44 @@ export function recordRuntimeReport(
     const parsed = JSON.parse(rawHookInput || '{}')
     if (!parsed || typeof parsed !== 'object') return false
 
-    if (authoritative) {
-      const report = runtimeReportFromHookInput(parsed, now)
-      if (!report) return false
-      fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify({ ...report, _source: 'hook_live' }), { mode: 0o600 })
-      return true
-    }
-
     const existing = readStoredTelemetry(connectionId, dir)
     const existingSource = text(existing?._source)
     const existingAtMs = existing?.at ? Date.parse(existing.at) : NaN
-    const convId = text(conversationId) ?? text(parsed.conversation_id) ?? text(parsed.session_id)
     const hookReport = runtimeReportFromHookInput(parsed, now)
+
+    if (authoritative) {
+      if (!hookReport) return false
+      const thinkingLevel = hookReport.thinkingLevel ?? preservedThinkingLevel(existing, hookReport.model.id)
+      const report = buildReport(hookReport.model.id, thinkingLevel, now.toISOString(), 'hook_live')
+      fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify(report), { mode: 0o600 })
+      return true
+    }
+
+    const enrichMatchingExistingEffort = () => {
+      if (
+        !existing ||
+        !hookReport ||
+        existing?.model?.id !== hookReport.model.id ||
+        !THINKING_LEVELS.has(hookReport.thinkingLevel) ||
+        existing.thinkingLevel === hookReport.thinkingLevel
+      ) {
+        return false
+      }
+      const enriched = {
+        ...existing,
+        thinkingLevel: hookReport.thinkingLevel,
+      }
+      fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify(enriched), { mode: 0o600 })
+      return true
+    }
+
+    const convId = text(conversationId) ?? text(parsed.conversation_id) ?? text(parsed.session_id)
 
     if (convId) {
       const store = readCursorChatModel(convId, { cwd, chatsDir })
       if (store?.model) {
         if (existingSource === 'hook_live' && Number.isFinite(existingAtMs) && existingAtMs > store.mtimeMs) {
-          return false
+          return enrichMatchingExistingEffort()
         }
         // Keep effort exposed on the hook itself when the hook matches the active store
         // model (e.g. first tool call before a switch); otherwise preserve effort only
@@ -330,7 +350,7 @@ export function recordRuntimeReport(
     }
 
     if (existing && text(existing?.model?.id) && (existingSource === 'hook_live' || existingSource === 'chat_store')) {
-      return false
+      return enrichMatchingExistingEffort()
     }
 
     if (!hookReport) return false
