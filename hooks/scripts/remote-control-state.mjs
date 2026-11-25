@@ -99,8 +99,11 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_BYTES,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitsShellOutput,
+  seal,
+  splitText,
   writeNote,
 } from './hook-context-budget.mjs'
+import { writePrivateText } from './private-state.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
@@ -1848,6 +1851,75 @@ export async function writeConnectionState(opts) {
  * so overlong CLI arguments or error paths never exceed 20,000 characters on stderr
  * (requirements 3c5147a7 / 91d7b47c).
  */
+function shellQuotePath(filePath) {
+  return /^[A-Za-z0-9_./:-]+$/.test(filePath)
+    ? filePath
+    : `'${String(filePath).replace(/'/g, "'\\''")}'`
+}
+
+/**
+ * Write a private, paged manifest listing ONLY this connect attempt's saved stderr
+ * diagnostic note commands under an owner-only temp folder, split with `splitText`
+ * (`NOTE_PART_CHARS` / `NOTE_PART_BYTES`) and sealed with `seal` so every part fits
+ * Cursor's Shell output ceiling even when hundreds of diagnostics were saved
+ * (requirements 3c5147a7 / 91d7b47c). Returns null if the temp folder is unwritable.
+ */
+export function writePagedStderrNotesManifest(notes, { tmpDir = os.tmpdir() } = {}) {
+  if (!Array.isArray(notes) || notes.length === 0) return null
+  try {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
+    const baseDir = path.join(tmpDir, `devspec-connect-stderr-${uid}`)
+    fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 })
+    try {
+      fs.chmodSync(baseDir, 0o700)
+    } catch {
+      /* best-effort on platforms without POSIX modes */
+    }
+    const stat = fs.lstatSync(baseDir)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
+
+    const body =
+      `# Saved stderr diagnostic notes for this connect attempt (${notes.length} total)\n` +
+      notes
+        .map((n, idx) => {
+          const id = typeof n?.id === 'string' ? n.id : ''
+          const cmd =
+            typeof n?.command === 'string'
+              ? n.command
+              : id
+                ? `cat ~/.devspec/notes/${id}.md`
+                : '(missing command)'
+          const parts = typeof n?.parts === 'number' && n.parts > 1 ? ` (${n.parts} parts)` : ''
+          return `${idx + 1}. ${cmd}${id ? ` [id=${id}]` : ''}${parts}`
+        })
+        .join('\n') +
+      '\n'
+    const id = crypto.createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16)
+    const pieces = splitText(body)
+    const partPath = (part) => path.join(baseDir, part === 1 ? `${id}.md` : `${id}.${part}.md`)
+    const partCmd = (part) => `cat ${shellQuotePath(partPath(part))}`
+    const first = partPath(1)
+    if (!fs.existsSync(first)) {
+      for (let part = pieces.length; part >= 1; part -= 1) {
+        const label = `${part === pieces.length ? 'End of DevSpec connect stderr manifest' : 'DevSpec connect stderr manifest'} ${id}: part ${part} of ${pieces.length}`
+        const after = part < pieces.length ? `read on with \`${partCmd(part + 1)}\`` : ''
+        const sealed = seal(label, pieces[part - 1], after)
+        if (!fitsShellOutput(sealed)) return null
+        writePrivateText(partPath(part), sealed)
+      }
+    }
+    return {
+      id,
+      file: first,
+      command: partCmd(1),
+      parts: pieces.length,
+    }
+  } catch {
+    return null
+  }
+}
+
 export function shellBudgetExceededError({
   field = 'reserve',
   reserveLength,
@@ -2024,16 +2096,18 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
         notes_omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         notes_continuation: {
           omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
-          list_command: 'ls -lt ~/.devspec/notes/*.md',
+          manifest_id: '0'.repeat(16),
+          parts: 99,
+          command: 'cat /tmp/devspec-connect-stderr-100000/0000000000000000.md',
           how_to_fetch_rest:
-            'Run `ls -lt ~/.devspec/notes/*.md` to list all 20000 saved stderr note files (including the 20000 omitted from this receipt) and read each with `cat ~/.devspec/notes/<id>.md`, or fix write permissions on ~/.devspec/notes and re-run connect.',
+            'Run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read the exact commands for all 20000 saved stderr diagnostic note(s) from this connect attempt (including the 20000 omitted from this receipt).',
         },
         note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         recovery:
-          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back. 20000 of 20000 saved stderr note command(s) did not fit in this receipt: run `ls -lt ~/.devspec/notes/*.md` to find the remaining saved note files and read them with `cat ~/.devspec/notes/<id>.md`.',
+          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back. 20000 of 20000 saved stderr note command(s) did not fit in this receipt: run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read all 20000 saved stderr note commands for this connect attempt.',
       },
       recovery:
-        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read the 1 listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run `ls -lt ~/.devspec/notes/*.md` then `cat ~/.devspec/notes/<id>.md` to fetch the remaining 20000 of 20000 saved stderr note(s).',
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read the 1 listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run `cat /tmp/devspec-connect-stderr-100000/0000000000000000.md` (and every further part it names — 99 parts total) to read the remaining 20000 of 20000 saved stderr note(s) for this connect attempt.',
     },
     null,
     2,

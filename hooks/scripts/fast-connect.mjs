@@ -45,6 +45,7 @@ import {
   formatBoundedCliStderr,
   installBoundedCliStderr,
   shellBudgetExceededError,
+  writePagedStderrNotesManifest,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -882,14 +883,37 @@ function buildBoundedFastConnectNoteReceipt(
   })
 }
 
-function trimStderrOmittedNotes(omitted, notesSlice) {
+function trimStderrOmittedNotes(omitted, notesSlice, { manifest = null } = {}) {
   if (!omitted || typeof omitted !== 'object' || !Array.isArray(omitted.notes)) return omitted
   const total = omitted.notes.length
   const returned = notesSlice.length
   if (returned >= total) return omitted
   const omittedCount = total - returned
-  const listCommand = 'ls -lt ~/.devspec/notes/*.md'
   const baseRecovery = typeof omitted.recovery === 'string' && omitted.recovery ? `${omitted.recovery} ` : ''
+  if (manifest) {
+    const nextPartsHint =
+      manifest.parts > 1 ? ` (and every further part it names — ${manifest.parts} parts total)` : ''
+    return {
+      ...omitted,
+      notes: notesSlice,
+      notes_total_count: total,
+      notes_returned_count: returned,
+      notes_omitted_count: omittedCount,
+      notes_continuation: {
+        omitted_count: omittedCount,
+        manifest_id: manifest.id,
+        parts: manifest.parts,
+        command: manifest.command,
+        how_to_fetch_rest: `Run \`${manifest.command}\`${nextPartsHint} to read the exact commands for all ${total} saved stderr diagnostic note(s) from this connect attempt (including the ${omittedCount} omitted from this receipt).`,
+      },
+      recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit in this receipt: run \`${manifest.command}\`${nextPartsHint} to read all ${total} saved stderr note commands for this connect attempt.`,
+    }
+  }
+  const remainingNotes = omitted.notes.slice(returned)
+  const remainingIds = remainingNotes.every((n) => typeof n?.id === 'string' && n.id)
+    ? remainingNotes.map((n) => n.id)
+    : null
+  if (!remainingIds) return null
   return {
     ...omitted,
     notes: notesSlice,
@@ -898,14 +922,20 @@ function trimStderrOmittedNotes(omitted, notesSlice) {
     notes_omitted_count: omittedCount,
     notes_continuation: {
       omitted_count: omittedCount,
-      list_command: listCommand,
-      how_to_fetch_rest: `Run \`${listCommand}\` to list all ${total} saved stderr note files (including the ${omittedCount} omitted from this receipt) and read each with \`cat ~/.devspec/notes/<id>.md\`, or fix write permissions on ~/.devspec/notes and re-run connect.`,
+      omitted_note_ids: remainingIds,
+      command_template: 'cat ~/.devspec/notes/<id>.md',
+      how_to_fetch_rest: `Read each of the ${omittedCount} omitted stderr diagnostic note ID(s) in notes_continuation.omitted_note_ids for this connect attempt with \`cat ~/.devspec/notes/<id>.md\`.`,
     },
-    recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit in this receipt: run \`${listCommand}\` to find the remaining saved note files and read them with \`cat ~/.devspec/notes/<id>.md\`.`,
+    recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit inline: read each ID in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`,
   }
 }
 
-function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
+function fitStderrOmittedForReceipt(
+  omitted,
+  buildText,
+  reserve,
+  { tmpDir = os.tmpdir(), manifestCache = null } = {},
+) {
   if (!omitted || typeof omitted !== 'object') {
     const text = buildText(null)
     return fitsShellOutput(`${reserve}${text}`) ? { fitted: true, stderrOmitted: null, text } : { fitted: false, stderrOmitted: null, text }
@@ -917,7 +947,20 @@ function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
   if (!Array.isArray(omitted.notes) || omitted.notes.length === 0) {
     return { fitted: false, stderrOmitted: omitted, text: fullText }
   }
-  const zeroObj = trimStderrOmittedNotes(omitted, [])
+  let manifest = null
+  if (manifestCache) {
+    if (!manifestCache.computed) {
+      manifestCache.value = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+      manifestCache.computed = true
+    }
+    manifest = manifestCache.value
+  } else {
+    manifest = writePagedStderrNotesManifest(omitted.notes, { tmpDir })
+  }
+  const zeroObj = trimStderrOmittedNotes(omitted, [], { manifest })
+  if (!zeroObj) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
   const zeroText = buildText(zeroObj)
   if (!fitsShellOutput(`${reserve}${zeroText}`)) {
     return { fitted: false, stderrOmitted: zeroObj, text: zeroText }
@@ -926,14 +969,14 @@ function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
   let hi = omitted.notes.length
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2)
-    const candidate = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, mid))
-    if (fitsShellOutput(`${reserve}${buildText(candidate)}`)) {
+    const candidate = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, mid), { manifest })
+    if (candidate && fitsShellOutput(`${reserve}${buildText(candidate)}`)) {
       lo = mid
     } else {
       hi = mid - 1
     }
   }
-  const fittedObj = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, lo))
+  const fittedObj = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, lo), { manifest })
   return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
 }
 
@@ -941,7 +984,7 @@ function buildFastConnectNoteFailureFallback(
   normalized,
   noteError,
   fullTextLength,
-  { reserve = '', fullTextBytes = null } = {},
+  { reserve = '', fullTextBytes = null, tmpDir = os.tmpdir() } = {},
 ) {
   const base =
     normalized && typeof normalized === 'object' && !Array.isArray(normalized)
@@ -957,6 +1000,7 @@ function buildFastConnectNoteFailureFallback(
   const exceededByBytesOnly =
     prior.length + fullTextLength <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
     priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const manifestCache = { computed: false, value: null }
   const stderrReadHintFor = (stderrOmitted) => {
     const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
       ? base.stderr_diagnostics_omitted.notes.length
@@ -965,7 +1009,15 @@ function buildFastConnectNoteFailureFallback(
     const omittedNotesCount = Number(stderrOmitted?.notes_omitted_count) || 0
     if (omittedNotesCount > 0) {
       const returnedNotesCount = Number(stderrOmitted?.notes_returned_count) || 0
-      return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run \`ls -lt ~/.devspec/notes/*.md\` then \`cat ~/.devspec/notes/<id>.md\` to fetch the remaining ${omittedNotesCount} of ${total} saved stderr note(s).`
+      const cont = stderrOmitted?.notes_continuation
+      if (typeof cont?.command === 'string' && cont.command) {
+        const nextHint = cont.parts > 1 ? ` (and every further part it names — ${cont.parts} parts total)` : ''
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run \`${cont.command}\`${nextHint} to read the remaining ${omittedNotesCount} of ${total} saved stderr note(s) for this connect attempt.`
+      }
+      if (Array.isArray(cont?.omitted_note_ids)) {
+        return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes and the remaining ${omittedNotesCount} of ${total} ID(s) in stderr_diagnostics_omitted.notes_continuation.omitted_note_ids with \`cat ~/.devspec/notes/<id>.md\`.`
+      }
+      return ` ${omittedNotesCount} of ${total} saved stderr diagnostic note(s) did not fit in this receipt.`
     }
     return ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
   }
@@ -1039,6 +1091,7 @@ function buildFastConnectNoteFailureFallback(
     base.stderr_diagnostics_omitted ?? null,
     (stderrOmitted) => makePayload([], { minimal: false, stderrOmitted }),
     reserve,
+    { tmpDir, manifestCache },
   )
   const useMinimal = !fullFit.fitted
   const chosenFit = useMinimal
@@ -1046,6 +1099,7 @@ function buildFastConnectNoteFailureFallback(
         base.stderr_diagnostics_omitted ?? null,
         (stderrOmitted) => makePayload([], { minimal: true, stderrOmitted }),
         reserve,
+        { tmpDir, manifestCache },
       )
     : fullFit
   if (chosenFit.fitted) {
@@ -1098,6 +1152,7 @@ function buildFastConnectNoteFailureFallback(
     base.stderr_diagnostics_omitted ?? null,
     (stderrOmitted) => JSON.stringify(buildFallbackObj(stderrOmitted), null, 2) + '\n',
     reserve,
+    { tmpDir, manifestCache },
   )
   if (prettyFallbackFit.fitted) return prettyFallbackFit.text
   // Single-line compact form preserves every required count, limit, saved stderr note pointers,
@@ -1107,6 +1162,7 @@ function buildFastConnectNoteFailureFallback(
     base.stderr_diagnostics_omitted ?? null,
     (stderrOmitted) => `${JSON.stringify(buildFallbackObj(stderrOmitted))}\n`,
     reserve,
+    { tmpDir, manifestCache },
   )
   if (compactFallbackFit.fitted) return compactFallbackFit.text
   throw shellBudgetExceededError({
@@ -1124,7 +1180,7 @@ function buildFastConnectNoteFailureFallback(
 
 export function formatFastConnectCliOutput(
   result,
-  { home = os.homedir(), reserve = '', suppressedDiagnostics = null } = {},
+  { home = os.homedir(), reserve = '', suppressedDiagnostics = null, tmpDir = os.tmpdir() } = {},
 ) {
   const normalized =
     result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
@@ -1159,6 +1215,7 @@ export function formatFastConnectCliOutput(
     return buildFastConnectNoteFailureFallback(normalized, noteError, fullText.length, {
       reserve,
       fullTextBytes,
+      tmpDir,
     })
   }
   const noteRef = {

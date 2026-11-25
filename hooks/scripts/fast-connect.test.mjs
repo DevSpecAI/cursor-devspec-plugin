@@ -1349,31 +1349,127 @@ describe('fast-connect CLI flags', () => {
         )
         assert.match(parsedMinimalNoteFail.recovery, /stderr_diagnostics_omitted\.notes/)
 
-        const tightStderrReserve = 'e'.repeat(18_200)
-        const trimmedFallbackOut = formatFastConnectCliOutput(
-          { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
-          {
-            home: brokenHome2,
-            reserve: tightStderrReserve,
-            suppressedDiagnostics: suppressedWithSavedNotes,
-          },
-        )
-        assert.ok(fitsShellOutput(tightStderrReserve + trimmedFallbackOut))
-        const parsedTrimmed = JSON.parse(trimmedFallbackOut)
-        assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.omitted_count, 12)
-        assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.notes_total_count, 12)
-        assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_returned_count >= 1)
-        assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_omitted_count >= 1)
-        assert.equal(
-          parsedTrimmed.stderr_diagnostics_omitted.notes[0].command,
-          'cat ~/.devspec/notes/0000000000000001.md',
-        )
-        assert.equal(
-          parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation?.list_command,
-          'ls -lt ~/.devspec/notes/*.md',
-        )
-        assert.match(parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation?.how_to_fetch_rest, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
-        assert.match(parsedTrimmed.recovery, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
+        const manifestTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc-manifest-'))
+        const blockedTmpFile = path.join(manifestTmpDir, 'not-a-dir')
+        fs.writeFileSync(blockedTmpFile, 'blocked')
+        try {
+          const tightStderrReserve = 'e'.repeat(18_200)
+          const trimmedFallbackOut = formatFastConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressedWithSavedNotes,
+              tmpDir: manifestTmpDir,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + trimmedFallbackOut))
+          const parsedTrimmed = JSON.parse(trimmedFallbackOut)
+          assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.omitted_count, 12)
+          assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.notes_total_count, 12)
+          assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_returned_count >= 1)
+          assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_omitted_count >= 1)
+          assert.equal(
+            parsedTrimmed.stderr_diagnostics_omitted.notes[0].command,
+            'cat ~/.devspec/notes/0000000000000001.md',
+          )
+          const cont12 = parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation
+          assert.equal(cont12?.parts, 1)
+          assert.match(cont12?.command, /^cat /)
+          assert.doesNotMatch(cont12?.command, /ls -lt/)
+          const manifestFile12 = cont12.command.replace(/^cat /, '').replace(/^'|'$/g, '')
+          const manifestBody12 = fs.readFileSync(manifestFile12, 'utf8')
+          assert.ok(fitsShellOutput(manifestBody12))
+          for (const n of savedNotes) {
+            assert.ok(manifestBody12.includes(n.command), `manifest must list ${n.command}`)
+          }
+          assert.ok(parsedTrimmed.recovery.includes(cont12.command))
+
+          // 300 saved stderr notes from this connect attempt: continuation MUST be paged
+          // so every part stays within fitsShellOutput, and MUST list ONLY this attempt's
+          // 300 notes (never unrelated files from ~/.devspec/notes).
+          const savedNotes300 = Array.from({ length: 300 }, (_, idx) => {
+            const id = `a${String(idx + 1).padStart(15, '0')}`
+            return { id, command: `cat ~/.devspec/notes/${id}.md`, length: 400 }
+          })
+          const suppressed300 = {
+            omitted_count: 300,
+            omitted_chars: 120_000,
+            shell_limit_chars: 20_000,
+            notes: savedNotes300,
+            recovery: 'Read saved stderr notes using the cat commands above.',
+          }
+          const trimmed300Out = formatFastConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressed300,
+              tmpDir: manifestTmpDir,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + trimmed300Out))
+          const parsed300 = JSON.parse(trimmed300Out)
+          const cont300 = parsed300.stderr_diagnostics_omitted?.notes_continuation
+          assert.ok(cont300?.parts >= 2, `expected multi-part paged manifest for 300 notes, got ${cont300?.parts}`)
+          let nextCmd = cont300.command
+          let collected300 = ''
+          let visitedParts = 0
+          while (nextCmd) {
+            const partPath = nextCmd.replace(/^cat /, '').replace(/^'|'$/g, '')
+            const partText = fs.readFileSync(partPath, 'utf8')
+            assert.ok(fitsShellOutput(partText), `manifest part ${visitedParts + 1} must fit fitsShellOutput`)
+            collected300 += partText
+            visitedParts += 1
+            const m = /read on with `(cat [^`]+)`/.exec(partText)
+            nextCmd = m ? m[1] : null
+          }
+          assert.equal(visitedParts, cont300.parts)
+          for (const n of savedNotes300) {
+            assert.ok(collected300.includes(n.command), `paged manifest must include ${n.command}`)
+          }
+          assert.ok(!collected300.includes('0000000000000001.md'), 'paged manifest must not include unrelated notes')
+
+          // When tmpDir is also unwritable: small omitted list falls back to exact omitted_note_ids;
+          // 300 notes that cannot fit inline refuse explicitly instead of silently cutting.
+          const inlineIdsFallbackOut = formatFastConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressedWithSavedNotes,
+              tmpDir: blockedTmpFile,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + inlineIdsFallbackOut))
+          const parsedInlineIds = JSON.parse(inlineIdsFallbackOut)
+          const inlineCont = parsedInlineIds.stderr_diagnostics_omitted?.notes_continuation
+          assert.ok(Array.isArray(inlineCont?.omitted_note_ids))
+          assert.equal(
+            parsedInlineIds.stderr_diagnostics_omitted.notes.length + inlineCont.omitted_note_ids.length,
+            12,
+          )
+          assert.equal(inlineCont.command_template, 'cat ~/.devspec/notes/<id>.md')
+
+          assert.throws(
+            () =>
+              formatFastConnectCliOutput(
+                { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+                {
+                  home: brokenHome2,
+                  reserve: tightStderrReserve,
+                  suppressedDiagnostics: suppressed300,
+                  tmpDir: blockedTmpFile,
+                },
+              ),
+            (err) => {
+              assert.equal(err.code, 'shell_output_limit_exceeded')
+              return true
+            },
+          )
+        } finally {
+          fs.rmSync(manifestTmpDir, { recursive: true, force: true })
+        }
 
         // Byte-only overflow (<= 20,000 chars but > 40,000 UTF-8 bytes) MUST report the
         // 40,000-byte UTF-8 Shell limit accurately in both the saved-note receipt and the
