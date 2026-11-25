@@ -112,8 +112,8 @@ import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { connectionsDirFor, registerPendingWakeNote, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
 import {
   clearWakeListenerNeeded,
-  compactStructuredRefusals,
   extractRoomCommandsFromWake,
+  formatStructuredRefusalsFallback,
   markWakeListenerNeeded,
   startRoomCommands,
   structuredRefusalFromError,
@@ -544,8 +544,17 @@ export function readerPage(wakes, { home = os.homedir(), skip = () => false, lis
   const printed = wakesForOneOutput([reservedHeader, ...fitted]).count - 1
   const remaining = total - printed
   const through = printed < total ? kept[printed] : wakes.length
-  if (printed === 0 && held) return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through }
-  return { text: readerHeader(printed, remaining, null, listener) + fitted.slice(0, printed).join(''), printed, remaining, through }
+  const printedWakes = fitted.slice(0, printed).map((text, idx) => ({ text, sourceIndex: kept[idx] }))
+  if (printed === 0 && held) {
+    return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through, printedWakes: [] }
+  }
+  return {
+    text: readerHeader(printed, remaining, null, listener) + fitted.slice(0, printed).join(''),
+    printed,
+    remaining,
+    through,
+    printedWakes,
+  }
 }
 
 function sleep(ms) {
@@ -629,25 +638,155 @@ export async function readWakes({
         skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '',
       },
     )
-    await write(page.text)
     let pickupRefusals = null
     let pickupNothingOpen = null
     let pickupDiagnosticNote = null
     let pickupDiagnosticWritten = false
     const pendingNoteReads = []
     const through = page.through > 0 ? wakes[page.through - 1].end : start
+    let earliestDeferredStart = null
+    let deferredEntries = []
+    let inlineCommands = []
+    let inlineMessages = []
+    let noteRefusals = []
+    let extractedSessionId = null
     if (resolvedConnectionId && page.printed > 0) {
-      // Inspect what actually reached the agent (`page.text`), not raw unread wakes:
-      // inline `owner_message` commands are picked up immediately; oversized commands
-      // handed over only as a `wake_in_note` pointer defer pickup and cursor advance
-      // until the agent reads the sealed note whole via `stepDeliveryHook` (req 3ea2b201).
-      const extracted = extractRoomCommandsFromWake(page.text, { home })
-      const noteRefusals = extracted.unreadableNotes.map((note) => ({
-        command_message_id: null,
-        command_turn_id: null,
-        refusal: note,
-      }))
-      for (const deferred of extracted.deferredNoteCommands) {
+      // Inspect each printed wake individually so every `wake_in_note` command records its
+      // OWN exact `[wakeStart, wakeEnd]` byte span instead of the whole page's end offset:
+      // reading one note out of order can never advance the cursor past another unread or
+      // failed note on the same page (requirement 3ea2b201).
+      const printedItems = Array.isArray(page.printedWakes)
+        ? page.printedWakes
+        : [{ text: page.text, sourceIndex: Math.max(0, page.through - 1) }]
+      for (const item of printedItems) {
+        const wakeStart = item.sourceIndex === 0 ? start : wakes[item.sourceIndex - 1].end
+        const wakeEnd = wakes[item.sourceIndex]?.end ?? through
+        const extracted = extractRoomCommandsFromWake(item.text, { home })
+        if (!extractedSessionId && extracted.sessionId) extractedSessionId = extracted.sessionId
+        inlineCommands.push(...extracted.inlineCommands)
+        inlineMessages.push(...extracted.inlineMessages)
+        for (const note of extracted.unreadableNotes) {
+          noteRefusals.push({
+            command_message_id: null,
+            command_turn_id: null,
+            refusal: note,
+          })
+        }
+        for (const deferred of extracted.deferredNoteCommands) {
+          if (earliestDeferredStart === null || wakeStart < earliestDeferredStart) {
+            earliestDeferredStart = wakeStart
+          }
+          deferredEntries.push({
+            ...deferred,
+            wakeStart,
+            wakeThrough: wakeEnd,
+          })
+        }
+      }
+    }
+
+    let rawDiag = ''
+    if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
+      const capturedDiag = []
+      let pickupResult = null
+      if (inlineCommands.length > 0) {
+        try {
+          pickupResult = await startCommands({
+            connectionId: resolvedConnectionId,
+            commands: inlineCommands,
+            batch: { type: 'owner_messages', session_id: extractedSessionId, messages: inlineMessages },
+            sessionId: extractedSessionId,
+            dir,
+            home,
+            fromWakeTurn: true,
+            // Capture command-start stderr so ALL stderr for this Shell call passes
+            // once through the shared Shell output ceiling (`fitShellDiagnostic`).
+            log: (line) => capturedDiag.push(String(line ?? '')),
+          })
+        } catch (error) {
+          pickupResult = {
+            ok: false,
+            outcome: 'refused',
+            refusals: [structuredRefusalFromError(error)],
+          }
+        }
+      }
+      const combinedRefusals = [
+        ...noteRefusals,
+        ...(Array.isArray(pickupResult?.refusals) ? pickupResult.refusals : []),
+      ]
+      if (combinedRefusals.length > 0) {
+        pickupRefusals = combinedRefusals
+        rawDiag =
+          `${capturedDiag.join('')}` +
+          `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
+      } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+        pickupNothingOpen = pickupResult.nothingOpen
+        rawDiag =
+          `${capturedDiag.join('')}` +
+          `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`
+      } else if (capturedDiag.length > 0) {
+        rawDiag = capturedDiag.join('')
+      }
+    }
+
+    // Decide stdout vs stderr budget on pickup refusals: if `page.text` + refusal/note-pointer
+    // fits inside Cursor's Shell ceiling, write `page.text` as usual; if a huge refusal could
+    // not be saved to a note and needs the Shell budget to preserve structured refusal details
+    // (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c), keep stdout empty on this refused read
+    // (the wake stays unread for retry) so the full 20,000-char ceiling holds the refusal.
+    let printedStdout = ''
+    if (pickupRefusals && rawDiag) {
+      const fittedWithStdout = fitShellDiagnostic(page.text, rawDiag, {
+        home,
+        label: 'devspec-wake-tail',
+        fallback: (noteError) =>
+          formatStructuredRefusalsFallback(pickupRefusals, {
+            prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: page.text,
+            noteError,
+          }),
+        requireStructuredFallback: true,
+      })
+      if (fittedWithStdout.text) {
+        await write(page.text)
+        printedStdout = page.text
+        pickupDiagnosticNote = fittedWithStdout.note
+        writeStderr(fittedWithStdout.text)
+        pickupDiagnosticWritten = true
+      } else {
+        const fittedFullBudget = fitShellDiagnostic('', rawDiag, {
+          home,
+          label: 'devspec-wake-tail',
+          fallback: (noteError) =>
+            formatStructuredRefusalsFallback(pickupRefusals, {
+              prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+              stdoutText: '',
+              noteError,
+            }),
+          requireStructuredFallback: true,
+        })
+        pickupDiagnosticNote = fittedFullBudget.note
+        if (fittedFullBudget.text) {
+          writeStderr(fittedFullBudget.text)
+          pickupDiagnosticWritten = true
+        }
+      }
+    } else {
+      await write(page.text)
+      printedStdout = page.text
+      if (rawDiag) {
+        const fitted = fitShellDiagnostic(printedStdout, rawDiag, { home, label: 'devspec-wake-tail' })
+        pickupDiagnosticNote = fitted.note
+        if (fitted.text) {
+          writeStderr(fitted.text)
+          pickupDiagnosticWritten = true
+        }
+      }
+    }
+
+    if (resolvedConnectionId && deferredEntries.length > 0 && !pickupRefusals) {
+      for (const deferred of deferredEntries) {
         registerPendingWakeNote(
           resolvedConnectionId,
           {
@@ -658,68 +797,15 @@ export async function readWakes({
             wakeFile: resolved,
             wakePositionPath: readPositionPath(key, dir),
             wakePositionVersion: POSITION_VERSION,
-            wakeThrough: through,
+            wakeStart: deferred.wakeStart,
+            wakeThrough: deferred.wakeThrough,
           },
           { dir },
         )
         pendingNoteReads.push(deferred.noteId)
       }
-      if (extracted.inlineCommands.length > 0 || noteRefusals.length > 0) {
-        const capturedDiag = []
-        let pickupResult = null
-        if (extracted.inlineCommands.length > 0) {
-          try {
-            pickupResult = await startCommands({
-              connectionId: resolvedConnectionId,
-              commands: extracted.inlineCommands,
-              batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.inlineMessages },
-              sessionId: extracted.sessionId,
-              dir,
-              home,
-              fromWakeTurn: true,
-              // Capture command-start stderr so ALL stderr for this Shell call passes
-              // once through the shared Shell output ceiling (`fitShellDiagnostic`).
-              log: (line) => capturedDiag.push(String(line ?? '')),
-            })
-          } catch (error) {
-            pickupResult = {
-              ok: false,
-              outcome: 'refused',
-              refusals: [structuredRefusalFromError(error)],
-            }
-          }
-        }
-        const combinedRefusals = [
-          ...noteRefusals,
-          ...(Array.isArray(pickupResult?.refusals) ? pickupResult.refusals : []),
-        ]
-        let rawDiag = ''
-        if (combinedRefusals.length > 0) {
-          pickupRefusals = combinedRefusals
-          rawDiag =
-            `${capturedDiag.join('')}` +
-            `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
-        } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
-          pickupNothingOpen = pickupResult.nothingOpen
-          rawDiag =
-            `${capturedDiag.join('')}` +
-            `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`
-        } else if (capturedDiag.length > 0) {
-          rawDiag = capturedDiag.join('')
-        }
-        if (rawDiag) {
-          const fallback = pickupRefusals
-            ? `devspec-wake-tail: report_pickup refused (note write failed; structured summary): ${JSON.stringify(compactStructuredRefusals(pickupRefusals))}\n`
-            : null
-          const fitted = fitShellDiagnostic(page.text, rawDiag, { home, label: 'devspec-wake-tail', fallback })
-          pickupDiagnosticNote = fitted.note
-          if (fitted.text) {
-            writeStderr(fitted.text)
-            pickupDiagnosticWritten = true
-          }
-        }
-      }
     }
+
     // Do not advance read position when report_pickup failed/refused: keep the wake queued
     // so the next read retries pickup and surfaces the structured refusal (req 3ea2b201 / 4e32d1a5).
     if (pickupRefusals) {
@@ -733,10 +819,23 @@ export async function readWakes({
         error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
       }
     }
-    // When the printed page only delivered a `wake_in_note` pointer for an oversized room
-    // command, keep the wake cursor unadvanced until the agent reads the sealed note whole
-    // and `stepDeliveryHook` completes `report_pickup` (requirement 3ea2b201).
+    // When the printed page delivered one or more `wake_in_note` pointers for oversized room
+    // commands, never advance past the earliest unread deferred note (any completed inline wakes
+    // strictly before `earliestDeferredStart` may advance up to `earliestDeferredStart`, leaving
+    // every deferred note queued until the agent reads it whole via `stepDeliveryHook`, req 3ea2b201).
     if (pendingNoteReads.length > 0) {
+      if (typeof earliestDeferredStart === 'number' && earliestDeferredStart > position) {
+        try {
+          writePrivateJson(readPositionPath(key, dir), {
+            version: POSITION_VERSION,
+            file: resolved,
+            offset: earliestDeferredStart,
+            at: new Date().toISOString(),
+          })
+        } catch {
+          /* non-fatal: deferred notes stay queued from earlier offset */
+        }
+      }
       return {
         ...page,
         marked: false,

@@ -164,6 +164,7 @@ export function registerPendingWakeNote(
     wakeFile = null,
     wakePositionPath = null,
     wakePositionVersion = 1,
+    wakeStart = null,
     wakeThrough = null,
   },
   { dir = connectionsDirFor() } = {},
@@ -176,13 +177,27 @@ export function registerPendingWakeNote(
   const target = path.join(steps, `wake-note-${noteId}.json`)
   const existing = readPrivateJson(target)
   if (existing && existing.note === noteId) {
-    if (wakePositionPath && typeof wakeThrough === 'number' && wakeThrough > (existing.wake_through ?? 0)) {
+    const nextStart =
+      typeof wakeStart === 'number'
+        ? typeof existing.wake_start === 'number'
+          ? Math.min(existing.wake_start, wakeStart)
+          : wakeStart
+        : existing.wake_start ?? null
+    const nextThrough =
+      typeof wakeThrough === 'number'
+        ? Math.max(existing.wake_through ?? 0, wakeThrough)
+        : existing.wake_through ?? null
+    if (
+      wakePositionPath &&
+      (nextThrough !== existing.wake_through || nextStart !== existing.wake_start || existing.wake_position_path !== wakePositionPath)
+    ) {
       writePrivateJson(target, {
         ...existing,
         wake_file: wakeFile ?? existing.wake_file ?? null,
         wake_position_path: wakePositionPath,
         wake_position_version: wakePositionVersion,
-        wake_through: wakeThrough,
+        wake_start: nextStart,
+        wake_through: nextThrough,
       })
     }
     return target
@@ -197,10 +212,79 @@ export function registerPendingWakeNote(
     wake_file: wakeFile,
     wake_position_path: wakePositionPath,
     wake_position_version: wakePositionVersion,
+    wake_start: typeof wakeStart === 'number' ? wakeStart : null,
     wake_through: typeof wakeThrough === 'number' ? wakeThrough : null,
+    completed: false,
     at: new Date().toISOString(),
   })
   return target
+}
+
+/**
+ * Advance each wake reader cursor ONLY up to the highest contiguous completed wake-note
+ * offset that has no earlier incomplete wake-note before it (requirement 3ea2b201).
+ * Out-of-order completed notes remain marked `completed: true` until every earlier note
+ * on the same wake file is also read and picked up; once the cursor passes them, their
+ * marker files are deleted.
+ */
+function advanceCompletedWakeNotePositions(steps) {
+  const files = pendingWakeNoteFiles(steps)
+  if (files.length === 0) return
+  const byPosPath = new Map()
+  for (const file of files) {
+    const entry = readPrivateJson(file)
+    if (!entry || typeof entry.wake_position_path !== 'string') continue
+    if (!byPosPath.has(entry.wake_position_path)) byPosPath.set(entry.wake_position_path, [])
+    byPosPath.get(entry.wake_position_path).push({ file, entry })
+  }
+  for (const [posPath, group] of byPosPath) {
+    let minIncompleteStart = Number.POSITIVE_INFINITY
+    for (const { entry } of group) {
+      if (entry.completed !== true) {
+        const start = typeof entry.wake_start === 'number' ? entry.wake_start : 0
+        if (start < minIncompleteStart) minIncompleteStart = start
+      }
+    }
+    const cur = readPrivateJson(posPath)
+    const prevOffset = typeof cur?.offset === 'number' ? cur.offset : 0
+    let nextOffset = prevOffset
+    let wakeFile = cur?.file ?? null
+    let posVersion = cur?.version ?? 1
+    for (const { entry } of group) {
+      if (entry.completed === true && typeof entry.wake_through === 'number' && entry.wake_through <= minIncompleteStart) {
+        if (entry.wake_through > nextOffset) {
+          nextOffset = entry.wake_through
+          wakeFile = entry.wake_file ?? wakeFile
+          posVersion = entry.wake_position_version ?? posVersion
+        }
+      }
+    }
+    let advancedOk = nextOffset === prevOffset
+    if (nextOffset > prevOffset) {
+      try {
+        writePrivateJson(posPath, {
+          version: posVersion,
+          file: wakeFile,
+          offset: nextOffset,
+          at: new Date().toISOString(),
+        })
+        advancedOk = true
+      } catch {
+        advancedOk = false
+      }
+    }
+    if (advancedOk) {
+      for (const { file, entry } of group) {
+        if (entry.completed === true && typeof entry.wake_through === 'number' && entry.wake_through <= nextOffset) {
+          try {
+            fs.rmSync(file, { force: true })
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+  }
 }
 
 function pendingWakeNoteFiles(steps) {
@@ -747,6 +831,11 @@ export async function stepDeliveryHook(
       drop(each)
       continue
     }
+    if (entry.completed === true) {
+      // Already picked up; waiting only for an earlier wake-note on the same page before cursor advance.
+      giveBack(each)
+      continue
+    }
     if (entry.pickup_pending === true) {
       completedWakeNotes.push({ taken: each, entry })
       continue
@@ -862,24 +951,27 @@ export async function stepDeliveryHook(
             `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
           )
         }
+        let hasPositionTrackedCompleted = false
         for (const { taken: noteTaken, entry } of completedWakeNotes) {
-          drop(noteTaken)
           if (typeof entry.wake_position_path === 'string' && typeof entry.wake_through === 'number') {
+            hasPositionTrackedCompleted = true
             try {
-              const cur = readPrivateJson(entry.wake_position_path)
-              const prevOffset = typeof cur?.offset === 'number' ? cur.offset : 0
-              if (entry.wake_through > prevOffset) {
-                writePrivateJson(entry.wake_position_path, {
-                  version: entry.wake_position_version ?? 1,
-                  file: entry.wake_file ?? cur?.file ?? null,
-                  offset: entry.wake_through,
-                  at: new Date().toISOString(),
-                })
-              }
+              writePrivateJson(noteTaken.original, {
+                ...entry,
+                completed: true,
+                pickup_pending: false,
+                pickup_refusals: null,
+              })
+              drop(noteTaken)
             } catch {
-              /* non-fatal: next wake read sees the file already picked up */
+              giveBack(noteTaken)
             }
+          } else {
+            drop(noteTaken)
           }
+        }
+        if (hasPositionTrackedCompleted) {
+          withStepsLock(connectionId, connDir, () => advanceCompletedWakeNotePositions(steps))
         }
       }
     } else {

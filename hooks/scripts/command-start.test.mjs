@@ -1424,4 +1424,203 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(capturedStderr, /turn_busy/)
     assert.match(capturedStderr, /88888888-8888-4888-8888-888888888888/)
   })
+
+  it('planOneShot never omits wakes_waiting when a near-limit first wake leaves more wakes queued (3c5147a7 / 91d7b47c)', () => {
+    const { home } = mkHome()
+    // First wake is ~19,900 chars on its own: fits alone, but NOT together with wakes_waiting.
+    const nearLimitWake = buildOwnerMessageEvents(ownerBatch('w'.repeat(9_650)))
+    const secondWake = buildOwnerMessageEvents(ownerBatch('Second queued wake'))
+    // With reserve leaving room for one wake_in_note pointer + wakes_waiting (but not two pointers),
+    // planOneShot must note-wrap wake 1 and emit wakes_waiting (count: 1).
+    const tightReserve = 'r'.repeat(19_600)
+    const planWritable = planOneShot([nearLimitWake, secondWake], { home, reserve: tightReserve })
+    assert.equal(planWritable.held, false)
+    assert.equal(planWritable.count, 1)
+    assert.ok(fitsShellOutput(tightReserve + planWritable.text))
+    assert.match(planWritable.text, /"type":"wakes_waiting"/, 'must disclose the remaining queued wake')
+    assert.match(planWritable.text, /"count":1/)
+
+    // When notes dir is ALSO unwritable so wake 1 cannot be note-wrapped to make room for wakes_waiting,
+    // planOneShot must hold instead of printing wake 1 without disclosing the queued remainder.
+    const brokenHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-oneshot-broken-'))
+    try {
+      fs.mkdirSync(path.join(brokenHome, '.devspec'), { recursive: true })
+      fs.writeFileSync(path.join(brokenHome, '.devspec', 'notes'), 'blocked')
+      const planBlocked = planOneShot([nearLimitWake, secondWake], { home: brokenHome })
+      assert.equal(planBlocked.held, true, 'must hold instead of omitting wakes_waiting disclosure')
+      assert.equal(planBlocked.count, 0)
+    } finally {
+      fs.rmSync(brokenHome, { recursive: true, force: true })
+    }
+  })
+
+  it('two wake_in_note commands on one readWakes page never advance the cursor past an unread or failed sibling note (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const turnA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'
+    const msgA = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1'
+    const turnB = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2'
+    const msgB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2'
+    const batchA = {
+      ...ownerBatch('A'.repeat(11_000)),
+      messages: [{ ...ownerBatch('A'.repeat(11_000)).messages[0], id: msgA, message_id: msgA, turn_id: turnA }],
+    }
+    const batchB = {
+      ...ownerBatch('B'.repeat(11_000)),
+      messages: [{ ...ownerBatch('B'.repeat(11_000)).messages[0], id: msgB, message_id: msgB, turn_id: turnB }],
+    }
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(batchA))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(batchB))
+
+    let firstOut = ''
+    const read1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (t) => { firstOut += t },
+      writeStderr: () => {},
+      startCommands: async () => ({ ok: true }),
+    })
+    assert.equal(read1.printed, 2)
+    assert.equal(read1.marked, false)
+    assert.equal(read1.pending_note_reads?.length, 2)
+    const [noteA, noteB] = read1.pending_note_reads
+    assert.notEqual(noteA, noteB)
+
+    // Case 1: Agent reads Note B FIRST (out of order) while Note A is still unread.
+    const picked = []
+    for (const file of noteFiles(home, noteB)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        startCommands: async (opts) => {
+          picked.push(...opts.commands.map((c) => c.messageId))
+          return { ok: true }
+        },
+      })
+    }
+    assert.deepEqual(picked, [msgB])
+
+    // Cursor must NOT have advanced past Note A!
+    let checkOut = ''
+    const checkAfterB = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (t) => { checkOut += t },
+      writeStderr: () => {},
+      startCommands: async () => ({ ok: true }),
+    })
+    assert.ok(checkAfterB.printed >= 1, 'unread Note A must still be present after out-of-order Note B read')
+    assert.match(checkOut, new RegExp(noteA))
+
+    // Case 2: Now agent reads Note A, and its pickup succeeds -> cursor advances past BOTH Note A and Note B!
+    for (const file of noteFiles(home, noteA)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        startCommands: async (opts) => {
+          picked.push(...opts.commands.map((c) => c.messageId))
+          return { ok: true }
+        },
+      })
+    }
+    assert.deepEqual(picked, [msgB, msgA])
+
+    const afterBoth = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: async () => ({ ok: true }),
+    })
+    assert.equal(afterBoth.printed, 0, 'cursor must advance past both notes only after both are read and picked up')
+    assert.equal(afterBoth.marked, true)
+  })
+
+  it('structured refusal fallback preserves >10 blocking entries and deep nested details, and discloses counts + recovery when array exceeds Shell budget (4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const notesPath = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(notesPath), { recursive: true })
+    fs.writeFileSync(notesPath, 'blocked')
+
+    // 1. 15 blocking entries + depth-6 nested detail + oversized text blob:
+    //    must preserve ALL 15 blocking entries and the depth-6 field when they fit inside fitsShellOutput!
+    const wake1 = buildOwnerMessageEvents(ownerBatch('Inline command 1'))
+    const blocking15 = Array.from({ length: 15 }, (_, idx) => ({ id: `blk-${idx + 1}`, reason: 'active_turn' }))
+    let stderr1 = ''
+    await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [wake1],
+      printedStdout: '',
+      priorStderr: '',
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: (chunk) => { stderr1 += chunk },
+      startCommands: async () => ({
+        ok: false,
+        outcome: 'refused',
+        refusals: [
+          {
+            command_message_id: MSG_ID,
+            command_turn_id: TURN_ID,
+            refusal: {
+              code: 'turn_busy',
+              blocking: blocking15,
+              nested: { l2: { l3: { l4: { l5: { l6_secret_token: 'keep-depth-6' } } } } },
+              huge_blob: 'z'.repeat(25_000),
+            },
+          },
+        ],
+      }),
+    })
+    assert.ok(fitsShellOutput(stderr1))
+    assert.match(stderr1, /blk-15/, 'must NOT arbitrarily slice blocking list at 10 when all 15 fit')
+    assert.match(stderr1, /keep-depth-6/, 'must NOT arbitrarily drop nested fields at depth >= 4')
+
+    // 2. 100 large blocking items (>20,000 chars even without any giant single string):
+    //    must keep maximum complete entries with explicit total_count, returned_count, omitted_count, and recovery!
+    const blocking100 = Array.from({ length: 100 }, (_, idx) => ({
+      id: `item-${idx + 1}`,
+      title: `Blocking item ${idx + 1} ${'q'.repeat(250)}`,
+    }))
+    let stderr2 = ''
+    await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [wake1],
+      printedStdout: '',
+      priorStderr: '',
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: (chunk) => { stderr2 += chunk },
+      startCommands: async () => ({
+        ok: false,
+        outcome: 'refused',
+        refusals: [
+          {
+            command_message_id: MSG_ID,
+            command_turn_id: TURN_ID,
+            refusal: {
+              code: 'multi_block',
+              blocking: blocking100,
+            },
+          },
+        ],
+      }),
+    })
+    assert.ok(fitsShellOutput(stderr2))
+    assert.match(stderr2, /"total_count":100/)
+    assert.match(stderr2, /"omitted_due_to_shell_limit":true/)
+    assert.match(stderr2, /"recovery":/)
+    assert.doesNotMatch(stderr2, /diagnostic omitted/, 'must surface structured refusal counts & recovery, never generic omission line')
+  })
 })

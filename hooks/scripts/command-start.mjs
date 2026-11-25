@@ -23,7 +23,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 import { pidAlive } from './close-on-end.mjs'
 import { REMOTE_WAKE_NOTIFY_PATTERN, resolveSpaceFreeWakeFile, wakeFileConnectionId } from './devspec-wake-file.mjs'
-import { readNoteText } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
@@ -283,42 +283,191 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
   }
 }
 
-/**
- * Compact structured summary of pickup refusals for Shell stderr fallback when a refusal
- * payload exceeds Cursor's Shell ceiling AND `~/.devspec/notes` cannot be written.
- * Preserves every structured refusal identifier/code/blocking field while replacing only
- * oversized string blobs (> 200 chars, sized so a refusal object stays a few hundred chars
- * inside the 20,000-char Shell ceiling) with explicit omission metadata (req 4e32d1a5).
- */
-const COMPACT_REFUSAL_FIELD_MAX_CHARS = 200
-
-function compactRefusalValue(value, depth = 0) {
-  if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number') {
+function cloneJsonSafe(value) {
+  if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
     return value
   }
-  if (typeof value === 'string') {
-    return value.length <= COMPACT_REFUSAL_FIELD_MAX_CHARS
-      ? value
-      : { omitted_large_text: true, chars: value.length, note_write_failed: true }
-  }
-  if (depth >= 4) return { omitted_nested: true }
-  if (Array.isArray(value)) {
-    return value.slice(0, 10).map((item) => compactRefusalValue(item, depth + 1))
-  }
+  if (Array.isArray(value)) return value.map((item) => cloneJsonSafe(item))
   if (typeof value === 'object') {
     const out = {}
     for (const [k, v] of Object.entries(value)) {
       if (typeof v === 'function' || k === 'stack') continue
-      out[k] = compactRefusalValue(v, depth + 1)
+      out[k] = cloneJsonSafe(v)
     }
     return out
   }
   return String(value)
 }
 
-export function compactStructuredRefusals(refusals) {
-  if (!Array.isArray(refusals)) return []
-  return refusals.map((item) => compactRefusalValue(item, 0))
+function getAtPath(root, pathKeys) {
+  let cur = root
+  for (const key of pathKeys) cur = cur[key]
+  return cur
+}
+
+function setAtPath(root, pathKeys, nextValue) {
+  let cur = root
+  for (let i = 0; i < pathKeys.length - 1; i += 1) cur = cur[pathKeys[i]]
+  cur[pathKeys[pathKeys.length - 1]] = nextValue
+}
+
+function findLargestShrinkableString(node, minLength, currentPath = [], best = null) {
+  if (typeof node === 'string') {
+    if (node.length > minLength && (!best || node.length > best.length)) {
+      return { path: currentPath, length: node.length }
+    }
+    return best
+  }
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i += 1) {
+      best = findLargestShrinkableString(node[i], minLength, [...currentPath, i], best)
+    }
+    return best
+  }
+  if (node && typeof node === 'object') {
+    if (node.omitted_large_text === true) return best
+    for (const [k, v] of Object.entries(node)) {
+      best = findLargestShrinkableString(v, minLength, [...currentPath, k], best)
+    }
+  }
+  return best
+}
+
+function findLargestRawArray(node, currentPath = [], best = null) {
+  if (Array.isArray(node)) {
+    const size = JSON.stringify(node).length
+    if (node.length > 0 && (!best || size > best.size)) {
+      best = { path: currentPath, size }
+    }
+    for (let i = 0; i < node.length; i += 1) {
+      best = findLargestRawArray(node[i], [...currentPath, i], best)
+    }
+    return best
+  }
+  if (node && typeof node === 'object') {
+    if (node.omitted_due_to_shell_limit === true) return best
+    for (const [k, v] of Object.entries(node)) {
+      best = findLargestRawArray(v, [...currentPath, k], best)
+    }
+  }
+  return best
+}
+
+/**
+ * Budget-fitted structured refusal fallback when a pickup refusal payload exceeds
+ * Cursor's Shell output ceiling AND `~/.devspec/notes` cannot be written
+ * (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+ *
+ * Uses `fitsShellOutput` directly with zero arbitrary list/depth/length caps:
+ *  1. Binary-searches the largest prefix of completely unmodified refusal objects that
+ *     fits beside `stdoutText`, reporting `total_count`, `returned_count`, `omitted_count`,
+ *     and `recovery`.
+ *  2. When even the first refusal object exceeds remaining budget, preserves every
+ *     structured field at every depth by replacing only the largest oversized string(s)
+ *     with explicit omission metadata (only when that actually shrinks JSON) and
+ *     binary-searching any oversized nested array to keep the maximum complete entries
+ *     with `{ items, total_count, returned_count, omitted_count, omitted_due_to_shell_limit, recovery }`.
+ *  3. Returns `null` if `stdoutText` itself leaves too little room even for a structured
+ *     refusal envelope with counts and recovery (never flattening to a generic sentence).
+ */
+export function formatStructuredRefusalsFallback(
+  refusals,
+  {
+    prefix = 'report_pickup refused (note write failed; structured refusal): ',
+    stdoutText = '',
+    noteError = null,
+    recovery = 'Fix write permissions on ~/.devspec/notes and retry so the complete structured refusal can be saved whole and read back.',
+  } = {},
+) {
+  const list = Array.isArray(refusals) ? refusals.map((item) => cloneJsonSafe(item)) : []
+  const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
+  const fits = (candidate) => fitsShellOutput(`${stdoutText}${candidate}`)
+  const wrap = (slice, extra = {}) =>
+    `${prefix}${JSON.stringify({
+      note_write_failed: true,
+      note_write_error: why,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      total_count: list.length,
+      returned_count: slice.length,
+      omitted_count: list.length - slice.length,
+      refusals: slice,
+      recovery,
+      ...extra,
+    })}\n`
+
+  if (list.length === 0) {
+    const emptyLine = wrap([])
+    return fits(emptyLine) ? emptyLine : null
+  }
+
+  // 1. Keep as many completely unmodified refusal objects as fit inside fitsShellOutput.
+  let lo = 0
+  let hi = list.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (fits(wrap(list.slice(0, mid)))) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  if (lo > 0) return wrap(list.slice(0, lo))
+
+  // 2. Single first refusal exceeds remaining Shell budget: shrink only oversized string
+  // leaves and/or binary-search oversized nested arrays while keeping all structured
+  // fields, counts, and recovery intact at every depth.
+  const first = cloneJsonSafe(list[0])
+  const stringReplacement = (len) => ({
+    omitted_large_text: true,
+    actual_length: len,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    note_write_failed: true,
+    recovery,
+  })
+  const minShrinkableStringLen = JSON.stringify(stringReplacement(CURSOR_SHELL_OUTPUT_MAX_CHARS)).length
+
+  while (!fits(wrap([first]))) {
+    const bigStr = findLargestShrinkableString(first, minShrinkableStringLen)
+    if (bigStr && bigStr.path.length > 0) {
+      setAtPath(first, bigStr.path, stringReplacement(bigStr.length))
+      continue
+    }
+    const bigArr = findLargestRawArray(first)
+    if (bigArr && bigArr.path.length > 0) {
+      const originalArr = getAtPath(first, bigArr.path)
+      const makeBoundedArr = (count) => ({
+        items: originalArr.slice(0, count),
+        total_count: originalArr.length,
+        returned_count: count,
+        omitted_count: originalArr.length - count,
+        omitted_due_to_shell_limit: true,
+        recovery,
+      })
+      let alo = 0
+      let ahi = originalArr.length
+      while (alo < ahi) {
+        const amid = Math.ceil((alo + ahi) / 2)
+        setAtPath(first, bigArr.path, makeBoundedArr(amid))
+        if (fits(wrap([first]))) {
+          alo = amid
+        } else {
+          ahi = amid - 1
+        }
+      }
+      setAtPath(first, bigArr.path, makeBoundedArr(alo))
+      if (fits(wrap([first]))) break
+      continue
+    }
+    break
+  }
+
+  const singleFitted = wrap([first])
+  if (fits(singleFitted)) return singleFitted
+
+  const countOnly = wrap([], {
+    codes: list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean),
+  })
+  return fits(countOnly) ? countOnly : null
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */

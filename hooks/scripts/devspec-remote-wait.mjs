@@ -85,6 +85,7 @@ import {
 } from './connect-phase-timing.mjs'
 import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
 import {
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
   shellDiagnosticReserve,
@@ -119,8 +120,8 @@ import { clearTurnCommands, commandsHandedOver, completionArguments, readTurnCom
 import { localTurnToComplete } from './local-turn.mjs'
 import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, registerPendingWakeNote, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
 import {
-  compactStructuredRefusals,
   extractRoomCommandsFromWake,
+  formatStructuredRefusalsFallback,
   startRoomCommands,
   structuredRefusalFromError,
 } from './command-start.mjs'
@@ -1709,23 +1710,43 @@ export function printedRoomCommands(printedWakes, fallbackSessionId = null, { ho
  * refusal diagnostic) and that any non-fatal stderr emitted beforehand is accounted for
  * before stdout is written (reqs 3ea2b201 / 3c5147a7 / 91d7b47c).
  */
+/**
+ * Whether `wakes` is the exact two-wake recall hand-off (`[... , recall_in_next_wake]`
+ * followed by `[turn_recall]`), where `wakes[0]` already discloses the queued recall in
+ * its own closing `recall_in_next_wake` line when no room remains for `wakes_waiting`.
+ */
+function isRecallInNextWakePair(wakes) {
+  if (!Array.isArray(wakes) || wakes.length !== 2) return false
+  const first = wakes[0]
+  const second = wakes[1]
+  return (
+    Array.isArray(first) &&
+    first.at(-1)?.type === 'recall_in_next_wake' &&
+    Array.isArray(second) &&
+    second[0]?.type === 'turn_recall'
+  )
+}
+
 export function planOneShot(wakes, { reserve = '', home = os.homedir() } = {}) {
+  const recallPair = isRecallInNextWakePair(wakes)
   const fitted = []
   for (let i = 0; i < wakes.length; i += 1) {
     const wake = wakes[i]
     const raw = wakeLines(wake)
-    if (fitsShellOutput(`${reserve}${raw}`)) {
+    const minTrailing =
+      i === 0 && wakes.length > 1 && !recallPair ? wakeLines([wakesWaitingEvent(wakes.length - 1)]) : ''
+    if (fitsShellOutput(`${reserve}${raw}${minTrailing}`)) {
       fitted.push(raw)
       continue
     }
     const note = wakeInNote(wake, { home })
     const pointer = note.error ? null : wakeLines(note.events)
-    if (pointer && fitsShellOutput(`${reserve}${pointer}`)) {
+    if (pointer && fitsShellOutput(`${reserve}${pointer}${minTrailing}`)) {
       fitted.push(pointer)
       continue
     }
-    // Never emit an oversized wake (> 20,000 combined chars) when note fallback fails:
-    // hold the wake instead of exposing the command to Cursor's silent cut (reqs 3c5147a7 / 91d7b47c).
+    // Never emit an oversized wake (> 20,000 combined chars) or omit a required remainder
+    // disclosure when note fallback fails: hold the wake instead (reqs 3c5147a7 / 91d7b47c).
     if (i === 0) {
       return {
         held: true,
@@ -1741,15 +1762,54 @@ export function planOneShot(wakes, { reserve = '', home = os.homedir() } = {}) {
     return { held: false, count: 0, text: '', printedWakes: [] }
   }
   const omittedTail = wakes.length - fitted.length
-  const { count, text } = wakesForOneOutput(fitted, {
+  let { count, text } = wakesForOneOutput(fitted, {
     waiting: (left) => wakeLines([wakesWaitingEvent(left + omittedTail)]),
     reserve,
   })
   let finalText = text
-  if (omittedTail > 0 && count === fitted.length) {
-    const waiting = wakeLines([wakesWaitingEvent(omittedTail)])
-    if (fitsShellOutput(`${reserve}${finalText}${waiting}`)) {
-      finalText += waiting
+  let remaining = wakes.length - count
+  const alreadyDisclosedRecall = recallPair && count === 1 && remaining === 1 && finalText.includes('"recall_in_next_wake"')
+  if (remaining > 0 && !alreadyDisclosedRecall) {
+    const waitingLine = wakeLines([wakesWaitingEvent(remaining)])
+    if (!finalText.endsWith(waitingLine)) {
+      if (fitsShellOutput(`${reserve}${finalText}${waitingLine}`)) {
+        finalText += waitingLine
+      } else {
+        // Reduce printed count or note-wrap the first wake so remaining wakes are NEVER
+        // left undisclosed (requirements 3c5147a7 / 91d7b47c).
+        let adjusted = false
+        for (let k = count - 1; k >= 1; k -= 1) {
+          const wLine = wakeLines([wakesWaitingEvent(wakes.length - k)])
+          const candidate = `${fitted.slice(0, k).join('')}${wLine}`
+          if (fitsShellOutput(`${reserve}${candidate}`)) {
+            count = k
+            finalText = candidate
+            remaining = wakes.length - k
+            adjusted = true
+            break
+          }
+        }
+        if (!adjusted) {
+          const note = wakeInNote(wakes[0], { home })
+          const wLine = wakeLines([wakesWaitingEvent(wakes.length - 1)])
+          const candidate = note.error ? null : `${wakeLines(note.events)}${wLine}`
+          if (candidate && fitsShellOutput(`${reserve}${candidate}`)) {
+            count = 1
+            finalText = candidate
+            remaining = wakes.length - 1
+            adjusted = true
+          }
+        }
+        if (!adjusted) {
+          return {
+            held: true,
+            error: new Error(`cannot fit wake + remainder disclosure (${remaining} queued) inside Cursor Shell ceiling`),
+            count: 0,
+            text: '',
+            printedWakes: [],
+          }
+        }
+      }
     }
   }
   if (!fitsShellOutput(`${reserve}${finalText}`)) {
@@ -1767,15 +1827,22 @@ export function planOneShot(wakes, { reserve = '', home = os.homedir() } = {}) {
 /**
  * Re-fit an already-selected one-shot page if stderr grew during pickup (e.g. a
  * `nothing_open` diagnostic) so `reserve + stdout` never crosses Cursor's Shell ceiling
- * while keeping the exact selected `printedWakes` count. Returns null if even note
- * wrapping cannot fit beside `reserve` (caller holds rather than exceeding the ceiling).
+ * while keeping the exact selected `printedWakes` count AND any required remainder
+ * disclosure (`wakes_waiting`). Returns null if even note wrapping cannot fit both.
  */
 function fitSelectedOneShotText(plan, totalCount, { reserve = '', home = os.homedir() } = {}) {
-  if (!reserve || fitsShellOutput(`${reserve}${plan.text}`)) return plan.text
+  const left = totalCount - plan.count
+  const alreadyDisclosedRecall =
+    left === 1 && plan.count === 1 && plan.text.includes('"recall_in_next_wake"')
+  const waiting = left > 0 && !alreadyDisclosedRecall ? wakeLines([wakesWaitingEvent(left)]) : ''
+  if (!reserve && (!waiting || plan.text.endsWith(waiting))) return plan.text
+  if (fitsShellOutput(`${reserve}${plan.text}`) && (!waiting || plan.text.endsWith(waiting))) {
+    return plan.text
+  }
   const fitted = []
   for (const wake of plan.printedWakes) {
     const raw = wakeLines(wake)
-    if (fitsShellOutput(`${reserve}${raw}`)) {
+    if (fitsShellOutput(`${reserve}${fitted.join('')}${raw}${waiting}`)) {
       fitted.push(raw)
       continue
     }
@@ -1783,12 +1850,7 @@ function fitSelectedOneShotText(plan, totalCount, { reserve = '', home = os.home
     if (note.error) return null
     fitted.push(wakeLines(note.events))
   }
-  let out = fitted.join('')
-  const left = totalCount - plan.count
-  if (left > 0) {
-    const waiting = wakeLines([wakesWaitingEvent(left)])
-    if (fitsShellOutput(`${reserve}${out}${waiting}`)) out += waiting
-  }
+  const out = `${fitted.join('')}${waiting}`
   return fitsShellOutput(`${reserve}${out}`) ? out : null
 }
 
@@ -1888,13 +1950,20 @@ export async function runOneShotRoomCommandPickup({
   let stderrText = ''
   let diagnosticNote = null
   if (rawDiag) {
+    const combinedPrior = `${priorStderr}${printedStdout}`
     const fallback = refusals
-      ? `devspec-remote-wait: report_pickup refused (note write failed; structured summary): ${JSON.stringify(compactStructuredRefusals(refusals))}\n`
+      ? (noteError) =>
+          formatStructuredRefusalsFallback(refusals, {
+            prefix: 'devspec-remote-wait: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: combinedPrior,
+            noteError,
+          })
       : null
-    const fitted = fitShellDiagnostic(`${priorStderr}${printedStdout}`, rawDiag, {
+    const fitted = fitShellDiagnostic(combinedPrior, rawDiag, {
       home,
       label: 'devspec-remote-wait',
       fallback,
+      requireStructuredFallback: Boolean(refusals),
     })
     diagnosticNote = fitted.note
     if (fitted.text) {
@@ -1935,6 +2004,7 @@ async function main() {
         read: 'cat ~/.devspec/notes/0000000000000000.md',
         note: RECALL_WHOLE_NOTE,
       },
+      wakesWaitingEvent(CURSOR_SHELL_OUTPUT_MAX_CHARS),
     ]) +
     oneShotDiagnosticReserve +
     oneShotSuppressedLine
