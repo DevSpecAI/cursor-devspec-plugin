@@ -615,7 +615,10 @@ export async function readWakes({
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
     const hasRoomCommands =
       Boolean(resolvedConnectionId) &&
-      wakes.some((wake) => extractRoomCommandsFromWake(wake.text, { home }).commands.length > 0)
+      wakes.some((wake) => {
+        const ex = extractRoomCommandsFromWake(wake.text, { home })
+        return ex.commands.length > 0 || ex.unreadableNotes.length > 0
+      })
     const page = readerPage(
       wakes.map((wake) => wake.text),
       {
@@ -633,32 +636,43 @@ export async function readWakes({
     if (resolvedConnectionId && page.printed > 0) {
       const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
       const extracted = extractRoomCommandsFromWake(printedSlice, { home })
-      if (extracted.commands.length > 0) {
+      const noteRefusals = extracted.unreadableNotes.map((note) => ({
+        command_message_id: null,
+        command_turn_id: null,
+        refusal: note,
+      }))
+      if (extracted.commands.length > 0 || noteRefusals.length > 0) {
         const capturedDiag = []
         let pickupResult = null
-        try {
-          pickupResult = await startCommands({
-            connectionId: resolvedConnectionId,
-            commands: extracted.commands,
-            batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
-            sessionId: extracted.sessionId,
-            dir,
-            home,
-            fromWakeTurn: true,
-            // Capture command-start stderr so ALL stderr for this Shell call passes
-            // once through the shared Shell output ceiling (`fitShellDiagnostic`).
-            log: (line) => capturedDiag.push(String(line ?? '')),
-          })
-        } catch (error) {
-          pickupResult = {
-            ok: false,
-            outcome: 'refused',
-            refusals: [structuredRefusalFromError(error)],
+        if (extracted.commands.length > 0) {
+          try {
+            pickupResult = await startCommands({
+              connectionId: resolvedConnectionId,
+              commands: extracted.commands,
+              batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
+              sessionId: extracted.sessionId,
+              dir,
+              home,
+              fromWakeTurn: true,
+              // Capture command-start stderr so ALL stderr for this Shell call passes
+              // once through the shared Shell output ceiling (`fitShellDiagnostic`).
+              log: (line) => capturedDiag.push(String(line ?? '')),
+            })
+          } catch (error) {
+            pickupResult = {
+              ok: false,
+              outcome: 'refused',
+              refusals: [structuredRefusalFromError(error)],
+            }
           }
         }
+        const combinedRefusals = [
+          ...noteRefusals,
+          ...(Array.isArray(pickupResult?.refusals) ? pickupResult.refusals : []),
+        ]
         let rawDiag = ''
-        if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
-          pickupRefusals = pickupResult.refusals
+        if (combinedRefusals.length > 0) {
+          pickupRefusals = combinedRefusals
           rawDiag =
             `${capturedDiag.join('')}` +
             `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`

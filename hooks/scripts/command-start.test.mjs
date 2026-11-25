@@ -27,7 +27,7 @@ import {
 import { fastConnect } from './fast-connect.mjs'
 import { fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote } from './hook-context-budget.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
-import { withWakeFollowLock } from './remote-control-state.mjs'
+import { ensureWakeFollowForConnection, withWakeFollowLock } from './remote-control-state.mjs'
 import { readRequestState } from './requests.mjs'
 import {
   FIXTURE_ID,
@@ -1182,6 +1182,174 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         fitsShellOutput(stdout + stderr),
         `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
       )
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+
+  it('ensureWakeFollowForConnection kills spawned child when PID file write fails (2df26cd2)', () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, 'wake.jsonl')
+    const connId = '22222222-2222-4222-8222-222222222299'
+    const killedSignals = []
+    const fakeIo = {
+      ...fs,
+      writeFileSync: (filePath, data, opts) => {
+        if (String(filePath).endsWith('.wake-follow.pid')) {
+          throw Object.assign(new Error('EACCES: cannot write pid'), { code: 'EACCES' })
+        }
+        return fs.writeFileSync(filePath, data, opts)
+      },
+    }
+    const res = ensureWakeFollowForConnection(connId, {
+      wakeFile,
+      ownerPid: process.pid,
+      resolveOwnerPid: () => process.pid,
+      findPid: () => null,
+      io: fakeIo,
+      spawn: () => ({
+        pid: 987654,
+        unref: () => {},
+        kill: (sig) => killedSignals.push(sig),
+      }),
+    })
+    assert.equal(res.ok, false)
+    assert.equal(res.killed_orphan, true)
+    assert.deepEqual(killedSignals, ['SIGTERM'])
+  })
+
+  it('does not advance wake position or mark read when a wake_in_note carrying owner_message is missing or unreadable (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const missingPointer = [{
+      type: 'wake_in_note',
+      carries: ['owner_message'],
+      read: 'cat ~/.devspec/notes/deadbeef12345678.md',
+      note: 'Command stored in note.',
+    }]
+    appendWakeEvents(wakeFile, missingPointer)
+    let startCalls = 0
+    const stderrChunks = []
+    const readRes = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: (t) => stderrChunks.push(t),
+      startCommands: async () => {
+        startCalls += 1
+        return { ok: true }
+      },
+    })
+    assert.equal(readRes.marked, false, 'must not advance wake position when command note is missing')
+    assert.equal(startCalls, 0)
+    assert.equal(readRes.pickup_refusals?.[0]?.refusal?.code, 'unreadable_command_note')
+    assert.match(stderrChunks.join(''), /unreadable_command_note/)
+
+    // Same guarantee for one-shot runOneShotRoomCommandPickup
+    const oneShotStderr = []
+    const pickup = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [missingPointer],
+      printedStdout: '',
+      dir,
+      home,
+      writeStderr: (t) => oneShotStderr.push(t),
+    })
+    assert.equal(pickup.ok, false)
+    assert.equal(pickup.refusals?.[0]?.refusal?.code, 'unreadable_command_note')
+    assert.match(oneShotStderr.join(''), /unreadable_command_note/)
+  })
+
+  it('caps repeated one-shot holding-wake retry stderr so combined output stays within fitsShellOutput and still surfaces eventual pickup refusal (3c5147a7 / 91d7b47c / 4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const notesPath = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(notesPath), { recursive: true })
+    // Block note creation transiently by placing a regular file where the notes dir belongs.
+    fs.writeFileSync(notesPath, 'blocked')
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  ok: false,
+                  code: 'turn_busy_after_hold',
+                  blocking_attempt_id: '99999999-9999-4999-8999-999999999999',
+                  error: 'Active turn owns Working',
+                }),
+              }],
+            },
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    fs.writeFileSync(
+      path.join(dir, `${CONN}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: CONN,
+        session_id: ROOM,
+        local_id: CONVERSATION,
+        agent_name: 'Cursor',
+        token: 'dvs_test',
+        mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+      }),
+      { mode: 0o600 },
+    )
+    const batch = ownerBatch('Oversized held body ' + 'h'.repeat(21_000))
+    batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
+    fs.writeFileSync(path.join(dir, `${CONN}.inbox.jsonl`), `${JSON.stringify(batch)}\n`, { mode: 0o600 })
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    try {
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', CONN, '--pending', '--poll-ms', '5'],
+          { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let stdout = ''
+        let stderr = ''
+        let unblocked = false
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => {
+          stderr += c.toString()
+          if (!unblocked && stderr.includes('further retry warnings suppressed')) {
+            unblocked = true
+            fs.rmSync(notesPath, { force: true })
+          }
+        })
+        const fallbackUnblock = setTimeout(() => {
+          if (!unblocked) {
+            unblocked = true
+            fs.rmSync(notesPath, { force: true })
+          }
+        }, 3000)
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.on('error', (e) => { clearTimeout(timer); clearTimeout(fallbackUnblock); reject(e) })
+        child.on('close', (code) => { clearTimeout(timer); clearTimeout(fallbackUnblock); resolve({ stdout, stderr, code }) })
+      })
+      assert.equal(code, 1)
+      assert.match(stderr, /further retry warnings suppressed/)
+      assert.ok(
+        fitsShellOutput(stdout + stderr),
+        `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
+      )
+      // The structured refusal must be surfaced either inline or via a sealed diagnostic note.
+      const noteMatch = /notes\/([0-9a-f]{16})\.md/.exec(stderr)
+      const refusalSource = noteMatch ? readNoteText(noteMatch[1], { home }) : stderr
+      assert.match(refusalSource, /turn_busy_after_hold/)
+      assert.match(refusalSource, /99999999-9999-4999-8999-999999999999/)
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }

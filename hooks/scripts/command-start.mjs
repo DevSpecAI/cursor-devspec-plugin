@@ -203,6 +203,7 @@ const NOTE_ID_IN_READ_RE = /notes\/([0-9a-f]{16})\.md\b/
  */
 export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), visitedNotes = null } = {}) {
   const rawMessages = []
+  const unreadableNotes = []
   let sessionId = null
   const seenNotes = visitedNotes ?? new Set()
   for (const line of String(wakeText ?? '').split('\n')) {
@@ -224,17 +225,37 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
     ) {
       const match = NOTE_ID_IN_READ_RE.exec(String(event.read ?? ''))
       const noteId = match?.[1] ?? null
-      if (noteId && !seenNotes.has(noteId)) {
+      if (!noteId) {
+        unreadableNotes.push({
+          code: 'invalid_command_note_ref',
+          note_id: null,
+          read: event.read ?? null,
+          error: 'wake_in_note carries owner_message without a valid note id',
+        })
+      } else if (!seenNotes.has(noteId)) {
         seenNotes.add(noteId)
         try {
           const noteText = readNoteText(noteId, { home })
           if (noteText) {
             const nested = extractRoomCommandsFromWake(noteText, { home, visitedNotes: seenNotes })
             rawMessages.push(...nested.messages)
+            unreadableNotes.push(...nested.unreadableNotes)
             if (!sessionId && nested.sessionId) sessionId = nested.sessionId
+          } else {
+            unreadableNotes.push({
+              code: 'unreadable_command_note',
+              note_id: noteId,
+              read: event.read ?? null,
+              error: 'command note is missing or empty',
+            })
           }
-        } catch {
-          /* unreadable note: leave empty */
+        } catch (error) {
+          unreadableNotes.push({
+            code: 'unreadable_command_note',
+            note_id: noteId,
+            read: event.read ?? null,
+            error: error instanceof Error ? error.message : String(error),
+          })
         }
       }
     }
@@ -243,6 +264,7 @@ export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), vis
     commands: commandsHandedOver(rawMessages),
     messages: rawMessages,
     sessionId,
+    unreadableNotes,
   }
 }
 

@@ -957,7 +957,16 @@ function ensureWakeFollowLocked(connectionId, wakeFile, io, opts) {
   try {
     io.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
   } catch (e) {
-    return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath }
+    // Terminate the newly spawned follower so a failed PID-file write never leaves an
+    // untracked live reader running (decision 2df26cd2).
+    const killFn = opts.killPid || ((p, sig) => process.kill(p, sig))
+    try {
+      if (typeof child.kill === 'function') child.kill('SIGTERM')
+      else killFn(pid, 'SIGTERM')
+    } catch {
+      /* already gone */
+    }
+    return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath, killed_orphan: true }
   }
 
   return {
@@ -1310,7 +1319,13 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   try {
     fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
   } catch (e) {
-    return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped }
+    try {
+      if (typeof child.kill === 'function') child.kill('SIGTERM')
+      else process.kill(pid, 'SIGTERM')
+    } catch {
+      /* already gone */
+    }
+    return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped, killed_orphan: true }
   }
 
   return {
