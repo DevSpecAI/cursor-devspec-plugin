@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { contextFile, readProjectContext, firingConversation } from './project-context.mjs'
-import { deliveryReadThrough, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
+import { deliveryReadThrough, noteCommand, pointToNote, POST_TOOL_CONTEXT_SHARE, SESSION_START_CONTEXT_SHARE, writeNote } from './hook-context-budget.mjs'
 import { cursorProcessOf, processStartTime } from './close-on-end.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
 /**
@@ -202,11 +202,20 @@ export function repositoryContextHook(input, {home=os.homedir(),force=false,shar
     epoch: read(sessionFile(id,home))?.epoch ?? 0,
     host: typeof host === 'function' ? host() : host ?? null,
   }
-  if (deliveryReadThrough(`${snapshotFile(id,home)}.delivery`, input, key, {home})) return null
-  const content = pointToNote(note, {
+  const progress = deliveryReadThrough(`${snapshotFile(id,home)}.delivery`, input, key, {home, details: true})
+  if (progress.done) return null
+  // When an earlier part of a multi-part note has already been read, point directly at
+  // the next unread part so the agent never re-reads content it already received (item 083422dd).
+  const targetNote = progress.nextPart > 1
+    ? { ...note, command: noteCommand(note.id, progress.nextPart) }
+    : note
+  const what = progress.nextPart > 1
+    ? `Part ${progress.nextPart} of ${progress.totalParts} of this conversation's DevSpec project context (remaining repositories and run-wide rules)`
+    : `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`
+  const content = pointToNote(targetNote, {
     share,
-    what: `This conversation's DevSpec project context (its ${snapshot.repository_context.repositories?.length ?? 'unknown'} repositories, as data, and the complete run-wide rules)`,
-    also: 'This line comes back after each step until you have read it. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.',
+    what,
+    also: 'This line comes back after each step until you have read it whole with the exact command above. If file access is outside your authorized scope, get_project_summary provides current project and rule context through DevSpec.',
   })
   return content===null ? null : {additional_context:content}
 }

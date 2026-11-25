@@ -5,19 +5,23 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it, beforeEach, afterEach } from 'node:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { parseArgs } from './remote-control-state.mjs'
+import { formatBoundedCliStderr, formatConnectCliOutput, installBoundedCliStderr, parseArgs, summarizeConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
 import {
   fastConnect as connectImpl,
+  formatFastConnectCliOutput,
   parseSessionIdFromPrompt,
   resolveProjectForConnect,
 } from './fast-connect.mjs'
@@ -541,6 +545,146 @@ describe('fastConnect', () => {
     assert.match(r.error, /owner-pid/)
     assert.equal(r.connection_id, connectionId)
   })
+  it('returns a short connect summary without rules or full repository list while keeping the full snapshot on disk (item 083422dd)', async () => {
+    assert.equal(formatFastConnectCliOutput, formatConnectCliOutput)
+    const bigRules = `Never skip checks. ${'Detail line. '.repeat(400)}RULES-WHOLE-END`
+    const repos = Array.from({ length: 12 }, (_, i) => ({
+      id: `repo-${i}`,
+      full_name: `org/repo-${i}`,
+      provider: 'github',
+      git_url: `https://github.com/org/repo-${i}.git`,
+      target_branch: 'staging',
+      default_branch: 'main',
+    }))
+    const r = await fastConnect({
+      localId,
+      cwd: process.cwd(),
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => 'https://github.com/org/repo-0.git',
+      resolveLocalFn: () => ({ action: 'register', connection_id: null }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'arg' }),
+      emitPhase: async () => {},
+      registerFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        codename: 'Brave Otter',
+        project_id: projectId,
+        project_selection: { version: 1, status: 'resolved', source: 'explicit', project: { id: projectId, name: 'DevSpec' } },
+        repository_context: { version: 1, project_id: projectId, status: 'available', repositories: repos },
+        project_custom_instructions: 'Project principles whole.',
+        project_agent_rules: bigRules,
+        owner_agent_rules: 'Owner rules whole.',
+        github_identity: { status: 'linked', logins: ['octocat'] },
+      }),
+      writeFn: async () => ({
+        ok: true,
+        connection_id: connectionId,
+        session_id: null,
+        session_codename: 'Brave Otter',
+        auth_ok: true,
+        poller: { ok: true, pid: 123 },
+      }),
+    })
+
+    assert.equal(r.ok, true)
+    assert.equal(r.project_id, projectId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 12)
+    assert.equal(r.github_status, 'linked as @octocat')
+    assert.equal('project_context' in r, false, 'connect output must not dump project_context')
+    assert.equal('project_selection' in r, false, 'connect output must not dump verbose project_selection')
+    assert.equal('project_context_file' in r, false, 'connect output must not duplicate context via another file path')
+    const serialized = JSON.stringify(r)
+    assert.doesNotMatch(serialized, /RULES-WHOLE-END|Project principles whole|Owner rules whole|org\/repo-11/)
+    assert.ok(serialized.length < 1_000, `short connect summary expected (<1000 chars), got ${serialized.length}`)
+
+    // CLI register/attach summarizer strips rules and repo list while preserving choice_required.
+    const cliSummary = summarizeConnectCliOutput({
+      ok: true,
+      connection_id: connectionId,
+      project_id: projectId,
+      project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+      repository_context: { status: 'available', repositories: repos },
+      project_agent_rules: bigRules,
+      owner_agent_rules: 'Owner rules',
+    })
+    assert.equal(cliSummary.project_name, 'DevSpec')
+    assert.equal(cliSummary.repository_count, 12)
+    assert.equal('project_agent_rules' in cliSummary, false)
+    assert.equal('repository_context' in cliSummary, false)
+    const choiceSummary = summarizeConnectCliOutput({
+      ok: false,
+      code: 'project_choice_required',
+      project_selection: { status: 'choice_required', candidates: [{ id: projectId, name: 'DevSpec' }] },
+    })
+    assert.equal(choiceSummary.project_selection?.status, 'choice_required')
+  })
+
+  it('reconnect reattaches the prior session when no --session or --new is passed, returns short summary with plugin_root, and refuses missing conversation id (item 66ad4866)', async () => {
+    const calls = []
+    const r = await fastConnect({
+      localId,
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({
+        action: 'reconnect',
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: 'Quiet Fox',
+      }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'env:CURSOR_CONVERSATION_ID' }),
+      emitPhase: async () => {},
+      registerFn: async () => {
+        calls.push('register')
+        return {
+          ok: true,
+          connection_id: connectionId,
+          project_id: projectId,
+          session_id: null,
+          codename: 'Quiet Fox',
+          project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+          repository_context: { version: 1, project_id: projectId, status: 'available', repositories: [] },
+          project_agent_rules: 'Long rules that must not be dumped inline',
+          github_identity: { status: 'link_required', url: 'https://app.devspec.ai/api/github/link?state=xyz' },
+        }
+      },
+      attachFn: async (opts) => {
+        calls.push(['attach', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId }
+      },
+      writeFn: async (opts) => {
+        calls.push(['write', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId, session_codename: 'Quiet Fox', auth_ok: true, poller: { ok: true, pid: 11 } }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.action, 'reconnect')
+    assert.equal(r.session_id, sessionId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 0)
+    assert.ok(typeof r.plugin_root === 'string' && r.plugin_root.length > 0)
+    assert.equal(r.github_identity?.status, 'link_required')
+    assert.match(r.github_status, /NOT LINKED/)
+    assert.equal('project_context' in r, false)
+    assert.doesNotMatch(JSON.stringify(r), /Long rules that must not be dumped inline/)
+    assert.deepEqual(calls, ['register', ['attach', sessionId], ['write', sessionId]])
+
+    // Never guesses or fabricates a conversation id when missing.
+    const missing = await fastConnect({
+      detectLocalIdFn: () => ({ local_id: null, source: null }),
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error, /conversation ID/)
+    assert.equal(missing.local_id, null)
+
+    // --name and --name=... map to codename.
+    assert.equal(parseArgs(['fast-connect', '--name', 'My Agent']).codename, 'My Agent')
+    assert.equal(parseArgs(['connect', '--name=My Agent']).codename, 'My Agent')
+  })
 })
 
 describe('fastConnect --new (item e707e925)', () => {
@@ -742,4 +886,834 @@ describe('fast-connect CLI flags', () => {
       }
     })
   }
+
+  it('writes an oversized 100-candidate project_choice_required refusal whole to a note instead of exceeding Cursor Shell ceiling', async () => {
+    const { formatConnectCliOutput } = await import('./remote-control-state.mjs')
+    const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc-100-choices-'))
+    try {
+      const candidates = Array.from({ length: 150 }, (_, i) => ({
+        id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
+        name: `Project Number ${i} — Organization Workspace Candidate`,
+        organization_name: `Acme Organization ${i}`,
+      }))
+      const refusal = {
+        ok: false,
+        code: 'project_choice_required',
+        error: 'Several accessible projects have that name. Choose a project and organisation.',
+        project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_name', candidates },
+        candidates: candidates.map((c) => c.id),
+      }
+      const out = formatConnectCliOutput(refusal, { home })
+      assert.equal(fitsShellOutput(out), true, `CLI output must fit Cursor Shell ceiling, got ${out.length} chars`)
+      const parsed = JSON.parse(out)
+      assert.equal(parsed.ok, false)
+      assert.equal(parsed.code, 'project_choice_required')
+      assert.equal(parsed.project_selection.status, 'choice_required')
+      assert.equal(parsed.project_selection.candidate_count, 150)
+      assert.equal(parsed.project_selection.omitted_inline, true)
+      assert.ok(parsed.complete_output_note?.id)
+      assert.ok(parsed.complete_output_note?.command)
+      const full = JSON.parse(readNoteText(parsed.complete_output_note.id, { home }))
+      assert.equal(full.project_selection.candidates.length, 150)
+      assert.equal(full.candidates, undefined, 'duplicate top-level candidate ID array is omitted')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('bounds the note receipt even when error text itself exceeds the Shell ceiling, and keeps structured candidates + recovery when note write fails', async () => {
+    const { formatConnectCliOutput } = await import('./remote-control-state.mjs')
+    const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc59-bounds-'))
+    const blockedHome = path.join(home, 'not-a-dir')
+    fs.writeFileSync(blockedHome, 'file blocking mkdir', 'utf8')
+    try {
+      const hugeError = `Server refusal: ${'E'.repeat(25_000)}`
+      const outHuge = formatConnectCliOutput(
+        { ok: false, code: 'register_failed', error: hugeError },
+        { home },
+      )
+      assert.equal(fitsShellOutput(outHuge), true, `oversized-error receipt must fit Shell ceiling, got ${outHuge.length}`)
+      const parsedHuge = JSON.parse(outHuge)
+      assert.equal(parsedHuge.omitted_fields_in_note, true)
+      assert.ok(parsedHuge.complete_output_note?.id)
+      const fullHuge = JSON.parse(readNoteText(parsedHuge.complete_output_note.id, { home }))
+      assert.equal(fullHuge.error, hugeError)
+
+      const hugeSession = 'S'.repeat(25_000)
+      const outHugeSession = formatConnectCliOutput(
+        { ok: false, code: 'project_choice_required', session_id: hugeSession, error: 'Choose project' },
+        { home },
+      )
+      assert.equal(fitsShellOutput(outHugeSession), true, `oversized-session receipt must fit Shell ceiling, got ${outHugeSession.length}`)
+      const parsedHugeSession = JSON.parse(outHugeSession)
+      assert.equal(parsedHugeSession.omitted_fields_in_note, true)
+      assert.equal(parsedHugeSession.session_id, undefined)
+      assert.equal(JSON.parse(readNoteText(parsedHugeSession.complete_output_note.id, { home })).session_id, hugeSession)
+
+      const candidates = Array.from({ length: 150 }, (_, i) => ({
+        id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
+        name: `Project Number ${i} — Organization Workspace Candidate`,
+        organization_name: `Acme Organization ${i}`,
+      }))
+      const outFailedWrite = formatConnectCliOutput(
+        {
+          ok: false,
+          code: 'project_choice_required',
+          error: 'Several accessible projects have that name. Choose a project and organisation.',
+          project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+          candidates: candidates.map((c) => c.id),
+        },
+        { home: blockedHome },
+      )
+      assert.equal(fitsShellOutput(outFailedWrite), true, `note-failure fallback must fit Shell ceiling, got ${outFailedWrite.length}`)
+      const parsedFallback = JSON.parse(outFailedWrite)
+      assert.equal(parsedFallback.code, 'project_choice_required')
+      assert.equal(parsedFallback.project_selection.candidate_count, 150)
+      assert.ok(parsedFallback.project_selection.returned_count > 0, 'keeps as many complete structured candidates as fit')
+      assert.equal(parsedFallback.project_selection.candidates.length, parsedFallback.project_selection.returned_count)
+      assert.equal(parsedFallback.project_selection.omitted_count, 150 - parsedFallback.project_selection.returned_count)
+      assert.equal(parsedFallback.project_selection.omitted_candidates_require_writable_notes, true)
+      assert.equal(parsedFallback.project_selection.recovery_tool, undefined, 'must not point at general list_projects for server-filtered choices')
+      assert.ok(parsedFallback.complete_output_note_error)
+      assert.doesNotMatch(parsedFallback.recovery, /list_projects/)
+      assert.match(parsedFallback.recovery, /re-run connect/)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('flushes complete inline 50-candidate project_choice_required JSON to stdout on a backpressured pipe before exiting (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    // 1. Unit check: writeStreamAndFlush waits for a slow 4096-byte backpressured Writable to finish draining.
+    const received = []
+    let flushed = false
+    const slowStream = new Writable({
+      highWaterMark: 4096,
+      write(chunk, _enc, cb) {
+        received.push(Buffer.from(chunk))
+        setTimeout(() => {
+          flushed = true
+          cb()
+        }, 40)
+      },
+    })
+    const payload = 'x'.repeat(12_500)
+    await writeStreamAndFlush(slowStream, payload)
+    assert.equal(flushed, true, 'must wait for slow stream write callback before returning')
+    assert.equal(Buffer.concat(received).toString('utf8'), payload)
+
+    // 2. End-to-end CLI check: 50-candidate choice_required (~12 KB) over a paused pipe arrives complete and valid JSON.
+    const candidates = Array.from({ length: 50 }, (_, i) => ({
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      name: `Pipe Project ${i}`,
+      organization_name: `Pipe Org ${i}`,
+      matched_by: ['repository'],
+    }))
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'project_choice_required',
+                error: 'Several accessible projects match. Choose a project and organisation.',
+                project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-pipe-flush-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true })
+      fs.writeFileSync(
+        path.join(home, '.cursor', 'mcp.json'),
+        JSON.stringify({ mcpServers: { devspec: { url: `http://127.0.0.1:${port}/api/mcp` } } }),
+      )
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [
+            script,
+            'fast-connect',
+            '--local-id', 'pipe-flush-conv',
+            '--owner-pid', String(process.pid),
+            '--cwd', home,
+            '--host-token', 'dvs_pipe_test_token',
+            '--no-poller',
+          ],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              DEVSPEC_MCP_URL: `http://127.0.0.1:${port}/api/mcp`,
+              DEVSPEC_MCP_TOKEN: 'dvs_pipe_test_token',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        )
+        // Pause stdout to simulate pipe backpressure before draining.
+        child.stdout.pause()
+        const chunks = []
+        let stderr = ''
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        setTimeout(() => {
+          child.stdout.on('data', (c) => chunks.push(c))
+          child.stdout.resume()
+        }, 100)
+        child.on('error', reject)
+        child.on('close', (code) => {
+          const out = Buffer.concat(chunks).toString('utf8')
+          if (!out) return reject(new Error(`empty stdout (code=${code}, stderr=${stderr})`))
+          resolve({ stdout: out, stderr, code })
+        })
+      })
+      assert.equal(code, 1)
+      assert.equal(stderr, '', 'non-Git cwd must not leak git stderr into Cursor Shell output')
+      assert.ok(Buffer.byteLength(stdout, 'utf8') > 8192, `expected > 8 KB JSON, got ${Buffer.byteLength(stdout, 'utf8')}`)
+      assert.ok(fitsShellOutput(stdout + stderr))
+      const parsed = JSON.parse(stdout)
+      assert.equal(parsed.code, 'project_choice_required')
+      assert.equal(parsed.project_selection.candidates.length, 50)
+      assert.equal(parsed.project_selection.candidates[49].name, 'Pipe Project 49')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps combined stdout + stderr within fitsShellOutput in a non-Git folder with near-limit 80-candidate project choices and respects stderr reserve (3c5147a7 / 91d7b47c / 4e32d1a5)', async () => {
+    const candidates = Array.from({ length: 80 }, (_, idx) => ({
+      project_id: `00000000-0000-4000-8000-${String(idx + 1).padStart(12, '0')}`,
+      name: `Near Limit Project ${idx}`,
+      organization_id: `10000000-0000-4000-8000-${String(idx + 1).padStart(12, '0')}`,
+      organization_name: `Org ${idx}`,
+    }))
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'project_choice_required',
+                error: 'Several accessible projects match. Choose a project and organisation.',
+                project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-nongit-80-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true })
+      fs.writeFileSync(
+        path.join(home, '.cursor', 'mcp.json'),
+        JSON.stringify({ mcpServers: { devspec: { url: `http://127.0.0.1:${port}/api/mcp` } } }),
+      )
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [
+            script,
+            'fast-connect',
+            '--local-id', 'nongit-80-conv',
+            '--owner-pid', String(process.pid),
+            '--cwd', home,
+            '--host-token', 'dvs_pipe_test_token',
+            '--no-poller',
+          ],
+          {
+            cwd: home,
+            env: {
+              ...process.env,
+              HOME: home,
+              DEVSPEC_MCP_URL: `http://127.0.0.1:${port}/api/mcp`,
+              DEVSPEC_MCP_TOKEN: 'dvs_pipe_test_token',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        child.on('error', reject)
+        child.on('close', (code) => resolve({ stdout, stderr, code }))
+      })
+      assert.equal(code, 1)
+      assert.equal(stderr, '', 'git remote probe in a non-Git folder must not write to stderr')
+      assert.ok(
+        fitsShellOutput(stdout + stderr),
+        `combined stdout (${stdout.length}) + stderr (${stderr.length}) must fit fitsShellOutput`,
+      )
+      const parsed = JSON.parse(stdout)
+      assert.equal(parsed.code, 'project_choice_required')
+      if (parsed.project_selection?.omitted_inline) {
+        assert.ok(parsed.complete_output_note?.command)
+      } else {
+        assert.equal(parsed.project_selection.candidates.length, 80)
+      }
+
+      // Also verify that explicit stderr reserve pushes a near-limit result into a sealed note.
+      const reserve = 'stderr diagnostic '.repeat(25)
+      const nearLimit = {
+        ok: false,
+        code: 'project_choice_required',
+        error: 'Choose a project.',
+        project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+      }
+      // Pad one candidate so fullText alone fits (~19,900 chars) but reserve + fullText exceeds 20,000.
+      const baseLen = (JSON.stringify(nearLimit, null, 2) + '\n').length
+      if (baseLen < 19_900) {
+        nearLimit.project_selection.candidates[0].description = 'd'.repeat(19_900 - baseLen)
+      }
+      const formatted = formatConnectCliOutput(nearLimit, { home, reserve })
+      assert.ok(fitsShellOutput(reserve + formatted), 'reserve + formatted stdout must fit fitsShellOutput')
+      const receipt = JSON.parse(formatted)
+      assert.equal(receipt.project_selection.omitted_inline, true)
+      assert.ok(receipt.complete_output_note?.command)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('bounds stderr within fitsShellOutput when --prompt-file or unknown CLI args exceed 20,000 characters (3c5147a7 / 91d7b47c)', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-promptfile-long-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    const runCliChild = (cliArgs, customHome = home) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [script, ...cliArgs], {
+          cwd: customHome,
+          env: { ...process.env, HOME: customHome },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        child.on('error', reject)
+        child.on('close', (code) => resolve({ stdout, stderr, code }))
+      })
+    try {
+      const longPath = 'x'.repeat(24_000)
+      const r1 = await runCliChild(['fast-connect', '--prompt-file', longPath])
+      assert.equal(r1.code, 1)
+      assert.ok(
+        fitsShellOutput(r1.stdout + r1.stderr),
+        `overlong --prompt-file combined output (${(r1.stdout + r1.stderr).length}) must fit fitsShellOutput`,
+      )
+      assert.match(r1.stderr, /--prompt-file/)
+      assert.match(r1.stderr, /actual_length 24000/)
+      assert.match(r1.stderr, /shell_limit_chars 20000/)
+      assert.match(r1.stderr, /cat ~\/\.devspec\/notes\/[0-9a-f]{16}\.md/)
+
+      // Even when ~/.devspec/notes cannot be written, stderr still stays inside fitsShellOutput.
+      const brokenHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-promptfile-broken-'))
+      try {
+        fs.mkdirSync(path.join(brokenHome, '.devspec'), { recursive: true })
+        fs.writeFileSync(path.join(brokenHome, '.devspec', 'notes'), 'file blocking notes dir')
+        const r2 = await runCliChild(['fast-connect', '--prompt-file', longPath], brokenHome)
+        assert.equal(r2.code, 1)
+        assert.ok(fitsShellOutput(r2.stdout + r2.stderr))
+        assert.match(r2.stderr, /actual_length 24000/)
+        assert.match(r2.stderr, /shell_limit_chars 20000/)
+        assert.match(r2.stderr, /fix write permissions on ~\/\.devspec\/notes/i)
+      } finally {
+        fs.rmSync(brokenHome, { recursive: true, force: true })
+      }
+
+      // Overlong unknown CLI command is also bounded.
+      const r3 = await runCliChild(['z'.repeat(24_000)])
+      assert.equal(r3.code, 2)
+      assert.ok(fitsShellOutput(r3.stdout + r3.stderr))
+      assert.match(r3.stderr, /actual_length 24000/)
+
+      // When prior stderr leaves too little room (only 20 chars) for the smallest visible note pointer or
+      // refusal, formatters explicitly refuse with field, limit, actual_length, note/counts, and recovery
+      // instead of overflowing fitsShellOutput or silently returning an empty string (reqs 3c5147a7 / 91d7b47c).
+      const tightReserve = 'e'.repeat(19_980)
+      assert.throws(
+        () => formatConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: tightReserve }),
+        (err) => {
+          assert.equal(err.code, 'shell_output_limit_exceeded')
+          assert.equal(err.field, 'reserve')
+          assert.equal(err.limit, 20_000)
+          assert.ok(err.actual_length > 20_000)
+          assert.ok(err.note?.id && err.note?.command, 'must still surface the saved note pointer')
+          return true
+        },
+      )
+
+      const brokenHome2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-tight-broken-'))
+      try {
+        fs.mkdirSync(path.join(brokenHome2, '.devspec'), { recursive: true })
+        fs.writeFileSync(path.join(brokenHome2, '.devspec', 'notes'), 'file blocking notes dir')
+        const candidatePayload = {
+          ok: false,
+          code: 'project_choice_required',
+          error: 'Multiple projects matched',
+          project_selection: {
+            version: 1,
+            status: 'multiple_matches',
+            candidates: [
+              { id: '1', name: 'A', detail: 'd'.repeat(10_000) },
+              { id: '2', name: 'B', detail: 'd'.repeat(10_000) },
+              { id: '3', name: 'C', detail: 'd'.repeat(10_000) },
+            ],
+          },
+        }
+        // When moderate reserve still fits the compact fallback, candidate counts and recovery are preserved whole.
+        const modReserve = 'e'.repeat(19_400)
+        const compactFallbackOut = formatConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: modReserve })
+        assert.ok(fitsShellOutput(modReserve + compactFallbackOut))
+        const parsedFallback = JSON.parse(compactFallbackOut)
+        assert.equal(parsedFallback.candidate_count, 3)
+        assert.equal(parsedFallback.returned_count, 0)
+        assert.equal(parsedFallback.omitted_count, 3)
+        assert.equal(parsedFallback.complete_output_note_failed, true)
+        assert.match(parsedFallback.recovery, /--project/)
+
+        // When tight reserve cannot fit even the compact refusal with counts and recovery, refuse explicitly.
+        assert.throws(
+          () => formatConnectCliOutput(candidatePayload, { home: brokenHome2, reserve: tightReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 20_000)
+            assert.equal(err.complete_output_note_failed, true)
+            assert.equal(err.candidate_count, 3)
+            assert.equal(err.returned_count, 0)
+            assert.equal(err.omitted_count, 3)
+            assert.match(err.recovery, /--project/)
+            return true
+          },
+        )
+        assert.throws(
+          () => formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: tightReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 20_000)
+            assert.equal(err.complete_output_note_failed, true)
+            return true
+          },
+        )
+        // When multi-byte UTF-8 reserve exceeds Cursor's 40,000-byte ceiling while staying
+        // under 20,000 characters, refusal MUST report the 40,000-byte limit and byte length
+        // rather than misreporting a 20,000-character limit with ~13,432 chars (3c5147a7 / 91d7b47c).
+        const utf8ByteReserve = '中'.repeat(13_330) // 13,330 chars, 39,990 UTF-8 bytes
+        assert.throws(
+          () => formatConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: utf8ByteReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 40_000)
+            assert.equal(err.limit_unit, 'bytes')
+            assert.ok(err.actual_length > 40_000, `expected byte actual_length > 40000, got ${err.actual_length}`)
+            assert.ok(err.actual_chars <= 20_000)
+            assert.equal(err.actual_bytes, err.actual_length)
+            assert.match(err.message, /40000/)
+            assert.match(err.message, /bytes/)
+            return true
+          },
+        )
+        assert.throws(
+          () => formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: utf8ByteReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.limit, 40_000)
+            assert.equal(err.limit_unit, 'bytes')
+            assert.ok(err.actual_length > 40_000)
+            assert.ok(err.actual_chars <= 20_000)
+            return true
+          },
+        )
+        // Default unwritable-note fallback on formatBoundedCliStderr must include concrete recovery instructions.
+        const defaultUnwritableDiag = formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2 })
+        assert.ok(fitsShellOutput(defaultUnwritableDiag))
+        assert.match(defaultUnwritableDiag, /fix write permissions on ~\/\.devspec\/notes and retry/i)
+
+        // Under-20,000-char multi-byte UTF-8 diagnostic (> 40,000 bytes) with unwritable notes
+        // under installBoundedCliStderr MUST cite the 40,000-byte ceiling on stderr AND record
+        // suppressedDiagnostics so the connect receipt discloses the omitted diagnostic (3c5147a7 / 91d7b47c).
+        {
+          let capturedUtf8Stderr = ''
+          const prevWrite = process.stderr.write
+          process.stderr.write = (chunk, enc, cb) => {
+            capturedUtf8Stderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+            const done = typeof enc === 'function' ? enc : cb
+            if (typeof done === 'function') done()
+            return true
+          }
+          const utf8Guard = installBoundedCliStderr({ label: 'remote-control-state', home: brokenHome2 })
+          try {
+            process.stderr.write(`${'中'.repeat(14_000)}\n`) // 14,001 chars (< 20,000), 42,001 bytes (> 40,000)
+            assert.match(capturedUtf8Stderr, /40000/)
+            assert.match(capturedUtf8Stderr, /bytes/)
+            assert.match(capturedUtf8Stderr, /fix write permissions on ~\/\.devspec\/notes and retry/i)
+            const suppressed = utf8Guard.getSuppressedDiagnostics()
+            assert.equal(suppressed?.omitted_count, 1)
+            assert.equal(suppressed?.omitted_bytes, 42_001)
+            assert.equal(suppressed?.shell_limit_bytes, 40_000)
+            assert.equal(suppressed?.note_write_failed_count, 1)
+            const receiptOut = formatConnectCliOutput(
+              { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
+              { home: brokenHome2, reserve: utf8Guard.getEmittedStderr(), suppressedDiagnostics: suppressed },
+            )
+            assert.ok(fitsShellOutput(capturedUtf8Stderr + receiptOut))
+            const parsedUtf8Receipt = JSON.parse(receiptOut)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.omitted_count, 1)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.omitted_bytes, 42_001)
+            assert.equal(parsedUtf8Receipt.stderr_diagnostics_omitted?.shell_limit_bytes, 40_000)
+            assert.match(parsedUtf8Receipt.stderr_diagnostics_omitted?.recovery, /~\/\.devspec\/notes/)
+          } finally {
+            utf8Guard.restore()
+            process.stderr.write = prevWrite
+          }
+        }
+
+        // When connect note writing fails after earlier stderr diagnostics were saved in notes,
+        // both the minimal fallback (oversized error field) AND tight-reserve fallbackObj MUST
+        // preserve stderr_diagnostics_omitted counts and saved note read commands (3c5147a7 / 91d7b47c).
+        const savedNotes = Array.from({ length: 12 }, (_, idx) => {
+          const id = `${String(idx + 1).padStart(16, '0')}`
+          return { id, command: `cat ~/.devspec/notes/${id}.md`, length: 400 }
+        })
+        const suppressedWithSavedNotes = {
+          omitted_count: 12,
+          omitted_chars: 4800,
+          shell_limit_chars: 20_000,
+          notes: savedNotes,
+          recovery: 'Read saved stderr notes using the cat commands above.',
+        }
+        const minimalNoteFailOut = formatConnectCliOutput(
+          { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+          { home: brokenHome2, suppressedDiagnostics: suppressedWithSavedNotes },
+        )
+        assert.ok(fitsShellOutput(minimalNoteFailOut))
+        const parsedMinimalNoteFail = JSON.parse(minimalNoteFailOut)
+        assert.equal(parsedMinimalNoteFail.omitted_fields_due_to_shell_limit, true)
+        assert.equal(parsedMinimalNoteFail.stderr_diagnostics_omitted?.omitted_count, 12)
+        assert.equal(parsedMinimalNoteFail.stderr_diagnostics_omitted?.notes?.length, 12)
+        assert.equal(
+          parsedMinimalNoteFail.stderr_diagnostics_omitted.notes[0].command,
+          'cat ~/.devspec/notes/0000000000000001.md',
+        )
+        assert.match(parsedMinimalNoteFail.recovery, /stderr_diagnostics_omitted\.notes/)
+
+        const manifestTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc-manifest-'))
+        const blockedTmpFile = path.join(manifestTmpDir, 'not-a-dir')
+        fs.writeFileSync(blockedTmpFile, 'blocked')
+        try {
+          const tightStderrReserve = 'e'.repeat(18_200)
+          const trimmedFallbackOut = formatConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressedWithSavedNotes,
+              tmpDir: manifestTmpDir,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + trimmedFallbackOut))
+          const parsedTrimmed = JSON.parse(trimmedFallbackOut)
+          assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.omitted_count, 12)
+          assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.notes_total_count, 12)
+          assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_returned_count >= 1)
+          assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_omitted_count >= 1)
+          assert.equal(
+            parsedTrimmed.stderr_diagnostics_omitted.notes[0].command,
+            'cat ~/.devspec/notes/0000000000000001.md',
+          )
+          const cont12 = parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation
+          assert.equal(cont12?.parts, 1)
+          assert.match(cont12?.command, /^cat /)
+          assert.doesNotMatch(cont12?.command, /ls -lt/)
+          const manifestFile12 = cont12.command.replace(/^cat /, '').replace(/^'|'$/g, '')
+          const manifestBody12 = fs.readFileSync(manifestFile12, 'utf8')
+          assert.ok(fitsShellOutput(manifestBody12))
+          for (const n of savedNotes) {
+            assert.ok(manifestBody12.includes(n.command), `manifest must list ${n.command}`)
+          }
+          assert.ok(parsedTrimmed.recovery.includes(cont12.command))
+
+          // 300 saved stderr notes from this connect attempt: continuation MUST be paged
+          // so every part stays within fitsShellOutput, and MUST list ONLY this attempt's
+          // 300 notes (never unrelated files from ~/.devspec/notes).
+          const savedNotes300 = Array.from({ length: 300 }, (_, idx) => {
+            const id = `a${String(idx + 1).padStart(15, '0')}`
+            return { id, command: `cat ~/.devspec/notes/${id}.md`, length: 400 }
+          })
+          const suppressed300 = {
+            omitted_count: 300,
+            omitted_chars: 120_000,
+            shell_limit_chars: 20_000,
+            notes: savedNotes300,
+            recovery: 'Read saved stderr notes using the cat commands above.',
+          }
+          const trimmed300Out = formatConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressed300,
+              tmpDir: manifestTmpDir,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + trimmed300Out))
+          const parsed300 = JSON.parse(trimmed300Out)
+          const cont300 = parsed300.stderr_diagnostics_omitted?.notes_continuation
+          assert.ok(cont300?.parts >= 2, `expected multi-part paged manifest for 300 notes, got ${cont300?.parts}`)
+          let nextCmd = cont300.command
+          let collected300 = ''
+          let visitedParts = 0
+          while (nextCmd) {
+            const partPath = nextCmd.replace(/^cat /, '').replace(/^'|'$/g, '')
+            const partText = fs.readFileSync(partPath, 'utf8')
+            assert.ok(fitsShellOutput(partText), `manifest part ${visitedParts + 1} must fit fitsShellOutput`)
+            collected300 += partText
+            visitedParts += 1
+            const m = /read on with `(cat [^`]+)`/.exec(partText)
+            nextCmd = m ? m[1] : null
+          }
+          assert.equal(visitedParts, cont300.parts)
+          for (const n of savedNotes300) {
+            assert.ok(collected300.includes(n.command), `paged manifest must include ${n.command}`)
+          }
+          assert.ok(!collected300.includes('0000000000000001.md'), 'paged manifest must not include unrelated notes')
+
+          // When tmpDir is also unwritable: small omitted list falls back to exact omitted_note_ids;
+          // 300 notes that cannot fit inline refuse explicitly instead of silently cutting.
+          const inlineIdsFallbackOut = formatConnectCliOutput(
+            { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+            {
+              home: brokenHome2,
+              reserve: tightStderrReserve,
+              suppressedDiagnostics: suppressedWithSavedNotes,
+              tmpDir: blockedTmpFile,
+            },
+          )
+          assert.ok(fitsShellOutput(tightStderrReserve + inlineIdsFallbackOut))
+          const parsedInlineIds = JSON.parse(inlineIdsFallbackOut)
+          const inlineCont = parsedInlineIds.stderr_diagnostics_omitted?.notes_continuation
+          assert.ok(Array.isArray(inlineCont?.omitted_note_ids))
+          assert.equal(
+            parsedInlineIds.stderr_diagnostics_omitted.notes.length + inlineCont.omitted_note_ids.length,
+            12,
+          )
+          assert.equal(inlineCont.command_template, 'cat ~/.devspec/notes/<id>.md')
+
+          assert.throws(
+            () =>
+              formatConnectCliOutput(
+                { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+                {
+                  home: brokenHome2,
+                  reserve: tightStderrReserve,
+                  suppressedDiagnostics: suppressed300,
+                  tmpDir: blockedTmpFile,
+                },
+              ),
+            (err) => {
+              assert.equal(err.code, 'shell_output_limit_exceeded')
+              assert.doesNotMatch(
+                err.message,
+                /omitted_note_ids|stderr_diagnostics_omitted\.notes/,
+                'thrown refusal must not direct reader to unprinted JSON fields',
+              )
+              assert.match(err.message, /300 saved stderr diagnostic note\(s\)/)
+              assert.match(err.message, /temporary directory/)
+              return true
+            },
+          )
+        } finally {
+          fs.rmSync(manifestTmpDir, { recursive: true, force: true })
+        }
+
+        // Byte-only overflow (<= 20,000 chars but > 40,000 UTF-8 bytes) MUST report the
+        // 40,000-byte UTF-8 Shell limit accurately in both the saved-note receipt and the
+        // unwritable-note fallback rather than misclaiming the 20,000-char limit (3c5147a7 / 91d7b47c).
+        const utf8ByteOnlyPayload = { ok: false, error: '中'.repeat(14_000) }
+        const utf8ByteOnlyReceiptOut = formatConnectCliOutput(utf8ByteOnlyPayload, { home })
+        assert.ok(fitsShellOutput(utf8ByteOnlyReceiptOut))
+        const parsedUtf8ByteOnlyReceipt = JSON.parse(utf8ByteOnlyReceiptOut)
+        assert.ok(parsedUtf8ByteOnlyReceipt.complete_output_note?.total_chars <= 20_000)
+        assert.ok(parsedUtf8ByteOnlyReceipt.complete_output_note?.total_bytes > 40_000)
+        assert.equal(parsedUtf8ByteOnlyReceipt.complete_output_note?.shell_limit_bytes, 40_000)
+        assert.match(parsedUtf8ByteOnlyReceipt.note, /40000-byte UTF-8 Shell limit/)
+        assert.doesNotMatch(parsedUtf8ByteOnlyReceipt.note, /exceeds Cursor's 20000-char Shell limit/)
+        const savedUtf8ByteOnly = readNoteText(parsedUtf8ByteOnlyReceipt.complete_output_note.id, { home })
+        assert.ok(savedUtf8ByteOnly && savedUtf8ByteOnly.includes('中'.repeat(14_000)))
+
+        const utf8ByteOnlyNoteFailOut = formatConnectCliOutput(utf8ByteOnlyPayload, { home: brokenHome2 })
+        assert.ok(fitsShellOutput(utf8ByteOnlyNoteFailOut))
+        const parsedUtf8ByteOnlyNoteFail = JSON.parse(utf8ByteOnlyNoteFailOut)
+        assert.ok(parsedUtf8ByteOnlyNoteFail.total_chars <= 20_000)
+        assert.ok(parsedUtf8ByteOnlyNoteFail.total_bytes > 40_000)
+        assert.equal(parsedUtf8ByteOnlyNoteFail.shell_limit_bytes, 40_000)
+        assert.match(parsedUtf8ByteOnlyNoteFail.recovery, /-byte \(/)
+      } finally {
+        fs.rmSync(brokenHome2, { recursive: true, force: true })
+      }
+
+      // Oversized browser-approval stderr (19,900-char URL) during connect is saved whole in a sealed note
+      // via installBoundedCliStderr, leaving headroom so combined stdout + stderr always fits fitsShellOutput
+      // and neither the approval URL nor the final sign_in_pending result is cut (reqs 3c5147a7 / 91d7b47c).
+      const hugeApprovalUrl = `https://app.devspec.ai/approve?token=${'u'.repeat(19_900)}`
+      const approvalLine = `DevSpec: approve Cursor in your browser to turn on remote control and commit tracking (staging). If it did not open, open this link: ${hugeApprovalUrl}\n`
+      const origWrite = process.stderr.write
+      let capturedRawStderr = ''
+      process.stderr.write = (chunk, enc, cb) => {
+        capturedRawStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        const done = typeof enc === 'function' ? enc : cb
+        if (typeof done === 'function') done()
+        return true
+      }
+      const guard = installBoundedCliStderr({ label: 'remote-control-state', home })
+      try {
+        process.stderr.write(approvalLine)
+        const pendingResult = {
+          ok: false,
+          code: 'sign_in_pending',
+          sign_in_url: hugeApprovalUrl,
+          error: `Still waiting for your OK in the browser (${hugeApprovalUrl}).`,
+        }
+        const stdoutOut = formatConnectCliOutput(pendingResult, {
+          home,
+          reserve: guard.getEmittedStderr(),
+        })
+        assert.ok(
+          fitsShellOutput(capturedRawStderr + stdoutOut),
+          `combined browser-approval stderr (${capturedRawStderr.length}) + stdout (${stdoutOut.length}) must fit fitsShellOutput`,
+        )
+        assert.match(capturedRawStderr, /notes\/[0-9a-f]{16}\.md/, 'oversized browser-approval message must be saved whole in a sealed note')
+        const noteMatch = /notes\/([0-9a-f]{16})\.md/.exec(capturedRawStderr)
+        const savedApproval = readNoteText(noteMatch[1], { home })
+        assert.ok(savedApproval && savedApproval.includes(hugeApprovalUrl), 'sealed stderr note must preserve the complete 19,900-char approval URL')
+        const parsedStdout = JSON.parse(stdoutOut)
+        assert.ok(parsedStdout.complete_output_note?.id, 'oversized sign_in_pending stdout must also be saved whole in a sealed note')
+      } finally {
+        guard.restore()
+        process.stderr.write = origWrite
+      }
+
+      // When earlier diagnostics fill the stderr allowance, a later diagnostic MUST NOT be
+      // silently dropped — with BOTH writable notes (emits note pointer + receipt disclosure)
+      // and unwritable notes (emits recovery notice + receipt disclosure) (3c5147a7 / 91d7b47c).
+      for (const writable of [true, false]) {
+        const testHome = fs.mkdtempSync(path.join(os.tmpdir(), `cursor-fc-stderr-full-${writable ? 'rw' : 'ro'}-`))
+        if (!writable) {
+          fs.mkdirSync(path.join(testHome, '.devspec'), { recursive: true })
+          fs.writeFileSync(path.join(testHome, '.devspec', 'notes'), 'blocked')
+        }
+        let rawStderr = ''
+        const prevWrite = process.stderr.write
+        process.stderr.write = (chunk, enc, cb) => {
+          rawStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+          const done = typeof enc === 'function' ? enc : cb
+          if (typeof done === 'function') done()
+          return true
+        }
+        const fullGuard = installBoundedCliStderr({ label: 'remote-control-state', home: testHome })
+        try {
+          // Fill stderr right up to the allowance with small diagnostics, then emit a later diagnostic.
+          for (let i = 0; i < 110; i += 1) {
+            process.stderr.write(`early-diag-${i}: ${'d'.repeat(170)}\n`)
+          }
+          const laterDiag = 'IMPORTANT_LATER_DIAGNOSTIC: something failed late in connect\n'
+          process.stderr.write(laterDiag)
+          const suppressed = fullGuard.getSuppressedDiagnostics()
+          assert.ok(suppressed && suppressed.omitted_count >= 1, `expected suppressed disclosure (writable=${writable})`)
+          assert.match(rawStderr, /diagnostic omitted/, `stderr must visibly disclose omission (writable=${writable})`)
+          if (writable) {
+            assert.match(rawStderr, /notes\/[0-9a-f]{16}\.md/, 'writable omission notice must point to saved note')
+            assert.ok(suppressed.notes?.length >= 1)
+            const lastNote = suppressed.notes[suppressed.notes.length - 1]
+            const saved = readNoteText(lastNote.id, { home: testHome })
+            assert.ok(saved && saved.includes('IMPORTANT_LATER_DIAGNOSTIC'))
+          } else {
+            assert.match(rawStderr, /fix ~\/\.devspec\/notes permissions and retry/i, 'unwritable omission notice must include recovery')
+            assert.ok(suppressed.note_write_failed_count >= 1)
+          }
+          const receipt = formatConnectCliOutput(
+            { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
+            { home: testHome, reserve: fullGuard.getEmittedStderr(), suppressedDiagnostics: suppressed },
+          )
+          assert.ok(
+            fitsShellOutput(rawStderr + receipt),
+            `combined stderr (${rawStderr.length}) + stdout (${receipt.length}) must fit fitsShellOutput (writable=${writable})`,
+          )
+          const parsedReceipt = JSON.parse(receipt)
+          assert.ok(
+            parsedReceipt.stderr_diagnostics_omitted?.omitted_count >= 1 ||
+              parsedReceipt.stderr_omitted_count >= 1,
+            `final connect receipt must disclose omitted stderr diagnostics (writable=${writable})`,
+          )
+        } finally {
+          fullGuard.restore()
+          process.stderr.write = prevWrite
+          fs.rmSync(testHome, { recursive: true, force: true })
+        }
+      }
+
+      // Backpressured stderr pipe: a 12,019-char diagnostic below the Shell ceiling must
+      // flush completely via flushStderr() before process.exit() rather than losing bytes
+      // past the first 4,096-byte chunk (3c5147a7 / 91d7b47c).
+      {
+        const diag12k = `backpressure-diag:${'z'.repeat(12_000)}\n`
+        assert.equal(diag12k.length, 12_019)
+        let delivered = ''
+        const prevWrite = process.stderr.write
+        process.stderr.write = (chunk, enc, cb) => {
+          const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+          const done = typeof enc === 'function' ? enc : cb
+          // Simulate a backpressured pipe: only deliver first 4,096 bytes synchronously,
+          // rest asynchronously after a tick.
+          delivered += text.slice(0, 4096)
+          setTimeout(() => {
+            delivered += text.slice(4096)
+            if (typeof done === 'function') done()
+          }, 20)
+          return false
+        }
+        const bpGuard = installBoundedCliStderr({ label: 'remote-control-state', home })
+        try {
+          process.stderr.write(diag12k)
+          assert.equal(delivered.length, 4096, 'before flushStderr, backpressured pipe only drained first 4,096 chars')
+          await bpGuard.flushStderr()
+          assert.equal(delivered.length, 12_019, 'flushStderr must wait until every byte of stderr has drained')
+          assert.equal(delivered, diag12k)
+        } finally {
+          bpGuard.restore()
+          process.stderr.write = prevWrite
+        }
+      }
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
 })

@@ -14,8 +14,13 @@
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { CURSOR_SHELL_OUTPUT_MAX_BYTES, CURSOR_SHELL_OUTPUT_MAX_CHARS } from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
+
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 import { AGENT_NAME } from './agent-identity.mjs'
 import { UUID, candidate, selectNamedProject, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { readRepositorySnapshot, storeRepositorySnapshot, repositoryContextTextFile, refreshRepositoryRules, renderGithubIdentity } from './repository-context.mjs'
@@ -32,6 +37,10 @@ import {
   registerConnection,
   attachConnection,
   writeConnectionState,
+  formatConnectCliOutput,
+  formatBoundedCliStderr,
+  installBoundedCliStderr,
+  writeStreamAndFlush,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -94,6 +103,7 @@ export function resolveGitRemote(cwd, { execFileSyncImpl = execFileSync } = {}) 
       encoding: 'utf8',
       windowsHide: true,
       timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const url = String(out || '').trim()
     return url || null
@@ -525,10 +535,16 @@ export async function fastConnect(opts = {}) {
     connectionId = registered.connection_id
     codename = registered.codename || registered.session_codename || null
 
-    if (sessionId) {
+    const attachTarget =
+      sessionId ||
+      (localAction.action === 'reconnect' && !newSession && localAction.session_id && registered.session_id !== localAction.session_id
+        ? localAction.session_id
+        : null)
+
+    if (attachTarget) {
       const attached = await attachFn({
         connectionId,
-        sessionId,
+        sessionId: attachTarget,
         cwd,
         launchId,
         agent,
@@ -544,11 +560,11 @@ export async function fastConnect(opts = {}) {
           local_id: localId,
           launch_id: launchId,
           connection_id: connectionId,
-          session_id: sessionId,
+          session_id: attachTarget,
           codename,
         }
       }
-      attachedSessionId = attached.session_id || sessionId
+      attachedSessionId = attached.session_id || attachTarget
     } else {
       // Registration also refreshes existing native conversations. Its attachment
       // snapshot is authoritative; hydration must not erase a live room bond.
@@ -694,6 +710,12 @@ export async function fastConnect(opts = {}) {
 
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
+  const repoCount = Array.isArray(projectSnapshot?.repository_context?.repositories)
+    ? projectSnapshot.repository_context.repositories.length
+    : null
+  // Return a short connect summary only (item 083422dd): the complete project rules
+  // and repository inventory are already persisted via storeRepositorySnapshot and
+  // delivered whole once through the repository-context note channel.
   return {
     ok: true,
     connection_id: connectionId,
@@ -702,11 +724,11 @@ export async function fastConnect(opts = {}) {
     local_id: localId,
     launch_id: launchId,
     action: localAction.action,
+    plugin_root: PLUGIN_ROOT,
     ...(createdRoom ? { new_session: true, session_url: createdRoom.session_url, title: createdRoom.title, access: makePrivate ? 'private' : 'shared' } : {}),
-    project_id: projectContext?.project.id,
-    project_selection: projectContext,
-    project_context: projectSnapshot,
-    project_context_file: repositoryContextTextFile(localId, opts.projectHome),
+    project_id: projectContext?.project.id ?? null,
+    ...(projectContext?.project?.name ? { project_name: projectContext.project.name } : {}),
+    ...(repoCount !== null ? { repository_count: repoCount } : {}),
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
@@ -715,12 +737,13 @@ export async function fastConnect(opts = {}) {
   }
 }
 
-export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --local-id <id> --owner-pid <pid> [options]
+export const FAST_CONNECT_USAGE = `Usage: node remote-control-state.mjs fast-connect --owner-pid <pid> [options]
 
-Connect this Cursor conversation to DevSpec in one command: register it, attach
-it to a room if asked, write its state and start its poller.
+Connect this Cursor conversation to DevSpec in one command: read its conversation
+id from CURSOR_CONVERSATION_ID, check existing connection state, register or
+reconnect, attach to a room if asked, write its state and start its poller.
 
-  --local-id <id>          This conversation's id (CURSOR_CONVERSATION_ID).
+  --local-id <id>          Optional override for CURSOR_CONVERSATION_ID.
   --agent <name>           Agent name shown in DevSpec. Default: Cursor.
   --cwd <path>             The working folder. Default: the current directory.
   --owner-pid <pid>        The Cursor process this connection belongs to; pass "$PPID".
@@ -732,53 +755,100 @@ it to a room if asked, write its state and start its poller.
   --title <text>           With --new: the new room's title.
   --project <name-or-id>   Choose this conversation's project. --project-id is the same.
   --launch-id <uuid>       The launch id stamped in the prompt, for local diagnostics.
-  --codename <name>        This agent's codename instead of a minted one.
+  --codename <name>        This agent's codename instead of a minted one. --name is the same.
   -h, --help               Print this help and exit. Connects nothing.
 
-Prints one JSON result; exits 0 when connected, 1 when not.
+Prints one short JSON result; exits 0 when connected, 1 when not.
 `
+
+export { formatConnectCliOutput as formatFastConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
 
 /**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
+ * @param {{ getEmittedStderr?: () => string }} [opts]
  */
-export async function runFastConnectCli(args) {
-  // Help is read before anything else: it registers, writes and calls nothing.
-  if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    process.stdout.write(FAST_CONNECT_USAGE)
-    process.exit(0)
+export async function runFastConnectCli(
+  args,
+  { getEmittedStderr = null, getSuppressedDiagnostics = null, flushStderr = null } = {},
+) {
+  const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
+  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
+  const currentSuppressed = () =>
+    getSuppressedDiagnostics
+      ? getSuppressedDiagnostics()
+      : localStderrGuard
+        ? localStderrGuard.getSuppressedDiagnostics()
+        : null
+  const drainStderr = async () => {
+    if (typeof flushStderr === 'function') await flushStderr()
+    else if (localStderrGuard) await localStderrGuard.flushStderr()
   }
-
-  let promptText = null
-  if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
-    try {
-      promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
-    } catch (err) {
-      process.stderr.write(
-        `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
-      )
-      process.exit(1)
+  try {
+    // Help is read before anything else: it registers, writes and calls nothing.
+    if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
+      await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
+      await drainStderr()
+      process.exit(0)
     }
+
+    let promptText = null
+    if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
+      const rawPromptFile = String(args['prompt-file'])
+      try {
+        promptText = fs.readFileSync(path.resolve(rawPromptFile), 'utf8')
+      } catch (err) {
+        const errCode = err && typeof err === 'object' && 'code' in err ? String(err.code) : 'read_failed'
+        const detail = err instanceof Error ? err.message : String(err)
+        const rawDiag = `fast-connect: could not read --prompt-file: ${detail}\n`
+        const priorStderr = currentStderr()
+        const rawDiagBytes = Buffer.byteLength(rawDiag)
+        const exceededBytesOnly =
+          priorStderr.length + rawDiag.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(priorStderr) + rawDiagBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        const summary = exceededBytesOnly
+          ? `could not read --prompt-file (field --prompt-file, actual_bytes ${Buffer.byteLength(rawPromptFile)}, actual_chars ${rawPromptFile.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}, code ${errCode})`
+          : `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
+        const bounded = formatBoundedCliStderr(rawDiag, {
+          label: 'fast-connect',
+          reserve: priorStderr,
+          summary,
+          fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback failed — fix write permissions on ~/.devspec/notes or pass a shorter --prompt-file path and retry.\n`,
+        })
+        await writeStreamAndFlush(process.stderr, bounded)
+        await drainStderr()
+        process.exit(1)
+      }
+    }
+
+    const result = await fastConnect({
+      localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
+      cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+      sessionId: typeof args.session === 'string' ? args.session : null,
+      newSession: !!args.new,
+      title: typeof args.title === 'string' ? args.title : null,
+      private: !!args.private,
+      launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
+      projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
+      agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
+      ownerPid: args['owner-pid'] ?? null,
+      noPoller: !!args.noPoller,
+      hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
+      codename: typeof args.codename === 'string' ? args.codename : null,
+      forceNew: !!args.forceNew,
+      promptText,
+    })
+
+    await writeStreamAndFlush(
+      process.stdout,
+      formatConnectCliOutput(result, {
+        reserve: currentStderr(),
+        suppressedDiagnostics: currentSuppressed(),
+      }),
+    )
+    await drainStderr()
+    process.exit(result.ok ? 0 : 1)
+  } finally {
+    if (localStderrGuard) localStderrGuard.restore()
   }
-
-  const result = await fastConnect({
-    localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
-    cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
-    sessionId: typeof args.session === 'string' ? args.session : null,
-    newSession: !!args.new,
-    title: typeof args.title === 'string' ? args.title : null,
-    private: !!args.private,
-    launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
-    projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
-    agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
-    ownerPid: args['owner-pid'] ?? null,
-    noPoller: !!args.noPoller,
-    hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
-    codename: typeof args.codename === 'string' ? args.codename : null,
-    forceNew: !!args.forceNew,
-    promptText,
-  })
-
-  process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-  process.exit(result.ok ? 0 : 1)
 }

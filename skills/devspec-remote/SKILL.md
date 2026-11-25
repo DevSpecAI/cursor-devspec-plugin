@@ -56,32 +56,25 @@ Never rejoin/attach a session because it shared a repo/cwd or another agent stop
 - **`--project <name-or-id>`** (`--project-id` also accepted) → explicit project for this conversation without writing a folder pin. Do not pre-resolve automatic scope: `fast-connect` sends the git remote and `.devspec/project.json` pin together and the server owns precedence (unique remote beats stale pin; candidate pin disambiguates shared remote; greenfield pin works with no repo; missing pins are normal and must not cause failed reads). If `fast-connect` returns `project_selection` with `status: "choice_required"`, or for `/devspec-project` opt-ins, open `connection-plumbing.md`.
 - **`--name="…"`** → agent name on the Agents page in place of a minted codename; pass as `--codename "…"`.
 
-### 2. Resolve local id & check existing bond
+### 2. Connect in one command (no preliminary helper calls)
+
+Run **one single Shell command** — do **not** run separate `find`/`plugin-root.mjs`, `resolve-local-id`, or `resolve-local` calls first. `fast-connect` reads `CURSOR_CONVERSATION_ID` from the environment itself (if absent, it refuses cleanly rather than fabricating an ID; native `create-chat` mints IDs for fresh chats), resolves whether this conversation is `already_live`, `reconnect` (reattaching its prior session if it had one), `register`, or `create_and_attach`, handles sign-in, optional `--new` session creation/attach, state write, and starting the continuous zero-token poller, and prints **one short JSON result** (including `plugin_root` for any later helper call). Pass `--launch-id` if `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`) is set, and pass `--name "…"` (or `--codename "…"`) when the person asked for a custom agent name.
 
 ```bash
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local-id --agent "Cursor" [--launch-id "<launch_id>"]
-node "$PLUGIN/hooks/scripts/remote-control-state.mjs" resolve-local --agent "Cursor" --local-id "<local_id>" [--force-new if --new]
-```
-
-Uses Cursor CLI's own `CURSOR_CONVERSATION_ID`; if unavailable, stop rather than minting a substitute for an existing chat (native `create-chat` mints IDs for fresh chats). Keep `local_id` and pass `--local-id` on every subsequent call. If the stamped prompt has `DevSpec launch_id for this run …: <uuid>` (or env `DEVSPEC_LAUNCH_ID`), pass `--launch-id` on resolve/register/attach/write/wait for `devspec-debug` diagnostics.
-
-| `resolve-local` `action` | What to do |
-|---|---|
-| `already_live` | Skip re-registering; re-arm wait (step 5). If `--session` changed, attach (see `connection-plumbing.md`). |
-| `reconnect` | Resume this conversation's recoverable stop (reattach its prior session only if it had one). |
-| `register` / `create_and_attach` | Run `fast-connect` below. |
-
-### 3. Connect (one-shot `fast-connect`)
-
-```bash
+PLUGIN="${CLAUDE_PLUGIN_ROOT:-}"
+if [ -z "$PLUGIN" ] || [ ! -f "$PLUGIN/hooks/scripts/remote-control-state.mjs" ]; then
+  FINDER=$(find "$HOME/.cursor/plugins" -maxdepth 9 -path '*/hooks/scripts/plugin-root.mjs' 2>/dev/null | head -1)
+  PLUGIN=$([ -n "$FINDER" ] && node "$FINDER")
+fi
+[ -n "$PLUGIN" ] || { echo "No installed Cursor DevSpec plugin found — reinstall it in Cursor." >&2; exit 1; }
 node "$PLUGIN/hooks/scripts/remote-control-state.mjs" fast-connect \
-  --local-id "<local_id>" --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" \
-  [--session "<uuid>" | --new [--private] [--title "…"]] [--project "<name-or-id>"] [--codename "<--name>"] [--launch-id "<launch_id>"]
+  --agent "Cursor" --cwd "$(pwd)" --owner-pid "$PPID" \
+  [--session "<uuid>" | --new [--private] [--title "…"]] [--project "<name-or-id>"] [--name "<--name>"] [--launch-id "<launch_id>"]
 ```
 
-`--owner-pid "$PPID"` anchors the poller to this Cursor process (without it the poller does not start). `fast-connect` handles sign-in, registration, optional `--new` session creation/attach, state write, and starting the continuous zero-token poller in one call (`fast-connect --help` lists its flags and connects nothing). For `--new`, it returns `session_id` and `session_url`; on failure, `code` names `create_session_failed` or `attach_failed` and the connection is not in a new session. If `fast-connect` returns a `sign_in_*` / `signed_out` code, or you need manual `register`/`attach`/`write`/`ensure-poller`, open `"$PLUGIN/skills/devspec-remote/connection-plumbing.md"`.
+`--owner-pid "$PPID"` anchors the poller to this Cursor process (without it the poller does not start). `fast-connect --help` lists its flags and connects nothing. For `--new`, it returns `session_id` and `session_url`; on failure, `code` names `create_session_failed` or `attach_failed` and the connection is not in a new session. If `fast-connect` returns a `sign_in_*` / `signed_out` code, or you need manual `register`/`attach`/`write`/`ensure-poller`, open `"$PLUGIN/skills/devspec-remote/connection-plumbing.md"`.
 
-Store the full **`connection_id`** UUID and **`codename`** (server-minted adjective-animal identity, or `--name`). Apply the run-wide instruction tiers returned in JSON (`project_custom_instructions`, `project_agent_rules`, `owner_agent_rules`; reply style is not one of them — open `records-and-instructions.md` for precedence and rules).
+Store the full **`connection_id`** UUID and **`codename`** (server-minted adjective-animal identity, or `--name`). Connect prints a short summary only — the project's full repository list and run-wide instruction tiers (`project_custom_instructions`, `project_agent_rules`, `owner_agent_rules`) are delivered whole once through the plugin's project-context note hook. Read every part of that note with its exact `cat` command (never piped through `head`/`tail`) so the reminder stops immediately; reply style is not one of the run-wide tiers (open `records-and-instructions.md` for precedence and rules).
 
 Print **in this local terminal only** (never post this block, any fragment of it, or any "You're connected…" / reconnect / listening / disconnect chrome via `devspec__post_session_message`, including on `--new` — attach stamps `remote_control_started` and the Agents page owns presence):
 

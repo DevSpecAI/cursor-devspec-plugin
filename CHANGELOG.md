@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.1
+
+- **Your Cursor agent can now propose and manage Inventory Map connections with proper request attribution.** Added `manage_inventory_connections` to request-attribution hooks and added concise Inventory guidance covering plain human-readable names, accurate resource types, curated `profile_fields` lookups, companion Document/Memory links, duplicate previews (`preview_ack`), and verified connections with code or config evidence.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.34.0
 
 - **Browser sign-in only.** Removed the legacy `DEVSPEC_MCP_TOKEN` environment-variable fallback from the plugin and its docs. Both Cursor's DevSpec tools and background features sign in through browser approval (with the copy-a-code flow over SSH).
