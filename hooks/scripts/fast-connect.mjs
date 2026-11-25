@@ -772,6 +772,16 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
   const richText = JSON.stringify(base, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${richText}`)) return richText
 
+  const compactStderrOmitted = base.stderr_diagnostics_omitted
+    ? {
+        omitted_count: base.stderr_diagnostics_omitted.omitted_count,
+        omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(base.stderr_diagnostics_omitted.note_write_failed_count
+          ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
+          : {}),
+        complete_in_note: noteRef.id,
+      }
+    : null
   const minimal = {
     ok: Boolean(base.ok),
     ...(typeof base.code === 'string' ? { code: base.code } : {}),
@@ -792,6 +802,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
         }
       : {}),
     omitted_fields_in_note: true,
+    ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
     complete_output_note: noteRef,
     note: noteMsg,
   }
@@ -809,6 +820,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
         ...(candidateCount !== null
           ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
           : {}),
+        ...(compactStderrOmitted ? { stderr_diagnostics_omitted: compactStderrOmitted } : {}),
         omitted_fields_in_note: true,
         complete_output_note: noteRef,
         note: noteMsg,
@@ -821,6 +833,9 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
     ok: Boolean(base.ok),
     ...(candidateCount !== null
       ? { candidate_count: candidateCount, returned_count: 0, omitted_count: candidateCount }
+      : {}),
+    ...(base.stderr_diagnostics_omitted
+      ? { stderr_omitted_count: base.stderr_diagnostics_omitted.omitted_count }
       : {}),
     note: noteRef.id,
     read: noteRef.command,
@@ -926,6 +941,9 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
         }
       : {}),
     complete_output_note_failed: true,
+    ...(base.stderr_diagnostics_omitted
+      ? { stderr_diagnostics_omitted: base.stderr_diagnostics_omitted }
+      : {}),
     total_chars: fullTextLength,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     recovery: allCandidates
@@ -950,9 +968,20 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
   })
 }
 
-export function formatFastConnectCliOutput(result, { home = os.homedir(), reserve = '' } = {}) {
+export function formatFastConnectCliOutput(
+  result,
+  { home = os.homedir(), reserve = '', suppressedDiagnostics = null } = {},
+) {
   const normalized =
     result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
+  if (
+    suppressedDiagnostics &&
+    normalized &&
+    typeof normalized === 'object' &&
+    !Array.isArray(normalized)
+  ) {
+    normalized.stderr_diagnostics_omitted = suppressedDiagnostics
+  }
   if (
     normalized &&
     typeof normalized === 'object' &&
@@ -1008,9 +1037,18 @@ export function writeStreamAndFlush(stream, text) {
  * @param {Record<string, unknown>} args parseArgs output
  * @param {{ getEmittedStderr?: () => string }} [opts]
  */
-export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) {
+export async function runFastConnectCli(
+  args,
+  { getEmittedStderr = null, getSuppressedDiagnostics = null } = {},
+) {
   const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
   const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
+  const currentSuppressed = () =>
+    getSuppressedDiagnostics
+      ? getSuppressedDiagnostics()
+      : localStderrGuard
+        ? localStderrGuard.getSuppressedDiagnostics()
+        : null
   try {
     // Help is read before anything else: it registers, writes and calls nothing.
     if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
@@ -1059,7 +1097,10 @@ export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) 
 
     await writeStreamAndFlush(
       process.stdout,
-      formatFastConnectCliOutput(result, { reserve: currentStderr() }),
+      formatFastConnectCliOutput(result, {
+        reserve: currentStderr(),
+        suppressedDiagnostics: currentSuppressed(),
+      }),
     )
     process.exit(result.ok ? 0 : 1)
   } finally {

@@ -1928,10 +1928,21 @@ export function formatBoundedCliStderr(
 }
 
 /**
+ * Visible omission notice emitted on stderr when earlier diagnostics exhaust the stderr
+ * allowance beside `CLI_STDOUT_RECEIPT_HEADROOM`, so no subsequent stderr write is ever
+ * dropped silently without a visible disclosure and recovery path (reqs 3c5147a7 / 91d7b47c).
+ */
+function buildStderrOmissionNotice(label, { length, note = null } = {}) {
+  return note
+    ? `${label}: diagnostic omitted (${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit; saved in note ${note.id}: ${note.command}); further stderr suppressed.\n`
+    : `${label}: diagnostic omitted (${length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS} Shell limit; note write failed — fix ~/.devspec/notes permissions and retry); further stderr suppressed.\n`
+}
+
+/**
  * Headroom reserved on CLI stderr so the final stdout connect receipt (or note-failure
- * refusal) always fits inside Cursor's combined Shell output ceiling (`fitsShellOutput`,
- * reqs 3c5147a7 / 91d7b47c). Derived from the actual fallback receipt structure rather
- * than a bare constant.
+ * refusal, including any `stderr_diagnostics_omitted` disclosure) always fits inside
+ * Cursor's combined Shell output ceiling (`fitsShellOutput`, reqs 3c5147a7 / 91d7b47c).
+ * Derived from the actual fallback receipt structure rather than a bare constant.
  */
 const CLI_STDOUT_RECEIPT_HEADROOM =
   JSON.stringify(
@@ -1944,6 +1955,14 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
       complete_output_note_failed: true,
       total_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      stderr_diagnostics_omitted: {
+        omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        recovery:
+          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.',
+      },
       recovery:
         'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).',
     },
@@ -1955,30 +1974,85 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
  * Intercept `process.stderr.write` for a CLI run so EVERY stderr diagnostic (including
  * browser-approval URLs from `authForConnect`) passes through the shared Shell output
  * ceiling (`formatBoundedCliStderr` + `fitsShellOutput`) while keeping headroom free
- * for the final stdout connect receipt. Any oversized stderr write is saved WHOLE in a
- * sealed note before emitting its short pointer (reqs 3c5147a7 / 91d7b47c).
+ * for BOTH a visible stderr omission notice AND the final stdout connect receipt.
+ * Any oversized stderr write is saved WHOLE in a sealed note before emitting its short
+ * pointer; if earlier diagnostics fill the stderr allowance, the reserved omission slot
+ * discloses what was omitted (with its note pointer or recovery path) and records
+ * `getSuppressedDiagnostics()` so the final stdout receipt also discloses it
+ * (reqs 3c5147a7 / 91d7b47c).
  */
 export function installBoundedCliStderr({
   label = 'remote-control-state',
   home = os.homedir(),
   reserveHeadroom = CLI_STDOUT_RECEIPT_HEADROOM,
 } = {}) {
+  const withNoteSample = buildStderrOmissionNotice(label, {
+    length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 100,
+    note: { id: '0'.repeat(16), command: 'cat ~/.devspec/notes/0000000000000000.md' },
+  })
+  const noNoteSample = buildStderrOmissionNotice(label, {
+    length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 100,
+    note: null,
+  })
+  const omissionReserve = withNoteSample.length >= noNoteSample.length ? withNoteSample : noNoteSample
+
   let emittedStderr = ''
+  let omissionNoticeEmitted = false
+  let omittedCount = 0
+  let omittedChars = 0
+  let omittedNoteFailedCount = 0
+  const omittedNotes = []
   const rawStderrWrite = process.stderr.write.bind(process.stderr)
+
+  const recordOmitted = (text, note) => {
+    omittedCount += 1
+    omittedChars += text.length
+    if (note) {
+      omittedNotes.push({ id: note.id, command: note.command, parts: note.parts })
+    } else {
+      omittedNoteFailedCount += 1
+    }
+  }
+
   process.stderr.write = (chunk, encoding, callback) => {
     const cb = typeof encoding === 'function' ? encoding : callback
     const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-    let toWrite = text
-    if (!fitsShellOutput(`${emittedStderr}${text}${reserveHeadroom}`)) {
+    let toWrite = ''
+    if (omissionNoticeEmitted) {
+      let saved = null
       try {
-        toWrite = formatBoundedCliStderr(text, {
-          label,
-          home,
-          reserve: `${emittedStderr}${reserveHeadroom}`,
-          summary: `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
-        })
+        saved = writeNote(text, { home })
       } catch {
-        toWrite = ''
+        saved = null
+      }
+      recordOmitted(text, saved)
+    } else {
+      const guardReserve = `${emittedStderr}${reserveHeadroom}${omissionReserve}`
+      if (fitsShellOutput(`${guardReserve}${text}`)) {
+        toWrite = text
+      } else {
+        try {
+          toWrite = formatBoundedCliStderr(text, {
+            label,
+            home,
+            reserve: guardReserve,
+            summary: `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+          })
+        } catch (err) {
+          const savedNote = err?.note ?? null
+          recordOmitted(text, savedNote)
+          const notice = buildStderrOmissionNotice(label, { length: text.length, note: savedNote })
+          if (fitsShellOutput(`${emittedStderr}${notice}${reserveHeadroom}`)) {
+            toWrite = notice
+            omissionNoticeEmitted = true
+          } else {
+            const shortNotice = `${label}: stderr omitted (${text.length} chars; ${savedNote ? savedNote.command : 'fix ~/.devspec/notes & retry'}).\n`
+            if (fitsShellOutput(`${emittedStderr}${shortNotice}${reserveHeadroom}`)) {
+              toWrite = shortNotice
+              omissionNoticeEmitted = true
+            }
+          }
+        }
       }
     }
     emittedStderr += toWrite
@@ -1992,6 +2066,23 @@ export function installBoundedCliStderr({
   }
   return {
     getEmittedStderr: () => emittedStderr,
+    getSuppressedDiagnostics: () => {
+      if (omittedCount === 0) return null
+      const recovery =
+        omittedNotes.length > 0 && omittedNoteFailedCount === 0
+          ? 'Read the saved note command(s) in stderr_diagnostics_omitted.notes to inspect the omitted stderr diagnostics.'
+          : omittedNotes.length > 0
+            ? 'Read the saved note command(s) in stderr_diagnostics_omitted.notes and fix ~/.devspec/notes write permissions to capture the remaining diagnostics.'
+            : 'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.'
+      return {
+        omitted_count: omittedCount,
+        omitted_chars: omittedChars,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        ...(omittedNotes.length > 0 ? { notes: omittedNotes.map((n) => ({ ...n })) } : {}),
+        ...(omittedNoteFailedCount > 0 ? { note_write_failed_count: omittedNoteFailedCount } : {}),
+        recovery,
+      }
+    },
     writeFinalError: (raw, done) => {
       let bounded = ''
       try {
@@ -2034,7 +2125,10 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
 
   if (cmd === 'fast-connect' || cmd === 'connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
-    await runFastConnectCli(args, { getEmittedStderr: cliStderr.getEmittedStderr })
+    await runFastConnectCli(args, {
+      getEmittedStderr: cliStderr.getEmittedStderr,
+      getSuppressedDiagnostics: cliStderr.getSuppressedDiagnostics,
+    })
     return
   }
 
