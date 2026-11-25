@@ -284,7 +284,11 @@ async function performMcpToolsCall({
     throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
-    throw new Error(payload.error.message || JSON.stringify(payload.error))
+    const err = new Error(payload.error.message || JSON.stringify(payload.error))
+    if (payload.error.code !== undefined) err.code = payload.error.code
+    if (payload.error.data !== undefined) err.data = payload.error.data
+    err.rpcError = payload.error
+    throw err
   }
 
   // tools/call result content is usually { content: [{ type:'text', text:'...' }], isError? }.

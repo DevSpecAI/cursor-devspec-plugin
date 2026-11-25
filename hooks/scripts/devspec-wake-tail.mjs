@@ -615,7 +615,7 @@ export async function readWakes({
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
     const hasRoomCommands =
       Boolean(resolvedConnectionId) &&
-      wakes.some((wake) => extractRoomCommandsFromWake(wake.text).commands.length > 0)
+      wakes.some((wake) => extractRoomCommandsFromWake(wake.text, { home }).commands.length > 0)
     const page = readerPage(
       wakes.map((wake) => wake.text),
       {
@@ -632,7 +632,7 @@ export async function readWakes({
     let pickupDiagnosticWritten = false
     if (resolvedConnectionId && page.printed > 0) {
       const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
-      const extracted = extractRoomCommandsFromWake(printedSlice)
+      const extracted = extractRoomCommandsFromWake(printedSlice, { home })
       if (extracted.commands.length > 0) {
         const capturedDiag = []
         let pickupResult = null

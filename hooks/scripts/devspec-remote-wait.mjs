@@ -87,7 +87,6 @@ import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from '
 import {
   fitShellDiagnostic,
   fitsShellOutput,
-  shellDiagnosticReserve,
   wakeInNote,
   wakesForOneOutput,
 } from './hook-context-budget.mjs'
@@ -118,7 +117,7 @@ import { turnActivityPath } from './turn-liveness.mjs'
 import { clearTurnCommands, commandsHandedOver, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
 import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
-import { startRoomCommands, structuredRefusalFromError } from './command-start.mjs'
+import { extractRoomCommandsFromWake, startRoomCommands, structuredRefusalFromError } from './command-start.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1672,26 +1671,66 @@ function frozenWakesOf(state, offset, batch) {
   return wakes.length > 0 ? wakes : null
 }
 
-const WAIT_DIAGNOSTIC_RESERVE = shellDiagnosticReserve('devspec-remote-wait')
-
-/** Extract canonical room commands present ONLY in the printed wakes (never an unprinted remainder). */
-export function printedRoomCommands(printedWakes, fallbackSessionId = null) {
-  const messages = []
-  let sessionId = fallbackSessionId ?? null
-  for (const wake of Array.isArray(printedWakes) ? printedWakes : []) {
-    if (!Array.isArray(wake)) continue
-    for (const event of wake) {
-      if (event?.type === 'owner_message' && event.message && typeof event.message === 'object') {
-        messages.push(event.message)
-        if (!sessionId && typeof event.session_id === 'string') sessionId = event.session_id
-      }
-    }
-  }
+/**
+ * Extract canonical room commands present ONLY in the printed wakes (never an unprinted
+ * remainder), expanding any `wake_in_note` pointer that carries `owner_message` so an
+ * oversized command stored in a sealed note still triggers `report_pickup` before the
+ * inbox cursor advances (requirement 3ea2b201).
+ */
+export function printedRoomCommands(printedWakes, fallbackSessionId = null, { home = os.homedir() } = {}) {
+  const wakes = Array.isArray(printedWakes) ? printedWakes : []
+  const wakeText = wakes.map((wake) => (Array.isArray(wake) ? wakeLines(wake) : '')).join('')
+  const extracted = extractRoomCommandsFromWake(wakeText, { home })
   return {
-    commands: commandsHandedOver(messages),
-    messages,
-    sessionId,
+    commands: extracted.commands,
+    messages: extracted.messages,
+    sessionId: extracted.sessionId ?? fallbackSessionId ?? null,
   }
+}
+
+/**
+ * Plan which wakes fit in one one-shot Shell result without writing stdout yet.
+ * Running `report_pickup` on `printedWakes` before writing stdout guarantees that a
+ * pickup refusal leaves stdout empty (so the full Shell budget holds the structured
+ * refusal diagnostic) and that any non-fatal stderr emitted beforehand is accounted for
+ * before stdout is written (reqs 3ea2b201 / 3c5147a7 / 91d7b47c).
+ */
+export function planOneShot(wakes, { reserve = '', home = os.homedir() } = {}) {
+  const fitted = reserve
+    ? wakes.map((wake) => {
+        const raw = wakeLines(wake)
+        if (fitsShellOutput(reserve + raw)) return raw
+        const note = wakeInNote(wake, { home })
+        return note.error ? raw : wakeLines(note.events)
+      })
+    : wakes.map(wakeLines)
+  const { count, text } = wakesForOneOutput(fitted, {
+    waiting: (left) => wakeLines([wakesWaitingEvent(left)]),
+    reserve,
+  })
+  return { count, text, printedWakes: wakes.slice(0, count) }
+}
+
+/**
+ * Re-fit an already-selected one-shot page if stderr grew during pickup (e.g. a
+ * `nothing_open` diagnostic) so `reserve + stdout` never crosses Cursor's Shell ceiling
+ * while keeping the exact selected `printedWakes` count.
+ */
+function fitSelectedOneShotText(plan, totalCount, { reserve = '', home = os.homedir() } = {}) {
+  if (!reserve || fitsShellOutput(`${reserve}${plan.text}`)) return plan.text
+  const fitted = plan.printedWakes.map((wake) => {
+    const raw = wakeLines(wake)
+    if (fitsShellOutput(`${reserve}${raw}`)) return raw
+    const note = wakeInNote(wake, { home })
+    return note.error ? raw : wakeLines(note.events)
+  })
+  let out = fitted.join('')
+  const left = totalCount - plan.count
+  if (left > 0) {
+    const waiting = wakeLines([wakesWaitingEvent(left)])
+    if (fitsShellOutput(`${reserve}${out}${waiting}`)) out += waiting
+  }
+  return out
 }
 
 /**
@@ -1710,20 +1749,9 @@ export async function printOneShot(
       new Promise((resolve, reject) => process.stdout.write(text, (error) => (error ? reject(error) : resolve()))),
   } = {},
 ) {
-  const fitted = reserve
-    ? wakes.map((wake) => {
-        const raw = wakeLines(wake)
-        if (fitsShellOutput(reserve + raw)) return raw
-        const note = wakeInNote(wake, { home })
-        return note.error ? raw : wakeLines(note.events)
-      })
-    : wakes.map(wakeLines)
-  const { count, text } = wakesForOneOutput(fitted, {
-    waiting: (left) => wakeLines([wakesWaitingEvent(left)]),
-    reserve,
-  })
-  await write(text)
-  return { count, text, printedWakes: wakes.slice(0, count) }
+  const plan = planOneShot(wakes, { reserve, home })
+  await write(plan.text)
+  return plan
 }
 
 /**
@@ -1736,6 +1764,7 @@ export async function runOneShotRoomCommandPickup({
   connectionId,
   printedWakes,
   printedStdout = '',
+  priorStderr = '',
   fallbackSessionId = null,
   dir = CONNECTIONS_DIR,
   home = os.homedir(),
@@ -1743,7 +1772,7 @@ export async function runOneShotRoomCommandPickup({
   startCommands = startRoomCommands,
   writeStderr = (text) => process.stderr.write(text),
 } = {}) {
-  const extracted = printedRoomCommands(printedWakes, fallbackSessionId)
+  const extracted = printedRoomCommands(printedWakes, fallbackSessionId, { home })
   if (extracted.commands.length === 0) {
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
@@ -1788,7 +1817,7 @@ export async function runOneShotRoomCommandPickup({
   let stderrText = ''
   let diagnosticNote = null
   if (rawDiag) {
-    const fitted = fitShellDiagnostic(printedStdout, rawDiag, { home, label: 'devspec-remote-wait' })
+    const fitted = fitShellDiagnostic(`${priorStderr}${printedStdout}`, rawDiag, { home, label: 'devspec-remote-wait' })
     diagnosticNote = fitted.note
     if (fitted.text) {
       writeStderr(fitted.text)
@@ -1809,6 +1838,17 @@ async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
   const connectionId = args.connectionId
+  // In one-shot mode, track every byte written to stderr (startup lines, soft-fails,
+  // diagnostics) so stdout sizing and fitShellDiagnostic enforce Cursor's combined
+  // stdout + stderr Shell ceiling across the entire process (reqs 3c5147a7 / 91d7b47c).
+  let emittedStderr = ''
+  if (!args.follow) {
+    const rawStderrWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk, ...rest) => {
+      emittedStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+      return rawStderrWrite(chunk, ...rest)
+    }
+  }
   if (!connectionId) {
     process.stderr.write('devspec-remote-wait: missing --connection-id\n')
     process.exit(2)
@@ -1871,9 +1911,11 @@ async function main() {
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()
-  process.stderr.write(
-    `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
-  )
+  if (args.follow) {
+    process.stderr.write(
+      `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
+    )
+  }
 
   // First connect arm only — mid-turn --pending re-arms are not cold-launch phases.
   if (args.fromEnd && !args.pending) {
@@ -2029,24 +2071,30 @@ async function main() {
                   appendWakeEvents(args.wakeFile, wake)
                 }
               } else {
-                const hasFrozenCmds = printedRoomCommands(frozen, batch.session_id ?? null).commands.length > 0
-                shot = await printOneShot(frozen, { reserve: hasFrozenCmds ? WAIT_DIAGNOSTIC_RESERVE : '' })
-                printed = shot.count
-                // Start ONLY commands in the wakes actually printed on this page, BEFORE
-                // advancing wake_batch_progress or the inbox cursor (req 3ea2b201).
+                const plan = planOneShot(frozen, { reserve: emittedStderr })
+                const hasFrozenCmds = printedRoomCommands(plan.printedWakes, batch.session_id ?? null).commands.length > 0
+                // Start ONLY commands in the wakes selected for this page BEFORE writing
+                // stdout or advancing wake_batch_progress / inbox cursor (req 3ea2b201).
                 if (hasFrozenCmds) {
                   pickup = await runOneShotRoomCommandPickup({
                     connectionId,
-                    printedWakes: shot.printedWakes,
-                    printedStdout: shot.text,
+                    printedWakes: plan.printedWakes,
+                    printedStdout: '',
+                    priorStderr: emittedStderr,
                     fallbackSessionId: batch.session_id ?? null,
                     dir: CONNECTIONS_DIR,
                     state: live,
                   })
                   if (!pickup.ok) {
-                    return { count: printed, pickupFailed: true, shot, pickup }
+                    return { count: 0, pickupFailed: true, shot: null, pickup }
                   }
                 }
+                const finalText = fitSelectedOneShotText(plan, frozen.length, { reserve: emittedStderr })
+                await new Promise((resolve, reject) =>
+                  process.stdout.write(finalText, (error) => (error ? reject(error) : resolve())),
+                )
+                shot = { count: plan.count, text: finalText, printedWakes: plan.printedWakes }
+                printed = plan.count
               }
               if (printed < frozen.length) {
                 writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(printed) } })
@@ -2074,7 +2122,7 @@ async function main() {
             return
           }
           const handedLine = `devspec-remote-wait: handed on ${frozenOut.count} of ${frozen.length} waiting wake(s)\n`
-          if (args.follow || fitsShellOutput(`${frozenOut.shot?.text ?? ''}${frozenOut.pickup?.stderrText ?? ''}${handedLine}`)) {
+          if (args.follow || fitsShellOutput(`${emittedStderr}${frozenOut.shot?.text ?? ''}${handedLine}`)) {
             process.stderr.write(handedLine)
           }
           if (args.follow) {
@@ -2150,7 +2198,7 @@ async function main() {
         // tried again every lap until it goes, with no cap: notes live in the same home
         // folder as the wake file, so this is a disk problem that clears, and the room is
         // told once (`tellRoomWakeHeld`).
-        const oneShotReserve = !args.follow && batch.type === 'owner_messages' ? WAIT_DIAGNOSTIC_RESERVE : ''
+        const oneShotReserve = !args.follow ? emittedStderr : ''
         const out = recallWakeOut(built, batch?.turn_recall, { connectionId, reserve: oneShotReserve })
         if (out.held) {
           process.stderr.write(
@@ -2174,20 +2222,21 @@ async function main() {
         if (args.follow) {
           for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
         } else {
+          const plan = planOneShot(out.wakes, { reserve: emittedStderr })
           const hasOwnerCmds =
             batch.type === 'owner_messages' &&
-            printedRoomCommands(out.wakes, batch.session_id ?? null).commands.length > 0
-          oneShot = await printOneShot(out.wakes, { reserve: hasOwnerCmds ? WAIT_DIAGNOSTIC_RESERVE : '' })
-          printedAll = oneShot.count >= out.wakes.length
-          // In one-shot mode, start ONLY the canonical room commands actually printed in
-          // this Shell output (never an unprinted remainder) BEFORE advancing the inbox
-          // cursor or persisting wake_batch_progress. When report_pickup refuses, leave the
-          // offset untouched and exit non-zero so the next read retries (req 3ea2b201).
+            printedRoomCommands(plan.printedWakes, batch.session_id ?? null).commands.length > 0
+          // In one-shot mode, start ONLY the canonical room commands selected for this
+          // Shell output BEFORE writing stdout or advancing the inbox cursor /
+          // wake_batch_progress. When report_pickup refuses, stdout stays empty (so the
+          // full Shell budget holds the refusal diagnostic) and the offset stays untouched
+          // so the next read retries (reqs 3ea2b201 / 3c5147a7 / 91d7b47c).
           if (hasOwnerCmds) {
             oneShotPickup = await runOneShotRoomCommandPickup({
               connectionId,
-              printedWakes: oneShot.printedWakes,
-              printedStdout: oneShot.text,
+              printedWakes: plan.printedWakes,
+              printedStdout: '',
+              priorStderr: emittedStderr,
               fallbackSessionId: batch.session_id ?? null,
               dir: CONNECTIONS_DIR,
               state: live,
@@ -2197,6 +2246,12 @@ async function main() {
               return
             }
           }
+          const finalText = fitSelectedOneShotText(plan, out.wakes.length, { reserve: emittedStderr })
+          await new Promise((resolve, reject) =>
+            process.stdout.write(finalText, (error) => (error ? reject(error) : resolve())),
+          )
+          oneShot = { count: plan.count, text: finalText, printedWakes: plan.printedWakes }
+          printedAll = plan.count >= out.wakes.length
           // The rest is frozen as built, for the next re-arm to print as it is: kept only
           // while the connection is live, under its steps lock (see the frozen wakes above).
           if (!printedAll) {
@@ -2209,9 +2264,8 @@ async function main() {
             } catch (e) {
               // Not kept: the cursor has not moved, so the next re-arm builds this delivery again.
               const keepErr = `devspec-remote-wait: could not keep the rest of this delivery (${e instanceof Error ? e.message : String(e)})\n`
-              if (fitsShellOutput(`${oneShot.text}${oneShotPickup.stderrText}${keepErr}`)) {
+              if (fitsShellOutput(`${emittedStderr}${oneShot.text}${keepErr}`)) {
                 process.stderr.write(keepErr)
-                oneShotPickup.stderrText += keepErr
               }
             }
           }
@@ -2266,7 +2320,7 @@ async function main() {
           continue
         }
         const exitLine = `devspec-remote-wait: wake (${wakeCount} msg) — exit 0\n`
-        if (fitsShellOutput(`${oneShot?.text ?? ''}${oneShotPickup.stderrText}${exitLine}`)) {
+        if (fitsShellOutput(`${emittedStderr}${oneShot?.text ?? ''}${exitLine}`)) {
           process.stderr.write(exitLine)
         }
         return

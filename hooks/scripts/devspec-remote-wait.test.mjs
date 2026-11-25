@@ -1660,17 +1660,16 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
     try {
       const state = () => JSON.parse(fs.readFileSync(path.join(room.dir, `${CANONICAL_CONNECTION}.json`), 'utf8'))
       // Size the command so that with the room-unread note its wake needs a pointer wake of
-      // its own (while still leaving room for one-shot diagnostic reserve), and without it
-      // the pointer would fit beside it: a rebuild would differ.
+      // its own, and without it the pointer would fit beside it: a rebuild would differ.
       const notice = wakeNotice({ connectionId: CANONICAL_CONNECTION, sessionId: ROOM, dir: room.dir })
       assert.ok(notice, 'the room has unread messages')
       const inbox = path.join(room.dir, `${CANONICAL_CONNECTION}.inbox.jsonl`)
       const batchFor = (body) => canonicalBatch(fixtureCommand(body), { session_id: ROOM, turn_recall: { version: 1, formatted_block: recallBlock, seen_keys: ['memory:00000000-0000-4000-8000-000000000001:v1'] } })
       const sizeWith = (body) => wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: notice, inboxFile: inbox })).length
       let body = 'a'.repeat(9_000)
-      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_740 - sizeWith(body)) / 2))
+      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - sizeWith(body)) / 2))
       const sizeWithout = wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: null, inboxFile: inbox })).length
-      assert.ok(sizeWithout < 19_600, `without the note the pointer fits beside it (${sizeWithout})`)
+      assert.ok(sizeWithout < 19_700, `without the note the pointer fits beside it (${sizeWithout})`)
       const batch = batchFor(body)
       fs.writeFileSync(inbox, JSON.stringify(batch) + '\n', { mode: 0o600 })
 

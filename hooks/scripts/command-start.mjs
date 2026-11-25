@@ -23,6 +23,7 @@ import { AGENT_NAME } from './agent-identity.mjs'
 import { ensureCliTrailWatch } from './cli-trail-watch.mjs'
 import { pidAlive } from './close-on-end.mjs'
 import { REMOTE_WAKE_NOTIFY_PATTERN, resolveSpaceFreeWakeFile, wakeFileConnectionId } from './devspec-wake-file.mjs'
+import { readNoteText } from './hook-context-budget.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { recordDeliveredBatchRequests } from './requests.mjs'
@@ -192,10 +193,18 @@ function clearTurnMarker(connectionId, dir) {
   clearTurnCommands(connectionId, { dir })
 }
 
-/** Extract canonical room commands (`{ turnId, messageId }`) and raw messages from wake JSONL text. */
-export function extractRoomCommandsFromWake(wakeText) {
+const NOTE_ID_IN_READ_RE = /notes\/([0-9a-f]{16})\.md\b/
+
+/**
+ * Extract canonical room commands (`{ turnId, messageId }`) and raw messages from wake
+ * JSONL text, expanding any `wake_in_note` pointer that carries `owner_message` so an
+ * oversized command stored in a sealed note still triggers honest `report_pickup`
+ * (requirement 3ea2b201).
+ */
+export function extractRoomCommandsFromWake(wakeText, { home = os.homedir(), visitedNotes = null } = {}) {
   const rawMessages = []
   let sessionId = null
+  const seenNotes = visitedNotes ?? new Set()
   for (const line of String(wakeText ?? '').split('\n')) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -208,6 +217,26 @@ export function extractRoomCommandsFromWake(wakeText) {
     if (event?.type === 'owner_message' && event.message && typeof event.message === 'object') {
       rawMessages.push(event.message)
       if (!sessionId && typeof event.session_id === 'string') sessionId = event.session_id
+    } else if (
+      event?.type === 'wake_in_note' &&
+      Array.isArray(event.carries) &&
+      event.carries.includes('owner_message')
+    ) {
+      const match = NOTE_ID_IN_READ_RE.exec(String(event.read ?? ''))
+      const noteId = match?.[1] ?? null
+      if (noteId && !seenNotes.has(noteId)) {
+        seenNotes.add(noteId)
+        try {
+          const noteText = readNoteText(noteId, { home })
+          if (noteText) {
+            const nested = extractRoomCommandsFromWake(noteText, { home, visitedNotes: seenNotes })
+            rawMessages.push(...nested.messages)
+            if (!sessionId && nested.sessionId) sessionId = nested.sessionId
+          }
+        } catch {
+          /* unreadable note: leave empty */
+        }
+      }
     }
   }
   return {

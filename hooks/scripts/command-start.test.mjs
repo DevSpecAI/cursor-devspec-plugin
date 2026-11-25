@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { after, describe, it } from 'node:test'
 
 import {
@@ -22,7 +25,8 @@ import {
   runOneShotRoomCommandPickup,
 } from './devspec-remote-wait.mjs'
 import { fastConnect } from './fast-connect.mjs'
-import { fitsShellOutput, readNoteText, shellDiagnosticReserve } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote } from './hook-context-budget.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 import { withWakeFollowLock } from './remote-control-state.mjs'
 import { readRequestState } from './requests.mjs'
 import {
@@ -30,6 +34,7 @@ import {
   fixtureCommand,
   fixtureEnvelope,
 } from './remote-ingress-test-fixtures.mjs'
+import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
 import {
   holdForNextStep,
   isStepBatch,
@@ -900,11 +905,17 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
   it('withWakeFollowLock chains past a dead reclaim guard without unlinking live guards (2df26cd2)', () => {
     const { dir } = mkHome()
     const lockFile = path.join(dir, `${CONN}.follow.lock`)
-    const deadToken = 'aaaa1111aaaa1111'
-    const deadGuardToken = 'bbbb2222bbbb2222'
-    const deadGuardFile = `${lockFile}.reclaim.${deadToken}`
-    fs.writeFileSync(lockFile, `${JSON.stringify({ pid: 999999999, token: deadToken })}\n`, { mode: 0o600 })
-    fs.writeFileSync(deadGuardFile, `${JSON.stringify({ pid: 999999998, token: deadGuardToken })}\n`, { mode: 0o600 })
+    // Chain 20 dead reclaim guards (>16) to prove recovery never permanently wedges.
+    let currToken = 'aaaa0000aaaa0000'
+    fs.writeFileSync(lockFile, `${JSON.stringify({ pid: 999999999, token: currToken })}\n`, { mode: 0o600 })
+    const deadFiles = []
+    for (let i = 1; i <= 20; i += 1) {
+      const nextToken = `bbbb${String(i).padStart(4, '0')}bbbb${String(i).padStart(4, '0')}`
+      const guardFile = `${lockFile}.reclaim.${currToken}`
+      fs.writeFileSync(guardFile, `${JSON.stringify({ pid: 999999900 + i, token: nextToken })}\n`, { mode: 0o600 })
+      deadFiles.push(guardFile)
+      currToken = nextToken
+    }
 
     let ran = false
     const res = withWakeFollowLock(
@@ -912,8 +923,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs,
       () => {
         ran = true
-        // Dead predecessor guard is cleaned up after stale lock unlink.
-        assert.equal(fs.existsSync(deadGuardFile), false)
+        for (const f of deadFiles) {
+          assert.equal(fs.existsSync(f), false, `dead predecessor ${path.basename(f)} must be cleaned up`)
+        }
         return { ok: true }
       },
       { dir },
@@ -921,5 +933,257 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(ran, true)
     assert.equal(res.ok, true)
     assert.equal(fs.existsSync(lockFile), false)
+  })
+
+  it('preserves JSON-RPC error code and structured data from mcpToolsCall through startRoomCommands (4e32d1a5)', async () => {
+    const { dir } = mkHome()
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            error: {
+              code: -32042,
+              message: 'Pickup refused.',
+              data: { code: 'attempt_active', blocking_attempt_id: '88888888-8888-4888-8888-888888888888' },
+            },
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    try {
+      const result = await startRoomCommands({
+        connectionId: CONN,
+        commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+        sessionId: ROOM,
+        dir,
+        state: {
+          connection_id: CONN,
+          session_id: ROOM,
+          token: 'dvs_test',
+          mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+        },
+        call: mcpToolsCall,
+        seedFn: async () => {},
+        ensureWatch: () => ({ started: false }),
+        log: () => {},
+      })
+      assert.equal(result.ok, false)
+      assert.equal(result.refusals.length, 1)
+      assert.equal(result.refusals[0].refusal.code, -32042)
+      assert.equal(result.refusals[0].refusal.data?.code, 'attempt_active')
+      assert.equal(
+        result.refusals[0].refusal.data?.blocking_attempt_id,
+        '88888888-8888-4888-8888-888888888888',
+      )
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+
+  it('picks up oversized owner_message commands wrapped in wake_in_note in both one-shot wait and readWakes (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Huge command ' + 'h'.repeat(21_000))
+    const built = buildOwnerMessageEvents(batch)
+    const wrapped = wakeInNote(built, { home })
+    assert.equal(wrapped.events[0].type, 'wake_in_note')
+    assert.ok(wrapped.events[0].carries.includes('owner_message'))
+
+    // 1. One-shot printedRoomCommands + runOneShotRoomCommandPickup must expand wake_in_note.
+    const extracted = printedRoomCommands([wrapped.events], ROOM, { home })
+    assert.deepEqual(
+      extracted.commands.map((c) => c.messageId),
+      [MSG_ID],
+    )
+    const picked = []
+    const pickup = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes: [wrapped.events],
+      printedStdout: JSON.stringify(wrapped.events[0]) + '\n',
+      fallbackSessionId: ROOM,
+      dir,
+      home,
+      writeStderr: () => {},
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async (req) => {
+            picked.push(req.arguments.command_message_id)
+            return { outcome: 'picked_up' }
+          },
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.equal(pickup.ok, true)
+    assert.deepEqual(picked, [MSG_ID])
+
+    // 2. readWakes must also expand wake_in_note and refuse to advance offset on pickup refusal.
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    appendWakeEvents(wakeFile, wrapped.events)
+    const msg2 = '33333333-3333-4333-8333-333333333399'
+    const turn2 = '77777777-7777-4777-8777-777777777799'
+    const wrapped2 = wakeInNote(buildOwnerMessageEvents(ownerBatch('Huge 2 ' + 'k'.repeat(21_000), { messageId: msg2, turnId: turn2 })), { home })
+    fs.writeFileSync(wakeFile, '')
+    appendWakeEvents(wakeFile, wrapped2.events)
+    const readRes = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async () => ({ ok: false, code: 'refused_huge', error: 'Try again' }),
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.equal(readRes.marked, false, 'must not advance wake position when note-wrapped command pickup refuses')
+    assert.equal(readRes.pickup_refusals[0].command_message_id, msg2)
+  })
+
+  it('one-shot CLI wait counts startup stderr in combined stdout + stderr Shell ceiling on near-limit wake with pickup refusal (3c5147a7 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({ ok: false, code: 'busy_refusal', retryable: true, error: 'Refused', detail: 'x'.repeat(2000) }),
+              }],
+            },
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    fs.writeFileSync(
+      path.join(dir, `${CONN}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: CONN,
+        session_id: ROOM,
+        local_id: CONVERSATION,
+        agent_name: 'Cursor',
+        token: 'dvs_test',
+        mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+      }),
+      { mode: 0o600 },
+    )
+    const batch = ownerBatch('Near limit body ' + 'm'.repeat(18_500))
+    batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
+    const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    try {
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', CONN, '--pending', '--poll-ms', '20'],
+          { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.on('error', (e) => { clearTimeout(timer); reject(e) })
+        child.on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }) })
+      })
+      assert.equal(code, 1)
+      assert.equal(stdout, '', 'stdout stays empty when pickup refuses so refusal diagnostic gets the full Shell budget')
+      assert.match(stderr, /busy_refusal/)
+      assert.ok(
+        fitsShellOutput(stdout + stderr),
+        `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
+      )
+      const persisted = JSON.parse(fs.readFileSync(path.join(dir, `${CONN}.json`), 'utf8'))
+      assert.equal(persisted.inbox_byte_offset ?? 0, 0, 'inbox offset must not advance on pickup refusal')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+
+  it('one-shot CLI wait keeps combined stdout + stderr within fitsShellOutput when near-limit wake gets a non-fatal nothing_open diagnostic (3c5147a7 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const server = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({ outcome: 'nothing_open', reason: 'already_closed', detail: 'y'.repeat(500) }),
+              }],
+            },
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    fs.writeFileSync(
+      path.join(dir, `${CONN}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: CONN,
+        session_id: ROOM,
+        local_id: CONVERSATION,
+        agent_name: 'Cursor',
+        token: 'dvs_test',
+        mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+      }),
+      { mode: 0o600 },
+    )
+    const batch = ownerBatch('Near limit nothing_open ' + 'm'.repeat(19_400))
+    batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
+    const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    try {
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', CONN, '--pending', '--poll-ms', '20'],
+          { env: { ...process.env, HOME: home, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => { stdout += c.toString() })
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.on('error', (e) => { clearTimeout(timer); reject(e) })
+        child.on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }) })
+      })
+      assert.equal(code, 0, stderr)
+      assert.match(stderr, /nothing_open/)
+      assert.ok(stdout.length > 0, 'wake is still delivered via sealed note or inline')
+      assert.ok(
+        fitsShellOutput(stdout + stderr),
+        `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
+      )
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
   })
 })

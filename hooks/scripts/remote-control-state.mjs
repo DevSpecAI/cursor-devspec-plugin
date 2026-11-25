@@ -692,13 +692,6 @@ function sameLockIdentity(a, b) {
 }
 
 /**
- * Bounded chain length when stepping past crashed reclaimers' dead guard files.
- * Sixteen hops comfortably outlasts repeated crashes without scanning unbounded
- * files on disk (requirements 3c5147a7 / 91d7b47c).
- */
-const WAKE_FOLLOW_RECLAIM_MAX_HOPS = 16
-
-/**
  * Reclaim a stale lock file without racing another caller that already replaced it
  * with a live lock (decision 2df26cd2).
  *
@@ -708,7 +701,9 @@ const WAKE_FOLLOW_RECLAIM_MAX_HOPS = 16
  * Because no caller ever unlinks a live or dead guard while acquiring the chain,
  * two callers can never race to remove a replacement guard; at most one live reclaimer
  * reaches `unlinkSync(lockFile)`, and dead predecessor guards are cleaned up only
- * after the stale lock is gone.
+ * after the stale lock is gone. Walks until an unclaimed tip is reached (bounded only
+ * by cycle detection via `visitedKeys`) so a dead follower is always recoverable
+ * regardless of how many prior reclaimers crashed.
  */
 function tryReclaimStaleWakeFollowLock(lockFile, staleInfo) {
   const myGuardToken = crypto.randomBytes(8).toString('hex')
@@ -719,8 +714,7 @@ function tryReclaimStaleWakeFollowLock(lockFile, staleInfo) {
     fs.writeFileSync(reclaimTemp, `${JSON.stringify({ pid: process.pid, token: myGuardToken })}\n`, { mode: 0o600 })
     let currKey = staleInfo.token || `ino-${staleInfo.ino}-${Math.trunc(staleInfo.mtimeMs)}`
     const visitedKeys = new Set()
-    for (let hop = 0; hop < WAKE_FOLLOW_RECLAIM_MAX_HOPS; hop += 1) {
-      if (visitedKeys.has(currKey)) return false
+    while (!visitedKeys.has(currKey)) {
       visitedKeys.add(currKey)
       const reclaimFile = `${lockFile}.reclaim.${currKey}`
       try {
