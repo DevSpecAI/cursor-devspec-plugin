@@ -742,6 +742,162 @@ Prints one short JSON result; exits 0 when connected, 1 when not.
  * a sealed note (`writeNote`) and returns a compact structured refusal naming that note
  * so Cursor never slices the choices in half (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
  */
+function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength) {
+  const base =
+    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? { ...normalized }
+      : { ok: false }
+  const selection = base.project_selection
+  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
+  if (selection && typeof selection === 'object') {
+    const { candidates: _omit, ...selectionRest } = selection
+    base.project_selection = {
+      ...selectionRest,
+      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+      omitted_inline: true,
+      complete_in_note: noteRef,
+    }
+  }
+  if (Array.isArray(base.candidates)) {
+    base.candidate_count = base.candidates.length
+    delete base.candidates
+  }
+  const noteMsg = `Full connect output (${fullTextLength} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+  base.complete_output_note = noteRef
+  base.note = noteMsg
+  const richText = JSON.stringify(base, null, 2) + '\n'
+  if (fitsShellOutput(richText)) return richText
+
+  const minimal = {
+    ok: Boolean(base.ok),
+    ...(typeof base.code === 'string' ? { code: base.code } : {}),
+    ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+    ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+    ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+    ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+    ...(selection && typeof selection === 'object'
+      ? {
+          project_selection: {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+            ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+            omitted_inline: true,
+            complete_in_note: noteRef,
+          },
+        }
+      : {}),
+    omitted_fields_in_note: true,
+    complete_output_note: noteRef,
+    note: noteMsg,
+  }
+  return JSON.stringify(minimal, null, 2) + '\n'
+}
+
+function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength) {
+  const base =
+    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+      ? { ...normalized }
+      : { ok: false }
+  const selection =
+    base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
+  const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
+  const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const recovery = allCandidates
+    ? `Could not write ~/.devspec/notes (${errMsg}). Call DevSpec MCP tool \`list_projects\` (or fix write permissions on ~/.devspec/notes and re-run connect) to retrieve all ${allCandidates.length} project choices.`
+    : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.`
+
+  const makePayload = (candidateSlice, { minimal = false } = {}) => {
+    const out = minimal
+      ? {
+          ok: Boolean(base.ok),
+          ...(typeof base.code === 'string' ? { code: base.code } : {}),
+          ...(typeof base.connection_id === 'string' ? { connection_id: base.connection_id } : {}),
+          ...(typeof base.session_id === 'string' ? { session_id: base.session_id } : {}),
+          ...(typeof base.local_id === 'string' ? { local_id: base.local_id } : {}),
+          ...(typeof base.project_id === 'string' ? { project_id: base.project_id } : {}),
+          omitted_fields_due_to_shell_limit: true,
+        }
+      : { ...base }
+    if (Array.isArray(out.candidates)) {
+      out.candidate_count = out.candidates.length
+      delete out.candidates
+    }
+    if (selection) {
+      const { candidates: _omit, ...selectionRest } = selection
+      const selBase = minimal
+        ? {
+            ...(selection.version !== undefined ? { version: selection.version } : {}),
+            ...(typeof selection.status === 'string' ? { status: selection.status } : {}),
+            ...(typeof selection.reason === 'string' ? { reason: selection.reason } : {}),
+          }
+        : selectionRest
+      out.project_selection = {
+        ...selBase,
+        ...(allCandidates
+          ? {
+              candidates: candidateSlice,
+              candidate_count: allCandidates.length,
+              returned_count: candidateSlice.length,
+              omitted_count: allCandidates.length - candidateSlice.length,
+              truncated_due_to_shell_limit: candidateSlice.length < allCandidates.length,
+              recovery_tool: 'list_projects',
+            }
+          : {}),
+      }
+    }
+    out.complete_output_note_error = errMsg
+    out.total_chars = fullTextLength
+    out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
+    out.recovery = recovery
+    return JSON.stringify(out, null, 2) + '\n'
+  }
+
+  const useMinimal = !fitsShellOutput(makePayload([], { minimal: false }))
+  if (allCandidates && allCandidates.length > 0) {
+    let lo = 0
+    let hi = allCandidates.length
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2)
+      if (fitsShellOutput(makePayload(allCandidates.slice(0, mid), { minimal: useMinimal }))) {
+        lo = mid
+      } else {
+        hi = mid - 1
+      }
+    }
+    const text = makePayload(allCandidates.slice(0, lo), { minimal: useMinimal })
+    if (fitsShellOutput(text)) return text
+  } else {
+    const text = makePayload([], { minimal: useMinimal })
+    if (fitsShellOutput(text)) return text
+  }
+
+  return (
+    JSON.stringify(
+      {
+        ok: Boolean(base.ok),
+        ...(typeof base.code === 'string' ? { code: base.code } : {}),
+        ...(allCandidates
+          ? {
+              candidate_count: allCandidates.length,
+              returned_count: 0,
+              omitted_count: allCandidates.length,
+              recovery_tool: 'list_projects',
+            }
+          : {}),
+        complete_output_note_failed: true,
+        total_chars: fullTextLength,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        recovery: allCandidates
+          ? 'Could not write ~/.devspec/notes. Call DevSpec MCP `list_projects` or fix permissions on ~/.devspec/notes and re-run connect.'
+          : 'Could not write ~/.devspec/notes. Fix permissions on ~/.devspec/notes and re-run connect.',
+      },
+      null,
+      2,
+    ) + '\n'
+  )
+}
+
 export function formatFastConnectCliOutput(result, { home = os.homedir() } = {}) {
   const normalized =
     result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
@@ -756,25 +912,6 @@ export function formatFastConnectCliOutput(result, { home = os.homedir() } = {})
   const fullText = JSON.stringify(normalized, null, 2) + '\n'
   if (fitsShellOutput(fullText)) return fullText
 
-  const compact =
-    normalized && typeof normalized === 'object' && !Array.isArray(normalized)
-      ? { ...normalized }
-      : { ok: false }
-  const selection = compact.project_selection
-  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
-  if (selection && typeof selection === 'object') {
-    const { candidates: _omit, ...selectionRest } = selection
-    compact.project_selection = {
-      ...selectionRest,
-      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
-      omitted_inline: true,
-    }
-  }
-  if (Array.isArray(compact.candidates)) {
-    compact.candidate_count = compact.candidates.length
-    delete compact.candidates
-  }
-
   try {
     const note = writeNote(fullText, { home })
     const noteRef = {
@@ -784,15 +921,10 @@ export function formatFastConnectCliOutput(result, { home = os.homedir() } = {})
       total_chars: fullText.length,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     }
-    if (compact.project_selection && typeof compact.project_selection === 'object') {
-      compact.project_selection.complete_in_note = noteRef
-    }
-    compact.complete_output_note = noteRef
-    compact.note = `Full connect output (${fullText.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${note.command}\` (and every further part it names) to read all choices.`
+    return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length)
   } catch (error) {
-    compact.complete_output_note_error = error instanceof Error ? error.message : String(error)
+    return buildFastConnectNoteFailureFallback(normalized, error, fullText.length)
   }
-  return JSON.stringify(compact, null, 2) + '\n'
 }
 
 /**

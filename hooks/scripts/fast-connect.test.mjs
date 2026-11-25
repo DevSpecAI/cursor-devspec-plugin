@@ -840,4 +840,53 @@ describe('fast-connect CLI flags', () => {
       fs.rmSync(home, { recursive: true, force: true })
     }
   })
+
+  it('bounds the note receipt even when error text itself exceeds the Shell ceiling, and keeps structured candidates + recovery when note write fails', async () => {
+    const { formatFastConnectCliOutput } = await import('./fast-connect.mjs')
+    const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc60-bounds-'))
+    const blockedHome = path.join(home, 'not-a-dir')
+    fs.writeFileSync(blockedHome, 'file blocking mkdir', 'utf8')
+    try {
+      const hugeError = `Server refusal: ${'E'.repeat(25_000)}`
+      const outHuge = formatFastConnectCliOutput(
+        { ok: false, code: 'register_failed', error: hugeError },
+        { home },
+      )
+      assert.equal(fitsShellOutput(outHuge), true, `oversized-error receipt must fit Shell ceiling, got ${outHuge.length}`)
+      const parsedHuge = JSON.parse(outHuge)
+      assert.equal(parsedHuge.omitted_fields_in_note, true)
+      assert.ok(parsedHuge.complete_output_note?.id)
+      const fullHuge = JSON.parse(readNoteText(parsedHuge.complete_output_note.id, { home }))
+      assert.equal(fullHuge.error, hugeError)
+
+      const candidates = Array.from({ length: 150 }, (_, i) => ({
+        id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
+        name: `Project Number ${i} — Organization Workspace Candidate`,
+        organization_name: `Acme Organization ${i}`,
+      }))
+      const outFailedWrite = formatFastConnectCliOutput(
+        {
+          ok: false,
+          code: 'project_choice_required',
+          error: 'Several accessible projects have that name. Choose a project and organisation.',
+          project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_name', candidates },
+          candidates: candidates.map((c) => c.id),
+        },
+        { home: blockedHome },
+      )
+      assert.equal(fitsShellOutput(outFailedWrite), true, `note-failure fallback must fit Shell ceiling, got ${outFailedWrite.length}`)
+      const parsedFallback = JSON.parse(outFailedWrite)
+      assert.equal(parsedFallback.code, 'project_choice_required')
+      assert.equal(parsedFallback.project_selection.candidate_count, 150)
+      assert.ok(parsedFallback.project_selection.returned_count > 0, 'keeps as many complete structured candidates as fit')
+      assert.equal(parsedFallback.project_selection.candidates.length, parsedFallback.project_selection.returned_count)
+      assert.equal(parsedFallback.project_selection.omitted_count, 150 - parsedFallback.project_selection.returned_count)
+      assert.equal(parsedFallback.project_selection.recovery_tool, 'list_projects')
+      assert.ok(parsedFallback.complete_output_note_error)
+      assert.match(parsedFallback.recovery, /list_projects/)
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
 })
