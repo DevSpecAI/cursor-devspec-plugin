@@ -1911,4 +1911,143 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(read3.printed, 0)
     assert.equal(read3.marked, true)
   })
+
+  it('keeps older command queued and discloses remaining pickup work when the newest command on a two-command read returns nothing_open (3c5147a7 / 91d7b47c / 3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    const turn1 = '11111111-1111-4111-8111-111111111111'
+    const msg1 = '22222222-2222-4222-8222-222222222222'
+    const turn2 = TURN_ID
+    const msg2 = MSG_ID
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Older open command 1', { messageId: msg1, turnId: turn1 })))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Newer already-closed command 2', { messageId: msg2, turnId: turn2 })))
+
+    const pickups = []
+    const call = async (req) => {
+      if (req.name === 'report_pickup') {
+        pickups.push(req.arguments.command_message_id)
+        if (req.arguments.command_message_id === msg2) {
+          return { ok: true, attempt_id: null, outcome: 'nothing_open' }
+        }
+        return { outcome: 'picked_up' }
+      }
+      return { ok: true }
+    }
+
+    // Read 1: newer msg2 returns nothing_open; older msg1 MUST stay queued, header MUST report
+    // remaining > 0 + disclosure note, stderr MUST disclose the skipped older pickup, and cursor stays held!
+    let out1 = ''
+    let err1 = ''
+    const read1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { out1 += text },
+      writeStderr: (text) => { err1 += text },
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read1.marked, false, 'cursor must NOT advance past unchecked older command after newer nothing_open')
+    assert.ok(read1.remaining >= 1, `expected remaining >= 1 in read1, got ${read1.remaining}`)
+    assert.deepEqual(pickups, [msg2])
+    assert.deepEqual(read1.unstarted_commands, [{ turnId: turn1, messageId: msg1 }])
+    const header1 = JSON.parse(out1.split('\n')[0])
+    assert.ok(header1.devspec_wakes.remaining >= 1, 'stdout header must NOT report remaining: 0 while older pickup is queued')
+    assert.match(String(header1.note ?? ''), /remain queued for pickup/i)
+    assert.match(err1, /remain queued for pickup/i)
+    assert.match(err1, new RegExp(msg1))
+
+    // Read 2: older command msg1 is returned and picked up (msg2 was already resolved as nothing_open),
+    // and NOW cursor advances to EOF with remaining: 0!
+    let out2 = ''
+    const read2 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { out2 += text },
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read2.marked, true)
+    assert.equal(read2.remaining, 0)
+    assert.deepEqual(pickups, [msg2, msg1])
+    assert.match(out2, /Older open command 1/)
+
+    // Read 3: EOF -> 0 wakes.
+    const read3 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read3.printed, 0)
+    assert.equal(read3.marked, true)
+  })
+
+  it('stepDeliveryHook still returns structured refusal in agent-facing additional_context when saving a concurrent delivery note fails (4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const batch1 = ownerBatch('Handed-over command whose pickup will be refused')
+    holdForNextStep(CONN, batch1, buildOwnerMessageEvents(batch1), { dir })
+    const raw1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '' },
+      { home, dir, listenerActive: () => true },
+    )
+    const noteId = noteIdIn(JSON.parse(raw1).additional_context)
+    const parts = noteFiles(home, noteId)
+    const partContents = parts.map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    // Enqueue a concurrent waiting item BEFORE the agent finishes reading the first note,
+    // AND make ~/.devspec/notes read-only so saving the concurrent delivery note throws EACCES.
+    const batch2 = ownerBatch('Concurrent arriving command', {
+      messageId: '99999999-9999-4999-8999-999999999999',
+      turnId: '88888888-8888-4888-8888-888888888888',
+    })
+    holdForNextStep(CONN, batch2, buildOwnerMessageEvents(batch2), { dir })
+
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.chmodSync(notesDir, 0o555)
+    let refusalRaw = null
+    try {
+      for (const callInput of partContents) {
+        refusalRaw = await stepDeliveryHook(callInput, {
+          home,
+          dir,
+          share: 1200,
+          listenerActive: () => true,
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_in_progress',
+                  blocking_turn_id: '77777777-7777-4777-8777-777777777777',
+                  reason: 'Another turn is currently open on this connection.',
+                },
+              },
+            ],
+          }),
+        })
+      }
+    } finally {
+      fs.chmodSync(notesDir, 0o700)
+    }
+    assert.ok(refusalRaw, 'stepDeliveryHook must NOT return null when concurrent delivery note saving fails after a structured pickup refusal')
+    const ctx = JSON.parse(refusalRaw).additional_context
+    assert.ok(ctx.length <= 1200, `additional_context (${ctx.length}) must stay within hook share (1200)`)
+    assert.match(ctx, /turn_in_progress/)
+    assert.match(ctx, /77777777-7777-4777-8777-777777777777/)
+    assert.match(ctx, /~\/\.devspec\/notes/)
+  })
 })

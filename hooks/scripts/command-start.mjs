@@ -829,10 +829,15 @@ export async function startRoomCommands({
   }
 
   if (nothingOpen.length > 0) {
+    // Record the checked `nothing_open` command id so a subsequent read retries any
+    // older `unstarted` command(s) rather than looping forever on the closed newest one
+    // (requirements 3ea2b201 / 3c5147a7 / 91d7b47c).
+    recordStartedCommandIds(connectionId, [primary.messageId], dir)
     return {
       ok: false,
       outcome: 'nothing_open',
       started: [],
+      ...(unstarted.length > 0 ? { unstarted } : {}),
       pickedUp: 0,
       startsTurn: false,
       nothingOpen,

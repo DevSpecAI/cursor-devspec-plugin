@@ -1929,6 +1929,11 @@ export async function runOneShotRoomCommandPickup({
   let ok = true
   let refusals = null
   let nothingOpen = null
+  const unstartedList = Array.isArray(startResult?.unstarted) ? startResult.unstarted : []
+  const unstartedNotice =
+    unstartedList.length > 0
+      ? `devspec-remote-wait: ${unstartedList.length} older room command(s) remain queued for pickup (${unstartedList.map((cmd) => cmd?.messageId).filter(Boolean).join(', ')}); inbox position held — run devspec-remote-wait again to pick up the rest.\n`
+      : ''
   const combinedRefusals = [
     ...noteRefusals,
     ...(Array.isArray(startResult?.refusals) ? startResult.refusals : []),
@@ -1938,14 +1943,16 @@ export async function runOneShotRoomCommandPickup({
     refusals = combinedRefusals
     rawDiag =
       `${capturedDiag.join('')}` +
-      `devspec-remote-wait: report_pickup refused; inbox position not advanced so next read retries: ${JSON.stringify(refusals)}\n`
+      `devspec-remote-wait: report_pickup refused; inbox position not advanced so next read retries: ${JSON.stringify(refusals)}\n` +
+      unstartedNotice
   } else if (Array.isArray(startResult?.nothingOpen) && startResult.nothingOpen.length > 0) {
     nothingOpen = startResult.nothingOpen
     rawDiag =
       `${capturedDiag.join('')}` +
-      `devspec-remote-wait: report_pickup returned nothing_open: ${JSON.stringify(nothingOpen)}\n`
-  } else if (capturedDiag.length > 0) {
-    rawDiag = capturedDiag.join('')
+      `devspec-remote-wait: report_pickup returned nothing_open: ${JSON.stringify(nothingOpen)}\n` +
+      unstartedNotice
+  } else if (capturedDiag.length > 0 || unstartedNotice) {
+    rawDiag = `${capturedDiag.join('')}${unstartedNotice}`
   }
   let stderrText = ''
   let diagnosticNote = null

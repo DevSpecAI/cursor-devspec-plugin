@@ -1107,6 +1107,74 @@ export async function stepDeliveryHook(
       logDiscarded('stepDeliveryHook', connectionId, discardLocked(connectionId, connDir))
       return null
     }
+    const formatPickupRefusals = (existingContext, priorNoteError = null) => {
+      if (!pickupRefusals) return existingContext
+      const refusalNotice =
+        `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
+      const buildFallback = (budget, noteError) => {
+        const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
+          prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
+          maxChars: budget,
+          noteError,
+        })
+        return formatted ? formatted.trimEnd() : null
+      }
+      if (!existingContext) {
+        if (priorNoteError) {
+          return buildFallback(share, priorNoteError)
+        }
+        try {
+          return fitHookContext(refusalNotice, {
+            share,
+            what: 'DevSpec room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          return buildFallback(share, noteError)
+        }
+      }
+      const remainingShare = share - existingContext.length - 2
+      let fittedInlineOrPointer = null
+      let inlineNoteError = priorNoteError
+      if (remainingShare > 0 && !priorNoteError) {
+        try {
+          fittedInlineOrPointer = fitHookContext(refusalNotice, {
+            share: remainingShare,
+            what: 'DevSpec room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          inlineNoteError = noteError
+        }
+      }
+      if (fittedInlineOrPointer && existingContext.length + 2 + fittedInlineOrPointer.length <= share) {
+        return `${existingContext}\n\n${fittedInlineOrPointer}`
+      }
+      // Never drop the structured pickup refusal when a concurrent delivery note
+      // fills the hook share: combine both into one sealed note, or if note writing
+      // fails, surface a budget-fitted structured refusal fallback inline (req 4e32d1a5 / 3c5147a7).
+      let combined = null
+      let combinedNoteError = inlineNoteError
+      if (!priorNoteError) {
+        try {
+          combined = fitHookContext(`${existingContext}\n\n${refusalNotice}`, {
+            share,
+            what: 'DevSpec pending delivery and room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          combinedNoteError = noteError
+        }
+      }
+      if (combined) return combined
+      const fbWithContext = remainingShare > 0 ? buildFallback(remainingShare, combinedNoteError) : null
+      if (fbWithContext && existingContext.length + 2 + fbWithContext.length <= share) {
+        return `${existingContext}\n\n${fbWithContext}`
+      }
+      const fbFull = buildFallback(share, combinedNoteError)
+      return fbFull ?? existingContext
+    }
+
     try {
       if (adding.length > 0) {
         const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
@@ -1114,11 +1182,22 @@ export async function stepDeliveryHook(
         record = { version: RECORD_VERSION, note: note.id, parts: [], items, at: new Date().toISOString() }
       }
       if (record && (adding.length > 0 || readChanged)) writePrivateJson(path.join(steps, HANDED), record)
-    } catch {
+    } catch (deliveryWriteError) {
       // Not handed over, so not taken: everything goes back for the next step.
       for (const each of adding) giveBack(each.taken)
       if (takenRecord) giveBack(takenRecord)
       for (const each of checked.filter((one) => !one.open)) drop(each.taken)
+      // Even when saving a concurrent delivery note fails, NEVER swallow structured
+      // pickup refusal details from this step — emit the budget-fitted refusal fallback
+      // as agent-facing additional_context (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+      if (pickupRefusals) {
+        const refusalContext = formatPickupRefusals(null, deliveryWriteError)
+        const refusalOutput = refusalContext ? JSON.stringify(postToolUseOutput(refusalContext)) : null
+        if (refusalOutput) {
+          await emit(refusalOutput)
+          return refusalOutput
+        }
+      }
       return null
     }
     for (const each of checked) drop(each.taken)
@@ -1133,73 +1212,7 @@ export async function stepDeliveryHook(
       record && record.pickup_pending !== true
         ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
         : null
-    if (pickupRefusals) {
-      const refusalNotice =
-        `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
-      const buildFallback = (budget, noteError) => {
-        const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
-          prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
-          maxChars: budget,
-          noteError,
-        })
-        return formatted ? formatted.trimEnd() : null
-      }
-      if (!context) {
-        try {
-          context = fitHookContext(refusalNotice, {
-            share,
-            what: 'DevSpec room-command pickup refusal details',
-            home,
-          })
-        } catch (noteError) {
-          context = buildFallback(share, noteError)
-        }
-      } else {
-        const remainingShare = share - context.length - 2
-        let fittedInlineOrPointer = null
-        let inlineNoteError = null
-        if (remainingShare > 0) {
-          try {
-            fittedInlineOrPointer = fitHookContext(refusalNotice, {
-              share: remainingShare,
-              what: 'DevSpec room-command pickup refusal details',
-              home,
-            })
-          } catch (noteError) {
-            inlineNoteError = noteError
-          }
-        }
-        if (fittedInlineOrPointer && context.length + 2 + fittedInlineOrPointer.length <= share) {
-          context = `${context}\n\n${fittedInlineOrPointer}`
-        } else {
-          // Never drop the structured pickup refusal when a concurrent delivery note
-          // fills the hook share: combine both into one sealed note, or if note writing
-          // fails, surface a budget-fitted structured refusal fallback inline (req 4e32d1a5 / 3c5147a7).
-          let combined = null
-          let combinedNoteError = inlineNoteError
-          try {
-            combined = fitHookContext(`${context}\n\n${refusalNotice}`, {
-              share,
-              what: 'DevSpec pending delivery and room-command pickup refusal details',
-              home,
-            })
-          } catch (noteError) {
-            combinedNoteError = noteError
-          }
-          if (combined) {
-            context = combined
-          } else {
-            const fbWithContext = remainingShare > 0 ? buildFallback(remainingShare, combinedNoteError) : null
-            if (fbWithContext && context.length + 2 + fbWithContext.length <= share) {
-              context = `${context}\n\n${fbWithContext}`
-            } else {
-              const fbFull = buildFallback(share, combinedNoteError)
-              if (fbFull) context = fbFull
-            }
-          }
-        }
-      }
-    }
+    context = formatPickupRefusals(context)
     if (needsListenerReminder) {
       const rawReminder = wakeListenerReminder(connectionId, { dir: connDir })
       if (!context) {
