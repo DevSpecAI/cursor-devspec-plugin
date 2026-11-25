@@ -435,7 +435,7 @@ describe('stamping a DevSpec write', () => {
       { op: 'launch', key: 'helper', kind: 'subagent', notifies: true, request: A, also: [] },
       { op: 'answered', id: A },
     )
-    for (const name of ['record_requirement', 'record_inventory_entry', 'record_dependency_review', 'record_implementation']) {
+    for (const name of ['record_requirement', 'record_inventory_entry', 'manage_inventory_connections', 'record_dependency_review', 'record_implementation']) {
       assert.deepEqual(stampRequest(name, { x: 1 }, CONN, 'helper', { home, includeProvenance: true }), {
         args: { x: 1, request_ref: A },
       }, name)

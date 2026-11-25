@@ -21,6 +21,7 @@ beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-c
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
 import {
   fastConnect as connectImpl,
+  formatFastConnectCliOutput,
   parseSessionIdFromPrompt,
   resolveProjectForConnect,
 } from './fast-connect.mjs'
@@ -545,6 +546,7 @@ describe('fastConnect', () => {
     assert.equal(r.connection_id, connectionId)
   })
   it('returns a short connect summary without rules or full repository list while keeping the full snapshot on disk (item 083422dd)', async () => {
+    assert.equal(formatFastConnectCliOutput, formatConnectCliOutput)
     const bigRules = `Never skip checks. ${'Detail line. '.repeat(400)}RULES-WHOLE-END`
     const repos = Array.from({ length: 12 }, (_, i) => ({
       id: `repo-${i}`,
@@ -618,6 +620,70 @@ describe('fastConnect', () => {
       project_selection: { status: 'choice_required', candidates: [{ id: projectId, name: 'DevSpec' }] },
     })
     assert.equal(choiceSummary.project_selection?.status, 'choice_required')
+  })
+
+  it('reconnect reattaches the prior session when no --session or --new is passed, returns short summary with plugin_root, and refuses missing conversation id (item 66ad4866)', async () => {
+    const calls = []
+    const r = await fastConnect({
+      localId,
+      launchId,
+      projectId,
+      resolveAuth: () => ({ ok: true, token: 't', mcp_url: 'https://example.test/api/mcp' }),
+      resolveGitRemoteFn: () => null,
+      resolveLocalFn: () => ({
+        action: 'reconnect',
+        connection_id: connectionId,
+        session_id: sessionId,
+        session_codename: 'Quiet Fox',
+      }),
+      detectLocalIdFn: () => ({ local_id: localId, source: 'env:CURSOR_CONVERSATION_ID' }),
+      emitPhase: async () => {},
+      registerFn: async () => {
+        calls.push('register')
+        return {
+          ok: true,
+          connection_id: connectionId,
+          project_id: projectId,
+          session_id: null,
+          codename: 'Quiet Fox',
+          project_selection: { status: 'resolved', project: { id: projectId, name: 'DevSpec' } },
+          repository_context: { version: 1, project_id: projectId, status: 'available', repositories: [] },
+          project_agent_rules: 'Long rules that must not be dumped inline',
+          github_identity: { status: 'link_required', url: 'https://app.devspec.ai/api/github/link?state=xyz' },
+        }
+      },
+      attachFn: async (opts) => {
+        calls.push(['attach', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId }
+      },
+      writeFn: async (opts) => {
+        calls.push(['write', opts.sessionId])
+        return { ok: true, connection_id: connectionId, session_id: opts.sessionId, session_codename: 'Quiet Fox', auth_ok: true, poller: { ok: true, pid: 11 } }
+      },
+    })
+    assert.equal(r.ok, true)
+    assert.equal(r.action, 'reconnect')
+    assert.equal(r.session_id, sessionId)
+    assert.equal(r.project_name, 'DevSpec')
+    assert.equal(r.repository_count, 0)
+    assert.ok(typeof r.plugin_root === 'string' && r.plugin_root.length > 0)
+    assert.equal(r.github_identity?.status, 'link_required')
+    assert.match(r.github_status, /NOT LINKED/)
+    assert.equal('project_context' in r, false)
+    assert.doesNotMatch(JSON.stringify(r), /Long rules that must not be dumped inline/)
+    assert.deepEqual(calls, ['register', ['attach', sessionId], ['write', sessionId]])
+
+    // Never guesses or fabricates a conversation id when missing.
+    const missing = await fastConnect({
+      detectLocalIdFn: () => ({ local_id: null, source: null }),
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error, /conversation ID/)
+    assert.equal(missing.local_id, null)
+
+    // --name and --name=... map to codename.
+    assert.equal(parseArgs(['fast-connect', '--name', 'My Agent']).codename, 'My Agent')
+    assert.equal(parseArgs(['connect', '--name=My Agent']).codename, 'My Agent')
   })
 })
 
@@ -1119,6 +1185,7 @@ describe('fast-connect CLI flags', () => {
         error: 'Choose a project.',
         project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
       }
+      // Pad one candidate so fullText alone fits (~19,900 chars) but reserve + fullText exceeds 20,000.
       const baseLen = (JSON.stringify(nearLimit, null, 2) + '\n').length
       if (baseLen < 19_900) {
         nearLimit.project_selection.candidates[0].description = 'd'.repeat(19_900 - baseLen)
@@ -1624,6 +1691,8 @@ describe('fast-connect CLI flags', () => {
         process.stderr.write = (chunk, enc, cb) => {
           const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
           const done = typeof enc === 'function' ? enc : cb
+          // Simulate a backpressured pipe: only deliver first 4,096 bytes synchronously,
+          // rest asynchronously after a tick.
           delivered += text.slice(0, 4096)
           setTimeout(() => {
             delivered += text.slice(4096)
