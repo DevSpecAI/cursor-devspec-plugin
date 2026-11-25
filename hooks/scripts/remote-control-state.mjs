@@ -2002,7 +2002,52 @@ export function installBoundedCliStderr({
   let omittedChars = 0
   let omittedNoteFailedCount = 0
   const omittedNotes = []
+  const pendingWrites = new Set()
   const rawStderrWrite = process.stderr.write.bind(process.stderr)
+
+  const writeTracked = (text, encoding, callback) => {
+    let settled = false
+    let resolveWrite
+    const promise = new Promise((resolve) => {
+      resolveWrite = resolve
+    })
+    pendingWrites.add(promise)
+    const finish = (err) => {
+      if (settled) return
+      settled = true
+      process.stderr.off('error', onErr)
+      pendingWrites.delete(promise)
+      resolveWrite()
+      if (typeof callback === 'function') callback(err)
+    }
+    const onErr = (err) => finish(err)
+    process.stderr.once('error', onErr)
+    return typeof encoding === 'string'
+      ? rawStderrWrite(text, encoding, finish)
+      : rawStderrWrite(text, finish)
+  }
+
+  const flushStderr = async () => {
+    while (pendingWrites.size > 0) {
+      await Promise.all([...pendingWrites])
+    }
+    if (process.stderr.writableNeedDrain || (process.stderr.writableLength ?? 0) > 0) {
+      await new Promise((resolve) => {
+        let settled = false
+        const done = () => {
+          if (settled) return
+          settled = true
+          process.stderr.off('drain', done)
+          process.stderr.off('error', done)
+          process.stderr.off('close', done)
+          resolve()
+        }
+        process.stderr.once('drain', done)
+        process.stderr.once('error', done)
+        process.stderr.once('close', done)
+      })
+    }
+  }
 
   const recordOmitted = (text, note) => {
     omittedCount += 1
@@ -2016,6 +2061,7 @@ export function installBoundedCliStderr({
 
   process.stderr.write = (chunk, encoding, callback) => {
     const cb = typeof encoding === 'function' ? encoding : callback
+    const enc = typeof encoding === 'string' ? encoding : undefined
     const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
     let toWrite = ''
     if (omissionNoticeEmitted) {
@@ -2060,12 +2106,11 @@ export function installBoundedCliStderr({
       if (typeof cb === 'function') queueMicrotask(cb)
       return true
     }
-    return typeof encoding === 'function'
-      ? rawStderrWrite(toWrite, encoding)
-      : rawStderrWrite(toWrite, encoding, callback)
+    return writeTracked(toWrite, enc, cb)
   }
   return {
     getEmittedStderr: () => emittedStderr,
+    flushStderr,
     getSuppressedDiagnostics: () => {
       if (omittedCount === 0) return null
       const recovery =
@@ -2093,11 +2138,13 @@ export function installBoundedCliStderr({
           summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
         })
       } catch {
-        done()
+        void flushStderr().finally(done)
         return
       }
       emittedStderr += bounded
-      rawStderrWrite(bounded, done)
+      writeTracked(bounded, undefined, () => {
+        void flushStderr().finally(done)
+      })
     },
     restore: () => {
       process.stderr.write = rawStderrWrite
@@ -2128,6 +2175,7 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
     await runFastConnectCli(args, {
       getEmittedStderr: cliStderr.getEmittedStderr,
       getSuppressedDiagnostics: cliStderr.getSuppressedDiagnostics,
+      flushStderr: cliStderr.flushStderr,
     })
     return
   }
@@ -2683,6 +2731,7 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
       hostToken,
     })
     process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+    await cliStderr.flushStderr()
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2692,5 +2741,6 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
     summary: `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
   })
   await new Promise((resolve) => process.stderr.write(boundedUnknown, resolve))
+  await cliStderr.flushStderr()
   process.exit(2)
 }
