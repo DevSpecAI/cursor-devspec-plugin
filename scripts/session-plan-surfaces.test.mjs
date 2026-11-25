@@ -10,6 +10,10 @@ const mcp = JSON.parse(read('mcp.json'))
 const readme = read('README.md')
 const changelog = read('CHANGELOG.md')
 const remoteSkill = read('skills/devspec-remote/SKILL.md')
+const remoteInteractionsPart = read('skills/devspec-remote/interactions.md')
+const remoteSkillParts = fs.readdirSync(new URL('../skills/devspec-remote', import.meta.url))
+  .filter((name) => name.endsWith('.md') && name !== 'SKILL.md')
+  .sort()
 
 describe('Cursor shared-session-plan surfaces', () => {
   it('keeps the command surface Cursor-operational and does not revive a prose work command', () => {
@@ -121,13 +125,49 @@ describe('Cursor shared-session-plan surfaces', () => {
   })
 
   it('keeps capability-bound helpers discoverable through the normal Remote skill', () => {
-    // Standalone launching now invokes the installed skill, not a plugin-owned
-    // launcher-generated thin brief. The full host instructions remain intact.
-    for (const command of ['manage-plan describe', 'manage-poll describe', 'manage-question describe', 'manage-question respond']) {
-      assert.ok(remoteSkill.includes(command), `${command} must remain discoverable`)
+    // Standalone launching invokes the installed skill, whose lean core points
+    // to interactions.md on demand for plans, polls, and directed questions.
+    assert.ok(remoteSkill.includes('interactions.md'), 'SKILL.md must point to interactions.md')
+    for (const name of ['manage-plan', 'manage-poll', 'manage-question']) {
+      assert.ok(remoteSkill.includes(name), `SKILL.md must tell the agent when to open interactions.md for ${name}`)
     }
-    assert.match(remoteSkill, /complete schema.*on demand|bounded on-demand discovery/i)
+    for (const command of ['manage-plan describe', 'manage-poll describe', 'manage-question describe', 'manage-question respond']) {
+      assert.ok(remoteInteractionsPart.includes(command), `${command} must remain discoverable in interactions.md`)
+    }
+    assert.match(remoteInteractionsPart, /complete schema.*on demand|bounded on-demand discovery/i)
     assert.equal(fs.existsSync(new URL('./pin-remote-plugin.mjs', import.meta.url)), false)
+  })
+
+  it('splits the Remote skill into a lean core and indexed on-demand parts without duplicating areas', () => {
+    assert.deepEqual(remoteSkillParts, [
+      'connection-plumbing.md',
+      'interactions.md',
+      'records-and-instructions.md',
+      'work-and-review.md',
+    ])
+    for (const part of remoteSkillParts) {
+      assert.ok(remoteSkill.includes(`\`${part}\``), `SKILL.md must index ${part}`)
+    }
+    const referencedParts = [...remoteSkill.matchAll(/`([a-z0-9-]+\.md)`/g)]
+      .map((m) => m[1])
+      .filter((name) => name !== 'SKILL.md')
+    assert.ok(referencedParts.length >= remoteSkillParts.length)
+    for (const name of new Set(referencedParts)) {
+      assert.ok(fs.existsSync(new URL(`../skills/devspec-remote/${name}`, import.meta.url)),
+        `SKILL.md references missing part ${name}`)
+    }
+    for (const movedHeading of [
+      '### Shared session plans',
+      '### Session polls',
+      '### Asking one person a question',
+      '### Working several requested items',
+      "## Keeping the project's records",
+      '## Tasks belong to this remote session',
+      '## Account + project instructions',
+      '### Sign-in',
+    ]) {
+      assert.equal(remoteSkill.includes(movedHeading), false, `core SKILL.md should not inline ${movedHeading}`)
+    }
   })
 
   it('preserves Cursor-native resume and local-session documentation', () => {
