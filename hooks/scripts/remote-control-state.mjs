@@ -645,21 +645,121 @@ function sleepSyncMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
+function readWakeFollowLockInfo(lockFile) {
+  let fd = null
+  try {
+    fd = fs.openSync(lockFile, 'r')
+    const stat = fs.fstatSync(fd)
+    const raw = fs.readFileSync(fd, 'utf8').trim()
+    let pid = null
+    let token = null
+    if (raw.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (Number.isInteger(parsed?.pid)) pid = parsed.pid
+        if (typeof parsed?.token === 'string' && /^[0-9a-f]{8,64}$/i.test(parsed.token)) token = parsed.token
+      } catch {
+        /* malformed JSON -> treat as empty/stale candidate */
+      }
+    } else if (raw) {
+      const parsedPid = Number.parseInt(raw, 10)
+      if (Number.isInteger(parsedPid)) pid = parsedPid
+    }
+    return {
+      raw,
+      pid,
+      token,
+      ino: String(stat.ino),
+      mtimeMs: stat.mtimeMs,
+    }
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function sameLockIdentity(a, b) {
+  if (!a || !b) return false
+  if (a.token || b.token) return a.token !== null && a.token === b.token
+  return a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.raw === b.raw
+}
+
+/**
+ * Reclaim a stale lock file without racing another caller that already replaced it
+ * with a live lock (decision 2df26cd2). Takes an exclusive guard keyed to the exact
+ * stale lock's token/inode, re-verifies the lock file still has that identical
+ * identity, and only then unlinks it.
+ */
+function tryReclaimStaleWakeFollowLock(lockFile, staleInfo) {
+  const key = staleInfo.token || `ino-${staleInfo.ino}-${Math.trunc(staleInfo.mtimeMs)}`
+  const reclaimFile = `${lockFile}.reclaim.${key}`
+  const reclaimTemp = `${reclaimFile}.${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  let claimedReclaim = false
+  try {
+    fs.writeFileSync(reclaimTemp, JSON.stringify({ pid: process.pid }), { mode: 0o600 })
+    try {
+      fs.linkSync(reclaimTemp, reclaimFile)
+      claimedReclaim = true
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return false
+      // If a prior reclaimer crashed mid-reclaim, only clear the guard when its PID is dead.
+      const guard = readWakeFollowLockInfo(reclaimFile)
+      if (guard && Number.isInteger(guard.pid) && guard.pid > 1 && !ownerAlive(guard.pid)) {
+        try {
+          fs.unlinkSync(reclaimFile)
+        } catch {
+          /* another caller cleared it */
+        }
+      }
+      return false
+    }
+    const current = readWakeFollowLockInfo(lockFile)
+    if (!sameLockIdentity(staleInfo, current)) return false
+    try {
+      fs.unlinkSync(lockFile)
+      return true
+    } catch {
+      return false
+    }
+  } finally {
+    try {
+      fs.unlinkSync(reclaimTemp)
+    } catch {
+      /* ignore */
+    }
+    if (claimedReclaim) {
+      try {
+        fs.unlinkSync(reclaimFile)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /**
  * Serialize wake-follow check-and-spawn across concurrent callers (for example
  * `writeConnectionState` and the newly spawned `devspec-remote-poll.mjs`), keeping
  * strictly one inbox follower per connection (decision 2df26cd2).
  *
- * Uses the same atomic temp-file + `linkSync` pattern as `step-delivery.mjs` so
- * the lock file never exists without its owner PID written first; any empty lock
- * left by an older crash is reclaimed once older than `WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS`.
+ * Uses atomic temp-file + `linkSync` with a unique per-acquisition token so the lock
+ * file never exists without its owner PID + token, and stale-lock reclaim is guarded
+ * per stale token/inode so a delayed caller can never unlink a live replacement lock.
  */
-function withWakeFollowLock(connectionId, io, work) {
+export function withWakeFollowLock(connectionId, io, work, { dir = CONNECTIONS_DIR } = {}) {
   if (io !== fs) return work()
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
-  const lockFile = wakeFollowLockPath(connectionId)
-  const tempLock = `${lockFile}.${process.pid}-${crypto.randomBytes(4).toString('hex')}`
-  fs.writeFileSync(tempLock, `${process.pid}\n`, { mode: 0o600 })
+  fs.mkdirSync(dir, { recursive: true })
+  const lockFile = path.join(dir, `${connectionId}.follow.lock`)
+  const myToken = crypto.randomBytes(8).toString('hex')
+  const tempLock = `${lockFile}.${process.pid}-${myToken}`
+  fs.writeFileSync(tempLock, `${JSON.stringify({ pid: process.pid, token: myToken })}\n`, { mode: 0o600 })
   const deadline = Date.now() + WAKE_FOLLOW_LOCK_WAIT_MS
   let acquired = false
   try {
@@ -671,27 +771,15 @@ function withWakeFollowLock(connectionId, io, work) {
       } catch (error) {
         if (error?.code !== 'EEXIST') throw error
       }
-      let raw = ''
-      let mtimeMs = null
-      try {
-        raw = fs.readFileSync(lockFile, 'utf8').trim()
-        mtimeMs = fs.statSync(lockFile).mtimeMs
-      } catch {
-        continue
-      }
-      const holder = Number.parseInt(raw, 10)
-      const deadHolder = Number.isInteger(holder) && holder > 1 && !ownerAlive(holder)
+      const info = readWakeFollowLockInfo(lockFile)
+      if (!info) continue
+      const deadHolder = Number.isInteger(info.pid) && info.pid > 1 && !ownerAlive(info.pid)
       const staleEmpty =
-        (!raw || !Number.isInteger(holder) || holder <= 1) &&
-        typeof mtimeMs === 'number' &&
-        Date.now() - mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
+        (!info.raw || !Number.isInteger(info.pid) || info.pid <= 1) &&
+        typeof info.mtimeMs === 'number' &&
+        Date.now() - info.mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
       if (deadHolder || staleEmpty) {
-        try {
-          fs.unlinkSync(lockFile)
-        } catch {
-          /* another caller cleared it */
-        }
-        continue
+        if (tryReclaimStaleWakeFollowLock(lockFile, info)) continue
       }
       sleepSyncMs(WAKE_FOLLOW_LOCK_RETRY_MS)
     }
@@ -706,6 +794,7 @@ function withWakeFollowLock(connectionId, io, work) {
     return {
       ok: false,
       code: 'wake_follow_lock_busy',
+      retryable: true,
       error: 'wake-follow startup lock busy; retry shortly',
       lock_wait_ms: WAKE_FOLLOW_LOCK_WAIT_MS,
     }
@@ -713,10 +802,13 @@ function withWakeFollowLock(connectionId, io, work) {
   try {
     return work()
   } finally {
-    try {
-      fs.unlinkSync(lockFile)
-    } catch {
-      /* ignore */
+    const current = readWakeFollowLockInfo(lockFile)
+    if (current?.token === myToken) {
+      try {
+        fs.unlinkSync(lockFile)
+      } catch {
+        /* ignore */
+      }
     }
   }
 }

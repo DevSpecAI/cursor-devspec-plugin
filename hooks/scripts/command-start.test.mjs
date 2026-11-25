@@ -305,12 +305,21 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         mcp_url: 'https://api.devspec.ai/api/mcp',
         auth_ok: true,
         poller: { ok: true, pid: 100 },
-        wake_follow: { ok: false, error: 'wake file directory is not writable' },
+        wake_follow: {
+          ok: false,
+          code: 'wake_follow_lock_busy',
+          retryable: true,
+          lock_wait_ms: 2_000,
+          error: 'wake-follow startup lock busy; retry shortly',
+        },
       }),
     })
     assert.equal(failed.ok, false)
-    assert.equal(failed.code, 'wake_follow_failed')
-    assert.match(failed.error, /not writable/)
+    assert.equal(failed.code, 'wake_follow_lock_busy', 'must preserve structured lock refusal code instead of overwriting it')
+    assert.equal(failed.lock_wait_ms, 2_000)
+    assert.equal(failed.retryable, true)
+    assert.equal(failed.wake_follow.lock_wait_ms, 2_000)
+    assert.match(failed.error, /lock busy/)
 
     const ok = await fastConnect({
       ...baseOpts,
@@ -476,7 +485,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     ])
   })
 
-  it('issues one single report_pickup call when multiple commands arrive together rather than looping per command', async () => {
+  it('issues one single report_pickup call when multiple commands arrive together and only marks the picked-up command started so older waiting commands can still be picked up by name (3ea2b201)', async () => {
     const { home, dir } = mkHome()
     const pickups = []
     const cmd1 = { turnId: '11111111-1111-4111-8111-111111111111', messageId: '22222222-2222-4222-8222-222222222222' }
@@ -496,6 +505,89 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(res.ok, true)
     assert.equal(pickups.length, 1, 'must not loop report_pickup once per command')
     assert.equal(pickups[0].command_message_id, MSG_ID)
+    assert.deepEqual(res.started, [cmd2], 'only the picked-up command may be recorded as started')
+    assert.deepEqual(res.unstarted, [cmd1])
+
+    // Older still-waiting command was NOT marked started and can still be picked up by name later.
+    const second = await startRoomCommands({
+      connectionId: CONN,
+      commands: [cmd1],
+      dir,
+      home,
+      call: async (req) => {
+        if (req.name === 'report_pickup') pickups.push(req.arguments)
+        return { outcome: 'picked_up' }
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+    })
+    assert.equal(second.ok, true)
+    assert.equal(second.duplicate, undefined)
+    assert.equal(pickups.length, 2)
+    assert.equal(pickups[1].command_message_id, cmd1.messageId)
+  })
+
+  it('keeps readWakes combined stdout + stderr within fitsShellOutput by saving oversized pickup diagnostics to a sealed note (3c5147a7 / 91d7b47c)', async () => {
+    const { fitsShellOutput } = await import('./hook-context-budget.mjs')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    // Multiple wakes pushing stdout near the Shell ceiling (~18,500 chars) plus a refusal
+    // payload that would push combined stdout + stderr past CURSOR_SHELL_OUTPUT_MAX_CHARS.
+    for (let i = 0; i < 6; i += 1) {
+      const batch = ownerBatch(`Near-limit wake ${i}: ${'W'.repeat(450)}`)
+      const events = buildOwnerMessageEvents(batch)
+      events[0].padding = 'P'.repeat(2_200)
+      appendWakeEvents(wakeFile, events)
+    }
+    let stdout = ''
+    let stderr = ''
+    const res = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { stdout += text },
+      writeStderr: (text) => { stderr += text },
+      startCommands: async () => ({
+        ok: false,
+        outcome: 'refused',
+        refusals: [{ code: 'turn_busy', detail: 'D'.repeat(6_000) }],
+      }),
+    })
+    assert.equal(res.marked, false)
+    assert.ok(stdout.length > 15_000, `expected near-limit stdout page, got ${stdout.length}`)
+    assert.equal(fitsShellOutput(stdout + stderr), true, `combined stdout + stderr (${stdout.length + stderr.length} chars) must fit Cursor Shell ceiling`)
+    assert.ok(res.pickup_diagnostic_note?.id, 'oversized pickup refusal must be saved whole to a sealed note')
+    assert.match(stderr, new RegExp(res.pickup_diagnostic_note.id))
+    const saved = readNoteText(res.pickup_diagnostic_note.id, { home })
+    assert.match(saved, /turn_busy/)
+    assert.match(saved, /D{100}/)
+  })
+
+  it('reclaims a stale wake-follow lock safely without unlinking a live replacement lock (2df26cd2)', async () => {
+    const { withWakeFollowLock } = await import('./remote-control-state.mjs')
+    const { dir } = mkHome()
+    const lockFile = path.join(dir, `${CONN}.follow.lock`)
+    // Write a stale lock owned by a dead PID.
+    fs.writeFileSync(lockFile, `${JSON.stringify({ pid: 999_999, token: 'deadbeef00001111' })}\n`, { mode: 0o600 })
+    let entered = 0
+    const res = withWakeFollowLock(
+      CONN,
+      fs,
+      () => {
+        entered += 1
+        // Verify our live lock holds our PID and a fresh token while inside the critical section.
+        const active = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+        assert.equal(active.pid, process.pid)
+        assert.notEqual(active.token, 'deadbeef00001111')
+        return { ok: true }
+      },
+      { dir },
+    )
+    assert.deepEqual(res, { ok: true })
+    assert.equal(entered, 1)
+    assert.equal(fs.existsSync(lockFile), false, 'lock released cleanly after work')
   })
 
   it('preserves nothing_open from report_pickup without marking a turn started or seeding a trail', async () => {

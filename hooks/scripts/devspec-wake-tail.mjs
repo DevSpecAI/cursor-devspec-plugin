@@ -100,7 +100,7 @@ import {
   wakeFileConnectionId,
   wakeLines,
 } from './devspec-wake-file.mjs'
-import { fitsShellOutput, wakeInNote, wakesForOneOutput } from './hook-context-budget.mjs'
+import { fitsShellOutput, wakeInNote, wakesForOneOutput, writeNote } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { connectionsDirFor, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
@@ -509,17 +509,46 @@ function eventsOf(wake) {
  * cannot write just now stops the read before it: the wakes before it go out, and when
  * it is the first, the header alone says so, so it is tried again on the next read.
  */
-export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null } = {}) {
+/** Fixed-shape stderr pointer emitted when pickup diagnostics would push stdout + stderr past Cursor's Shell ceiling. */
+function pickupDiagnosticPointer(command) {
+  return `devspec-wake-tail: pickup details saved whole — run \`${command}\` (and any further parts).\n`
+}
+
+/**
+ * Exact ceiling reservation for `pickupDiagnosticPointer` (16-hex note id), derived
+ * directly from the pointer format so `stdout + stderr` always fits `fitsShellOutput`
+ * even when pickup emits a large refusal or nothing_open payload (reqs 3c5147a7 / 91d7b47c).
+ */
+const PICKUP_DIAGNOSTIC_RESERVE = pickupDiagnosticPointer('cat ~/.devspec/notes/0000000000000000.md')
+
+function formatPickupDiagnosticForShell(pageText, diagnosticText, { home = os.homedir() } = {}) {
+  if (fitsShellOutput(pageText + diagnosticText)) {
+    return { text: diagnosticText, note: null }
+  }
+  try {
+    const note = writeNote(diagnosticText, { home })
+    const pointer = pickupDiagnosticPointer(note.command)
+    if (fitsShellOutput(pageText + pointer)) {
+      return { text: pointer, note }
+    }
+    return { text: '', note }
+  } catch {
+    return { text: '', note: null }
+  }
+}
+
+export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null, reserve = '' } = {}) {
   const kept = []
   for (let i = 0; i < wakes.length; i += 1) if (wakes[i].trim() && !skip(wakes[i])) kept.push(i)
   const total = kept.length
   if (total === 0) return { text: readerHeader(0, 0, NOTHING_UNREAD, listener), printed: 0, remaining: 0, through: wakes.length }
   const longest = readerHeader(total, total, null, listener)
+  const reservedHeader = longest + reserve
   const fitted = []
   let held = null
   for (const i of kept) {
     let wake = wakes[i]
-    if (!fitsShellOutput(longest + wake)) {
+    if (!fitsShellOutput(reservedHeader + wake)) {
       const out = wakeInNote(eventsOf(wake), { home })
       if (out.error) {
         held = out.error
@@ -529,9 +558,9 @@ export function readerPage(wakes, { home = os.homedir(), skip = () => false, lis
     }
     fitted.push(wake)
     // Nothing after this one can go out with it: no note is written for a wake that waits.
-    if (!fitsShellOutput(longest + fitted.join(''))) break
+    if (!fitsShellOutput(reservedHeader + fitted.join(''))) break
   }
-  const printed = wakesForOneOutput([longest, ...fitted]).count - 1
+  const printed = wakesForOneOutput([reservedHeader, ...fitted]).count - 1
   const remaining = total - printed
   const through = printed < total ? kept[printed] : wakes.length
   if (printed === 0 && held) return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through }
@@ -591,6 +620,7 @@ export async function readWakes({
   home = os.homedir(),
   dir = connectionsDirFor(home),
   write = writeStdout,
+  writeStderr = (text) => process.stderr.write(text),
   settleMs = POLL_MS,
   scriptPath = SCRIPT_PATH,
   isAlive = pidAlive,
@@ -603,13 +633,23 @@ export async function readWakes({
     const position = readPosition(resolved, key, dir)
     const { start, wakes } = await unreadWakes(resolved, position, { settleMs })
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
+    const hasRoomCommands =
+      Boolean(resolvedConnectionId) &&
+      wakes.some((wake) => extractRoomCommandsFromWake(wake.text).commands.length > 0)
     const page = readerPage(
       wakes.map((wake) => wake.text),
-      { home, listener, skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '' },
+      {
+        home,
+        listener,
+        reserve: hasRoomCommands ? PICKUP_DIAGNOSTIC_RESERVE : '',
+        skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '',
+      },
     )
     await write(page.text)
     let pickupRefusals = null
     let pickupNothingOpen = null
+    let pickupDiagnosticNote = null
+    let pickupDiagnosticWritten = false
     if (resolvedConnectionId && page.printed > 0) {
       const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
       const extracted = extractRoomCommandsFromWake(printedSlice)
@@ -634,14 +674,22 @@ export async function readWakes({
         }
         if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
           pickupRefusals = pickupResult.refusals
-          process.stderr.write(
-            `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`,
-          )
+          const rawDiag = `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
+          const fitted = formatPickupDiagnosticForShell(page.text, rawDiag, { home })
+          pickupDiagnosticNote = fitted.note
+          if (fitted.text) {
+            writeStderr(fitted.text)
+            pickupDiagnosticWritten = true
+          }
         } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
           pickupNothingOpen = pickupResult.nothingOpen
-          process.stderr.write(
-            `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`,
-          )
+          const rawDiag = `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`
+          const fitted = formatPickupDiagnosticForShell(page.text, rawDiag, { home })
+          pickupDiagnosticNote = fitted.note
+          if (fitted.text) {
+            writeStderr(fitted.text)
+            pickupDiagnosticWritten = true
+          }
         }
       }
     }
@@ -652,11 +700,17 @@ export async function readWakes({
         ...page,
         marked: false,
         pickup_refusals: pickupRefusals,
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        pickup_diagnostic_written: pickupDiagnosticWritten,
         error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
       }
     }
     const through = page.through > 0 ? wakes[page.through - 1].end : start
-    const extra = pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}
+    const extra = {
+      ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
+      ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+      ...(pickupDiagnosticWritten ? { pickup_diagnostic_written: true } : {}),
+    }
     if (through === position) return { ...page, ...extra, marked: true }
     try {
       writePrivateJson(readPositionPath(key, dir), { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
@@ -703,9 +757,11 @@ async function main() {
     return
   }
   if (!page.marked) {
-    // Said only when it keeps the output within what Cursor shows whole.
-    const said = `devspec-wake-tail: the wakes above could not be marked read (${page.error?.message ?? 'unknown error'}); they print again next time.\n`
-    if (fitsShellOutput(page.text + said)) process.stderr.write(said)
+    // Said only when no pickup diagnostic was already emitted and it keeps output within Cursor's ceiling.
+    if (!page.pickup_diagnostic_written) {
+      const said = `devspec-wake-tail: the wakes above could not be marked read (${page.error?.message ?? 'unknown error'}); they print again next time.\n`
+      if (fitsShellOutput(page.text + said)) process.stderr.write(said)
+    }
     process.exitCode = 1
   }
 }

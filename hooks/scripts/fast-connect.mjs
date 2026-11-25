@@ -678,8 +678,10 @@ export async function fastConnect(opts = {}) {
   if (wakeFollow && !wakeFollow.ok && !wakeFollow.skipped && !opts.noPoller) {
     return {
       ok: false,
-      code: 'wake_follow_failed',
+      code: typeof wakeFollow.code === 'string' && wakeFollow.code ? wakeFollow.code : 'wake_follow_failed',
       error: wakeFollow.error || written.warning_wake_follow || 'ensure_wake_follow_failed',
+      ...(typeof wakeFollow.lock_wait_ms === 'number' ? { lock_wait_ms: wakeFollow.lock_wait_ms } : {}),
+      ...(typeof wakeFollow.retryable === 'boolean' ? { retryable: wakeFollow.retryable } : {}),
       local_id: localId,
       launch_id: launchId,
       connection_id: connectionId,

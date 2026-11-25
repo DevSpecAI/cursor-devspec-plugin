@@ -379,9 +379,11 @@ export async function startRoomCommands({
 
   // Pick up the single primary (latest) command in one single report_pickup call — never
   // looping one database-backed pickup per accumulated command (requirement c900f599).
-  // Advance started-command state ONLY on a genuine pickup (requirement 3ea2b201) and
-  // preserve full structured refusal / nothing_open payloads verbatim (requirement 4e32d1a5).
+  // Advance started-command state ONLY for the exact command DevSpec picked up — never
+  // marking older still-waiting commands in the batch as started (requirement 3ea2b201) —
+  // and preserve full structured refusal / nothing_open payloads verbatim (req 4e32d1a5).
   const primary = toStart[toStart.length - 1]
+  const unstarted = toStart.slice(0, -1)
   const succeeded = []
   const refusals = []
   const nothingOpen = []
@@ -422,7 +424,7 @@ export async function startRoomCommands({
           nothingOpen.push(entry)
           log(`command-start: report_pickup nothing_open for ${connectionId} (${primary.messageId}): ${JSON.stringify(res)}\n`)
         } else {
-          succeeded.push(...toStart)
+          succeeded.push(primary)
         }
       } catch (error) {
         const structured = structuredRefusalFromError(error)
@@ -490,6 +492,7 @@ export async function startRoomCommands({
     ok: refusals.length === 0,
     outcome: refusals.length === 0 ? (pickupResponse?.outcome ?? 'picked_up') : 'refused',
     started: succeeded,
+    ...(succeeded.length > 0 && unstarted.length > 0 ? { unstarted } : {}),
     pickedUp: succeeded.length > 0 ? 1 : 0,
     startsTurn: succeeded.length > 0 ? effectiveStartsTurn : false,
     ...(pickupResponse && refusals.length === 0 ? { response: pickupResponse } : {}),
