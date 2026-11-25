@@ -103,6 +103,7 @@ function uuids(value) {
  *   current: string|null,
  *   joined: Set<string>,
  *   chosen: boolean,
+ *   seenTranscriptTurns: Map<string, string|null>,
  * }}
  */
 export function reduceRequestLog(text) {
@@ -111,6 +112,7 @@ export function reduceRequestLog(text) {
   const launches = new Map()
   const aliases = new Map()
   const schedules = []
+  const seenTranscriptTurns = new Map()
   let current = null
   let joined = new Set()
   let chosen = false
@@ -171,12 +173,22 @@ export function reduceRequestLog(text) {
         break
       case 'answered': {
         // The agent posted its final answer to this room command
-        // (post_session_message with complete_turn), so once its work is done
-        // the command is finished. Until then it stays open (item 984ca8b4).
+        // (post_session_message with complete_turn). DevSpec closes the command's
+        // delivery immediately, so it must no longer serve as the foreground turn's
+        // current request (item da03801e). It stays in `open` until closed so any
+        // background subagent it launched keeps naming its request_ref while its
+        // work runs on (item 984ca8b4).
         const info = open.get(event.id)
         if (info) info.answered = true
+        if (current === event.id) current = null
+        joined.delete(event.id)
         break
       }
+      case 'transcript_turn':
+        if (typeof event.key === 'string' && event.key) {
+          seenTranscriptTurns.set(event.key, UUID.test(event.ref ?? '') ? event.ref : null)
+        }
+        break
       case 'launch':
         if (KEY.test(event.key ?? '') && carriedRef(event.request)) {
           launches.set(event.key, {
@@ -219,7 +231,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, joined, chosen }
+  return { open, started, launches, schedules, current, joined, chosen, seenTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
@@ -440,7 +452,8 @@ export function recordDeliveredBatchRequests(connectionId, batch, { dir = DEFAUL
   if (!connectionId || !batch || typeof batch !== 'object') return []
   const events = []
   const state = readRequestState(connectionId, { dir })
-  const activeTurn = midTurn || (state.current !== null && (state.current === NO_REQUEST || state.open.has(state.current)))
+  const currentOpen = state.current && state.current !== NO_REQUEST ? state.open.get(state.current) : null
+  const activeTurn = midTurn || state.current === NO_REQUEST || Boolean(currentOpen && !currentOpen.answered)
   if (batch.type === 'owner_messages' || batch.type === 'canonical_commands') {
     const executeIds = Array.isArray(batch.execute_message_ids)
       ? batch.execute_message_ids
@@ -484,12 +497,14 @@ export function requestRefForWrite(state, agentId = null) {
     if (launch) return state.open.has(launch.request) || launch.request === NO_REQUEST ? launch.request : null
   }
   if (state.current === NO_REQUEST) return NO_REQUEST
-  return state.current && state.open.has(state.current) ? state.current : null
+  const info = state.current ? state.open.get(state.current) : null
+  return info && !info.answered ? state.current : null
 }
 
 /**
  * The delivery `provenance_ref` of the room command a write made now serves, or
- * null when the write serves a typed terminal prompt, nobody's request, or an
+ * null when the write serves a typed terminal prompt, nobody's request, an
+ * already-answered command (whose delivery DevSpec closed on final answer), or an
  * unknown request.
  */
 export function provenanceRefForWrite(state, agentId = null) {
@@ -497,7 +512,8 @@ export function provenanceRefForWrite(state, agentId = null) {
   const ref = requestRefForWrite(state, agentId)
   if (!ref || ref === NO_REQUEST) return null
   const info = state.open.get(ref)
-  return typeof info?.provenance_ref === 'string' && UUID.test(info.provenance_ref) ? info.provenance_ref : null
+  if (!info || info.answered) return null
+  return typeof info.provenance_ref === 'string' && UUID.test(info.provenance_ref) ? info.provenance_ref : null
 }
 
 /**
@@ -528,7 +544,7 @@ function carriedEntries(state) {
     if (entries.some((entry) => entry.id === (ref ?? UNSTATED))) return
     if (ref === NO_REQUEST) entries.push({ id: NO_REQUEST, kind: 'none', current, attribution: 'nobody' })
     else if (ref === UNSTATED || ref === null) entries.push({ id: UNSTATED, kind: 'unstated', current, attribution: 'unknown' })
-    else if (state.open.has(ref)) entries.push(openEntry(ref, state.open.get(ref), current))
+    else if (state.open.has(ref) && !state.open.get(ref).answered) entries.push(openEntry(ref, state.open.get(ref), current))
   }
   add(state.current, true)
   for (const id of state.joined) add(id, false)

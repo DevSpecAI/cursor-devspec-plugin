@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+/**
+ * Tests for typed-turn-sync.mjs (item da03801e): registering a terminal-typed
+ * Cursor turn from the conversation transcript when Cursor CLI skips
+ * beforeSubmitPrompt, clearing stale requests on failure, and closing finished
+ * requests between turns when Cursor CLI skips stop.
+ */
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { describe, it } from 'node:test'
+import {
+  finishIdleRequests,
+  recordConnectTurnBaseline,
+  syncTypedTurnFromTranscript,
+} from './typed-turn-sync.mjs'
+import {
+  appendRequestEvent,
+  provenanceRefForWrite,
+  readRequestState,
+  requestRefForWrite,
+} from './requests.mjs'
+import { stampRequest } from './request-ref.mjs'
+
+const CONN = '11111111-1111-4111-8111-111111111111'
+const ROOM = '22222222-2222-4222-8222-222222222222'
+const ATTACH = '33333333-3333-4333-8333-333333333333'
+const ALI = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const CMD_A = '0000000a-0000-4000-8000-00000000000a'
+const MSG_A = '1000000a-0000-4000-8000-00000000000a'
+const DELIVERY_A = '2000000a-0000-4000-8000-00000000000a'
+const HOOK_TYPED = '0000000d-0000-4000-8000-00000000000d'
+const CONV = 'conv-da03801e'
+
+function makeEnv() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-typed-sync-'))
+  const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+  fs.mkdirSync(dir, { recursive: true })
+  const transcriptPath = path.join(home, `${CONV}.jsonl`)
+  return { home, dir, transcriptPath }
+}
+
+function typedRow(prompt) {
+  return JSON.stringify({
+    role: 'user',
+    message: {
+      content: [{ type: 'text', text: `<timestamp>Wednesday, Nov 25, 2026, 5:10 PM (UTC)</timestamp>\n<user_query>\n${prompt}\n</user_query>` }],
+    },
+  })
+}
+
+function commandRow() {
+  return JSON.stringify({
+    role: 'user',
+    message: {
+      content: [
+        {
+          type: 'text',
+          text: '<timestamp>Wednesday, Nov 25, 2026, 5:09 PM (UTC)</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed).</user_query>',
+        },
+      ],
+    },
+  })
+}
+
+function turnEndedRow(status = 'success') {
+  return JSON.stringify({ type: 'turn_ended', status })
+}
+
+describe('typed-turn-sync (item da03801e)', () => {
+  it('opens a typed_prompt request for a terminal message after an answered room command, admits local_turn, and never stamps the old command', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    // Prior room command was delivered and answered.
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_A }, { dir })
+
+    // Transcript now shows the answered command turn followed by a new live typed prompt.
+    fs.writeFileSync(transcriptPath, `${commandRow()}\n${typedRow('Start task 3d327b4a')}\n`)
+
+    const reqCalls = []
+    const pickupCalls = []
+    let patched = null
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: {
+        connection_id: CONN,
+        session_id: ROOM,
+        speech_attachment_id: ATTACH,
+        attached_at: '2026-11-25T17:00:00.000Z',
+      },
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        reqCalls.push(args)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      callPickup: async (args) => {
+        pickupCalls.push(args)
+        return {
+          status: 'working',
+          connection_id: CONN,
+          attempt_id: args.attempt_id,
+          expected_session_id: ROOM,
+        }
+      },
+      patchState: (patch) => { patched = patch },
+      dir,
+    })
+
+    assert.equal(res.action, 'opened')
+    assert.equal(reqCalls.length, 1)
+    assert.equal(reqCalls[0].kind, 'typed_prompt')
+    assert.equal(pickupCalls.length, 1)
+    assert.equal(pickupCalls[0].local_turn, true)
+    assert.equal(patched?.local_turn?.session_id, ROOM)
+
+    const state = readRequestState(CONN, { dir })
+    assert.equal(state.current, res.requestId)
+    assert.equal(state.open.get(res.requestId)?.kind, 'typed_prompt')
+    assert.equal(state.open.get(res.requestId)?.requested_by, ALI)
+    assert.equal(requestRefForWrite(state), res.requestId)
+    assert.equal(provenanceRefForWrite(state), null)
+
+    // claim_work_item goes out without provenance_ref; record_implementation stamps the typed_prompt request_ref.
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x', request_ref: res.requestId },
+    })
+
+    // Repeated sync on the same turn is a fast no-op (no duplicate openRequest).
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must not open twice') },
+      dir,
+    })
+    assert.equal(second.action, 'already_synced')
+  })
+
+  it('skips the connect turn baseline and opens a request for the next typed message', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('/devspec-remote')}\n`)
+    assert.equal(recordConnectTurnBaseline(CONN, transcriptPath, { dir }), true)
+
+    const first = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must not open for connect turn') },
+      dir,
+    })
+    assert.equal(first.action, 'already_synced')
+
+    // Next typed prompt has a new row index and opens normally.
+    fs.writeFileSync(transcriptPath, `${typedRow('/devspec-remote')}\n${typedRow('Please claim task X')}\n`)
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+    })
+    assert.equal(second.action, 'opened')
+    assert.equal(readRequestState(CONN, { dir }).current, second.requestId)
+  })
+
+  it('adopts a typed_prompt already opened by beforeSubmitPrompt instead of opening a duplicate', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Run tests')}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must not duplicate hook request') },
+      dir,
+    })
+    assert.equal(res.action, 'adopted_hook_request')
+    assert.equal(res.requestId, HOOK_TYPED)
+  })
+
+  it('leaves live room command turns untouched so writes still carry command provenance', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    fs.writeFileSync(transcriptPath, `${commandRow()}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must not open for room command') },
+      dir,
+    })
+    assert.equal(res.action, 'not_typed_live')
+    assert.equal(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }).args.provenance_ref, DELIVERY_A)
+    assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }).args.request_ref, CMD_A)
+  })
+
+  it('clears stale foreground request when openRequest fails so writes go out unstamped', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Claim task offline')}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('network down') },
+      dir,
+    })
+    assert.equal(res.action, 'cleared_stale')
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+  })
+
+  it('closes finished typed_prompt and answered room commands and completes local_turn once turn_ended is written', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: CMD_A, kind: 'command', message_id: MSG_A, provenance_ref: DELIVERY_A, requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_A }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_A }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Done')}\n${turnEndedRow('success')}\n`)
+
+    const closedIds = []
+    const completed = []
+    let patched = null
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state: { session_id: ROOM, local_turn: { attempt_id: '44444444-4444-4444-8444-444444444444', session_id: ROOM } },
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.action === 'close') closedIds.push(args.request_id)
+        return { status: 'closed' }
+      },
+      callComplete: async (args) => {
+        completed.push(args)
+        return { ok: true }
+      },
+      patchState: (patch) => { patched = patch },
+      dir,
+    })
+
+    assert.deepEqual(closedIds.sort(), [CMD_A, HOOK_TYPED].sort())
+    assert.equal(res.localCompleted, true)
+    assert.equal(completed.length, 1)
+    assert.deepEqual(patched, { local_turn: null })
+    assert.equal(readRequestState(CONN, { dir }).open.size, 0)
+  })
+})

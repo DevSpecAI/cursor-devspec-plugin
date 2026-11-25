@@ -720,7 +720,7 @@ function scanTranscript(bytes) {
         if (row?.role === 'user') {
           turns += 1
           lastUser = digest(text)
-          userRows.push({ start, kind: userRowKind(userRowText(row)) })
+          userRows.push({ start, kind: userRowKind(userRowText(row)), digest: lastUser })
         }
       }
     }
@@ -746,6 +746,34 @@ function scanTranscript(bytes) {
 
 function digest(text) {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)
+}
+
+/**
+ * The latest turn-starting user row in `transcriptPath`, whether that turn has ended
+ * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
+ * Returns null when the transcript cannot be read or does not exist yet.
+ */
+export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
+  const conversation = transcriptConversation(transcriptPath)
+  if (!conversation) return null
+  const read = readTranscriptTurns(transcriptPath, { attempts })
+  if (!read || read.missing) return null
+  let lastIndex = -1
+  let lastRow = null
+  for (let i = read.userRows.length - 1; i >= 0; i -= 1) {
+    if (startsTurn(read.userRows[i])) {
+      lastIndex = i + 1
+      lastRow = read.userRows[i]
+      break
+    }
+  }
+  return {
+    kind: lastRow ? lastRow.kind : 'none',
+    ended: Boolean(read.end),
+    key: lastRow ? `${conversation}#${lastIndex}#${lastRow.digest}` : null,
+    stamp: read.stamp,
+    turns: read.turns,
+  }
 }
 
 /**

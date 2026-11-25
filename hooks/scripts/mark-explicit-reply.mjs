@@ -32,7 +32,17 @@ import {
   explicitReplyMarkerPath,
   clearTurnMarker,
 } from './mirror-turn.mjs'
-import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
+import {
+  appendRequestEvent,
+  commandsAnsweredNow,
+  finishTurnRequests,
+  readRequestState,
+  requestFinished,
+  requestsWithWorkPending,
+} from './requests.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
+import { readConnectionCapability } from './manage-plan-bridge.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
 import {
   currentTurnNoticeIds,
@@ -144,12 +154,39 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
     /* non-fatal */
   }
 
-  // If the message completed the turn (or was marked complete), clear the .turn marker immediately
-  // and mark the turn's room commands answered so Stop can close them once their work finishes.
+  // If the message completed the turn (or was marked complete), clear the .turn marker immediately,
+  // mark the turn's room commands answered, and close any finished requests on DevSpec right away
+  // so an answered command does not linger open when Cursor CLI skips the stop hook (item da03801e).
   const isCompleteTurn = args?.complete_turn === true || args?.completeTurn === true
   if (isCompleteTurn) {
     clearTurnMarker(connectionId)
     markCommandsAnswered(connectionId, dir ? { dir } : {})
+    try {
+      const reqState = readRequestState(connectionId, { dir: connDir })
+      const pending = requestsWithWorkPending(reqState)
+      const hasFinished = [...reqState.open.keys()].some((id) => requestFinished(reqState, id, pending))
+      if (hasFinished && state) {
+        const credential = connectionCredential(state)
+        const capability = state.connection_capability || readConnectionCapability(connectionId)
+        if (credential.ok && capability) {
+          await finishTurnRequests({
+            connectionId,
+            dir: connDir,
+            call: (reqArgs) =>
+              mcpToolsCall({
+                mcpUrl: credential.mcp_url,
+                token: credential.token,
+                connectionCapability: capability,
+                name: 'report_request',
+                arguments: reqArgs,
+                timeoutMs: 3_000,
+              }),
+          })
+        }
+      }
+    } catch {
+      /* non-fatal: answered command is already cleared from current and the poller retries close */
+    }
   }
 
   return true

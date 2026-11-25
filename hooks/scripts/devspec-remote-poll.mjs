@@ -180,6 +180,7 @@ import {
   turnCommandsPath,
 } from './turn-commands.mjs'
 import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
+import { finishIdleRequests, syncTypedTurnFromTranscript, typedTurnSyncPending } from './typed-turn-sync.mjs'
 import {
   claimTurnEnd,
   clearSettle,
@@ -2185,6 +2186,7 @@ async function main() {
   const transcriptTurnEndMemo = {}
   const turnEndProbeMemo = {}
   const settleProbeMemo = {}
+  const typedTurnMemo = {}
   // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
   // and when the next is due (nextReportTry). Null once due is null: given up.
   let reportRetry = null
@@ -2915,6 +2917,10 @@ async function main() {
           if (!m && settleDue({ connectionId, transcriptPath: lapTranscriptPath, dir: CONNECTIONS_DIR, memo: settleProbeMemo })) {
             return true
           }
+          // A new terminal-typed turn or turn end in Cursor's transcript when Cursor skips beforeSubmitPrompt/stop.
+          if (typedTurnSyncPending({ transcriptPath: lapTranscriptPath, memo: typedTurnMemo })) {
+            return true
+          }
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2980,6 +2986,45 @@ async function main() {
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
     observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
+    // Register any new terminal-typed turn from Cursor's transcript when Cursor CLI
+    // skips beforeSubmitPrompt (item da03801e). Idle request cleanup runs below only
+    // when no tracked turn marker is being handled by reportTranscriptTurnEnd.
+    if (transcriptPath) {
+      const capability = readConnectionCapability(connectionId)
+      const callRequest = (reqArgs) =>
+        mcpToolsCall({
+          mcpUrl,
+          token,
+          connectionCapability: capability,
+          name: 'report_request',
+          arguments: reqArgs,
+          timeoutMs: 3_000,
+        })
+      const callPickup = (pickupArgs) =>
+        mcpToolsCall({
+          mcpUrl,
+          token,
+          connectionCapability: capability,
+          name: 'report_pickup',
+          arguments: pickupArgs,
+          timeoutMs: 5_000,
+        })
+      try {
+        await syncTypedTurnFromTranscript({
+          connectionId,
+          transcriptPath,
+          state: liveState || state,
+          connectionCapability: capability,
+          callRequest,
+          callPickup,
+          patchState,
+          dir: CONNECTIONS_DIR,
+          memo: typedTurnMemo,
+        })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: typed turn sync failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
     // Cursor ended the tracked turn and no stop hook has reported it: Cursor runs a
     // plugin's stop hook only when the person has a hooks file of their own
     // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
@@ -3023,6 +3068,40 @@ async function main() {
     // A turn end the poller could only notice settles (transcript-turn-end.mjs
     // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
     await lapSettle(marker, transcriptPath)
+    // When no tracked turn marker is active and Cursor is between turns, close any
+    // finished typed_prompt or answered room commands that missed a stop hook (item da03801e).
+    if (!marker && transcriptPath) {
+      const capability = readConnectionCapability(connectionId)
+      try {
+        await finishIdleRequests({
+          connectionId,
+          transcriptPath,
+          state: readState(connectionId) || liveState || state,
+          connectionCapability: capability,
+          callRequest: (reqArgs) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'report_request',
+              arguments: reqArgs,
+              timeoutMs: 3_000,
+            }),
+          callComplete: (completeArgs) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              name: 'report_complete',
+              arguments: completeArgs,
+              timeoutMs: 5_000,
+            }),
+          patchState,
+          dir: CONNECTIONS_DIR,
+        })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: idle request cleanup failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0

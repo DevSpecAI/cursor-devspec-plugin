@@ -368,7 +368,32 @@ describe('opening and naming requests', () => {
     assert.equal(requestFinished(state, A, new Set()), true)
     assert.equal(requestFinished(state, A, new Set([A])), false, 'not while its work still runs')
     assert.deepEqual(markCommandsAnswered(CONN, { dir }), [], 'answered once')
-    assert.equal(selectableRequests(state).some((entry) => entry.id === A), true, 'still carried this turn')
+    assert.equal(state.current, null, 'an answered command is no longer the foreground current request')
+    assert.equal(requestRefForWrite(state), null, 'foreground writes never stamp an answered command')
+    assert.equal(provenanceRefForWrite(state), null, 'provenance_ref is never stamped after the command was answered')
+    assert.equal(selectableRequests(state)?.some((entry) => entry.id === A) ?? false, false, 'answered command is no longer selectable')
+  })
+
+  it('never stamps an answered command onto foreground writes or claim_work_item (item da03801e)', () => {
+    const { home, dir } = tempHome()
+    for (const event of [openA, { op: 'current', ref: A }, { op: 'answered', id: A }]) {
+      appendRequestEvent(CONN, event, { dir })
+    }
+    const state = readRequestState(CONN, { dir })
+    assert.equal(state.current, null)
+    assert.equal(requestRefForWrite(state), null)
+    assert.equal(provenanceRefForWrite(state), null)
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    // A subsequent room command starts fresh as current rather than joining the answered command.
+    appendRequestEvent(CONN, openB, { dir })
+    const batch = recordDeliveredBatchRequests(CONN, { type: 'owner_messages', messages: [{ message_id: MSG_B }] }, { dir })
+    assert.deepEqual(batch, [{ op: 'current', ref: B }])
+    assert.equal(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }).args.provenance_ref, DELIVERY_B)
   })
 
   it('an unknown turn clears the current request instead of keeping the last one', () => {
