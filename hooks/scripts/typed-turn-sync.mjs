@@ -451,42 +451,64 @@ export async function syncTypedTurnFromTranscript({
             // Mark the recovered open request as started without leaving it as foreground
             // current (and preserving any unrelated foreground request) so finishIdleRequests
             // recognises it via requestFinished() and closes it on DevSpec (req 3ea2b201).
-            if (!reqState.started.has(entry.requestId)) {
-              const prevCurrent = reqState.current
-              const prevFromWake = reqState.currentFromWake
-              const prevJoined = [...reqState.joined]
-              const startedOk = appendRequestEvent(
-                connectionId,
-                { op: 'current', ref: entry.requestId },
-                { dir },
-              )
-              if (!startedOk) {
-                allPersisted = false
-                continue
+            // Persist restoreForeground on the pending entry so if a disk error interrupts
+            // after marking started, retry still restores the prior foreground state before
+            // completing sync.
+            if (!reqState.started.has(entry.requestId) || entry.restoreForeground) {
+              const fg = entry.restoreForeground ?? {
+                current: reqState.current,
+                fromWake: reqState.currentFromWake,
+                joined: [...reqState.joined],
+                currentRestored: false,
               }
-              const restoredOk = appendRequestEvent(
-                connectionId,
-                {
-                  op: 'current',
-                  ref: prevCurrent,
-                  ...(prevFromWake && prevCurrent !== null ? { from_wake: true } : {}),
-                },
-                { dir },
-              )
-              if (!restoredOk) {
-                allPersisted = false
-                continue
+              if (!reqState.started.has(entry.requestId)) {
+                const startedOk = appendRequestEvent(
+                  connectionId,
+                  { op: 'current', ref: entry.requestId },
+                  { dir },
+                )
+                if (!startedOk) {
+                  allPersisted = false
+                  continue
+                }
+                entry.restoreForeground = fg
               }
-              let joinedOk = true
-              for (const joinedId of prevJoined) {
-                if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
-                  joinedOk = false
-                  break
+              if (!fg.currentRestored) {
+                if (reqState.current === entry.requestId || !reqState.started.has(entry.requestId)) {
+                  const restoredOk = appendRequestEvent(
+                    connectionId,
+                    {
+                      op: 'current',
+                      ref: fg.current,
+                      ...(fg.fromWake && fg.current !== null ? { from_wake: true } : {}),
+                    },
+                    { dir },
+                  )
+                  if (!restoredOk) {
+                    allPersisted = false
+                    continue
+                  }
+                  fg.currentRestored = true
+                } else {
+                  // A newer foreground turn already replaced `current` before retry;
+                  // do not overwrite it with older foreground state.
+                  delete entry.restoreForeground
                 }
               }
-              if (!joinedOk) {
-                allPersisted = false
-                continue
+              if (entry.restoreForeground) {
+                let joinedOk = true
+                for (const joinedId of fg.joined) {
+                  if (reqState.joined.has(joinedId) && reqState.current === fg.current) continue
+                  if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
+                    joinedOk = false
+                    break
+                  }
+                }
+                if (!joinedOk) {
+                  allPersisted = false
+                  continue
+                }
+                delete entry.restoreForeground
               }
             }
             if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
@@ -585,14 +607,19 @@ export async function syncTypedTurnFromTranscript({
   }
 
   // A live non-typed turn (timestamp-only wake or command_turn wake) must not inherit an
-  // unrelated earlier typed_prompt — even if an unnotified background job or scheduled run
-  // exists — unless this wake was explicitly restored by host promptArrival (`currentFromWake`)
-  // or carried an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
+  // unrelated earlier typed_prompt OR an already-answered room command restored by a prior
+  // background wake — even if an unnotified background job or scheduled run exists — unless
+  // this wake was explicitly restored by host promptArrival (`currentFromWake`) or carried
+  // an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
+  const isClearableForUnrelatedWake = (reqState) => {
+    if (!reqState?.current) return false
+    const info = reqState.open.get(reqState.current)
+    if (!info) return false
+    return info.kind === 'typed_prompt' || (info.kind === 'command' && info.answered === true)
+  }
+
   if (active.kind !== 'typed') {
-    const isTypedCurrent = Boolean(
-      initial.current && initial.open.get(initial.current)?.kind === 'typed_prompt',
-    )
-    if (!isTypedCurrent) {
+    if (!isClearableForUnrelatedWake(initial)) {
       if (memo) memo.synced = true
       return { action: 'not_typed_live', active }
     }
@@ -604,10 +631,7 @@ export async function syncTypedTurnFromTranscript({
         if (reqState.seenTranscriptTurns.has(active.key)) {
           return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
         }
-        const stillTyped = Boolean(
-          reqState.current && reqState.open.get(reqState.current)?.kind === 'typed_prompt',
-        )
-        if (!stillTyped) {
+        if (!isClearableForUnrelatedWake(reqState)) {
           return { action: 'not_typed_live', active }
         }
         if (reqState.currentFromWake) {

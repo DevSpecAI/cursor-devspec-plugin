@@ -1236,4 +1236,150 @@ describe('typed-turn-sync (item da03801e)', () => {
       'unmatched explicit notification ID must leave next write unstamped instead of borrowing an unrelated launch',
     )
   })
+
+  it('restores prior foreground state on retry when a disk error interrupts ended-turn recovery after marking started (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const PRIOR_CMD = '77777777-7777-4777-8777-777777777777'
+    const JOINED_REQ = '88888888-8888-4888-8888-888888888888'
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn whose restore hits disk error')}\n`)
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(reqLog)
+    const memo = { stamp: null, synced: false }
+    let openedId = null
+    const origAppend = fs.appendFileSync
+    try {
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openedId = args.request_id
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(first.action, 'open_write_failed')
+      assert.ok(openedId)
+
+      // Disk recovers with an unrelated live foreground command + joined request, and the typed turn ends.
+      fs.rmSync(reqLog, { recursive: true, force: true })
+      appendRequestEvent(CONN, { op: 'open', id: PRIOR_CMD, kind: 'command', requested_by: ALI }, { dir })
+      appendRequestEvent(CONN, { op: 'open', id: JOINED_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: PRIOR_CMD }, { dir })
+      appendRequestEvent(CONN, { op: 'joined', id: JOINED_REQ }, { dir })
+      fs.writeFileSync(transcriptPath, `${typedRow('Turn whose restore hits disk error')}\n${turnEndedRow('success')}\n`)
+
+      // Inject a disk error right after `{ op: 'current', ref: openedId }` is written, so the
+      // restore `{ op: 'current', ref: PRIOR_CMD }` fails on the first flush attempt.
+      let failNext = false
+      fs.appendFileSync = (filePath, data, options) => {
+        const text = String(data)
+        if (filePath === reqLog && failNext) {
+          failNext = false
+          const err = new Error('ENOSPC: injected restore failure')
+          err.code = 'ENOSPC'
+          throw err
+        }
+        if (filePath === reqLog && text.includes('"op":"current"') && text.includes(openedId)) {
+          failNext = true
+        }
+        return origAppend(filePath, data, options)
+      }
+
+      const interrupted = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(interrupted.action, 'open_write_failed')
+      assert.equal(memo.synced, false, 'interrupted restore must leave memo unsynced so poller retries')
+      const midState = readRequestState(CONN, { dir })
+      assert.equal(midState.started.has(openedId), true, 'started write succeeded before disk error')
+      assert.equal(midState.current, openedId, 'ended request was left current by injected error')
+
+      // Restore normal disk writes and retry: poller must restore PRIOR_CMD + JOINED_REQ before syncing.
+      fs.appendFileSync = origAppend
+      const recovered = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(recovered.action, 'not_typed_live')
+      assert.equal(memo.synced, true)
+      const finalState = readRequestState(CONN, { dir })
+      assert.equal(finalState.started.has(openedId), true)
+      assert.equal(finalState.current, PRIOR_CMD, 'retry must restore prior foreground current')
+      assert.equal(finalState.joined.has(JOINED_REQ), true, 'retry must restore prior joined requests')
+    } finally {
+      fs.appendFileSync = origAppend
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+  })
+
+  it('clears an answered room command restored by a matched background wake when an unrelated timestamp-only wake arrives next (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ROOM_CMD = '99999999-9999-4999-8999-999999999999'
+    appendRequestEvent(CONN, { op: 'open', id: ROOM_CMD, kind: 'command', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: ROOM_CMD }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'cmd-bg-1', kind: 'shell', notifies: true, request: ROOM_CMD, also: [] }, { dir })
+    // Room command was answered; DevSpec closed delivery so current became null, while ROOM_CMD stays open for background work.
+    appendRequestEvent(CONN, { op: 'answered', id: ROOM_CMD }, { dir })
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+
+    // Wake 1: matched <task-notification> restores ROOM_CMD for its background completion turn.
+    const matchedWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>cmd-bg-1</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${matchedWake}\n`)
+    const wake1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake1.action, 'restored_wake_request')
+    assert.equal(wake1.requestId, ROOM_CMD)
+    assert.equal(readRequestState(CONN, { dir }).current, ROOM_CMD)
+    assert.deepEqual(stampRequest('create_task', { title: 'Follow-up from wake 1' }, CONN, null, { home }), {
+      args: { title: 'Follow-up from wake 1', request_ref: ROOM_CMD },
+    })
+
+    // Wake 2: unrelated timestamp-only wake must clear the answered room command so writes stay unstamped.
+    const unrelatedWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 9:15 PM (UTC)</timestamp>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${matchedWake}\n${unrelatedWake}\n`)
+    const wake2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake2.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(
+      stampRequest('create_task', { title: 'Unrelated wake write' }, CONN, null, { home }),
+      { args: { title: 'Unrelated wake write' } },
+      'second unrelated wake must leave requester unknown instead of stamping the answered room command',
+    )
+  })
 })
