@@ -2069,7 +2069,7 @@ async function main() {
         // to the agent's Shell tool so we start the commands right here.
         if (!args.follow && batch.type === 'owner_messages') {
           try {
-            await startRoomCommands({
+            const startResult = await startRoomCommands({
               connectionId,
               commands: commandsHandedOver(batch.messages),
               batch,
@@ -2077,8 +2077,19 @@ async function main() {
               dir: CONNECTIONS_DIR,
               state: live,
             })
-          } catch {
-            /* best effort */
+            if (Array.isArray(startResult?.refusals) && startResult.refusals.length > 0) {
+              process.stderr.write(
+                `devspec-remote-wait: report_pickup refused: ${JSON.stringify(startResult.refusals)}\n`,
+              )
+            } else if (Array.isArray(startResult?.nothingOpen) && startResult.nothingOpen.length > 0) {
+              process.stderr.write(
+                `devspec-remote-wait: report_pickup returned nothing_open: ${JSON.stringify(startResult.nothingOpen)}\n`,
+              )
+            }
+          } catch (error) {
+            process.stderr.write(
+              `devspec-remote-wait: report_pickup error: ${error instanceof Error ? error.message : String(error)}\n`,
+            )
           }
         } else if (!(args.follow && batch.type === 'owner_messages')) {
           recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })

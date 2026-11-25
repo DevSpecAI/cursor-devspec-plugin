@@ -629,6 +629,14 @@ export const WAKE_FOLLOW_LOCK_RETRY_MS = 20
  */
 export const WAKE_FOLLOW_LOCK_WAIT_MS = 2_000
 
+/**
+ * Grace period before an empty/unparseable wake-follow lockfile (e.g. left by an
+ * older plugin version crashing between create and write) is treated as abandoned
+ * and reclaimed. Well above local disk write latency (<5 ms) and below
+ * `WAKE_FOLLOW_LOCK_WAIT_MS` (2 s).
+ */
+export const WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS = 1_000
+
 function wakeFollowLockPath(connectionId) {
   return path.join(CONNECTIONS_DIR, `${connectionId}.follow.lock`)
 }
@@ -641,44 +649,66 @@ function sleepSyncMs(ms) {
  * Serialize wake-follow check-and-spawn across concurrent callers (for example
  * `writeConnectionState` and the newly spawned `devspec-remote-poll.mjs`), keeping
  * strictly one inbox follower per connection (decision 2df26cd2).
+ *
+ * Uses the same atomic temp-file + `linkSync` pattern as `step-delivery.mjs` so
+ * the lock file never exists without its owner PID written first; any empty lock
+ * left by an older crash is reclaimed once older than `WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS`.
  */
 function withWakeFollowLock(connectionId, io, work) {
   if (io !== fs) return work()
   fs.mkdirSync(CONNECTIONS_DIR, { recursive: true })
   const lockFile = wakeFollowLockPath(connectionId)
+  const tempLock = `${lockFile}.${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  fs.writeFileSync(tempLock, `${process.pid}\n`, { mode: 0o600 })
   const deadline = Date.now() + WAKE_FOLLOW_LOCK_WAIT_MS
   let acquired = false
-  while (Date.now() < deadline) {
-    try {
-      const fd = fs.openSync(lockFile, 'wx', 0o600)
+  try {
+    while (Date.now() < deadline) {
       try {
-        fs.writeSync(fd, `${process.pid}\n`)
-      } finally {
-        fs.closeSync(fd)
+        fs.linkSync(tempLock, lockFile)
+        acquired = true
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
       }
-      acquired = true
-      break
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error
-    }
-    let holder = null
-    try {
-      holder = Number.parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10)
-    } catch {
-      continue
-    }
-    if (Number.isInteger(holder) && holder > 1 && !ownerAlive(holder)) {
+      let raw = ''
+      let mtimeMs = null
       try {
-        fs.unlinkSync(lockFile)
+        raw = fs.readFileSync(lockFile, 'utf8').trim()
+        mtimeMs = fs.statSync(lockFile).mtimeMs
       } catch {
-        /* another caller cleared it */
+        continue
       }
-      continue
+      const holder = Number.parseInt(raw, 10)
+      const deadHolder = Number.isInteger(holder) && holder > 1 && !ownerAlive(holder)
+      const staleEmpty =
+        (!raw || !Number.isInteger(holder) || holder <= 1) &&
+        typeof mtimeMs === 'number' &&
+        Date.now() - mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
+      if (deadHolder || staleEmpty) {
+        try {
+          fs.unlinkSync(lockFile)
+        } catch {
+          /* another caller cleared it */
+        }
+        continue
+      }
+      sleepSyncMs(WAKE_FOLLOW_LOCK_RETRY_MS)
     }
-    sleepSyncMs(WAKE_FOLLOW_LOCK_RETRY_MS)
+  } finally {
+    try {
+      fs.unlinkSync(tempLock)
+    } catch {
+      /* ignore */
+    }
   }
   if (!acquired) {
-    return { ok: false, error: 'wake-follow startup lock busy; retry shortly' }
+    return {
+      ok: false,
+      code: 'wake_follow_lock_busy',
+      error: 'wake-follow startup lock busy; retry shortly',
+      lock_wait_ms: WAKE_FOLLOW_LOCK_WAIT_MS,
+    }
   }
   try {
     return work()

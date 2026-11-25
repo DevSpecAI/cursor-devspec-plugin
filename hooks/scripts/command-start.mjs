@@ -50,11 +50,15 @@ const STARTED_VERSION = 1
  */
 export const MAX_STARTED_COMMAND_IDS = 200
 /**
- * Shared MCP call timeout for `report_pickup` and stale-turn `report_complete` when
- * starting room commands. Matches `devspec-remote-wait.mjs` (`notifyWorkingEnded`, 15 s)
- * and `hooks/hooks.json` (`step-delivery.mjs` 15 s hook budget).
+ * Shared wall-clock deadline across the entire `startRoomCommands` sequence
+ * (stale-turn `report_complete`, single `report_pickup`, and `seedWorkTrailForConnection`).
+ * Leaves 3 s headroom inside `hooks/hooks.json`'s 15 s `step-delivery.mjs` hook timeout
+ * so the hook always finishes and emits stdout before Cursor kills it (requirements
+ * 3c5147a7 / 91d7b47c).
  */
-export const COMMAND_START_TIMEOUT_MS = 15_000
+export const COMMAND_START_BUDGET_MS = 12_000
+/** Back-compat alias for `COMMAND_START_BUDGET_MS`. */
+export const COMMAND_START_TIMEOUT_MS = COMMAND_START_BUDGET_MS
 const LEASE_VERSION = 1
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/
 
@@ -214,7 +218,7 @@ export function extractRoomCommandsFromWake(wakeText) {
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */
-function structuredRefusalFromError(error) {
+export function structuredRefusalFromError(error) {
   if (!error || typeof error !== 'object') {
     return { error: String(error ?? 'refused') }
   }
@@ -232,6 +236,12 @@ function structuredRefusalFromError(error) {
     refusal.cause = structuredRefusalFromError(error.cause)
   }
   return refusal
+}
+
+/** Whether a `report_pickup` response explicitly says DevSpec has no open attempt to start. */
+function isNothingOpenResponse(res) {
+  if (!res || typeof res !== 'object') return false
+  return res.outcome === 'nothing_open' || res.status === 'nothing_open'
 }
 
 /** Whether a `report_pickup` response carries a refusal rather than a successful pickup. */
@@ -252,8 +262,11 @@ function pickupRefusalFromResponse(res) {
 /**
  * Mark room commands as actually started by the agent:
  *  - deduplicates by `messageId` only after `report_pickup` succeeds (never before),
- *  - finishes any stale abandoned working attempt with one `report_complete` call,
- *  - sends `report_pickup` naming each command, preserving any structured refusal details,
+ *  - shares one wall-clock budget (`COMMAND_START_BUDGET_MS`) across stale-turn
+ *    `report_complete`, single `report_pickup`, and `seedWorkTrailForConnection`,
+ *  - issues at most ONE `report_pickup` call (never looping per command, req c900f599),
+ *  - distinguishes `nothing_open` (no working attempt started, preserved verbatim) from
+ *    refusals/errors (preserved verbatim so callers can surface & retry),
  *  - writes `.turn` marker, records `turn-commands` + transcript baseline when starting a turn,
  *  - seeds Working trail + starts CLI trail watcher when attached,
  *  - records delivered requests in `.requests.jsonl` when `batch` is provided.
@@ -262,7 +275,7 @@ export async function startRoomCommands({
   connectionId,
   commands = null,
   batch = null,
-  sessionId = null,
+  sessionId = undefined,
   dir = defaultConnectionsDir(),
   home = os.homedir(),
   state = null,
@@ -271,10 +284,19 @@ export async function startRoomCommands({
   call = mcpToolsCall,
   seedFn = seedWorkTrailForConnection,
   ensureWatch = ensureCliTrailWatch,
-  timeoutMs = COMMAND_START_TIMEOUT_MS,
+  timeoutMs = COMMAND_START_BUDGET_MS,
+  now = Date.now,
   log = (line) => process.stderr.write(line),
 } = {}) {
-  if (!connectionId) return { ok: false, started: [], pickedUp: 0, refusals: [{ code: 'missing_connection_id', error: 'missing connectionId' }] }
+  if (!connectionId) {
+    return {
+      ok: false,
+      outcome: 'refused',
+      started: [],
+      pickedUp: 0,
+      refusals: [{ code: 'missing_connection_id', error: 'missing connectionId' }],
+    }
+  }
   const resolvedState = state ?? readPrivateJson(path.join(dir, `${connectionId}.json`))
   const rawCommands = Array.isArray(commands)
     ? commands
@@ -283,9 +305,13 @@ export async function startRoomCommands({
       : []
   const already = new Set(readStartedCommandIds(connectionId, dir))
   const toStart = rawCommands.filter((cmd) => cmd?.turnId && cmd?.messageId && !already.has(cmd.messageId))
-  if (toStart.length === 0) return { ok: true, started: [], pickedUp: 0, duplicate: true }
+  if (toStart.length === 0) return { ok: true, outcome: 'duplicate', started: [], pickedUp: 0, duplicate: true }
 
-  const credential = resolvedState ? connectionCredential(resolvedState) : { ok: false }
+  if (!resolvedState) {
+    return { ok: true, skipped: true, reason: 'no_connection_state', started: [], pickedUp: 0 }
+  }
+
+  const credential = connectionCredential(resolvedState)
   const token = credential.ok ? credential.token : (resolvedState?.token || resolvedState?.mcp_token || null)
   const mcpUrl = credential.mcp_url || resolvedState?.mcp_url || null
   const attachedSessionId =
@@ -295,6 +321,11 @@ export async function startRoomCommands({
         ? batch.session_id
         : (resolvedState?.session_id ?? null)
 
+  // One shared wall-clock deadline across every network step in this command start
+  // (stale-turn report_complete, report_pickup, and seedWorkTrailForConnection).
+  const deadline = now() + timeoutMs
+  const remainingBudgetMs = () => Math.max(0, deadline - now())
+
   // If a previous turn marker is stale (abandoned: no activity past TURN_SILENCE_MS,
   // or no longer live), finish the abandoned working attempt in one single report_complete
   // call (attemptEndArguments — never looping once per saved command, requirement c900f599).
@@ -303,7 +334,7 @@ export async function startRoomCommands({
   const staleBySilence =
     prevMarker &&
     typeof prevMarker.startedAt === 'number' &&
-    Date.now() - prevMarker.startedAt >= TURN_SILENCE_MS &&
+    now() - prevMarker.startedAt >= TURN_SILENCE_MS &&
     !prevActivity
   const prevLive = !staleBySilence && turnIsLive(prevMarker, { activity: prevActivity })
   if (prevMarker && !prevLive && token && mcpUrl) {
@@ -317,18 +348,21 @@ export async function startRoomCommands({
             reason: 'max_turn_ms',
           }
         : attemptEndArguments({ connectionId, reason: 'max_turn_ms' })
-    try {
-      await call({
-        mcpUrl,
-        token,
-        name: 'report_complete',
-        arguments: completeArgs,
-        timeoutMs,
-      })
-    } catch (error) {
-      log(
-        `command-start: stale-turn report_complete failed for ${connectionId}: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
-      )
+    const completeTimeout = remainingBudgetMs()
+    if (completeTimeout > 0) {
+      try {
+        await call({
+          mcpUrl,
+          token,
+          name: 'report_complete',
+          arguments: completeArgs,
+          timeoutMs: completeTimeout,
+        })
+      } catch (error) {
+        log(
+          `command-start: stale-turn report_complete failed for ${connectionId}: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
+        )
+      }
     }
     clearTurnMarker(connectionId, dir)
   }
@@ -343,46 +377,67 @@ export async function startRoomCommands({
     }
   }
 
-  // Report pickup by name to DevSpec BEFORE recording IDs as started (requirement 3ea2b201)
-  // and preserve full structured refusal payloads if DevSpec refuses or throws (requirement 4e32d1a5).
+  // Pick up the single primary (latest) command in one single report_pickup call — never
+  // looping one database-backed pickup per accumulated command (requirement c900f599).
+  // Advance started-command state ONLY on a genuine pickup (requirement 3ea2b201) and
+  // preserve full structured refusal / nothing_open payloads verbatim (requirement 4e32d1a5).
+  const primary = toStart[toStart.length - 1]
   const succeeded = []
   const refusals = []
+  const nothingOpen = []
+  let pickupResponse = null
+
   if (!token || !mcpUrl) {
     const refusal = { code: 'missing_credentials', error: 'No DevSpec credentials available for report_pickup.' }
-    refusals.push(refusal)
+    refusals.push({ command_message_id: primary.messageId, command_turn_id: primary.turnId, refusal })
     log(`command-start: report_pickup skipped for ${connectionId}: ${JSON.stringify(refusal)}\n`)
   } else {
-    for (const command of toStart) {
+    const pickupTimeout = remainingBudgetMs()
+    if (pickupTimeout <= 0) {
+      const refusal = {
+        code: 'budget_exhausted',
+        retryable: true,
+        budget_ms: timeoutMs,
+        error: 'Command start hook budget exhausted before report_pickup.',
+      }
+      refusals.push({ command_message_id: primary.messageId, command_turn_id: primary.turnId, refusal })
+      log(`command-start: report_pickup budget exhausted for ${connectionId} (${primary.messageId}): ${JSON.stringify(refusal)}\n`)
+    } else {
       try {
         const res = await call({
           mcpUrl,
           token,
           name: 'report_pickup',
-          arguments: pickupArguments(connectionId, command),
-          timeoutMs,
+          arguments: pickupArguments(connectionId, primary),
+          timeoutMs: pickupTimeout,
         })
+        pickupResponse = res
         const refused = pickupRefusalFromResponse(res)
         if (refused) {
-          const entry = { command_message_id: command.messageId, command_turn_id: command.turnId, refusal: refused }
+          const entry = { command_message_id: primary.messageId, command_turn_id: primary.turnId, refusal: refused }
           refusals.push(entry)
-          log(`command-start: report_pickup refused for ${connectionId} (${command.messageId}): ${JSON.stringify(refused)}\n`)
+          log(`command-start: report_pickup refused for ${connectionId} (${primary.messageId}): ${JSON.stringify(refused)}\n`)
+        } else if (isNothingOpenResponse(res)) {
+          const entry = { command_message_id: primary.messageId, command_turn_id: primary.turnId, response: res }
+          nothingOpen.push(entry)
+          log(`command-start: report_pickup nothing_open for ${connectionId} (${primary.messageId}): ${JSON.stringify(res)}\n`)
         } else {
-          succeeded.push(command)
+          succeeded.push(...toStart)
         }
       } catch (error) {
         const structured = structuredRefusalFromError(error)
-        const entry = { command_message_id: command.messageId, command_turn_id: command.turnId, refusal: structured }
+        const entry = { command_message_id: primary.messageId, command_turn_id: primary.turnId, refusal: structured }
         refusals.push(entry)
-        log(`command-start: report_pickup failed for ${connectionId} (${command.messageId}): ${JSON.stringify(structured)}\n`)
+        log(`command-start: report_pickup failed for ${connectionId} (${primary.messageId}): ${JSON.stringify(structured)}\n`)
       }
     }
   }
 
-  // Advance started-command state ONLY for commands whose report_pickup actually succeeded.
+  // Advance started-command state ONLY when report_pickup genuinely started an attempt.
   if (succeeded.length > 0) {
     recordStartedCommandIds(connectionId, succeeded.map((cmd) => cmd.messageId), dir)
     if (effectiveStartsTurn) {
-      const marker = writeTurnMarker(connectionId, dir)
+      const marker = writeTurnMarker(connectionId, dir, now())
       recordTurnCommands(connectionId, succeeded, { dir })
       const conversationId = resolvedState?.local_id || null
       if (conversationId && marker?.startedAt) {
@@ -396,16 +451,18 @@ export async function startRoomCommands({
         })
       }
     }
-    if (attachedSessionId && token && mcpUrl) {
+    const seedTimeout = remainingBudgetMs()
+    if (attachedSessionId && token && mcpUrl && seedTimeout > 0) {
       try {
         await seedFn({
           connectionId,
           mcpUrl,
           token,
           agentName: resolvedState?.agent_name || AGENT_NAME,
+          timeoutMs: seedTimeout,
         })
-      } catch {
-        /* ignore */
+      } catch (error) {
+        log(`command-start: seedWorkTrailForConnection failed for ${connectionId}: ${JSON.stringify(structuredRefusalFromError(error))}\n`)
       }
     }
     if (attachedSessionId) {
@@ -417,11 +474,25 @@ export async function startRoomCommands({
     }
   }
 
+  if (nothingOpen.length > 0) {
+    return {
+      ok: false,
+      outcome: 'nothing_open',
+      started: [],
+      pickedUp: 0,
+      startsTurn: false,
+      nothingOpen,
+      response: pickupResponse,
+    }
+  }
+
   return {
     ok: refusals.length === 0,
+    outcome: refusals.length === 0 ? (pickupResponse?.outcome ?? 'picked_up') : 'refused',
     started: succeeded,
-    pickedUp: succeeded.length,
-    startsTurn: effectiveStartsTurn,
+    pickedUp: succeeded.length > 0 ? 1 : 0,
+    startsTurn: succeeded.length > 0 ? effectiveStartsTurn : false,
+    ...(pickupResponse && refusals.length === 0 ? { response: pickupResponse } : {}),
     ...(refusals.length > 0 ? { refusals } : {}),
   }
 }

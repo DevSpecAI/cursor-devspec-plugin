@@ -109,6 +109,7 @@ import {
   extractRoomCommandsFromWake,
   markWakeListenerNeeded,
   startRoomCommands,
+  structuredRefusalFromError,
 } from './command-start.mjs'
 
 /**
@@ -607,12 +608,15 @@ export async function readWakes({
       { home, listener, skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '' },
     )
     await write(page.text)
+    let pickupRefusals = null
+    let pickupNothingOpen = null
     if (resolvedConnectionId && page.printed > 0) {
       const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
       const extracted = extractRoomCommandsFromWake(printedSlice)
       if (extracted.commands.length > 0) {
+        let pickupResult = null
         try {
-          await startCommands({
+          pickupResult = await startCommands({
             connectionId: resolvedConnectionId,
             commands: extracted.commands,
             batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
@@ -621,18 +625,44 @@ export async function readWakes({
             home,
             fromWakeTurn: true,
           })
-        } catch {
-          /* best effort — never fails printing the wake */
+        } catch (error) {
+          pickupResult = {
+            ok: false,
+            outcome: 'refused',
+            refusals: [structuredRefusalFromError(error)],
+          }
+        }
+        if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
+          pickupRefusals = pickupResult.refusals
+          process.stderr.write(
+            `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`,
+          )
+        } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+          pickupNothingOpen = pickupResult.nothingOpen
+          process.stderr.write(
+            `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n`,
+          )
         }
       }
     }
+    // Do not advance read position when report_pickup failed/refused: keep the wake queued
+    // so the next read retries pickup and surfaces the structured refusal (req 3ea2b201 / 4e32d1a5).
+    if (pickupRefusals) {
+      return {
+        ...page,
+        marked: false,
+        pickup_refusals: pickupRefusals,
+        error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
+      }
+    }
     const through = page.through > 0 ? wakes[page.through - 1].end : start
-    if (through === position) return { ...page, marked: true }
+    const extra = pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}
+    if (through === position) return { ...page, ...extra, marked: true }
     try {
       writePrivateJson(readPositionPath(key, dir), { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
-      return { ...page, marked: true }
+      return { ...page, ...extra, marked: true }
     } catch (error) {
-      return { ...page, marked: false, error }
+      return { ...page, ...extra, marked: false, error }
     }
   })
 }

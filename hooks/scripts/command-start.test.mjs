@@ -445,4 +445,169 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(completeCalls.length, 1, 'stale turn cleanup must issue one single attempt-end report_complete call')
     assert.deepEqual(completeCalls[0], { connection_id: CONN, reason: 'max_turn_ms' })
   })
+
+  it('enforces one shared wall-clock budget across stale report_complete, report_pickup, and seedWorkTrailForConnection', async () => {
+    const { home, dir } = mkHome()
+    let clock = 1_000_000
+    fs.writeFileSync(path.join(dir, `${CONN}.turn`), JSON.stringify({ startedAt: clock - 120_000, connection_id: CONN }))
+    const seenTimeouts = []
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      timeoutMs: 12_000,
+      now: () => clock,
+      call: async (req) => {
+        seenTimeouts.push({ name: req.name, timeoutMs: req.timeoutMs })
+        clock += 5_000
+        return { outcome: 'picked_up' }
+      },
+      seedFn: async (opts) => {
+        seenTimeouts.push({ name: 'seed', timeoutMs: opts.timeoutMs })
+      },
+      ensureWatch: () => ({ started: false }),
+    })
+    assert.equal(res.ok, true)
+    assert.deepEqual(seenTimeouts, [
+      { name: 'report_complete', timeoutMs: 12_000 },
+      { name: 'report_pickup', timeoutMs: 7_000 },
+      { name: 'seed', timeoutMs: 2_000 },
+    ])
+  })
+
+  it('issues one single report_pickup call when multiple commands arrive together rather than looping per command', async () => {
+    const { home, dir } = mkHome()
+    const pickups = []
+    const cmd1 = { turnId: '11111111-1111-4111-8111-111111111111', messageId: '22222222-2222-4222-8222-222222222222' }
+    const cmd2 = { turnId: TURN_ID, messageId: MSG_ID }
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [cmd1, cmd2],
+      dir,
+      home,
+      call: async (req) => {
+        if (req.name === 'report_pickup') pickups.push(req.arguments)
+        return { outcome: 'picked_up' }
+      },
+      seedFn: async () => {},
+      ensureWatch: () => ({ started: false }),
+    })
+    assert.equal(res.ok, true)
+    assert.equal(pickups.length, 1, 'must not loop report_pickup once per command')
+    assert.equal(pickups[0].command_message_id, MSG_ID)
+  })
+
+  it('preserves nothing_open from report_pickup without marking a turn started or seeding a trail', async () => {
+    const { home, dir } = mkHome()
+    let seeded = false
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async () => ({ ok: true, attempt_id: null, outcome: 'nothing_open' }),
+      seedFn: async () => { seeded = true },
+      ensureWatch: () => ({ started: false }),
+      log: () => {},
+    })
+    assert.equal(res.ok, false)
+    assert.equal(res.outcome, 'nothing_open')
+    assert.equal(res.pickedUp, 0)
+    assert.equal(res.nothingOpen.length, 1)
+    assert.equal(res.nothingOpen[0].response.outcome, 'nothing_open')
+    assert.equal(seeded, false)
+    assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false)
+  })
+
+  it('readWakes does not advance read position on a retryable pickup refusal and retries on the second read', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Retry this wake')))
+    let attempts = 0
+    const call = async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw Object.assign(new Error('Try again'), { code: 'connection_busy', retryable: true, details: { retry_after_ms: 250 } })
+      }
+      return { outcome: 'picked_up' }
+    }
+    let firstOut = ''
+    const first = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { firstOut += text },
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }), log: () => {} }),
+    })
+    assert.equal(first.marked, false)
+    assert.equal(first.pickup_refusals[0].refusal.code, 'connection_busy')
+    assert.equal(first.pickup_refusals[0].refusal.retryable, true)
+    assert.match(firstOut, /Retry this wake/)
+
+    let secondOut = ''
+    const second = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async (text) => { secondOut += text },
+      startCommands: (opts) => startRoomCommands({ ...opts, call, seedFn: async () => {}, ensureWatch: () => ({ started: false }), log: () => {} }),
+    })
+    assert.equal(second.marked, true)
+    assert.match(secondOut, /Retry this wake/)
+    assert.equal(attempts, 2)
+  })
+
+  it('stepDeliveryHook retains pending pickup on refusal, surfaces structured details, and retries on the next step', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Mid-turn retry test')
+    holdForNextStep(CONN, batch, buildOwnerMessageEvents(batch), { dir })
+    const raw1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'ls' }, tool_output: '' },
+      { home, dir, listenerActive: () => true },
+    )
+    const noteId = noteIdIn(JSON.parse(raw1).additional_context)
+    const parts = noteFiles(home, noteId)
+
+    let attempts = 0
+    const startCommands = async (opts) => {
+      attempts += 1
+      if (attempts === 1) {
+        return {
+          ok: false,
+          outcome: 'refused',
+          started: [],
+          pickedUp: 0,
+          refusals: [{ command_message_id: MSG_ID, command_turn_id: TURN_ID, refusal: { code: 'turn_busy', retryable: true, blocking_turn_id: '99999999-9999-4999-8999-999999999999' } }],
+        }
+      }
+      return { ok: true, outcome: 'picked_up', started: opts.commands, pickedUp: 1 }
+    }
+
+    let refusalRaw = null
+    for (const part of parts) {
+      refusalRaw = await stepDeliveryHook(catCall(home, part, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        startCommands,
+        listenerActive: () => true,
+      })
+    }
+    assert.equal(attempts, 1)
+    assert.ok(refusalRaw, 'structured refusal must be surfaced')
+    assert.match(JSON.parse(refusalRaw).additional_context, /turn_busy/)
+    assert.match(JSON.parse(refusalRaw).additional_context, /99999999-9999-4999-8999-999999999999/)
+
+    // Next step retries pickup and clears the handed record once pickup succeeds.
+    const retryRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'pwd' }, tool_output: '' },
+      { home, dir, startCommands, listenerActive: () => true },
+    )
+    assert.equal(attempts, 2)
+    assert.equal(retryRaw, null)
+  })
 })

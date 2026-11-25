@@ -124,6 +124,7 @@ import {
   clearWakeListenerNeeded,
   isWakeListenerActive,
   startRoomCommands,
+  structuredRefusalFromError,
   wakeListenerReminder,
   wakeNeededPath,
 } from './command-start.mjs'
@@ -642,13 +643,25 @@ export async function stepDeliveryHook(
   let record = null
   let readChanged = false
   let completedOwnerItems = []
+  let keptForPickupRetry = null
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
-      const { record: next, done } = readThrough(kept, input, { home })
-      record = done ? null : { ...kept, parts: next.parts }
-      readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
-      if (done) completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
+      if (kept.pickup_pending === true) {
+        // A previous step read this note whole, but report_pickup refused; retry pickup now
+        // without re-prompting the agent to re-read the note.
+        completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
+        keptForPickupRetry = kept
+        readChanged = true
+      } else {
+        const { record: next, done } = readThrough(kept, input, { home })
+        record = done ? null : { ...kept, parts: next.parts }
+        readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
+        if (done) {
+          completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
+          keptForPickupRetry = { ...kept, parts: next.parts }
+        }
+      }
     } else {
       giveBack(takenRecord)
       return null
@@ -668,28 +681,69 @@ export async function stepDeliveryHook(
   )
   const adding = checked.filter((each) => each.open)
 
-  // The agent just finished reading a step note holding room message(s): now report
-  // pickup and mark them started so the room switches from waiting to Working only once
-  // the agent actually has them.
-  for (const item of completedOwnerItems) {
-    try {
-      const messages = Array.isArray(item.messages) && item.messages.length > 0
+  // The agent just finished reading a step note holding room message(s) (or a previous
+  // pickup refused and is retrying): combine all owner items into ONE single startCommands
+  // call (no per-item loop, req c900f599). If report_pickup refuses, keep the record as
+  // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
+  // preserve/surface the full structured refusal details (req 4e32d1a5).
+  let pickupRefusals = null
+  if (completedOwnerItems.length > 0) {
+    const combinedMessages = completedOwnerItems.flatMap((item) =>
+      Array.isArray(item.messages) && item.messages.length > 0
         ? item.messages
-        : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message)
-      const commands = Array.isArray(item.commands) && item.commands.length > 0 ? item.commands : commandsHandedOver(messages)
-      if (commands.length > 0) {
-        await startCommands({
+        : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+    )
+    const combinedCommands = completedOwnerItems.flatMap((item) =>
+      Array.isArray(item.commands) && item.commands.length > 0
+        ? item.commands
+        : commandsHandedOver(
+            Array.isArray(item.messages) && item.messages.length > 0
+              ? item.messages
+              : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+          ),
+    )
+    const firstSessionId =
+      completedOwnerItems.find((item) => typeof item.session_id === 'string' && item.session_id)?.session_id ??
+      state.session_id ??
+      null
+    if (combinedCommands.length > 0) {
+      let pickupResult = null
+      try {
+        pickupResult = await startCommands({
           connectionId,
-          commands,
-          batch: { type: 'owner_messages', session_id: item.session_id ?? state.session_id ?? null, messages },
-          sessionId: item.session_id ?? state.session_id ?? null,
+          commands: combinedCommands,
+          batch: { type: 'owner_messages', session_id: firstSessionId, messages: combinedMessages },
+          sessionId: firstSessionId,
           dir: connDir,
           home,
           state,
         })
+      } catch (error) {
+        pickupResult = {
+          ok: false,
+          outcome: 'refused',
+          refusals: [structuredRefusalFromError(error)],
+        }
       }
-    } catch {
-      /* never fail the hook if report_pickup cannot reach DevSpec */
+      if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
+        pickupRefusals = pickupResult.refusals
+        process.stderr.write(
+          `step-delivery: report_pickup refused for ${connectionId}; retaining pending pickup for retry: ${JSON.stringify(pickupRefusals)}\n`,
+        )
+        if (!record && keptForPickupRetry) {
+          record = {
+            ...keptForPickupRetry,
+            items: completedOwnerItems,
+            pickup_pending: true,
+            pickup_refusals: pickupRefusals,
+          }
+          readChanged = true
+        }
+      } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+        process.stderr.write(
+          `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
+        )
+      }
     }
   }
 
@@ -733,9 +787,22 @@ export async function stepDeliveryHook(
     if (adding.length > 0) {
       recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
-    let context = record
-      ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
-      : null
+    let context =
+      record && record.pickup_pending !== true
+        ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+        : null
+    if (pickupRefusals) {
+      const refusalNotice =
+        `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
+      const fittedRefusal = fitHookContext(refusalNotice, {
+        share,
+        what: 'DevSpec room-command pickup refusal details',
+        home,
+      })
+      if (fittedRefusal) {
+        context = context && context.length + 2 + fittedRefusal.length <= share ? `${context}\n\n${fittedRefusal}` : (context ?? fittedRefusal)
+      }
+    }
     if (needsListenerReminder) {
       const rawReminder = wakeListenerReminder(connectionId, { dir: connDir })
       if (!context) {
@@ -773,8 +840,9 @@ export async function releaseAtIdle(
   reclaimAbandoned(steps)
   const handedPath = path.join(steps, HANDED)
   if (waitingFiles(steps).length === 0) {
-    // Nothing new, and nothing handed over, or a note the idle wake already pointed at.
-    if (!fs.existsSync(handedPath) || readPrivateJson(handedPath)?.woken === true) return null
+    // Nothing new, and nothing handed over, or a note already woken / awaiting pickup retry only.
+    const handed = fs.existsSync(handedPath) ? readPrivateJson(handedPath) : null
+    if (!handed || handed.woken === true || handed.pickup_pending === true) return null
   }
   const now = turnState ?? (await readTurnState(state?.local_id, { home }))
   if (now !== 'between') return null
