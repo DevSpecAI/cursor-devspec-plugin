@@ -21,6 +21,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   appendRequestEvent,
   closeRequest,
+  NO_REQUEST,
   openRequest,
   promptArrival,
   readRequestState,
@@ -256,6 +257,15 @@ function pendingOpenKey(dir, connectionId, turnKey) {
   return `${path.resolve(dir)}|${connectionId}|${turnKey}`
 }
 
+function pendingOpensForConnection(dir, connectionId) {
+  const prefix = `${path.resolve(dir)}|${connectionId}|`
+  const matches = []
+  for (const [key, entry] of pendingLocalOpens) {
+    if (key.startsWith(prefix)) matches.push([key, entry])
+  }
+  return matches
+}
+
 /**
  * Deterministic RFC-4122 UUID derived from `(connectionId, turnKey)` so even a
  * cross-process retry after a transient local persistence failure re-sends the same
@@ -412,6 +422,48 @@ export async function syncTypedTurnFromTranscript({
     memo.synced = false
   }
   if (active.ended || !active.key) {
+    const pendingEntries = pendingOpensForConnection(dir, connectionId)
+    if (pendingEntries.length > 0) {
+      const flushed = await withTypedSyncLock(
+        connectionId,
+        dir,
+        async () => {
+          let allPersisted = true
+          for (const [pKey, entry] of pendingEntries) {
+            const reqState = readRequestState(connectionId, { dir })
+            if (!reqState.open.has(entry.requestId)) {
+              const ok = appendRequestEvent(
+                connectionId,
+                {
+                  op: 'open',
+                  id: entry.requestId,
+                  kind: 'typed_prompt',
+                  ...(entry.requestedBy ? { requested_by: entry.requestedBy } : {}),
+                },
+                { dir },
+              )
+              if (!ok) {
+                allPersisted = false
+                continue
+              }
+            }
+            if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
+              appendRequestEvent(connectionId, { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId }, { dir })
+            }
+            pendingLocalOpens.delete(pKey)
+          }
+          return allPersisted
+        },
+        { deadlineMs },
+      )
+      if (!flushed) {
+        return {
+          action: 'open_write_failed',
+          requestId: pendingEntries[0][1].requestId,
+          active,
+        }
+      }
+    }
     if (memo) memo.synced = true
     return { action: 'not_typed_live', active }
   }
@@ -422,19 +474,42 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
-  // Resolve explicit host-injected `<task-notification>` wake rows directly from
-  // non-typed transcript rows so Cursor CLI (which skips beforeSubmitPrompt) still
-  // restores the launching request. Never infer a scheduled wake from an ordinary
-  // typed `<user_query>` row (decisions 2fcd26bd / ce71a72b): if a human types text
-  // that happens to match a recorded schedule, it is still a new terminal-typed request.
+  // Resolve explicit host-injected `<task-notification>` wake rows AND documented Cursor
+  // CLI background-task completion rows (`command_turn`, which omit `<task-id>` when Cursor
+  // skips beforeSubmitPrompt) back to the recorded launching request(s) (decision ce71a72b).
+  // Never restore from an unrelated timestamp-only wake (decision 2fcd26bd), never overwrite
+  // a live unanswered room command, and never infer a scheduled wake from typed `<user_query>` text.
   const resolveTranscriptWake = (reqState) => {
     if (active.kind === 'typed') return null
     const rawText = typeof active.rawText === 'string' ? active.rawText : ''
     if (rawText) {
       const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
-      if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch }
+      if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
     }
-    return null
+    const isDocumentedCompletionRow =
+      active.kind === 'command_turn' || (rawText && /<task-notification\b/i.test(rawText))
+    if (!isDocumentedCompletionRow) return null
+    // Never steal attribution from a live unanswered room command or an owner_message wake.
+    const currentInfo = reqState.current ? reqState.open.get(reqState.current) : null
+    if (currentInfo?.kind === 'command' && !currentInfo.answered) return null
+    if (rawText && /"type"\s*:\s*"owner_message"/.test(rawText)) return null
+    const refs = []
+    for (const launch of new Set(reqState.launches.values())) {
+      if (!launch.notifies || launch.notified) continue
+      const candidates = [launch.request, ...(launch.also ?? [])]
+      for (const candidate of candidates) {
+        if ((reqState.open.has(candidate) || candidate === NO_REQUEST) && !refs.includes(candidate)) {
+          refs.push(candidate)
+        }
+      }
+    }
+    if (refs.length === 0) return null
+    return {
+      origin: 'task-notification',
+      text: rawText,
+      match: { ref: refs.at(-1), also: refs.slice(0, -1) },
+      direct: false,
+    }
   }
 
   if (resolveTranscriptWake(initial)) {
@@ -448,14 +523,19 @@ export async function syncTypedTurnFromTranscript({
         }
         const wake = resolveTranscriptWake(reqState)
         if (!wake) return { action: 'not_a_wake' }
-        const arrival = promptArrival({
-          fromAPerson: false,
-          origin: wake.origin,
-          text: wake.text,
-          midTurn: false,
-          state: reqState,
-        })
-        for (const event of arrival.events) {
+        const events = wake.direct
+          ? promptArrival({
+              fromAPerson: false,
+              origin: wake.origin,
+              text: wake.text,
+              midTurn: false,
+              state: reqState,
+            }).events
+          : [
+              { op: 'current', ref: wake.match.ref, from_wake: true },
+              ...wake.match.also.map((id) => ({ op: 'joined', id })),
+            ]
+        for (const event of events) {
           if (!appendRequestEvent(connectionId, event, { dir })) {
             return { action: 'binding_write_failed', key: active.key, active }
           }
@@ -620,7 +700,11 @@ export async function syncTypedTurnFromTranscript({
           }
         } else if (opened.localPersistFailed) {
           if (opened.requestId) {
-            pendingLocalOpens.set(pKey, { requestId: opened.requestId, requestedBy: opened.requestedBy ?? null })
+            pendingLocalOpens.set(pKey, {
+              requestId: opened.requestId,
+              requestedBy: opened.requestedBy ?? null,
+              turnKey: active.key,
+            })
           }
           log(
             `typed-turn-sync: local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
@@ -783,7 +867,15 @@ export async function finishIdleRequests({
         ? reqState.current
         : ([...reqState.open.keys()].find((id) => requestFinished(reqState, id, pending)) ?? null)
 
-  if (!candidateId && !localAttemptId) return { closed: [], localCompleted: false }
+  // Also recover any server-accepted open whose local append previously failed so it is
+  // closed on DevSpec even if the turn ended before a local write retry succeeded (req 3ea2b201).
+  const pendingEntries = pendingOpensForConnection(dir, connectionId)
+  const pendingFallback =
+    !candidateId && pendingEntries.length > 0
+      ? pendingEntries.find(([, entry]) => active.key && entry.turnKey === active.key) ?? pendingEntries[0]
+      : null
+
+  if (!candidateId && !pendingFallback && !localAttemptId) return { closed: [], localCompleted: false }
 
   let localCompleted = false
   let localCompleteRefusal = null
@@ -839,6 +931,9 @@ export async function finishIdleRequests({
     })
     if (ok) {
       closed.push(candidateId)
+      for (const [pKey, entry] of pendingEntries) {
+        if (entry.requestId === candidateId) pendingLocalOpens.delete(pKey)
+      }
       rotateRequestLog(connectionId, { dir })
     } else {
       closeRefusal =
@@ -846,6 +941,37 @@ export async function finishIdleRequests({
         (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
         (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
       log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+    }
+  } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
+    const [pendingKey, pendingEntry] = pendingFallback
+    let lastCloseResponse = null
+    let lastCloseError = null
+    let serverClosed = false
+    try {
+      const res = await callRequest({
+        connection_id: connectionId,
+        action: 'close',
+        request_id: pendingEntry.requestId,
+        reason: 'host_finished',
+      })
+      lastCloseResponse = res
+      serverClosed = res?.status === 'closed'
+    } catch (err) {
+      lastCloseError = err
+      serverClosed = /unknown request/i.test(String(err?.message ?? err))
+    }
+    if (serverClosed) {
+      pendingLocalOpens.delete(pendingKey)
+      // Best-effort close record if disk is writable again; request was never opened on disk.
+      appendRequestEvent(connectionId, { op: 'close', id: pendingEntry.requestId }, { dir })
+      closed.push(pendingEntry.requestId)
+      rotateRequestLog(connectionId, { dir })
+    } else {
+      closeRefusal =
+        refusalFromResponse(lastCloseResponse) ??
+        (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+        (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+      log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
     }
   }
 

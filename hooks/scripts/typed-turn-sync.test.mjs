@@ -948,4 +948,113 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(res.refusal.code, 'retry_blocked')
     assert.deepEqual(res.refusal.details, { blocker: 'room_locked' })
   })
+
+  it('bounds 35 MB trailing whitespace inside trimSliceBounds at deadlineMs (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const rowWithTrailingWs = `${JSON.stringify({ role: 'assistant', message: { content: 'ok' } })}${' '.repeat(35 * 1024 * 1024)}\n`
+    fs.writeFileSync(transcriptPath, rowWithTrailingWs)
+    const started = Date.now()
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      budgetMs: 65,
+      attempts: 1,
+      dir,
+      log: () => {},
+    })
+    const elapsed = Date.now() - started
+    assert.equal(res.action, 'budget_exhausted')
+    assert.ok(elapsed < 120, `35 MB trailing whitespace row must stop near budgetMs=65, took ${elapsed}ms`)
+  })
+
+  it('recovers and closes a server-accepted open whose local append failed even if the turn ends before retry (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn that ends after local open fail')}\n`)
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(reqLog, { recursive: true }) // block appendRequestEvent
+    const memo = {}
+    let openedId = null
+    try {
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openedId = args.request_id
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(first.action, 'open_write_failed')
+      assert.ok(openedId)
+      assert.equal(memo.synced, false)
+
+      // Now the turn ends BEFORE disk recovers.
+      fs.writeFileSync(transcriptPath, `${typedRow('Turn that ends after local open fail')}\n${turnEndedRow('success')}\n`)
+      const endedSync = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(endedSync.action, 'open_write_failed')
+      assert.equal(memo.synced, false, 'must NOT mark memo synced while an unpersisted server open remains')
+
+      // Idle cleanup closes the still-open server request even if disk is still blocked.
+      const closedIds = []
+      const idle = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          if (args.action === 'close') closedIds.push(args.request_id)
+          return { status: 'closed' }
+        },
+        dir,
+        log: () => {},
+      })
+      assert.deepEqual(closedIds, [openedId])
+      assert.deepEqual(idle.closed, [openedId])
+    } finally {
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+  })
+
+  it('restores the launching request on a documented Cursor background-completion row without a notification ID (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bg-cli-noid', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
+    const completionRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<timestamp>Wed, Nov 25, 2026, 8:42 PM (UTC)</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed).</user_query>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Start background task')}\n${completionRow}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.requestId, HOOK_TYPED)
+    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
+    assert.deepEqual(
+      stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }),
+      { args: { task_id: 'x', request_ref: HOOK_TYPED } },
+      'documented Cursor completion row must preserve launching request attribution even without a notification ID',
+    )
+  })
 })

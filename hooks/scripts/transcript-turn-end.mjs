@@ -727,17 +727,60 @@ function concatChunksBounded(chunks, deadlineMs) {
   return out
 }
 
-function trimSliceBounds(bytes, start, end) {
+function findByteBounded(bytes, byte, start, end, deadlineMs) {
+  if (deadlineMs === null) {
+    const idx = bytes.indexOf(byte, start)
+    return idx >= 0 && idx < end ? idx : -1
+  }
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    const limit = Math.min(pos + BOUNDED_STEP_BYTES, end)
+    const idx = bytes.subarray(pos, limit).indexOf(byte)
+    if (idx >= 0) return pos + idx
+  }
+  return -1
+}
+
+function trimSliceBounds(bytes, start, end, deadlineMs = null) {
   let s = start
   let e = end
-  while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) s += 1
-  while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) e -= 1
+  if (deadlineMs === null) {
+    while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) s += 1
+    while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) e -= 1
+    return { s, e }
+  }
+  let nextCheck = s + BOUNDED_STEP_BYTES
+  while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) {
+    s += 1
+    if (s >= nextCheck) {
+      if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+      nextCheck = s + BOUNDED_STEP_BYTES
+    }
+  }
+  let prevCheck = e - BOUNDED_STEP_BYTES
+  while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) {
+    e -= 1
+    if (e <= prevCheck) {
+      if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+      prevCheck = e - BOUNDED_STEP_BYTES
+    }
+  }
   return { s, e }
 }
 
-function sliceContainsMarker(bytes, start, end, marker) {
-  const idx = bytes.indexOf(marker, start)
-  return idx >= 0 && idx + marker.length <= end
+function sliceContainsMarker(bytes, start, end, marker, deadlineMs = null) {
+  if (deadlineMs === null) {
+    const idx = bytes.indexOf(marker, start)
+    return idx >= 0 && idx + marker.length <= end
+  }
+  const overlap = Math.max(0, marker.length - 1)
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    const windowStart = Math.max(start, pos - overlap)
+    const windowEnd = Math.min(pos + BOUNDED_STEP_BYTES, end)
+    if (bytes.subarray(windowStart, windowEnd).indexOf(marker) >= 0) return true
+  }
+  return false
 }
 
 function digestSliceBounded(bytes, start, end, deadlineMs) {
@@ -927,13 +970,19 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     if (deadlineMs !== null && Date.now() >= deadlineMs) {
       return { budgetExhausted: true }
     }
-    const newline = bytes.indexOf(0x0a, start)
-    const { s, e } = trimSliceBounds(bytes, start, newline)
+    const newline = findByteBounded(bytes, 0x0a, start, bytes.length, deadlineMs)
+    if (newline === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+    if (newline < 0) return null
+    const trimmed = trimSliceBounds(bytes, start, newline, deadlineMs)
+    if (trimmed === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+    const { s, e } = trimmed
     if (s < e) {
       lastSpan = { s, e }
       lastParsedRow = null
       lastStart = start
-      if (sliceContainsMarker(bytes, s, e, ROLE_USER_MARKER)) {
+      const hasUserMarker = sliceContainsMarker(bytes, s, e, ROLE_USER_MARKER, deadlineMs)
+      if (hasUserMarker === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+      if (hasUserMarker) {
         let row = null
         try {
           row = parseJsonSliceBounded(bytes, s, e, deadlineMs)
