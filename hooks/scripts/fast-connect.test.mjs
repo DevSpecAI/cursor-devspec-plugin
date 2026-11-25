@@ -872,6 +872,17 @@ describe('fast-connect CLI flags', () => {
       const fullHuge = JSON.parse(readNoteText(parsedHuge.complete_output_note.id, { home }))
       assert.equal(fullHuge.error, hugeError)
 
+      const hugeSession = 'S'.repeat(25_000)
+      const outHugeSession = formatConnectCliOutput(
+        { ok: false, code: 'project_choice_required', session_id: hugeSession, error: 'Choose project' },
+        { home },
+      )
+      assert.equal(fitsShellOutput(outHugeSession), true, `oversized-session receipt must fit Shell ceiling, got ${outHugeSession.length}`)
+      const parsedHugeSession = JSON.parse(outHugeSession)
+      assert.equal(parsedHugeSession.omitted_fields_in_note, true)
+      assert.equal(parsedHugeSession.session_id, undefined)
+      assert.equal(JSON.parse(readNoteText(parsedHugeSession.complete_output_note.id, { home })).session_id, hugeSession)
+
       const candidates = Array.from({ length: 150 }, (_, i) => ({
         id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
         name: `Project Number ${i} — Organization Workspace Candidate`,
@@ -882,7 +893,7 @@ describe('fast-connect CLI flags', () => {
           ok: false,
           code: 'project_choice_required',
           error: 'Several accessible projects have that name. Choose a project and organisation.',
-          project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_name', candidates },
+          project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
           candidates: candidates.map((c) => c.id),
         },
         { home: blockedHome },
@@ -894,9 +905,11 @@ describe('fast-connect CLI flags', () => {
       assert.ok(parsedFallback.project_selection.returned_count > 0, 'keeps as many complete structured candidates as fit')
       assert.equal(parsedFallback.project_selection.candidates.length, parsedFallback.project_selection.returned_count)
       assert.equal(parsedFallback.project_selection.omitted_count, 150 - parsedFallback.project_selection.returned_count)
-      assert.equal(parsedFallback.project_selection.recovery_tool, 'list_projects')
+      assert.equal(parsedFallback.project_selection.omitted_candidates_require_writable_notes, true)
+      assert.equal(parsedFallback.project_selection.recovery_tool, undefined, 'must not point at general list_projects for server-filtered choices')
       assert.ok(parsedFallback.complete_output_note_error)
-      assert.match(parsedFallback.recovery, /list_projects/)
+      assert.doesNotMatch(parsedFallback.recovery, /list_projects/)
+      assert.match(parsedFallback.recovery, /re-run connect/)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

@@ -1682,7 +1682,23 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength) {
     complete_output_note: noteRef,
     note: noteMsg,
   }
-  return JSON.stringify(minimal, null, 2) + '\n'
+  const minimalText = JSON.stringify(minimal, null, 2) + '\n'
+  if (fitsShellOutput(minimalText)) return minimalText
+
+  // Final guaranteed-bounded receipt when caller-supplied identifier fields (such as an
+  // unbounded --session or --local-id argument) exceed Cursor's Shell ceiling on their own.
+  return (
+    JSON.stringify(
+      {
+        ok: Boolean(base.ok),
+        omitted_fields_in_note: true,
+        complete_output_note: noteRef,
+        note: noteMsg,
+      },
+      null,
+      2,
+    ) + '\n'
+  )
 }
 
 function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
@@ -1693,7 +1709,7 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
   const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
   const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
   const recovery = allCandidates
-    ? `Could not write ~/.devspec/notes (${errMsg}). Call DevSpec MCP tool \`list_projects\` (or fix write permissions on ~/.devspec/notes and re-run connect) to retrieve all ${allCandidates.length} project choices.`
+    ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).`
     : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.`
 
   const makePayload = (candidateSlice, { minimal = false } = {}) => {
@@ -1730,7 +1746,7 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
               returned_count: candidateSlice.length,
               omitted_count: allCandidates.length - candidateSlice.length,
               truncated_due_to_shell_limit: candidateSlice.length < allCandidates.length,
-              recovery_tool: 'list_projects',
+              omitted_candidates_require_writable_notes: candidateSlice.length < allCandidates.length,
             }
           : {}),
       }
@@ -1765,21 +1781,20 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
     JSON.stringify(
       {
         ok: Boolean(base.ok),
-        ...(typeof base.code === 'string' ? { code: base.code } : {}),
         ...(allCandidates
           ? {
               candidate_count: allCandidates.length,
               returned_count: 0,
               omitted_count: allCandidates.length,
-              recovery_tool: 'list_projects',
+              omitted_candidates_require_writable_notes: true,
             }
           : {}),
         complete_output_note_failed: true,
         total_chars: fullTextLength,
         shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         recovery: allCandidates
-          ? 'Could not write ~/.devspec/notes. Call DevSpec MCP `list_projects` or fix permissions on ~/.devspec/notes and re-run connect.'
-          : 'Could not write ~/.devspec/notes. Fix permissions on ~/.devspec/notes and re-run connect.',
+          ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
+          : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.',
       },
       null,
       2,
