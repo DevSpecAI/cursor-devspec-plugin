@@ -808,11 +808,12 @@ export async function readWakes({
       const fittedWithStdout = fitShellDiagnostic(pageText, rawDiag, {
         home,
         label: 'devspec-wake-tail',
-        fallback: (noteError) =>
+        fallback: (noteError, savedNote) =>
           formatStructuredRefusalsFallback(pickupRefusals, {
             prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
             stdoutText: pageText,
             noteError,
+            savedNote,
             allowMinimalEnvelope: false,
           }),
         requireStructuredFallback: true,
@@ -827,11 +828,12 @@ export async function readWakes({
         const fittedFullBudget = fitShellDiagnostic('', rawDiag, {
           home,
           label: 'devspec-wake-tail',
-          fallback: (noteError) =>
+          fallback: (noteError, savedNote) =>
             formatStructuredRefusalsFallback(pickupRefusals, {
               prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
               stdoutText: '',
               noteError,
+              savedNote,
             }),
           requireStructuredFallback: true,
         })

@@ -844,13 +844,48 @@ export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
   return shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
 }
 
+function shellQuotePath(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`
+}
+
+/**
+ * Private fallback note store under `os.tmpdir()` used only when `~/.devspec/notes`
+ * cannot be written, so the exact original oversized refusal/diagnostic is still saved
+ * whole in Shell-sized parts on disk and can be read back with `cat` without making a
+ * new request whose response might differ (requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
+  const raw = String(text ?? '')
+  const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const dir = baseDir ?? path.join(os.tmpdir(), `devspec-notes-${uid}`)
+  const pieces = splitText(raw)
+  const partPath = (part) => path.join(dir, part === 1 ? `${id}.md` : `${id}-part-${part}.md`)
+  const firstFile = partPath(1)
+  if (!fs.existsSync(firstFile)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    for (let part = pieces.length; part >= 1; part -= 1) {
+      const nextCmd = part < pieces.length ? `\n\n--- next part (${part + 1}/${pieces.length}): cat ${shellQuotePath(partPath(part + 1))} ---\n` : '\n'
+      writePrivateText(partPath(part), `${pieces[part - 1]}${nextCmd}`)
+    }
+  }
+  return {
+    id,
+    file: firstFile,
+    command: `cat ${shellQuotePath(firstFile)}`,
+    parts: pieces.length,
+    fallback: true,
+  }
+}
+
 /**
  * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`, stdout + stderr)
  * at one shared boundary for stderr diagnostics (requirements 3c5147a7 / 91d7b47c).
  * Returns the diagnostic verbatim when `stdoutText + diagnosticText` fits; otherwise
  * saves the full diagnostic whole in a sealed note (`writeNote`) and returns the
- * fixed-shape pointer. If the note cannot be written (disk error), emits a visibly
- * marked shortened notice with the write error rather than letting Cursor truncate silently.
+ * fixed-shape pointer. If `~/.devspec/notes` cannot be written, saves the exact original
+ * content whole to a private fallback note in `os.tmpdir()` (`writeFallbackDiagnosticNote`)
+ * so callers can read the original response without retrying a network request.
  */
 export function fitShellDiagnostic(
   stdoutText,
@@ -863,8 +898,8 @@ export function fitShellDiagnostic(
   if (fitsShellOutput(stdout + diag)) {
     return { text: diag, note: null }
   }
-  const resolveFallback = (error) => {
-    const candidate = typeof fallback === 'function' ? fallback(error) : fallback
+  const resolveFallback = (error, savedFallbackNote = null) => {
+    const candidate = typeof fallback === 'function' ? fallback(error, savedFallbackNote) : fallback
     return typeof candidate === 'string' && candidate ? candidate : null
   }
   let noteError = null
@@ -874,7 +909,7 @@ export function fitShellDiagnostic(
     if (fitsShellOutput(stdout + pointer)) {
       return { text: pointer, note }
     }
-    const fb = resolveFallback(null)
+    const fb = resolveFallback(null, note)
     if (fb && fitsShellOutput(stdout + fb)) {
       return { text: fb, note, overflow: true, usedFallback: true }
     }
@@ -882,20 +917,33 @@ export function fitShellDiagnostic(
   } catch (error) {
     noteError = error
   }
-  const fb = resolveFallback(noteError)
+  let fallbackNote = null
+  try {
+    fallbackNote = writeFallbackDiagnosticNote(diag)
+  } catch {
+    fallbackNote = null
+  }
+  const fb = resolveFallback(noteError, fallbackNote)
   if (fb && fitsShellOutput(stdout + fb)) {
-    return { text: fb, note: null, noteError, usedFallback: true }
+    return { text: fb, note: fallbackNote, noteError, usedFallback: true }
+  }
+  if (fallbackNote) {
+    const fallbackPointer = shellDiagnosticPointer(label, fallbackNote.command)
+    if (fitsShellOutput(stdout + fallbackPointer)) {
+      return { text: fallbackPointer, note: fallbackNote, noteError }
+    }
   }
   if (requireStructuredFallback) {
-    return { text: '', note: null, noteError, overflow: true }
+    return { text: '', note: fallbackNote, noteError, overflow: true }
   }
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
-  const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).\n`
+  const readHint = fallbackNote ? ` Read original: \`${fallbackNote.command}\`.` : ''
+  const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).${readHint}\n`
   if (fitsShellOutput(stdout + short)) {
-    return { text: short, note: null, noteError }
+    return { text: short, note: fallbackNote, noteError }
   }
-  const bare = `${label}: diagnostic omitted (note write failed).\n`
-  return { text: fitsShellOutput(stdout + bare) ? bare : '', note: null, noteError }
+  const bare = `${label}: diagnostic omitted (note write failed).${readHint}\n`
+  return { text: fitsShellOutput(stdout + bare) ? bare : '', note: fallbackNote, noteError }
 }
 
 /** What a wake kept whole in a note says about itself: one fixed sentence. */

@@ -1665,6 +1665,17 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(parsed.omitted_count, 1)
     assert.equal(parsed.shell_limit_chars, 20_000)
     assert.deepEqual(parsed.codes, ['turn_busy'])
+    assert.equal(
+      parsed.blocking_turn_id ?? parsed.blocking?.[0]?.blocking_turn_id,
+      '88888888-8888-4888-8888-888888888888',
+      'tight refusal fallback must preserve actionable blocking_turn_id rather than stripping to bare codes',
+    )
+    assert.ok(typeof parsed.read === 'string' && parsed.read.startsWith('cat '), 'must retain exact original refusal on disk with a cat command')
+    const savedPath = parsed.read.replace(/^cat\s+'|'$/g, '')
+    assert.ok(fs.existsSync(savedPath), 'saved original refusal file must exist on disk')
+    const savedOriginal = fs.readFileSync(savedPath, 'utf8')
+    assert.match(savedOriginal, /88888888-8888-4888-8888-888888888888/)
+    assert.match(savedOriginal, /x{500}/)
     assert.ok(typeof parsed.recovery === 'string' && parsed.recovery.includes('~/.devspec/notes'))
   })
 
@@ -2049,5 +2060,55 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(ctx, /turn_in_progress/)
     assert.match(ctx, /77777777-7777-4777-8777-777777777777/)
     assert.match(ctx, /~\/\.devspec\/notes/)
+  })
+
+  it('refuses and keeps wake cursor held when local connection state cannot be read during readWakes (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wake.jsonl`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Command while connection state is corrupt')))
+    // Corrupt local connection state JSON so reading it fails transiently.
+    const statePath = path.join(dir, `${CONN}.json`)
+    const goodState = fs.readFileSync(statePath, 'utf8')
+    fs.writeFileSync(statePath, '{not valid json')
+
+    let stderr1 = ''
+    const read1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: (text) => { stderr1 += text },
+      startCommands: (opts) => startRoomCommands({ ...opts, call: async () => ({ outcome: 'picked_up' }), seedFn: async () => {}, ensureWatch: () => ({ started: false }) }),
+    })
+    assert.equal(read1.marked, false, 'wake cursor MUST NOT advance when local connection state cannot be read')
+    assert.equal(read1.pickup_refusals?.[0]?.refusal?.code, 'unreadable_connection_state')
+    assert.match(stderr1, /unreadable_connection_state/)
+
+    // Once connection state is readable again, the next read picks up the command and advances the cursor.
+    fs.writeFileSync(statePath, goodState)
+    const pickups = []
+    const read2 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 10,
+      write: async () => {},
+      writeStderr: () => {},
+      startCommands: (opts) =>
+        startRoomCommands({
+          ...opts,
+          call: async (req) => {
+            if (req.name === 'report_pickup') pickups.push(req.arguments.command_message_id)
+            return { outcome: 'picked_up' }
+          },
+          seedFn: async () => {},
+          ensureWatch: () => ({ started: false }),
+        }),
+    })
+    assert.equal(read2.marked, true)
+    assert.deepEqual(pickups, [MSG_ID])
   })
 })

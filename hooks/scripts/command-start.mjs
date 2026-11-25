@@ -370,6 +370,71 @@ function findLargestRawArray(node, currentPath = [], best = null) {
  *  3. Returns `null` if `stdoutText` itself leaves too little room even for a structured
  *     refusal envelope with counts and recovery (never flattening to a generic sentence).
  */
+function compactBlockingFields(entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const inner = entry.refusal && typeof entry.refusal === 'object' ? entry.refusal : entry
+  const out = {}
+  const copySmall = (target, key, val) => {
+    if (val === undefined || val === null) return
+    if (typeof val === 'boolean' || typeof val === 'number') {
+      target[key] = val
+    } else if (typeof val === 'string') {
+      if (val.length <= 160) target[key] = val
+    } else if (Array.isArray(val)) {
+      const compactItems = val
+        .slice(0, 3)
+        .map((item) => {
+          if (item && typeof item === 'object') {
+            const picked = {}
+            for (const f of ['id', 'turn_id', 'attempt_id', 'task_id', 'code', 'reason', 'title']) {
+              if (typeof item[f] === 'string' && item[f].length <= 80) picked[f] = item[f]
+            }
+            return Object.keys(picked).length > 0 ? picked : null
+          }
+          return typeof item === 'string' && item.length <= 80 ? item : null
+        })
+        .filter(Boolean)
+      if (compactItems.length > 0) {
+        target[key] = compactItems.length < val.length
+          ? { items: compactItems, total_count: val.length, returned_count: compactItems.length }
+          : compactItems
+      }
+    } else if (typeof val === 'object') {
+      const sub = {}
+      for (const [sk, sv] of Object.entries(val)) {
+        if (typeof sv === 'boolean' || typeof sv === 'number') sub[sk] = sv
+        else if (typeof sv === 'string' && sv.length <= 120) sub[sk] = sv
+      }
+      if (Object.keys(sub).length > 0) target[key] = sub
+    }
+  }
+  for (const key of ['step', 'command_message_id', 'command_turn_id']) {
+    if (typeof entry[key] === 'string' && entry[key].length <= 120) out[key] = entry[key]
+  }
+  const priorityKeys = [
+    'code',
+    'blocking_turn_id',
+    'blocking_attempt_id',
+    'blocking_attempt',
+    'blocking_items',
+    'blocking',
+    'conflicting_records',
+    'conflicts',
+    'details',
+    'retryable',
+    'status',
+  ]
+  for (const key of priorityKeys) {
+    if (key in inner) copySmall(out, key, inner[key])
+  }
+  for (const [k, v] of Object.entries(inner)) {
+    if (k in out || k === 'error' || k === 'detail' || k === 'message') continue
+    if (typeof v === 'string' && v.length <= 80) out[k] = v
+    else if (typeof v === 'boolean' || typeof v === 'number') out[k] = v
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
 export function formatStructuredRefusalsFallback(
   refusals,
   {
@@ -377,12 +442,17 @@ export function formatStructuredRefusalsFallback(
     stdoutText = '',
     maxChars = null,
     noteError = null,
+    savedNote = null,
     recovery = 'Fix write permissions on ~/.devspec/notes and retry so the complete structured refusal can be saved whole and read back.',
     allowMinimalEnvelope = true,
   } = {},
 ) {
   const list = Array.isArray(refusals) ? refusals.map((item) => cloneJsonSafe(item)) : []
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
+  const savedCmd = typeof savedNote?.command === 'string' && savedNote.command ? savedNote.command : null
+  const effectiveRecovery = savedCmd
+    ? `Read the complete original refusal with \`${savedCmd}\` (and any further parts it names); fix write permissions on ~/.devspec/notes.`
+    : recovery
   const limitChars = typeof maxChars === 'number' && maxChars > 0 ? maxChars : CURSOR_SHELL_OUTPUT_MAX_CHARS
   const fits = (candidate) =>
     typeof maxChars === 'number' && maxChars > 0
@@ -396,8 +466,9 @@ export function formatStructuredRefusalsFallback(
       total_count: list.length,
       returned_count: slice.length,
       omitted_count: list.length - slice.length,
+      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
       refusals: slice,
-      recovery,
+      recovery: effectiveRecovery,
       ...extra,
     })}\n`
 
@@ -420,25 +491,23 @@ export function formatStructuredRefusalsFallback(
   if (lo > 0) return wrap(list.slice(0, lo))
 
   // 2. Single first refusal exceeds remaining budget: shrink only oversized string
-  // leaves and/or binary-search oversized nested arrays while keeping all structured
-  // fields, counts, and recovery intact at every depth.
+  // leaves (using a concise marker so actionable structured fields stay intact) and/or
+  // binary-search oversized nested arrays while keeping counts, saved original pointer,
+  // and recovery at every depth.
   const first = cloneJsonSafe(list[0])
   const stringReplacement = (len) => ({
     omitted_large_text: true,
     actual_length: len,
-    shell_limit_chars: limitChars,
-    note_write_failed: true,
-    recovery,
   })
   const minShrinkableStringLen = JSON.stringify(stringReplacement(limitChars)).length
 
   while (!fits(wrap([first]))) {
     const bigStr = findLargestShrinkableString(first, minShrinkableStringLen)
-    if (bigStr && bigStr.path.length > 0) {
+    const bigArr = findLargestRawArray(first)
+    if (bigStr && bigStr.path.length > 0 && (!bigArr || bigStr.length >= bigArr.size)) {
       setAtPath(first, bigStr.path, stringReplacement(bigStr.length))
       continue
     }
-    const bigArr = findLargestRawArray(first)
     if (bigArr && bigArr.path.length > 0) {
       const originalArr = getAtPath(first, bigArr.path)
       const makeBoundedArr = (count) => ({
@@ -447,7 +516,7 @@ export function formatStructuredRefusalsFallback(
         returned_count: count,
         omitted_count: originalArr.length - count,
         omitted_due_to_shell_limit: true,
-        recovery,
+        recovery: effectiveRecovery,
       })
       let alo = 0
       let ahi = originalArr.length
@@ -464,6 +533,10 @@ export function formatStructuredRefusalsFallback(
       if (fits(wrap([first]))) break
       continue
     }
+    if (bigStr && bigStr.path.length > 0) {
+      setAtPath(first, bigStr.path, stringReplacement(bigStr.length))
+      continue
+    }
     break
   }
 
@@ -473,6 +546,7 @@ export function formatStructuredRefusalsFallback(
   if (!allowMinimalEnvelope) return null
 
   const allCodes = list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
+  const blockingDetails = list.map(compactBlockingFields).filter(Boolean)
   const fitCodes = (build) => {
     let clo = 0
     let chi = allCodes.length
@@ -487,15 +561,66 @@ export function formatStructuredRefusalsFallback(
     const candidate = build(allCodes.slice(0, clo))
     return fits(candidate) ? candidate : null
   }
+  const fitBlocking = (build) => {
+    if (blockingDetails.length === 0) return null
+    let blo = 0
+    let bhi = blockingDetails.length
+    while (blo < bhi) {
+      const bmid = Math.ceil((blo + bhi) / 2)
+      if (fits(build(blockingDetails.slice(0, bmid)))) {
+        blo = bmid
+      } else {
+        bhi = bmid - 1
+      }
+    }
+    if (blo === 0) return null
+    const candidate = build(blockingDetails.slice(0, blo))
+    return fits(candidate) ? candidate : null
+  }
 
-  // Tier 1: full prefix + full metadata + as many refusal codes as fit.
+  // Tier 1: full prefix + full metadata + compact actionable blocking fields + codes.
+  const tier1WithBlocking = fitBlocking((blocking) =>
+    wrap([], {
+      ...(allCodes.length > 0 ? { codes: allCodes } : {}),
+      ...(blocking.length > 0 ? { blocking } : {}),
+    }),
+  )
+  if (tier1WithBlocking) return tier1WithBlocking
   const tier1 = fitCodes((codes) => wrap([], { codes }))
   if (tier1) return tier1
 
-  // Tier 2: compact structured JSON envelope preserving refusal status, counts,
-  // limit, note-write failure, refusal codes, and concrete recovery steps
-  // for tight remaining budgets (e.g. ~200-350 chars left after prior stderr or hook share).
-  const tier2 = fitCodes(
+  // Tier 2: compact structured JSON envelope preserving actionable blocking fields,
+  // saved original-response `read` command (when fallback storage succeeded), counts,
+  // limit, refusal codes, and concrete recovery steps for tight ~250-350 char budgets.
+  const tier2Recovery = savedCmd
+    ? 'Read full original via `read`; fix ~/.devspec/notes.'
+    : 'Fix ~/.devspec/notes permissions and retry.'
+  const tier2Full = fitBlocking(
+    (blocking) =>
+      `${JSON.stringify({
+        refused: 'report_pickup',
+        note_write_failed: true,
+        shell_limit_chars: limitChars,
+        total_count: list.length,
+        omitted_count: list.length,
+        ...(allCodes.length > 0 ? { codes: allCodes } : {}),
+        ...(blocking.length > 0 ? { blocking } : {}),
+        ...(savedCmd ? { read: savedCmd } : {}),
+        recovery: tier2Recovery,
+      })}\n`,
+  )
+  if (tier2Full) return tier2Full
+
+  // Tier 2b: keep primary actionable blocking identifiers (e.g. blocking_turn_id /
+  // blocking_attempt / code) + `read` pointer even under a tight ~300-350 char budget.
+  const primaryInner = list[0]?.refusal && typeof list[0].refusal === 'object' ? list[0].refusal : list[0]
+  const tightBlocking = {}
+  for (const key of ['blocking_turn_id', 'blocking_attempt_id', 'blocking_attempt', 'retryable']) {
+    if (primaryInner && primaryInner[key] !== undefined && JSON.stringify(primaryInner[key]).length <= 120) {
+      tightBlocking[key] = primaryInner[key]
+    }
+  }
+  const tier2Tight = fitCodes(
     (codes) =>
       `${JSON.stringify({
         refused: 'report_pickup',
@@ -504,20 +629,43 @@ export function formatStructuredRefusalsFallback(
         total_count: list.length,
         omitted_count: list.length,
         ...(codes.length > 0 ? { codes } : {}),
-        recovery: 'Fix ~/.devspec/notes permissions and retry.',
+        ...tightBlocking,
+        ...(savedCmd ? { read: savedCmd } : {}),
+        recovery: tier2Recovery,
       })}\n`,
   )
-  if (tier2) return tier2
+  if (tier2Tight) return tier2Tight
 
-  // Tier 3: minimal structured JSON omission + recovery notice that fits inside
-  // `shellDiagnosticReserve('devspec-remote-wait')` (~119 chars).
+  // Tier 3: minimal structured JSON omission + saved original pointer + recovery notice
+  // that fits inside `shellDiagnosticReserve('devspec-remote-wait')` (~119-200 chars).
+  const tier3WithRead = savedCmd
+    ? `${JSON.stringify({
+        refused: 'report_pickup',
+        ...tightBlocking,
+        ...(allCodes.length > 0 ? { codes: allCodes.slice(0, 1) } : {}),
+        omitted_count: list.length,
+        shell_limit_chars: limitChars,
+        read: savedCmd,
+        recovery: 'Read `read`; fix ~/.devspec/notes.',
+      })}\n`
+    : null
+  if (tier3WithRead && fits(tier3WithRead)) return tier3WithRead
   const tier3 = `${JSON.stringify({
+    refused: 'report_pickup',
+    ...tightBlocking,
+    omitted_count: list.length,
+    shell_limit_chars: limitChars,
+    ...(savedCmd ? { read: savedCmd } : {}),
+    recovery: 'Fix ~/.devspec/notes & retry.',
+  })}\n`
+  if (fits(tier3)) return tier3
+  const tier3Bare = `${JSON.stringify({
     refused: 'report_pickup',
     omitted_count: list.length,
     shell_limit_chars: limitChars,
     recovery: 'Fix ~/.devspec/notes & retry.',
   })}\n`
-  return fits(tier3) ? tier3 : null
+  return fits(tier3Bare) ? tier3Bare : null
 }
 
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */
@@ -600,7 +748,6 @@ export async function startRoomCommands({
       refusals: [{ code: 'missing_connection_id', error: 'missing connectionId' }],
     }
   }
-  const resolvedState = state ?? readPrivateJson(path.join(dir, `${connectionId}.json`))
   const rawCommands = Array.isArray(commands)
     ? commands
     : Array.isArray(batch?.messages)
@@ -610,8 +757,49 @@ export async function startRoomCommands({
   const toStart = rawCommands.filter((cmd) => cmd?.turnId && cmd?.messageId && !already.has(cmd.messageId))
   if (toStart.length === 0) return { ok: true, outcome: 'duplicate', started: [], pickedUp: 0, duplicate: true }
 
+  let stateReadError = null
+  let resolvedState = state
   if (!resolvedState) {
-    return { ok: true, skipped: true, reason: 'no_connection_state', started: [], pickedUp: 0 }
+    const statePath = path.join(dir, `${connectionId}.json`)
+    try {
+      resolvedState = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+    } catch (error) {
+      stateReadError = error
+      resolvedState = null
+    }
+  }
+  if (!resolvedState || typeof resolvedState !== 'object') {
+    const errCode =
+      stateReadError && typeof stateReadError === 'object' && 'code' in stateReadError
+        ? String(stateReadError.code)
+        : 'unreadable_state'
+    const errMsg =
+      stateReadError instanceof Error ? stateReadError.message : 'connection state could not be read'
+    const refusal = {
+      code: errCode === 'ENOENT' ? 'missing_connection_state' : 'unreadable_connection_state',
+      error_code: errCode,
+      retryable: true,
+      error: `Cannot start room command pickup because connection state could not be read (${errMsg}).`,
+    }
+    const primaryPending = toStart[toStart.length - 1]
+    log(`command-start: connection state unreadable for ${connectionId}: ${JSON.stringify(refusal)}\n`)
+    return {
+      ok: false,
+      outcome: 'refused',
+      skipped: true,
+      reason: 'no_connection_state',
+      started: [],
+      unstarted: toStart,
+      pickedUp: 0,
+      startsTurn: false,
+      refusals: [
+        {
+          command_message_id: primaryPending.messageId,
+          command_turn_id: primaryPending.turnId,
+          refusal,
+        },
+      ],
+    }
   }
 
   const credential = connectionCredential(resolvedState)

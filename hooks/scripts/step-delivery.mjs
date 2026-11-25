@@ -110,6 +110,7 @@ import {
   POST_TOOL_CONTEXT_SHARE,
   postToolUseOutput,
   readThrough,
+  writeFallbackDiagnosticNote,
   writeNote,
 } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
@@ -1112,10 +1113,17 @@ export async function stepDeliveryHook(
       const refusalNotice =
         `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
       const buildFallback = (budget, noteError) => {
+        let savedFallback = null
+        try {
+          savedFallback = writeFallbackDiagnosticNote(refusalNotice)
+        } catch {
+          savedFallback = null
+        }
         const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
           prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
           maxChars: budget,
           noteError,
+          savedNote: savedFallback,
         })
         return formatted ? formatted.trimEnd() : null
       }

@@ -1959,11 +1959,12 @@ export async function runOneShotRoomCommandPickup({
   if (rawDiag) {
     const combinedPrior = `${priorStderr}${printedStdout}`
     const fallback = refusals
-      ? (noteError) =>
+      ? (noteError, savedNote) =>
           formatStructuredRefusalsFallback(refusals, {
             prefix: 'devspec-remote-wait: report_pickup refused (note write failed; structured refusal): ',
             stdoutText: combinedPrior,
             noteError,
+            savedNote,
           })
       : null
     const fitted = fitShellDiagnostic(combinedPrior, rawDiag, {
