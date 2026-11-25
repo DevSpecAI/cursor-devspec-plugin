@@ -32,6 +32,15 @@ import path from 'node:path'
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 const CURSOR_CHATS_DIR = path.join(os.homedir(), '.cursor', 'chats')
 
+/**
+ * SQLite busy-wait ceiling (ms) when reading Cursor's live WAL-mode chat store.
+ * Cursor holds only sub-millisecond single-row write locks when updating `meta.key='0'`
+ * on turn start, while hooks and polls must stay responsive and never stall a turn;
+ * 100 ms clears transient write contention without noticeable latency, and on timeout
+ * callers fall back to the last-known-good telemetry file.
+ */
+export const CHAT_STORE_BUSY_TIMEOUT_MS = 100
+
 /** The levels `agent_stats.thinkingLevel` accepts. Anything else is sent as null, or the server drops the whole report. */
 const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 
@@ -182,7 +191,7 @@ export function readCursorChatModel(conversationId, { cwd, chatsDir = CURSOR_CHA
   let db = null
   try {
     const mtimeMs = effectiveStoreMtimeMs(dbPath)
-    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 100 })
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: CHAT_STORE_BUSY_TIMEOUT_MS })
     const row = db.prepare("SELECT value FROM meta WHERE key = '0'").get()
     const meta = decodeMetaJson(row?.value)
     const model = text(meta?.lastUsedModel)
@@ -298,6 +307,7 @@ export function recordRuntimeReport(
     const existingSource = text(existing?._source)
     const existingAtMs = existing?.at ? Date.parse(existing.at) : NaN
     const convId = text(conversationId) ?? text(parsed.conversation_id) ?? text(parsed.session_id)
+    const hookReport = runtimeReportFromHookInput(parsed, now)
 
     if (convId) {
       const store = readCursorChatModel(convId, { cwd, chatsDir })
@@ -305,12 +315,15 @@ export function recordRuntimeReport(
         if (existingSource === 'hook_live' && Number.isFinite(existingAtMs) && existingAtMs > store.mtimeMs) {
           return false
         }
-        const report = buildReport(
-          store.model,
-          preservedThinkingLevel(existing, store.model),
-          now.toISOString(),
-          'chat_store',
-        )
+        // Keep effort exposed on the hook itself when the hook matches the active store
+        // model (e.g. first tool call before a switch); otherwise preserve effort only
+        // from an existing report for the same model and clear it on a model switch.
+        const hookEffort =
+          hookReport?.model?.id === store.model && THINKING_LEVELS.has(hookReport.thinkingLevel)
+            ? hookReport.thinkingLevel
+            : null
+        const thinkingLevel = hookEffort ?? preservedThinkingLevel(existing, store.model)
+        const report = buildReport(store.model, thinkingLevel, now.toISOString(), 'chat_store')
         fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify(report), { mode: 0o600 })
         return true
       }
@@ -320,9 +333,8 @@ export function recordRuntimeReport(
       return false
     }
 
-    const report = runtimeReportFromHookInput(parsed, now)
-    if (!report) return false
-    fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify({ ...report, _source: 'tool_hook' }), { mode: 0o600 })
+    if (!hookReport) return false
+    fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify({ ...hookReport, _source: 'tool_hook' }), { mode: 0o600 })
     return true
   } catch {
     return false
@@ -346,15 +358,30 @@ export function agentStatsArgs(
         const hookLiveIsNewer =
           existingSource === 'hook_live' && Number.isFinite(existingAtMs) && existingAtMs > store.mtimeMs
         if (!hookLiveIsNewer) {
-          const atIso =
-            Number.isFinite(store.mtimeMs) && store.mtimeMs > 0
-              ? new Date(store.mtimeMs).toISOString()
-              : new Date().toISOString()
-          return {
-            agent_stats: toWireReport(
-              buildReport(store.model, preservedThinkingLevel(existing, store.model), atIso),
-            ),
+          const thinkingLevel = preservedThinkingLevel(existing, store.model)
+          const effectiveAtMs = Math.max(
+            Number.isFinite(store.mtimeMs) && store.mtimeMs > 0 ? store.mtimeMs : 0,
+            existing?.model?.id === store.model && Number.isFinite(existingAtMs) ? existingAtMs : 0,
+          )
+          const atIso = effectiveAtMs > 0 ? new Date(effectiveAtMs).toISOString() : new Date().toISOString()
+          const nextReport = buildReport(store.model, thinkingLevel, atIso, 'chat_store')
+          // Persist the fresher chat-store report as last-known-good so a transient SQLite
+          // read failure on a subsequent poll never reverts DevSpec to an older cached model.
+          const shouldPersist =
+            !existing ||
+            existing?.model?.id !== store.model ||
+            existing?.thinkingLevel !== thinkingLevel ||
+            existingSource !== 'chat_store' ||
+            !Number.isFinite(existingAtMs) ||
+            effectiveAtMs > existingAtMs
+          if (shouldPersist) {
+            try {
+              fs.writeFileSync(telemetryPath(connectionId, dir), JSON.stringify(nextReport), { mode: 0o600 })
+            } catch {
+              /* non-fatal: still return the live report for this poll */
+            }
           }
+          return { agent_stats: toWireReport(nextReport) }
         }
       }
     }

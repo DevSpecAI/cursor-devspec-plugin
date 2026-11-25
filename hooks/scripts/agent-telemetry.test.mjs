@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import {
+  CHAT_STORE_BUSY_TIMEOUT_MS,
   agentStatsArgs,
   readCursorChatModel,
   recordRuntimeReport,
@@ -298,5 +299,75 @@ describe('stale tool hooks never revert a live model switch (item c2ddefb6)', ()
       true,
     )
     assert.equal(agentStatsArgs(conn, { dir, localId: convCorrupt, cwd: CWD, chatsDir }).agent_stats.model.id, 'grok-4.7')
+  })
+
+  it('preserves effort reported on a matching tool hook when the chat store is readable', () => {
+    const conn = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+    const convId = 'conv-matching-tool-effort'
+    const t0 = NOW.getTime()
+
+    writeCursorChatStore(chatsDir, CWD, convId, { lastUsedModel: 'gemini-4-neon' }, { mtimeMs: t0 })
+    assert.equal(
+      recordRuntimeReport(
+        conn,
+        JSON.stringify({
+          conversation_id: convId,
+          model: 'gemini-4-neon',
+          model_params: [{ id: 'reasoning_effort', value: 'high' }],
+        }),
+        { dir, chatsDir, cwd: CWD, now: new Date(t0), authoritative: false },
+      ),
+      true,
+    )
+    const stats = agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats
+    assert.equal(stats.model.id, 'gemini-4-neon')
+    assert.equal(stats.thinkingLevel, 'high')
+
+    // A stale tool hook carrying a different model's effort must NOT apply to the switched store model
+    writeCursorChatStore(chatsDir, CWD, convId, { lastUsedModel: 'claude-opus-5-5' }, { mtimeMs: t0 + 5_000 })
+    assert.equal(
+      recordRuntimeReport(
+        conn,
+        JSON.stringify({
+          conversation_id: convId,
+          model: 'gemini-4-neon',
+          model_params: [{ id: 'reasoning_effort', value: 'high' }],
+        }),
+        { dir, chatsDir, cwd: CWD, now: new Date(t0 + 6_000), authoritative: false },
+      ),
+      true,
+    )
+    const switched = agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats
+    assert.equal(switched.model.id, 'claude-opus-5-5')
+    assert.equal(switched.thinkingLevel, null)
+  })
+
+  it('persists last-known-good chat-store telemetry on poll so a later unreadable store never reverts', () => {
+    const conn = '88888888-9999-4aaa-8bbb-cccccccccccc'
+    const convId = 'conv-last-known-good'
+    const t0 = NOW.getTime()
+
+    // Initial tool hook caches grok-4.7
+    const dbPath = writeCursorChatStore(chatsDir, CWD, convId, { lastUsedModel: 'grok-4.7' }, { mtimeMs: t0 })
+    recordRuntimeReport(conn, JSON.stringify({ conversation_id: convId, model: 'grok-4.7' }), {
+      dir,
+      chatsDir,
+      cwd: CWD,
+      now: new Date(t0),
+      authoritative: false,
+    })
+
+    // User switches to claude-opus-5-5; poller observes and persists it
+    writeCursorChatStore(chatsDir, CWD, convId, { lastUsedModel: 'claude-opus-5-5' }, { mtimeMs: t0 + 10_000 })
+    const firstPoll = agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats
+    assert.equal(firstPoll.model.id, 'claude-opus-5-5')
+
+    // SQLite becomes unreadable before the next poll -> must stay on claude-opus-5-5, never revert to grok-4.7
+    fs.writeFileSync(dbPath, 'temporarily unreadable')
+    const secondPoll = agentStatsArgs(conn, { dir, localId: convId, cwd: CWD, chatsDir }).agent_stats
+    assert.equal(secondPoll.model.id, 'claude-opus-5-5')
+    assert.equal(secondPoll.at, firstPoll.at)
+    assert.equal(typeof CHAT_STORE_BUSY_TIMEOUT_MS, 'number')
+    assert.ok(CHAT_STORE_BUSY_TIMEOUT_MS > 0)
   })
 })
