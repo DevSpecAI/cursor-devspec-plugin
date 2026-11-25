@@ -637,8 +637,9 @@ describe('typed-turn-sync (item da03801e)', () => {
     const memo = { stamp: null, synced: false }
     const logs = []
     let openCalls = 0
+    let first
     try {
-      const first = await syncTypedTurnFromTranscript({
+      first = await syncTypedTurnFromTranscript({
         connectionId: CONN,
         transcriptPath,
         connectionCapability: 'cap-secret',
@@ -658,7 +659,8 @@ describe('typed-turn-sync (item da03801e)', () => {
       fs.rmSync(reqLog, { recursive: true, force: true })
     }
 
-    // Once transient write failure clears, the next pass syncs cleanly.
+    // Once transient write failure clears, the next pass persists the SAME already-opened
+    // server request without issuing a second report_request(open) call (req 3ea2b201).
     const second = await syncTypedTurnFromTranscript({
       connectionId: CONN,
       transcriptPath,
@@ -672,9 +674,10 @@ describe('typed-turn-sync (item da03801e)', () => {
       log: (line) => logs.push(line),
     })
     assert.equal(second.action, 'opened')
+    assert.equal(second.requestId, first.requestId, 'retry must persist the exact first opened server request id')
     assert.equal(memo.synced, true)
-    assert.equal(readRequestState(CONN, { dir }).open.has(second.requestId), true)
-    assert.equal(openCalls, 2)
+    assert.equal(readRequestState(CONN, { dir }).open.has(first.requestId), true)
+    assert.equal(openCalls, 1, 'must not open a second orphaned server request on retry')
   })
 
   it('preserves structured completion and close refusals in finishIdleRequests without dropping details (4e32d1a5)', async () => {
@@ -734,13 +737,17 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.match(logs.join(''), /request_locked/)
   })
 
-  it('preserves a typed_prompt with an un-notified background launch on Cursor CLI when beforeSubmitPrompt does not fire (ce71a72b)', async () => {
+  it('does NOT let an unrelated timestamp-only or command_turn wake inherit an earlier request merely because an unnotified background launch exists (2fcd26bd / ce71a72b)', async () => {
     const { home, dir, transcriptPath } = makeEnv()
     appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
     appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
     appendRequestEvent(CONN, { op: 'launch', key: 'bg-cli-1', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
-    // Cursor CLI strips <task-notification> leaving a bare timestamp / command_turn row without running promptArrival.
-    fs.writeFileSync(transcriptPath, `${typedRow('Start background build')}\n${commandRow()}\n`)
+    // Unrelated timestamp-only wake without any <task-notification> tying it to bg-cli-1.
+    const tsOnlyRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wed, Nov 25, 2026, 8:40 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Start background build')}\n${tsOnlyRow}\n`)
 
     const res = await syncTypedTurnFromTranscript({
       connectionId: CONN,
@@ -748,12 +755,42 @@ describe('typed-turn-sync (item da03801e)', () => {
       connectionCapability: 'cap-secret',
       dir,
     })
-    assert.equal(res.action, 'preserved_wake_request')
-    assert.equal(res.requestId, HOOK_TYPED)
-    assert.equal(readRequestState(CONN, { dir }).current, HOOK_TYPED)
-    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
-      args: { task_id: 'x', request_ref: HOOK_TYPED },
+    assert.equal(res.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(
+      stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }),
+      { args: { task_id: 'x' } },
+      'write on an unrelated wake must stay unstamped rather than inheriting an unnotified launch',
+    )
+  })
+
+  it('enforces budgetMs mid-row on a single huge transcript row so sync stops at the deadline (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    // Build a single ~35 MB JSONL user row whose synchronous monolithic parse would exceed a tight budget.
+    const hugeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: `<timestamp>Wed, Nov 25, 2026, 8:41 PM (UTC)</timestamp>\n<user_query>\n${'z'.repeat(35 * 1024 * 1024)}\n</user_query>`,
+          },
+        ],
+      },
     })
+    fs.writeFileSync(transcriptPath, `${hugeRow}\n`)
+    const started = Date.now()
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      budgetMs: 60,
+      attempts: 1,
+      dir,
+      log: () => {},
+    })
+    const elapsed = Date.now() - started
+    assert.equal(res.action, 'budget_exhausted')
+    assert.ok(elapsed < 105, `single huge row must stop near budgetMs=60, took ${elapsed}ms`)
   })
 
   it('enforces budgetMs during synchronous transcript reading so a half-written transcript cannot overrun the hook timeout (3c5147a7 / 91d7b47c)', async () => {

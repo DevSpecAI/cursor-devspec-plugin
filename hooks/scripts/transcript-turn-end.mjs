@@ -429,6 +429,18 @@ const LINE_READ_CHUNK_BYTES = 64 * 1024
 const READ_CHUNK_BYTES = 1024 * 1024
 
 /**
+ * Smaller I/O and scan step used only when a caller supplies a wall-clock `deadlineMs`
+ * (e.g. synchronous `preToolUse` typed-turn sync). Each 64 KB step completes in <1 ms so
+ * `deadlineMs` is enforced mid-file and mid-row without cutting or limiting row length
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+const BOUNDED_STEP_BYTES = 64 * 1024
+
+const ROLE_USER_MARKER = Buffer.from('"role":"user"')
+const TURN_ENDED_MARKER = Buffer.from('"turn_ended"')
+const BUDGET_EXHAUSTED_TOKEN = Symbol('budget_exhausted')
+
+/**
  * A read of the whole transcript counts only when the file has not changed while it was
  * read nor for STABLE_READ_GAP_MS after. Cursor rewrites the file in place at a turn's
  * start (Node's writeFile: truncate, then the content in pieces with a pause between
@@ -576,11 +588,12 @@ function readWholeOnce(transcriptPath, { deadlineMs = null } = {}) {
   try {
     const before = fs.fstatSync(fd)
     if (before.size === 0) return null
+    const stepBytes = deadlineMs !== null ? BOUNDED_STEP_BYTES : READ_CHUNK_BYTES
     const chunks = []
     let offset = 0
     while (offset < before.size) {
       if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
-      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, before.size - offset))
+      const chunk = Buffer.alloc(Math.min(stepBytes, before.size - offset))
       const read = fs.readSync(fd, chunk, 0, chunk.length, offset)
       if (read <= 0) break
       chunks.push(read === chunk.length ? chunk : chunk.subarray(0, read))
@@ -691,7 +704,8 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
     if (deadlineMs !== null && Date.now() + STABLE_READ_GAP_MS > deadlineMs) return { budgetExhausted: true }
     sleepSync(STABLE_READ_GAP_MS)
     if (fileStamp(transcriptPath) !== whole.stamp) continue
-    const bytes = Buffer.concat(whole.chunks)
+    const bytes = concatChunksBounded(whole.chunks, deadlineMs)
+    if (bytes === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
     const parsed = scanTranscript(bytes, { deadlineMs })
     if (parsed?.budgetExhausted) return { budgetExhausted: true }
     if (parsed) return { ...parsed, bytes, size: bytes.length, stamp: whole.stamp, atMs: whole.atMs }
@@ -699,17 +713,212 @@ export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATT
   return null
 }
 
+function concatChunksBounded(chunks, deadlineMs) {
+  if (deadlineMs === null) return Buffer.concat(chunks)
+  let total = 0
+  for (const c of chunks) total += c.length
+  const out = Buffer.allocUnsafe(total)
+  let offset = 0
+  for (const c of chunks) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    c.copy(out, offset)
+    offset += c.length
+  }
+  return out
+}
+
+function trimSliceBounds(bytes, start, end) {
+  let s = start
+  let e = end
+  while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) s += 1
+  while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) e -= 1
+  return { s, e }
+}
+
+function sliceContainsMarker(bytes, start, end, marker) {
+  const idx = bytes.indexOf(marker, start)
+  return idx >= 0 && idx + marker.length <= end
+}
+
+function digestSliceBounded(bytes, start, end, deadlineMs) {
+  const hash = crypto.createHash('sha256')
+  if (deadlineMs === null) {
+    hash.update(bytes.subarray(start, end))
+    return hash.digest('hex').slice(0, 16)
+  }
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    hash.update(bytes.subarray(pos, Math.min(pos + BOUNDED_STEP_BYTES, end)))
+  }
+  return hash.digest('hex').slice(0, 16)
+}
+
+/**
+ * Deadline-checked RFC-8259 JSON parser used for oversized rows (> BOUNDED_STEP_BYTES)
+ * when a caller enforces `deadlineMs`. Checks the wall-clock deadline every
+ * `BOUNDED_STEP_BYTES` inside large string literals and containers so a single huge row
+ * cannot overrun the caller's deadline while still parsing losslessly when budget remains.
+ */
+function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
+  if (deadlineMs === null || end - start <= BOUNDED_STEP_BYTES) {
+    if (deadlineMs !== null && Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    return JSON.parse(bytes.toString('utf8', start, end))
+  }
+  let pos = start
+  let nextCheck = start + BOUNDED_STEP_BYTES
+
+  const checkBudget = () => {
+    if (pos >= nextCheck) {
+      nextCheck = pos + BOUNDED_STEP_BYTES
+      if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+    }
+  }
+  const skipWs = () => {
+    while (pos < end) {
+      const b = bytes[pos]
+      if (b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a) {
+        pos += 1
+        checkBudget()
+      } else {
+        break
+      }
+    }
+  }
+  const readString = () => {
+    pos += 1 // opening '"'
+    const parts = []
+    let segStart = pos
+    while (pos < end) {
+      const b = bytes[pos]
+      if (b === 0x22) {
+        if (pos > segStart) parts.push(bytes.toString('utf8', segStart, pos))
+        pos += 1
+        return parts.length <= 1 ? (parts[0] ?? '') : parts.join('')
+      }
+      if (b === 0x5c) {
+        if (pos > segStart) parts.push(bytes.toString('utf8', segStart, pos))
+        pos += 1
+        if (pos >= end) throw new SyntaxError('Unterminated escape')
+        const esc = bytes[pos++]
+        if (esc === 0x22) parts.push('"')
+        else if (esc === 0x5c) parts.push('\\')
+        else if (esc === 0x2f) parts.push('/')
+        else if (esc === 0x62) parts.push('\b')
+        else if (esc === 0x66) parts.push('\f')
+        else if (esc === 0x6e) parts.push('\n')
+        else if (esc === 0x72) parts.push('\r')
+        else if (esc === 0x74) parts.push('\t')
+        else if (esc === 0x75) {
+          if (pos + 4 > end) throw new SyntaxError('Invalid unicode escape')
+          const code = Number.parseInt(bytes.toString('ascii', pos, pos + 4), 16)
+          if (!Number.isFinite(code)) throw new SyntaxError('Invalid unicode escape')
+          pos += 4
+          parts.push(String.fromCharCode(code))
+        } else {
+          throw new SyntaxError('Invalid escape')
+        }
+        segStart = pos
+        checkBudget()
+        continue
+      }
+      pos += 1
+      if (pos >= nextCheck) {
+        nextCheck = pos + BOUNDED_STEP_BYTES
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+      }
+    }
+    throw new SyntaxError('Unterminated string')
+  }
+  const readValue = () => {
+    skipWs()
+    if (pos >= end) throw new SyntaxError('Unexpected end')
+    const b = bytes[pos]
+    if (b === 0x22) return readString()
+    if (b === 0x7b) {
+      pos += 1
+      const obj = {}
+      skipWs()
+      if (pos < end && bytes[pos] === 0x7d) {
+        pos += 1
+        return obj
+      }
+      while (pos < end) {
+        skipWs()
+        if (bytes[pos] !== 0x22) throw new SyntaxError('Expected key')
+        const key = readString()
+        skipWs()
+        if (bytes[pos] !== 0x3a) throw new SyntaxError('Expected colon')
+        pos += 1
+        obj[key] = readValue()
+        skipWs()
+        if (bytes[pos] === 0x2c) {
+          pos += 1
+          checkBudget()
+          continue
+        }
+        if (bytes[pos] === 0x7d) {
+          pos += 1
+          return obj
+        }
+        throw new SyntaxError('Expected comma or }')
+      }
+      throw new SyntaxError('Unterminated object')
+    }
+    if (b === 0x5b) {
+      pos += 1
+      const arr = []
+      skipWs()
+      if (pos < end && bytes[pos] === 0x5d) {
+        pos += 1
+        return arr
+      }
+      while (pos < end) {
+        arr.push(readValue())
+        skipWs()
+        if (bytes[pos] === 0x2c) {
+          pos += 1
+          checkBudget()
+          continue
+        }
+        if (bytes[pos] === 0x5d) {
+          pos += 1
+          return arr
+        }
+        throw new SyntaxError('Expected comma or ]')
+      }
+      throw new SyntaxError('Unterminated array')
+    }
+    const litStart = pos
+    while (pos < end) {
+      const ch = bytes[pos]
+      if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x09 || ch === 0x0d || ch === 0x0a) break
+      pos += 1
+    }
+    return JSON.parse(bytes.toString('utf8', litStart, pos))
+  }
+  try {
+    const val = readValue()
+    skipWs()
+    if (pos !== end) throw new SyntaxError('Trailing JSON tokens')
+    return val
+  } catch (err) {
+    if (err === BUDGET_EXHAUSTED_TOKEN) return BUDGET_EXHAUSTED_TOKEN
+    throw err
+  }
+}
+
 /**
  * Null when the file does not end in a complete line (it is being written). A user row
- * is a line whose top-level `role` is "user"; the substring test only skips parsing lines
- * that cannot be one.
+ * is a line whose top-level `role` is "user"; the byte-marker test only skips parsing
+ * lines that cannot be one.
  */
 function scanTranscript(bytes, { deadlineMs = null } = {}) {
   // Cursor ends every row with a newline: anything after the last one is half written.
   if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) return null
   let turns = 0
   let lastUser = null
-  let last = null
+  let lastSpan = null
+  let lastParsedRow = null
   let lastStart = 0
   let lastNonResumedText = null
   const userRows = []
@@ -719,20 +928,25 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
       return { budgetExhausted: true }
     }
     const newline = bytes.indexOf(0x0a, start)
-    const text = bytes.toString('utf8', start, newline).trim()
-    if (text) {
-      last = text
+    const { s, e } = trimSliceBounds(bytes, start, newline)
+    if (s < e) {
+      lastSpan = { s, e }
+      lastParsedRow = null
       lastStart = start
-      if (text.includes('"role":"user"')) {
+      if (sliceContainsMarker(bytes, s, e, ROLE_USER_MARKER)) {
         let row = null
         try {
-          row = JSON.parse(text)
+          row = parseJsonSliceBounded(bytes, s, e, deadlineMs)
         } catch {
           /* not a whole row */
         }
+        if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+        lastParsedRow = row
         if (row?.role === 'user') {
           turns += 1
-          lastUser = digest(text)
+          const userDigest = digestSliceBounded(bytes, s, e, deadlineMs)
+          if (userDigest === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+          lastUser = userDigest
           const rawText = userRowText(row)
           const kind = userRowKind(rawText)
           if (kind !== 'resumed') lastNonResumedText = rawText
@@ -746,12 +960,16 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     return { budgetExhausted: true }
   }
   let end = null
-  if (last) {
-    let row = null
-    try {
-      row = JSON.parse(last)
-    } catch {
-      return null
+  let lastLineDigest = null
+  if (lastSpan) {
+    let row = lastParsedRow
+    if (row === null) {
+      try {
+        row = parseJsonSliceBounded(bytes, lastSpan.s, lastSpan.e, deadlineMs)
+      } catch {
+        return null
+      }
+      if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
     }
     if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
       end = {
@@ -759,11 +977,16 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
         error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
       }
     }
+    lastLineDigest =
+      lastUser !== null && userRows.length > 0 && userRows[userRows.length - 1].start === lastStart
+        ? lastUser
+        : digestSliceBounded(bytes, lastSpan.s, lastSpan.e, deadlineMs)
+    if (lastLineDigest === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
   }
   if (deadlineMs !== null && Date.now() >= deadlineMs) {
     return { budgetExhausted: true }
   }
-  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest: last ? digest(last) : null, userRows, lastNonResumedText }
+  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest, userRows, lastNonResumedText }
 }
 
 function digest(text) {

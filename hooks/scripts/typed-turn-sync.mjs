@@ -17,7 +17,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   appendRequestEvent,
   closeRequest,
@@ -245,12 +245,37 @@ export function refusalFromResponse(res) {
 }
 
 /**
+ * Process-local retry cache for requests that DevSpec already opened (`status: 'open'`)
+ * when local `appendRequestEvent` failed transiently. Keyed by resolved dir, connection
+ * id, and transcript turn key so retries persist the already-opened server request
+ * instead of opening a second orphaned request on DevSpec (requirement 3ea2b201).
+ */
+const pendingLocalOpens = new Map()
+
+function pendingOpenKey(dir, connectionId, turnKey) {
+  return `${path.resolve(dir)}|${connectionId}|${turnKey}`
+}
+
+/**
+ * Deterministic RFC-4122 UUID derived from `(connectionId, turnKey)` so even a
+ * cross-process retry after a transient local persistence failure re-sends the same
+ * `request_id` to DevSpec rather than opening a second server request (req 3ea2b201).
+ */
+export function deterministicTypedTurnRequestId(connectionId, turnKey) {
+  const hash = createHash('sha256').update(`devspec:typed_prompt:${connectionId}:${turnKey}`).digest()
+  hash[6] = (hash[6] & 0x0f) | 0x40
+  hash[8] = (hash[8] & 0x3f) | 0x80
+  const hex = hash.subarray(0, 16).toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+}
+
+/**
  * Open a `typed_prompt` request while preserving any structured refusal payload from
  * `report_request` — whether returned as a non-open object or thrown as an MCP/HTTP
  * error (requirement 4e32d1a5). Distinguishes local persistence failure after DevSpec
  * accepted the open so callers never mark the turn synced (requirement 3ea2b201).
  */
-async function openTypedRequestPreservingRefusal({ connectionId, callRequest, dir }) {
+async function openTypedRequestPreservingRefusal({ connectionId, callRequest, dir, id = undefined }) {
   let lastResponse = null
   let lastError = null
   const wrappedCall = async (args) => {
@@ -270,12 +295,14 @@ async function openTypedRequestPreservingRefusal({ connectionId, callRequest, di
     kind: 'typed_prompt',
     call: wrappedCall,
     dir,
+    ...(id ? { id } : {}),
   })
   if (requestId) return { ok: true, requestId, refusal: null, localPersistFailed: false }
   if (lastResponse && typeof lastResponse === 'object' && lastResponse.status === 'open') {
     return {
       ok: false,
       requestId: lastResponse.request_id ?? null,
+      requestedBy: typeof lastResponse.requested_by_user_id === 'string' ? lastResponse.requested_by_user_id : null,
       localPersistFailed: true,
       refusal: {
         code: 'local_open_persist_failed',
@@ -290,7 +317,7 @@ async function openTypedRequestPreservingRefusal({ connectionId, callRequest, di
       : lastError !== null
         ? structuredRefusalFromError(lastError)
         : { status: 'refused' }
-  return { ok: false, requestId: null, refusal, localPersistFailed: false }
+  return { ok: false, requestId: null, requestedBy: null, refusal, localPersistFailed: false }
 }
 
 /**
@@ -409,15 +436,6 @@ export async function syncTypedTurnFromTranscript({
     }
     return null
   }
-  const hasUnnotifiedLaunchFor = (reqState, requestId) => {
-    if (!requestId) return false
-    for (const launch of new Set(reqState.launches.values())) {
-      if (launch.notifies && !launch.notified && (launch.request === requestId || launch.also.includes(requestId))) {
-        return true
-      }
-    }
-    return false
-  }
 
   if (resolveTranscriptWake(initial)) {
     const restored = await withTypedSyncLock(
@@ -460,10 +478,9 @@ export async function syncTypedTurnFromTranscript({
   }
 
   // A live non-typed turn (timestamp-only wake or command_turn wake) must not inherit an
-  // unrelated earlier typed_prompt (even if it has a future scheduled run that did not
-  // fire here), while preserving attribution when this wake restored it via promptArrival
-  // (`currentFromWake`) or when an un-notified background launch for it is still pending
-  // on Cursor CLI without beforeSubmitPrompt (decisions 2fcd26bd / ce71a72b).
+  // unrelated earlier typed_prompt — even if an unnotified background job or scheduled run
+  // exists — unless this wake was explicitly restored by host promptArrival (`currentFromWake`)
+  // or carried an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
   if (active.kind !== 'typed') {
     const isTypedCurrent = Boolean(
       initial.current && initial.open.get(initial.current)?.kind === 'typed_prompt',
@@ -486,10 +503,8 @@ export async function syncTypedTurnFromTranscript({
         if (!stillTyped) {
           return { action: 'not_typed_live', active }
         }
-        if (reqState.currentFromWake || hasUnnotifiedLaunchFor(reqState, reqState.current)) {
-          // Preserve attribution for a wake-restored request (even after its launch was
-          // marked notified) or a Cursor CLI background-launch wake where beforeSubmitPrompt
-          // did not fire and Cursor stripped <task-notification> from the transcript row.
+        if (reqState.currentFromWake) {
+          // Preserve attribution ONLY for a wake explicitly restored via promptArrival.
           if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
             return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
           }
@@ -528,16 +543,69 @@ export async function syncTypedTurnFromTranscript({
       }
 
       const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
-      const existingTyped = unboundOpenTypedPrompt(reqState)
+      const deterministicId = deterministicTypedTurnRequestId(connectionId, active.key)
+      const alreadyOpenForTurn =
+        reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
+      const existingTyped = unboundOpenTypedPrompt(reqState) ?? alreadyOpenForTurn
       let requestId = existingTyped
       let openedNow = false
       let openRefusal = null
+      if (alreadyOpenForTurn && !unboundOpenTypedPrompt(reqState)) {
+        const currentWritten = appendRequestEvent(
+          connectionId,
+          midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+          { dir },
+        )
+        if (!currentWritten) {
+          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
+        }
+      }
+      const pKey = pendingOpenKey(dir, connectionId, active.key)
+      const pendingOpen = !requestId ? pendingLocalOpens.get(pKey) ?? null : null
+
+      if (pendingOpen) {
+        const persisted = appendRequestEvent(
+          connectionId,
+          {
+            op: 'open',
+            id: pendingOpen.requestId,
+            kind: 'typed_prompt',
+            ...(pendingOpen.requestedBy ? { requested_by: pendingOpen.requestedBy } : {}),
+          },
+          { dir },
+        )
+        if (!persisted) {
+          return {
+            action: 'open_write_failed',
+            requestId: pendingOpen.requestId,
+            key: active.key,
+            midTurn,
+            refusal: {
+              code: 'local_open_persist_failed',
+              error: 'DevSpec opened request but local open record failed to persist',
+              request_id: pendingOpen.requestId,
+            },
+          }
+        }
+        pendingLocalOpens.delete(pKey)
+        requestId = pendingOpen.requestId
+        openedNow = true
+        const currentWritten = appendRequestEvent(
+          connectionId,
+          midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+          { dir },
+        )
+        if (!currentWritten) {
+          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
+        }
+      }
 
       if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
         const opened = await openTypedRequestPreservingRefusal({
           connectionId,
           callRequest: effectiveCallRequest,
           dir,
+          id: deterministicId,
         })
         if (opened.ok) {
           requestId = opened.requestId
@@ -551,6 +619,9 @@ export async function syncTypedTurnFromTranscript({
             return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
           }
         } else if (opened.localPersistFailed) {
+          if (opened.requestId) {
+            pendingLocalOpens.set(pKey, { requestId: opened.requestId, requestedBy: opened.requestedBy ?? null })
+          }
           log(
             `typed-turn-sync: local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
           )
