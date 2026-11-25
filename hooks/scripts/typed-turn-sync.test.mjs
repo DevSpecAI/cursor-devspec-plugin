@@ -2167,4 +2167,101 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(after.current, CMD_ALICE)
     assert.equal(turnAmbiguity(after), null, 'ended typed turn must not falsely join a later turn')
   })
+
+  it('binds a hook-created request to the later ended typed prompt and still registers the earlier unseen typed prompt without duplicating the later one (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending, deterministicTypedTurnRequestId } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const row1 = typedRow('Earlier unseen typed prompt without hook')
+    const row2 = typedRow('Later typed prompt that beforeSubmitPrompt already opened')
+    fs.writeFileSync(transcriptPath, `${row1}\n${row2}\n${turnEndedRow('success')}\n`)
+    const { typedTurnKeys } = activeTranscriptTurn(transcriptPath, { attempts: 1 })
+    assert.equal(typedTurnKeys.length, 2)
+    const [key1, key2] = typedTurnKeys
+
+    // Hook opened HOOK_TYPED ONLY for the later typed prompt (key2).
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+
+    const memo = {}
+    const opened = []
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        opened.push(args)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(res.action, 'opened')
+    assert.equal(res.key, key1, 'must register the EARLIER unseen prompt, never skip it')
+    assert.equal(res.requestId, deterministicTypedTurnRequestId(CONN, key1))
+    assert.equal(opened.length, 1, 'must NOT open a duplicate request for the hook-covered later prompt')
+    const state = readRequestState(CONN, { dir })
+    assert.equal(state.seenTranscriptTurns.get(key2), HOOK_TYPED, 'later prompt must be explicitly bound to HOOK_TYPED')
+    assert.equal(state.seenTranscriptTurns.get(key1), res.requestId, 'earlier prompt must be explicitly bound to its newly opened request')
+    assert.equal(state.failedTranscriptTurns.size, 0)
+    assert.equal(memo.synced, true)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+  })
+
+  it('preserves currentBoundByWake when recovering an older typed prompt after a matched background wake so a later unrelated timestamp-only wake still clears it (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ROOM_CMD = '99999999-9999-4999-8999-999999999999'
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    // Unanswered room command with a background launch.
+    appendRequestEvent(CONN, { op: 'open', id: ROOM_CMD, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'wake-bg-1', kind: 'shell', notifies: true, request: ROOM_CMD, also: [] }, { dir })
+
+    // Transcript contains an older unseen typed prompt, followed by a turn_ended,
+    // followed by a matched <task-notification> wake for ROOM_CMD.
+    const olderTyped = typedRow('Older unseen typed prompt before background wake')
+    const wakeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>wake-bg-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${olderTyped}\n${turnEndedRow('success')}\n${wakeRow}\n`)
+
+    const opened = []
+    const wakeRes = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        opened.push(args)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+    })
+    assert.equal(wakeRes.action, 'restored_wake_request')
+    assert.equal(wakeRes.requestId, ROOM_CMD)
+    assert.equal(opened.length, 1, 'older unseen typed prompt is recovered on the same pass')
+    const afterWake = readRequestState(CONN, { dir })
+    assert.equal(afterWake.current, ROOM_CMD)
+    assert.equal(afterWake.currentBoundByWake, true, 'restoring ROOM_CMD after older typed prompt recovery MUST preserve currentBoundByWake')
+
+    // Next unrelated timestamp-only wake MUST clear ROOM_CMD rather than stamping writes for Alice!
+    const tsOnly = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 7:15 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${olderTyped}\n${turnEndedRow('success')}\n${wakeRow}\n${tsOnly}\n`)
+    const unrelatedRes = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(unrelatedRes.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+      args: { task_id: 'x' },
+    })
+  })
 })

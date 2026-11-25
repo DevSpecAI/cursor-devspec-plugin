@@ -155,7 +155,7 @@ export function reduceRequestLog(text) {
         // A new turn: what it carries starts again from what woke it.
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
-        currentBoundByWake = false
+        currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
         joined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
@@ -210,7 +210,7 @@ export function reduceRequestLog(text) {
           // Once a transcript turn binds the wake-restored current request, mark
           // it bound by that wake so a subsequent unrelated wake clears it
           // (even for an unanswered room command) instead of inheriting it.
-          if (current !== null && boundRef === current) {
+          if (!event.historical && current !== null && boundRef === current) {
             if (currentFromWake) currentBoundByWake = true
             currentFromWake = false
           }

@@ -493,6 +493,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
     const fg = entry.restoreForeground ?? {
       current: reqState.current,
       fromWake: reqState.currentFromWake,
+      boundByWake: reqState.currentBoundByWake,
       joined: [...reqState.joined],
       currentRestored: false,
     }
@@ -514,6 +515,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
             op: 'current',
             ref: fg.current,
             ...(fg.fromWake && fg.current !== null ? { from_wake: true } : {}),
+            ...(fg.boundByWake && fg.current !== null ? { bound_by_wake: true } : {}),
           },
           { dir },
         )
@@ -890,7 +892,7 @@ export async function syncTypedTurnFromTranscript({
         : active.kind === 'typed' && active.key
           ? [active.key]
           : []
-    if (typedKeys.length === 0) return
+    if (typedKeys.length === 0) return true
     const reqState = readRequestState(connectionId, { dir })
     const unseen = typedKeys.filter(
       (key) =>
@@ -898,10 +900,10 @@ export async function syncTypedTurnFromTranscript({
         !reqState.seenTranscriptTurns.has(key) &&
         !getPendingLocalOpen(dir, connectionId, key),
     )
-    if (unseen.length === 0) return
+    if (unseen.length === 0) return true
     const boundRefs = new Set(reqState.seenTranscriptTurns.values())
     const pendingIds = new Set(pendingOpensForConnection(dir, connectionId).map(([, e]) => e.requestId))
-    let unboundHookCount = 0
+    const unboundHookIds = []
     for (const [id, info] of reqState.open) {
       if (
         info.kind === 'typed_prompt' &&
@@ -910,23 +912,39 @@ export async function syncTypedTurnFromTranscript({
         !isFailedTurnDeterministicId(dir, connectionId, id, null) &&
         (!excludeLiveKey || id !== deterministicTypedTurnRequestId(connectionId, excludeLiveKey))
       ) {
-        unboundHookCount += 1
+        unboundHookIds.push(id)
       }
     }
-    const priorHookCount =
-      excludeLiveKey && unboundOpenTypedPrompt(reqState)
-        ? Math.max(0, unboundHookCount - 1)
-        : unboundHookCount
-    for (const key of unseen.slice(priorHookCount)) {
+    const reservedForLive = excludeLiveKey ? unboundOpenTypedPrompt(reqState) : null
+    const priorHookIds = reservedForLive
+      ? unboundHookIds.filter((id) => id !== reservedForLive)
+      : unboundHookIds
+    // Hook-created unbound typed_prompt requests cover the NEWEST unseen typed prompts
+    // (oldest-to-newest pairing against the tail of `unseen`), never skipping an earlier
+    // unregistered typed prompt. Bind each covered prompt explicitly to its hook request
+    // and queue every earlier unseen prompt for registration (requirement 3ea2b201).
+    const pairCount = Math.min(priorHookIds.length, unseen.length)
+    const earlierUnseen = unseen.slice(0, unseen.length - pairCount)
+    const coveredUnseen = unseen.slice(unseen.length - pairCount)
+    const matchedHooks = priorHookIds.slice(priorHookIds.length - pairCount)
+    for (const key of earlierUnseen) {
       recordFailedTypedTurn(dir, connectionId, key)
     }
+    for (let i = 0; i < pairCount; i += 1) {
+      if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: coveredUnseen[i], ref: matchedHooks[i], historical: true }, { dir })) {
+        return false
+      }
+    }
+    return true
   }
 
   // Queue every previously unseen typed turn (not covered by an open hook-created
   // typed_prompt and not the live typed turn being opened right below) BEFORE
   // advancing sync state so two (or more) typed turns that finish between poller
   // reads are never skipped or marked synced prematurely (requirement 3ea2b201).
-  enqueueUnseenTypedTurns(!active.ended && active.kind === 'typed' ? active.key : null)
+  if (!enqueueUnseenTypedTurns(!active.ended && active.kind === 'typed' ? active.key : null)) {
+    return { action: 'binding_write_failed', key: active.key, active }
+  }
 
   if (active.ended || !active.key) {
     const flush = await retryQueuedFailedTurn({ excludeKey: null })
