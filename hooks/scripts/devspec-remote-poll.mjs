@@ -180,7 +180,12 @@ import {
   turnCommandsPath,
 } from './turn-commands.mjs'
 import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
-import { finishIdleRequests, syncTypedTurnFromTranscript, typedTurnSyncPending } from './typed-turn-sync.mjs'
+import {
+  finishIdleRequests,
+  syncTypedTurnFromTranscript,
+  TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+  typedTurnSyncPending,
+} from './typed-turn-sync.mjs'
 import {
   claimTurnEnd,
   clearSettle,
@@ -2998,7 +3003,7 @@ async function main() {
           connectionCapability: capability,
           name: 'report_request',
           arguments: reqArgs,
-          timeoutMs: 3_000,
+          timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
         })
       const callPickup = (pickupArgs) =>
         mcpToolsCall({
@@ -3007,7 +3012,7 @@ async function main() {
           connectionCapability: capability,
           name: 'report_pickup',
           arguments: pickupArgs,
-          timeoutMs: 5_000,
+          timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
         })
       try {
         await syncTypedTurnFromTranscript({
@@ -3085,7 +3090,7 @@ async function main() {
               connectionCapability: capability,
               name: 'report_request',
               arguments: reqArgs,
-              timeoutMs: 3_000,
+              timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
             }),
           callComplete: (completeArgs) =>
             mcpToolsCall({

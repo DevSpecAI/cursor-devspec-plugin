@@ -32,7 +32,7 @@ import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { currentTurnNoticeIds, normalizeNoticeIds, prepareNoticeReply, recordNoticeReply } from './notice-reply.mjs'
 import { readToolReply } from './tool-reply.mjs'
-import { syncTypedTurnFromTranscript } from './typed-turn-sync.mjs'
+import { syncTypedTurnFromTranscript, TYPED_SYNC_HOOK_TIMEOUT_MS } from './typed-turn-sync.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
@@ -318,7 +318,7 @@ async function syncTypedTurnForHook(rawInput, { home = os.homedir(), env = proce
             connectionCapability: capability,
             name: 'report_request',
             arguments: args,
-            timeoutMs: 2_500,
+            timeoutMs: TYPED_SYNC_HOOK_TIMEOUT_MS,
           })
       : null,
     callPickup: credential.ok
@@ -329,7 +329,7 @@ async function syncTypedTurnForHook(rawInput, { home = os.homedir(), env = proce
             connectionCapability: capability,
             name: 'report_pickup',
             arguments: args,
-            timeoutMs: 2_500,
+            timeoutMs: TYPED_SYNC_HOOK_TIMEOUT_MS,
           })
       : null,
     patchState: (patch) => patchConnectionStateFile(connState.connection_id, patch, home),

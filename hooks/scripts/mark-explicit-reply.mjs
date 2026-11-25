@@ -40,6 +40,7 @@ import {
   requestFinished,
   requestsWithWorkPending,
 } from './requests.mjs'
+import { recordedSessionCrons, TYPED_SYNC_BACKGROUND_TIMEOUT_MS } from './typed-turn-sync.mjs'
 import { connectionCredential } from './resolve-mcp-auth.mjs'
 import { readConnectionCapability } from './manage-plan-bridge.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
@@ -163,7 +164,8 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
     markCommandsAnswered(connectionId, dir ? { dir } : {})
     try {
       const reqState = readRequestState(connectionId, { dir: connDir })
-      const pending = requestsWithWorkPending(reqState)
+      const sessionCrons = recordedSessionCrons(reqState)
+      const pending = requestsWithWorkPending(reqState, { sessionCrons })
       const hasFinished = [...reqState.open.keys()].some((id) => requestFinished(reqState, id, pending))
       if (hasFinished && state) {
         const credential = connectionCredential(state)
@@ -172,6 +174,7 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
           await finishTurnRequests({
             connectionId,
             dir: connDir,
+            sessionCrons,
             call: (reqArgs) =>
               mcpToolsCall({
                 mcpUrl: credential.mcp_url,
@@ -179,7 +182,7 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
                 connectionCapability: capability,
                 name: 'report_request',
                 arguments: reqArgs,
-                timeoutMs: 3_000,
+                timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
               }),
           })
         }

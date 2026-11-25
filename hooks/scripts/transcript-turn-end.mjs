@@ -749,8 +749,10 @@ function digest(text) {
 }
 
 /**
- * The latest turn-starting user row in `transcriptPath`, whether that turn has ended
+ * The latest non-resumed user row in `transcriptPath`, whether that turn has ended
  * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
+ * Only intra-turn `resumed` rows are skipped; a `timestamp`-only wake row is returned
+ * as `kind: 'timestamp'` so it never falls back to an earlier typed prompt.
  * Returns null when the transcript cannot be read or does not exist yet.
  */
 export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
@@ -761,7 +763,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
   let lastIndex = -1
   let lastRow = null
   for (let i = read.userRows.length - 1; i >= 0; i -= 1) {
-    if (startsTurn(read.userRows[i])) {
+    if (read.userRows[i].kind !== 'resumed') {
       lastIndex = i + 1
       lastRow = read.userRows[i]
       break

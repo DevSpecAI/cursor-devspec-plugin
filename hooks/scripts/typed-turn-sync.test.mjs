@@ -258,4 +258,123 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.deepEqual(patched, { local_turn: null })
     assert.equal(readRequestState(CONN, { dir }).open.size, 0)
   })
+
+  it('does not fall back to an earlier typed prompt when the latest user row is a timestamp-only wake', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const timestampOnly = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:05 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier typed prompt')}\n${timestampOnly}\n`)
+
+    let opened = 0
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { opened += 1; return { request_id: HOOK_TYPED } },
+      dir,
+    })
+    assert.equal(res.action, 'not_typed_live')
+    assert.equal(res.active.kind, 'timestamp')
+    assert.equal(opened, 0, 'timestamp-only wake must not reuse earlier typed prompt')
+  })
+
+  it('keeps an open request with a recorded scheduled wake from closing in finishIdleRequests', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'cron-1', prompt: 'Check build status', request: HOOK_TYPED, also: [] }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Watch the build')}\n${turnEndedRow('success')}\n`)
+
+    const closedIds = []
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.action === 'close') closedIds.push(args.request_id)
+        return { status: 'closed' }
+      },
+      dir,
+    })
+    assert.deepEqual(closedIds, [])
+    assert.deepEqual(res.closed, [])
+    assert.equal(readRequestState(CONN, { dir }).open.has(HOOK_TYPED), true)
+  })
+
+  it('preserves structured admission refusal, leaves turn unsynced until admission succeeds, and retries without duplicating open_request', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Start task 123')}\n`)
+    const memo = { stamp: null, synced: false }
+    const logs = []
+    let openCalls = 0
+    let pickupCalls = 0
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: '55555555-5555-4555-8555-555555555555',
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    const structuredRefusal = {
+      connection_id: CONN,
+      expected_session_id: ROOM,
+      status: 'foreground_owned_by_command',
+      blocking_turn_id: '66666666-6666-4666-8666-666666666666',
+    }
+
+    const first = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => { openCalls += 1; return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI } },
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return { ...structuredRefusal, attempt_id: args.attempt_id }
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+
+    assert.equal(first.action, 'admission_failed')
+    assert.equal(first.refusal.status, 'foreground_owned_by_command')
+    assert.equal(first.refusal.blocking_turn_id, '66666666-6666-4666-8666-666666666666')
+    assert.equal(memo.synced, false, 'memo must not be marked synced while admission failed')
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0, 'turn must not be recorded as synced while admission failed')
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /foreground_owned_by_command/)
+
+    // Second call retries admission without duplicating open_request, then marks synced!
+    let patched = null
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => { openCalls += 1; return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI } },
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => { patched = patch },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+
+    assert.equal(second.action, 'adopted_hook_request')
+    assert.equal(second.requestId, first.requestId)
+    assert.equal(openCalls, 1, 'must reuse already-opened typed_prompt request instead of duplicating')
+    assert.equal(pickupCalls, 2)
+    assert.equal(memo.synced, true)
+    assert.ok(patched?.local_turn?.attempt_id)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
+  })
 })
