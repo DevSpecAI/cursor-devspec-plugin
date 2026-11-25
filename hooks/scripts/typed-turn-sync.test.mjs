@@ -1057,4 +1057,120 @@ describe('typed-turn-sync (item da03801e)', () => {
       'documented Cursor completion row must preserve launching request attribution even without a notification ID',
     )
   })
+
+  it('bounds a valid large transcript row with a multi-megabyte numeric field at deadlineMs (3c5147a7 / 91d7b47c)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const bigNum = '1' + '0'.repeat(35 * 1024 * 1024)
+    const row = `{"role":"user","big":${bigNum},"message":{"content":[{"type":"text","text":"<timestamp>Wed, Nov 25, 2026, 8:42 PM (UTC)</timestamp>\\n<user_query>\\nhi\\n</user_query>"}]}}\n`
+    fs.writeFileSync(transcriptPath, row)
+
+    const start = Date.now()
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      budgetMs: 65,
+      log: () => {},
+    })
+    const elapsed = Date.now() - start
+    assert.equal(res.action, 'budget_exhausted')
+    assert.ok(elapsed < 100, `expected bounded numeric scan to stop near 65 ms deadline, took ${elapsed} ms`)
+  })
+
+  it('marks a recovered pending open as started when disk recovers before an ended turn so finishIdleRequests closes it (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn whose disk recovers before end')}\n`)
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(reqLog)
+    const memo = { stamp: null, synced: false }
+    let openedId = null
+    try {
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openedId = args.request_id
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(first.action, 'open_write_failed')
+      assert.ok(openedId)
+
+      // Disk recovers and the turn ends BEFORE the next sync runs.
+      fs.rmSync(reqLog, { recursive: true, force: true })
+      fs.writeFileSync(transcriptPath, `${typedRow('Turn whose disk recovers before end')}\n${turnEndedRow('success')}\n`)
+
+      const endedSync = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+        log: () => {},
+      })
+      assert.equal(endedSync.action, 'not_typed_live')
+      assert.equal(memo.synced, true)
+      const afterFlush = readRequestState(CONN, { dir })
+      assert.equal(afterFlush.open.has(openedId), true, 'recovered open must be persisted')
+      assert.equal(afterFlush.started.has(openedId), true, 'recovered open must be marked started for idle cleanup')
+      assert.equal(afterFlush.current, null, 'ended recovered open must not linger as foreground current')
+
+      // Normal idle cleanup must now pick up and close the recovered request on DevSpec.
+      const closedIds = []
+      const idle = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          if (args.action === 'close') closedIds.push(args.request_id)
+          return { status: 'closed' }
+        },
+        dir,
+        log: () => {},
+      })
+      assert.deepEqual(closedIds, [openedId])
+      assert.deepEqual(idle.closed, [openedId])
+      assert.equal(readRequestState(CONN, { dir }).open.has(openedId), false)
+    } finally {
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+  })
+
+  it('never borrows unrelated pending launches when a task-notification names an unmatched explicit ID (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'known-job', kind: 'shell', notifies: true, request: HOOK_TYPED, also: [] }, { dir })
+    const otherJobWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>different-unrecorded-job</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Start known job')}\n${otherJobWake}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(
+      stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }),
+      { args: { task_id: 'x' } },
+      'unmatched explicit notification ID must leave next write unstamped instead of borrowing an unrelated launch',
+    )
+  })
 })

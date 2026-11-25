@@ -447,8 +447,57 @@ export async function syncTypedTurnFromTranscript({
                 continue
               }
             }
+            // Mark the recovered open request as started without leaving it as foreground
+            // current (and preserving any unrelated foreground request) so finishIdleRequests
+            // recognises it via requestFinished() and closes it on DevSpec (req 3ea2b201).
+            if (!reqState.started.has(entry.requestId)) {
+              const prevCurrent = reqState.current
+              const prevFromWake = reqState.currentFromWake
+              const prevJoined = [...reqState.joined]
+              const startedOk = appendRequestEvent(
+                connectionId,
+                { op: 'current', ref: entry.requestId },
+                { dir },
+              )
+              if (!startedOk) {
+                allPersisted = false
+                continue
+              }
+              const restoredOk = appendRequestEvent(
+                connectionId,
+                {
+                  op: 'current',
+                  ref: prevCurrent,
+                  ...(prevFromWake && prevCurrent !== null ? { from_wake: true } : {}),
+                },
+                { dir },
+              )
+              if (!restoredOk) {
+                allPersisted = false
+                continue
+              }
+              let joinedOk = true
+              for (const joinedId of prevJoined) {
+                if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
+                  joinedOk = false
+                  break
+                }
+              }
+              if (!joinedOk) {
+                allPersisted = false
+                continue
+              }
+            }
             if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
-              appendRequestEvent(connectionId, { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId }, { dir })
+              const boundOk = appendRequestEvent(
+                connectionId,
+                { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId },
+                { dir },
+              )
+              if (!boundOk) {
+                allPersisted = false
+                continue
+              }
             }
             pendingLocalOpens.delete(pKey)
           }
@@ -485,6 +534,12 @@ export async function syncTypedTurnFromTranscript({
     if (rawText) {
       const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
       if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
+      // When a notification explicitly names a task/tool-use ID that did not match any
+      // recorded launch, it belongs to a different (or already-closed) job — never borrow
+      // unrelated pending launches (decision ce71a72b).
+      if (/<(?:task-id|tool-use-id)\b[^>]*>\s*[^<\s][\s\S]*?<\/(?:task-id|tool-use-id)\s*>/i.test(rawText)) {
+        return null
+      }
     }
     const isDocumentedCompletionRow =
       active.kind === 'command_turn' || (rawText && /<task-notification\b/i.test(rawText))

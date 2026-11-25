@@ -655,13 +655,15 @@ const SUMMARY_ROW = /^<available_subagent_types>[\s\S]*<\/dynamic_tool_catalog>$
 function userRowKind(text) {
   for (const sentence of COMMAND_TURN_SENTENCES) {
     if (text === sentence) continue // a start row always carries its timestamp
-    const form = new RegExp(`^${TIMESTAMP}\\n\\n<user_query>${escapeRegExp(sentence)}</user_query>$`)
-    if (form.test(text)) return 'command_turn'
+    if (text.endsWith(`</user_query>`) && text.includes(sentence)) {
+      const form = new RegExp(`^${TIMESTAMP}\\n\\n<user_query>${escapeRegExp(sentence)}</user_query>$`)
+      if (form.test(text)) return 'command_turn'
+    }
   }
-  if (new RegExp(`^${TIMESTAMP}$`).test(text)) return 'timestamp'
+  if (text.startsWith('<timestamp>') && text.endsWith('</timestamp>') && new RegExp(`^${TIMESTAMP}$`).test(text)) return 'timestamp'
   if (text === RESUMED_TURN_SENTENCE) return 'resumed'
-  if (TYPED_PROMPT.test(text)) return 'typed'
-  if (SUMMARY_ROW.test(text) && !text.includes('<user_query>')) return 'summary'
+  if (text.endsWith('\n</user_query>') && text.includes('<timestamp>') && TYPED_PROMPT.test(text)) return 'typed'
+  if (text.startsWith('<available_subagent_types>') && text.endsWith('</dynamic_tool_catalog>') && !text.includes('<user_query>')) return 'summary'
   return 'other'
 }
 
@@ -836,6 +838,7 @@ function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
       if (b === 0x22) {
         if (pos > segStart) parts.push(bytes.toString('utf8', segStart, pos))
         pos += 1
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
         return parts.length <= 1 ? (parts[0] ?? '') : parts.join('')
       }
       if (b === 0x5c) {
@@ -866,11 +869,94 @@ function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
       }
       pos += 1
       if (pos >= nextCheck) {
+        if (pos > segStart) {
+          parts.push(bytes.toString('utf8', segStart, pos))
+          segStart = pos
+        }
         nextCheck = pos + BOUNDED_STEP_BYTES
         if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
       }
     }
     throw new SyntaxError('Unterminated string')
+  }
+  // RFC-8259 numeric literal parser bounded by BOUNDED_STEP_BYTES so a multi-megabyte
+  // numeric field cannot overrun deadlineMs; retains enough significant decimal digits
+  // and exponent range to preserve IEEE-754 double precision (~17 digits, exponent +-308).
+  const readBoundedNumber = (litStart, litEnd) => {
+    let p = litStart
+    let litCheck = p + BOUNDED_STEP_BYTES
+    const checkLit = () => {
+      if (p >= litCheck) {
+        litCheck = p + BOUNDED_STEP_BYTES
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+      }
+    }
+    const isDigit = (c) => c >= 0x30 && c <= 0x39
+    let sign = ''
+    if (p < litEnd && bytes[p] === 0x2d) {
+      sign = '-'
+      p += 1
+    }
+    if (p >= litEnd) throw new SyntaxError('Invalid number')
+    let sig = ''
+    let intDigits = 0
+    let fracLeadingZeros = 0
+    let sawNonZero = false
+    if (bytes[p] === 0x30) {
+      p += 1
+      if (p < litEnd && isDigit(bytes[p])) throw new SyntaxError('Leading zero in number')
+    } else if (bytes[p] >= 0x31 && bytes[p] <= 0x39) {
+      while (p < litEnd && isDigit(bytes[p])) {
+        const d = bytes[p]
+        if (sig.length < 25) sig += String.fromCharCode(d)
+        sawNonZero = true
+        intDigits += 1
+        p += 1
+        checkLit()
+      }
+    } else {
+      throw new SyntaxError('Invalid number')
+    }
+    if (p < litEnd && bytes[p] === 0x2e) {
+      p += 1
+      if (p >= litEnd || !isDigit(bytes[p])) throw new SyntaxError('Invalid fraction')
+      while (p < litEnd && isDigit(bytes[p])) {
+        const d = bytes[p]
+        if (!sawNonZero && d === 0x30) {
+          fracLeadingZeros += 1
+        } else {
+          sawNonZero = true
+          if (sig.length < 25) sig += String.fromCharCode(d)
+        }
+        p += 1
+        checkLit()
+      }
+    }
+    let explicitExp = 0
+    if (p < litEnd && (bytes[p] === 0x65 || bytes[p] === 0x45)) {
+      p += 1
+      let expSign = 1
+      if (p < litEnd && (bytes[p] === 0x2b || bytes[p] === 0x2d)) {
+        if (bytes[p] === 0x2d) expSign = -1
+        p += 1
+      }
+      if (p >= litEnd || !isDigit(bytes[p])) throw new SyntaxError('Invalid exponent')
+      let expMag = 0
+      while (p < litEnd && isDigit(bytes[p])) {
+        if (expMag < 1e9) expMag = expMag * 10 + (bytes[p] - 0x30)
+        p += 1
+        checkLit()
+      }
+      explicitExp = expSign * expMag
+    }
+    if (p !== litEnd) throw new SyntaxError('Invalid number')
+    if (!sawNonZero) return sign ? -0 : 0
+    const shift = intDigits > 0 ? intDigits - 1 : -(fracLeadingZeros + 1)
+    const totalExp = shift + explicitExp
+    if (totalExp > 400) return sign ? -Infinity : Infinity
+    if (totalExp < -400) return sign ? -0 : 0
+    const mantissa = sig.length > 1 ? `${sig[0]}.${sig.slice(1)}` : sig
+    return Number(`${sign}${mantissa}e${totalExp}`)
   }
   const readValue = () => {
     skipWs()
@@ -936,8 +1022,19 @@ function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
       const ch = bytes[pos]
       if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x09 || ch === 0x0d || ch === 0x0a) break
       pos += 1
+      checkBudget()
     }
-    return JSON.parse(bytes.toString('utf8', litStart, pos))
+    const len = pos - litStart
+    if (len === 4 && bytes[litStart] === 0x74 && bytes[litStart + 1] === 0x72 && bytes[litStart + 2] === 0x75 && bytes[litStart + 3] === 0x65) {
+      return true
+    }
+    if (len === 5 && bytes[litStart] === 0x66 && bytes[litStart + 1] === 0x61 && bytes[litStart + 2] === 0x6c && bytes[litStart + 3] === 0x73 && bytes[litStart + 4] === 0x65) {
+      return false
+    }
+    if (len === 4 && bytes[litStart] === 0x6e && bytes[litStart + 1] === 0x75 && bytes[litStart + 2] === 0x6c && bytes[litStart + 3] === 0x6c) {
+      return null
+    }
+    return readBoundedNumber(litStart, pos)
   }
   try {
     const val = readValue()
