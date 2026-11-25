@@ -772,7 +772,7 @@ export async function runFastConnectCli(
           label: 'fast-connect',
           reserve: currentStderr(),
           summary,
-          fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback could not fit Cursor's Shell ceiling.\n`,
+          fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback failed — fix write permissions on ~/.devspec/notes or pass a shorter --prompt-file path and retry.\n`,
         })
         await writeStreamAndFlush(process.stderr, bounded)
         await drainStderr()

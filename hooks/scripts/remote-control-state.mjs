@@ -1666,6 +1666,10 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
     ? {
         omitted_count: base.stderr_diagnostics_omitted.omitted_count,
         omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(Array.isArray(base.stderr_diagnostics_omitted.notes) &&
+        base.stderr_diagnostics_omitted.notes.length > 0
+          ? { saved_note_count: base.stderr_diagnostics_omitted.notes.length }
+          : {}),
         ...(base.stderr_diagnostics_omitted.note_write_failed_count
           ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
           : {}),
@@ -1742,6 +1746,52 @@ function buildBoundedConnectNoteReceipt(summary, noteRef, fullTextLength, { rese
   })
 }
 
+function trimStderrOmittedNotes(omitted, notesSlice) {
+  if (!omitted || typeof omitted !== 'object' || !Array.isArray(omitted.notes)) return omitted
+  const total = omitted.notes.length
+  const returned = notesSlice.length
+  if (returned >= total) return omitted
+  return {
+    ...omitted,
+    notes: notesSlice,
+    notes_total_count: total,
+    notes_returned_count: returned,
+    notes_omitted_count: total - returned,
+  }
+}
+
+function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
+  if (!omitted || typeof omitted !== 'object') {
+    const text = buildText(null)
+    return fitsShellOutput(`${reserve}${text}`) ? { fitted: true, stderrOmitted: null, text } : { fitted: false, stderrOmitted: null, text }
+  }
+  const fullText = buildText(omitted)
+  if (fitsShellOutput(`${reserve}${fullText}`)) {
+    return { fitted: true, stderrOmitted: omitted, text: fullText }
+  }
+  if (!Array.isArray(omitted.notes) || omitted.notes.length === 0) {
+    return { fitted: false, stderrOmitted: omitted, text: fullText }
+  }
+  const zeroObj = trimStderrOmittedNotes(omitted, [])
+  const zeroText = buildText(zeroObj)
+  if (!fitsShellOutput(`${reserve}${zeroText}`)) {
+    return { fitted: false, stderrOmitted: zeroObj, text: zeroText }
+  }
+  let lo = 0
+  let hi = omitted.notes.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    const candidate = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, mid))
+    if (fitsShellOutput(`${reserve}${buildText(candidate)}`)) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  const fittedObj = trimStderrOmittedNotes(omitted, omitted.notes.slice(0, lo))
+  return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
+}
+
 function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { reserve = '' } = {}) {
   const base =
     summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
@@ -1749,11 +1799,20 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
     base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
   const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
   const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const hasSavedStderrNotes =
+    Array.isArray(base.stderr_diagnostics_omitted?.notes) &&
+    base.stderr_diagnostics_omitted.notes.length > 0
+  const stderrReadHint = hasSavedStderrNotes
+    ? ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
+    : ''
   const recovery = allCandidates
-    ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).`
-    : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.`
+    ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${stderrReadHint}`
+    : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.${stderrReadHint}`
 
-  const makePayload = (candidateSlice, { minimal = false } = {}) => {
+  const makePayload = (
+    candidateSlice,
+    { minimal = false, stderrOmitted = base.stderr_diagnostics_omitted ?? null } = {},
+  ) => {
     const out = minimal
       ? {
           ok: Boolean(base.ok),
@@ -1765,6 +1824,11 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
           omitted_fields_due_to_shell_limit: true,
         }
       : { ...base }
+    if (stderrOmitted) {
+      out.stderr_diagnostics_omitted = stderrOmitted
+    } else {
+      delete out.stderr_diagnostics_omitted
+    }
     if (Array.isArray(out.candidates)) {
       out.candidate_count = out.candidates.length
       delete out.candidates
@@ -1799,26 +1863,46 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
     return JSON.stringify(out, null, 2) + '\n'
   }
 
-  const useMinimal = !fitsShellOutput(`${reserve}${makePayload([], { minimal: false })}`)
-  if (allCandidates && allCandidates.length > 0) {
-    let lo = 0
-    let hi = allCandidates.length
-    while (lo < hi) {
-      const mid = Math.ceil((lo + hi) / 2)
-      if (fitsShellOutput(`${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal })}`)) {
-        lo = mid
-      } else {
-        hi = mid - 1
+  const fullFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => makePayload([], { minimal: false, stderrOmitted }),
+    reserve,
+  )
+  const useMinimal = !fullFit.fitted
+  const chosenFit = useMinimal
+    ? fitStderrOmittedForReceipt(
+        base.stderr_diagnostics_omitted ?? null,
+        (stderrOmitted) => makePayload([], { minimal: true, stderrOmitted }),
+        reserve,
+      )
+    : fullFit
+  if (chosenFit.fitted) {
+    if (allCandidates && allCandidates.length > 0) {
+      let lo = 0
+      let hi = allCandidates.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        if (
+          fitsShellOutput(
+            `${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal, stderrOmitted: chosenFit.stderrOmitted })}`,
+          )
+        ) {
+          lo = mid
+        } else {
+          hi = mid - 1
+        }
       }
+      const text = makePayload(allCandidates.slice(0, lo), {
+        minimal: useMinimal,
+        stderrOmitted: chosenFit.stderrOmitted,
+      })
+      if (fitsShellOutput(`${reserve}${text}`)) return text
+    } else {
+      return chosenFit.text
     }
-    const text = makePayload(allCandidates.slice(0, lo), { minimal: useMinimal })
-    if (fitsShellOutput(`${reserve}${text}`)) return text
-  } else {
-    const text = makePayload([], { minimal: useMinimal })
-    if (fitsShellOutput(`${reserve}${text}`)) return text
   }
 
-  const fallbackObj = {
+  const buildFallbackObj = (stderrOmitted) => ({
     ok: Boolean(base.ok),
     ...(allCandidates
       ? {
@@ -1829,30 +1913,36 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength, { r
         }
       : {}),
     complete_output_note_failed: true,
-    ...(base.stderr_diagnostics_omitted
-      ? { stderr_diagnostics_omitted: base.stderr_diagnostics_omitted }
-      : {}),
+    ...(stderrOmitted ? { stderr_diagnostics_omitted: stderrOmitted } : {}),
     total_chars: fullTextLength,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     recovery: allCandidates
-      ? 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).'
-      : 'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.',
-  }
-  const fallbackReceipt = JSON.stringify(fallbackObj, null, 2) + '\n'
-  if (fitsShellOutput(`${reserve}${fallbackReceipt}`)) return fallbackReceipt
-  // Single-line compact form preserves every required count, limit, and recovery field
-  // (requirements 3c5147a7 / 91d7b47c). If reserve leaves too little room even for that,
-  // refuse explicitly with field, limit, actual length, counts, and recovery.
-  const compactFallback = `${JSON.stringify(fallbackObj)}\n`
-  if (fitsShellOutput(`${reserve}${compactFallback}`)) return compactFallback
+      ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHint}`
+      : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHint}`,
+  })
+  const prettyFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => JSON.stringify(buildFallbackObj(stderrOmitted), null, 2) + '\n',
+    reserve,
+  )
+  if (prettyFallbackFit.fitted) return prettyFallbackFit.text
+  // Single-line compact form preserves every required count, limit, saved stderr note pointers,
+  // and recovery field (requirements 3c5147a7 / 91d7b47c). If reserve leaves too little room
+  // even for that, refuse explicitly with field, limit, actual length, counts, and recovery.
+  const compactFallbackFit = fitStderrOmittedForReceipt(
+    base.stderr_diagnostics_omitted ?? null,
+    (stderrOmitted) => `${JSON.stringify(buildFallbackObj(stderrOmitted))}\n`,
+    reserve,
+  )
+  if (compactFallbackFit.fitted) return compactFallbackFit.text
   throw shellBudgetExceededError({
     field: 'reserve',
     reserveLength: String(reserve ?? '').length,
-    requiredLength: compactFallback.length,
+    requiredLength: compactFallbackFit.text.length,
     fullTextLength,
     noteFailed: true,
     candidateCount: allCandidates ? allCandidates.length : null,
-    recovery: fallbackObj.recovery,
+    recovery: buildFallbackObj(compactFallbackFit.stderrOmitted).recovery,
   })
 }
 
@@ -2234,7 +2324,7 @@ export function formatBoundedCliStderr(
   const fb =
     typeof fallback === 'string' && fallback
       ? fallback
-      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed.\n`
+      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
   if (fitsShellOutput(`${prior}${fb}`)) return fb
   const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
   if (fitsShellOutput(`${prior}${omitted}`)) return omitted
@@ -2260,9 +2350,10 @@ function buildStderrOmissionNotice(label, { length, note = null } = {}) {
 
 /**
  * Headroom reserved on CLI stderr so the final stdout connect receipt (or note-failure
- * refusal, including any `stderr_diagnostics_omitted` disclosure) always fits inside
- * Cursor's combined Shell output ceiling (`fitsShellOutput`, reqs 3c5147a7 / 91d7b47c).
- * Derived from the actual fallback receipt structure rather than a bare constant.
+ * refusal, including any `stderr_diagnostics_omitted` disclosure and saved note command)
+ * always fits inside Cursor's combined Shell output ceiling (`fitsShellOutput`,
+ * reqs 3c5147a7 / 91d7b47c). Derived from the actual fallback receipt structure rather
+ * than a bare constant.
  */
 const CLI_STDOUT_RECEIPT_HEADROOM =
   JSON.stringify(
@@ -2279,12 +2370,22 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
         omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
         shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes: [
+          {
+            id: '0'.repeat(16),
+            command: 'cat ~/.devspec/notes/0000000000000000.md',
+            length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+          },
+        ],
+        notes_total_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes_returned_count: 1,
+        notes_omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         recovery:
           'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.',
       },
       recovery:
-        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).',
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.',
     },
     null,
     2,
