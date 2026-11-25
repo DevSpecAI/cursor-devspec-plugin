@@ -1374,6 +1374,29 @@ describe('fast-connect CLI flags', () => {
         )
         assert.match(parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation?.how_to_fetch_rest, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
         assert.match(parsedTrimmed.recovery, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
+
+        // Byte-only overflow (<= 20,000 chars but > 40,000 UTF-8 bytes) MUST report the
+        // 40,000-byte UTF-8 Shell limit accurately in both the saved-note receipt and the
+        // unwritable-note fallback rather than misclaiming the 20,000-char limit (3c5147a7 / 91d7b47c).
+        const utf8ByteOnlyPayload = { ok: false, error: '中'.repeat(14_000) }
+        const utf8ByteOnlyReceiptOut = formatFastConnectCliOutput(utf8ByteOnlyPayload, { home })
+        assert.ok(fitsShellOutput(utf8ByteOnlyReceiptOut))
+        const parsedUtf8ByteOnlyReceipt = JSON.parse(utf8ByteOnlyReceiptOut)
+        assert.ok(parsedUtf8ByteOnlyReceipt.complete_output_note?.total_chars <= 20_000)
+        assert.ok(parsedUtf8ByteOnlyReceipt.complete_output_note?.total_bytes > 40_000)
+        assert.equal(parsedUtf8ByteOnlyReceipt.complete_output_note?.shell_limit_bytes, 40_000)
+        assert.match(parsedUtf8ByteOnlyReceipt.note, /40000-byte UTF-8 Shell limit/)
+        assert.doesNotMatch(parsedUtf8ByteOnlyReceipt.note, /exceeds Cursor's 20000-char Shell limit/)
+        const savedUtf8ByteOnly = readNoteText(parsedUtf8ByteOnlyReceipt.complete_output_note.id, { home })
+        assert.ok(savedUtf8ByteOnly && savedUtf8ByteOnly.includes('中'.repeat(14_000)))
+
+        const utf8ByteOnlyNoteFailOut = formatFastConnectCliOutput(utf8ByteOnlyPayload, { home: brokenHome2 })
+        assert.ok(fitsShellOutput(utf8ByteOnlyNoteFailOut))
+        const parsedUtf8ByteOnlyNoteFail = JSON.parse(utf8ByteOnlyNoteFailOut)
+        assert.ok(parsedUtf8ByteOnlyNoteFail.total_chars <= 20_000)
+        assert.ok(parsedUtf8ByteOnlyNoteFail.total_bytes > 40_000)
+        assert.equal(parsedUtf8ByteOnlyNoteFail.shell_limit_bytes, 40_000)
+        assert.match(parsedUtf8ByteOnlyNoteFail.recovery, /-byte \(/)
       } finally {
         fs.rmSync(brokenHome2, { recursive: true, force: true })
       }

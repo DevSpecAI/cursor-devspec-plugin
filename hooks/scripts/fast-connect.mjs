@@ -17,7 +17,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, writeNote } from './hook-context-budget.mjs'
+import {
+  CURSOR_SHELL_OUTPUT_MAX_BYTES,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitsShellOutput,
+  writeNote,
+} from './hook-context-budget.mjs'
 import { mcpToolsCall, mcpToolsCallWithRetry } from './mcp-call.mjs'
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
@@ -746,7 +751,12 @@ Prints one short JSON result; exits 0 when connected, 1 when not.
  * a sealed note (`writeNote`) and returns a compact structured refusal naming that note
  * so Cursor never slices the choices in half (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
  */
-function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength, { reserve = '' } = {}) {
+function buildBoundedFastConnectNoteReceipt(
+  normalized,
+  noteRef,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
   const base =
     normalized && typeof normalized === 'object' && !Array.isArray(normalized)
       ? { ...normalized }
@@ -766,7 +776,17 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
     base.candidate_count = base.candidates.length
     delete base.candidates
   }
-  const noteMsg = `Full connect output (${fullTextLength} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const combinedChars = prior.length + fullTextLength
+  const combinedBytes = priorBytes + textBytes
+  const exceededByBytesOnly =
+    combinedChars <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    combinedBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const noteMsg = exceededByBytesOnly
+    ? `Full connect output (${textBytes} bytes / ${fullTextLength} chars${priorBytes ? `, ${combinedBytes} bytes with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_BYTES}-byte UTF-8 Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
+    : `Full connect output (${fullTextLength} chars${prior.length ? `, ${combinedChars} chars with prior stderr` : ''}) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${noteRef.command}\` (and every further part it names) to read all details.`
   base.complete_output_note = noteRef
   base.note = noteMsg
   const richText = JSON.stringify(base, null, 2) + '\n'
@@ -776,6 +796,9 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
     ? {
         omitted_count: base.stderr_diagnostics_omitted.omitted_count,
         omitted_chars: base.stderr_diagnostics_omitted.omitted_chars,
+        ...(typeof base.stderr_diagnostics_omitted.omitted_bytes === 'number'
+          ? { omitted_bytes: base.stderr_diagnostics_omitted.omitted_bytes }
+          : {}),
         ...(Array.isArray(base.stderr_diagnostics_omitted.notes) &&
         base.stderr_diagnostics_omitted.notes.length > 0
           ? { saved_note_count: base.stderr_diagnostics_omitted.notes.length }
@@ -784,6 +807,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength,
           ? { note_write_failed_count: base.stderr_diagnostics_omitted.note_write_failed_count }
           : {}),
         complete_in_note: noteRef.id,
+        read: noteRef.command,
       }
     : null
   const minimal = {
@@ -913,7 +937,12 @@ function fitStderrOmittedForReceipt(omitted, buildText, reserve) {
   return { fitted: true, stderrOmitted: fittedObj, text: buildText(fittedObj) }
 }
 
-function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength, { reserve = '' } = {}) {
+function buildFastConnectNoteFailureFallback(
+  normalized,
+  noteError,
+  fullTextLength,
+  { reserve = '', fullTextBytes = null } = {},
+) {
   const base =
     normalized && typeof normalized === 'object' && !Array.isArray(normalized)
       ? { ...normalized }
@@ -922,6 +951,12 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
   const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
   const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
+  const prior = String(reserve ?? '')
+  const priorBytes = Buffer.byteLength(prior)
+  const textBytes = typeof fullTextBytes === 'number' ? fullTextBytes : fullTextLength
+  const exceededByBytesOnly =
+    prior.length + fullTextLength <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    priorBytes + textBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
   const stderrReadHintFor = (stderrOmitted) => {
     const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
       ? base.stderr_diagnostics_omitted.notes.length
@@ -936,9 +971,12 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
   }
   const recoveryFor = (stderrOmitted) => {
     const hint = stderrReadHintFor(stderrOmitted)
+    const sizeDesc = exceededByBytesOnly
+      ? `${textBytes}-byte (${fullTextLength}-char)`
+      : `${fullTextLength}-char`
     return allCandidates
       ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${hint}`
-      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.${hint}`
+      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${sizeDesc} output.${hint}`
   }
 
   const makePayload = (
@@ -990,7 +1028,9 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     }
     out.complete_output_note_error = errMsg
     out.total_chars = fullTextLength
+    out.total_bytes = textBytes
     out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
+    out.shell_limit_bytes = CURSOR_SHELL_OUTPUT_MAX_BYTES
     out.recovery = recoveryFor(stderrOmitted)
     return JSON.stringify(out, null, 2) + '\n'
   }
@@ -1047,7 +1087,9 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     complete_output_note_failed: true,
     ...(stderrOmitted ? { stderr_diagnostics_omitted: stderrOmitted } : {}),
     total_chars: fullTextLength,
+    total_bytes: textBytes,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
     recovery: allCandidates
       ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHintFor(stderrOmitted)}`
       : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHintFor(stderrOmitted)}`,
@@ -1105,6 +1147,7 @@ export function formatFastConnectCliOutput(
   const fullText = JSON.stringify(normalized, null, 2) + '\n'
   if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
 
+  const fullTextBytes = Buffer.byteLength(fullText)
   let note = null
   let noteError = null
   try {
@@ -1113,16 +1156,24 @@ export function formatFastConnectCliOutput(
     noteError = error
   }
   if (!note) {
-    return buildFastConnectNoteFailureFallback(normalized, noteError, fullText.length, { reserve })
+    return buildFastConnectNoteFailureFallback(normalized, noteError, fullText.length, {
+      reserve,
+      fullTextBytes,
+    })
   }
   const noteRef = {
     id: note.id,
     command: note.command,
     parts: note.parts,
     total_chars: fullText.length,
+    total_bytes: fullTextBytes,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
   }
-  return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, { reserve })
+  return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, {
+    reserve,
+    fullTextBytes,
+  })
 }
 
 /**
@@ -1182,10 +1233,17 @@ export async function runFastConnectCli(
         const errCode = err && typeof err === 'object' && 'code' in err ? String(err.code) : 'read_failed'
         const detail = err instanceof Error ? err.message : String(err)
         const rawDiag = `fast-connect: could not read --prompt-file: ${detail}\n`
-        const summary = `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
+        const priorStderr = currentStderr()
+        const rawDiagBytes = Buffer.byteLength(rawDiag)
+        const exceededBytesOnly =
+          priorStderr.length + rawDiag.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(priorStderr) + rawDiagBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
+        const summary = exceededBytesOnly
+          ? `could not read --prompt-file (field --prompt-file, actual_bytes ${Buffer.byteLength(rawPromptFile)}, actual_chars ${rawPromptFile.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}, code ${errCode})`
+          : `could not read --prompt-file (field --prompt-file, actual_length ${rawPromptFile.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, code ${errCode})`
         const bounded = formatBoundedCliStderr(rawDiag, {
           label: 'fast-connect',
-          reserve: currentStderr(),
+          reserve: priorStderr,
           summary,
           fallback: `fast-connect: ${summary}; full error omitted because stderr + note fallback failed — fix write permissions on ~/.devspec/notes or pass a shorter --prompt-file path and retry.\n`,
         })

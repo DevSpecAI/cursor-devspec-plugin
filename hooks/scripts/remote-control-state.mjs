@@ -2005,7 +2005,9 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
       omitted_candidates_require_writable_notes: true,
       complete_output_note_failed: true,
       total_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+      total_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES * 10,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      shell_limit_bytes: CURSOR_SHELL_OUTPUT_MAX_BYTES,
       stderr_diagnostics_omitted: {
         omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
@@ -2209,11 +2211,17 @@ export function installBoundedCliStderr({
     writeFinalError: (raw, done) => {
       let bounded = ''
       try {
+        const rawBytes = Buffer.byteLength(raw)
+        const exceededBytesOnly =
+          emittedStderr.length + raw.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+          Buffer.byteLength(emittedStderr) + rawBytes > CURSOR_SHELL_OUTPUT_MAX_BYTES
         bounded = formatBoundedCliStderr(raw, {
           label,
           home,
           reserve: emittedStderr,
-          summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+          summary: exceededBytesOnly
+            ? `error_bytes ${rawBytes}, error_chars ${raw.length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+            : `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
         })
       } catch {
         void flushStderr().finally(done)
@@ -2813,10 +2821,17 @@ async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-contr
     process.exit(result.ok ? 0 : 1)
   }
 
-  const boundedUnknown = formatBoundedCliStderr(`Unknown command: ${cmd}\n`, {
+  const rawUnknown = `Unknown command: ${cmd}\n`
+  const priorUnknownStderr = cliStderr.getEmittedStderr()
+  const unknownBytesOnly =
+    priorUnknownStderr.length + rawUnknown.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS &&
+    Buffer.byteLength(priorUnknownStderr) + Buffer.byteLength(rawUnknown) > CURSOR_SHELL_OUTPUT_MAX_BYTES
+  const boundedUnknown = formatBoundedCliStderr(rawUnknown, {
     label: 'remote-control-state',
-    reserve: cliStderr.getEmittedStderr(),
-    summary: `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+    reserve: priorUnknownStderr,
+    summary: unknownBytesOnly
+      ? `field command, actual_bytes ${Buffer.byteLength(String(cmd ?? ''))}, actual_chars ${String(cmd ?? '').length}, shell_limit_bytes ${CURSOR_SHELL_OUTPUT_MAX_BYTES}`
+      : `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
   })
   await new Promise((resolve) => process.stderr.write(boundedUnknown, resolve))
   await cliStderr.flushStderr()
