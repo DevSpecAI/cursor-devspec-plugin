@@ -943,13 +943,32 @@ export function formatFastConnectCliOutput(result, { home = os.homedir() } = {})
 }
 
 /**
+ * Write `text` to `stream` and wait for Node to flush every byte to the underlying
+ * file descriptor before returning (so `process.exit()` never truncates output on a
+ * backpressured pipe — requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeStreamAndFlush(stream, text) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      stream.off('error', done)
+      resolve()
+    }
+    stream.once('error', done)
+    stream.write(text, done)
+  })
+}
+
+/**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
  */
 export async function runFastConnectCli(args) {
   // Help is read before anything else: it registers, writes and calls nothing.
   if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    process.stdout.write(FAST_CONNECT_USAGE)
+    await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
     process.exit(0)
   }
 
@@ -958,7 +977,8 @@ export async function runFastConnectCli(args) {
     try {
       promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
     } catch (err) {
-      process.stderr.write(
+      await writeStreamAndFlush(
+        process.stderr,
         `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
       )
       process.exit(1)
@@ -983,6 +1003,6 @@ export async function runFastConnectCli(args) {
     promptText,
   })
 
-  process.stdout.write(formatFastConnectCliOutput(result))
+  await writeStreamAndFlush(process.stdout, formatFastConnectCliOutput(result))
   process.exit(result.ok ? 0 : 1)
 }
