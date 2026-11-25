@@ -29,7 +29,9 @@ Start `cursor-agent`, type `/plugin`, search the Marketplace for **DevSpec for C
 
 ### 2. Approve DevSpec for Cursor CLI
 
-In `cursor-agent`, type `/mcp` and open DevSpec's server (`devspec-cursor`, shown as `plugin-devspec-devspec-cursor` in CLI output). Choose **Enable** if Cursor asks, then **Login**. Your browser opens DevSpec's approval page for Cursor: sign in to DevSpec if asked, click **Allow**, and restart `cursor-agent` so the agent's DevSpec tools and connection load cleanly.
+In `cursor-agent`, type `/mcp` and open DevSpec's server (**`Devspec-cursor (plugin)`**, shown as `plugin-devspec-devspec-cursor` in CLI output). Choose **Enable** if Cursor asks, then **Login**. Your browser opens DevSpec's approval page for Cursor: sign in to DevSpec if asked, click **Allow**, and restart `cursor-agent` so the agent's DevSpec tools and connection load cleanly.
+
+> **Look for `Devspec-cursor (plugin)` specifically.** If you also use DevSpec in Claude Code, Cursor imports your Claude Code plugins automatically, so `/mcp` may also show a separate `Devspec (plugin)` entry (`plugin-devspec-devspec`) with an `Invalid URL` error. Ignore that entry and select **`Devspec-cursor (plugin)`** instead — Claude Code's plugin stands aside inside Cursor. Cursor also stores `/mcp` approvals per repository folder, so opening a new folder for the first time may ask for a quick **Login** → **Allow** there too.
 
 ### 3. Connect
 
