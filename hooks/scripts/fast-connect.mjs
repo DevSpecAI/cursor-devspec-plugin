@@ -99,6 +99,7 @@ export function resolveGitRemote(cwd, { execFileSyncImpl = execFileSync } = {}) 
       encoding: 'utf8',
       windowsHide: true,
       timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const url = String(out || '').trim()
     return url || null
@@ -742,7 +743,7 @@ Prints one short JSON result; exits 0 when connected, 1 when not.
  * a sealed note (`writeNote`) and returns a compact structured refusal naming that note
  * so Cursor never slices the choices in half (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
  */
-function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength) {
+function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength, { reserve = '' } = {}) {
   const base =
     normalized && typeof normalized === 'object' && !Array.isArray(normalized)
       ? { ...normalized }
@@ -766,7 +767,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength)
   base.complete_output_note = noteRef
   base.note = noteMsg
   const richText = JSON.stringify(base, null, 2) + '\n'
-  if (fitsShellOutput(richText)) return richText
+  if (fitsShellOutput(`${reserve}${richText}`)) return richText
 
   const minimal = {
     ok: Boolean(base.ok),
@@ -792,7 +793,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength)
     note: noteMsg,
   }
   const minimalText = JSON.stringify(minimal, null, 2) + '\n'
-  if (fitsShellOutput(minimalText)) return minimalText
+  if (fitsShellOutput(`${reserve}${minimalText}`)) return minimalText
 
   // Final guaranteed-bounded receipt when caller-supplied identifier fields (such as an
   // unbounded --session or --local-id argument) exceed Cursor's Shell ceiling on their own.
@@ -810,7 +811,7 @@ function buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullTextLength)
   )
 }
 
-function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength) {
+function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLength, { reserve = '' } = {}) {
   const base =
     normalized && typeof normalized === 'object' && !Array.isArray(normalized)
       ? { ...normalized }
@@ -869,23 +870,23 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     return JSON.stringify(out, null, 2) + '\n'
   }
 
-  const useMinimal = !fitsShellOutput(makePayload([], { minimal: false }))
+  const useMinimal = !fitsShellOutput(`${reserve}${makePayload([], { minimal: false })}`)
   if (allCandidates && allCandidates.length > 0) {
     let lo = 0
     let hi = allCandidates.length
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2)
-      if (fitsShellOutput(makePayload(allCandidates.slice(0, mid), { minimal: useMinimal }))) {
+      if (fitsShellOutput(`${reserve}${makePayload(allCandidates.slice(0, mid), { minimal: useMinimal })}`)) {
         lo = mid
       } else {
         hi = mid - 1
       }
     }
     const text = makePayload(allCandidates.slice(0, lo), { minimal: useMinimal })
-    if (fitsShellOutput(text)) return text
+    if (fitsShellOutput(`${reserve}${text}`)) return text
   } else {
     const text = makePayload([], { minimal: useMinimal })
-    if (fitsShellOutput(text)) return text
+    if (fitsShellOutput(`${reserve}${text}`)) return text
   }
 
   return (
@@ -913,7 +914,7 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
   )
 }
 
-export function formatFastConnectCliOutput(result, { home = os.homedir() } = {}) {
+export function formatFastConnectCliOutput(result, { home = os.homedir(), reserve = '' } = {}) {
   const normalized =
     result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : result
   if (
@@ -925,7 +926,7 @@ export function formatFastConnectCliOutput(result, { home = os.homedir() } = {})
     delete normalized.candidates
   }
   const fullText = JSON.stringify(normalized, null, 2) + '\n'
-  if (fitsShellOutput(fullText)) return fullText
+  if (fitsShellOutput(`${reserve}${fullText}`)) return fullText
 
   try {
     const note = writeNote(fullText, { home })
@@ -936,9 +937,9 @@ export function formatFastConnectCliOutput(result, { home = os.homedir() } = {})
       total_chars: fullText.length,
       shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     }
-    return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length)
+    return buildBoundedFastConnectNoteReceipt(normalized, noteRef, fullText.length, { reserve })
   } catch (error) {
-    return buildFastConnectNoteFailureFallback(normalized, error, fullText.length)
+    return buildFastConnectNoteFailureFallback(normalized, error, fullText.length, { reserve })
   }
 }
 
@@ -964,45 +965,62 @@ export function writeStreamAndFlush(stream, text) {
 /**
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
+ * @param {{ getEmittedStderr?: () => string }} [opts]
  */
-export async function runFastConnectCli(args) {
-  // Help is read before anything else: it registers, writes and calls nothing.
-  if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
-    process.exit(0)
-  }
-
-  let promptText = null
-  if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
-    try {
-      promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
-    } catch (err) {
-      await writeStreamAndFlush(
-        process.stderr,
-        `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
-      )
-      process.exit(1)
+export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) {
+  let localStderr = ''
+  const origStderrWrite = getEmittedStderr ? null : process.stderr.write.bind(process.stderr)
+  if (origStderrWrite) {
+    process.stderr.write = (chunk, ...rest) => {
+      localStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+      return origStderrWrite(chunk, ...rest)
     }
   }
+  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderr)
+  try {
+    // Help is read before anything else: it registers, writes and calls nothing.
+    if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
+      await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
+      process.exit(0)
+    }
 
-  const result = await fastConnect({
-    localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
-    cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
-    sessionId: typeof args.session === 'string' ? args.session : null,
-    newSession: !!args.new,
-    title: typeof args.title === 'string' ? args.title : null,
-    private: !!args.private,
-    launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
-    projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
-    agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
-    ownerPid: args['owner-pid'] ?? null,
-    noPoller: !!args.noPoller,
-    hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
-    codename: typeof args.codename === 'string' ? args.codename : null,
-    forceNew: !!args.forceNew,
-    promptText,
-  })
+    let promptText = null
+    if (typeof args['prompt-file'] === 'string' && args['prompt-file']) {
+      try {
+        promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
+      } catch (err) {
+        await writeStreamAndFlush(
+          process.stderr,
+          `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
+        )
+        process.exit(1)
+      }
+    }
 
-  await writeStreamAndFlush(process.stdout, formatFastConnectCliOutput(result))
-  process.exit(result.ok ? 0 : 1)
+    const result = await fastConnect({
+      localId: typeof args['local-id'] === 'string' ? args['local-id'] : null,
+      cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
+      sessionId: typeof args.session === 'string' ? args.session : null,
+      newSession: !!args.new,
+      title: typeof args.title === 'string' ? args.title : null,
+      private: !!args.private,
+      launchId: typeof args['launch-id'] === 'string' ? args['launch-id'] : null,
+      projectId: typeof args['project-id'] === 'string' ? args['project-id'] : null,
+      agent: typeof args.agent === 'string' ? args.agent : AGENT_NAME,
+      ownerPid: args['owner-pid'] ?? null,
+      noPoller: !!args.noPoller,
+      hostToken: typeof args['host-token'] === 'string' ? args['host-token'] : null,
+      codename: typeof args.codename === 'string' ? args.codename : null,
+      forceNew: !!args.forceNew,
+      promptText,
+    })
+
+    await writeStreamAndFlush(
+      process.stdout,
+      formatFastConnectCliOutput(result, { reserve: currentStderr() }),
+    )
+    process.exit(result.ok ? 0 : 1)
+  } finally {
+    if (origStderrWrite) process.stderr.write = origStderrWrite
+  }
 }

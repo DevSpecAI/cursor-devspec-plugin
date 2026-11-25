@@ -502,6 +502,7 @@ export function resolveOwnerPidFromChildTreeWin32(startPid, { maxNodes = 40, tim
       timeout: Math.max(timeout + 4000, 5000),
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -758,6 +759,7 @@ export function win32ProcessInfo(pid, { timeoutMs = 2000 } = {}) {
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
@@ -823,6 +825,7 @@ export function resolveOwnerPidAutoWindows(startPid = process.pid, { maxHops = 1
       timeout: timeoutMs,
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim()
     const found = Number.parseInt(out, 10)
     return Number.isInteger(found) && found > 1 ? found : null
@@ -1844,13 +1847,19 @@ if (isMain) {
 }
 
 async function runCli() {
+  let emittedStderr = ''
+  const rawStderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = (chunk, ...rest) => {
+    emittedStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    return rawStderrWrite(chunk, ...rest)
+  }
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
 
   if (cmd === 'fast-connect' || cmd === 'connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
-    await runFastConnectCli(args)
+    await runFastConnectCli(args, { getEmittedStderr: () => emittedStderr })
     return
   }
 
