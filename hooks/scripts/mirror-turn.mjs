@@ -605,8 +605,13 @@ async function main() {
       timeoutMs,
     })
 
-  // The model Cursor says this turn runs, for the Agents page (item cc47378e).
-  recordRuntimeReport(connectionId, raw)
+  // The model Cursor says this turn runs, for the Agents page (item cc47378e / c2ddefb6).
+  // `user_prompt` (beforeSubmitPrompt) and `stop` come from Cursor's live model manager.
+  recordRuntimeReport(connectionId, raw, {
+    authoritative: mode === 'user_prompt' || mode === 'stop',
+    conversationId: localId || conversationId,
+    cwd: state.cwd,
+  })
 
   const text = extractLastText(raw, mode)
   const fromAPerson = mode === 'user_prompt' && promptCameFromAPerson(raw, text)
