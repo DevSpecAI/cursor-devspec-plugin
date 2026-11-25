@@ -817,4 +817,39 @@ describe('fast-connect CLI flags', () => {
       }
     })
   }
+
+  it('writes an oversized 100-candidate project_choice_required refusal whole to a note instead of exceeding Cursor Shell ceiling', async () => {
+    const { formatConnectCliOutput } = await import('./remote-control-state.mjs')
+    const { fitsShellOutput, readNoteText } = await import('./hook-context-budget.mjs')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-fc-100-choices-'))
+    try {
+      const candidates = Array.from({ length: 150 }, (_, i) => ({
+        id: `${String(i).padStart(8, '0')}-1111-4111-8111-111111111111`,
+        name: `Project Number ${i} — Organization Workspace Candidate`,
+        organization_name: `Acme Organization ${i}`,
+      }))
+      const refusal = {
+        ok: false,
+        code: 'project_choice_required',
+        error: 'Several accessible projects have that name. Choose a project and organisation.',
+        project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_name', candidates },
+        candidates: candidates.map((c) => c.id),
+      }
+      const out = formatConnectCliOutput(refusal, { home })
+      assert.equal(fitsShellOutput(out), true, `CLI output must fit Cursor Shell ceiling, got ${out.length} chars`)
+      const parsed = JSON.parse(out)
+      assert.equal(parsed.ok, false)
+      assert.equal(parsed.code, 'project_choice_required')
+      assert.equal(parsed.project_selection.status, 'choice_required')
+      assert.equal(parsed.project_selection.candidate_count, 150)
+      assert.equal(parsed.project_selection.omitted_inline, true)
+      assert.ok(parsed.complete_output_note?.id)
+      assert.ok(parsed.complete_output_note?.command)
+      const full = JSON.parse(readNoteText(parsed.complete_output_note.id, { home }))
+      assert.equal(full.project_selection.candidates.length, 150)
+      assert.equal(full.candidates, undefined, 'duplicate top-level candidate ID array is omitted')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
 })

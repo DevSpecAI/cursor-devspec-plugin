@@ -32,6 +32,7 @@ import {
   registerConnection,
   attachConnection,
   writeConnectionState,
+  formatConnectCliOutput,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -765,6 +766,6 @@ export async function runFastConnectCli(args) {
     promptText,
   })
 
-  process.stdout.write(JSON.stringify(result, null, 2) + '\n')
+  process.stdout.write(formatConnectCliOutput(result))
   process.exit(result.ok ? 0 : 1)
 }

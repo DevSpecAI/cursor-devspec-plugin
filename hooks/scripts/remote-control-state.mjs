@@ -95,6 +95,7 @@ import {
 import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, writeNote } from './hook-context-budget.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
@@ -1610,6 +1611,10 @@ export function summarizeConnectCliOutput(result) {
   const summary = { ...rest }
   if (selection?.status === 'choice_required' || result.code === 'project_choice_required') {
     summary.project_selection = selection
+    // Do not duplicate candidate IDs alongside `project_selection.candidates` in CLI output.
+    if (Array.isArray(selection?.candidates) && Array.isArray(summary.candidates)) {
+      delete summary.candidates
+    }
   } else if (selection?.project?.name && !summary.project_name) {
     summary.project_name = selection.project.name
   }
@@ -1617,6 +1622,55 @@ export function summarizeConnectCliOutput(result) {
     summary.repository_count = repoCtx.repositories.length
   }
   return summary
+}
+
+/**
+ * Format connect CLI JSON within Cursor's Shell output ceiling (`fitsShellOutput`,
+ * `hook-context-budget.mjs`). When a variable-length payload (such as a large
+ * `project_selection.candidates` refusal list) exceeds Cursor's ceiling, write the
+ * complete, uncut JSON to a sealed note (`writeNote`) and emit a compact structured
+ * receipt naming the note command so Cursor never clips the middle of the choices
+ * (requirements 3c5147a7, 91d7b47c, 4e32d1a5).
+ */
+export function formatConnectCliOutput(result, { home = os.homedir() } = {}) {
+  const summary = summarizeConnectCliOutput(result)
+  const fullText = JSON.stringify(summary, null, 2) + '\n'
+  if (fitsShellOutput(fullText)) return fullText
+
+  const compact = summary && typeof summary === 'object' && !Array.isArray(summary) ? { ...summary } : { ok: false }
+  const selection = compact.project_selection
+  const candidateCount = Array.isArray(selection?.candidates) ? selection.candidates.length : null
+  if (selection && typeof selection === 'object') {
+    const { candidates: _omit, ...selectionRest } = selection
+    compact.project_selection = {
+      ...selectionRest,
+      ...(candidateCount !== null ? { candidate_count: candidateCount } : {}),
+      omitted_inline: true,
+    }
+  }
+  if (Array.isArray(compact.candidates)) {
+    compact.candidate_count = compact.candidates.length
+    delete compact.candidates
+  }
+
+  try {
+    const note = writeNote(fullText, { home })
+    const noteRef = {
+      id: note.id,
+      command: note.command,
+      parts: note.parts,
+      total_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    }
+    if (compact.project_selection && typeof compact.project_selection === 'object') {
+      compact.project_selection.complete_in_note = noteRef
+    }
+    compact.complete_output_note = noteRef
+    compact.note = `Full connect output (${fullText.length} chars) exceeds Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-char Shell limit and was saved whole to a note. Run \`${note.command}\` (and every further part it names) to read all choices.`
+  } catch (error) {
+    compact.complete_output_note_error = error instanceof Error ? error.message : String(error)
+  }
+  return JSON.stringify(compact, null, 2) + '\n'
 }
 
 /**
@@ -2411,7 +2465,7 @@ async function runCli() {
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    process.stdout.write(JSON.stringify(summarizeConnectCliOutput(result), null, 2) + '\n')
+    process.stdout.write(formatConnectCliOutput(result))
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2436,7 +2490,7 @@ async function runCli() {
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    process.stdout.write(JSON.stringify(summarizeConnectCliOutput(result), null, 2) + '\n')
+    process.stdout.write(formatConnectCliOutput(result))
     process.exit(result.ok ? 0 : 1)
   }
 
