@@ -253,9 +253,119 @@ export function refusalFromResponse(res) {
  * instead of opening a second orphaned request on DevSpec (requirement 3ea2b201).
  */
 const pendingLocalOpens = new Map()
+/**
+ * Tracks the latest typed turn key whose registration failed/was refused per
+ * `<resolvedDir>|<connectionId>`, so if the turn ends before a retry succeeds, the
+ * poller retries registration rather than marking the ended transcript synced without
+ * completing the refused work (requirement 3ea2b201).
+ */
+const failedTypedTurnKeys = new Map()
 
 function pendingOpenKey(dir, connectionId, turnKey) {
   return `${path.resolve(dir)}|${connectionId}|${turnKey}`
+}
+
+function failedTurnKey(dir, connectionId) {
+  return `${path.resolve(dir)}|${connectionId}`
+}
+
+function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
+  const reqState = readRequestState(connectionId, { dir })
+  if (!reqState.open.has(entry.requestId)) {
+    const ok = appendRequestEvent(
+      connectionId,
+      {
+        op: 'open',
+        id: entry.requestId,
+        kind: 'typed_prompt',
+        ...(entry.requestedBy ? { requested_by: entry.requestedBy } : {}),
+      },
+      { dir },
+    )
+    if (!ok) return false
+  }
+  // Mark the recovered open request as started without leaving it as foreground
+  // current (and preserving any unrelated foreground request) so finishIdleRequests
+  // recognises it via requestFinished() and closes it on DevSpec (req 3ea2b201).
+  // Persist restoreForeground on the pending entry so if a disk error interrupts
+  // after marking started, retry still restores the prior foreground state before
+  // completing sync.
+  if (!reqState.started.has(entry.requestId) || entry.restoreForeground) {
+    const fg = entry.restoreForeground ?? {
+      current: reqState.current,
+      fromWake: reqState.currentFromWake,
+      joined: [...reqState.joined],
+      currentRestored: false,
+    }
+    if (!reqState.started.has(entry.requestId)) {
+      const startedOk = appendRequestEvent(
+        connectionId,
+        { op: 'current', ref: entry.requestId },
+        { dir },
+      )
+      if (!startedOk) return false
+      entry.restoreForeground = fg
+    }
+    if (!fg.currentRestored) {
+      if (reqState.current === entry.requestId || !reqState.started.has(entry.requestId)) {
+        const restoredOk = appendRequestEvent(
+          connectionId,
+          {
+            op: 'current',
+            ref: fg.current,
+            ...(fg.fromWake && fg.current !== null ? { from_wake: true } : {}),
+          },
+          { dir },
+        )
+        if (!restoredOk) return false
+        fg.currentRestored = true
+      } else {
+        // A newer foreground turn already replaced `current` before retry;
+        // do not overwrite it with older foreground state.
+        delete entry.restoreForeground
+      }
+    }
+    if (entry.restoreForeground) {
+      for (const joinedId of fg.joined) {
+        if (reqState.joined.has(joinedId) && reqState.current === fg.current) continue
+        if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
+          return false
+        }
+      }
+      delete entry.restoreForeground
+    }
+  }
+  if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
+    const boundOk = appendRequestEvent(
+      connectionId,
+      { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId },
+      { dir },
+    )
+    if (!boundOk) return false
+  }
+  pendingLocalOpens.delete(pKey)
+  return true
+}
+
+/**
+ * Pending requests when the caller has NO host `background_tasks` or `session_crons`
+ * list (e.g. poller idle cleanup or explicit-reply hook): preserves both recorded
+ * schedules (`recordedSessionCrons`) AND recorded `Monitor` launches (`kind: 'monitor'`,
+ * which emit event wakes without completion notices, `notifies: false`), so idle cleanup
+ * never closes a request while its monitor or schedule can still wake the agent
+ * (decision ce71a72b).
+ */
+export function pendingWorkWithoutHostLists(reqState) {
+  const sessionCrons = recordedSessionCrons(reqState)
+  const pending = requestsWithWorkPending(reqState, { sessionCrons })
+  for (const launch of new Set(reqState.launches.values())) {
+    if (launch.kind === 'monitor' && !launch.notified) {
+      for (const id of [launch.request, ...(launch.also ?? [])]) {
+        if (reqState.open.has(id)) pending.add(id)
+      }
+    }
+  }
+  return pending
 }
 
 function pendingOpensForConnection(dir, connectionId) {
@@ -431,98 +541,9 @@ export async function syncTypedTurnFromTranscript({
         async () => {
           let allPersisted = true
           for (const [pKey, entry] of pendingEntries) {
-            const reqState = readRequestState(connectionId, { dir })
-            if (!reqState.open.has(entry.requestId)) {
-              const ok = appendRequestEvent(
-                connectionId,
-                {
-                  op: 'open',
-                  id: entry.requestId,
-                  kind: 'typed_prompt',
-                  ...(entry.requestedBy ? { requested_by: entry.requestedBy } : {}),
-                },
-                { dir },
-              )
-              if (!ok) {
-                allPersisted = false
-                continue
-              }
+            if (!flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)) {
+              allPersisted = false
             }
-            // Mark the recovered open request as started without leaving it as foreground
-            // current (and preserving any unrelated foreground request) so finishIdleRequests
-            // recognises it via requestFinished() and closes it on DevSpec (req 3ea2b201).
-            // Persist restoreForeground on the pending entry so if a disk error interrupts
-            // after marking started, retry still restores the prior foreground state before
-            // completing sync.
-            if (!reqState.started.has(entry.requestId) || entry.restoreForeground) {
-              const fg = entry.restoreForeground ?? {
-                current: reqState.current,
-                fromWake: reqState.currentFromWake,
-                joined: [...reqState.joined],
-                currentRestored: false,
-              }
-              if (!reqState.started.has(entry.requestId)) {
-                const startedOk = appendRequestEvent(
-                  connectionId,
-                  { op: 'current', ref: entry.requestId },
-                  { dir },
-                )
-                if (!startedOk) {
-                  allPersisted = false
-                  continue
-                }
-                entry.restoreForeground = fg
-              }
-              if (!fg.currentRestored) {
-                if (reqState.current === entry.requestId || !reqState.started.has(entry.requestId)) {
-                  const restoredOk = appendRequestEvent(
-                    connectionId,
-                    {
-                      op: 'current',
-                      ref: fg.current,
-                      ...(fg.fromWake && fg.current !== null ? { from_wake: true } : {}),
-                    },
-                    { dir },
-                  )
-                  if (!restoredOk) {
-                    allPersisted = false
-                    continue
-                  }
-                  fg.currentRestored = true
-                } else {
-                  // A newer foreground turn already replaced `current` before retry;
-                  // do not overwrite it with older foreground state.
-                  delete entry.restoreForeground
-                }
-              }
-              if (entry.restoreForeground) {
-                let joinedOk = true
-                for (const joinedId of fg.joined) {
-                  if (reqState.joined.has(joinedId) && reqState.current === fg.current) continue
-                  if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
-                    joinedOk = false
-                    break
-                  }
-                }
-                if (!joinedOk) {
-                  allPersisted = false
-                  continue
-                }
-                delete entry.restoreForeground
-              }
-            }
-            if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
-              const boundOk = appendRequestEvent(
-                connectionId,
-                { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId },
-                { dir },
-              )
-              if (!boundOk) {
-                allPersisted = false
-                continue
-              }
-            }
-            pendingLocalOpens.delete(pKey)
           }
           return allPersisted
         },
@@ -534,6 +555,97 @@ export async function syncTypedTurnFromTranscript({
           requestId: pendingEntries[0][1].requestId,
           active,
         }
+      }
+    }
+    const fKey = failedTurnKey(dir, connectionId)
+    if (active.ended && active.kind === 'typed' && active.key && failedTypedTurnKeys.get(fKey) === active.key) {
+      const reqState = readRequestState(connectionId, { dir })
+      if (reqState.seenTranscriptTurns.has(active.key)) {
+        failedTypedTurnKeys.delete(fKey)
+      } else {
+        if (!connectionCapability || typeof effectiveCallRequest !== 'function') {
+          return { action: 'cleared_stale', key: active.key, ended: true }
+        }
+        const retryResult = await withTypedSyncLock(
+          connectionId,
+          dir,
+          async () => {
+            const lockedState = readRequestState(connectionId, { dir })
+            if (lockedState.seenTranscriptTurns.has(active.key)) {
+              failedTypedTurnKeys.delete(fKey)
+              return {
+                action: 'already_synced',
+                key: active.key,
+                ref: lockedState.seenTranscriptTurns.get(active.key),
+              }
+            }
+            const deterministicId = deterministicTypedTurnRequestId(connectionId, active.key)
+            let requestId =
+              lockedState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
+            let requestedBy = null
+            if (!requestId) {
+              const opened = await openTypedRequestPreservingRefusal({
+                connectionId,
+                callRequest: effectiveCallRequest,
+                dir,
+                id: deterministicId,
+              })
+              if (opened.ok) {
+                requestId = opened.requestId
+                requestedBy = opened.requestedBy ?? null
+              } else if (opened.localPersistFailed) {
+                if (opened.requestId) {
+                  pendingLocalOpens.set(pendingOpenKey(dir, connectionId, active.key), {
+                    requestId: opened.requestId,
+                    requestedBy: opened.requestedBy ?? null,
+                    turnKey: active.key,
+                  })
+                  failedTypedTurnKeys.delete(fKey)
+                }
+                log(
+                  `typed-turn-sync: ended-turn local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
+                )
+                return {
+                  action: 'open_write_failed',
+                  requestId: opened.requestId,
+                  key: active.key,
+                  ended: true,
+                  refusal: opened.refusal,
+                }
+              } else {
+                log(
+                  `typed-turn-sync: ended-turn open_request retry failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
+                )
+                return {
+                  action: 'cleared_stale',
+                  key: active.key,
+                  ended: true,
+                  refusal: opened.refusal,
+                }
+              }
+            }
+            const pKey = pendingOpenKey(dir, connectionId, active.key)
+            const entry = { requestId, requestedBy, turnKey: active.key }
+            pendingLocalOpens.set(pKey, entry)
+            const persisted = flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)
+            failedTypedTurnKeys.delete(fKey)
+            if (!persisted) {
+              return {
+                action: 'open_write_failed',
+                requestId,
+                key: active.key,
+                ended: true,
+              }
+            }
+            return { action: 'opened', requestId, key: active.key, ended: true }
+          },
+          { deadlineMs },
+        )
+        if (!retryResult) return { action: 'lock_busy' }
+        if (memo && (retryResult.action === 'opened' || retryResult.action === 'already_synced')) {
+          memo.synced = true
+        }
+        return retryResult
       }
     }
     if (memo) memo.synced = true
@@ -868,22 +980,31 @@ export async function syncTypedTurnFromTranscript({
     { deadlineMs },
   )
 
+  const fKey = failedTurnKey(dir, connectionId)
   if (
-    memo &&
     result &&
     (result.action === 'opened' || result.action === 'already_synced' || result.action === 'adopted_hook_request')
   ) {
-    memo.synced = true
+    if (failedTypedTurnKeys.get(fKey) === active.key) failedTypedTurnKeys.delete(fKey)
+    if (memo) memo.synced = true
+  } else if (
+    result &&
+    (result.action === 'cleared_stale' ||
+      result.action === 'admission_failed' ||
+      result.action === 'state_write_failed' ||
+      result.action === 'binding_write_failed')
+  ) {
+    failedTypedTurnKeys.set(fKey, active.key)
   }
   return result ?? { action: 'lock_busy' }
 }
 
 /**
  * When Cursor is between turns (`ended: true`), close the single finished request
- * belonging to the ended turn (if it has no pending background work or recorded
- * schedules) and complete any lingering `local_turn` admission. Covers Cursor CLI
- * where the plugin's `stop` hook does not fire, without iterating over a variable-length
- * set of database close calls (requirement c900f599).
+ * belonging to the ended turn (if it has no pending background work, monitors, or
+ * recorded schedules) and complete any lingering `local_turn` admission. Covers Cursor
+ * CLI where the plugin's `stop` hook does not fire, without iterating over a
+ * variable-length set of database close calls (requirement c900f599).
  */
 export async function finishIdleRequests({
   connectionId,
@@ -901,8 +1022,7 @@ export async function finishIdleRequests({
   const reqState = readRequestState(connectionId, { dir })
   const sessionId = state?.session_id || null
   const localAttemptId = localTurnToComplete(state?.local_turn, sessionId)
-  const sessionCrons = recordedSessionCrons(reqState)
-  const pending = requestsWithWorkPending(reqState, { sessionCrons })
+  const pending = pendingWorkWithoutHostLists(reqState)
   const active = activeTranscriptTurn(transcriptPath, { attempts })
   if (!active || !active.ended) return { closed: [], localCompleted: false }
 

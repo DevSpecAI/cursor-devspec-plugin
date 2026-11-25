@@ -42,7 +42,7 @@ import {
   rotateRequestLog,
 } from './requests.mjs'
 import {
-  recordedSessionCrons,
+  pendingWorkWithoutHostLists,
   refusalFromResponse,
   structuredRefusalFromError,
   TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
@@ -176,8 +176,7 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
     if (primaryAnsweredId && state) {
       try {
         const reqState = readRequestState(connectionId, { dir: connDir })
-        const sessionCrons = recordedSessionCrons(reqState)
-        const pending = requestsWithWorkPending(reqState, { sessionCrons })
+        const pending = pendingWorkWithoutHostLists(reqState)
         if (requestFinished(reqState, primaryAnsweredId, pending)) {
           const credential = connectionCredential(state)
           const capability = state.connection_capability || readConnectionCapability(connectionId)

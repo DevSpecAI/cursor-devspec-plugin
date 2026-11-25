@@ -1382,4 +1382,108 @@ describe('typed-turn-sync (item da03801e)', () => {
       'second unrelated wake must leave requester unknown instead of stamping the answered room command',
     )
   })
+
+  it('retries a refused typed-turn registration even after turn_ended is appended and stays unsynced while still refused (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn refused then ended')}\n`)
+    const memo = { stamp: null, synced: false }
+    let attempts = 0
+
+    // Attempt 1 (live): retryable refusal leaves memo unsynced.
+    const first = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        attempts += 1
+        return { ok: false, error: 'temporary outage', retryable: true }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(first.action, 'cleared_stale')
+    assert.equal(memo.synced, false)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+
+    // Turn ends before retry runs.
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn refused then ended')}\n${turnEndedRow('success')}\n`)
+
+    // Attempt 2 (ended, still refused): MUST actually retry and keep memo.synced === false!
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        attempts += 1
+        return { ok: false, error: 'still unavailable', retryable: true }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(attempts, 2, 'appending turn_ended must NOT skip retrying the refused turn')
+    assert.equal(second.action, 'cleared_stale')
+    assert.equal(memo.synced, false, 'ended refused turn must stay unsynced until registration succeeds')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+
+    // Attempt 3 (ended, DevSpec recovers): registration succeeds, marks synced, does not leave ended turn as current.
+    const third = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        attempts += 1
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(attempts, 3)
+    assert.equal(third.action, 'opened')
+    assert.equal(memo.synced, true)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(third.requestId), true)
+    assert.equal(after.started.has(third.requestId), true)
+    assert.equal(after.current, null, 'ended retried turn must not linger as foreground current')
+  })
+
+  it('keeps an open request with a recorded Monitor launch open in finishIdleRequests so later monitor events resolve to the launching request (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    appendRequestEvent(CONN, { op: 'open', id: HOOK_TYPED, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: HOOK_TYPED }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'mon-1', kind: 'monitor', notifies: false, request: HOOK_TYPED, also: [] }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Start monitor')}\n${turnEndedRow('success')}\n`)
+
+    const monitorWakeText = '<task-notification><task-id>mon-1</task-id><event>disk usage 95%</event></task-notification>'
+    const { requestForWake } = await import('./requests.mjs')
+    assert.equal(
+      requestForWake({ origin: 'task-notification', text: monitorWakeText, state: readRequestState(CONN, { dir }) }).ref,
+      HOOK_TYPED,
+    )
+
+    let closeCalled = false
+    const idle = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        closeCalled = true
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+    assert.equal(closeCalled, false, 'finishIdleRequests must NOT close a request while its recorded monitor can still wake the agent')
+    assert.deepEqual(idle.closed, [])
+    assert.equal(readRequestState(CONN, { dir }).open.has(HOOK_TYPED), true)
+    assert.equal(
+      requestForWake({ origin: 'task-notification', text: monitorWakeText, state: readRequestState(CONN, { dir }) }).ref,
+      HOOK_TYPED,
+      'monitor wake after idle cleanup must still resolve to the launching request',
+    )
+  })
 })
