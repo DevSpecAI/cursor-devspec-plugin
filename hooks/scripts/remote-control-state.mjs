@@ -2218,42 +2218,114 @@ export function formatBoundedCliStderr(
   })
 }
 
+/**
+ * Headroom reserved on CLI stderr so the final stdout connect receipt (or note-failure
+ * refusal) always fits inside Cursor's combined Shell output ceiling (`fitsShellOutput`,
+ * reqs 3c5147a7 / 91d7b47c). Derived from the actual fallback receipt structure rather
+ * than a bare constant.
+ */
+const CLI_STDOUT_RECEIPT_HEADROOM =
+  JSON.stringify(
+    {
+      ok: false,
+      candidate_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      returned_count: 0,
+      omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      omitted_candidates_require_writable_notes: true,
+      complete_output_note_failed: true,
+      total_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      recovery:
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).',
+    },
+    null,
+    2,
+  ) + '\n'
+
+/**
+ * Intercept `process.stderr.write` for a CLI run so EVERY stderr diagnostic (including
+ * browser-approval URLs from `authForConnect`) passes through the shared Shell output
+ * ceiling (`formatBoundedCliStderr` + `fitsShellOutput`) while keeping headroom free
+ * for the final stdout connect receipt. Any oversized stderr write is saved WHOLE in a
+ * sealed note before emitting its short pointer (reqs 3c5147a7 / 91d7b47c).
+ */
+export function installBoundedCliStderr({
+  label = 'remote-control-state',
+  home = os.homedir(),
+  reserveHeadroom = CLI_STDOUT_RECEIPT_HEADROOM,
+} = {}) {
+  let emittedStderr = ''
+  const rawStderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = (chunk, encoding, callback) => {
+    const cb = typeof encoding === 'function' ? encoding : callback
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    let toWrite = text
+    if (!fitsShellOutput(`${emittedStderr}${text}${reserveHeadroom}`)) {
+      try {
+        toWrite = formatBoundedCliStderr(text, {
+          label,
+          home,
+          reserve: `${emittedStderr}${reserveHeadroom}`,
+          summary: `stderr_length ${text.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+        })
+      } catch {
+        toWrite = ''
+      }
+    }
+    emittedStderr += toWrite
+    if (!toWrite) {
+      if (typeof cb === 'function') queueMicrotask(cb)
+      return true
+    }
+    return typeof encoding === 'function'
+      ? rawStderrWrite(toWrite, encoding)
+      : rawStderrWrite(toWrite, encoding, callback)
+  }
+  return {
+    getEmittedStderr: () => emittedStderr,
+    writeFinalError: (raw, done) => {
+      let bounded = ''
+      try {
+        bounded = formatBoundedCliStderr(raw, {
+          label,
+          home,
+          reserve: emittedStderr,
+          summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
+        })
+      } catch {
+        done()
+        return
+      }
+      emittedStderr += bounded
+      rawStderrWrite(bounded, done)
+    },
+    restore: () => {
+      process.stderr.write = rawStderrWrite
+    },
+  }
+}
+
 // --- CLI entry (skipped when imported for tests) ---
 const isMain =
   Boolean(process.argv[1]) &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 
 if (isMain) {
-  void runCli().catch((err) => {
+  const cliStderr = installBoundedCliStderr({ label: 'remote-control-state' })
+  void runCli(cliStderr).catch((err) => {
     const raw = `remote-control-state: ${err?.message || err}\n`
-    let bounded = ''
-    try {
-      bounded = formatBoundedCliStderr(raw, {
-        label: 'remote-control-state',
-        summary: `error_length ${raw.length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
-      })
-    } catch {
-      process.exit(1)
-      return
-    }
-    process.stderr.write(bounded, () => process.exit(1))
+    cliStderr.writeFinalError(raw, () => process.exit(1))
   })
 }
 
-async function runCli() {
-  let emittedStderr = ''
-  const rawStderrWrite = process.stderr.write.bind(process.stderr)
-  process.stderr.write = (chunk, ...rest) => {
-    emittedStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-    return rawStderrWrite(chunk, ...rest)
-  }
+async function runCli(cliStderr = installBoundedCliStderr({ label: 'remote-control-state' })) {
   const args = parseArgs(process.argv.slice(2))
   const cmd = args._[0] || 'read'
   const launchId = resolveLaunchId(args['launch-id'])
 
   if (cmd === 'fast-connect') {
     const { runFastConnectCli } = await import('./fast-connect.mjs')
-    await runFastConnectCli(args, { getEmittedStderr: () => emittedStderr })
+    await runFastConnectCli(args, { getEmittedStderr: cliStderr.getEmittedStderr })
     return
   }
 
@@ -2782,7 +2854,7 @@ async function runCli() {
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: emittedStderr }))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: cliStderr.getEmittedStderr() }))
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2808,13 +2880,13 @@ async function runCli() {
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: emittedStderr }))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result, { reserve: cliStderr.getEmittedStderr() }))
     process.exit(result.ok ? 0 : 1)
   }
 
   const boundedUnknown = formatBoundedCliStderr(`Unknown command: ${cmd}\n`, {
     label: 'remote-control-state',
-    reserve: emittedStderr,
+    reserve: cliStderr.getEmittedStderr(),
     summary: `field command, actual_length ${String(cmd ?? '').length}, shell_limit_chars ${CURSOR_SHELL_OUTPUT_MAX_CHARS}`,
   })
   await writeStreamAndFlush(process.stderr, boundedUnknown)

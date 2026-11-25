@@ -35,6 +35,7 @@ import {
   writeConnectionState,
   formatConnectCliOutput,
   formatBoundedCliStderr,
+  installBoundedCliStderr,
   writeStreamAndFlush,
 } from './remote-control-state.mjs'
 
@@ -734,15 +735,8 @@ Prints one JSON result; exits 0 when connected, 1 when not.
  * @param {Record<string, unknown>} args parseArgs output
  */
 export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) {
-  let localStderr = ''
-  const origStderrWrite = getEmittedStderr ? null : process.stderr.write.bind(process.stderr)
-  if (origStderrWrite) {
-    process.stderr.write = (chunk, ...rest) => {
-      localStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-      return origStderrWrite(chunk, ...rest)
-    }
-  }
-  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderr)
+  const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
+  const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
   try {
     // Help is read before anything else: it registers, writes and calls nothing.
     if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
@@ -795,6 +789,6 @@ export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) 
     )
     process.exit(result.ok ? 0 : 1)
   } finally {
-    if (origStderrWrite) process.stderr.write = origStderrWrite
+    if (localStderrGuard) localStderrGuard.restore()
   }
 }
