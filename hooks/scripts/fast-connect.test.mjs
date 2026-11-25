@@ -1298,6 +1298,65 @@ describe('fast-connect CLI flags', () => {
         guard.restore()
         process.stderr.write = origWrite
       }
+
+      // When earlier diagnostics fill the stderr allowance, a later diagnostic MUST NOT be
+      // silently dropped — with BOTH writable notes (emits note pointer + receipt disclosure)
+      // and unwritable notes (emits recovery notice + receipt disclosure) (3c5147a7 / 91d7b47c).
+      for (const writable of [true, false]) {
+        const testHome = fs.mkdtempSync(path.join(os.tmpdir(), `cursor-fc-stderr-full-${writable ? 'rw' : 'ro'}-`))
+        if (!writable) {
+          fs.mkdirSync(path.join(testHome, '.devspec'), { recursive: true })
+          fs.writeFileSync(path.join(testHome, '.devspec', 'notes'), 'blocked')
+        }
+        let rawStderr = ''
+        const prevWrite = process.stderr.write
+        process.stderr.write = (chunk, enc, cb) => {
+          rawStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+          const done = typeof enc === 'function' ? enc : cb
+          if (typeof done === 'function') done()
+          return true
+        }
+        const fullGuard = installBoundedCliStderr({ label: 'remote-control-state', home: testHome })
+        try {
+          // Fill stderr right up to the allowance with small diagnostics, then emit a later diagnostic.
+          for (let i = 0; i < 110; i += 1) {
+            process.stderr.write(`early-diag-${i}: ${'d'.repeat(170)}\n`)
+          }
+          const laterDiag = 'IMPORTANT_LATER_DIAGNOSTIC: something failed late in connect\n'
+          process.stderr.write(laterDiag)
+          const suppressed = fullGuard.getSuppressedDiagnostics()
+          assert.ok(suppressed && suppressed.omitted_count >= 1, `expected suppressed disclosure (writable=${writable})`)
+          assert.match(rawStderr, /diagnostic omitted/, `stderr must visibly disclose omission (writable=${writable})`)
+          if (writable) {
+            assert.match(rawStderr, /notes\/[0-9a-f]{16}\.md/, 'writable omission notice must point to saved note')
+            assert.ok(suppressed.notes?.length >= 1)
+            const lastNote = suppressed.notes[suppressed.notes.length - 1]
+            const saved = readNoteText(lastNote.id, { home: testHome })
+            assert.ok(saved && saved.includes('IMPORTANT_LATER_DIAGNOSTIC'))
+          } else {
+            assert.match(rawStderr, /fix ~\/\.devspec\/notes permissions and retry/i, 'unwritable omission notice must include recovery')
+            assert.ok(suppressed.note_write_failed_count >= 1)
+          }
+          const receipt = formatConnectCliOutput(
+            { ok: true, connection_id: '11111111-1111-4111-8111-111111111111', session_id: null },
+            { home: testHome, reserve: fullGuard.getEmittedStderr(), suppressedDiagnostics: suppressed },
+          )
+          assert.ok(
+            fitsShellOutput(rawStderr + receipt),
+            `combined stderr (${rawStderr.length}) + stdout (${receipt.length}) must fit fitsShellOutput (writable=${writable})`,
+          )
+          const parsedReceipt = JSON.parse(receipt)
+          assert.ok(
+            parsedReceipt.stderr_diagnostics_omitted?.omitted_count >= 1 ||
+              parsedReceipt.stderr_omitted_count >= 1,
+            `final connect receipt must disclose omitted stderr diagnostics (writable=${writable})`,
+          )
+        } finally {
+          fullGuard.restore()
+          process.stderr.write = prevWrite
+          fs.rmSync(testHome, { recursive: true, force: true })
+        }
+      }
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
     }

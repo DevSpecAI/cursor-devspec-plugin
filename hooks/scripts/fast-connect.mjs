@@ -734,9 +734,18 @@ Prints one JSON result; exits 0 when connected, 1 when not.
  * CLI entry for `remote-control-state.mjs fast-connect …`.
  * @param {Record<string, unknown>} args parseArgs output
  */
-export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) {
+export async function runFastConnectCli(
+  args,
+  { getEmittedStderr = null, getSuppressedDiagnostics = null } = {},
+) {
   const localStderrGuard = getEmittedStderr ? null : installBoundedCliStderr({ label: 'fast-connect' })
   const currentStderr = () => (getEmittedStderr ? getEmittedStderr() : localStderrGuard.getEmittedStderr())
+  const currentSuppressed = () =>
+    getSuppressedDiagnostics
+      ? getSuppressedDiagnostics()
+      : localStderrGuard
+        ? localStderrGuard.getSuppressedDiagnostics()
+        : null
   try {
     // Help is read before anything else: it registers, writes and calls nothing.
     if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
@@ -785,7 +794,10 @@ export async function runFastConnectCli(args, { getEmittedStderr = null } = {}) 
 
     await writeStreamAndFlush(
       process.stdout,
-      formatConnectCliOutput(result, { reserve: currentStderr() }),
+      formatConnectCliOutput(result, {
+        reserve: currentStderr(),
+        suppressedDiagnostics: currentSuppressed(),
+      }),
     )
     process.exit(result.ok ? 0 : 1)
   } finally {
