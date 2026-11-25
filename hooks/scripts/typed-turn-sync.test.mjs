@@ -1745,4 +1745,160 @@ describe('typed-turn-sync (item da03801e)', () => {
       'unrelated timestamp-only wake after an automation wake must remain unstated, never stamped none',
     )
   })
+
+  it('clears an UNANSWERED room command restored by a matched background wake when a later timestamp-only wake arrives (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ROOM_CMD = '77777777-7777-4777-8777-777777777777'
+    appendRequestEvent(CONN, { op: 'open', id: ROOM_CMD, kind: 'command', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: ROOM_CMD }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'unans-bg-1', kind: 'shell', notifies: true, request: ROOM_CMD, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'unans-bg-2', kind: 'shell', notifies: true, request: ROOM_CMD, also: [] }, { dir })
+    // Room command is still UNANSWERED; its first foreground turn cleared current (e.g. another turn ran).
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+
+    // Wake 1: matched <task-notification> restores the unanswered room command.
+    const matchedWake1 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>unans-bg-1</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${matchedWake1}\n`)
+    const wake1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake1.action, 'restored_wake_request')
+    assert.equal(wake1.requestId, ROOM_CMD)
+    assert.equal(readRequestState(CONN, { dir }).current, ROOM_CMD)
+    assert.deepEqual(stampRequest('create_task', { title: 'Matched wake 1 write' }, CONN, null, { home }), {
+      args: { title: 'Matched wake 1 write', request_ref: ROOM_CMD },
+    })
+
+    // Wake 1 ends, then Wake 2 (a later unrelated timestamp-only wake) arrives while ROOM_CMD is still unanswered:
+    // Wake 2 MUST clear ROOM_CMD from foreground current so writes go out unstamped (unknown requester).
+    const tsWake2 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 11:05 PM (UTC)</timestamp>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${matchedWake1}\n${turnEndedRow('success')}\n${tsWake2}\n`)
+    const wake2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake2.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    assert.deepEqual(
+      stampRequest('create_task', { title: 'Unrelated timestamp wake 2 write' }, CONN, null, { home }),
+      { args: { title: 'Unrelated timestamp wake 2 write' } },
+      'second timestamp-only wake must not inherit an unanswered room command from an earlier wake turn',
+    )
+
+    // ROOM_CMD remains open, so a later matched completion for unans-bg-2 still restores it.
+    const matchedWake3 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>unans-bg-2</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${matchedWake1}\n${tsWake2}\n${matchedWake3}\n`)
+    const wake3 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wake3.action, 'restored_wake_request')
+    assert.equal(wake3.requestId, ROOM_CMD)
+  })
+
+  it('persists server-opened typed requests across separate OS processes when local open fails before turn_ended (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(reqLog, { recursive: true }) // force appendRequestEvent to fail
+    fs.writeFileSync(transcriptPath, `${typedRow('Cross-process local open failure')}\n`)
+    let openedId = null
+    const memo1 = {}
+    try {
+      const first = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openedId = args.request_id
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo: memo1,
+        log: () => {},
+      })
+      assert.equal(first.action, 'open_write_failed')
+      assert.ok(openedId)
+      assert.equal(memo1.synced, false)
+
+      // Turn ends before a fresh OS poller process starts.
+      fs.writeFileSync(transcriptPath, `${typedRow('Cross-process local open failure')}\n${turnEndedRow('success')}\n`)
+      const { execFileSync } = await import('node:child_process')
+      const { fileURLToPath } = await import('node:url')
+      const syncModulePath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'typed-turn-sync.mjs')
+      const runFreshPoller = () =>
+        JSON.parse(
+          execFileSync(
+            process.execPath,
+            [
+              '--input-type=module',
+              '-e',
+              `
+                import { syncTypedTurnFromTranscript } from ${JSON.stringify(syncModulePath)};
+                const memo = {};
+                const res = await syncTypedTurnFromTranscript({
+                  connectionId: ${JSON.stringify(CONN)},
+                  transcriptPath: ${JSON.stringify(transcriptPath)},
+                  connectionCapability: 'cap-secret',
+                  dir: ${JSON.stringify(dir)},
+                  memo,
+                  log: () => {},
+                });
+                process.stdout.write(JSON.stringify({ res, synced: memo.synced }));
+              `,
+            ],
+            { encoding: 'utf8' },
+          ),
+        )
+
+      // Fresh process #1 while requests.jsonl is still blocked: MUST NOT mark transcript synced!
+      const blockedRun = runFreshPoller()
+      assert.equal(blockedRun.res.action, 'open_write_failed')
+      assert.equal(blockedRun.res.requestId, openedId)
+      assert.equal(blockedRun.synced, false)
+
+      // Restore disk writability; fresh process #2 MUST persist the server-opened request & mark synced.
+      fs.rmSync(reqLog, { recursive: true, force: true })
+      const recoveredRun = runFreshPoller()
+      assert.equal(recoveredRun.synced, true)
+      const persisted = readRequestState(CONN, { dir })
+      assert.equal(persisted.open.has(openedId), true, 'fresh poller must persist open event for server-accepted request')
+      assert.equal(persisted.started.has(openedId), true, 'fresh poller must mark recovered request started so idle cleanup closes it')
+      assert.equal(persisted.seenTranscriptTurns.size, 1)
+      assert.equal(fs.existsSync(path.join(dir, `${CONN}.pending-opens.json`)), false, 'sidecar must be cleaned up after flush')
+    } finally {
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+  })
 })

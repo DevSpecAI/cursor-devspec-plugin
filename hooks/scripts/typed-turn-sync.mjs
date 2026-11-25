@@ -34,6 +34,7 @@ import {
 import { activeTranscriptTurn, STABLE_READ_ATTEMPTS } from './transcript-turn-end.mjs'
 import { localTurnScope, localTurnToComplete, startLocalTurn } from './local-turn.mjs'
 import { completionArguments } from './turn-commands.mjs'
+import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 
 const DEFAULT_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
@@ -266,6 +267,116 @@ function pendingOpenKey(dir, connectionId, turnKey) {
   return `${path.resolve(dir)}|${connectionId}|${turnKey}`
 }
 
+function pendingOpensSidecarPath(dir, connectionId) {
+  return path.join(dir, `${connectionId}.pending-opens.json`)
+}
+
+function pendingOpensFallbackPath(dir, connectionId) {
+  const uid = typeof process.getuid === 'function' ? String(process.getuid()) : 'user'
+  const digest = createHash('sha256').update(`${path.resolve(dir)}|${connectionId}`).digest('hex').slice(0, 16)
+  return path.join(os.tmpdir(), `devspec-pending-opens-${uid}`, `${digest}.json`)
+}
+
+function readPendingOpensFile(filePath, { verifyOwnerDir = false } = {}) {
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    if (verifyOwnerDir) {
+      const dirStat = fs.lstatSync(path.dirname(filePath))
+      if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return {}
+      if (typeof process.getuid === 'function' && dirStat.uid !== process.getuid()) return {}
+    }
+    const parsed = readPrivateJson(filePath)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function writePendingOpensFile(filePath, entriesObj, { verifyOwnerDir = false } = {}) {
+  const keys = Object.keys(entriesObj)
+  if (keys.length === 0) {
+    try {
+      if (fs.existsSync(filePath)) fs.rmSync(filePath, { force: true })
+    } catch {
+      /* ignore */
+    }
+    return true
+  }
+  try {
+    if (verifyOwnerDir) {
+      const baseDir = path.dirname(filePath)
+      fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 })
+      try {
+        fs.chmodSync(baseDir, 0o700)
+      } catch {
+        /* ignore on platforms without POSIX modes */
+      }
+      const dirStat = fs.lstatSync(baseDir)
+      if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return false
+      if (typeof process.getuid === 'function' && dirStat.uid !== process.getuid()) return false
+    }
+    writePrivateJson(filePath, entriesObj)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Persist a server-opened typed request whose local `requests.jsonl` append failed so
+ * even a separate OS process (such as a fresh poller starting after `turn_ended`) sees
+ * and flushes the open record instead of marking the transcript synced (req 3ea2b201).
+ */
+function savePendingLocalOpen(dir, connectionId, entry) {
+  if (!entry?.requestId || !entry?.turnKey) return
+  const pKey = pendingOpenKey(dir, connectionId, entry.turnKey)
+  pendingLocalOpens.set(pKey, entry)
+  const primaryPath = pendingOpensSidecarPath(dir, connectionId)
+  const fallbackPath = pendingOpensFallbackPath(dir, connectionId)
+  const merged = {
+    ...readPendingOpensFile(fallbackPath, { verifyOwnerDir: true }),
+    ...readPendingOpensFile(primaryPath),
+    [entry.turnKey]: entry,
+  }
+  if (!writePendingOpensFile(primaryPath, merged)) {
+    writePendingOpensFile(fallbackPath, merged, { verifyOwnerDir: true })
+  }
+}
+
+function deletePendingLocalOpen(dir, connectionId, pKey, turnKey = null, requestId = null) {
+  if (pKey) pendingLocalOpens.delete(pKey)
+  if (turnKey) pendingLocalOpens.delete(pendingOpenKey(dir, connectionId, turnKey))
+  for (const [filePath, verifyOwnerDir] of [
+    [pendingOpensSidecarPath(dir, connectionId), false],
+    [pendingOpensFallbackPath(dir, connectionId), true],
+  ]) {
+    const existing = readPendingOpensFile(filePath, { verifyOwnerDir })
+    let changed = false
+    for (const [k, v] of Object.entries(existing)) {
+      if ((turnKey && k === turnKey) || (requestId && v?.requestId === requestId)) {
+        delete existing[k]
+        changed = true
+      }
+    }
+    if (changed) writePendingOpensFile(filePath, existing, { verifyOwnerDir })
+  }
+}
+
+function getPendingLocalOpen(dir, connectionId, turnKey) {
+  const pKey = pendingOpenKey(dir, connectionId, turnKey)
+  const mem = pendingLocalOpens.get(pKey)
+  if (mem) return mem
+  const persisted =
+    readPendingOpensFile(pendingOpensSidecarPath(dir, connectionId))[turnKey] ??
+    readPendingOpensFile(pendingOpensFallbackPath(dir, connectionId), { verifyOwnerDir: true })[turnKey] ??
+    null
+  if (persisted?.requestId && persisted?.turnKey) {
+    pendingLocalOpens.set(pKey, persisted)
+    return persisted
+  }
+  return null
+}
+
 function failedTurnKey(dir, connectionId) {
   return `${path.resolve(dir)}|${connectionId}`
 }
@@ -367,6 +478,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       )
       if (!startedOk) return false
       entry.restoreForeground = fg
+      savePendingLocalOpen(dir, connectionId, entry)
     }
     if (!fg.currentRestored) {
       if (reqState.current === entry.requestId || !reqState.started.has(entry.requestId)) {
@@ -381,6 +493,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
         )
         if (!restoredOk) return false
         fg.currentRestored = true
+        savePendingLocalOpen(dir, connectionId, entry)
       } else {
         // A newer foreground turn already replaced `current` before retry;
         // do not overwrite it with older foreground state.
@@ -405,7 +518,8 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
     )
     if (!boundOk) return false
   }
-  pendingLocalOpens.delete(pKey)
+  deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+  clearFailedTypedTurn(dir, connectionId, entry.turnKey)
   return true
 }
 
@@ -432,11 +546,23 @@ export function pendingWorkWithoutHostLists(reqState) {
 
 function pendingOpensForConnection(dir, connectionId) {
   const prefix = `${path.resolve(dir)}|${connectionId}|`
-  const matches = []
-  for (const [key, entry] of pendingLocalOpens) {
-    if (key.startsWith(prefix)) matches.push([key, entry])
+  const byKey = new Map()
+  for (const [filePath, verifyOwnerDir] of [
+    [pendingOpensFallbackPath(dir, connectionId), true],
+    [pendingOpensSidecarPath(dir, connectionId), false],
+  ]) {
+    const persisted = readPendingOpensFile(filePath, { verifyOwnerDir })
+    for (const [turnKey, entry] of Object.entries(persisted)) {
+      if (entry?.requestId && (entry?.turnKey || turnKey)) {
+        const normalized = { ...entry, turnKey: entry.turnKey || turnKey }
+        byKey.set(pendingOpenKey(dir, connectionId, normalized.turnKey), normalized)
+      }
+    }
   }
-  return matches
+  for (const [key, entry] of pendingLocalOpens) {
+    if (key.startsWith(prefix)) byKey.set(key, entry)
+  }
+  return [...byKey.entries()]
 }
 
 /**
@@ -667,7 +793,7 @@ export async function syncTypedTurnFromTranscript({
             requestedBy = opened.requestedBy ?? null
           } else if (opened.localPersistFailed) {
             if (opened.requestId) {
-              pendingLocalOpens.set(pendingOpenKey(dir, connectionId, queuedKey), {
+              savePendingLocalOpen(dir, connectionId, {
                 requestId: opened.requestId,
                 requestedBy: opened.requestedBy ?? null,
                 turnKey: queuedKey,
@@ -696,7 +822,7 @@ export async function syncTypedTurnFromTranscript({
         }
         const pKey = pendingOpenKey(dir, connectionId, queuedKey)
         const entry = { requestId, requestedBy, turnKey: queuedKey }
-        pendingLocalOpens.set(pKey, entry)
+        savePendingLocalOpen(dir, connectionId, entry)
         const persisted = flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)
         clearFailedTypedTurn(dir, connectionId, queuedKey)
         if (!persisted) {
@@ -819,13 +945,14 @@ export async function syncTypedTurnFromTranscript({
   }
 
   // A live non-typed turn (timestamp-only wake or command_turn wake) must not inherit an
-  // unrelated earlier typed_prompt OR an already-answered room command restored by a prior
-  // background wake — even if an unnotified background job or scheduled run exists — unless
-  // this wake was explicitly restored by host promptArrival (`currentFromWake`) or carried
-  // an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
+  // unrelated earlier typed_prompt OR a room command (answered OR unanswered) restored by
+  // a prior background wake — even if an unnotified background job or scheduled run exists —
+  // unless this wake was explicitly restored by host promptArrival (`currentFromWake`) or
+  // carried an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
     if (reqState.current === NO_REQUEST) return true
+    if (reqState.currentFromWake || reqState.currentBoundByWake) return true
     const info = reqState.open.get(reqState.current)
     if (!info) return false
     return info.kind === 'typed_prompt' || (info.kind === 'command' && info.answered === true)
@@ -913,7 +1040,7 @@ export async function syncTypedTurnFromTranscript({
         }
       }
       const pKey = pendingOpenKey(dir, connectionId, active.key)
-      const pendingOpen = !requestId ? pendingLocalOpens.get(pKey) ?? null : null
+      const pendingOpen = !requestId ? getPendingLocalOpen(dir, connectionId, active.key) : null
 
       if (pendingOpen) {
         const persisted = appendRequestEvent(
@@ -939,7 +1066,7 @@ export async function syncTypedTurnFromTranscript({
             },
           }
         }
-        pendingLocalOpens.delete(pKey)
+        deletePendingLocalOpen(dir, connectionId, pKey, active.key, pendingOpen.requestId)
         requestId = pendingOpen.requestId
         openedNow = true
         const currentWritten = appendRequestEvent(
@@ -972,7 +1099,7 @@ export async function syncTypedTurnFromTranscript({
           }
         } else if (opened.localPersistFailed) {
           if (opened.requestId) {
-            pendingLocalOpens.set(pKey, {
+            savePendingLocalOpen(dir, connectionId, {
               requestId: opened.requestId,
               requestedBy: opened.requestedBy ?? null,
               turnKey: active.key,
@@ -1213,7 +1340,7 @@ export async function finishIdleRequests({
     if (ok) {
       closed.push(candidateId)
       for (const [pKey, entry] of pendingEntries) {
-        if (entry.requestId === candidateId) pendingLocalOpens.delete(pKey)
+        if (entry.requestId === candidateId) deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
       }
       rotateRequestLog(connectionId, { dir })
     } else {
@@ -1242,7 +1369,7 @@ export async function finishIdleRequests({
       serverClosed = /unknown request/i.test(String(err?.message ?? err))
     }
     if (serverClosed) {
-      pendingLocalOpens.delete(pendingKey)
+      deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
       // Best-effort close record if disk is writable again; request was never opened on disk.
       appendRequestEvent(connectionId, { op: 'close', id: pendingEntry.requestId }, { dir })
       closed.push(pendingEntry.requestId)

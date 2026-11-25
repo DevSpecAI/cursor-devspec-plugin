@@ -102,6 +102,7 @@ function uuids(value) {
  *   schedules: Array<{ prompt: string, request: string, also: string[], id: string|null }>,
  *   current: string|null,
  *   currentFromWake: boolean,
+ *   currentBoundByWake: boolean,
  *   joined: Set<string>,
  *   chosen: boolean,
  *   seenTranscriptTurns: Map<string, string|null>,
@@ -118,6 +119,7 @@ export function reduceRequestLog(text) {
   const failedTranscriptTurns = new Set()
   let current = null
   let currentFromWake = false
+  let currentBoundByWake = false
   let joined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
@@ -146,12 +148,14 @@ export function reduceRequestLog(text) {
         if (current === event.id) {
           current = null
           currentFromWake = false
+          currentBoundByWake = false
         }
         break
       case 'current':
         // A new turn: what it carries starts again from what woke it.
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
+        currentBoundByWake = false
         joined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
@@ -176,6 +180,7 @@ export function reduceRequestLog(text) {
           joined.delete(next ?? UNSTATED)
           current = next
           currentFromWake = false
+          currentBoundByWake = false
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
@@ -192,6 +197,7 @@ export function reduceRequestLog(text) {
         if (current === event.id) {
           current = null
           currentFromWake = false
+          currentBoundByWake = false
         }
         joined.delete(event.id)
         break
@@ -201,10 +207,13 @@ export function reduceRequestLog(text) {
           const boundRef = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
           seenTranscriptTurns.set(event.key, boundRef)
           failedTranscriptTurns.delete(event.key)
-          // Once a transcript turn binds the wake-restored current request, a
-          // subsequent unrelated wake must not also treat that stale current as
-          // freshly restored for itself.
-          if (current !== null && boundRef === current) currentFromWake = false
+          // Once a transcript turn binds the wake-restored current request, mark
+          // it bound by that wake so a subsequent unrelated wake clears it
+          // (even for an unanswered room command) instead of inheriting it.
+          if (current !== null && boundRef === current) {
+            if (currentFromWake) currentBoundByWake = true
+            currentFromWake = false
+          }
         }
         break
       case 'typed_turn_failed':
@@ -254,7 +263,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, currentFromWake, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, started, launches, schedules, current, currentFromWake, currentBoundByWake, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
