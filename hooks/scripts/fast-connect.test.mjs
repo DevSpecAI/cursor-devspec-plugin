@@ -1165,6 +1165,7 @@ describe('fast-connect CLI flags', () => {
         assert.ok(fitsShellOutput(r2.stdout + r2.stderr))
         assert.match(r2.stderr, /actual_length 24000/)
         assert.match(r2.stderr, /shell_limit_chars 20000/)
+        assert.match(r2.stderr, /fix write permissions on ~\/\.devspec\/notes/i)
       } finally {
         fs.rmSync(brokenHome, { recursive: true, force: true })
       }
@@ -1244,6 +1245,59 @@ describe('fast-connect CLI flags', () => {
             assert.equal(err.complete_output_note_failed, true)
             return true
           },
+        )
+        // Default unwritable-note fallback on formatBoundedCliStderr must include concrete recovery instructions.
+        const defaultUnwritableDiag = formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2 })
+        assert.ok(fitsShellOutput(defaultUnwritableDiag))
+        assert.match(defaultUnwritableDiag, /fix write permissions on ~\/\.devspec\/notes and retry/i)
+
+        // When connect note writing fails after earlier stderr diagnostics were saved in notes,
+        // both the minimal fallback (oversized error field) AND tight-reserve fallbackObj MUST
+        // preserve stderr_diagnostics_omitted counts and saved note read commands (3c5147a7 / 91d7b47c).
+        const savedNotes = Array.from({ length: 12 }, (_, idx) => {
+          const id = `${String(idx + 1).padStart(16, '0')}`
+          return { id, command: `cat ~/.devspec/notes/${id}.md`, length: 400 }
+        })
+        const suppressedWithSavedNotes = {
+          omitted_count: 12,
+          omitted_chars: 4800,
+          shell_limit_chars: 20_000,
+          notes: savedNotes,
+          recovery: 'Read saved stderr notes using the cat commands above.',
+        }
+        const minimalNoteFailOut = formatFastConnectCliOutput(
+          { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+          { home: brokenHome2, suppressedDiagnostics: suppressedWithSavedNotes },
+        )
+        assert.ok(fitsShellOutput(minimalNoteFailOut))
+        const parsedMinimalNoteFail = JSON.parse(minimalNoteFailOut)
+        assert.equal(parsedMinimalNoteFail.omitted_fields_due_to_shell_limit, true)
+        assert.equal(parsedMinimalNoteFail.stderr_diagnostics_omitted?.omitted_count, 12)
+        assert.equal(parsedMinimalNoteFail.stderr_diagnostics_omitted?.notes?.length, 12)
+        assert.equal(
+          parsedMinimalNoteFail.stderr_diagnostics_omitted.notes[0].command,
+          'cat ~/.devspec/notes/0000000000000001.md',
+        )
+        assert.match(parsedMinimalNoteFail.recovery, /stderr_diagnostics_omitted\.notes/)
+
+        const tightStderrReserve = 'e'.repeat(18_900)
+        const trimmedFallbackOut = formatFastConnectCliOutput(
+          { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
+          {
+            home: brokenHome2,
+            reserve: tightStderrReserve,
+            suppressedDiagnostics: suppressedWithSavedNotes,
+          },
+        )
+        assert.ok(fitsShellOutput(tightStderrReserve + trimmedFallbackOut))
+        const parsedTrimmed = JSON.parse(trimmedFallbackOut)
+        assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.omitted_count, 12)
+        assert.equal(parsedTrimmed.stderr_diagnostics_omitted?.notes_total_count, 12)
+        assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_returned_count >= 1)
+        assert.ok(parsedTrimmed.stderr_diagnostics_omitted?.notes_omitted_count >= 1)
+        assert.equal(
+          parsedTrimmed.stderr_diagnostics_omitted.notes[0].command,
+          'cat ~/.devspec/notes/0000000000000001.md',
         )
       } finally {
         fs.rmSync(brokenHome2, { recursive: true, force: true })

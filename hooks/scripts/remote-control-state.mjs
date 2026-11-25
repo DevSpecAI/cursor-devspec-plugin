@@ -1914,7 +1914,7 @@ export function formatBoundedCliStderr(
   const fb =
     typeof fallback === 'string' && fallback
       ? fallback
-      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed.\n`
+      : `${label}: ${meta}diagnostic (${text.length} chars) exceeded Cursor's ${CURSOR_SHELL_OUTPUT_MAX_CHARS}-character Shell output ceiling and note fallback failed — fix write permissions on ~/.devspec/notes and retry so the complete diagnostic can be saved whole and read back.\n`
   if (fitsShellOutput(`${prior}${fb}`)) return fb
   const omitted = `${label}: diagnostic omitted (${text.length} chars > ${CURSOR_SHELL_OUTPUT_MAX_CHARS}); note write failed — fix ~/.devspec/notes permissions and retry.\n`
   if (fitsShellOutput(`${prior}${omitted}`)) return omitted
@@ -1940,9 +1940,10 @@ function buildStderrOmissionNotice(label, { length, note = null } = {}) {
 
 /**
  * Headroom reserved on CLI stderr so the final stdout connect receipt (or note-failure
- * refusal, including any `stderr_diagnostics_omitted` disclosure) always fits inside
- * Cursor's combined Shell output ceiling (`fitsShellOutput`, reqs 3c5147a7 / 91d7b47c).
- * Derived from the actual fallback receipt structure rather than a bare constant.
+ * refusal, including any `stderr_diagnostics_omitted` disclosure and saved note command)
+ * always fits inside Cursor's combined Shell output ceiling (`fitsShellOutput`,
+ * reqs 3c5147a7 / 91d7b47c). Derived from the actual fallback receipt structure rather
+ * than a bare constant.
  */
 const CLI_STDOUT_RECEIPT_HEADROOM =
   JSON.stringify(
@@ -1959,12 +1960,22 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
         omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         omitted_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
         shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes: [
+          {
+            id: '0'.repeat(16),
+            command: 'cat ~/.devspec/notes/0000000000000000.md',
+            length: CURSOR_SHELL_OUTPUT_MAX_CHARS * 10,
+          },
+        ],
+        notes_total_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes_returned_count: 1,
+        notes_omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         recovery:
           'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.',
       },
       recovery:
-        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).',
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.',
     },
     null,
     2,
