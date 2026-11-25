@@ -1067,6 +1067,8 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let lastParsedRow = null
   let lastStart = 0
   let lastNonResumedText = null
+  let sawTurnEndedSinceLastNonResumed = false
+  let lastNonResumedPrecededByTurnEnded = false
   const userRows = []
   let start = 0
   while (start < bytes.length) {
@@ -1101,8 +1103,28 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           lastUser = userDigest
           const rawText = userRowText(row)
           const kind = userRowKind(rawText)
-          if (kind !== 'resumed') lastNonResumedText = rawText
+          if (kind !== 'resumed') {
+            lastNonResumedText = rawText
+            lastNonResumedPrecededByTurnEnded = sawTurnEndedSinceLastNonResumed
+            sawTurnEndedSinceLastNonResumed = false
+          }
           userRows.push({ start, kind, digest: lastUser })
+        }
+      } else {
+        const hasTurnEndedMarker = sliceContainsMarker(bytes, s, e, TURN_ENDED_MARKER, deadlineMs)
+        if (hasTurnEndedMarker === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+        if (hasTurnEndedMarker) {
+          let row = null
+          try {
+            row = parseJsonSliceBounded(bytes, s, e, deadlineMs)
+          } catch {
+            /* not a whole row */
+          }
+          if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+          lastParsedRow = row
+          if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
+            sawTurnEndedSinceLastNonResumed = true
+          }
         }
       }
     }
@@ -1138,7 +1160,16 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   if (deadlineMs !== null && Date.now() >= deadlineMs) {
     return { budgetExhausted: true }
   }
-  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest, userRows, lastNonResumedText }
+  return {
+    turns,
+    lastUser,
+    end,
+    lastLineStart: lastStart,
+    lastLineDigest,
+    userRows,
+    lastNonResumedText,
+    lastNonResumedPrecededByTurnEnded,
+  }
 }
 
 function digest(text) {
@@ -1156,6 +1187,8 @@ function extractUserQueryText(rawText) {
  * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
  * Only intra-turn `resumed` rows are skipped; a `timestamp`-only wake row is returned
  * as `kind: 'timestamp'` so it never falls back to an earlier typed prompt.
+ * Also reports all `typed` user row keys in chronological order (`typedTurnKeys`) and
+ * whether a `turn_ended` row separated the latest non-resumed row from the turn before it.
  * Returns `{ budgetExhausted: true }` when `deadlineMs` expires before a clean read
  * completes, or null when the transcript cannot be read or does not exist yet.
  */
@@ -1167,11 +1200,15 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
   if (!read || read.missing) return null
   let lastIndex = -1
   let lastRow = null
-  for (let i = read.userRows.length - 1; i >= 0; i -= 1) {
-    if (read.userRows[i].kind !== 'resumed') {
+  const typedTurnKeys = []
+  for (let i = 0; i < read.userRows.length; i += 1) {
+    const row = read.userRows[i]
+    if (row.kind === 'typed') {
+      typedTurnKeys.push(`${conversation}#${i + 1}#${row.digest}`)
+    }
+    if (row.kind !== 'resumed') {
       lastIndex = i + 1
-      lastRow = read.userRows[i]
-      break
+      lastRow = row
     }
   }
   const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
@@ -1179,6 +1216,8 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
     kind: lastRow ? lastRow.kind : 'none',
     ended: Boolean(read.end),
     key: lastRow ? `${conversation}#${lastIndex}#${lastRow.digest}` : null,
+    typedTurnKeys,
+    precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
     stamp: read.stamp,
     turns: read.turns,
     rawText,

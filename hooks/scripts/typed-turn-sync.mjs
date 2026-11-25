@@ -165,16 +165,30 @@ export function typedTurnSyncPending({ transcriptPath, memo = null } = {}) {
 }
 
 /**
- * Record the connect turn's own typed prompt as already observed so `/devspec-remote`
- * itself does not open a stray `typed_prompt` request right as the connection starts.
+ * Record the connect turn's own typed prompt (and any pre-connect typed turns already
+ * present in the transcript) as observed so `/devspec-remote` and historical pre-connect
+ * turns do not open stray `typed_prompt` requests right as the connection starts.
  */
 export function recordConnectTurnBaseline(connectionId, transcriptPath, { dir = DEFAULT_DIR, attempts = STABLE_READ_ATTEMPTS } = {}) {
   if (!connectionId || !transcriptPath) return false
   const active = activeTranscriptTurn(transcriptPath, { attempts })
-  if (!active || active.kind !== 'typed' || !active.key) return false
+  if (!active) return false
+  const keys =
+    Array.isArray(active.typedTurnKeys) && active.typedTurnKeys.length > 0
+      ? active.typedTurnKeys
+      : active.kind === 'typed' && active.key
+        ? [active.key]
+        : []
+  if (keys.length === 0) return false
   const reqState = readRequestState(connectionId, { dir })
-  if (reqState.seenTranscriptTurns.has(active.key)) return false
-  return appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })
+  let wrote = false
+  for (const key of keys) {
+    if (reqState.seenTranscriptTurns.has(key)) continue
+    if (appendRequestEvent(connectionId, { op: 'transcript_turn', key, ref: null }, { dir })) {
+      wrote = true
+    }
+  }
+  return wrote
 }
 
 /**
@@ -194,7 +208,7 @@ function unboundOpenTypedPrompt(reqState) {
 
 /**
  * Whether a live, unanswered room command owns the currently running turn (in which case
- * a typed prompt added during it joins the turn rather than silently replacing it).
+ * a typed prompt or wake added during it joins the turn rather than silently replacing it).
  */
 function hasActiveRemoteCommandTurn(connectionId, reqState, dir) {
   if (!reqState?.current) return false
@@ -206,6 +220,18 @@ function hasActiveRemoteCommandTurn(connectionId, reqState, dir) {
   } catch {
     return false
   }
+}
+
+/**
+ * Whether a live terminal-typed turn (not already separated by `turn_ended` and not
+ * restored from a prior wake) owns the currently running turn so a mid-turn background
+ * completion joins it rather than replacing it and erasing two-person attribution
+ * (decision ce71a72b).
+ */
+function hasActiveTypedTurn(reqState, active) {
+  if (!reqState?.current || active?.precededByTurnEnded) return false
+  if (reqState.currentFromWake || reqState.currentBoundByWake) return false
+  return reqState.open.get(reqState.current)?.kind === 'typed_prompt'
 }
 
 /**
@@ -857,23 +883,55 @@ export async function syncTypedTurnFromTranscript({
     memo.stamp = active.stamp
     memo.synced = false
   }
-  if (active.ended || !active.key) {
-    // If the poller first observes a typed turn AFTER turn_ended and it was never
-    // registered (nor baselined at connect), queue it so it is registered now or
-    // remains queued for retry — never marking the transcript synced while skipped
-    // work is unregistered (requirement 3ea2b201).
-    if (active.ended && active.kind === 'typed' && active.key) {
-      const endedState = readRequestState(connectionId, { dir })
+  const enqueueUnseenTypedTurns = (excludeLiveKey = null) => {
+    const typedKeys =
+      Array.isArray(active.typedTurnKeys) && active.typedTurnKeys.length > 0
+        ? active.typedTurnKeys
+        : active.kind === 'typed' && active.key
+          ? [active.key]
+          : []
+    if (typedKeys.length === 0) return
+    const reqState = readRequestState(connectionId, { dir })
+    const unseen = typedKeys.filter(
+      (key) =>
+        key !== excludeLiveKey &&
+        !reqState.seenTranscriptTurns.has(key) &&
+        !getPendingLocalOpen(dir, connectionId, key),
+    )
+    if (unseen.length === 0) return
+    const boundRefs = new Set(reqState.seenTranscriptTurns.values())
+    const pendingIds = new Set(pendingOpensForConnection(dir, connectionId).map(([, e]) => e.requestId))
+    let unboundHookCount = 0
+    for (const [id, info] of reqState.open) {
       if (
-        !endedState.seenTranscriptTurns.has(active.key) &&
-        !getPendingLocalOpen(dir, connectionId, active.key)
+        info.kind === 'typed_prompt' &&
+        !boundRefs.has(id) &&
+        !pendingIds.has(id) &&
+        !isFailedTurnDeterministicId(dir, connectionId, id, null) &&
+        (!excludeLiveKey || id !== deterministicTypedTurnRequestId(connectionId, excludeLiveKey))
       ) {
-        recordFailedTypedTurn(dir, connectionId, active.key)
+        unboundHookCount += 1
       }
     }
+    const priorHookCount =
+      excludeLiveKey && unboundOpenTypedPrompt(reqState)
+        ? Math.max(0, unboundHookCount - 1)
+        : unboundHookCount
+    for (const key of unseen.slice(priorHookCount)) {
+      recordFailedTypedTurn(dir, connectionId, key)
+    }
+  }
+
+  // Queue every previously unseen typed turn (not covered by an open hook-created
+  // typed_prompt and not the live typed turn being opened right below) BEFORE
+  // advancing sync state so two (or more) typed turns that finish between poller
+  // reads are never skipped or marked synced prematurely (requirement 3ea2b201).
+  enqueueUnseenTypedTurns(!active.ended && active.kind === 'typed' ? active.key : null)
+
+  if (active.ended || !active.key) {
     const flush = await retryQueuedFailedTurn({ excludeKey: null })
     if (flush.ran) {
-      if (memo && flush.ok) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) memo.synced = true
       return {
         ...flush.result,
         ...(active.ended ? { ended: true } : {}),
@@ -936,7 +994,9 @@ export async function syncTypedTurnFromTranscript({
           }
           return { action: 'already_carried_wake', requestId: reqState.current, key: active.key, active }
         }
-        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
+        const midTurn =
+          hasActiveRemoteCommandTurn(connectionId, reqState, dir) ||
+          hasActiveTypedTurn(reqState, active)
         const events = wake.direct
           ? promptArrival({
               fromAPerson: false,
@@ -960,7 +1020,13 @@ export async function syncTypedTurnFromTranscript({
         if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref }, { dir })) {
           return { action: 'binding_write_failed', requestId: ref, key: active.key, active }
         }
-        return { action: 'restored_wake_request', requestId: ref, key: active.key, active }
+        return {
+          action: 'restored_wake_request',
+          requestId: ref,
+          key: active.key,
+          active,
+          ...(midTurn ? { midTurn: true } : {}),
+        }
       },
       { deadlineMs },
     )
@@ -1318,7 +1384,23 @@ export async function finishIdleRequests({
       ? pendingEntries.find(([, entry]) => active.key && entry.turnKey === active.key) ?? pendingEntries[0]
       : null
 
-  if (!candidateId && !pendingFallback && !localAttemptId) return { closed: [], localCompleted: false }
+  const clearEndedForeground = () => {
+    const curState = readRequestState(connectionId, { dir })
+    if (!curState.current) return
+    const curInfo = curState.open.get(curState.current)
+    const shouldClear =
+      curState.currentFromWake ||
+      curState.currentBoundByWake ||
+      curInfo?.kind === 'typed_prompt'
+    if (shouldClear) {
+      appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+    }
+  }
+
+  if (!candidateId && !pendingFallback && !localAttemptId) {
+    clearEndedForeground()
+    return { closed: [], localCompleted: false }
+  }
 
   let localCompleted = false
   let localCompleteRefusal = null
@@ -1417,6 +1499,8 @@ export async function finishIdleRequests({
       log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
     }
   }
+
+  if (!closeRefusal) clearEndedForeground()
 
   return {
     closed,

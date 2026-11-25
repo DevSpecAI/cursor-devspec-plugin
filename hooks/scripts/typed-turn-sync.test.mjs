@@ -1989,4 +1989,182 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(after.joined.has(REQ_BOB), true, 'must keep joined launcher request distinct')
     assert.ok(turnAmbiguity(after), 'two-person ambiguity must remain intact so writes ask which person they serve')
   })
+
+  it('queues and registers ALL previously unseen typed turns that finish between poller reads without marking synced early (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    fs.writeFileSync(
+      transcriptPath,
+      `${typedRow('First unseen typed turn')}\n${typedRow('Second unseen typed turn')}\n${turnEndedRow('success')}\n`,
+    )
+    const memo = {}
+    const opened = []
+    const callRequest = async (args) => {
+      opened.push(args)
+      return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+    }
+
+    // Poll 1: registers Turn 1, MUST leave Turn 2 queued and memo.synced === false!
+    const first = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(first.action, 'opened')
+    assert.equal(first.ended, true)
+    assert.equal(opened.length, 1)
+    assert.equal(memo.synced, false, 'must NOT mark transcript synced while a second unseen typed turn remains queued')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true, 'typedTurnSyncPending must remain true until all unseen turns are registered')
+    assert.equal(readRequestState(CONN, { dir }).failedTranscriptTurns.size, 1)
+
+    // Poll 2 (same unchanged transcript snapshot): registers Turn 2 and ONLY THEN marks synced!
+    const second = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(second.action, 'opened')
+    assert.equal(second.ended, true)
+    assert.notEqual(second.requestId, first.requestId)
+    assert.equal(opened.length, 2, 'both unseen typed turns must be registered')
+    assert.equal(memo.synced, true, 'transcript may mark synced once every unseen typed turn is registered')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+    const finalState = readRequestState(CONN, { dir })
+    assert.equal(finalState.failedTranscriptTurns.size, 0)
+    assert.equal(finalState.open.has(first.requestId), true)
+    assert.equal(finalState.open.has(second.requestId), true)
+    assert.equal(finalState.started.has(first.requestId), true)
+    assert.equal(finalState.started.has(second.requestId), true)
+  })
+
+  it('joins a matched background completion into a live terminal-typed turn instead of replacing it when prompt hook is absent (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111ac'
+
+    // Alice's earlier room command launched a background job and finished its own turn.
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bg-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: null }, { dir })
+
+    // Bob types a prompt in the terminal (Cursor CLI without beforeSubmitPrompt hook).
+    const bobRow = typedRow('Bob starts a new terminal task')
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+    const bobSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+    })
+    assert.equal(bobSync.action, 'opened')
+    const TYPED_BOB = bobSync.requestId
+    assert.equal(readRequestState(CONN, { dir }).current, TYPED_BOB)
+
+    // While Bob's terminal turn is STILL LIVE (no turn_ended), Alice's background completion arrives.
+    const aliceNotifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>alice-bg-1</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceNotifRow}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wakeSync.action, 'restored_wake_request')
+    assert.equal(wakeSync.midTurn, true)
+    assert.equal(wakeSync.requestId, TYPED_BOB)
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, TYPED_BOB, 'mid-turn background completion must NOT replace Bob’s live typed request')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'mid-turn background completion must JOIN the live typed turn')
+    assert.equal(after.launches.get('alice-bg-1')?.notified, true)
+    const amb = turnAmbiguity(after)
+    assert.ok(amb && amb.length === 2, 'two-person attribution ambiguity must be preserved')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write must NOT silently stamp Alice’s background requester over Bob’s live typed turn')
+    assert.notEqual(stamped.args?.request_ref, CMD_ALICE)
+  })
+
+  it('clears ended typed_prompt foreground in finishIdleRequests so a later background wake after turn end starts a clean new turn (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111ad'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bg-2', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+
+    // Bob's typed turn launches its own background job and ENDS (turn_ended).
+    const bobRow = typedRow('Bob launches his own background job')
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+    const bobSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+    })
+    const TYPED_BOB = bobSync.requestId
+    appendRequestEvent(CONN, { op: 'launch', key: 'bob-bg-2', kind: 'shell', notifies: true, request: TYPED_BOB, also: [] }, { dir })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${turnEndedRow('success')}\n`)
+    await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ status: 'closed' }),
+      dir,
+      log: () => {},
+    })
+    // TYPED_BOB stays open for bob-bg-2, but is no longer foreground current.
+    assert.equal(readRequestState(CONN, { dir }).open.has(TYPED_BOB), true)
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+
+    // Cursor rewrites the transcript without turn_ended when Alice's background completion starts a NEW turn.
+    const aliceNotifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>alice-bg-2</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceNotifRow}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(wakeSync.action, 'restored_wake_request')
+    assert.equal(wakeSync.requestId, CMD_ALICE)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE)
+    assert.equal(turnAmbiguity(after), null, 'ended typed turn must not falsely join a later turn')
+  })
 })
