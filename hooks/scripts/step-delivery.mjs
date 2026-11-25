@@ -119,9 +119,17 @@ import { firingConversation } from './project-context.mjs'
 import { readLastTurnEnd, STABLE_READ_ATTEMPTS, STABLE_READ_GAP_MS } from './transcript-turn-end.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
+import {
+  clearWakeListenerNeeded,
+  isWakeListenerActive,
+  startRoomCommands,
+  wakeListenerReminder,
+  wakeNeededPath,
+} from './command-start.mjs'
+import { commandsHandedOver } from './turn-commands.mjs'
 
-/** The inbox batches that reach a working agent at its next step: check jobs and notices. */
-export const STEP_BATCH_TYPES = Object.freeze(['check_job_dispatches', 'canonical_system_notices'])
+/** The inbox batches that reach a working agent at its next step: canonical room messages, check jobs, and notices. */
+export const STEP_BATCH_TYPES = Object.freeze(['owner_messages', 'check_job_dispatches', 'canonical_system_notices'])
 
 /** Where DevSpec says how a check job is taken and ruled. Pointed at, never restated. */
 export const CHECK_JOB_RULES =
@@ -146,7 +154,9 @@ const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
 const CHECK_JOB_LOOKUP_MS = 5_000
 
 export function isStepBatch(batch) {
-  return STEP_BATCH_TYPES.includes(batch?.type)
+  if (!batch || typeof batch !== 'object') return false
+  if (batch.type === 'owner_messages') return batch?.ingress?.canonical === true
+  return STEP_BATCH_TYPES.includes(batch.type)
 }
 
 export function connectionsDirFor(home = os.homedir(), env = process.env) {
@@ -192,6 +202,22 @@ export async function readTurnState(conversationId, { home = os.homedir() } = {}
 /** One held batch: the wake events the follow built for it, and what it is. */
 export function stepItem(batch, events, { now = Date.now() } = {}) {
   const list = Array.isArray(events) ? events : []
+  if (batch?.type === 'owner_messages') {
+    const messages = Array.isArray(batch.messages) ? batch.messages : []
+    const commands = commandsHandedOver(messages)
+    return {
+      version: RECORD_VERSION,
+      key:
+        batch.acceptance_key ??
+        `owner_messages:${commands.map((c) => c.messageId).join(',') || list.length}`,
+      kind: 'owner_messages',
+      session_id: batch.session_id ?? null,
+      commands,
+      messages,
+      held_at: new Date(now).toISOString(),
+      events: list,
+    }
+  }
   if (batch?.type === 'check_job_dispatches') {
     const job = batch.messages?.[0]
     return {
@@ -215,7 +241,8 @@ export function stepItem(batch, events, { now = Date.now() } = {}) {
 
 function validItem(item) {
   return item?.version === RECORD_VERSION && typeof item.key === 'string' &&
-    (item.kind === 'check_job' || item.kind === 'notices') && Array.isArray(item.events)
+    (item.kind === 'owner_messages' || item.kind === 'check_job' || item.kind === 'notices') &&
+    Array.isArray(item.events)
 }
 
 function validRecord(record) {
@@ -444,9 +471,18 @@ export function itemStillOpen(item, options = {}) {
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`
 
 function itemCounts(items) {
+  const roomMessages = items.reduce(
+    (sum, item) =>
+      sum + (item.kind === 'owner_messages' ? item.events.filter((e) => e?.type === 'owner_message').length || 1 : 0),
+    0,
+  )
   const checks = items.filter((item) => item.kind === 'check_job').length
   const notices = items.reduce((sum, item) => sum + (item.kind === 'notices' ? item.events.filter((e) => e?.type === 'system_notice').length : 0), 0)
-  return [checks ? plural(checks, 'check job', 'check jobs') : null, notices ? plural(notices, 'notice', 'notices') : null]
+  return [
+    roomMessages ? plural(roomMessages, 'room message', 'room messages') : null,
+    checks ? plural(checks, 'check job', 'check jobs') : null,
+    notices ? plural(notices, 'notice', 'notices') : null,
+  ]
     .filter(Boolean)
     .join(' and ')
 }
@@ -460,6 +496,12 @@ export function stepNoteText(items, { connectionId = null } = {}) {
   const lines = [
     `DevSpec sent you ${itemCounts(items) || 'nothing'} while you were working. Deal with all of them now, in this one pause, then carry on with what you were doing.`,
   ]
+  if (items.some((item) => item.kind === 'owner_messages')) {
+    lines.push(
+      '',
+      'Answer each canonical room message (type: owner_message) before ending your turn via post_session_message({ connection_id, message, complete_turn: true }) (when attached). Preserve its authority, project_scope, and sender_response_style.',
+    )
+  }
   if (items.some((item) => item.kind === 'check_job')) {
     lines.push('', `How a check job is taken and ruled is DevSpec's rule: ${CHECK_JOB_RULES} (claim_check_job repeats the first as \`helpers\`).`)
   }
@@ -468,6 +510,17 @@ export function stepNoteText(items, { connectionId = null } = {}) {
     lines.push('', `What a notice asks of you, and whether and how you answer it, is DevSpec's rule too: ${NOTICE_RULES}.`)
   }
   for (const item of items) {
+    if (item.kind === 'owner_messages') {
+      const msgIds = item.events
+        .filter((event) => event?.type === 'owner_message')
+        .map((event) => event.message?.message_id)
+        .filter(Boolean)
+      lines.push('', `## Room message${msgIds.length > 1 ? 's' : ''}${msgIds.length ? ` (${msgIds.join(', ')})` : ''}`)
+      for (const event of item.events) {
+        lines.push(JSON.stringify(event))
+      }
+      continue
+    }
     if (item.kind === 'check_job') {
       const event = item.events.find((each) => each?.type === 'check_job') ?? {}
       const job = event.check_job ?? {}
@@ -505,7 +558,17 @@ const STEP_ALSO = 'Deal with all of it in one pause, then carry on with your tas
 function idlePointer(note, items, connectionId) {
   return {
     type: 'held_for_step',
-    holds: [...new Set(items.map((item) => (item.kind === 'check_job' ? 'check_job' : 'system_notice')))],
+    holds: [
+      ...new Set(
+        items.map((item) =>
+          item.kind === 'owner_messages'
+            ? 'owner_message'
+            : item.kind === 'check_job'
+              ? 'check_job'
+              : 'system_notice',
+        ),
+      ),
+    ],
     connection_id: connectionId,
     note: note.id,
     read_with: note.command,
@@ -522,7 +585,16 @@ function idlePointer(note, items, connectionId) {
  */
 export async function stepDeliveryHook(
   input,
-  { env = process.env, home = os.homedir(), dir = null, isOpen = itemStillOpen, share = POST_TOOL_CONTEXT_SHARE, emit = () => {} } = {},
+  {
+    env = process.env,
+    home = os.homedir(),
+    dir = null,
+    isOpen = itemStillOpen,
+    share = POST_TOOL_CONTEXT_SHARE,
+    emit = () => {},
+    startCommands = startRoomCommands,
+    listenerActive = isWakeListenerActive,
+  } = {},
 ) {
   if (!input || typeof input !== 'object') return null
   // A helper agent's call: its conversation id is its own, so the lookup below finds no
@@ -533,19 +605,44 @@ export async function stepDeliveryHook(
   const connectionId = state.connection_id
   const connDir = dir ?? connectionsDirFor(home, env)
   const steps = stepsDir(connectionId, connDir)
-  if (!fs.existsSync(steps)) return null
+  const neededFile = wakeNeededPath(connectionId, connDir)
+  const hasSteps = fs.existsSync(steps)
+  const hasWakeNeeded = fs.existsSync(neededFile)
+  if (!hasSteps && !hasWakeNeeded) return null
+
+  const toolCmd = String(input?.tool_input?.command ?? '')
+  const startingListener =
+    toolCmd.includes('devspec-wake-tail.mjs') && !/\bdevspec-wake-tail\.mjs\b[^;\n]*\bread\b/.test(toolCmd)
+  let needsListenerReminder = false
+  if (hasWakeNeeded) {
+    if (listenerActive(connectionId, { dir: connDir })) {
+      clearWakeListenerNeeded(connectionId, connDir)
+    } else if (!startingListener) {
+      needsListenerReminder = true
+    }
+  }
+
+  if (!hasSteps) {
+    if (!needsListenerReminder) return null
+    const reminder = wakeListenerReminder(connectionId, { dir: connDir }).slice(0, share)
+    const output = JSON.stringify(postToolUseOutput(reminder))
+    await emit(output)
+    return output
+  }
   reclaimAbandoned(steps)
 
   // What came back of the note already handed over, in this tool call.
   const takenRecord = take(path.join(steps, HANDED))
   let record = null
   let readChanged = false
+  let completedOwnerItems = []
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
       const { record: next, done } = readThrough(kept, input, { home })
       record = done ? null : { ...kept, parts: next.parts }
       readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
+      if (done) completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
     } else {
       giveBack(takenRecord)
       return null
@@ -564,6 +661,31 @@ export async function stepDeliveryHook(
     fresh.map(async (each) => ({ ...each, open: await isOpen(each.item, { connectionId, state }) })),
   )
   const adding = checked.filter((each) => each.open)
+
+  // The agent just finished reading a step note holding room message(s): now report
+  // pickup and mark them started so the room switches from waiting to Working only once
+  // the agent actually has them.
+  for (const item of completedOwnerItems) {
+    try {
+      const messages = Array.isArray(item.messages) && item.messages.length > 0
+        ? item.messages
+        : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message)
+      const commands = Array.isArray(item.commands) && item.commands.length > 0 ? item.commands : commandsHandedOver(messages)
+      if (commands.length > 0) {
+        await startCommands({
+          connectionId,
+          commands,
+          batch: { type: 'owner_messages', session_id: item.session_id ?? state.session_id ?? null, messages },
+          sessionId: item.session_id ?? state.session_id ?? null,
+          dir: connDir,
+          home,
+          state,
+        })
+      }
+    } catch {
+      /* never fail the hook if report_pickup cannot reach DevSpec */
+    }
+  }
 
   // From the check that the connection is still live until the pointer has been written
   // out, under the connection's steps lock, which every write that ends the connection
@@ -605,8 +727,17 @@ export async function stepDeliveryHook(
     if (adding.length > 0) {
       recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
-    if (!record) return null
-    const context = pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+    let context = record
+      ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+      : null
+    if (needsListenerReminder) {
+      const reminder = wakeListenerReminder(connectionId, { dir: connDir })
+      if (!context) {
+        context = reminder.slice(0, share)
+      } else if (context.length + 2 + reminder.length <= share) {
+        context = `${context}\n\n${reminder}`
+      }
+    }
     const output = context ? JSON.stringify(postToolUseOutput(context)) : null
     // Written out, and the write finished, before the lock goes, so no end comes between
     // the check and the agent's pointer.

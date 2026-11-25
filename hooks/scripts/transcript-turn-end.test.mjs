@@ -991,11 +991,26 @@ async function startPoller({ attached = false, capability = false } = {}) {
     recordAnswered() {
       fs.appendFileSync(path.join(dir, `${CONNECTION}.requests.jsonl`), `${JSON.stringify({ op: 'answered', id: REQUEST })}\n`)
     },
-    /** Hand the agent a room command (or several together) and wait for the poller to start it. */
+    /** Hand the agent a room command (or several together) and wait for the agent to start it. */
     async deliver(body = 'ship the release notes', command = COMMAND, sequence = 1) {
       assert.ok(await until(() => stub.polls.length >= 1), `no poll; stderr:\n${stderr}`)
+      const inboxFile = path.join(dir, `${CONNECTION}.inbox.jsonl`)
+      const countInbox = () => {
+        try { return fs.readFileSync(inboxFile, 'utf8').trim().split('\n').filter(Boolean).length } catch { return 0 }
+      }
+      const beforeInbox = countInbox()
       const pickups = stub.named('report_pickup').length
+      const list = Array.isArray(command) ? command : [command]
       stub.serve(Array.isArray(command) ? commandsPoll(sessionId, command, sequence) : commandPoll(body, sessionId, command, sequence))
+      assert.ok(await until(() => countInbox() > beforeInbox), `no inbox write; stderr:\n${stderr}`)
+      const { startRoomCommands } = await import('./command-start.mjs')
+      await startRoomCommands({
+        connectionId: CONNECTION,
+        commands: list.map((item) => ({ turnId: item.turnId, messageId: item.messageId })),
+        sessionId,
+        dir,
+        home,
+      })
       assert.ok(await until(() => stub.named('report_pickup').length > pickups && fs.existsSync(marker)), `no pickup; stderr:\n${stderr}`)
       const polled = stub.polls.length
       assert.ok(await until(() => stub.polls.slice(polled).some((poll) => poll.busy === true)), 'the turn reports busy')

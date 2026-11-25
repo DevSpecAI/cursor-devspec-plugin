@@ -104,6 +104,12 @@ import { fitsShellOutput, wakeInNote, wakesForOneOutput } from './hook-context-b
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
 import { connectionsDirFor, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import {
+  clearWakeListenerNeeded,
+  extractRoomCommandsFromWake,
+  markWakeListenerNeeded,
+  startRoomCommands,
+} from './command-start.mjs'
 
 /**
  * How often the tail looks for new wakes, and how long the reader waits to see whether
@@ -389,6 +395,7 @@ function tail({ file, connectionId, scriptPath }) {
       }
     }
     lease('listening')
+    clearWakeListenerNeeded(key, dir)
   })
 
   /** One look's announcements, holding the steps lock: what to stop for, or null to carry on. */
@@ -420,6 +427,7 @@ function tail({ file, connectionId, scriptPath }) {
     if (text) process.stdout.write(text)
     offset = through
     lease(full ? 'retired' : matches >= LISTENER_RELIEF_AT ? 'relief' : 'listening')
+    if (full) markWakeListenerNeeded(key, dir)
     return full
       ? `printed ${matches} notify matches; the next would reach Cursor's limit of ${CURSOR_NOTIFY_MATCH_LIMIT}, so stopping here. The wake reader tells the agent to start a new listener, which announces the rest.`
       : null
@@ -585,9 +593,11 @@ export async function readWakes({
   settleMs = POLL_MS,
   scriptPath = SCRIPT_PATH,
   isAlive = pidAlive,
+  startCommands = startRoomCommands,
 } = {}) {
   const resolved = path.resolve(String(file ?? ''))
   const key = readerKey(resolved, connectionId)
+  const resolvedConnectionId = (SAFE_ID.test(connectionId ?? '') ? connectionId : null) ?? wakeFileConnectionId(resolved)
   return withStepsLockAsync(key, dir, async () => {
     const position = readPosition(resolved, key, dir)
     const { start, wakes } = await unreadWakes(resolved, position, { settleMs })
@@ -597,6 +607,25 @@ export async function readWakes({
       { home, listener, skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '' },
     )
     await write(page.text)
+    if (resolvedConnectionId && page.printed > 0) {
+      const printedSlice = wakes.slice(0, page.through).map((w) => w.text).join('')
+      const extracted = extractRoomCommandsFromWake(printedSlice)
+      if (extracted.commands.length > 0) {
+        try {
+          await startCommands({
+            connectionId: resolvedConnectionId,
+            commands: extracted.commands,
+            batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
+            sessionId: extracted.sessionId,
+            dir,
+            home,
+            fromWakeTurn: true,
+          })
+        } catch {
+          /* best effort — never fails printing the wake */
+        }
+      }
+    }
     const through = page.through > 0 ? wakes[page.through - 1].end : start
     if (through === position) return { ...page, marked: true }
     try {

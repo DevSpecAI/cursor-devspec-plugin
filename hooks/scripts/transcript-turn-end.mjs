@@ -790,7 +790,10 @@ export function turnBaselinePath(connectionId, dir = CONNECTIONS_DIR) {
  * would have taken. Once the file has changed it never is, and that turn's end is not
  * reported from the transcript (as before this existed).
  */
-export function recordTurnBaseline(connectionId, { turn, conversationId, transcriptPath = null, dir = CONNECTIONS_DIR } = {}) {
+export function recordTurnBaseline(
+  connectionId,
+  { turn, conversationId, transcriptPath = null, dir = CONNECTIONS_DIR, beforeCurrentCommandTurn = false } = {},
+) {
   if (!connectionId || typeof turn !== 'number') return false
   const conversation = transcriptPath ? transcriptConversation(transcriptPath) : conversationId
   if (!conversation || (conversationId && conversation !== conversationId)) return false
@@ -800,10 +803,25 @@ export function recordTurnBaseline(connectionId, { turn, conversationId, transcr
     writeBaseline(connectionId, dir, { v: 4, turn, conversation, pending: true, transcriptPath, expect })
     return false
   }
-  return writeBaseline(connectionId, dir, snapshotOf(turn, conversation, read))
+  return writeBaseline(connectionId, dir, snapshotOf(turn, conversation, read, { beforeCurrentCommandTurn }))
 }
 
-function snapshotOf(turn, conversation, read) {
+function snapshotOf(turn, conversation, read, { beforeCurrentCommandTurn = false } = {}) {
+  if (beforeCurrentCommandTurn && !read.missing && !read.end && Array.isArray(read.userRows)) {
+    const commandRow = [...read.userRows].reverse().find((row) => row.kind === 'command_turn')
+    if (commandRow && Number.isInteger(commandRow.start) && commandRow.start >= 0) {
+      const kept = commandRow.start
+      return {
+        v: 4,
+        turn,
+        conversation,
+        between: true,
+        kept,
+        keptDigest: digestBytes(read.bytes.subarray(0, kept)),
+        stamp: read.stamp,
+      }
+    }
+  }
   const between = read.missing ? true : Boolean(read.end)
   const kept = read.missing ? 0 : between ? read.lastLineStart : read.size
   return {

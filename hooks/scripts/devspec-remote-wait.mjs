@@ -109,9 +109,10 @@ import { recallConversation, recallWakeOut, settleRecallHandover } from './turn-
 import { turnFailureNotice } from './turn-failure.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
-import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
+import { clearTurnCommands, commandsHandedOver, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
 import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import { startRoomCommands } from './command-start.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1950,21 +1951,40 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
-        // A check job or notice that arrives while Cursor is in a turn waits for the
-        // agent's next step instead (step-delivery.mjs): Cursor would hold the wake
-        // file until the turn ended. Held before the offset moves, so nothing is lost;
-        // if it cannot be held, it goes to the wake file as before.
+        // A room message, check job, or notice that arrives while Cursor is in a turn
+        // waits for the agent's next step instead (step-delivery.mjs): Cursor would hold
+        // the wake file until the turn ended. Held before the offset moves, so nothing is
+        // lost; if it cannot be held, it goes to the wake file as before.
         if (args.follow && args.wakeFile && isStepBatch(batch) && (await readTurnState(live?.local_id)) === 'in_turn') {
+          let stepEvents = built
+          let stepRecallOut = null
+          if (batch.type === 'owner_messages') {
+            stepRecallOut = recallWakeOut(built, batch?.turn_recall, { connectionId })
+            if (stepRecallOut.held) {
+              process.stderr.write(
+                `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${stepRecallOut.held instanceof Error ? stepRecallOut.held.message : String(stepRecallOut.held)}); trying again\n`,
+              )
+              await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold })
+              await sleep(pollMs)
+              continue
+            }
+            stepEvents = stepRecallOut.recallWake
+              ? [...stepRecallOut.events, ...stepRecallOut.recallWake]
+              : stepRecallOut.events
+          }
           let held = false
           try {
-            held = holdForNextStep(connectionId, batch, built, { dir: CONNECTIONS_DIR }).held
+            held = holdForNextStep(connectionId, batch, stepEvents, { dir: CONNECTIONS_DIR }).held
           } catch (e) {
             process.stderr.write(`devspec-remote-wait: hold for the next step failed: ${e instanceof Error ? e.message : String(e)}\n`)
           }
           if (held) {
-            for (const event of built) await emitStdoutEvent(event)
+            for (const event of stepEvents) await emitStdoutEvent(event)
             offset = newOffset
             offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            if (stepRecallOut) {
+              settleRecallHandover(recallConversation(readState(connectionId), connectionId), stepRecallOut, batch)
+            }
             process.stderr.write(`devspec-remote-wait: held (${wakeCount} msg) for the agent's next step — follow\n`)
             continue
           }
@@ -2043,7 +2063,26 @@ async function main() {
           offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         }
         // A delivery's bookkeeping is done once, when its first wake is printed.
-        recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        // For canonical room messages handed to the wake file in follow mode,
+        // `devspec-wake-tail.mjs read` records requests + reports pickup once the
+        // woken agent actually reads the wake. In one-shot mode, stdout goes straight
+        // to the agent's Shell tool so we start the commands right here.
+        if (!args.follow && batch.type === 'owner_messages') {
+          try {
+            await startRoomCommands({
+              connectionId,
+              commands: commandsHandedOver(batch.messages),
+              batch,
+              sessionId: batch.session_id || live?.session_id || null,
+              dir: CONNECTIONS_DIR,
+              state: live,
+            })
+          } catch {
+            /* best effort */
+          }
+        } else if (!(args.follow && batch.type === 'owner_messages')) {
+          recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        }
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
         recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })

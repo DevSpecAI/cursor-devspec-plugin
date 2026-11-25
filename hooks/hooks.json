@@ -124,7 +124,7 @@
       },
       {
         "type": "command",
-        "command": "sh -c 'for f in \"$HOME\"/.devspec/remote-control/connections/*.steps/*; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/step-delivery.mjs\" post-tool; fi; break; done; printf \"{}\"'",
+        "command": "sh -c 'for f in \"$HOME\"/.devspec/remote-control/connections/*.steps/* \"$HOME\"/.devspec/remote-control/connections/*.wake-needed; do if [ -e \"$f\" ]; then command -v node >/dev/null 2>&1 && exec node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/step-delivery.mjs\" post-tool; fi; done; printf \"{}\"'",
         "timeout": 15
       },
       {

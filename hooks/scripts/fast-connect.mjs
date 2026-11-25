@@ -674,6 +674,22 @@ export async function fastConnect(opts = {}) {
     }
   }
 
+  const wakeFollow = written.wake_follow || null
+  if (wakeFollow && !wakeFollow.ok && !wakeFollow.skipped && !opts.noPoller) {
+    return {
+      ok: false,
+      code: 'wake_follow_failed',
+      error: wakeFollow.error || written.warning_wake_follow || 'ensure_wake_follow_failed',
+      local_id: localId,
+      launch_id: launchId,
+      connection_id: connectionId,
+      session_id: attachedSessionId,
+      codename: written.session_codename || codename,
+      poller,
+      wake_follow: wakeFollow,
+    }
+  }
+
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
   return {
@@ -692,6 +708,7 @@ export async function fastConnect(opts = {}) {
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
+    ...(written.wake_listener ? { wake_listener: written.wake_listener } : {}),
     ...(auth.signed_in_now ? { signed_in_now: true } : {}),
   }
 }

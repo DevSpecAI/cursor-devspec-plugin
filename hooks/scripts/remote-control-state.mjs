@@ -96,6 +96,8 @@ import { mcpToolsCall } from './mcp-call.mjs'
 import { authForConnect } from './sign-in-flow.mjs'
 import { findProjectPin } from './provenance-assistance.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
+import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
+import { clearWakeListenerNeeded, markWakeListenerNeeded, wakeListenerInfo } from './command-start.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -1133,6 +1135,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const capability_cleared = clearConnectionCapability(connectionId)
+  clearWakeListenerNeeded(connectionId, CONNECTIONS_DIR)
   const killResult = stopPollerForConnection(connectionId)
   return {
     ok: true,
@@ -1806,9 +1809,33 @@ export async function writeConnectionState(opts) {
     result.poller = poller
     if (!poller.ok) {
       result.warning_poller = poller.error
+    } else {
+      const wakeFile = resolveSpaceFreeWakeFile(connectionId)
+      const wakeFollow = ensureWakeFollowForConnection(connectionId, {
+        cwd,
+        ownerPid,
+        launchId,
+        wakeFile,
+        fromEnd: !prev.connection_id || prev.enabled === false,
+      })
+      result.wake_follow = wakeFollow
+      if (!wakeFollow.ok) {
+        result.warning_wake_follow = wakeFollow.error
+      } else {
+        const listener = wakeListenerInfo(connectionId, {
+          wakeFile: wakeFollow.wake_file || wakeFile,
+          followPid: wakeFollow.pid ?? null,
+          dir: CONNECTIONS_DIR,
+        })
+        result.wake_listener = listener
+        if (!listener.active) {
+          markWakeListenerNeeded(connectionId, CONNECTIONS_DIR)
+        }
+      }
     }
   } else if (opts.noPoller) {
     result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+    result.wake_follow = { ok: true, skipped: true, reason: 'no-poller' }
   }
 
   await emitPhase({
