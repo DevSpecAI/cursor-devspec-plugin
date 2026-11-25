@@ -863,12 +863,21 @@ function trimStderrOmittedNotes(omitted, notesSlice) {
   const total = omitted.notes.length
   const returned = notesSlice.length
   if (returned >= total) return omitted
+  const omittedCount = total - returned
+  const listCommand = 'ls -lt ~/.devspec/notes/*.md'
+  const baseRecovery = typeof omitted.recovery === 'string' && omitted.recovery ? `${omitted.recovery} ` : ''
   return {
     ...omitted,
     notes: notesSlice,
     notes_total_count: total,
     notes_returned_count: returned,
-    notes_omitted_count: total - returned,
+    notes_omitted_count: omittedCount,
+    notes_continuation: {
+      omitted_count: omittedCount,
+      list_command: listCommand,
+      how_to_fetch_rest: `Run \`${listCommand}\` to list all ${total} saved stderr note files (including the ${omittedCount} omitted from this receipt) and read each with \`cat ~/.devspec/notes/<id>.md\`, or fix write permissions on ~/.devspec/notes and re-run connect.`,
+    },
+    recovery: `${baseRecovery}${omittedCount} of ${total} saved stderr note command(s) did not fit in this receipt: run \`${listCommand}\` to find the remaining saved note files and read them with \`cat ~/.devspec/notes/<id>.md\`.`,
   }
 }
 
@@ -913,15 +922,24 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     base.project_selection && typeof base.project_selection === 'object' ? base.project_selection : null
   const allCandidates = Array.isArray(selection?.candidates) ? selection.candidates : null
   const errMsg = noteError instanceof Error ? noteError.message : String(noteError)
-  const hasSavedStderrNotes =
-    Array.isArray(base.stderr_diagnostics_omitted?.notes) &&
-    base.stderr_diagnostics_omitted.notes.length > 0
-  const stderrReadHint = hasSavedStderrNotes
-    ? ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
-    : ''
-  const recovery = allCandidates
-    ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${stderrReadHint}`
-    : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.${stderrReadHint}`
+  const stderrReadHintFor = (stderrOmitted) => {
+    const total = Array.isArray(base.stderr_diagnostics_omitted?.notes)
+      ? base.stderr_diagnostics_omitted.notes.length
+      : 0
+    if (total === 0) return ''
+    const omittedNotesCount = Number(stderrOmitted?.notes_omitted_count) || 0
+    if (omittedNotesCount > 0) {
+      const returnedNotesCount = Number(stderrOmitted?.notes_returned_count) || 0
+      return ` Read the ${returnedNotesCount} listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run \`ls -lt ~/.devspec/notes/*.md\` then \`cat ~/.devspec/notes/<id>.md\` to fetch the remaining ${omittedNotesCount} of ${total} saved stderr note(s).`
+    }
+    return ' Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.'
+  }
+  const recoveryFor = (stderrOmitted) => {
+    const hint = stderrReadHintFor(stderrOmitted)
+    return allCandidates
+      ? `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect so all ${allCandidates.length} server-matched project choices can be saved whole and read back (or pass --project <id> directly if you already know the project ID).${hint}`
+      : `Could not write ~/.devspec/notes (${errMsg}). Fix write permissions on ~/.devspec/notes and re-run connect to read the full ${fullTextLength}-char output.${hint}`
+  }
 
   const makePayload = (
     candidateSlice,
@@ -973,7 +991,7 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     out.complete_output_note_error = errMsg
     out.total_chars = fullTextLength
     out.shell_limit_chars = CURSOR_SHELL_OUTPUT_MAX_CHARS
-    out.recovery = recovery
+    out.recovery = recoveryFor(stderrOmitted)
     return JSON.stringify(out, null, 2) + '\n'
   }
 
@@ -1031,8 +1049,8 @@ function buildFastConnectNoteFailureFallback(normalized, noteError, fullTextLeng
     total_chars: fullTextLength,
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     recovery: allCandidates
-      ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHint}`
-      : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHint}`,
+      ? `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly).${stderrReadHintFor(stderrOmitted)}`
+      : `Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect.${stderrReadHintFor(stderrOmitted)}`,
   })
   const prettyFallbackFit = fitStderrOmittedForReceipt(
     base.stderr_diagnostics_omitted ?? null,

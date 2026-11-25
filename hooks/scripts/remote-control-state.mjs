@@ -2020,12 +2020,18 @@ const CLI_STDOUT_RECEIPT_HEADROOM =
         notes_total_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         notes_returned_count: 1,
         notes_omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        notes_continuation: {
+          omitted_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+          list_command: 'ls -lt ~/.devspec/notes/*.md',
+          how_to_fetch_rest:
+            'Run `ls -lt ~/.devspec/notes/*.md` to list all 20000 saved stderr note files (including the 20000 omitted from this receipt) and read each with `cat ~/.devspec/notes/<id>.md`, or fix write permissions on ~/.devspec/notes and re-run connect.',
+        },
         note_write_failed_count: CURSOR_SHELL_OUTPUT_MAX_CHARS,
         recovery:
-          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back.',
+          'Fix write permissions on ~/.devspec/notes and re-run connect so omitted stderr diagnostics can be saved whole and read back. 20000 of 20000 saved stderr note command(s) did not fit in this receipt: run `ls -lt ~/.devspec/notes/*.md` to find the remaining saved note files and read them with `cat ~/.devspec/notes/<id>.md`.',
       },
       recovery:
-        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read saved stderr diagnostics with the cat commands in stderr_diagnostics_omitted.notes.',
+        'Could not write ~/.devspec/notes. Fix write permissions on ~/.devspec/notes and re-run connect so all server-matched project choices can be saved whole and read back (or pass --project <id> directly). Read the 1 listed stderr diagnostic note(s) via stderr_diagnostics_omitted.notes, and run `ls -lt ~/.devspec/notes/*.md` then `cat ~/.devspec/notes/<id>.md` to fetch the remaining 20000 of 20000 saved stderr note(s).',
     },
     null,
     2,

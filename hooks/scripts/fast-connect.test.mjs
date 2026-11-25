@@ -1349,7 +1349,7 @@ describe('fast-connect CLI flags', () => {
         )
         assert.match(parsedMinimalNoteFail.recovery, /stderr_diagnostics_omitted\.notes/)
 
-        const tightStderrReserve = 'e'.repeat(18_900)
+        const tightStderrReserve = 'e'.repeat(18_200)
         const trimmedFallbackOut = formatFastConnectCliOutput(
           { ok: false, code: 'connect_failed', error: 'e'.repeat(25_000) },
           {
@@ -1368,6 +1368,12 @@ describe('fast-connect CLI flags', () => {
           parsedTrimmed.stderr_diagnostics_omitted.notes[0].command,
           'cat ~/.devspec/notes/0000000000000001.md',
         )
+        assert.equal(
+          parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation?.list_command,
+          'ls -lt ~/.devspec/notes/*.md',
+        )
+        assert.match(parsedTrimmed.stderr_diagnostics_omitted?.notes_continuation?.how_to_fetch_rest, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
+        assert.match(parsedTrimmed.recovery, /ls -lt ~\/\.devspec\/notes\/\*\.md/)
       } finally {
         fs.rmSync(brokenHome2, { recursive: true, force: true })
       }
