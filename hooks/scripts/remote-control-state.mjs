@@ -1802,6 +1802,25 @@ function buildConnectNoteFailureFallback(summary, noteError, fullTextLength) {
   )
 }
 
+/**
+ * Write `text` to `stream` and wait for Node to flush every byte to the underlying
+ * file descriptor before returning (so `process.exit()` never truncates output on a
+ * backpressured pipe — requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeStreamAndFlush(stream, text) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      stream.off('error', done)
+      resolve()
+    }
+    stream.once('error', done)
+    stream.write(text, done)
+  })
+}
+
 export function formatConnectCliOutput(result, { home = os.homedir() } = {}) {
   const summary = summarizeConnectCliOutput(result)
   const fullText = JSON.stringify(summary, null, 2) + '\n'
@@ -2614,7 +2633,7 @@ async function runCli() {
       gitRemote: args['git-remote'] || null,
       hostname: args.hostname || null,
     })
-    process.stdout.write(formatConnectCliOutput(result))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
     process.exit(result.ok ? 0 : 1)
   }
 
@@ -2622,7 +2641,8 @@ async function runCli() {
     const connectionId = args['connection-id']
     const sessionId = args.session
     if (!connectionId || !sessionId) {
-      process.stderr.write(
+      await writeStreamAndFlush(
+        process.stderr,
         'Usage: remote-control-state.mjs attach --connection-id <uuid> --session <uuid> [--launch-id <uuid>]\n',
       )
       process.exit(2)
@@ -2639,7 +2659,7 @@ async function runCli() {
       agent: args.agent || AGENT_NAME,
       hostToken,
     })
-    process.stdout.write(formatConnectCliOutput(result))
+    await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
     process.exit(result.ok ? 0 : 1)
   }
 

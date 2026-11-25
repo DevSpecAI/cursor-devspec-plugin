@@ -5,14 +5,16 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it, beforeEach, afterEach } from 'node:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { selectProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot } from './repository-context.mjs'
-import { parseArgs, summarizeConnectCliOutput } from './remote-control-state.mjs'
+import { parseArgs, summarizeConnectCliOutput, writeStreamAndFlush } from './remote-control-state.mjs'
 let projectHome
 beforeEach(() => { projectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-connect-project-')) })
 afterEach(() => fs.rmSync(projectHome, { recursive: true, force: true }))
@@ -911,6 +913,115 @@ describe('fast-connect CLI flags', () => {
       assert.doesNotMatch(parsedFallback.recovery, /list_projects/)
       assert.match(parsedFallback.recovery, /re-run connect/)
     } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('flushes complete inline 50-candidate project_choice_required JSON to stdout on a backpressured pipe before exiting (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    // 1. Unit check: writeStreamAndFlush waits for a slow 4096-byte backpressured Writable to finish draining.
+    const received = []
+    let flushed = false
+    const slowStream = new Writable({
+      highWaterMark: 4096,
+      write(chunk, _enc, cb) {
+        received.push(Buffer.from(chunk))
+        setTimeout(() => {
+          flushed = true
+          cb()
+        }, 40)
+      },
+    })
+    const payload = 'x'.repeat(12_500)
+    await writeStreamAndFlush(slowStream, payload)
+    assert.equal(flushed, true, 'must wait for slow stream write callback before returning')
+    assert.equal(Buffer.concat(received).toString('utf8'), payload)
+
+    // 2. End-to-end CLI check: 50-candidate choice_required (~12 KB) over a paused pipe arrives complete and valid JSON.
+    const candidates = Array.from({ length: 50 }, (_, i) => ({
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      name: `Pipe Project ${i}`,
+      organization_name: `Pipe Org ${i}`,
+      matched_by: ['repository'],
+    }))
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'project_choice_required',
+                error: 'Several accessible projects match. Choose a project and organisation.',
+                project_selection: { version: 1, status: 'choice_required', reason: 'ambiguous_repository', candidates },
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-pipe-flush-'))
+    const script = fileURLToPath(new URL('./remote-control-state.mjs', import.meta.url))
+    try {
+      fs.mkdirSync(path.join(home, '.cursor'), { recursive: true })
+      fs.writeFileSync(
+        path.join(home, '.cursor', 'mcp.json'),
+        JSON.stringify({ mcpServers: { devspec: { url: `http://127.0.0.1:${port}/api/mcp` } } }),
+      )
+      const { stdout, code } = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [
+            script,
+            'fast-connect',
+            '--local-id', 'pipe-flush-conv',
+            '--owner-pid', String(process.pid),
+            '--cwd', home,
+            '--host-token', 'dvs_pipe_test_token',
+            '--no-poller',
+          ],
+          {
+            env: {
+              ...process.env,
+              HOME: home,
+              DEVSPEC_MCP_URL: `http://127.0.0.1:${port}/api/mcp`,
+              DEVSPEC_MCP_TOKEN: 'dvs_pipe_test_token',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        )
+        // Pause stdout to simulate pipe backpressure before draining.
+        child.stdout.pause()
+        const chunks = []
+        let stderr = ''
+        child.stderr.on('data', (c) => { stderr += c.toString() })
+        setTimeout(() => {
+          child.stdout.on('data', (c) => chunks.push(c))
+          child.stdout.resume()
+        }, 100)
+        child.on('error', reject)
+        child.on('close', (code) => {
+          const out = Buffer.concat(chunks).toString('utf8')
+          if (!out) return reject(new Error(`empty stdout (code=${code}, stderr=${stderr})`))
+          resolve({ stdout: out, code })
+        })
+      })
+      assert.equal(code, 1)
+      assert.ok(Buffer.byteLength(stdout, 'utf8') > 8192, `expected > 8 KB JSON, got ${Buffer.byteLength(stdout, 'utf8')}`)
+      const parsed = JSON.parse(stdout)
+      assert.equal(parsed.code, 'project_choice_required')
+      assert.equal(parsed.project_selection.candidates.length, 50)
+      assert.equal(parsed.project_selection.candidates[49].name, 'Pipe Project 49')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
       fs.rmSync(home, { recursive: true, force: true })
     }
   })

@@ -33,6 +33,7 @@ import {
   attachConnection,
   writeConnectionState,
   formatConnectCliOutput,
+  writeStreamAndFlush,
 } from './remote-control-state.mjs'
 
 /** UUID values for these keys are never session ids (automation cold-launch, etc.). */
@@ -732,7 +733,7 @@ Prints one JSON result; exits 0 when connected, 1 when not.
 export async function runFastConnectCli(args) {
   // Help is read before anything else: it registers, writes and calls nothing.
   if (args.help || (Array.isArray(args._) && args._.slice(1).includes('help'))) {
-    process.stdout.write(FAST_CONNECT_USAGE)
+    await writeStreamAndFlush(process.stdout, FAST_CONNECT_USAGE)
     process.exit(0)
   }
 
@@ -741,7 +742,8 @@ export async function runFastConnectCli(args) {
     try {
       promptText = fs.readFileSync(path.resolve(String(args['prompt-file'])), 'utf8')
     } catch (err) {
-      process.stderr.write(
+      await writeStreamAndFlush(
+        process.stderr,
         `fast-connect: could not read --prompt-file: ${err instanceof Error ? err.message : err}\n`,
       )
       process.exit(1)
@@ -766,6 +768,6 @@ export async function runFastConnectCli(args) {
     promptText,
   })
 
-  process.stdout.write(formatConnectCliOutput(result))
+  await writeStreamAndFlush(process.stdout, formatConnectCliOutput(result))
   process.exit(result.ok ? 0 : 1)
 }
