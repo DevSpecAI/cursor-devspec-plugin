@@ -1246,6 +1246,36 @@ describe('fast-connect CLI flags', () => {
             return true
           },
         )
+        // When multi-byte UTF-8 reserve exceeds Cursor's 40,000-byte ceiling while staying
+        // under 20,000 characters, refusal MUST report the 40,000-byte limit and byte length
+        // rather than misreporting a 20,000-character limit with ~13,432 chars (3c5147a7 / 91d7b47c).
+        const utf8ByteReserve = '中'.repeat(13_330) // 13,330 chars, 39,990 UTF-8 bytes
+        assert.throws(
+          () => formatFastConnectCliOutput({ ok: false, error: 'x'.repeat(25_000) }, { home, reserve: utf8ByteReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.field, 'reserve')
+            assert.equal(err.limit, 40_000)
+            assert.equal(err.limit_unit, 'bytes')
+            assert.ok(err.actual_length > 40_000, `expected byte actual_length > 40000, got ${err.actual_length}`)
+            assert.ok(err.actual_chars <= 20_000)
+            assert.equal(err.actual_bytes, err.actual_length)
+            assert.match(err.message, /40000/)
+            assert.match(err.message, /bytes/)
+            return true
+          },
+        )
+        assert.throws(
+          () => formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2, reserve: utf8ByteReserve }),
+          (err) => {
+            assert.equal(err.code, 'shell_output_limit_exceeded')
+            assert.equal(err.limit, 40_000)
+            assert.equal(err.limit_unit, 'bytes')
+            assert.ok(err.actual_length > 40_000)
+            assert.ok(err.actual_chars <= 20_000)
+            return true
+          },
+        )
         // Default unwritable-note fallback on formatBoundedCliStderr must include concrete recovery instructions.
         const defaultUnwritableDiag = formatBoundedCliStderr('y'.repeat(25_000), { home: brokenHome2 })
         assert.ok(fitsShellOutput(defaultUnwritableDiag))
