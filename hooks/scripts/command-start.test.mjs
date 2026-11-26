@@ -3564,4 +3564,162 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(picked.length, 1, 'reading the restored inner note MUST trigger pickup')
     assert.ok(picked[0].includes(INNER_MSG))
   })
+
+  it('readWakes reserved diagnostic slot paginates a 60,000-character refusal with exact Shell-bounded continuation commands so following them recovers the blocking record at the end (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { execSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(dir, 'tmp-60k-blocked')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stdoutChunks = []
+    const stderrChunks = []
+    try {
+      const page = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async (text) => { stdoutChunks.push(text) },
+        writeStderr: (text) => { stderrChunks.push(text) },
+        startCommands: async () => {
+          fs.rmSync(diagDir, { recursive: true, force: true })
+          fs.writeFileSync(diagDir, 'not-a-directory\n')
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_60k',
+                  padding: 'p'.repeat(58_000),
+                  blocking_items: [{ id: 'blk-tail-end-marker', reason: 'active_edit_at_tail' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      const printedOut = stdoutChunks.join('')
+      const printedErr = stderrChunks.join('')
+      assert.equal(page.marked, false)
+      assert.ok(fitsShellOutput(printedOut + printedErr), 'combined stdout+stderr must fit Shell ceiling')
+      const firstCmd = page.pickup_diagnostic_note?.command
+      assert.ok(firstCmd && firstCmd.startsWith('head -c '), `expected paged head -c command; got ${firstCmd}`)
+      assert.ok(printedErr.includes(firstCmd), 'stderr must advertise the exact first-page read command')
+
+      // Follow the exact advertised command and every `next part` continuation command!
+      let currentCmd = firstCmd
+      let pagesRead = 0
+      let collected = ''
+      while (currentCmd) {
+        const out = execSync(currentCmd, { encoding: 'utf8' })
+        assert.ok(fitsShellOutput(out), `page ${pagesRead + 1} (${out.length} chars) must fit Shell ceiling`)
+        collected += out
+        pagesRead += 1
+        assert.ok(pagesRead <= 10, 'must terminate cleanly within expected part count')
+        const nextMatch = /next part \(\d+\/\d+\): (tail -c \+\d+ '[^']+' \| head -c \d+) ---/.exec(out)
+        currentCmd = nextMatch ? nextMatch[1] : null
+      }
+      assert.ok(pagesRead >= 4, `60k refusal must span multiple Shell-sized pages; read ${pagesRead}`)
+      assert.match(collected, /turn_busy_60k/, 'must recover refusal code')
+      assert.match(collected, /blk-tail-end-marker/, 'following continuations MUST recover the blocking record at the end of the 60k payload')
+      assert.match(collected, /active_edit_at_tail/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('releaseAtIdle preserves a refused command awaiting pickup retry when handing over fresh unread commands at idle (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_REFUSED = '33333333-3333-4333-8333-333333333391'
+    const TURN_REFUSED = '77777777-7777-4777-8777-777777777791'
+    const MSG_FRESH_1 = '33333333-3333-4333-8333-333333333392'
+    const TURN_FRESH_1 = '77777777-7777-4777-8777-777777777792'
+    const MSG_FRESH_2 = '33333333-3333-4333-8333-333333333393'
+    const TURN_FRESH_2 = '77777777-7777-4777-8777-777777777793'
+
+    // Step 1: deliver and read command 1, whose report_pickup refuses so HANDED has pickup_pending=true.
+    const batch1 = ownerBatch('Refused command awaiting retry', { messageId: MSG_REFUSED, turnId: TURN_REFUSED })
+    holdForNextStep(CONN, batch1, buildOwnerMessageEvents(batch1), { dir })
+    const handOver1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+    const note1Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOver1).additional_context)[1]
+    for (const file of noteFiles(home, note1Id)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async () => ({
+          ok: false,
+          outcome: 'refused',
+          started: [],
+          pickedUp: 0,
+          refusals: [{ command_message_id: MSG_REFUSED, command_turn_id: TURN_REFUSED, refusal: { code: 'turn_busy' } }],
+        }),
+      })
+    }
+
+    // Step 2: two fresh commands arrive in waiting files right as Cursor goes idle!
+    const fresh1 = ownerBatch('Fresh idle command 1', { messageId: MSG_FRESH_1, turnId: TURN_FRESH_1 })
+    const fresh2 = ownerBatch('Fresh idle command 2', { messageId: MSG_FRESH_2, turnId: TURN_FRESH_2 })
+    holdForNextStep(CONN, fresh1, buildOwnerMessageEvents(fresh1), { dir })
+    holdForNextStep(CONN, fresh2, buildOwnerMessageEvents(fresh2), { dir })
+
+    const released = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+    })
+    assert.ok(released?.note, 'releaseAtIdle must hand over the fresh unread commands')
+    const wakeNoteText = readNoteText(released.note, { home })
+    assert.ok(wakeNoteText.includes(MSG_FRESH_1))
+    assert.ok(wakeNoteText.includes(MSG_FRESH_2))
+
+    // Step 3: when the agent wakes and reads the idle wake note, BOTH the previously refused
+    // command (from pickup_pending retry!) AND the two fresh commands MUST be passed to startCommands!
+    const picked = []
+    for (const file of noteFiles(home, released.note)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async ({ commands }) => {
+          picked.push(...commands.map((c) => c.messageId))
+          return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+        },
+      })
+    }
+    assert.ok(picked.includes(MSG_REFUSED), 'refused command MUST NOT be dropped from retry queue by releaseAtIdle')
+    assert.ok(picked.includes(MSG_FRESH_1), 'fresh command 1 must be picked up once read')
+    assert.ok(picked.includes(MSG_FRESH_2), 'fresh command 2 must be picked up once read')
+  })
 })

@@ -1788,7 +1788,13 @@ export async function releaseAtIdle(
   if (waitingFiles(steps).length === 0) {
     // Nothing new, and nothing handed over, or a note already woken / awaiting pickup retry only.
     const handed = fs.existsSync(handedPath) ? readPrivateJson(handedPath) : null
-    if (!handed || handed.woken === true || handed.pickup_pending === true) return null
+    if (
+      !handed ||
+      handed.woken === true ||
+      (!hasUnreadNote(handed) && (handed.pickup_pending === true || handed.inner_note_pending === true))
+    ) {
+      return null
+    }
   }
   const now = turnState ?? (await readTurnState(state?.local_id, { home }))
   if (now !== 'between') return null
@@ -1808,7 +1814,40 @@ export async function releaseAtIdle(
     giveBack(takenRecord)
     return null
   }
-  const items = [...(record?.items ?? []), ...fresh]
+  // Preserve any refused pickup retry / pending inner wake-note retry on HANDED when
+  // handing over fresh unread items at idle so a refused command is NEVER dropped from
+  // the retry queue (requirement 3ea2b201).
+  const pendingRetryMeta = record
+    ? {
+        ...(record.inner_note_pending === true
+          ? {
+              inner_note_pending: true,
+              inner_note_items: Array.isArray(record.inner_note_items) ? record.inner_note_items : record.items,
+            }
+          : {}),
+        ...(record.pickup_pending === true
+          ? {
+              pickup_pending: true,
+              pickup_items: Array.isArray(record.pickup_items)
+                ? record.pickup_items
+                : record.items.filter((i) => i.kind === 'owner_messages'),
+            }
+          : {}),
+        ...(Array.isArray(record.pickup_refusals) && record.pickup_refusals.length > 0
+          ? { pickup_refusals: record.pickup_refusals }
+          : {}),
+      }
+    : {}
+  const hasPendingRetry = Boolean(pendingRetryMeta.pickup_pending || pendingRetryMeta.inner_note_pending)
+  const unreadPrior = hasUnreadNote(record) ? record.items : []
+  const seenKeys = new Set()
+  const items = []
+  for (const item of [...unreadPrior, ...fresh]) {
+    const key = typeof item?.key === 'string' && item.key ? item.key : null
+    if (key && seenKeys.has(key)) continue
+    if (key) seenKeys.add(key)
+    items.push(item)
+  }
   const open = []
   const dropped = []
   for (const item of items) {
@@ -1832,7 +1871,11 @@ export async function releaseAtIdle(
       return { pointed: [], dropped, note: null, discarded: true }
     }
     if (open.length === 0) {
-      finish()
+      for (const each of taken) drop(each)
+      if (takenRecord && record) {
+        if (hasPendingRetry) giveBack(takenRecord)
+        else drop(takenRecord)
+      }
       return { pointed: [], dropped, note: null }
     }
     let note = null
@@ -1848,7 +1891,9 @@ export async function releaseAtIdle(
         parts: record?.note === note.id ? record.parts ?? [] : [],
         items: open,
         at: new Date().toISOString(),
+        note_read: false,
         woken: true,
+        ...pendingRetryMeta,
       })
       append(wakeFile, wake)
     } catch (error) {

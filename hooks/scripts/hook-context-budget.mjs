@@ -900,10 +900,12 @@ export function shellDiagnosticReserve(label = 'devspec-wake-tail', { fallbackDi
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
-  const candidates = [notePtr, fallbackPtr]
+  const fallbackHeadPtr = shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(fallbackSampleFile)}`)
+  const candidates = [notePtr, fallbackPtr, fallbackHeadPtr]
   if (fallbackDir) {
     const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
     candidates.push(shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`))
+    candidates.push(shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(dirSampleFile)}`))
   }
   return maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
 }
@@ -1043,19 +1045,64 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       for (const slot of slots) {
         if (slot.fd === null || !slotStillLinked(slot)) continue
         try {
+          const quoted = shellQuotePath(slot.filePath)
+          const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
+          if (fitsOneRead) {
+            fs.ftruncateSync(slot.fd, 0)
+            fs.writeSync(slot.fd, raw, 0, 'utf8')
+            fs.fsyncSync(slot.fd)
+            slot.used = true
+            return {
+              id,
+              file: slot.filePath,
+              command: `cat ${quoted}`,
+              parts: 1,
+              fallback: true,
+              reserved: true,
+            }
+          }
+          // Multi-part content inside a single pre-opened file: split on clean line/UTF-8
+          // boundaries via `splitText` and embed exact Shell-bounded continuation commands
+          // (`tail -c +<offset> <file> | head -c <len>`) at the end of every page so
+          // following the chain recovers 100% of the refusal verbatim (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
+          const pieces = splitText(raw)
+          const totalParts = pieces.length
+          const totalChars = raw.length
+          const nextLens = new Array(totalParts).fill(0)
+          const starts1 = new Array(totalParts).fill(1)
+          let pages = []
+          for (let pass = 0; pass < 4; pass += 1) {
+            const built = new Array(totalParts)
+            for (let i = totalParts - 1; i >= 0; i -= 1) {
+              const footer =
+                i + 1 < totalParts
+                  ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]} ---\n`
+                  : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
+              built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+              nextLens[i] = built[i].length
+            }
+            let offset = 1
+            let changed = false
+            for (let i = 0; i < totalParts; i += 1) {
+              if (starts1[i] !== offset) {
+                starts1[i] = offset
+                changed = true
+              }
+              offset += built[i].length
+            }
+            pages = built
+            if (!changed && pass > 0) break
+          }
+          const contentBuf = Buffer.concat(pages)
           fs.ftruncateSync(slot.fd, 0)
-          fs.writeSync(slot.fd, raw, 0, 'utf8')
+          fs.writeSync(slot.fd, contentBuf, 0, contentBuf.length, 0)
           fs.fsyncSync(slot.fd)
           slot.used = true
-          const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
-          const command = fitsOneRead
-            ? `cat ${shellQuotePath(slot.filePath)}`
-            : `head -c ${NOTE_PART_CHARS} ${shellQuotePath(slot.filePath)}`
           return {
             id,
             file: slot.filePath,
-            command,
-            parts: fitsOneRead ? 1 : Math.ceil(raw.length / NOTE_PART_CHARS),
+            command: `head -c ${pages[0].length} ${quoted}`,
+            parts: totalParts,
             fallback: true,
             reserved: true,
           }
