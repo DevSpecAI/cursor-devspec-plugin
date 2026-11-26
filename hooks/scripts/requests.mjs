@@ -386,11 +386,17 @@ export function reduceRequestLog(text) {
 }
 
 /**
- * Extract the last `{ op: 'rotated', archive_bytes, archive_ino, archive_dev }`
- * watermark written into the active request log by `rotateRequestLog`, if any.
+ * Extract all `{ op: 'rotated', archive_name?, archive_bytes, archive_ino, archive_dev }`
+ * watermarks written into the active request log by `rotateRequestLog`. Returns a map
+ * keyed by archive file basename (legacy watermarks without `archive_name` default to
+ * `${connectionId}.requests.jsonl.1`) plus an inode map keyed by `${dev}:${ino}`, keeping
+ * the latest watermark recorded for each archive.
  */
-function latestArchiveWatermark(text) {
-  let watermark = null
+function archiveWatermarks(text, connectionId) {
+  const defaultName = `${connectionId}.requests.jsonl.1`
+  const byName = new Map()
+  const byIno = new Map()
+  const rawLines = []
   for (const line of String(text || '').split('\n')) {
     if (!line.includes('"rotated"')) continue
     try {
@@ -401,17 +407,25 @@ function latestArchiveWatermark(text) {
         Number.isFinite(event.archive_bytes) &&
         event.archive_bytes >= 0
       ) {
-        watermark = {
+        const archiveName =
+          typeof event.archive_name === 'string' && event.archive_name ? event.archive_name : defaultName
+        const wm = {
+          archive_name: archiveName,
           archive_bytes: event.archive_bytes,
           archive_ino: typeof event.archive_ino === 'number' ? event.archive_ino : null,
           archive_dev: typeof event.archive_dev === 'number' ? event.archive_dev : null,
         }
+        byName.set(archiveName, wm)
+        if (wm.archive_ino !== null) {
+          byIno.set(`${wm.archive_dev ?? ''}:${wm.archive_ino}`, wm)
+        }
+        rawLines.push(wm)
       }
     } catch {
       /* ignore torn line */
     }
   }
-  return watermark
+  return { byName, byIno, latest: [...byName.values()] }
 }
 
 /**
@@ -437,6 +451,7 @@ function stagedRequestLogFiles(connectionId, dir) {
       mtimeMs = fs.statSync(fullPath).mtimeMs
     } catch (error) {
       if (error?.code === 'ENOENT') continue
+      return { files: [], error }
     }
     matched.push({ fullPath, name, mtimeMs })
   }
@@ -445,10 +460,44 @@ function stagedRequestLogFiles(connectionId, dir) {
 }
 
 /**
- * Combined change stamp covering the active request log AND every retained
- * archive (`.requests.jsonl.1`) and staged rotation file (`.requests.jsonl.rotating-*`)
- * that `readRequestState` reads. Returns `null` on any non-ENOENT stat/readdir error
- * so callers never skip reconciliation on a transient filesystem error (req 3ea2b201).
+ * Find every retained archive file for `connectionId` in `dir`: both the primary
+ * `.requests.jsonl.1` archive and any `.requests.jsonl.archive-*` archives created by
+ * subsequent rotations (which NEVER overwrite or unlink earlier archives so an already-open
+ * writer fd on any prior archive remains visible — requirement 3ea2b201 / decision ce71a72b).
+ */
+function archiveRequestLogFiles(connectionId, dir) {
+  const legacyName = `${connectionId}.requests.jsonl.1`
+  const archivePrefix = `${connectionId}.requests.jsonl.archive-`
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { files: [], error: null }
+    return { files: [], error }
+  }
+  const matched = []
+  for (const name of entries) {
+    if (name !== legacyName && !name.startsWith(archivePrefix)) continue
+    const fullPath = path.join(dir, name)
+    let mtimeMs = 0
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      return { files: [], error }
+    }
+    matched.push({ fullPath, name, mtimeMs })
+  }
+  matched.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+  return { files: matched.map((m) => m.fullPath), error: null }
+}
+
+/**
+ * Combined change stamp covering the active request log AND every retained archive
+ * (`.requests.jsonl.1` and `.requests.jsonl.archive-*`) and staged rotation file
+ * (`.requests.jsonl.rotating-*`) that `readRequestState` reads. Returns `null` on any
+ * non-ENOENT stat/readdir error so callers never skip reconciliation on a transient
+ * filesystem error (req 3ea2b201).
  */
 export function requestLogChangeStamp(connectionId, { dir = DEFAULT_DIR } = {}) {
   if (!connectionId) return ''
@@ -465,7 +514,11 @@ export function requestLogChangeStamp(connectionId, { dir = DEFAULT_DIR } = {}) 
     }
   }
   if (!statTag('active', file)) return null
-  if (!statTag('archive', `${file}.1`)) return null
+  const archives = archiveRequestLogFiles(connectionId, dir)
+  if (archives.error) return null
+  for (const archiveFile of archives.files) {
+    if (!statTag(`archive:${path.basename(archiveFile)}`, archiveFile)) return null
+  }
   const staged = stagedRequestLogFiles(connectionId, dir)
   if (staged.error) return null
   for (const stagedFile of staged.files) {
@@ -499,31 +552,52 @@ export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
   } catch (error) {
     if (error?.code !== 'ENOENT') readError ??= error
   }
-  // If a writer that already had the rotated log's fd open appended after
-  // `rotateRequestLog`'s final read, the archive `${file}.1` on the recorded inode
-  // will have grown past `archive_bytes`. Replay the archive ahead of the active
-  // log so NO late `launch`, `schedule`, `open`, or `typed_turn_failed` is ever
-  // ignored (requirement 3ea2b201 / decision ce71a72b).
-  let archiveText = ''
-  if (!readError && text) {
-    const watermark = latestArchiveWatermark(text)
-    if (watermark) {
-      const archiveFile = `${file}.1`
-      try {
-        const archStat = fs.statSync(archiveFile)
-        const sameArchive =
-          watermark.archive_ino == null ||
-          (archStat.ino === watermark.archive_ino &&
-            (watermark.archive_dev == null || archStat.dev === watermark.archive_dev))
-        if (sameArchive && archStat.size > watermark.archive_bytes) {
-          archiveText = fs.readFileSync(archiveFile, 'utf8')
+  // If a writer that already had ANY rotated log's fd open appended after
+  // `rotateRequestLog`'s final read (even across multiple subsequent rotations),
+  // that retained archive (`.requests.jsonl.1` or `.requests.jsonl.archive-*`) will
+  // have grown past its recorded watermark `archive_bytes` (or lack a watermark).
+  // Replay every such archive ahead of the active log so NO late `launch`, `schedule`,
+  // `open`, or `typed_turn_failed` is ever missed (requirement 3ea2b201 / decision ce71a72b).
+  const archiveTexts = []
+  if (!readError) {
+    const archives = archiveRequestLogFiles(connectionId, dir)
+    if (archives.error) {
+      readError = archives.error
+    } else if (archives.files.length > 0) {
+      const watermarks = archiveWatermarks(text, connectionId)
+      for (const archiveFile of archives.files) {
+        try {
+          const archStat = fs.statSync(archiveFile)
+          const base = path.basename(archiveFile)
+          const byInoWm =
+            watermarks.byIno.get(`${archStat.dev ?? ''}:${archStat.ino}`) ??
+            watermarks.byIno.get(`:${archStat.ino}`) ??
+            null
+          const byNameWm = watermarks.byName.get(base) ?? null
+          const wm =
+            byInoWm ??
+            (byNameWm &&
+            (byNameWm.archive_ino == null ||
+              (archStat.ino === byNameWm.archive_ino &&
+                (byNameWm.archive_dev == null || archStat.dev === byNameWm.archive_dev)))
+              ? byNameWm
+              : null)
+          if (!wm) {
+            archiveTexts.push(fs.readFileSync(archiveFile, 'utf8'))
+          } else if (archStat.size > wm.archive_bytes) {
+            const tailReplay = carryForwardTailLines(fs.readFileSync(archiveFile), wm.archive_bytes)
+            if (tailReplay) archiveTexts.push(tailReplay)
+          }
+        } catch (error) {
+          if (error?.code !== 'ENOENT') {
+            readError = error
+            break
+          }
         }
-      } catch (error) {
-        if (error?.code !== 'ENOENT') readError = error
       }
     }
   }
-  const combined = [...stagedTexts, ...(archiveText ? [archiveText] : []), ...(text ? [text] : [])].join('\n')
+  const combined = [...stagedTexts, ...archiveTexts, ...(text ? [text] : [])].join('\n')
   const state = reduceRequestLog(combined)
   return readError ? { ...state, readError } : state
 }
@@ -1074,16 +1148,36 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
         }
       }
     }
+    const priorArchives = archiveRequestLogFiles(connectionId, dir)
+    if (priorArchives.error) {
+      onError?.(priorArchives.error)
+      return false
+    }
+    const priorArchiveStats = new Map()
+    for (const oldArch of priorArchives.files) {
+      try {
+        priorArchiveStats.set(oldArch, fs.statSync(oldArch))
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          onError?.(error)
+          return false
+        }
+      }
+    }
     const preBuf = fs.readFileSync(file)
-    const preState = reduceRequestLog(preBuf.toString('utf8'))
+    const preText = preBuf.toString('utf8')
+    const preState = reduceRequestLog(preText)
     if (preState.open.size > 0 || preState.failedTranscriptTurns.size > 0) return false
+    const carriedWatermarks = archiveWatermarks(preText, connectionId).latest
     // Atomically claim the active log into a unique staging file BEFORE archiving it,
     // then re-read the claimed file to catch ANY concurrent `launch`, `schedule`,
-    // `typed_turn_failed`, or `open` appended between our read and our rename. Also
-    // persist a `{ op: 'rotated', archive_bytes, archive_ino, archive_dev }` watermark
-    // in the new active log AND re-stat `${file}.1` immediately after archiving so
-    // even a writer holding an already-open fd to the old inode that appends AFTER
-    // our final read is recovered immediately and on every subsequent `readRequestState`
+    // `typed_turn_failed`, or `open` appended between our read and our rename. NEVER
+    // overwrite or unlink an existing archive (`.requests.jsonl.1` or prior
+    // `.requests.jsonl.archive-*`): if `.1` already exists, place the new archive at a
+    // unique `.archive-*` path and carry forward every prior archive's watermark
+    // advanced to the exact size already verified clean by `effectiveState` so a
+    // writer holding an already-open fd to ANY earlier archive remains visible across
+    // arbitrary subsequent rotations without resurrecting already-closed work
     // (requirements 3ea2b201 / ce71a72b).
     const staged = `${file}.rotating-${process.pid}-${randomUUID().slice(0, 8)}`
     fs.renameSync(file, staged)
@@ -1091,10 +1185,44 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
       const stagedStat = fs.statSync(staged)
       const stagedBuf = fs.readFileSync(staged)
       const hasExtraTail = stagedBuf.length > preBuf.length
+      const primaryArchive = `${file}.1`
+      const archiveFile = fs.existsSync(primaryArchive)
+        ? `${file}.archive-${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+        : primaryArchive
+      const archiveName = path.basename(archiveFile)
       const initialLines = []
+      const emittedArchiveNames = new Set()
+      for (const [oldArch, oldStat] of priorArchiveStats) {
+        const oldName = path.basename(oldArch)
+        emittedArchiveNames.add(oldName)
+        initialLines.push(
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: oldName,
+            archive_bytes: oldStat.size,
+            archive_ino: oldStat.ino,
+            archive_dev: oldStat.dev,
+            at: new Date().toISOString(),
+          })}\n`,
+        )
+      }
+      for (const priorWm of carriedWatermarks) {
+        if (emittedArchiveNames.has(priorWm.archive_name)) continue
+        initialLines.push(
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: priorWm.archive_name,
+            archive_bytes: priorWm.archive_bytes,
+            archive_ino: priorWm.archive_ino,
+            archive_dev: priorWm.archive_dev,
+            at: new Date().toISOString(),
+          })}\n`,
+        )
+      }
       initialLines.push(
         `${JSON.stringify({
           op: 'rotated',
+          archive_name: archiveName,
           archive_bytes: stagedBuf.length,
           archive_ino: stagedStat.ino,
           archive_dev: stagedStat.dev,
@@ -1134,28 +1262,51 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
         }
       }
       fs.appendFileSync(file, initialLines.join(''), { mode: 0o600 })
-      const archiveFile = `${file}.1`
-      fs.renameSync(staged, archiveFile)
-      // NEVER delete older `.rotating-*` files from prior failed rotations: a writer
-      // may still hold an open fd to one of them and append a `launch` or
-      // `typed_turn_failed` at any time. `readRequestState` replays every `.rotating-*`
-      // file ahead of the active log; verify none of them grew or became unreadable
-      // during this rotation (requirements 3ea2b201 / ce71a72b).
-      let priorStagedGrew = false
+      // Guard against a concurrent rotator creating `${file}.1` between our `existsSync`
+      // check and rename: never overwrite an existing `.1` archive.
+      let finalArchiveFile = archiveFile
+      if (finalArchiveFile === primaryArchive && fs.existsSync(primaryArchive)) {
+        finalArchiveFile = `${file}.archive-${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+      }
+      fs.renameSync(staged, finalArchiveFile)
+      if (finalArchiveFile !== archiveFile) {
+        fs.appendFileSync(
+          file,
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: path.basename(finalArchiveFile),
+            archive_bytes: stagedBuf.length,
+            archive_ino: stagedStat.ino,
+            archive_dev: stagedStat.dev,
+            at: new Date().toISOString(),
+          })}\n`,
+          { mode: 0o600 },
+        )
+      }
+      // NEVER delete older `.rotating-*` or prior archive files: a writer may still
+      // hold an open fd to one of them and append a `launch` or `typed_turn_failed` at
+      // any time. Verify none of them grew or became unreadable during this rotation
+      // (requirements 3ea2b201 / ce71a72b).
+      let priorGrew = false
       for (const [oldStaged, beforeSize] of priorStagedSizes) {
         const afterStat = fs.statSync(oldStaged)
-        if (afterStat.size > beforeSize) priorStagedGrew = true
+        if (afterStat.size > beforeSize) priorGrew = true
       }
-      // Re-stat the archived inode immediately after moving it into place: if a writer
-      // with an already-open fd appended after `readFileSync(staged)`, carry those
-      // bytes + restored open refs into the active log right away and advance the
+      for (const [oldArch, oldStat] of priorArchiveStats) {
+        const afterStat = fs.statSync(oldArch)
+        if (afterStat.size > oldStat.size) priorGrew = true
+      }
+      // Re-stat the newly archived inode immediately after moving it into place: if a
+      // writer with an already-open fd appended after `readFileSync(staged)`, carry those
+      // bytes + restored open refs into the active log right away and advance its
       // watermark (requirements 3ea2b201 / ce71a72b).
-      const postArchStat = fs.statSync(archiveFile)
+      const postArchStat = fs.statSync(finalArchiveFile)
       if (postArchStat.size > stagedBuf.length) {
-        const postArchBuf = fs.readFileSync(archiveFile)
+        const postArchBuf = fs.readFileSync(finalArchiveFile)
         const lateCarry = carryForwardTailLines(postArchBuf, stagedBuf.length)
         const updatedWatermark = `${JSON.stringify({
           op: 'rotated',
+          archive_name: path.basename(finalArchiveFile),
           archive_bytes: postArchBuf.length,
           archive_ino: postArchStat.ino,
           archive_dev: postArchStat.dev,
@@ -1164,7 +1315,7 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
         fs.appendFileSync(file, `${lateCarry}${updatedWatermark}`, { mode: 0o600 })
         return false
       }
-      return !hasExtraTail && !priorStagedGrew
+      return !hasExtraTail && !priorGrew
     } catch (error) {
       onError?.(error)
       try {

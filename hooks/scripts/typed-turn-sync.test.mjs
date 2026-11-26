@@ -5828,4 +5828,157 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.match(stamped.deny, /msg-alice-wake1/)
     assert.match(stamped.deny, /msg-bob-wake2/)
   })
+
+  it('a second successful rotation NEVER replaces/unlinks the first archive so a late launch written via an open fd from before the first rotation is still detected and reconciled (3ea2b201)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const { rotateRequestLog } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const REQ_ALICE = '11111111-1111-4111-8111-1111111111ae'
+    const REQ_SECOND = '22222222-2222-4222-8222-2222222222ae'
+
+    fs.writeFileSync(transcriptPath, `${turnEndedRow()}\n`)
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(dir, { recursive: true })
+    const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad', ref: null, pad: 'p'.repeat(400) })}\n`
+    fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'command', requested_by: ALICE, message_id: 'msg-alice-2rot' }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: REQ_ALICE }, { dir })
+
+    // Open fd BEFORE Rotation #1!
+    const firstFd = fs.openSync(reqLogPath, 'a')
+    try {
+      // Rotation #1 via finishIdleRequests -> moves original inode to `.requests.jsonl.1`.
+      const idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+      assert.deepEqual(idle1.closed, [REQ_ALICE])
+      assert.equal(fs.existsSync(`${reqLogPath}.1`), true)
+      const firstArchiveIno = fs.statSync(`${reqLogPath}.1`).ino
+
+      // Now accumulate enough log lines and run a SECOND successful rotation!
+      fs.appendFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+      appendRequestEvent(CONN, { op: 'open', id: REQ_SECOND, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: REQ_SECOND }, { dir })
+      appendRequestEvent(CONN, { op: 'close', id: REQ_SECOND }, { dir })
+      const rotated2 = rotateRequestLog(CONN, { dir })
+      assert.equal(rotated2, true, 'second rotation must succeed')
+      assert.equal(fs.statSync(`${reqLogPath}.1`).ino, firstArchiveIno, 'second rotation MUST NOT replace or unlink the first archive inode!')
+      const archiveFiles = fs.readdirSync(dir).filter((name) => name.startsWith(`${CONN}.requests.jsonl.archive-`))
+      assert.ok(archiveFiles.length >= 1, 'second rotation must write a distinct non-overwriting .archive-* file')
+
+      // Completion arrives in transcript BEFORE the late launch lands -> first poll caches `memo.synced = true`.
+      const wakeRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>two-rotations-late-launch</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+      const memo = {}
+      const poll1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(poll1.action, 'not_typed_live')
+      assert.equal(memo.synced, true)
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+
+      // Now the writer holding `firstFd` from BEFORE Rotation #1 appends the launch record!
+      fs.writeSync(
+        firstFd,
+        `${JSON.stringify({ op: 'launch', key: 'two-rotations-late-launch', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n`,
+      )
+
+      // Poller MUST detect the append to the first archive even after Rotation #2!
+      assert.equal(
+        typedTurnSyncPending({ transcriptPath, memo }),
+        true,
+        'typedTurnSyncPending MUST detect append to first archive even after a second rotation',
+      )
+      const poll2 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(poll2.action, 'restored_wake_request', 'reconciliation MUST recover late launch from first archive across two rotations')
+      assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+      assert.equal(readRequestState(CONN, { dir }).launches.get('two-rotations-late-launch')?.notified, true)
+      assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, REQ_ALICE)
+    } finally {
+      fs.closeSync(firstFd)
+    }
+  })
+
+  it('when a scheduled wake starts and ends between sync passes, a later unrelated timestamp-only wake does NOT inherit the finished wake’s requester (ce71a72b)', async () => {
+    const { promptArrival } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111af'
+    const PROV_ALICE = '99999999-9999-4999-8999-9999999999af'
+
+    for (const scheduledRowText of [
+      'check deploy status',
+      '<timestamp>Wednesday, Nov 25, 2026, 6:20 PM (UTC)</timestamp>',
+    ]) {
+      const { home, dir, transcriptPath } = makeEnv()
+      appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE, provenance_ref: PROV_ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'schedule', id: 'sched-alice-end', prompt: 'check deploy status', request: CMD_ALICE, also: [] }, { dir })
+
+      // Turn 1: scheduled wake fires via promptArrival (`from_wake: true`), runs, and ENDS (`turn_ended`) BEFORE any sync runs!
+      const schedEvents = promptArrival({
+        fromAPerson: false,
+        origin: 'scheduled-trigger',
+        text: 'check deploy status',
+        midTurn: false,
+        state: readRequestState(CONN, { dir }),
+      }).events
+      for (const ev of schedEvents) appendRequestEvent(CONN, ev, { dir })
+      assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE)
+      assert.equal(readRequestState(CONN, { dir }).currentFromWake, true)
+
+      const scheduledRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: scheduledRowText }] },
+      })
+      const laterUnrelatedTimestamp = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:35 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${scheduledRow}\n${turnEndedRow()}\n${laterUnrelatedTimestamp}\n`)
+
+      // Now sync runs on Turn 2 (the unrelated timestamp-only wake)!
+      const res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(res.action, 'cleared_for_wake', `unrelated timestamp wake after finished scheduled wake (${scheduledRowText}) MUST clear stale wake requester`)
+      const after = readRequestState(CONN, { dir })
+      assert.equal(after.current, null, 'finished scheduled wake requester MUST NOT stay current for later unrelated timestamp wake')
+      assert.equal(after.open.has(CMD_ALICE), true, 'Alice’s request stays open for future real scheduled firings')
+      assert.deepEqual(
+        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }),
+        { args: { task_id: 'x' } },
+        'write during later unrelated timestamp wake MUST NOT be stamped with Alice’s finished scheduled wake request',
+      )
+    }
+  })
 })

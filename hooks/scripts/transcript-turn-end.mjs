@@ -1072,6 +1072,8 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let liveTurnPrecededByTurnEnded = false
   let sameTurnTypedRowIndex = -1
   let sameTurnOtherRows = []
+  let currentTurnNonTypedRows = []
+  const endedNonTypedRows = []
   const allOtherRows = []
   const userRows = []
   let start = 0
@@ -1116,18 +1118,23 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               sawTurnEndedSinceLastNonResumed = false
               sameTurnTypedRowIndex = rowIndex
               sameTurnOtherRows = []
+              currentTurnNonTypedRows = []
             } else if (kind === 'command_turn') {
               liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sawTurnEndedSinceLastNonResumed = false
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
+              currentTurnNonTypedRows = []
             } else if (kind === 'timestamp') {
               // Housekeeping rows (`timestamp`, `summary`) never start a new user turn
               // and must not wipe `sawTurnEndedSinceLastNonResumed` before the next
-              // typed prompt arrives (decision ce71a72b).
+              // typed prompt arrives (decision ce71a72b). Still record them in
+              // `currentTurnNonTypedRows` so a timestamp-only or scheduled wake that
+              // ends with `turn_ended` between sync passes is recognized as an ended wake.
               liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
+              currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText })
             } else if (kind === 'other') {
               if (sameTurnTypedRowIndex < 0 && sameTurnOtherRows.length === 0) {
                 liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
@@ -1136,6 +1143,9 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               const otherEntry = { rowIndex, digest: lastUser, rawText }
               sameTurnOtherRows.push(otherEntry)
               allOtherRows.push(otherEntry)
+              if (sameTurnTypedRowIndex < 0) {
+                currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText })
+              }
             }
           }
           userRows.push({ start, kind, digest: lastUser })
@@ -1157,6 +1167,10 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
             liveTurnPrecededByTurnEnded = false
             sameTurnTypedRowIndex = -1
             sameTurnOtherRows = []
+            if (currentTurnNonTypedRows.length > 0) {
+              endedNonTypedRows.push(...currentTurnNonTypedRows)
+              currentTurnNonTypedRows = []
+            }
           }
         }
       }
@@ -1206,6 +1220,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     sameTurnTypedRowIndex,
     sameTurnOtherRows,
     allOtherRows,
+    endedNonTypedRows,
   }
 }
 
@@ -1273,6 +1288,13 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
         rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
       }))
     : []
+  const endedNonTypedWakes = Array.isArray(read.endedNonTypedRows)
+    ? read.endedNonTypedRows.map((entry) => ({
+        key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+        kind: entry.kind,
+        rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+      }))
+    : []
   const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
   return {
     kind: lastRow ? lastRow.kind : 'none',
@@ -1282,6 +1304,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
     liveTurnTypedKey,
     sameTurnWakes,
     notificationWakes,
+    endedNonTypedWakes,
     precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
     liveTurnPrecededByTurnEnded: Boolean(read.liveTurnPrecededByTurnEnded),
     stamp: read.stamp,

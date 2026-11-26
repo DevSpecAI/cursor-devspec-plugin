@@ -2026,14 +2026,38 @@ export async function syncTypedTurnFromTranscript({
         // clearing stale foreground state) so appending the launch record later re-runs
         // sync (via `reqStamp`) and reconciles + joins the notification (3ea2b201 / ce71a72b).
         if (reqState.currentFromWake) {
-          // Preserve attribution ONLY for a wake explicitly restored via promptArrival.
-          if (hasPendingUnmatchedNotificationId) {
+          // If an earlier non-typed/scheduled wake turn started AND ended (`turn_ended`)
+          // between sync passes and NOTHING links the current live turn (`active`) to
+          // `reqState.current`, that finished turn already consumed `currentFromWake`:
+          // mark the finished wake row(s) seen and clear `current` so a later unrelated
+          // timestamp-only wake NEVER inherits the finished wake's requester (ce71a72b).
+          const activeMatchesSchedule =
+            typeof active.rawText === 'string' &&
+            active.rawText.trim().length > 0 &&
+            requestForWake({ origin: 'scheduled-trigger', text: active.rawText, state: reqState }).ref === reqState.current
+          const unseenEndedWakes =
+            active.precededByTurnEnded && !activeMatchesSchedule && Array.isArray(active.endedNonTypedWakes)
+              ? active.endedNonTypedWakes.filter((w) => {
+                  if (!w?.key || reqState.seenTranscriptTurns.has(w.key)) return false
+                  return w.kind === 'timestamp' || w.kind === 'other'
+                })
+              : []
+          if (unseenEndedWakes.length > 0) {
+            for (const endedWake of unseenEndedWakes) {
+              if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: endedWake.key, ref: null, historical: true }, { dir })) {
+                return { action: 'binding_write_failed', key: endedWake.key, active }
+              }
+            }
+          } else {
+            // Preserve attribution ONLY for a live wake explicitly restored via promptArrival.
+            if (hasPendingUnmatchedNotificationId) {
+              return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
+            }
+            if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
+              return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
+            }
             return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
           }
-          if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
-            return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
-          }
-          return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
         }
         if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
           return { action: 'binding_write_failed', key: active.key, active }
