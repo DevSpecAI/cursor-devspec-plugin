@@ -1061,13 +1061,17 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
               reserved: true,
             }
           }
-          // Multi-part content inside a single pre-opened file: split on clean line/UTF-8
-          // boundaries via `splitText` and embed exact Shell-bounded continuation commands
-          // (`tail -c +<offset> <file> | head -c <len>`) at the end of every page so
-          // following the chain recovers 100% of the refusal verbatim (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
-          const pieces = splitText(raw)
-          const totalParts = pieces.length
+          // Multi-part content inside a single pre-opened file: subtract the worst-case
+          // continuation footer (including the full quoted file path) from Cursor's Shell
+          // output ceiling BEFORE splitting so EVERY page + footer fits `fitsShellOutput`
+          // even under deep directory paths (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
           const totalChars = raw.length
+          const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999 ---\n`
+          const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+          const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+          if (pageMaxChars <= 0 || pageMaxBytes <= 0) continue
+          const pieces = splitText(raw, pageMaxChars, pageMaxBytes)
+          const totalParts = pieces.length
           const nextLens = new Array(totalParts).fill(0)
           const starts1 = new Array(totalParts).fill(1)
           let pages = []
@@ -1093,6 +1097,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
             pages = built
             if (!changed && pass > 0) break
           }
+          if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) continue
           const contentBuf = Buffer.concat(pages)
           fs.ftruncateSync(slot.fd, 0)
           fs.writeSync(slot.fd, contentBuf, 0, contentBuf.length, 0)
@@ -1137,8 +1142,14 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
   const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const dir = baseDir ?? path.join(os.tmpdir(), `devspec-notes-${uid}`)
-  const pieces = splitText(raw)
   const partPath = (part) => path.join(dir, part === 1 ? `${id}.md` : `${id}-part-${part}.md`)
+  const worstNextCmd = `\n\n--- next part (99999/99999): cat ${shellQuotePath(partPath(99999))} ---\n`
+  const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstNextCmd.length)
+  const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstNextCmd, 'utf8'))
+  if (pageMaxChars <= 0 || pageMaxBytes <= 0) {
+    throw new Error(`fallback diagnostic path exceeds Shell output limit (${dir.length} chars)`)
+  }
+  const pieces = splitText(raw, pageMaxChars, pageMaxBytes)
   const firstFile = partPath(1)
   if (!fs.existsSync(firstFile)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })

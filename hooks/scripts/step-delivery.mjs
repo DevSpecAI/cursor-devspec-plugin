@@ -1870,18 +1870,66 @@ export async function releaseAtIdle(
       logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
       return { pointed: [], dropped, note: null, discarded: true }
     }
-    if (open.length === 0) {
+    // Merge any concurrent HANDED record written by a parallel postToolUse hook while
+    // `releaseAtIdle` awaited `isOpen`, so the idle handoff NEVER overwrites or drops
+    // a newer command handed over concurrently (requirement 3ea2b201).
+    const concurrent = readPrivateJson(handedPath)
+    const hasConcurrent = validRecord(concurrent)
+    const concurrentUnread = hasConcurrent && hasUnreadNote(concurrent) ? concurrent.items : []
+    const mergedOpen = []
+    const mergedKeys = new Set()
+    for (const item of [...open, ...concurrentUnread]) {
+      const key = typeof item?.key === 'string' && item.key ? item.key : null
+      if (key && mergedKeys.has(key)) continue
+      if (key) mergedKeys.add(key)
+      mergedOpen.push(item)
+    }
+    const cInner =
+      hasConcurrent && concurrent.inner_note_pending === true
+        ? Array.isArray(concurrent.inner_note_items)
+          ? concurrent.inner_note_items
+          : concurrent.items
+        : []
+    const rInner = Array.isArray(pendingRetryMeta.inner_note_items) ? pendingRetryMeta.inner_note_items : []
+    const mergedInner = [...cInner, ...rInner]
+    const cPickup =
+      hasConcurrent && concurrent.pickup_pending === true
+        ? Array.isArray(concurrent.pickup_items)
+          ? concurrent.pickup_items
+          : concurrent.items.filter((i) => i.kind === 'owner_messages')
+        : []
+    const rPickup = Array.isArray(pendingRetryMeta.pickup_items) ? pendingRetryMeta.pickup_items : []
+    const mergedPickup = [...cPickup, ...rPickup]
+    const mergedRefusals = [
+      ...(hasConcurrent && Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
+      ...(Array.isArray(pendingRetryMeta.pickup_refusals) ? pendingRetryMeta.pickup_refusals : []),
+    ]
+    const mergedPendingMeta = {
+      ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : {}),
+      ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : {}),
+      ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
+    }
+
+    if (mergedOpen.length === 0) {
       for (const each of taken) drop(each)
-      if (takenRecord && record) {
-        if (hasPendingRetry) giveBack(takenRecord)
+      if (hasConcurrent && hasPendingRetry) {
+        try {
+          writePrivateJson(handedPath, { ...concurrent, ...mergedPendingMeta })
+          if (takenRecord && record) drop(takenRecord)
+        } catch {
+          if (takenRecord && record) giveBack(takenRecord)
+        }
+      } else if (takenRecord && record) {
+        if (hasPendingRetry && !hasConcurrent) giveBack(takenRecord)
         else drop(takenRecord)
       }
       return { pointed: [], dropped, note: null }
     }
     let note = null
+    const previousConcurrent = hasConcurrent ? concurrent : null
     try {
-      note = writeNote(stepNoteText(open, { connectionId }), { home })
-      const wake = [idlePointer(note, open, connectionId)]
+      note = writeNote(stepNoteText(mergedOpen, { connectionId }), { home })
+      const wake = [idlePointer(note, mergedOpen, connectionId)]
       // The pointer is a few hundred characters whatever the note holds; checked against
       // Cursor's rules on one output all the same, in the one place they are kept.
       if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
@@ -1889,22 +1937,28 @@ export async function releaseAtIdle(
         version: RECORD_VERSION,
         note: note.id,
         parts: record?.note === note.id ? record.parts ?? [] : [],
-        items: open,
+        items: mergedOpen,
         at: new Date().toISOString(),
         note_read: false,
         woken: true,
-        ...pendingRetryMeta,
+        ...mergedPendingMeta,
       })
       append(wakeFile, wake)
     } catch (error) {
-      if (note) fs.rmSync(handedPath, { force: true })
+      if (note) {
+        if (previousConcurrent) {
+          try { writePrivateJson(handedPath, previousConcurrent) } catch { /* ignore */ }
+        } else {
+          fs.rmSync(handedPath, { force: true })
+        }
+      }
       for (const each of taken) giveBack(each)
       if (takenRecord && record) giveBack(takenRecord)
       throw error
     }
     finish()
-    recordTurnWake(connectionId, turnWakeFromEvents(open.flatMap((item) => item.events)), { dir })
-    return { pointed: open.map((item) => item.key), dropped, note: note.id }
+    recordTurnWake(connectionId, turnWakeFromEvents(mergedOpen.flatMap((item) => item.events)), { dir })
+    return { pointed: mergedOpen.map((item) => item.key), dropped, note: note.id }
   })
 }
 

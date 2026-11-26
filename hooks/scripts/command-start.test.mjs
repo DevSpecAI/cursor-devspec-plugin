@@ -3722,4 +3722,152 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.ok(picked.includes(MSG_FRESH_1), 'fresh command 1 must be picked up once read')
     assert.ok(picked.includes(MSG_FRESH_2), 'fresh command 2 must be picked up once read')
   })
+
+  it('readWakes reserved diagnostic slot keeps EVERY page + continuation footer inside fitsShellOutput even under a 2,500-char deep directory path (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { execSync } = await import('node:child_process')
+    const { home } = mkHome()
+    // Build a valid ~2,500-char deep directory path inside home so the quoted path inside
+    // each continuation footer would have pushed 18,000 + footer > 20,000 chars!
+    const deepSegments = Array.from({ length: 12 }, (_, i) => `nested-dir-segment-${String(i).padStart(2, '0')}-${'a'.repeat(180)}`)
+    const deepDir = path.join(home, ...deepSegments)
+    fs.mkdirSync(deepDir, { recursive: true, mode: 0o700 })
+    const wakeFile = path.join(deepDir, `${CONN}.wakes`)
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(deepDir, 'tmp-deep-blocked')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(deepDir, 'diagnostic-notes')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stdoutChunks = []
+    const stderrChunks = []
+    try {
+      const page = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir: deepDir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async (text) => { stdoutChunks.push(text) },
+        writeStderr: (text) => { stderrChunks.push(text) },
+        startCommands: async () => {
+          fs.rmSync(diagDir, { recursive: true, force: true })
+          fs.writeFileSync(diagDir, 'not-a-directory\n')
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_deep_path',
+                  padding: 'q'.repeat(58_000),
+                  blocking_items: [{ id: 'blk-deep-path-tail', reason: 'deep_path_preserved' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      const printedOut = stdoutChunks.join('')
+      const printedErr = stderrChunks.join('')
+      assert.equal(page.marked, false)
+      assert.ok(fitsShellOutput(printedOut + printedErr), 'combined stdout+stderr must fit Shell ceiling')
+      const firstCmd = page.pickup_diagnostic_note?.command
+      assert.ok(firstCmd && firstCmd.startsWith('head -c '))
+      assert.ok(printedErr.includes(firstCmd))
+
+      let currentCmd = firstCmd
+      let pagesRead = 0
+      let collected = ''
+      while (currentCmd) {
+        const out = execSync(currentCmd, { encoding: 'utf8' })
+        assert.ok(
+          fitsShellOutput(out),
+          `deep-path page ${pagesRead + 1} (${out.length} chars) MUST fit Shell ceiling (${CURSOR_SHELL_OUTPUT_MAX_CHARS})`,
+        )
+        collected += out
+        pagesRead += 1
+        assert.ok(pagesRead <= 12)
+        const nextMatch = /next part \(\d+\/\d+\): (tail -c \+\d+ '[^']+' \| head -c \d+) ---/.exec(out)
+        currentCmd = nextMatch ? nextMatch[1] : null
+      }
+      assert.ok(pagesRead >= 4)
+      assert.match(collected, /turn_busy_deep_path/)
+      assert.match(collected, /blk-deep-path-tail/)
+      assert.match(collected, /deep_path_preserved/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('releaseAtIdle merges a concurrent HANDED note written by a parallel tool hook while awaiting isOpen instead of overwriting it (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_OLD = '33333333-3333-4333-8333-3333333333a1'
+    const TURN_OLD = '77777777-7777-4777-8777-7777777777a1'
+    const MSG_CONCURRENT = '33333333-3333-4333-8333-3333333333a2'
+    const TURN_CONCURRENT = '77777777-7777-4777-8777-7777777777a2'
+
+    // Hand over older command 1 first.
+    const batchOld = ownerBatch('Older command checked by releaseAtIdle', { messageId: MSG_OLD, turnId: TURN_OLD })
+    holdForNextStep(CONN, batchOld, buildOwnerMessageEvents(batchOld), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+
+    // While releaseAtIdle awaits `isOpen` on the older item, a parallel tool hook hands over
+    // a newer command into HANDED!
+    let concurrentHanded = false
+    const released = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+      isOpen: async () => {
+        if (!concurrentHanded) {
+          concurrentHanded = true
+          const batchNew = ownerBatch('Newer concurrent command during releaseAtIdle', {
+            messageId: MSG_CONCURRENT,
+            turnId: TURN_CONCURRENT,
+          })
+          holdForNextStep(CONN, batchNew, buildOwnerMessageEvents(batchNew), { dir })
+          await stepDeliveryHook(
+            { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+            { home, dir, listenerActive: () => true },
+          )
+        }
+        return true
+      },
+    })
+
+    assert.ok(released?.note, 'releaseAtIdle must write combined idle wake note')
+    const combinedText = readNoteText(released.note, { home })
+    assert.ok(combinedText.includes(MSG_OLD), 'idle note must retain older command')
+    assert.ok(combinedText.includes(MSG_CONCURRENT), 'idle note MUST preserve concurrent command handed over while awaiting isOpen')
+    const handedRecord = JSON.parse(fs.readFileSync(path.join(dir, `${CONN}.steps`, 'handed.json'), 'utf8'))
+    assert.ok(
+      handedRecord.items.some((item) => item.events.some((e) => e.message?.message_id === MSG_CONCURRENT)),
+      'HANDED record MUST still track the concurrent newer command',
+    )
+  })
 })
