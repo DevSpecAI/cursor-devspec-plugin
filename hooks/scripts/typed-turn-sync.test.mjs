@@ -3222,4 +3222,107 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(stamped.deny, undefined)
     assert.equal(stamped.args?.request_ref, res.requestId, 'writes in the new turn must stamp only the terminal prompt')
   })
+
+  it('summary row between an ended room turn and a new terminal prompt still forgets the ended room marker and attributes solely to the terminal prompt (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ROOM = '44444444-4444-4444-8444-4444444444fc'
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ROOM, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ROOM }, { dir })
+    fs.writeFileSync(path.join(dir, `${CONN}.turn`), JSON.stringify({ remoteTurn: true, startedAt: Date.now() - 5_000 }))
+
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    const summaryRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<available_subagent_types>summary</available_subagent_types>\n<dynamic_tool_catalog>tools</dynamic_tool_catalog>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(
+      transcriptPath,
+      `${cmdRow}\n${turnEndedRow()}\n${summaryRow}\n${typedRow('Terminal prompt after summary row')}\n`,
+    )
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+    })
+    assert.equal(res.action, 'opened')
+    assert.equal(res.midTurn, false, 'summary row after turn_ended must NOT revive the ended room turn marker')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, res.requestId, 'terminal prompt after summary must replace ended room command as sole current')
+    assert.equal(after.joined.size, 0, 'must NOT report two requesters')
+    assert.equal(turnAmbiguity(after), null)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined)
+    assert.equal(stamped.args?.request_ref, res.requestId)
+  })
+
+  it('transient request-log read error never marks transcript memo synced so recovery with unchanged files still reconciles the completion notification (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const CMD_ALICE = '55555555-5555-4555-8555-5555555555fd'
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bg-transient-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    const notifRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<task-notification><task-id>bg-transient-1</task-id></task-notification>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${notifRow}\n`)
+
+    const reqFile = path.join(dir, `${CONN}.requests.jsonl`)
+    const origStat = fs.statSync(reqFile)
+    const memo = {}
+
+    // Simulate a transient request-log read error (EACCES) while leaving file content unchanged.
+    fs.chmodSync(reqFile, 0o000)
+    try {
+      const failedPass = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { throw new Error('should not open') },
+        dir,
+        memo,
+      })
+      assert.equal(failedPass.action, 'request_log_unreadable')
+      assert.equal(memo.synced, false, 'transient request-log read error must NEVER mark memo synced')
+    } finally {
+      fs.chmodSync(reqFile, 0o600)
+      fs.utimesSync(reqFile, origStat.atime, origStat.mtime)
+    }
+
+    // With BOTH files completely unchanged after read recovery, typedTurnSyncPending MUST return true!
+    assert.equal(
+      typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }),
+      true,
+      'poller must still see pending sync after transient request-log read error recovers with unchanged files',
+    )
+    const recoveredPass = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('should not open') },
+      dir,
+      memo,
+    })
+    assert.equal(recoveredPass.action, 'restored_wake_request')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE)
+    assert.equal(after.launches.get('bg-transient-1')?.notified, true)
+    assert.equal(memo.synced, true)
+  })
 })

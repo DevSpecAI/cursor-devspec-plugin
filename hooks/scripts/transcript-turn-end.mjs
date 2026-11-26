@@ -1111,12 +1111,20 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           if (kind !== 'resumed') {
             lastNonResumedText = rawText
             lastNonResumedPrecededByTurnEnded = sawTurnEndedSinceLastNonResumed
-            sawTurnEndedSinceLastNonResumed = false
             if (kind === 'typed') {
               liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              sawTurnEndedSinceLastNonResumed = false
               sameTurnTypedRowIndex = rowIndex
               sameTurnOtherRows = []
-            } else if (kind === 'command_turn' || kind === 'timestamp') {
+            } else if (kind === 'command_turn') {
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              sawTurnEndedSinceLastNonResumed = false
+              sameTurnTypedRowIndex = -1
+              sameTurnOtherRows = []
+            } else if (kind === 'timestamp') {
+              // Housekeeping rows (`timestamp`, `summary`) never start a new user turn
+              // and must not wipe `sawTurnEndedSinceLastNonResumed` before the next
+              // typed prompt arrives (decision ce71a72b).
               liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
@@ -1124,6 +1132,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               if (sameTurnTypedRowIndex < 0 && sameTurnOtherRows.length === 0) {
                 liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               }
+              sawTurnEndedSinceLastNonResumed = false
               const otherEntry = { rowIndex, digest: lastUser, rawText }
               sameTurnOtherRows.push(otherEntry)
               allOtherRows.push(otherEntry)

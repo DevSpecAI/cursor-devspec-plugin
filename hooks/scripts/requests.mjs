@@ -282,12 +282,14 @@ export function reduceRequestLog(text) {
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
   let text = ''
+  let readError = null
   try {
     text = fs.readFileSync(requestLogPath(connectionId, dir), 'utf8')
-  } catch {
-    /* no log yet: nothing open */
+  } catch (error) {
+    if (error?.code !== 'ENOENT') readError = error
   }
-  return reduceRequestLog(text)
+  const state = reduceRequestLog(text)
+  return readError ? { ...state, readError } : state
 }
 
 /**

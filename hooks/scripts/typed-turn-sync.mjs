@@ -184,6 +184,7 @@ export function recordConnectTurnBaseline(connectionId, transcriptPath, { dir = 
         : []
   if (keys.length === 0) return false
   const reqState = readRequestState(connectionId, { dir })
+  if (reqState.readError) return false
   let wrote = false
   for (const key of keys) {
     if (reqState.seenTranscriptTurns.has(key)) continue
@@ -948,10 +949,11 @@ export async function syncTypedTurnFromTranscript({
     if (!memo) return
     // Capture the request-log stamp BEFORE reading `.requests.jsonl` to confirm no
     // previously unmatched `<task-notification>` now matches a launch appended while
-    // this pass awaited an earlier request/admission (requirement 3ea2b201).
+    // this pass awaited an earlier request/admission, and NEVER advance `memo.synced`
+    // if reading `.requests.jsonl` failed transiently (requirement 3ea2b201).
     const verifiedReqStamp = currentReqStamp()
     const verifyState = readRequestState(connectionId, { dir })
-    if (hasUnseenMatchableNotification(verifyState)) {
+    if (sawRequestLogReadError || verifyState.readError || hasUnseenMatchableNotification(verifyState)) {
       memo.stamp = active.stamp
       memo.reqFile = reqFile
       memo.reqStamp = reqStampAtStart
@@ -969,6 +971,24 @@ export async function syncTypedTurnFromTranscript({
     memo.reqStamp = reqStampAtStart
     memo.synced = false
   }
+  // Never treat a transient `.requests.jsonl` read failure (e.g. EACCES/EBUSY/EIO)
+  // as an empty log or mark the transcript checked (requirement 3ea2b201).
+  let sawRequestLogReadError = false
+  const isBlockingReadError = (err) => {
+    if (!err) return false
+    sawRequestLogReadError = true
+    return err.code !== 'EISDIR'
+  }
+  const startReqState = readRequestState(connectionId, { dir })
+  if (isBlockingReadError(startReqState.readError)) {
+    log(
+      `typed-turn-sync: request log unreadable for ${connectionId}: ${startReqState.readError?.message ?? 'read failed'}\n`,
+    )
+    return {
+      action: 'request_log_unreadable',
+      error: startReqState.readError?.message ?? 'read failed',
+    }
+  }
   const enqueueUnseenTypedTurns = (excludeLiveKey = null) => {
     const typedKeys =
       Array.isArray(active.typedTurnKeys) && active.typedTurnKeys.length > 0
@@ -978,6 +998,7 @@ export async function syncTypedTurnFromTranscript({
           : []
     if (typedKeys.length === 0) return true
     const reqState = readRequestState(connectionId, { dir })
+    if (isBlockingReadError(reqState.readError)) return false
     const unseen = typedKeys.filter(
       (key) =>
         key !== excludeLiveKey &&
@@ -1028,6 +1049,9 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const reqState = readRequestState(connectionId, { dir })
+        if (isBlockingReadError(reqState.readError)) {
+          return { action: 'request_log_unreadable', key: turnKey }
+        }
         if (reqState.seenTranscriptTurns.has(turnKey)) {
           return { action: 'already_synced', key: turnKey, ref: reqState.seenTranscriptTurns.get(turnKey) }
         }
@@ -1263,6 +1287,7 @@ export async function syncTypedTurnFromTranscript({
   // without altering live turn foreground state (requirement 3ea2b201).
   for (const wakeRow of historicalWakeRows) {
     const preState = readRequestState(connectionId, { dir })
+    if (preState.readError) return { action: 'request_log_unreadable', key: wakeRow.key }
     if (preState.seenTranscriptTurns.has(wakeRow.key)) continue
     if (!resolveWakeForText(wakeRow.rawText, preState)) continue
     const histRes = await withTypedSyncLock(
@@ -1270,6 +1295,7 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const reqState = readRequestState(connectionId, { dir })
+        if (reqState.readError) return { action: 'request_log_unreadable', key: wakeRow.key }
         if (reqState.seenTranscriptTurns.has(wakeRow.key)) {
           return { action: 'already_synced', key: wakeRow.key }
         }
@@ -1315,7 +1341,7 @@ export async function syncTypedTurnFromTranscript({
       { deadlineMs },
     )
     if (!histRes) return { action: 'lock_busy', key: wakeRow.key }
-    if (histRes.action === 'binding_write_failed') return histRes
+    if (histRes.action === 'binding_write_failed' || histRes.action === 'request_log_unreadable') return histRes
   }
 
   if (active.ended || !active.key) {
@@ -1378,6 +1404,9 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const reqState = readRequestState(connectionId, { dir })
+        if (reqState.readError) {
+          return { action: 'request_log_unreadable', key: wakeRow.key }
+        }
         if (reqState.seenTranscriptTurns.has(wakeRow.key)) {
           return { action: 'already_synced', key: wakeRow.key, ref: reqState.seenTranscriptTurns.get(wakeRow.key) }
         }
@@ -1474,15 +1503,19 @@ export async function syncTypedTurnFromTranscript({
     for (const wakeRow of sameTurnWakeRows) {
       if (!wakeRow?.key || wakeRow.key === active.key) continue
       const currentState = readRequestState(connectionId, { dir })
+      if (currentState.readError) return { action: 'request_log_unreadable', key: wakeRow.key }
       if (currentState.seenTranscriptTurns.has(wakeRow.key)) continue
       if (!resolveWakeForText(wakeRow.rawText, currentState)) continue
       const earlier = await applyTranscriptWakeRow(wakeRow)
       if (!earlier) return { action: 'lock_busy', key: wakeRow.key }
-      if (earlier.action === 'binding_write_failed') return earlier
+      if (earlier.action === 'binding_write_failed' || earlier.action === 'request_log_unreadable') return earlier
     }
   }
 
   const initial = readRequestState(connectionId, { dir })
+  if (isBlockingReadError(initial.readError)) {
+    return { action: 'request_log_unreadable' }
+  }
   if (initial.seenTranscriptTurns.has(active.key)) {
     const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey })
     if (flush.ran) {
@@ -1556,6 +1589,9 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const reqState = readRequestState(connectionId, { dir })
+        if (reqState.readError) {
+          return { action: 'request_log_unreadable', key: active.key }
+        }
         if (reqState.seenTranscriptTurns.has(active.key)) {
           return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
         }
@@ -1647,6 +1683,7 @@ export async function finishIdleRequests({
 } = {}) {
   if (!connectionId || !transcriptPath) return { closed: [], localCompleted: false }
   const reqState = readRequestState(connectionId, { dir })
+  if (reqState.readError && reqState.readError.code !== 'EISDIR') return { closed: [], localCompleted: false }
   const sessionId = state?.session_id || null
   const localAttemptId = localTurnToComplete(state?.local_turn, sessionId)
   const pending = pendingWorkWithoutHostLists(reqState)
