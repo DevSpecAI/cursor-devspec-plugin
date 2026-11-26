@@ -1289,10 +1289,20 @@ export async function syncTypedTurnFromTranscript({
         let requestId = existingTyped
         let openedNow = false
         let openRefusal = null
+        const hasOtherLiveJoined = (rState, targetId) =>
+          [...(rState?.joined ?? [])].some(
+            (id) => id !== targetId && rState.open.has(id) && !rState.open.get(id)?.answered,
+          )
         if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
           const currentWritten = appendRequestEvent(
             connectionId,
-            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+            midTurn
+              ? { op: 'joined', id: requestId }
+              : {
+                  op: 'current',
+                  ref: requestId,
+                  ...(hasOtherLiveJoined(reqState, requestId) ? { preserve_joined: true } : {}),
+                },
             { dir },
           )
           if (!currentWritten) {
@@ -1337,7 +1347,13 @@ export async function syncTypedTurnFromTranscript({
             if (needsBinding) {
               const currentWritten = appendRequestEvent(
                 connectionId,
-                midTurn ? { op: 'joined', id: pendingOpen.requestId } : { op: 'current', ref: pendingOpen.requestId },
+                midTurn
+                  ? { op: 'joined', id: pendingOpen.requestId }
+                  : {
+                      op: 'current',
+                      ref: pendingOpen.requestId,
+                      ...(hasOtherLiveJoined(reqState, pendingOpen.requestId) ? { preserve_joined: true } : {}),
+                    },
                 { dir },
               )
               if (!currentWritten) {
@@ -1395,9 +1411,16 @@ export async function syncTypedTurnFromTranscript({
             effectiveMidTurn = hasActiveRemoteCommandTurn(connectionId, postOpenState, dir, postOpenActive ?? active)
             supersededByNewerTurn = newerCurrentLanded || transcriptMovedOn
             if (!supersededByNewerTurn) {
+              const preserveJoined = hasOtherLiveJoined(postOpenState, requestId)
               const currentWritten = appendRequestEvent(
                 connectionId,
-                effectiveMidTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+                effectiveMidTurn
+                  ? { op: 'joined', id: requestId }
+                  : {
+                      op: 'current',
+                      ref: requestId,
+                      ...(preserveJoined ? { preserve_joined: true } : {}),
+                    },
                 { dir },
               )
               if (!currentWritten) {
@@ -2146,14 +2169,44 @@ export async function finishIdleRequests({
           // admitted while `await callComplete` was in flight (requirement 3ea2b201).
           const clearOutcome = await withTypedSyncLock(connectionId, dir, async () => {
             const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
-            const diskState = readPrivateJson(path.join(dir, `${connectionId}.json`))
+            if (!latestActive || latestActive.budgetExhausted) {
+              return {
+                status: 'transcript_unreadable',
+                refusal: {
+                  code: latestActive?.budgetExhausted ? 'budget_exhausted' : 'transcript_unreadable',
+                  retryable: true,
+                  error: 'Could not re-read transcript after idle report_complete to verify local_turn is still safe to clear.',
+                },
+              }
+            }
+            const stateFile = path.join(dir, `${connectionId}.json`)
+            let diskState = null
+            try {
+              const rawState = fs.readFileSync(stateFile, 'utf8')
+              diskState = JSON.parse(rawState)
+            } catch (err) {
+              if (err?.code !== 'ENOENT') {
+                const errRefusal = structuredRefusalFromError(err)
+                return {
+                  status: 'state_unreadable',
+                  refusal: {
+                    ...errRefusal,
+                    ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
+                    code: 'state_unreadable',
+                    retryable: true,
+                    error:
+                      err?.message ??
+                      'Could not read connection state file after idle report_complete to verify local_turn.',
+                  },
+                }
+              }
+            }
             const diskAttemptId = diskState?.local_turn?.attempt_id ?? null
             const memAttemptId = state?.local_turn?.attempt_id ?? null
             const supersededByAttempt =
               (diskAttemptId && diskAttemptId !== localAttemptId) ||
               (memAttemptId && memAttemptId !== localAttemptId)
-            const transcriptAdvanced =
-              !latestActive || !latestActive.ended || latestActive.stamp !== initialStamp
+            const transcriptAdvanced = !latestActive.ended || latestActive.stamp !== initialStamp
             if (supersededByAttempt || transcriptAdvanced) {
               return { status: 'superseded' }
             }
@@ -2168,15 +2221,22 @@ export async function finishIdleRequests({
             }
             return { status: saved ? 'cleared' : 'write_failed' }
           })
-          if (!clearOutcome || clearOutcome.status === 'write_failed') {
-            localCompleteRefusal = {
+          if (
+            !clearOutcome ||
+            clearOutcome.status === 'write_failed' ||
+            clearOutcome.status === 'state_unreadable' ||
+            clearOutcome.status === 'transcript_unreadable'
+          ) {
+            localCompleteRefusal = clearOutcome?.refusal ?? {
               code: !clearOutcome ? 'lock_busy' : 'state_write_failed',
               retryable: true,
               error: !clearOutcome
                 ? 'Could not acquire typed-sync lock to persist cleared local_turn after idle report_complete.'
                 : 'Failed to persist cleared local_turn after idle report_complete.',
             }
-            log(`typed-turn-sync: failed to persist cleared local_turn for ${connectionId}\n`)
+            log(
+              `typed-turn-sync: failed to verify or persist cleared local_turn for ${connectionId}: ${JSON.stringify(localCompleteRefusal)}\n`,
+            )
           } else {
             localCompleted = true
           }

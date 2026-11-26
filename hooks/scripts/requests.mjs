@@ -158,7 +158,9 @@ export function reduceRequestLog(text) {
         }
         break
       case 'current':
-        // A new turn: what it carries starts again from what woke it.
+        // A new turn: what it carries starts again from what woke it, unless
+        // `preserve_joined` is set (when establishing a turn's foreground request
+        // after another requester already joined the same running turn).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
@@ -167,7 +169,11 @@ export function reduceRequestLog(text) {
             ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
             : [],
         )
-        joined = new Set()
+        if (event.preserve_joined) {
+          if (UUID.test(current ?? '')) joined.delete(current)
+        } else {
+          joined = new Set()
+        }
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
         break

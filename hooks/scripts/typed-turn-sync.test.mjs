@@ -4748,4 +4748,109 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(stamped.deny, undefined)
     assert.equal(stamped.args?.request_ref, CMD_ALICE, 'next write MUST stamp Alice’s live room request, not Bob’s older terminal prompt')
   })
+
+  it('finishIdleRequests fails closed without clearing a newer local_turn attempt when reading the saved connection state file fails after report_complete (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const ATTEMPT_OLD = '99999999-9999-4999-8999-9999999999fe'
+    const ATTEMPT_NEW = '88888888-8888-4888-8888-8888888888fe'
+    const SESSION = '77777777-7777-4777-8777-7777777777fe'
+    const stateFile = path.join(dir, `${CONN}.json`)
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn 1 finished before newer attempt read fails')}\n${turnEndedRow()}\n`)
+    const state = {
+      connection_id: CONN,
+      session_id: SESSION,
+      local_turn: { attempt_id: ATTEMPT_OLD, session_id: SESSION },
+    }
+    fs.writeFileSync(stateFile, JSON.stringify({ ...state, local_turn: { attempt_id: ATTEMPT_NEW, session_id: SESSION } }), { mode: 0o600 })
+
+    const origReadFileSync = fs.readFileSync
+    let failStateRead = false
+    fs.readFileSync = (filePath, ...rest) => {
+      if (failStateRead && String(filePath) === stateFile) {
+        throw Object.assign(new Error('transient EIO reading connection state'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    let patchCalls = 0
+    const logs = []
+    try {
+      const res = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        state,
+        connectionCapability: 'cap-secret',
+        callComplete: async () => {
+          failStateRead = true
+          return { phase: 'done', closed_as: 'completed' }
+        },
+        patchState: () => {
+          patchCalls += 1
+          return true
+        },
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.equal(res.localCompleted, false, 'MUST NOT report localCompleted when state file check failed')
+      assert.equal(res.localCompleteRefusal?.code, 'state_unreadable')
+      assert.equal(res.localCompleteRefusal?.cause_code, 'EIO')
+      assert.equal(patchCalls, 0, 'MUST NOT erase local_turn when disk state could not be verified')
+      assert.ok(logs.some((l) => /state_unreadable/i.test(l)))
+    } finally {
+      failStateRead = false
+      fs.readFileSync = origReadFileSync
+    }
+
+    // Once readable again, finishIdleRequests sees ATTEMPT_NEW on disk and treats the old receipt
+    // as superseded WITHOUT clearing ATTEMPT_NEW.
+    const res2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async () => ({ phase: 'done', closed_as: 'completed' }),
+      patchState: () => {
+        patchCalls += 1
+        return true
+      },
+      dir,
+      log: () => {},
+    })
+    assert.equal(res2.localCompleted, true)
+    assert.equal(patchCalls, 0, 'newer attempt on disk MUST NOT be cleared by older completion receipt')
+  })
+
+  it('syncLiveTypedTurn preserves a different person’s room command that joined the running turn while open_request was in flight so the next write asks which request it serves (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111fe'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob starts terminal turn while Alice room command joins mid-open')}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        // While Bob's terminal open_request is in flight, Alice's room command JOINS the running turn!
+        appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+        appendRequestEvent(CONN, { op: 'joined', id: CMD_ALICE }, { dir })
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+      },
+      dir,
+      memo: {},
+    })
+
+    assert.equal(res.action, 'opened')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, res.requestId, 'Bob’s terminal request becomes foreground current')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'Alice’s joined room command MUST NOT be erased by Bob’s current binding')
+    assert.equal(turnAmbiguity(after)?.length, 2, 'turn MUST remain ambiguous across Bob and Alice')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write MUST ask which requester it serves instead of stamping Bob alone')
+  })
 })
