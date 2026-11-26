@@ -5011,4 +5011,93 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     clearPendingUnsavedRefusals(spoolKey, recovered, { home, fallbackDir: diagDir, backupDir: dir })
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, { home, fallbackDir: diagDir, backupDir: dir }), [])
   })
+
+  it('Pass-2 multipart recovery handles a legal POSIX newline in the note path cleanly AND never deletes an original Pass-2 note if its integrity check fails (4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const newlineHome = path.join(home, 'dir-with\nnewline')
+    const notesDir = path.join(newlineHome, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const blockedTmp = path.join(home, 'tmp-newline-multipart')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    fs.writeFileSync(diagDir, 'not-a-directory\n')
+    const { reserveDiagnosticNoteSlots, peekPendingUnsavedRefusals, clearPendingUnsavedRefusals } = await import(
+      './hook-context-budget.mjs'
+    )
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const spoolKey = path.resolve(dir)
+    const originalJson = JSON.stringify([
+      {
+        command_message_id: MSG_ID,
+        refusal: {
+          code: 'turn_busy_newline_path',
+          padding: 'n'.repeat(22_000),
+          blocking_items: [{ id: 'blk-newline-path-ok', reason: 'must_parse_cleanly' }],
+        },
+      },
+    ])
+    const store = reserveDiagnosticNoteSlots({ home: newlineHome, fallbackDir: diagDir, backupDir: null })
+    assert.equal(store.ok, true)
+    let savedFile = null
+    try {
+      fs.chmodSync(notesDir, 0o000)
+      const saved = store.write(originalJson, { spoolKey })
+      assert.ok(saved)
+      assert.equal(saved.pendingPermissionRecovery, true)
+      assert.ok(saved.parts >= 2)
+      savedFile = saved.file
+    } finally {
+      store.release()
+      fs.chmodSync(notesDir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+
+    // 1. Legal newline in path MUST reassemble cleanly to exact valid JSON!
+    const recovered = peekPendingUnsavedRefusals(spoolKey, { home: newlineHome, fallbackDir: diagDir, backupDir: dir })
+    assert.equal(recovered.length, 1)
+    assert.equal(recovered[0], originalJson)
+    assert.equal(JSON.parse(recovered[0])[0].refusal.blocking_items[0].id, 'blk-newline-path-ok')
+
+    // 2. If the file on disk fails integrity verification, clearPendingUnsavedRefusals MUST NOT delete it!
+    fs.appendFileSync(savedFile, 'corrupted-tail')
+    const corrupted = peekPendingUnsavedRefusals(spoolKey, { home: newlineHome, fallbackDir: diagDir, backupDir: dir })
+    assert.equal(corrupted.length, 1)
+    assert.match(corrupted[0], /failed integrity check/)
+    clearPendingUnsavedRefusals(spoolKey, corrupted, { home: newlineHome, fallbackDir: diagDir, backupDir: dir })
+    assert.equal(fs.existsSync(savedFile), true, 'original Pass-2 file MUST NOT be deleted when integrity check fails')
+  })
+
+  it('per-entry content-addressed spool files make concurrent append + cleanup race-free without touching newer entries (3c5147a7 / 3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { spoolUnsavedRefusal, peekPendingUnsavedRefusals, clearPendingUnsavedRefusals } = await import(
+      './hook-context-budget.mjs'
+    )
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const entry1 = JSON.stringify({ code: 'older_refusal', id: 'blk-1' })
+    const entry2 = JSON.stringify({ code: 'newer_refusal', id: 'blk-2' })
+
+    const r1 = spoolUnsavedRefusal(spoolKey, entry1, spoolOpts)
+    assert.equal(r1.persistedOnDisk, true)
+    const snapshot = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.deepEqual(snapshot, [entry1])
+
+    // Simulate another process appending entry2 right before cleanup deletes entry1!
+    const r2 = spoolUnsavedRefusal(spoolKey, entry2, spoolOpts)
+    assert.equal(r2.persistedOnDisk, true)
+    assert.notEqual(r1.file, r2.file, 'each refusal entry MUST live in its own content-addressed file')
+
+    clearPendingUnsavedRefusals(spoolKey, snapshot, spoolOpts)
+    assert.equal(fs.existsSync(r1.file), false, 'surfaced entry1 file must be removed')
+    assert.equal(fs.existsSync(r2.file), true, 'concurrently appended entry2 file MUST remain untouched')
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [entry2])
+  })
 })

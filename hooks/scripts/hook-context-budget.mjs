@@ -1020,16 +1020,25 @@ function spoolCandidateDirs({ home = os.homedir(), fallbackDir = null, backupDir
   return out
 }
 
-function spoolFilePath(dir, scopeTag) {
-  return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+function spoolEntryHash(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex').slice(0, 16)
+}
+
+function spoolEntryFilePrefix(scopeTag) {
+  return `devspec-unsaved-refusal-${scopeTag}-`
+}
+
+function spoolEntryFilePath(dir, scopeTag, entryHash) {
+  return path.join(dir, `${spoolEntryFilePrefix(scopeTag)}${entryHash}.json`)
 }
 
 /**
  * Reassemble a Pass-2 pending-refusal note losslessly by stripping ONLY the header and
  * page footers tagged with that file's exact per-file cryptographic `nonce`, then
- * verifying exact UTF-16 length and SHA-256 against the header seal. Real diagnostic
- * lines resembling page footers are never modified and no generated continuation command
- * can remain in the recovered payload (requirements 4e32d1a5 / 91d7b47c / 3c5147a7).
+ * verifying exact UTF-16 length and SHA-256 against the header seal. Uses `[\s\S]*?` for
+ * the shell-quoted path so legal POSIX paths containing newlines still reassemble cleanly,
+ * real diagnostic lines resembling page footers are never modified, and no generated
+ * continuation command can remain in the recovered payload (reqs 4e32d1a5 / 91d7b47c / 3c5147a7).
  */
 function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
   const nl = content.indexOf('\n')
@@ -1043,7 +1052,7 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
   const expectedChars = Number(charsRaw)
   let body = content.slice(nl + 1)
   const footerRe = new RegExp(
-    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ [^\\n]* \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
+    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ [\\s\\S]*? \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
     'g',
   )
   body = body.replace(footerRe, '')
@@ -1444,10 +1453,11 @@ export function formatDiagnosticStorePreflightError(label, errors = [], { priorT
 
 /**
  * Durable cross-process spool for unabridged oversized refusals when note stores fail
- * mid-pickup: persists private JSON spool files on disk across separate CLI processes AND
- * discovers Pass-2 open-fd pending-refusal notes once directory permissions are restored,
- * so a retry in a brand-new OS process recovers and emits a working read command for the
- * original refusal even when the retry pickup succeeds (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ * mid-pickup: persists ONE immutable content-addressed private JSON file per refusal
+ * entry (`devspec-unsaved-refusal-<scope>-<hash>.json`) so concurrent processes can
+ * NEVER race or delete each other's entries during cleanup, AND discovers Pass-2 open-fd
+ * pending-refusal notes once directory permissions are restored (reqs 3c5147a7 / 4e32d1a5 /
+ * 91d7b47c / 3ea2b201).
  */
 const pendingUnsavedRefusals = new Map()
 
@@ -1460,14 +1470,18 @@ export function spoolUnsavedRefusal(spoolKey, diagnosticText, { home = os.homedi
     pendingUnsavedRefusals.set(key, [...existing, text])
   }
   const scopeTag = spoolScopeTag(key)
+  const entryHash = spoolEntryHash(text)
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
-    const file = spoolFilePath(dir, scopeTag)
+    const file = spoolEntryFilePath(dir, scopeTag, entryHash)
     try {
-      const prev = readPrivateJson(file)
-      const prevEntries = Array.isArray(prev?.entries) ? prev.entries.filter((e) => typeof e === 'string' && e) : []
-      const nextEntries = prevEntries.includes(text) ? prevEntries : [...prevEntries, text]
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-      writePrivateJson(file, { version: 1, scope: scopeTag, entries: nextEntries })
+      writePrivateJson(file, {
+        version: 2,
+        scope: scopeTag,
+        hash: entryHash,
+        at: new Date().toISOString(),
+        text,
+      })
       return { persistedOnDisk: true, file }
     } catch {
       /* try next candidate directory */
@@ -1495,20 +1509,23 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
     for (const entry of mem) pushUnique(entry)
   }
   const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
-    const jsonFile = spoolFilePath(dir, scopeTag)
-    const parsed = readPrivateJson(jsonFile)
-    if (Array.isArray(parsed?.entries)) {
-      for (const entry of parsed.entries) pushUnique(entry)
-    }
     let names = []
     try {
-      names = fs.readdirSync(dir)
+      names = fs.readdirSync(dir).sort()
     } catch {
       continue
     }
     for (const name of names) {
+      if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
+        const parsed = readPrivateJson(path.join(dir, name))
+        if (typeof parsed?.text === 'string' && parsed.text) {
+          pushUnique(parsed.text)
+        }
+        continue
+      }
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
       try {
@@ -1531,7 +1548,9 @@ export function clearPendingUnsavedRefusals(
 ) {
   const key = String(spoolKey ?? '')
   if (!key) return
-  const clearedSet = Array.isArray(cleared) ? new Set(cleared.filter((e) => typeof e === 'string' && e)) : null
+  const clearedList = Array.isArray(cleared) ? cleared.filter((e) => typeof e === 'string' && e) : null
+  const clearedSet = clearedList ? new Set(clearedList) : null
+  const clearedHashes = clearedList ? new Set(clearedList.map(spoolEntryHash)) : null
   if (cleared === null) {
     pendingUnsavedRefusals.delete(key)
   } else if (clearedSet) {
@@ -1546,29 +1565,21 @@ export function clearPendingUnsavedRefusals(
     else pendingUnsavedRefusals.set(key, rest)
   }
   const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
-    const jsonFile = spoolFilePath(dir, scopeTag)
-    try {
-      if (fs.existsSync(jsonFile)) {
-        if (!clearedSet) {
-          fs.rmSync(jsonFile, { force: true })
-        } else {
-          // Only remove entries THIS pass actually surfaced; preserve any refusal appended
-          // concurrently by another process after this reader took its snapshot (3ea2b201 / 3c5147a7).
-          const parsed = readPrivateJson(jsonFile)
-          if (Array.isArray(parsed?.entries)) {
-            const remaining = parsed.entries.filter((entry) => typeof entry === 'string' && entry && !clearedSet.has(entry))
-            if (remaining.length === 0) {
-              fs.rmSync(jsonFile, { force: true })
-            } else {
-              writePrivateJson(jsonFile, { version: 1, scope: scopeTag, entries: remaining })
-            }
-          }
+    if (clearedHashes) {
+      // Unlink ONLY the exact per-entry content-addressed files surfaced by this pass;
+      // any newer refusal appended concurrently by another process lives under its own
+      // distinct hash filename and is NEVER touched (requirements 3c5147a7 / 3ea2b201).
+      for (const hash of clearedHashes) {
+        const entryFile = spoolEntryFilePath(dir, scopeTag, hash)
+        try {
+          if (fs.existsSync(entryFile)) fs.rmSync(entryFile, { force: true })
+        } catch {
+          /* leave for next cleanup if transiently unwritable */
         }
       }
-    } catch {
-      /* leave for next cleanup if transiently unwritable */
     }
     let names = []
     try {
@@ -1577,18 +1588,25 @@ export function clearPendingUnsavedRefusals(
       continue
     }
     for (const name of names) {
+      if (!clearedHashes && name.startsWith(entryPrefix) && name.endsWith('.json')) {
+        try {
+          fs.rmSync(path.join(dir, name), { force: true })
+        } catch {
+          /* ignore */
+        }
+        continue
+      }
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
       try {
         const content = fs.readFileSync(fullPath, 'utf8')
         if (!content.startsWith(scopePrefix)) continue
-        if (!clearedSet) {
+        const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
+        // NEVER delete an original Pass-2 note whose integrity check failed; keep it on
+        // disk so the full paginated original remains readable (reqs 4e32d1a5 / 91d7b47c).
+        if (!recovered?.ok) continue
+        if (!clearedSet || clearedSet.has(recovered.body)) {
           fs.rmSync(fullPath, { force: true })
-        } else {
-          const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
-          if (recovered?.body && clearedSet.has(recovered.body)) {
-            fs.rmSync(fullPath, { force: true })
-          }
         }
       } catch {
         /* ignore */
