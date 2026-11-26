@@ -5801,4 +5801,201 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(retryStderr.join(''), /cat /)
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
   })
+
+  it('oversized >128 KiB refusal under mid-pickup ENOSPC compresses in place into the pre-allocated slot with a working gzip read command and lossless fresh-process recovery, and deep legal paths fit the 16 KiB spool slot without path duplication (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { Writable } = await import('node:stream')
+    const zlib = await import('node:zlib')
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      reserveDiagnosticNoteSlots,
+      fitShellDiagnostic,
+      spoolUnsavedRefusal,
+      peekPendingUnsavedRefusals,
+      clearPendingUnsavedRefusals,
+    } = await import('./hook-context-budget.mjs')
+    const { runOneShotRoomCommandPickup, writeStderrChecked } = await import('./devspec-remote-wait.mjs')
+    const hookBudgetUrl = new URL('./hook-context-budget.mjs', import.meta.url).href
+
+    // 1. > 128 KiB refusal (200 KiB!) when disk fills (ENOSPC on new files AND on any
+    //    fs.writeSync extending past RESERVED_DIAGNOSTIC_SLOT_BYTES):
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const reserved = reserveDiagnosticNoteSlots({ home, fallbackDir: diagDir, backupDir: dir, spoolKey })
+    assert.equal(reserved.ok, true)
+
+    const hugeRefusal = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [
+        { id: 'blk-over-128k-first', detail: 'X'.repeat(200_000) },
+        { id: 'blk-over-128k-final', reason: 'must_survive_enospc_past_128k' },
+      ],
+    })
+    assert.ok(Buffer.byteLength(hugeRefusal, 'utf8') > RESERVED_DIAGNOSTIC_SLOT_BYTES)
+
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    const origWriteSync = fs.writeSync
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    fs.writeFileSync = () => {
+      throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+    }
+    fs.writeSync = (fd, buf, offset, length, position) => {
+      const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+      if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) {
+        throw Object.assign(new Error('ENOSPC extending past pre-allocated slot'), { code: 'ENOSPC' })
+      }
+      return origWriteSync(fd, buf, offset, length, position)
+    }
+
+    let fitted = null
+    let spoolRes = null
+    try {
+      fitted = fitShellDiagnostic('', hugeRefusal, {
+        home,
+        label: 'devspec-remote-wait',
+        fallbackDir: diagDir,
+        backupDir: dir,
+        reservedStore: reserved,
+        spoolKey,
+      })
+      spoolRes = spoolUnsavedRefusal(spoolKey, hugeRefusal, {
+        ...spoolOpts,
+        savedNote: fitted.note,
+        reservedStore: reserved,
+      })
+    } finally {
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      fs.writeSync = origWriteSync
+      reserved.release()
+    }
+
+    assert.equal(fitted.note?.compressed, 'gzip', 'must fall back to in-place gzip inside pre-allocated 128 KiB slot')
+    assert.match(fitted.note.command, /^gzip -dc /)
+    assert.match(fitted.text, /gzip -dc /, 'stderr output MUST include working gzip read command')
+    const decompressed = zlib.gunzipSync(fs.readFileSync(fitted.note.file)).toString('utf8')
+    assert.equal(decompressed, hugeRefusal, 'gzipped slot MUST preserve entire 200 KiB refusal byte-for-byte')
+    assert.equal(spoolRes.persistedOnDisk, true, '16 KiB spool slot MUST persist gzip note_ref under ENOSPC')
+
+    // Brand-new OS process MUST gunzip and recover the full 200 KiB refusal including blk-over-128k-final!
+    const childPeek = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { peekPendingUnsavedRefusals } from ${JSON.stringify(hookBudgetUrl)}; console.log(JSON.stringify(peekPendingUnsavedRefusals(${JSON.stringify(spoolKey)}, ${JSON.stringify(spoolOpts)})));`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(childPeek.status, 0, childPeek.stderr)
+    const recovered = JSON.parse(childPeek.stdout)
+    assert.equal(recovered.length, 1)
+    assert.equal(recovered[0], hugeRefusal)
+    assert.match(recovered[0], /blk-over-128k-final/)
+    clearPendingUnsavedRefusals(spoolKey, recovered, spoolOpts)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+
+    // 2. Legal deep path (~2,600 chars, where storing path twice would overflow 4 KiB) + ENOSPC + EPIPE:
+    let deepHome = home
+    for (let i = 0; i < 16; i += 1) {
+      deepHome = path.join(deepHome, `nested-segment-${String(i).padStart(2, '0')}-${'d'.repeat(140)}`)
+    }
+    const deepNotesDir = path.join(deepHome, '.devspec', 'notes')
+    fs.mkdirSync(deepNotesDir, { recursive: true, mode: 0o700 })
+    assert.ok(deepNotesDir.length > 2300, `expected deep path > 2300 chars; got ${deepNotesDir.length}`)
+    const deepDir = path.join(deepHome, '.devspec', 'remote-control', 'connections')
+    const deepDiagDir = path.join(deepDir, 'diagnostic-notes')
+    const deepSpoolKey = path.resolve(deepDir)
+    const deepSpoolOpts = { home: deepHome, fallbackDir: deepDiagDir, backupDir: deepDir }
+
+    const reservedDeep = reserveDiagnosticNoteSlots({
+      home: deepHome,
+      fallbackDir: deepDiagDir,
+      backupDir: deepDir,
+      spoolKey: deepSpoolKey,
+    })
+    assert.equal(reservedDeep.ok, true)
+    const printedWakes = [buildOwnerMessageEvents(ownerBatch('Deep path ENOSPC + EPIPE check'))]
+    const brokenStderr = new Writable({
+      write(_chunk, _enc, cb) {
+        cb(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      },
+    })
+    let blockDeepSpool = false
+    const origRenameSync = fs.renameSync
+    fs.writeFileSync = (filePath, data, opts) => {
+      if (blockDeepSpool && String(filePath).includes('devspec-unsaved-refusal')) {
+        throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+      }
+      return origWriteFileSync(filePath, data, opts)
+    }
+    fs.renameSync = (from, to) => {
+      if (blockDeepSpool && String(to).includes('devspec-unsaved-refusal')) {
+        throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+      }
+      return origRenameSync(from, to)
+    }
+    try {
+      await assert.rejects(
+        () =>
+          runOneShotRoomCommandPickup({
+            connectionId: CONN,
+            printedWakes,
+            dir: deepDir,
+            home: deepHome,
+            reservedStore: reservedDeep,
+            startCommands: async () => {
+              blockDeepSpool = true
+              return {
+                ok: false,
+                outcome: 'refused',
+                refusals: [
+                  {
+                    command_message_id: 'msg-deep-path-1',
+                    refusal: {
+                      code: 'blocked_by_items',
+                      blocking_items: [{ id: 'blk-deep-path-survived', detail: 'D'.repeat(25000) }],
+                    },
+                  },
+                ],
+              }
+            },
+            writeStderr: (text) => writeStderrChecked(text, brokenStderr),
+          }),
+        /write EPIPE/,
+      )
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      blockDeepSpool = false
+      fs.writeFileSync = origWriteFileSync
+      fs.renameSync = origRenameSync
+      reservedDeep.release()
+    }
+
+    const childDeep = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { peekPendingUnsavedRefusals } from ${JSON.stringify(hookBudgetUrl)}; console.log(JSON.stringify(peekPendingUnsavedRefusals(${JSON.stringify(deepSpoolKey)}, ${JSON.stringify(deepSpoolOpts)})));`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(childDeep.status, 0, childDeep.stderr)
+    const deepRecovered = JSON.parse(childDeep.stdout)
+    assert.ok(
+      deepRecovered.some((e) => e.includes('blk-deep-path-survived')),
+      'fresh OS process MUST recover saved note on deep legal path (>2300 chars) after ENOSPC + EPIPE',
+    )
+    clearPendingUnsavedRefusals(deepSpoolKey, deepRecovered, deepSpoolOpts)
+    assert.deepEqual(peekPendingUnsavedRefusals(deepSpoolKey, deepSpoolOpts), [])
+  })
 })

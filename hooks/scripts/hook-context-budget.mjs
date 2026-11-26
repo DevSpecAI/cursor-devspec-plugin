@@ -149,6 +149,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 
 import { wakeLines } from './devspec-wake-file.mjs'
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
@@ -235,13 +236,15 @@ export const NOTE_PART_BYTES = 36_000
 export const RESERVED_DIAGNOSTIC_SLOT_BYTES = 128 * 1024
 
 /**
- * Pre-allocated size for the reserved pending-refusal spool pointer slot (4 KiB: one
- * standard POSIX filesystem block, plenty for a ~250-byte `{ kind: 'note_ref', ... }`
- * JSON pointer with trailing ASCII spaces) so even if the disk fills (`ENOSPC`) after a
- * note is saved and `stderr` breaks (`EPIPE`), the pointer can be overwritten in place
- * with zero new block allocation so the next OS process still discovers the saved note.
+ * Pre-allocated size for the reserved pending-refusal spool pointer slot (16 KiB:
+ * 4 standard POSIX blocks, large enough for a single Linux `PATH_MAX` 4,096-byte path
+ * even under worst-case JSON escaping plus metadata fields, because `note_ref` stores
+ * `file` once and derives the shell read command on recovery) so even if the disk fills
+ * (`ENOSPC`) after a note is saved and `stderr` breaks (`EPIPE`), the pointer can be
+ * overwritten in place with zero new block allocation so the next OS process still
+ * discovers the saved note.
  */
-export const RESERVED_SPOOL_POINTER_BYTES = 4096
+export const RESERVED_SPOOL_POINTER_BYTES = 16 * 1024
 
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
@@ -1327,7 +1330,48 @@ export function reserveDiagnosticNoteSlots({
     }
     if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
     const contentBuf = Buffer.concat(pages)
-    writeAllSync(activeSlot.fd, contentBuf)
+    try {
+      writeAllSync(activeSlot.fd, contentBuf)
+    } catch (writeErr) {
+      // If extending past the pre-allocated 128 KiB slot hits `ENOSPC` on a full
+      // filesystem, fall back to writing gzip-compressed `payloadText` IN PLACE into
+      // the pre-allocated slot (allocating ZERO new disk blocks) with a working
+      // `gzip -dc` read command AND lossless gunzip recovery on the next pass
+      // (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
+      const gzBuf = zlib.gzipSync(Buffer.from(payloadText, 'utf8'))
+      if (gzBuf.length <= (activeSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES)) {
+        writeAllSync(activeSlot.fd, gzBuf)
+        if (requireReadableByPath) {
+          if (!verifySlotReadableByPath(activeSlot, gzBuf.length)) {
+            throw new Error(`reserved gzip diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+          }
+        } else {
+          const st = fs.fstatSync(activeSlot.fd)
+          if (st.nlink <= 0 || st.size !== gzBuf.length) {
+            throw new Error(`reserved gzip diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+          }
+        }
+        activeSlot.used = true
+        const rawBytes = Buffer.byteLength(payloadText, 'utf8')
+        const gzParts = Math.max(1, Math.ceil(rawBytes / NOTE_PART_BYTES))
+        const gzCommand =
+          gzParts === 1
+            ? `gzip -dc ${quoted}`
+            : `gzip -dc ${quoted} | head -c ${NOTE_PART_BYTES}`
+        return {
+          id,
+          file: activeSlot.filePath,
+          command: gzCommand,
+          parts: gzParts,
+          fallback: true,
+          reserved: true,
+          compressed: 'gzip',
+          rawBytes,
+          ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
+        }
+      }
+      throw writeErr
+    }
     if (requireReadableByPath) {
       if (!verifySlotReadableByPath(activeSlot, contentBuf.length)) {
         throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
@@ -1378,7 +1422,7 @@ export function reserveDiagnosticNoteSlots({
           })
           if (written) return written
         } catch {
-          try { fs.ftruncateSync(activeSlot.fd, 0) } catch { /* ignore */ }
+          /* keep pre-allocated blocks intact for Pass 2 or fallback without freeing via ftruncate(0) */
         }
       }
       // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.
@@ -1407,7 +1451,7 @@ export function reserveDiagnosticNoteSlots({
           })
           if (written) return written
         } catch {
-          try { fs.ftruncateSync(slot.fd, 0) } catch { /* ignore */ }
+          /* keep pre-allocated blocks intact */
         }
       }
       return null
@@ -1577,15 +1621,26 @@ const pendingUnsavedRefusals = new Map()
 function recoverNoteRefPayload(parsed) {
   if (!parsed || parsed.kind !== 'note_ref' || typeof parsed.file !== 'string' || !parsed.file) return null
   const partsCount = Number.isInteger(parsed.parts) && parsed.parts > 0 ? parsed.parts : 1
-  const readFallbackCmd = typeof parsed.command === 'string' && parsed.command ? parsed.command : `cat ${shellQuotePath(parsed.file)}`
+  const quoted = shellQuotePath(parsed.file)
+  const readFallbackCmd =
+    typeof parsed.command === 'string' && parsed.command
+      ? parsed.command
+      : parsed.compressed === 'gzip'
+        ? partsCount > 1
+          ? `gzip -dc ${quoted} | head -c ${NOTE_PART_BYTES}`
+          : `gzip -dc ${quoted}`
+        : `cat ${quoted}`
   try {
-    if (parsed.reserved) {
+    if (parsed.compressed === 'gzip') {
+      const gunzipped = zlib.gunzipSync(fs.readFileSync(parsed.file)).toString('utf8')
+      if (gunzipped) return { ok: true, text: gunzipped }
+    } else if (parsed.reserved) {
       let content = fs.readFileSync(parsed.file, 'utf8')
       const noncePat =
         typeof parsed.frame_nonce === 'string' && /^[0-9a-f]{16}$/.test(parsed.frame_nonce)
           ? ` \\[frame:${parsed.frame_nonce}\\]`
           : ''
-      const quotedPath = shellQuotePath(parsed.file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const quotedPath = quoted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       const footerRe = new RegExp(
         `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ ${quotedPath} \\| head -c \\d+)?${noncePat} ---\\n`,
         'g',
@@ -1640,10 +1695,10 @@ export function spoolUnsavedRefusal(
   const entryHash = spoolEntryHash(text)
   const dirs = spoolCandidateDirs({ home, fallbackDir, backupDir })
 
-  // If the full diagnostic is ALREADY saved whole on disk in `savedNote`, persist a tiny
-  // ~250-byte `note_ref` pointer (trying candidate dirs + the note's own dir + the
-  // pre-allocated 4 KiB reserved spool slot) so even `ENOSPC` + `EPIPE` leaves the saved
-  // note discoverable by the next OS process without duplicating tens of KiB (3ea2b201 / 4e32d1a5).
+  // If the full diagnostic is ALREADY saved whole on disk in `savedNote`, persist a
+  // compact `note_ref` pointer storing `file` ONCE (never duplicating the path inside
+  // `command`, so even a deep legal POSIX path fits easily inside the pre-allocated
+  // 16 KiB spool slot under `ENOSPC` + `EPIPE`) (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c).
   if (savedNote && typeof savedNote.file === 'string' && savedNote.file) {
     const refPayload = {
       version: 2,
@@ -1652,10 +1707,10 @@ export function spoolUnsavedRefusal(
       kind: 'note_ref',
       at: new Date().toISOString(),
       file: savedNote.file,
-      command: savedNote.command,
       parts: savedNote.parts ?? 1,
       fallback: Boolean(savedNote.fallback),
       ...(savedNote.reserved ? { reserved: true } : {}),
+      ...(savedNote.compressed ? { compressed: savedNote.compressed } : {}),
       ...(savedNote.frameNonce ? { frame_nonce: savedNote.frameNonce } : {}),
     }
     const refDirs = [...dirs]
@@ -1695,8 +1750,9 @@ export function spoolUnsavedRefusal(
       /* try next candidate directory */
     }
   }
-  // Last-resort pre-allocated fallback under `ENOSPC`: write into a pre-allocated 4 KiB
-  // spool slot if small, or into a pre-allocated 128 KiB diagnostic slot if oversized.
+  // Last-resort pre-allocated fallback under `ENOSPC`: write into a pre-allocated 16 KiB
+  // spool slot if small, or into a pre-allocated 128 KiB diagnostic slot (auto-gzipping
+  // in place if > 128 KiB) if oversized.
   if (reservedStore && typeof reservedStore.writeSpoolPointer === 'function') {
     const fromSlot = reservedStore.writeSpoolPointer({
       version: 2,
@@ -1718,10 +1774,10 @@ export function spoolUnsavedRefusal(
           kind: 'note_ref',
           at: new Date().toISOString(),
           file: saved.file,
-          command: saved.command,
           parts: saved.parts ?? 1,
           fallback: Boolean(saved.fallback),
           ...(saved.reserved ? { reserved: true } : {}),
+          ...(saved.compressed ? { compressed: saved.compressed } : {}),
         }
         if (typeof reservedStore.writeSpoolPointer === 'function') {
           const fromSlot = reservedStore.writeSpoolPointer(refPayload)

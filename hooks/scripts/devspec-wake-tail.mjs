@@ -1020,7 +1020,7 @@ export async function readWakes({
       })
       pickupDiagnosticNote = fittedWithStdout.note
       const savedReadableNow =
-        (Boolean(fittedWithStdout.note) && !fittedWithStdout.note.pendingPermissionRecovery) ||
+        (Boolean(fittedWithStdout.note) && !fittedWithStdout.note.pendingPermissionRecovery && !fittedWithStdout.note.compressed) ||
         fitsShellOutput(printedStdout + effectiveRawDiag)
       const diagText =
         fittedWithStdout.text ||
@@ -1066,7 +1066,7 @@ export async function readWakes({
         await writeStderr(fitted.text)
         pickupDiagnosticWritten = true
         const savedReadableNow =
-          (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
+          (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery && !fitted.note.compressed) ||
           fitsShellOutput(printedStdout + effectiveRawDiag)
         if (pendingSpoolEntries.length > 0 && savedReadableNow) {
           clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)

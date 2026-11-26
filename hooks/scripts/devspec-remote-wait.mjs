@@ -2062,7 +2062,7 @@ export async function runOneShotRoomCommandPickup({
     })
     diagnosticNote = fitted.note
     const savedReadableNow =
-      (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
+      (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery && !fitted.note.compressed) ||
       fitsShellOutput(combinedPrior + effectiveRawDiag)
     const diagText =
       fitted.text ||
