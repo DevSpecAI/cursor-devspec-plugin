@@ -1363,14 +1363,10 @@ export async function syncTypedTurnFromTranscript({
           if (opened.ok) {
             requestId = opened.requestId
             openedNow = true
-            // Re-read BOTH `.requests.jsonl` and the transcript AFTER awaiting DevSpec's
-            // open reply so an older terminal open NEVER replaces a newer live room
-            // command (or newer turn) that became `current` while the open was in flight
-            // (decision ce71a72b).
-            const postOpenState = readRequestState(connectionId, { dir })
-            if (isBlockingReadError(postOpenState.readError)) {
-              return { action: 'request_log_unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
-            }
+            // Re-read the transcript FIRST, then `.requests.jsonl` immediately after,
+            // AFTER awaiting DevSpec's open reply so an older terminal open NEVER
+            // replaces a newer live room command (or newer turn) that became `current`
+            // while the open was in flight OR while re-reading the transcript (decision ce71a72b).
             const postOpenActive = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
             if (postOpenActive?.budgetExhausted) {
               return { action: 'budget_exhausted', budget_ms: budgetMs }
@@ -1380,6 +1376,10 @@ export async function syncTypedTurnFromTranscript({
                 `typed-turn-sync: transcript unreadable after open_request for ${connectionId} (${turnKey}); deferring current binding and leaving turn unsynced\n`,
               )
               return { action: 'unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
+            }
+            const postOpenState = readRequestState(connectionId, { dir })
+            if (isBlockingReadError(postOpenState.readError)) {
+              return { action: 'request_log_unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
             }
             const newerCurrentLanded =
               postOpenState.current !== reqState.current &&
@@ -2083,13 +2083,14 @@ export async function finishIdleRequests({
   const clearEndedForeground = async () => {
     if (!initialCurrent) return
     await withTypedSyncLock(connectionId, dir, async () => {
+      // Re-verify the transcript FIRST, then `.requests.jsonl` immediately after, so a
+      // new live typed turn OR room command arriving while reading the transcript is
+      // NEVER cleared (ce71a72b).
+      const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
+      if (!latestActive || !latestActive.ended || latestActive.stamp !== initialStamp) return
       const curState = readRequestState(connectionId, { dir })
       if (curState.readError) return
       if (!curState.current || curState.current !== initialCurrent) return
-      // Re-verify the transcript is still idle on the same ended turn so a new live
-      // typed turn opened while awaiting report_complete/closeRequest is NEVER cleared (ce71a72b).
-      const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
-      if (!latestActive || !latestActive.ended || latestActive.stamp !== initialStamp) return
       const curInfo = curState.open.get(curState.current)
       const shouldClear =
         curState.currentFromWake ||
@@ -2144,10 +2145,10 @@ export async function finishIdleRequests({
           // receipt for the previous turn NEVER erases a newer turn's saved attempt
           // admitted while `await callComplete` was in flight (requirement 3ea2b201).
           const clearOutcome = await withTypedSyncLock(connectionId, dir, async () => {
+            const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
             const diskState = readPrivateJson(path.join(dir, `${connectionId}.json`))
             const diskAttemptId = diskState?.local_turn?.attempt_id ?? null
             const memAttemptId = state?.local_turn?.attempt_id ?? null
-            const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
             const supersededByAttempt =
               (diskAttemptId && diskAttemptId !== localAttemptId) ||
               (memAttemptId && memAttemptId !== localAttemptId)
@@ -2212,6 +2213,21 @@ export async function finishIdleRequests({
     let commitOutcome = null
     try {
       commitOutcome = await withTypedSyncLock(connectionId, dir, async () => {
+        // Re-read the transcript FIRST, then `.requests.jsonl` immediately after. If the
+        // transcript cannot be re-read after the close reply, FAIL CLOSED instead of
+        // recording a local close or reporting success without verification (req 3ea2b201).
+        const postCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+        if (!postCloseActive || postCloseActive.budgetExhausted) {
+          return {
+            status: 'refused',
+            refusal: {
+              code: postCloseActive?.budgetExhausted ? 'budget_exhausted' : 'transcript_unreadable',
+              retryable: true,
+              request_id: targetRequestId,
+              error: 'Could not re-read transcript after close reply to verify request is still safe to close',
+            },
+          }
+        }
         const postCloseState = readRequestState(connectionId, { dir })
         if (postCloseState.readError) {
           return {
@@ -2222,9 +2238,8 @@ export async function finishIdleRequests({
             },
           }
         }
-        const postCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
         const postCloseStillIdle = Boolean(
-          postCloseActive && postCloseActive.ended && postCloseActive.stamp === initialStamp,
+          postCloseActive.ended && postCloseActive.stamp === initialStamp,
         )
         const newlyCarried =
           (postCloseState.current === targetRequestId && initialCurrent !== targetRequestId) ||
@@ -2327,89 +2342,110 @@ export async function finishIdleRequests({
     }
   }
   if (candidateId && connectionCapability && typeof callRequest === 'function') {
-    // Re-read `.requests.jsonl` and transcript AFTER awaiting `callComplete` so a
-    // background launch, schedule, or new turn recorded during that wait is NEVER
-    // closed prematurely (requirements 3ea2b201 / ce71a72b).
-    const preCloseState = readRequestState(connectionId, { dir })
-    if (preCloseState.readError) {
+    // Re-read transcript FIRST, then `.requests.jsonl`, AFTER awaiting `callComplete` so
+    // a background launch, schedule, or new turn recorded during that wait is NEVER closed
+    // prematurely, and an unreadable transcript fails closed instead of silently skipping
+    // verification (requirements 3ea2b201 / ce71a72b).
+    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+    if (!preCloseActive || preCloseActive.budgetExhausted) {
       closeRefusal = {
-        code: 'request_log_unreadable',
-        error: preCloseState.readError?.message ?? 'request log unreadable before close',
+        code: preCloseActive?.budgetExhausted ? 'budget_exhausted' : 'transcript_unreadable',
+        retryable: true,
+        request_id: candidateId,
+        error: 'Could not re-read transcript before close to verify turn is still idle',
       }
-      log(`typed-turn-sync: idle close skipped because request log is unreadable for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+      log(`typed-turn-sync: idle close skipped because transcript is unreadable for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
     } else {
-      const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
-      const preCloseStillIdle = Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
-      const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
-      const stillFinished =
-        preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
-      if (stillFinished) {
-        let lastCloseResponse = null
-        let lastCloseError = null
-        let serverClosed = false
-        try {
-          const res = await callRequest({
-            connection_id: connectionId,
-            action: 'close',
-            request_id: candidateId,
-            reason: 'host_finished',
-          })
-          lastCloseResponse = res
-          serverClosed = res?.status === 'closed'
-        } catch (err) {
-          lastCloseError = err
-          serverClosed = /unknown request/i.test(String(err?.message ?? err))
+      const preCloseState = readRequestState(connectionId, { dir })
+      if (preCloseState.readError) {
+        closeRefusal = {
+          code: 'request_log_unreadable',
+          error: preCloseState.readError?.message ?? 'request log unreadable before close',
         }
-        if (serverClosed) {
-          await commitServerClose(candidateId, { isCandidate: true })
-        } else {
-          closeRefusal =
-            refusalFromResponse(lastCloseResponse) ??
-            (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
-            (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
-          log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+        log(`typed-turn-sync: idle close skipped because request log is unreadable for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+      } else {
+        const preCloseStillIdle = Boolean(preCloseActive.ended && preCloseActive.stamp === initialStamp)
+        const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
+        const stillFinished =
+          preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
+        if (stillFinished) {
+          let lastCloseResponse = null
+          let lastCloseError = null
+          let serverClosed = false
+          try {
+            const res = await callRequest({
+              connection_id: connectionId,
+              action: 'close',
+              request_id: candidateId,
+              reason: 'host_finished',
+            })
+            lastCloseResponse = res
+            serverClosed = res?.status === 'closed'
+          } catch (err) {
+            lastCloseError = err
+            serverClosed = /unknown request/i.test(String(err?.message ?? err))
+          }
+          if (serverClosed) {
+            await commitServerClose(candidateId, { isCandidate: true })
+          } else {
+            closeRefusal =
+              refusalFromResponse(lastCloseResponse) ??
+              (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+              (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+            log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+          }
         }
       }
     }
   } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
     const [pendingKey, pendingEntry] = pendingFallback
-    const preCloseState = readRequestState(connectionId, { dir })
-    if (preCloseState.readError) {
+    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+    if (!preCloseActive || preCloseActive.budgetExhausted) {
       closeRefusal = {
-        code: 'request_log_unreadable',
-        error: preCloseState.readError?.message ?? 'request log unreadable before fallback close',
+        code: preCloseActive?.budgetExhausted ? 'budget_exhausted' : 'transcript_unreadable',
+        retryable: true,
+        request_id: pendingEntry.requestId,
+        error: 'Could not re-read transcript before fallback close to verify turn is still idle',
       }
-      log(`typed-turn-sync: idle pending-open close skipped because request log is unreadable for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+      log(`typed-turn-sync: idle pending-open close skipped because transcript is unreadable for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
     } else {
-      const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
-      const preCloseStillIdle =
-        Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
-        !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
-      if (preCloseStillIdle) {
-        let lastCloseResponse = null
-        let lastCloseError = null
-        let serverClosed = false
-        try {
-          const res = await callRequest({
-            connection_id: connectionId,
-            action: 'close',
-            request_id: pendingEntry.requestId,
-            reason: 'host_finished',
-          })
-          lastCloseResponse = res
-          serverClosed = res?.status === 'closed'
-        } catch (err) {
-          lastCloseError = err
-          serverClosed = /unknown request/i.test(String(err?.message ?? err))
+      const preCloseState = readRequestState(connectionId, { dir })
+      if (preCloseState.readError) {
+        closeRefusal = {
+          code: 'request_log_unreadable',
+          error: preCloseState.readError?.message ?? 'request log unreadable before fallback close',
         }
-        if (serverClosed) {
-          await commitServerClose(pendingEntry.requestId, { isCandidate: false, pendingKey, pendingEntry })
-        } else {
-          closeRefusal =
-            refusalFromResponse(lastCloseResponse) ??
-            (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
-            (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
-          log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+        log(`typed-turn-sync: idle pending-open close skipped because request log is unreadable for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+      } else {
+        const preCloseStillIdle =
+          Boolean(preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
+          !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
+        if (preCloseStillIdle) {
+          let lastCloseResponse = null
+          let lastCloseError = null
+          let serverClosed = false
+          try {
+            const res = await callRequest({
+              connection_id: connectionId,
+              action: 'close',
+              request_id: pendingEntry.requestId,
+              reason: 'host_finished',
+            })
+            lastCloseResponse = res
+            serverClosed = res?.status === 'closed'
+          } catch (err) {
+            lastCloseError = err
+            serverClosed = /unknown request/i.test(String(err?.message ?? err))
+          }
+          if (serverClosed) {
+            await commitServerClose(pendingEntry.requestId, { isCandidate: false, pendingKey, pendingEntry })
+          } else {
+            closeRefusal =
+              refusalFromResponse(lastCloseResponse) ??
+              (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+              (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+            log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+          }
         }
       }
     }

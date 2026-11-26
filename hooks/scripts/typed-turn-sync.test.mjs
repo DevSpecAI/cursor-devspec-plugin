@@ -4631,4 +4631,121 @@ describe('typed-turn-sync (item da03801e)', () => {
     const finalStamp = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(finalStamp.args?.request_ref, CMD_ALICE)
   })
+
+  it('finishIdleRequests fails closed without closing locally or reporting success when post-close transcript verification fails (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const REQ_ID = '55555555-5555-4555-8555-5555555555fd'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn whose post-close transcript verification fails')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ID, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ID }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ID }, { dir })
+
+    const origOpenSync = fs.openSync
+    let failTranscriptRead = false
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (failTranscriptRead && String(filePath) === transcriptPath) {
+        throw Object.assign(new Error('transient EACCES re-reading transcript after close'), { code: 'EACCES' })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    const logs = []
+    try {
+      const idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => {
+          // Server acknowledges close, then the post-close transcript read fails!
+          failTranscriptRead = true
+          return { status: 'closed' }
+        },
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.deepEqual(idle1.closed, [], 'MUST NOT report request closed when post-close transcript verification failed')
+      assert.equal(idle1.closeRefusal?.code, 'transcript_unreadable')
+      assert.equal(idle1.closeRefusal?.request_id, REQ_ID)
+      assert.ok(logs.some((l) => /transcript_unreadable/i.test(l)))
+      const midState = readRequestState(CONN, { dir })
+      assert.equal(midState.open.has(REQ_ID), true, 'MUST NOT write local close event without verifying transcript')
+      assert.equal(midState.closed?.has(REQ_ID) ?? false, false)
+      assert.equal(midState.current, REQ_ID, 'MUST NOT clear foreground current while close verification failed')
+    } finally {
+      failTranscriptRead = false
+      fs.openSync = origOpenSync
+    }
+
+    // Once the transcript is readable again, the next idle sweep verifies and closes cleanly.
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ status: 'closed' }),
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle2.closed, [REQ_ID])
+    assert.equal(idle2.closeRefusal, undefined)
+    const afterState = readRequestState(CONN, { dir })
+    assert.equal(afterState.open.has(REQ_ID), false)
+    assert.equal(afterState.closed?.has(REQ_ID), true)
+    assert.equal(afterState.current, null)
+  })
+
+  it('syncLiveTypedTurn NEVER overwrites a different person’s room command that becomes current while re-reading the transcript after open_request (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111fd'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob terminal prompt racing Alice room command during transcript re-read')}\n`)
+
+    const origOpenSync = fs.openSync
+    let injectAliceOnNextTranscriptRead = false
+    let injected = false
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (injectAliceOnNextTranscriptRead && !injected && String(filePath) === transcriptPath) {
+        injected = true
+        // Alice's room command lands and becomes `current` DURING the post-open transcript re-read!
+        appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+
+    let res = null
+    try {
+      res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          injectAliceOnNextTranscriptRead = true
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+        },
+        dir,
+        memo: {},
+      })
+    } finally {
+      fs.openSync = origOpenSync
+    }
+
+    assert.equal(injected, true, 'test hook must have fired during post-open transcript re-read')
+    assert.equal(res.action, 'opened')
+    assert.equal(res.superseded, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'older terminal open MUST NOT replace Alice’s room command that landed during transcript re-read')
+    assert.equal(after.joined.size, 0, 'superseded terminal request must not pollute Alice’s room command')
+    assert.equal(after.started.has(res.requestId), true, 'superseded terminal request must be marked started for idle cleanup')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined)
+    assert.equal(stamped.args?.request_ref, CMD_ALICE, 'next write MUST stamp Alice’s live room request, not Bob’s older terminal prompt')
+  })
 })
