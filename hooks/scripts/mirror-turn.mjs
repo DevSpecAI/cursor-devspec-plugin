@@ -569,16 +569,31 @@ export function prepareAgentMirrorText(text) {
 }
 
 /**
- * Snapshot the keys of non-typed wakes that already ended (`turn_ended`) in
- * `transcriptPath` before a prompt hook fired, so `syncTypedTurnFromTranscript`
- * never lets an earlier wake that ended without firing `beforeSubmitPrompt`
- * consume a later wake's known prompt-hook attribution (decision ce71a72b).
+ * Snapshot the keys of non-typed wakes already present in `transcriptPath` before a
+ * prompt hook fired — both those that already ended (`endedNonTypedWakes`) AND any
+ * earlier non-typed wake still open because its `turn_ended` marker has not reached
+ * disk yet (`liveNonTypedWakes`, excluding any row already matching `promptText`).
+ * `syncTypedTurnFromTranscript` excludes these keys when counting wakes that ended
+ * AFTER the hook ran so an earlier wake never consumes a later wake's known
+ * prompt-hook attribution (decision ce71a72b).
  */
-export function priorEndedWakeKeysForTranscript(transcriptPath) {
+export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = null } = {}) {
   if (!transcriptPath) return undefined
   const snapshot = activeTranscriptTurn(transcriptPath, { attempts: 1 })
   if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return undefined
-  return snapshot.endedNonTypedWakes.map((w) => w?.key).filter((k) => typeof k === 'string' && k)
+  const trimmedPrompt = typeof promptText === 'string' ? promptText.trim() : ''
+  const keys = new Set()
+  for (const w of snapshot.endedNonTypedWakes) {
+    if (typeof w?.key === 'string' && w.key) keys.add(w.key)
+  }
+  if (Array.isArray(snapshot.liveNonTypedWakes)) {
+    for (const w of snapshot.liveNonTypedWakes) {
+      if (typeof w?.key !== 'string' || !w.key) continue
+      if (trimmedPrompt && typeof w.rawText === 'string' && w.rawText.trim() === trimmedPrompt) continue
+      keys.add(w.key)
+    }
+  }
+  return [...keys]
 }
 
 async function main() {
@@ -640,7 +655,9 @@ async function main() {
         !fromAPerson && origin && !midTurn
           ? hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId || conversationId)
           : null
-      const priorEndedWakeKeys = hookTranscript ? priorEndedWakeKeysForTranscript(hookTranscript) : undefined
+      const priorEndedWakeKeys = hookTranscript
+        ? priorEndedWakeKeysForTranscript(hookTranscript, { promptText: text })
+        : undefined
       const arrival = promptArrival({
         fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
         origin,
@@ -716,7 +733,12 @@ async function main() {
               timeoutMs: 10_000,
             }),
         })
-        if (admitted) patchOwnState(connectionId, { local_turn: admitted })
+        if (admitted) {
+          patchOwnState(connectionId, {
+            local_turn: admitted,
+            ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
+          })
+        }
       }
     }
 

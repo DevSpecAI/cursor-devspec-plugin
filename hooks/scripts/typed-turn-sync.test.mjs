@@ -6507,5 +6507,144 @@ describe('typed-turn-sync (item da03801e)', () => {
         args: { task_id: 'x' },
       })
     }
+
+    // Case 3: Earlier wake's `turn_ended` reaches the transcript AFTER `mirror-turn.mjs user_prompt`
+    // ran for Bob's scheduled wake -> sync MUST NOT mistake that delayed end marker for the end of
+    // Bob's wake (ce71a72b), and a later real end of Bob's wake MUST still clear attribution!
+    {
+      const { home, dir, transcriptPath } = setupHookEnv()
+      const earlierOpenWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+      })
+      // Note: NO `turn_ended` yet when mirror-turn.mjs runs!
+      fs.writeFileSync(transcriptPath, `${earlierOpenWakeRow}\n`)
+
+      const hookRes = runPromptHook(home, {
+        conversation_id: CONV,
+        origin: { kind: 'scheduled-trigger' },
+        prompt: 'bob scheduled check',
+      })
+      assert.equal(hookRes.status, 0, hookRes.stderr)
+      assert.equal(readRequestState(CONN, { dir }).currentWakePriorEndedKeys.size, 1)
+
+      // Now the earlier wake's `turn_ended` flushes AFTER the hook ran, followed by Bob's wake row!
+      const bobWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n${bobWakeRow}\n`)
+
+      const syncDelayed = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(syncDelayed.action, 'preserved_wake_request', 'delayed turn_ended from earlier wake MUST NOT clear Bob’s scheduled wake requester')
+      assert.equal(syncDelayed.requestId, CMD_BOB)
+      assert.equal(
+        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+        CMD_BOB,
+        'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+      )
+
+      // And once Bob's wake actually finishes and an unrelated wake starts, sync still clears it!
+      const laterUnrelated = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:25 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n${laterUnrelated}\n`)
+      const syncAfterEnd = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(syncAfterEnd.action, 'cleared_for_wake')
+      assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+        args: { task_id: 'x' },
+      })
+    }
+  })
+
+  it('a leftover local_turn admission from an earlier turn is NEVER mistaken for a new prompt-hook typed request whose own admission failed (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const PREV_ATTEMPT = '77777777-7777-4777-8777-777777777777'
+    const NEW_HOOK_REQ = '88888888-8888-4888-8888-888888888888'
+    // Prompt hook opened NEW_HOOK_REQ for Turn 2, but room admission failed, leaving Turn 1's
+    // legacy/stale `state.local_turn` (with no matching turn_key or request_id) in state.
+    appendRequestEvent(CONN, { op: 'open', id: NEW_HOOK_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: NEW_HOOK_REQ }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn 2 after failed hook admission')}\n`)
+
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+      local_turn: { attempt_id: PREV_ATTEMPT, session_id: ROOM },
+    }
+    const memo = { stamp: null, synced: false }
+    let pickupCalls = 0
+
+    // Pass 1: sync MUST attempt room admission for Turn 2; if refused, leave unsynced for retry!
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        throw new Error('must adopt hook request, not open a second one')
+      },
+      callPickup: async (args) => {
+        pickupCalls += 1
+        assert.equal(args.previous_attempt_id, PREV_ATTEMPT)
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'foreground_owned_by_command',
+        }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pickupCalls, 1, 'leftover local_turn from Turn 1 MUST NOT suppress pickup for Turn 2')
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0)
+
+    // Pass 2: room now admits Turn 2 -> sync persists local_turn with request_id & turn_key and marks synced!
+    let patched = null
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        patched = patch
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pickupCalls, 2)
+    assert.equal(pass2.action, 'adopted_hook_request')
+    assert.equal(pass2.requestId, NEW_HOOK_REQ)
+    assert.equal(patched?.local_turn_request_id, NEW_HOOK_REQ)
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
 })

@@ -1526,7 +1526,7 @@ export async function syncTypedTurnFromTranscript({
           const alreadyAdmittedForThisTurn =
             Boolean(state?.local_turn) &&
             (state.local_turn.turn_key === turnKey ||
-              (!openedNow && existingTyped === safeUnboundHook && !state.local_turn.turn_key))
+              (typeof state.local_turn_request_id === 'string' && state.local_turn_request_id === requestId))
           const needsRoomAdmission =
             !effectiveMidTurn && !supersededByNewerTurn && Boolean(sessionId) && !alreadyAdmittedForThisTurn
           const scope =
@@ -1581,7 +1581,11 @@ export async function syncTypedTurnFromTranscript({
             if (typeof patchState === 'function') {
               let saved = false
               try {
-                saved = patchState({ local_turn: { ...admission.admitted, turn_key: turnKey } }) === true
+                saved =
+                  patchState({
+                    local_turn: { ...admission.admitted, turn_key: turnKey },
+                    local_turn_request_id: requestId,
+                  }) === true
               } catch (error) {
                 log(
                   `typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,

@@ -1220,6 +1220,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     sameTurnTypedRowIndex,
     sameTurnOtherRows,
     allOtherRows,
+    currentTurnNonTypedRows,
     endedNonTypedRows,
   }
 }
@@ -1288,6 +1289,14 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
         rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
       }))
     : []
+  const liveNonTypedWakes =
+    !read.end && Array.isArray(read.currentTurnNonTypedRows)
+      ? read.currentTurnNonTypedRows.map((entry) => ({
+          key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+          kind: entry.kind,
+          rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+        }))
+      : []
   const endedNonTypedWakes = Array.isArray(read.endedNonTypedRows)
     ? read.endedNonTypedRows.map((entry) => ({
         key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
@@ -1304,6 +1313,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
     liveTurnTypedKey,
     sameTurnWakes,
     notificationWakes,
+    liveNonTypedWakes,
     endedNonTypedWakes,
     precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
     liveTurnPrecededByTurnEnded: Boolean(read.liveTurnPrecededByTurnEnded),
