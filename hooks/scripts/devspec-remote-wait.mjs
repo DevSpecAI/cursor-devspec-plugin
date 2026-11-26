@@ -2010,7 +2010,7 @@ export async function runOneShotRoomCommandPickup({
     if (refusals && !savedReadableNow && !fitted.note?.pendingPermissionRecovery) {
       spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
     } else if (pendingSpoolEntries.length > 0 && savedReadableNow && fitted.text) {
-      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
+      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
     }
     const diagText =
       fitted.text ||

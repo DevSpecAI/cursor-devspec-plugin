@@ -963,7 +963,7 @@ export async function readWakes({
       if (!savedReadableNow && !fittedWithStdout.note?.pendingPermissionRecovery) {
         spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
       } else if (pendingSpoolEntries.length > 0 && savedReadableNow && fittedWithStdout.text) {
-        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
+        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
       }
       const diagText =
         fittedWithStdout.text ||
@@ -994,7 +994,7 @@ export async function readWakes({
           (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
           fitsShellOutput(printedStdout + effectiveRawDiag)
         if (pendingSpoolEntries.length > 0 && savedReadableNow) {
-          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
+          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
         }
       }
     }

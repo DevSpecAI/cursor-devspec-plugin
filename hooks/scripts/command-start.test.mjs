@@ -4879,4 +4879,136 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(noteText.includes(CHECK_JOB_1), false, 'wake note MUST NOT include settled CHECK_JOB_1')
     assert.equal(noteText.includes(CHECK_JOB_2), false, 'wake note MUST NOT include settled concurrent CHECK_JOB_2')
   })
+
+  it('clearPendingUnsavedRefusals removes ONLY surfaced entries and preserves a newer refusal appended by another process while pickup was in flight (3c5147a7 / 3ea2b201)', async () => {
+    const { execSync, spawnSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wakes`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { spoolUnsavedRefusal, peekPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const refusalA = `devspec-wake-tail: report_pickup refused: ${JSON.stringify([{ refusal: { code: 'refusal_A', blocking_items: [{ id: 'blk-A' }] } }])}\n`
+    const refusalB = `devspec-wake-tail: report_pickup refused: ${JSON.stringify([{ refusal: { code: 'refusal_B_concurrent', blocking_items: [{ id: 'blk-B-appended-mid-pickup' }] } }])}\n`
+
+    // Spool Refusal A before reader starts.
+    spoolUnsavedRefusal(spoolKey, refusalA, spoolOpts)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Concurrent spool preservation test')))
+
+    const hookBudgetUrl = new URL('./hook-context-budget.mjs', import.meta.url).href
+    const stderr1 = []
+    const page1 = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 1,
+      scriptPath: '/tmp/tail.mjs',
+      write: async () => {},
+      writeStderr: (t) => { stderr1.push(t) },
+      startCommands: async ({ commands }) => {
+        // While pickup is in flight (AFTER readWakes snapshotted Refusal A), ANOTHER OS PROCESS
+        // appends Refusal B to the durable disk spool!
+        const appendRun = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `import { spoolUnsavedRefusal } from ${JSON.stringify(hookBudgetUrl)}; spoolUnsavedRefusal(${JSON.stringify(spoolKey)}, ${JSON.stringify(refusalB)}, ${JSON.stringify(spoolOpts)});`,
+          ],
+          { encoding: 'utf8' },
+        )
+        assert.equal(appendRun.status, 0, appendRun.stderr)
+        return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+      },
+    })
+    assert.equal(page1.marked, true)
+    assert.match(stderr1.join(''), /blk-A/, 'Pass 1 must surface Refusal A')
+    assert.equal(stderr1.join('').includes('blk-B-appended-mid-pickup'), false, 'Pass 1 had not snapshotted Refusal B')
+
+    // Refusal B MUST STILL be queued on disk for the next read — NOT deleted when Pass 1 cleared Refusal A!
+    const remaining = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.deepEqual(remaining, [refusalB], 'Refusal B appended mid-pickup MUST remain queued')
+
+    // Next read surfaces Refusal B and drains the queue cleanly.
+    const stderr2 = []
+    await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 1,
+      scriptPath: '/tmp/tail.mjs',
+      write: async () => {},
+      writeStderr: (t) => { stderr2.push(t) },
+    })
+    const err2 = stderr2.join('')
+    const recovered2 = err2.includes('cat ') ? execSync(/cat [^\n`]+/.exec(err2)[0].replace('~', home), { encoding: 'utf8' }) : err2
+    assert.match(recovered2, /blk-B-appended-mid-pickup/, 'next read MUST surface concurrently appended Refusal B')
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [], 'queue must be empty after Refusal B is surfaced')
+  })
+
+  it('Pass-2 multipart pending-refusal recovery is byte-exact: strips ALL generated continuation lines so JSON parses cleanly and NEVER strips real text resembling a page footer (4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const blockedTmp = path.join(home, 'tmp-multipart-exact')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    fs.writeFileSync(diagDir, 'not-a-directory\n')
+    const { reserveDiagnosticNoteSlots, peekPendingUnsavedRefusals, clearPendingUnsavedRefusals } = await import(
+      './hook-context-budget.mjs'
+    )
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const spoolKey = path.resolve(dir)
+    // Include BOTH >22,000 chars (forcing multi-part framing) AND a real line resembling a page footer inside structured JSON!
+    const literalFooterLookalike = '\n\n--- part 1/2 (999 chars total) ---\n'
+    const originalPayloadObj = [
+      {
+        command_message_id: MSG_ID,
+        refusal: {
+          code: 'turn_busy_multipart_exact',
+          literal_footer_text: literalFooterLookalike,
+          padding: 'z'.repeat(22_000),
+          blocking_items: [{ id: 'blk-after-page-boundary', detail: literalFooterLookalike }],
+        },
+      },
+    ]
+    const originalJson = JSON.stringify(originalPayloadObj)
+    const store = reserveDiagnosticNoteSlots({ home, fallbackDir: diagDir, backupDir: null })
+    assert.equal(store.ok, true)
+    try {
+      // Force Pass 2 by chmod 0o000 on notesDir while its pre-opened fd keeps nlink === 1.
+      fs.chmodSync(notesDir, 0o000)
+      const saved = store.write(originalJson, { spoolKey })
+      assert.ok(saved, 'Pass 2 MUST persist multipart refusal through open fd')
+      assert.equal(saved.pendingPermissionRecovery, true)
+      assert.ok(saved.parts >= 2, `must span >= 2 parts; got ${saved.parts}`)
+    } finally {
+      store.release()
+      fs.chmodSync(notesDir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+
+    const recovered = peekPendingUnsavedRefusals(spoolKey, { home, fallbackDir: diagDir, backupDir: dir })
+    assert.equal(recovered.length, 1)
+    assert.equal(recovered[0], originalJson, 'reassembled multipart refusal MUST be byte-for-byte identical to original')
+    const parsed = JSON.parse(recovered[0])
+    assert.equal(parsed[0].refusal.code, 'turn_busy_multipart_exact')
+    assert.equal(parsed[0].refusal.literal_footer_text, literalFooterLookalike, 'real text resembling a page footer MUST NOT be stripped')
+    assert.equal(parsed[0].refusal.blocking_items[0].id, 'blk-after-page-boundary')
+    assert.equal(parsed[0].refusal.blocking_items[0].detail, literalFooterLookalike)
+    clearPendingUnsavedRefusals(spoolKey, recovered, { home, fallbackDir: diagDir, backupDir: dir })
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, { home, fallbackDir: diagDir, backupDir: dir }), [])
+  })
 })

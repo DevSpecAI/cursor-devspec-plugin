@@ -995,8 +995,8 @@ function spoolScopeTag(spoolKey) {
   return createHash('sha256').update(String(spoolKey ?? 'default')).digest('hex').slice(0, 12)
 }
 
-function pendingDiagnosticRefusalHeader(spoolKey) {
-  return `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${spoolScopeTag(spoolKey)}]\n`
+function pendingDiagnosticRefusalHeader(spoolKey, { nonce, sha256, chars }) {
+  return `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${spoolScopeTag(spoolKey)}] [nonce:${nonce}] [sha256:${sha256}] [chars:${chars}]\n`
 }
 
 function spoolCandidateDirs({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
@@ -1024,10 +1024,39 @@ function spoolFilePath(dir, scopeTag) {
   return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
 }
 
-function stripReservedPageFraming(text, header) {
-  let body = text.startsWith(header) ? text.slice(header.length) : text
-  body = body.replace(/\n\n--- part \d+\/\d+ \([^\n]*\) ---\n/g, '')
-  return body
+/**
+ * Reassemble a Pass-2 pending-refusal note losslessly by stripping ONLY the header and
+ * page footers tagged with that file's exact per-file cryptographic `nonce`, then
+ * verifying exact UTF-16 length and SHA-256 against the header seal. Real diagnostic
+ * lines resembling page footers are never modified and no generated continuation command
+ * can remain in the recovered payload (requirements 4e32d1a5 / 91d7b47c / 3c5147a7).
+ */
+function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
+  const nl = content.indexOf('\n')
+  if (nl < 0) return null
+  const firstLine = content.slice(0, nl)
+  const match = /^# DevSpec Pending Diagnostic Refusal \[scope:([0-9a-f]{12})\] \[nonce:([0-9a-f]{16})\] \[sha256:([0-9a-f]{64})\] \[chars:(\d+)\]$/.exec(
+    firstLine,
+  )
+  if (!match || match[1] !== expectedScopeTag) return null
+  const [, , nonce, expectedSha256, charsRaw] = match
+  const expectedChars = Number(charsRaw)
+  let body = content.slice(nl + 1)
+  const footerRe = new RegExp(
+    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ [^\\n]* \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
+    'g',
+  )
+  body = body.replace(footerRe, '')
+  const actualSha256 = createHash('sha256').update(body, 'utf8').digest('hex')
+  if (body.length !== expectedChars || actualSha256 !== expectedSha256) {
+    return {
+      ok: false,
+      body:
+        `[WARNING: recovered pending diagnostic refusal failed integrity check (expected ${expectedChars} chars sha256=${expectedSha256}, got ${body.length} chars sha256=${actualSha256})]\n` +
+        body,
+    }
+  }
+  return { ok: true, body }
 }
 
 export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
@@ -1142,7 +1171,12 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       /* optional backup slot: primary slot already passed preflight */
     }
   }
-  const writeFormattedToSlot = (activeSlot, payloadText, id, { requireReadableByPath = true, pendingPermissionRecovery = false } = {}) => {
+  const writeFormattedToSlot = (
+    activeSlot,
+    payloadText,
+    id,
+    { requireReadableByPath = true, pendingPermissionRecovery = false, frameNonce = null } = {},
+  ) => {
     const quoted = shellQuotePath(activeSlot.filePath)
     const fitsOneRead = payloadText.length <= NOTE_PART_CHARS && Buffer.byteLength(payloadText) <= NOTE_PART_BYTES
     if (fitsOneRead) {
@@ -1170,7 +1204,8 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       }
     }
     const totalChars = payloadText.length
-    const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999 ---\n`
+    const nonceSuffix = frameNonce ? ` [frame:${frameNonce}]` : ''
+    const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999${nonceSuffix} ---\n`
     const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
     const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
     if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
@@ -1184,8 +1219,8 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       for (let i = totalParts - 1; i >= 0; i -= 1) {
         const footer =
           i + 1 < totalParts
-            ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]} ---\n`
-            : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
+            ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]}${nonceSuffix} ---\n`
+            : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars)${nonceSuffix} ---\n`
         built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
         nextLens[i] = built[i].length
       }
@@ -1260,7 +1295,13 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       // restored, BOTH the printed read command works directly AND a fresh CLI process
       // discovers the tagged file on disk and surfaces it even if retry pickup succeeds
       // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
-      const header = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home)
+      const frameNonce = randomBytes(8).toString('hex')
+      const rawSha256 = createHash('sha256').update(raw, 'utf8').digest('hex')
+      const header = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home, {
+        nonce: frameNonce,
+        sha256: rawSha256,
+        chars: raw.length,
+      })
       for (let idx = 0; idx < initialCount; idx += 1) {
         const slot = slots[idx]
         if (slot.fd === null) continue
@@ -1270,6 +1311,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
           const written = writeFormattedToSlot(slot, `${header}${raw}`, id, {
             requireReadableByPath: false,
             pendingPermissionRecovery: true,
+            frameNonce,
           })
           if (written) return written
         } catch {
@@ -1453,7 +1495,7 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
     for (const entry of mem) pushUnique(entry)
   }
   const scopeTag = spoolScopeTag(key)
-  const header = pendingDiagnosticRefusalHeader(key)
+  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
     const jsonFile = spoolFilePath(dir, scopeTag)
     const parsed = readPrivateJson(jsonFile)
@@ -1471,8 +1513,9 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
       const fullPath = path.join(dir, name)
       try {
         const content = fs.readFileSync(fullPath, 'utf8')
-        if (!content.startsWith(header)) continue
-        pushUnique(stripReservedPageFraming(content, header))
+        if (!content.startsWith(scopePrefix)) continue
+        const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
+        if (recovered?.body) pushUnique(recovered.body)
       } catch {
         /* still unreadable or vanished */
       }
@@ -1483,25 +1526,47 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
 
 export function clearPendingUnsavedRefusals(
   spoolKey,
-  count = null,
+  cleared = null,
   { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
 ) {
   const key = String(spoolKey ?? '')
   if (!key) return
-  if (count === null) {
+  const clearedSet = Array.isArray(cleared) ? new Set(cleared.filter((e) => typeof e === 'string' && e)) : null
+  if (cleared === null) {
     pendingUnsavedRefusals.delete(key)
+  } else if (clearedSet) {
+    const existing = pendingUnsavedRefusals.get(key) ?? []
+    const rest = existing.filter((entry) => !clearedSet.has(entry))
+    if (rest.length === 0) pendingUnsavedRefusals.delete(key)
+    else pendingUnsavedRefusals.set(key, rest)
   } else {
     const existing = pendingUnsavedRefusals.get(key) ?? []
-    const rest = existing.slice(count)
+    const rest = existing.slice(Number(cleared) || 0)
     if (rest.length === 0) pendingUnsavedRefusals.delete(key)
     else pendingUnsavedRefusals.set(key, rest)
   }
   const scopeTag = spoolScopeTag(key)
-  const header = pendingDiagnosticRefusalHeader(key)
+  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
     const jsonFile = spoolFilePath(dir, scopeTag)
     try {
-      if (fs.existsSync(jsonFile)) fs.rmSync(jsonFile, { force: true })
+      if (fs.existsSync(jsonFile)) {
+        if (!clearedSet) {
+          fs.rmSync(jsonFile, { force: true })
+        } else {
+          // Only remove entries THIS pass actually surfaced; preserve any refusal appended
+          // concurrently by another process after this reader took its snapshot (3ea2b201 / 3c5147a7).
+          const parsed = readPrivateJson(jsonFile)
+          if (Array.isArray(parsed?.entries)) {
+            const remaining = parsed.entries.filter((entry) => typeof entry === 'string' && entry && !clearedSet.has(entry))
+            if (remaining.length === 0) {
+              fs.rmSync(jsonFile, { force: true })
+            } else {
+              writePrivateJson(jsonFile, { version: 1, scope: scopeTag, entries: remaining })
+            }
+          }
+        }
+      }
     } catch {
       /* leave for next cleanup if transiently unwritable */
     }
@@ -1516,8 +1581,14 @@ export function clearPendingUnsavedRefusals(
       const fullPath = path.join(dir, name)
       try {
         const content = fs.readFileSync(fullPath, 'utf8')
-        if (content.startsWith(header)) {
+        if (!content.startsWith(scopePrefix)) continue
+        if (!clearedSet) {
           fs.rmSync(fullPath, { force: true })
+        } else {
+          const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
+          if (recovered?.body && clearedSet.has(recovered.body)) {
+            fs.rmSync(fullPath, { force: true })
+          }
         }
       } catch {
         /* ignore */
