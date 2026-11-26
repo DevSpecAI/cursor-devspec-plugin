@@ -5473,4 +5473,144 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(remaining.includes(refusalBeforeClaim), true, 'refusalBeforeClaim MUST be migrated to v2 and preserved')
     assert.equal(remaining.includes(refusalAfterClaim), true, 'refusalAfterClaim written after atomic claim MUST remain untouched')
   })
+
+  it('writeStderrChecked absorbs Node Writable nextTick error emission without crashing and write-ahead spools oversized refusals across real EPIPE streams (3ea2b201 / 4e32d1a5 / 91d7b47c / 3c5147a7)', async () => {
+    const { Writable } = await import('node:stream')
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { peekPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+    const { runOneShotRoomCommandPickup, writeStderrChecked: waitWriteStderrChecked } = await import(
+      './devspec-remote-wait.mjs'
+    )
+    const { writeStderrChecked: tailWriteStderrChecked } = await import('./devspec-wake-tail.mjs')
+
+    const makeBrokenWritable = () =>
+      new Writable({
+        write(_chunk, _enc, cb) {
+          cb(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+        },
+      })
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const printedWakes = [buildOwnerMessageEvents(ownerBatch('Real Node Writable EPIPE check'))]
+
+    // 1. runOneShotRoomCommandPickup with a real Node Writable that fails with EPIPE and
+    // emits 'error' on process.nextTick AFTER the write callback: MUST reject cleanly
+    // (no uncaught 'error' crash!) AND leave the oversized live refusal durably spooled!
+    await assert.rejects(
+      () =>
+        runOneShotRoomCommandPickup({
+          connectionId: CONN,
+          printedWakes,
+          dir,
+          home,
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            refusals: [
+              {
+                command_message_id: 'msg-real-epipe-1',
+                refusal: {
+                  code: 'blocked_by_items',
+                  blocking_items: [{ id: 'blk-real-writable-epipe-wait', padding: 'R'.repeat(25000) }],
+                },
+              },
+            ],
+          }),
+          writeStderr: (text) => waitWriteStderrChecked(text, makeBrokenWritable()),
+        }),
+      /write EPIPE/,
+    )
+    // Flush nextTick so any unabsorbed Writable 'error' event would fail the test immediately.
+    await new Promise((resolve) => setImmediate(resolve))
+    const queuedAfterWait = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.ok(
+      queuedAfterWait.some((e) => e.includes('blk-real-writable-epipe-wait')),
+      'oversized refusal MUST remain durably spooled when Node Writable emits nextTick EPIPE',
+    )
+
+    // Next healthy retry surfaces the saved note + cat pointer and clears the queue!
+    const okWaitStderr = []
+    const okWait = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes,
+      dir,
+      home,
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (t) => okWaitStderr.push(t),
+    })
+    assert.equal(okWait.ok, true)
+    assert.ok(okWait.diagnosticNote?.file)
+    assert.match(okWaitStderr.join(''), /cat /)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+
+    // 2. readWakes with a real Node Writable failing with EPIPE!
+    const wakeFile = path.join(home, `${CONN}-real-writable.wakes`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Real Node Writable EPIPE wake-tail')))
+    await assert.rejects(
+      () =>
+        readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          dir,
+          home,
+          settleMs: 1,
+          scriptPath: '/tmp/tail.mjs',
+          write: async () => {},
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            refusals: [
+              {
+                command_message_id: 'msg-real-epipe-2',
+                refusal: {
+                  code: 'blocked_by_items',
+                  blocking_items: [{ id: 'blk-real-writable-epipe-tail', padding: 'T'.repeat(25000) }],
+                },
+              },
+            ],
+          }),
+          writeStderr: (text) => tailWriteStderrChecked(text, makeBrokenWritable()),
+        }),
+      /write EPIPE/,
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    const queuedAfterTail = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.ok(
+      queuedAfterTail.some((e) => e.includes('blk-real-writable-epipe-tail')),
+      'readWakes MUST keep oversized refusal durably spooled when Node Writable emits nextTick EPIPE',
+    )
+
+    const okTailStderr = []
+    const okTail = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      dir,
+      home,
+      settleMs: 1,
+      scriptPath: '/tmp/tail.mjs',
+      write: async () => {},
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (t) => okTailStderr.push(t),
+    })
+    assert.equal(okTail.marked, true)
+    assert.ok(okTail.pickup_diagnostic_note?.file)
+    assert.match(okTailStderr.join(''), /cat /)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
 })

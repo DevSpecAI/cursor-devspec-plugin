@@ -622,25 +622,43 @@ function writeStdout(text) {
  * (`listenerAdvice`, read from its lease under the same lock), the header says so and
  * names it by `scriptPath`, the copy this reader runs from.
  */
-function writeStderrChecked(text) {
+export function writeStderrChecked(text, stream = process.stderr) {
   return new Promise((resolve, reject) => {
     let settled = false
     const onError = (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    }
-    process.stderr.once('error', onError)
-    try {
-      process.stderr.write(text, (error) => {
-        process.stderr.removeListener('error', onError)
-        if (settled) return
+      if (!settled) {
         settled = true
-        if (error) reject(error)
-        else resolve()
+        reject(error)
+      }
+    }
+    const detachLater = () => {
+      // Node.js Writable may emit 'error' on a later process.nextTick turn after
+      // invoking the write callback (via errorOrDestroy); keep `onError` attached
+      // until the setImmediate check phase so the emitted stream error is absorbed
+      // instead of crashing the process before callers can handle the rejection
+      // (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c / 3c5147a7).
+      const timer = setImmediate(() => stream.removeListener('error', onError))
+      timer.unref?.()
+    }
+    stream.on('error', onError)
+    try {
+      stream.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        stream.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
       })
     } catch (error) {
-      process.stderr.removeListener('error', onError)
+      detachLater()
       if (!settled) {
         settled = true
         reject(error)
@@ -769,8 +787,13 @@ export async function readWakes({
       if (fittedWithStdout.text) {
         await write(page.text)
         pickupDiagnosticNote = fittedWithStdout.note
+        const savedEarlyNote = Boolean(fittedWithStdout.note) || fitsShellOutput(page.text + noteDiag)
+        spoolUnsavedRefusal(spoolKey, noteDiag, spoolOpts)
         await writeStderr(fittedWithStdout.text)
         pickupDiagnosticWritten = true
+        if (savedEarlyNote) {
+          clearPendingUnsavedRefusals(spoolKey, [noteDiag], spoolOpts)
+        }
       } else {
         const fittedFullBudget = fitShellDiagnostic('', noteDiag, {
           home,
@@ -786,6 +809,7 @@ export async function readWakes({
           fallbackDir: fallbackNoteDir,
         })
         pickupDiagnosticNote = fittedFullBudget.note
+        const savedEarlyNote = Boolean(fittedFullBudget.note) || fitsShellOutput(noteDiag)
         const fallbackNotice =
           fittedFullBudget.text ||
           formatShellRefusalOmissionNotice(pickupRefusals, {
@@ -794,9 +818,13 @@ export async function readWakes({
             actualChars: noteDiag.length,
             noteError: fittedFullBudget.noteError,
           })
+        spoolUnsavedRefusal(spoolKey, noteDiag, spoolOpts)
         if (fallbackNotice) {
           await writeStderr(fallbackNotice)
           pickupDiagnosticWritten = true
+          if (savedEarlyNote && fittedFullBudget.text) {
+            clearPendingUnsavedRefusals(spoolKey, [noteDiag], spoolOpts)
+          }
         }
       }
       return {
@@ -995,23 +1023,23 @@ export async function readWakes({
           actualChars: effectiveRawDiag.length,
           noteError: fittedWithStdout.noteError,
         })
-      if (!savedReadableNow && !fittedWithStdout.note?.pendingPermissionRecovery) {
+      // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a
+      // fatal broken-pipe crash mid-write leaves the refusal durably queued for the next
+      // pass, and clear it ONLY AFTER stderr flush completes (reqs 3ea2b201 / 4e32d1a5 /
+      // 91d7b47c / 3c5147a7).
+      const spooledLiveAhead = Boolean(rawDiag && !fittedWithStdout.note?.pendingPermissionRecovery)
+      if (spooledLiveAhead) {
         spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
       }
       if (diagText) {
-        try {
-          await writeStderr(diagText)
-          pickupDiagnosticWritten = true
-        } catch (err) {
-          spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
-          throw err
-        }
+        await writeStderr(diagText)
+        pickupDiagnosticWritten = true
       }
-      // Clear pending spooled refusals ONLY AFTER publishing their diagnostic/read reference
-      // to stderr succeeds so an output error never drops them from the recovery queue
-      // (reqs 3ea2b201 / 91d7b47c).
-      if (pendingSpoolEntries.length > 0 && savedReadableNow && fittedWithStdout.text && pickupDiagnosticWritten) {
-        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
+      if (savedReadableNow && fittedWithStdout.text && pickupDiagnosticWritten) {
+        const toClear = spooledLiveAhead ? [...pendingSpoolEntries, rawDiag] : pendingSpoolEntries
+        if (toClear.length > 0) {
+          clearPendingUnsavedRefusals(spoolKey, toClear, spoolOpts)
+        }
       }
     } else if (effectiveRawDiag) {
       const fitted = fitShellDiagnostic(printedStdout, effectiveRawDiag, {

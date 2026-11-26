@@ -1854,31 +1854,43 @@ function writeStdoutChecked(text) {
       settled = true
       reject(error)
     }
-    process.stdout.once('error', onError)
-    process.stdout.write(text, (error) => {
-      process.stdout.removeListener('error', onError)
-      if (settled) return
-      settled = true
-      if (error) reject(error)
-      else resolve()
-    })
+    const detachLater = () => {
+      const timer = setImmediate(() => process.stdout.removeListener('error', onError))
+      timer.unref?.()
+    }
+    process.stdout.on('error', onError)
+    try {
+      process.stdout.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        process.stdout.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
+      })
+    } catch (error) {
+      detachLater()
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
   })
 }
 
-/**
- * Print `wakes` as one Shell result (a one-shot run): whole wakes while they fit one
- * output together, and a line saying how many wait (`wakesForOneOutput`,
- * hook-context-budget.mjs, the same sizing the wake file's reader uses). When `reserve`
- * is non-empty, keeps room for bounded stderr diagnostics so `stdout + stderr` never
- * crosses Cursor's Shell ceiling (reqs 3c5147a7 / 91d7b47c). Returns `{ held, count, text, printedWakes }`.
- */
 export async function printOneShot(
   wakes,
   {
     reserve = '',
     home = os.homedir(),
-    write = (text) =>
-      new Promise((resolve, reject) => process.stdout.write(text, (error) => (error ? reject(error) : resolve()))),
+    write = (text) => writeStdoutChecked(text),
   } = {},
 ) {
   const plan = planOneShot(wakes, { reserve, home })
@@ -1887,25 +1899,43 @@ export async function printOneShot(
   return plan
 }
 
-function writeStderrChecked(text) {
+export function writeStderrChecked(text, stream = process.stderr) {
   return new Promise((resolve, reject) => {
     let settled = false
     const onError = (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    }
-    process.stderr.once('error', onError)
-    try {
-      process.stderr.write(text, (error) => {
-        process.stderr.removeListener('error', onError)
-        if (settled) return
+      if (!settled) {
         settled = true
-        if (error) reject(error)
-        else resolve()
+        reject(error)
+      }
+    }
+    const detachLater = () => {
+      // Node.js Writable may emit 'error' on a later process.nextTick turn after
+      // invoking the write callback (via errorOrDestroy); keep `onError` attached
+      // until the setImmediate check phase so the emitted stream error is absorbed
+      // instead of crashing the process before callers can handle the rejection
+      // (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c / 3c5147a7).
+      const timer = setImmediate(() => stream.removeListener('error', onError))
+      timer.unref?.()
+    }
+    stream.on('error', onError)
+    try {
+      stream.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        stream.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
       })
     } catch (error) {
-      process.stderr.removeListener('error', onError)
+      detachLater()
       if (!settled) {
         settled = true
         reject(error)
@@ -2044,25 +2074,23 @@ export async function runOneShotRoomCommandPickup({
             noteError: fitted.noteError,
           })
         : '')
-    if (refusals && !savedReadableNow && !fitted.note?.pendingPermissionRecovery) {
+    // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a
+    // fatal broken-pipe crash mid-write leaves the refusal durably queued for the next
+    // pass, and clear it ONLY AFTER stderr flush completes (reqs 3ea2b201 / 4e32d1a5 /
+    // 91d7b47c / 3c5147a7).
+    const spooledLiveAhead = Boolean(refusals && rawDiag && !fitted.note?.pendingPermissionRecovery)
+    if (spooledLiveAhead) {
       spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
     }
     if (diagText) {
-      try {
-        await writeStderr(diagText)
-        stderrText = diagText
-      } catch (err) {
-        if (refusals) {
-          spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
-        }
-        throw err
-      }
+      await writeStderr(diagText)
+      stderrText = diagText
     }
-    // Clear pending spooled refusals ONLY AFTER publishing their diagnostic/read reference
-    // to stderr succeeds so an output error never drops them from the recovery queue
-    // (reqs 3ea2b201 / 91d7b47c).
-    if (pendingSpoolEntries.length > 0 && savedReadableNow && fitted.text && stderrText) {
-      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
+    if (savedReadableNow && fitted.text && stderrText) {
+      const toClear = spooledLiveAhead ? [...pendingSpoolEntries, rawDiag] : pendingSpoolEntries
+      if (toClear.length > 0) {
+        clearPendingUnsavedRefusals(spoolKey, toClear, spoolOpts)
+      }
     }
   }
   return {
