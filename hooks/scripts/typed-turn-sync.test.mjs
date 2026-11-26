@@ -3645,4 +3645,87 @@ describe('typed-turn-sync (item da03801e)', () => {
     )
     assert.equal(after.seenTranscriptTurns.get(turnKey), OLDER_REQ)
   })
+
+  it('finishIdleRequests re-checks pending launches after awaiting report_complete so a launch recorded mid-wait keeps the request open for its wake (3ea2b201 / ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { requestForWake } = await import('./requests.mjs')
+    const REQ_ID = '55555555-5555-4555-8555-5555555555a1'
+    const ATTEMPT_ID = '66666666-6666-4666-8666-6666666666a1'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Run background job')}\n${turnEndedRow()}\n`)
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ID, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ID }, { dir })
+
+    const closeCalls = []
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state: { session_id: ROOM, local_turn: { attempt_id: ATTEMPT_ID, session_id: ROOM } },
+      connectionCapability: 'cap-secret',
+      callComplete: async () => {
+        // Record a background launch on REQ_ID WHILE awaiting report_complete!
+        appendRequestEvent(
+          CONN,
+          { op: 'launch', key: 'bg-task-midwait', kind: 'background_task', request: REQ_ID },
+          { dir },
+        )
+        return { outcome: 'completed', phase: 'done' }
+      },
+      callRequest: async (args) => {
+        closeCalls.push(args)
+        return { status: 'closed' }
+      },
+      patchState: () => true,
+      dir,
+    })
+
+    assert.equal(res.localCompleted, true)
+    assert.deepEqual(closeCalls, [], 'MUST NOT close REQ_ID once a background launch was recorded during report_complete')
+    assert.deepEqual(res.closed, [])
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(REQ_ID), true, 'REQ_ID must stay open for its pending background launch')
+    const wakeMatch = requestForWake({
+      origin: 'task-notification',
+      text: '<task-notification><task-id>bg-task-midwait</task-id></task-notification>',
+      state: after,
+    })
+    assert.equal(wakeMatch.ref, REQ_ID, 'later background wake must still resolve its requester')
+  })
+
+  it('retrying an older terminal request preserves NO_REQUEST (independent-work choice) joined with a room command on a live turn (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { NO_REQUEST, turnAmbiguity } = await import('./requests.mjs')
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f9'
+
+    // Live turn carries BOTH Alice's room command AND independent work (NO_REQUEST) in joined!
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'joined', id: NO_REQUEST }, { dir })
+
+    const beforeStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true })
+    assert.ok(beforeStamped.deny, 'before retry, claim must ask which work (Alice vs independent work) it serves')
+
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier missed terminal prompt')}\n${turnEndedRow()}\n${cmdRow}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+    })
+    assert.equal(res.retriedFailedTurn?.action, 'opened')
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE)
+    assert.equal(after.joined.has(NO_REQUEST), true, 'independent-work choice (NO_REQUEST) MUST remain in joined after older-turn retry')
+    assert.equal(turnAmbiguity(after)?.length, 2)
+    const afterStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true })
+    assert.ok(afterStamped.deny, 'after retry, the same claim MUST STILL ask which work it serves instead of auto-stamping Alice')
+  })
 })

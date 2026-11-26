@@ -603,17 +603,25 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       const stillSameForeground =
         afterRestore.current === fg.current &&
         (fg.current === null ||
+          fg.current === NO_REQUEST ||
           (afterRestore.open.has(fg.current) && !afterRestore.open.get(fg.current)?.answered))
       if (stillSameForeground) {
         for (const joinedId of fg.joined) {
           if (afterRestore.joined.has(joinedId)) continue
-          if (!afterRestore.open.has(joinedId) || afterRestore.open.get(joinedId)?.answered) continue
+          if (
+            joinedId !== NO_REQUEST &&
+            joinedId !== UNSTATED &&
+            (!afterRestore.open.has(joinedId) || afterRestore.open.get(joinedId)?.answered)
+          ) {
+            continue
+          }
           if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
             return false
           }
         }
-        if (fg.chosen && fg.current !== null && !afterRestore.chosen) {
-          if (!appendRequestEvent(connectionId, { op: 'serve', ref: fg.current }, { dir })) {
+        if (fg.chosen && !afterRestore.chosen) {
+          const serveRef = fg.current === null ? UNSTATED : fg.current
+          if (!appendRequestEvent(connectionId, { op: 'serve', ref: serveRef }, { dir })) {
             return false
           }
         }
@@ -1980,6 +1988,18 @@ export async function finishIdleRequests({
   const closed = []
   let closeRefusal = null
   if (candidateId && connectionCapability && typeof callRequest === 'function') {
+    // Re-read `.requests.jsonl` and transcript AFTER awaiting `callComplete` so a
+    // background launch, schedule, or new turn recorded during that wait is NEVER
+    // closed prematurely (requirements 3ea2b201 / ce71a72b).
+    const preCloseState = readRequestState(connectionId, { dir })
+    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+    const preCloseStillIdle =
+      !preCloseState.readError &&
+      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
+    const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
+    const stillFinished =
+      preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
+    if (stillFinished) {
     let lastCloseResponse = null
     let lastCloseError = null
     const ok = await closeRequest({
@@ -2015,7 +2035,14 @@ export async function finishIdleRequests({
         (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
       log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
     }
+    }
   } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
+    const preCloseState = readRequestState(connectionId, { dir })
+    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+    const preCloseStillIdle =
+      !(preCloseState.readError && preCloseState.readError.code !== 'EISDIR') &&
+      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
+    if (preCloseStillIdle) {
     const [pendingKey, pendingEntry] = pendingFallback
     let lastCloseResponse = null
     let lastCloseError = null
@@ -2045,6 +2072,7 @@ export async function finishIdleRequests({
         (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
         (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
       log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+    }
     }
   }
 
