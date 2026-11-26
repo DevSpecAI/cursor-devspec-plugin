@@ -112,6 +112,7 @@ function uuids(value) {
  */
 export function reduceRequestLog(text) {
   const open = new Map()
+  const closed = new Set()
   const started = new Set()
   const launches = new Map()
   const aliases = new Map()
@@ -135,6 +136,7 @@ export function reduceRequestLog(text) {
     switch (event?.op) {
       case 'open':
         if (UUID.test(event.id ?? '')) {
+          closed.delete(event.id)
           open.set(event.id, {
             kind: event.kind,
             ...(event.message_id ? { message_id: event.message_id } : {}),
@@ -144,6 +146,7 @@ export function reduceRequestLog(text) {
         }
         break
       case 'close':
+        if (UUID.test(event.id ?? '')) closed.add(event.id)
         open.delete(event.id)
         started.delete(event.id)
         joined.delete(event.id)
@@ -277,7 +280,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {

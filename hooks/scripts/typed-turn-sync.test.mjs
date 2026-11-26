@@ -4058,4 +4058,121 @@ describe('typed-turn-sync (item da03801e)', () => {
       'wake for pending launch MUST STILL resolve to the original request (not UNSTATED)',
     )
   })
+
+  it('finishIdleRequests reports closeRefusal when removing .pending-opens.json fails and subsequent sync NEVER resurrects the closed request into open (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555f1'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Fallback close where pending-opens unlink fails')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    // Simulate unlink/rm failure on `.pending-opens.json` while `.requests.jsonl` is writable!
+    const origRmSync = fs.rmSync
+    fs.rmSync = (targetPath, ...rest) => {
+      if (String(targetPath) === sidecar) {
+        throw Object.assign(new Error('EPERM removing pending-opens.json'), { code: 'EPERM' })
+      }
+      return origRmSync(targetPath, ...rest)
+    }
+    const logs = []
+    let idle1 = null
+    try {
+      idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.deepEqual(idle1.closed, [], 'MUST NOT report closed when removing .pending-opens.json fails')
+      assert.equal(idle1.closeRefusal?.code, 'pending_open_cleanup_failed')
+      assert.equal(fs.existsSync(sidecar), true)
+      assert.ok(logs.some((l) => /pending_open_cleanup_failed/i.test(l)))
+
+      // Even if sync runs while the stale `.pending-opens.json` still exists, it MUST NOT resurrect RECOVERED_REQ into open!
+      const memo = {}
+      await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { throw new Error('must not reopen closed request') },
+        dir,
+        memo,
+      })
+      assert.equal(readRequestState(CONN, { dir }).open.has(RECOVERED_REQ), false, 'stale pending-opens entry MUST NOT resurrect already-closed request')
+      assert.equal(memo.synced, false, 'sync must remain unsynced until stale recovery entry is cleaned up')
+    } finally {
+      fs.rmSync = origRmSync
+    }
+
+    // Once unlink works again, next idle sweep removes the recovery entry and completes cleanly!
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ status: 'closed' }),
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle2.closed, [RECOVERED_REQ])
+    assert.equal(idle2.closeRefusal, undefined)
+    assert.equal(fs.existsSync(sidecar), false)
+    assert.equal(readRequestState(CONN, { dir }).open.has(RECOVERED_REQ), false)
+  })
+
+  it('finishIdleRequests does NOT close a request that joined a different person’s live terminal turn while awaiting DevSpec’s close reply (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f8'
+    const TYPED_BOB = '22222222-2222-4222-8222-2222222222f8'
+
+    // Alice's command had a background launch that already notified and finished Turn 1.
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bg-join-race', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'notified', key: 'alice-bg-join-race' }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier ended turn')}\n${turnEndedRow()}\n`)
+
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        // While close for CMD_ALICE is in flight, Bob opens a live terminal turn AND
+        // Alice's background completion joins Bob's live turn!
+        fs.appendFileSync(transcriptPath, `${typedRow('Bob starts a new terminal turn')}\n`)
+        appendRequestEvent(CONN, { op: 'open', id: TYPED_BOB, kind: 'typed_prompt', requested_by: BOB }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: TYPED_BOB }, { dir })
+        appendRequestEvent(CONN, { op: 'joined', id: CMD_ALICE }, { dir })
+        assert.ok(turnAmbiguity(readRequestState(CONN, { dir }))?.length === 2)
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+
+    assert.deepEqual(res.closed, [], 'MUST NOT close CMD_ALICE after it joined Bob’s live turn during close wait')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, TYPED_BOB)
+    assert.equal(after.open.has(CMD_ALICE), true, 'CMD_ALICE must remain open while carried in Bob’s live turn')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'CMD_ALICE must remain in joined')
+    assert.equal(turnAmbiguity(after)?.length, 2, 'two-person ambiguity must remain intact')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'writes MUST STILL require a choice instead of auto-stamping Bob alone')
+  })
 })

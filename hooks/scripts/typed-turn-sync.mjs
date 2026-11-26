@@ -365,10 +365,10 @@ function writePendingOpensFile(filePath, entriesObj, { verifyOwnerDir = false } 
   if (keys.length === 0) {
     try {
       if (fs.existsSync(filePath)) fs.rmSync(filePath, { force: true })
+      return !fs.existsSync(filePath)
     } catch {
-      /* ignore */
+      return false
     }
-    return true
   }
   try {
     if (verifyOwnerDir) {
@@ -412,13 +412,19 @@ function savePendingLocalOpen(dir, connectionId, entry) {
 }
 
 function deletePendingLocalOpen(dir, connectionId, pKey, turnKey = null, requestId = null) {
-  if (pKey) pendingLocalOpens.delete(pKey)
-  if (turnKey) pendingLocalOpens.delete(pendingOpenKey(dir, connectionId, turnKey))
+  let ok = true
+  let error = null
   for (const [filePath, verifyOwnerDir] of [
     [pendingOpensSidecarPath(dir, connectionId), false],
     [pendingOpensFallbackPath(dir, connectionId), true],
   ]) {
-    const existing = readPendingOpensFile(filePath, { verifyOwnerDir })
+    const detailed = readPendingOpensFileDetailed(filePath, { verifyOwnerDir })
+    if (detailed.readError) {
+      ok = false
+      error ??= detailed.readError
+      continue
+    }
+    const existing = detailed.entries
     let changed = false
     for (const [k, v] of Object.entries(existing)) {
       if ((turnKey && k === turnKey) || (requestId && v?.requestId === requestId)) {
@@ -426,8 +432,19 @@ function deletePendingLocalOpen(dir, connectionId, pKey, turnKey = null, request
         changed = true
       }
     }
-    if (changed) writePendingOpensFile(filePath, existing, { verifyOwnerDir })
+    if (changed) {
+      const wrote = writePendingOpensFile(filePath, existing, { verifyOwnerDir })
+      if (!wrote) {
+        ok = false
+        error ??= new Error(`failed to remove pending-open entry from ${filePath}`)
+      }
+    }
   }
+  if (ok) {
+    if (pKey) pendingLocalOpens.delete(pKey)
+    if (turnKey) pendingLocalOpens.delete(pendingOpenKey(dir, connectionId, turnKey))
+  }
+  return { ok, ...(error ? { error } : {}) }
 }
 
 function getPendingLocalOpen(dir, connectionId, turnKey) {
@@ -528,6 +545,16 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
   // request log here, or restoring `fg.current = null` would wipe a live room command
   // from another person and mark the older turn synced (3ea2b201 / ce71a72b).
   if (reqState.readError) return false
+  // If this recovered request was ALREADY recorded closed in `.requests.jsonl` (for example
+  // because an earlier idle sweep closed it on DevSpec and locally, then failed to remove
+  // the on-disk `.pending-opens.json` entry), NEVER re-open the closed request into `open`:
+  // retry removing the stale recovery entry instead (requirement 3ea2b201).
+  if (reqState.closed?.has(entry.requestId)) {
+    const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+    if (!removed.ok) return false
+    clearFailedTypedTurn(dir, connectionId, entry.turnKey)
+    return true
+  }
   if (!reqState.open.has(entry.requestId)) {
     const ok = appendRequestEvent(
       connectionId,
@@ -638,7 +665,8 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
     )
     if (!boundOk) return false
   }
-  deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+  const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+  if (!removed.ok) return false
   clearFailedTypedTurn(dir, connectionId, entry.turnKey)
   return true
 }
@@ -1911,6 +1939,7 @@ export async function finishIdleRequests({
       : null
 
   const initialCurrent = reqState.current
+  const initialJoined = new Set(reqState.joined)
   const initialStamp = active.stamp
   const clearEndedForeground = async () => {
     if (!initialCurrent) return
@@ -2045,8 +2074,14 @@ export async function finishIdleRequests({
         const postCloseStillIdle = Boolean(
           postCloseActive && postCloseActive.ended && postCloseActive.stamp === initialStamp,
         )
-        const targetStillActive = postCloseState.current === targetRequestId && !postCloseStillIdle
-        if (targetStillActive || hasPendingWorkForRequest(postCloseState, targetRequestId)) {
+        const newlyCarried =
+          (postCloseState.current === targetRequestId && initialCurrent !== targetRequestId) ||
+          (postCloseState.joined.has(targetRequestId) && !initialJoined.has(targetRequestId))
+        const targetCarriedByLiveTurn =
+          (!postCloseStillIdle &&
+            (postCloseState.current === targetRequestId || postCloseState.joined.has(targetRequestId))) ||
+          newlyCarried
+        if (targetCarriedByLiveTurn || hasPendingWorkForRequest(postCloseState, targetRequestId)) {
           return { status: 'aborted_pending_work' }
         }
         if (isCandidate && postCloseState.open.has(targetRequestId)) {
@@ -2055,7 +2090,11 @@ export async function finishIdleRequests({
             return { status: 'aborted_pending_work' }
           }
         }
-        const localClosed = appendRequestEvent(connectionId, { op: 'close', id: targetRequestId }, { dir })
+        const alreadyClosedLocally =
+          !postCloseState.open.has(targetRequestId) && Boolean(postCloseState.closed?.has(targetRequestId))
+        const localClosed = alreadyClosedLocally
+          ? true
+          : appendRequestEvent(connectionId, { op: 'close', id: targetRequestId }, { dir })
         if (!localClosed) {
           return {
             status: 'refused',
@@ -2064,6 +2103,32 @@ export async function finishIdleRequests({
               retryable: true,
               request_id: targetRequestId,
               error: 'DevSpec acknowledged close but local close record failed to persist',
+            },
+          }
+        }
+        // Remove matching `.pending-opens.json` recovery entry ONLY once local close is
+        // persisted, and fail closed (do NOT report closed) if removing the on-disk
+        // recovery entry fails (requirement 3ea2b201).
+        let cleanupFailed = null
+        if (pendingEntry) {
+          const removed = deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
+          if (!removed.ok) cleanupFailed = removed.error ?? new Error('failed to remove pending-open recovery entry')
+        } else {
+          for (const [pKey, entry] of pendingEntries) {
+            if (entry.requestId === targetRequestId) {
+              const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+              if (!removed.ok) cleanupFailed ??= removed.error ?? new Error('failed to remove pending-open recovery entry')
+            }
+          }
+        }
+        if (cleanupFailed) {
+          return {
+            status: 'refused',
+            refusal: {
+              code: 'pending_open_cleanup_failed',
+              retryable: true,
+              request_id: targetRequestId,
+              ...structuredRefusalFromError(cleanupFailed),
             },
           }
         }
@@ -2093,15 +2158,6 @@ export async function finishIdleRequests({
     }
     if (commitOutcome.status === 'closed') {
       closed.push(targetRequestId)
-      if (pendingEntry) {
-        deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
-      } else {
-        for (const [pKey, entry] of pendingEntries) {
-          if (entry.requestId === targetRequestId) {
-            deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
-          }
-        }
-      }
       maybeRotateLog()
     } else if (commitOutcome.status === 'aborted_pending_work') {
       abortedClose = true
