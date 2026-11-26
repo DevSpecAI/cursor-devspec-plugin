@@ -203,9 +203,12 @@ export function reduceRequestLog(text) {
         }
         break
       case 'current':
-        // A new turn: what it carries starts again from what woke it, preserving ONLY
-        // explicit requester ids that belong to THIS running turn (never stale joined
-        // requesters left over from an earlier ended turn).
+        // A new turn: what it carries starts again from what woke it. When
+        // `preserve_live_joined` is set (establishing the foreground request for a
+        // live terminal turn), drop ONLY stale joined ids explicitly listed in
+        // `drop_joined_ids` (plus `priorTurnJoined` and `current`) so a room command
+        // joining the same live turn even immediately before this event is written
+        // NEVER disappears from `joined` (decision ce71a72b).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
@@ -214,7 +217,11 @@ export function reduceRequestLog(text) {
             ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
             : [],
         )
-        if (Array.isArray(event.preserve_joined_ids)) {
+        if (event.preserve_live_joined === true) {
+          const drop = new Set(Array.isArray(event.drop_joined_ids) ? event.drop_joined_ids : [])
+          if (UUID.test(current ?? '')) drop.add(current)
+          joined = new Set([...joined].filter((id) => !drop.has(id) && !priorTurnJoined.has(id)))
+        } else if (Array.isArray(event.preserve_joined_ids)) {
           const keep = new Set(event.preserve_joined_ids.filter((id) => UUID.test(id ?? '') && id !== current))
           joined = new Set([...joined].filter((id) => keep.has(id)))
         } else {
@@ -835,7 +842,9 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
   const file = requestLogPath(connectionId, dir)
   try {
     if (fs.statSync(file).size < minBytes) return false
-    const state = reduceRequestLog(fs.readFileSync(file, 'utf8'))
+    const preBuf = fs.readFileSync(file)
+    const preText = preBuf.toString('utf8')
+    const state = reduceRequestLog(preText)
     if (state.open.size > 0 || state.failedTranscriptTurns.size > 0) return false
     // Never rotate while a `.pending-opens.json` recovery file exists or while any
     // unnotified launch/monitor/schedule for a request awaiting recovery sits in the log
@@ -852,26 +861,70 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
     for (const schedule of state.schedules) {
       if (schedule.request !== NO_REQUEST) return false
     }
-    fs.renameSync(file, `${file}.1`)
-    for (const launch of new Set(state.launches.values())) {
-      if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {
-        appendRequestEvent(
-          connectionId,
-          { op: 'launch', key: launch.key, kind: launch.kind, notifies: true, request: NO_REQUEST, also: [] },
-          { dir },
-        )
+    // Atomically claim the active log into a unique staging file BEFORE archiving it,
+    // then re-read the claimed file to catch ANY concurrent `launch`, `schedule`,
+    // `typed_turn_failed`, or `open` appended between our read and our rename. Carry
+    // every newly appended line (plus any idle-closed request metadata restored by a
+    // raced launch) straight into the active log before archiving (reqs 3ea2b201 / ce71a72b).
+    const staged = `${file}.rotating-${process.pid}-${randomUUID().slice(0, 8)}`
+    fs.renameSync(file, staged)
+    try {
+      const stagedBuf = fs.readFileSync(staged)
+      const hasExtraTail = stagedBuf.length > preBuf.length
+      if (hasExtraTail) {
+        const stagedText = stagedBuf.toString('utf8')
+        const extraText = stagedBuf.subarray(preBuf.length).toString('utf8')
+        const stagedState = reduceRequestLog(stagedText)
+        const extraState = reduceRequestLog(extraText)
+        const restoredLines = []
+        for (const [id, info] of stagedState.open) {
+          if (!extraState.open.has(id)) {
+            restoredLines.push(
+              `${JSON.stringify({
+                op: 'open',
+                id,
+                kind: info.kind,
+                ...(info.message_id ? { message_id: info.message_id } : {}),
+                ...(info.provenance_ref ? { provenance_ref: info.provenance_ref } : {}),
+                ...(info.requested_by ? { requested_by: info.requested_by } : {}),
+                at: new Date().toISOString(),
+              })}\n`,
+            )
+          }
+        }
+        const normalizedExtra = extraText.endsWith('\n') ? extraText : `${extraText}\n`
+        fs.appendFileSync(file, `${restoredLines.join('')}${normalizedExtra}`, { mode: 0o600 })
       }
-    }
-    for (const schedule of state.schedules) {
-      if (schedule.request === NO_REQUEST) {
-        appendRequestEvent(
-          connectionId,
-          { op: 'schedule', prompt: schedule.prompt, id: schedule.id, request: NO_REQUEST, also: [] },
-          { dir },
-        )
+      for (const launch of new Set(state.launches.values())) {
+        if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {
+          appendRequestEvent(
+            connectionId,
+            { op: 'launch', key: launch.key, kind: launch.kind, notifies: true, request: NO_REQUEST, also: [] },
+            { dir },
+          )
+        }
       }
+      for (const schedule of state.schedules) {
+        if (schedule.request === NO_REQUEST) {
+          appendRequestEvent(
+            connectionId,
+            { op: 'schedule', prompt: schedule.prompt, id: schedule.id, request: NO_REQUEST, also: [] },
+            { dir },
+          )
+        }
+      }
+      fs.renameSync(staged, `${file}.1`)
+      return !hasExtraTail
+    } catch {
+      try {
+        if (!fs.existsSync(file) && fs.existsSync(staged)) {
+          fs.renameSync(staged, file)
+        }
+      } catch {
+        /* ignore rollback failure */
+      }
+      return false
     }
-    return true
   } catch {
     return false
   }

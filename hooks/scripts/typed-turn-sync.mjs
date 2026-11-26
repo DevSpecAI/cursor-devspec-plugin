@@ -1289,34 +1289,26 @@ export async function syncTypedTurnFromTranscript({
         let requestId = existingTyped
         let openedNow = false
         let openRefusal = null
-        // Requests that ALREADY joined this live terminal turn before registration ran:
-        // when `reqState.current === null` (idle / prior turn already cleared), any open
-        // unanswered id in `reqState.joined` not tagged as left over from an earlier
-        // answered turn (`priorTurnJoined`) joined THIS live turn before the poller
-        // opened the terminal request and MUST be preserved. Conversely, when
-        // `reqState.current !== null`, everything in `reqState.joined` belonged to that
-        // previous un-cleared turn and MUST NOT be inherited into the new turn (ce71a72b).
-        const preExistingLiveJoinedIds = (rState, targetId) =>
-          rState.current === null
-            ? [...rState.joined].filter(
-                (id) =>
-                  id !== targetId &&
-                  !rState.priorTurnJoined?.has(id) &&
-                  rState.open.has(id) &&
-                  !rState.open.get(id)?.answered,
-              )
-            : []
+        // Stale joined ids that belonged to a PREVIOUS turn (to drop explicitly via
+        // `preserve_live_joined: true` + `drop_joined_ids`). Using a denylist instead
+        // of an allowlist guarantees that ANY room command joining THIS live turn —
+        // before registration, during `open_request`, OR immediately before our
+        // `op: 'current'` append — is preserved atomically in `reduceRequestLog`
+        // without inheriting stale joins from earlier turns (decision ce71a72b).
+        const stalePriorJoinedIds =
+          reqState.current !== null
+            ? [...reqState.joined]
+            : [...(reqState.priorTurnJoined ?? [])]
+        const currentBindingEvent = (targetId) => ({
+          op: 'current',
+          ref: targetId,
+          preserve_live_joined: true,
+          ...(stalePriorJoinedIds.length > 0 ? { drop_joined_ids: stalePriorJoinedIds } : {}),
+        })
         if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
-          const keepJoined = preExistingLiveJoinedIds(reqState, requestId)
           const currentWritten = appendRequestEvent(
             connectionId,
-            midTurn
-              ? { op: 'joined', id: requestId }
-              : {
-                  op: 'current',
-                  ref: requestId,
-                  ...(keepJoined.length > 0 ? { preserve_joined_ids: keepJoined } : {}),
-                },
+            midTurn ? { op: 'joined', id: requestId } : currentBindingEvent(requestId),
             { dir },
           )
           if (!currentWritten) {
@@ -1359,16 +1351,9 @@ export async function syncTypedTurnFromTranscript({
               ? reqState.current !== pendingOpen.requestId && !reqState.joined.has(pendingOpen.requestId)
               : reqState.current !== pendingOpen.requestId
             if (needsBinding) {
-              const keepJoined = preExistingLiveJoinedIds(reqState, pendingOpen.requestId)
               const currentWritten = appendRequestEvent(
                 connectionId,
-                midTurn
-                  ? { op: 'joined', id: pendingOpen.requestId }
-                  : {
-                      op: 'current',
-                      ref: pendingOpen.requestId,
-                      ...(keepJoined.length > 0 ? { preserve_joined_ids: keepJoined } : {}),
-                    },
+                midTurn ? { op: 'joined', id: pendingOpen.requestId } : currentBindingEvent(pendingOpen.requestId),
                 { dir },
               )
               if (!currentWritten) {
@@ -1426,27 +1411,9 @@ export async function syncTypedTurnFromTranscript({
             effectiveMidTurn = hasActiveRemoteCommandTurn(connectionId, postOpenState, dir, postOpenActive ?? active)
             supersededByNewerTurn = newerCurrentLanded || transcriptMovedOn
             if (!supersededByNewerTurn) {
-              // Preserve BOTH: (a) requesters that joined THIS live terminal turn BEFORE
-              // registration ran (when `reqState.current === null` and not in `priorTurnJoined`),
-              // and (b) requesters that NEWLY joined while `open_request` was in flight —
-              // never stale joined requesters left over from an earlier ended turn (ce71a72b).
-              const preJoinedSet = new Set(preExistingLiveJoinedIds(reqState, requestId))
-              const keepJoinedIds = [...postOpenState.joined].filter(
-                (id) =>
-                  id !== requestId &&
-                  postOpenState.open.has(id) &&
-                  !postOpenState.open.get(id)?.answered &&
-                  (preJoinedSet.has(id) || !reqState.joined.has(id)),
-              )
               const currentWritten = appendRequestEvent(
                 connectionId,
-                effectiveMidTurn
-                  ? { op: 'joined', id: requestId }
-                  : {
-                      op: 'current',
-                      ref: requestId,
-                      ...(keepJoinedIds.length > 0 ? { preserve_joined_ids: keepJoinedIds } : {}),
-                    },
+                effectiveMidTurn ? { op: 'joined', id: requestId } : currentBindingEvent(requestId),
                 { dir },
               )
               if (!currentWritten) {
@@ -2422,6 +2389,14 @@ export async function finishIdleRequests({
             },
           }
         }
+        // Attempt log rotation INSIDE the sync lock before declaring close complete:
+        // if a concurrent background launch arrived during rotation and restored
+        // `targetRequestId` into active `.requests.jsonl`, abort reporting closed!
+        maybeRotateLog()
+        const afterRotateState = readRequestState(connectionId, { dir })
+        if (!afterRotateState.readError && (afterRotateState.open.has(targetRequestId) || hasPendingWorkForRequest(afterRotateState, targetRequestId))) {
+          return { status: 'aborted_pending_work' }
+        }
         return { status: 'closed' }
       })
     } catch (lockErr) {
@@ -2448,7 +2423,6 @@ export async function finishIdleRequests({
     }
     if (commitOutcome.status === 'closed') {
       closed.push(targetRequestId)
-      maybeRotateLog()
     } else if (commitOutcome.status === 'aborted_pending_work') {
       abortedClose = true
     } else {
