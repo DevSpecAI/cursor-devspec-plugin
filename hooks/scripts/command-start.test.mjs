@@ -2984,11 +2984,13 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       call: catCall(home, file, { conversation: CONVERSATION }),
     }))
 
-    // Block TMPDIR and dir/diagnostic-notes now, and block ~/.devspec/notes inside startCommands
-    // so ALL THREE note stores reject writes when formatPickupRefusals runs.
+    // Block TMPDIR, dir/diagnostic-notes, and steps/diagnostic-notes now, and block
+    // ~/.devspec/notes inside startCommands so ALL note stores reject writes when
+    // formatPickupRefusals runs.
     const blockedTmp = path.join(dir, 'tmp-all-blocked')
     fs.writeFileSync(blockedTmp, 'not-a-directory\n')
     fs.writeFileSync(path.join(dir, 'diagnostic-notes'), 'not-a-directory\n')
+    fs.writeFileSync(path.join(dir, `${CONN}.steps`, 'diagnostic-notes'), 'not-a-directory\n')
     const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
     process.env.TMPDIR = blockedTmp
     process.env.TMP = blockedTmp
@@ -3036,7 +3038,162 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       assert.equal(parsed.limit_chars, 320)
       assert.ok(parsed.actual_chars > 320)
       assert.deepEqual(parsed.codes, ['turn_busy_all_unwritable'])
+      assert.match(parsed.recovery, /stderr/)
       assert.match(parsed.recovery, /~\/\.devspec\/notes/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('stepDeliveryHook merges concurrent HANDED note written while an earlier hook awaits a refused pickup so reading the fresh note triggers pickup for the fresh command too (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const MSG_1 = '33333333-3333-4333-8333-3333333333b1'
+    const TURN_1 = '77777777-7777-4777-8777-7777777777b1'
+    const MSG_2 = '33333333-3333-4333-8333-3333333333b2'
+    const TURN_2 = '77777777-7777-4777-8777-7777777777b2'
+
+    // Hand over command 1 first.
+    const batch1 = ownerBatch('First command', { messageId: MSG_1, turnId: TURN_1 })
+    holdForNextStep(CONN, batch1, buildOwnerMessageEvents(batch1), { dir })
+    const handOver1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+    const note1Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOver1).additional_context)[1]
+    const note1Parts = noteFiles(home, note1Id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    // Hook 1 reads note 1 and awaits startCommands (which refuses). While Hook 1 is awaiting,
+    // command 2 arrives and Hook 2 hands over note 2 into HANDED!
+    let note2Id = null
+    let hook2Raw = null
+    let hook1Raw = null
+    for (const partCall of note1Parts) {
+      hook1Raw = await stepDeliveryHook(partCall, {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async () => {
+          const batch2 = ownerBatch('Second fresh command', { messageId: MSG_2, turnId: TURN_2 })
+          holdForNextStep(CONN, batch2, buildOwnerMessageEvents(batch2), { dir })
+          hook2Raw = await stepDeliveryHook(
+            { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+            { home, dir, listenerActive: () => true },
+          )
+          note2Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(hook2Raw).additional_context)[1]
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_1,
+                command_turn_id: TURN_1,
+                refusal: { code: 'turn_busy_race', blocking_turn_id: 'blk-race-1' },
+              },
+            ],
+          }
+        },
+      })
+    }
+    assert.ok(note2Id, 'Hook 2 must have handed over note 2')
+    assert.ok(hook1Raw, 'Hook 1 must return context')
+
+    // Now the agent reads note 2: Hook 3 MUST trigger pickup with BOTH MSG_1 (retry) AND MSG_2 (fresh)!
+    const note2Parts = noteFiles(home, note2Id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+    const pickedBatches = []
+    for (const partCall of note2Parts) {
+      await stepDeliveryHook(partCall, {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async ({ commands }) => {
+          pickedBatches.push(commands.map((c) => c.messageId))
+          return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+        },
+      })
+    }
+    assert.equal(pickedBatches.length, 1)
+    assert.ok(pickedBatches[0].includes(MSG_1), 'older refused command 1 must be retried')
+    assert.ok(pickedBatches[0].includes(MSG_2), 'fresh concurrent command 2 must NOT be overwritten and MUST be picked up')
+  })
+
+  it('stepDeliveryHook surfaces BOTH a small refusal and an oversized blocking refusal together (shrinking only huge text) when all note stores reject writes (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const INLINE_MSG_ID = '33333333-3333-4333-8333-3333333333c1'
+    const INLINE_TURN_ID = '77777777-7777-4777-8777-7777777777c1'
+    const INNER_MSG_ID = '33333333-3333-4333-8333-3333333333c2'
+    const INNER_TURN_ID = '77777777-7777-4777-8777-7777777777c2'
+
+    const innerBatch = ownerBatch('Inner command for two-refusal check', { messageId: INNER_MSG_ID, turnId: INNER_TURN_ID })
+    const innerNote = writeNote(wakeLines(buildOwnerMessageEvents(innerBatch)), { home })
+    const innerNoteFile = noteFiles(home, innerNote.id)[0]
+    const mixedBatch = ownerBatch('Inline command for two-refusal check', { messageId: INLINE_MSG_ID, turnId: INLINE_TURN_ID })
+    const mixedEvents = [
+      { type: 'wake_in_note', carries: ['owner_message'], read: innerNote.command, note: innerNote.id },
+      ...buildOwnerMessageEvents(mixedBatch),
+    ]
+    holdForNextStep(CONN, mixedBatch, mixedEvents, { dir })
+
+    const handOverRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo hi' }, tool_output: 'hi' },
+      { home, dir, listenerActive: () => true },
+    )
+    const outerNoteId = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOverRaw).additional_context)[1]
+    const outerParts = noteFiles(home, outerNoteId).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    // Remove inner note AND block all 4 diagnostic note stores.
+    fs.rmSync(innerNoteFile, { force: true })
+    const blockedTmp = path.join(dir, 'tmp-two-refusals')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    fs.writeFileSync(path.join(dir, 'diagnostic-notes'), 'not-a-directory\n')
+    fs.writeFileSync(path.join(dir, `${CONN}.steps`, 'diagnostic-notes'), 'not-a-directory\n')
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    try {
+      let lastRaw = null
+      for (const partCall of outerParts) {
+        lastRaw = await stepDeliveryHook(partCall, {
+          home,
+          dir,
+          listenerActive: () => true,
+          startCommands: async () => {
+            fs.rmSync(path.join(home, '.devspec', 'notes'), { recursive: true, force: true })
+            fs.writeFileSync(path.join(home, '.devspec', 'notes'), 'not-a-directory\n')
+            return {
+              ok: false,
+              outcome: 'refused',
+              started: [],
+              pickedUp: 0,
+              refusals: [
+                {
+                  command_message_id: INLINE_MSG_ID,
+                  command_turn_id: INLINE_TURN_ID,
+                  refusal: {
+                    code: 'turn_busy_second_refusal',
+                    blocking_items: [{ id: 'blk-second-1', reason: 'active_edit' }],
+                    detail: 'y'.repeat(4_500),
+                  },
+                },
+              ],
+            }
+          },
+        })
+      }
+      assert.ok(lastRaw)
+      const ctx = JSON.parse(lastRaw).additional_context
+      assert.ok(ctx.length <= 3_300, `must fit normal hook share; got len=${ctx.length}`)
+      assert.match(ctx, new RegExp(innerNote.id), 'must preserve Refusal 1 (unreadable inner note + read ref)')
+      assert.match(ctx, /turn_busy_second_refusal/, 'must ALSO surface Refusal 2 code')
+      assert.match(ctx, /blk-second-1/, 'must ALSO surface Refusal 2 blocking_items')
+      assert.match(ctx, /"omitted_count":0/, 'both refusals must be returned with zero refusals dropped')
+      assert.match(ctx, /"omitted_large_text":true/, 'only the oversized string leaf should be marked omitted')
+      assert.match(ctx, /stderr/, 'recovery must honestly name hook stderr when all note stores rejected writes')
     } finally {
       for (const [k, v] of Object.entries(prevTmp)) {
         if (v === undefined) delete process.env[k]

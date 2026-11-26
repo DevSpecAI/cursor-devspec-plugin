@@ -515,6 +515,13 @@ function validRecord(record) {
     Array.isArray(record.items) && record.items.every(validItem)
 }
 
+function hasUnreadNote(record) {
+  if (!record) return false
+  if (record.note_read === true) return false
+  if (record.note_read === false) return true
+  return record.pickup_pending !== true && record.inner_note_pending !== true
+}
+
 function list(dir) {
   try {
     return fs.readdirSync(dir)
@@ -976,70 +983,74 @@ export async function stepDeliveryHook(
   let keptForPickupRetry = null
   let unreadableInnerNoteRefusals = []
   let unreadableInnerNoteItems = []
+  let unreadNoteRecord = null
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
-      if (kept.inner_note_pending === true || kept.pickup_pending === true) {
-        // A previous step read this note whole and retained unreadable inner
-        // `wake_in_note` item(s), refused/unstarted inline pickup item(s), or BOTH
-        // (requirements 3ea2b201 / 4e32d1a5). Retry each pending set independently
-        // without re-prompting the agent to re-read the outer note.
-        if (kept.inner_note_pending === true) {
-          const innerSource = Array.isArray(kept.inner_note_items) ? kept.inner_note_items : kept.items
-          const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerSource)
-          unreadableInnerNoteRefusals = unreadableRefusals
-          unreadableInnerNoteItems = unreadableItems
-          if (immediateOwnerItems.length > 0) {
-            completedOwnerItems.push(...immediateOwnerItems)
-          }
-        }
-        if (kept.pickup_pending === true) {
-          const pickupSource = Array.isArray(kept.pickup_items)
-            ? kept.pickup_items
-            : kept.items.filter((item) => item.kind === 'owner_messages')
-          completedOwnerItems.push(...pickupSource)
-        }
-        keptForPickupRetry = completedOwnerItems.length > 0 ? { ...kept, items: completedOwnerItems } : kept
-        if (unreadableInnerNoteItems.length > 0) {
-          record = {
-            ...kept,
-            items: unreadableInnerNoteItems,
-            inner_note_pending: true,
-            inner_note_items: unreadableInnerNoteItems,
-            pickup_pending: false,
-            pickup_items: [],
-            pickup_refusals: unreadableInnerNoteRefusals,
-          }
-        } else {
-          record = null
+      const hadPendingInner = kept.inner_note_pending === true
+      const hadPendingPickup = kept.pickup_pending === true
+      if (hadPendingInner) {
+        const innerSource = Array.isArray(kept.inner_note_items) ? kept.inner_note_items : kept.items
+        const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerSource)
+        unreadableInnerNoteRefusals.push(...unreadableRefusals)
+        unreadableInnerNoteItems.push(...unreadableItems)
+        if (immediateOwnerItems.length > 0) {
+          completedOwnerItems.push(...immediateOwnerItems)
         }
         readChanged = true
-      } else {
+      }
+      if (hadPendingPickup) {
+        const pickupSource = Array.isArray(kept.pickup_items)
+          ? kept.pickup_items
+          : kept.items.filter((item) => item.kind === 'owner_messages')
+        completedOwnerItems.push(...pickupSource)
+        readChanged = true
+      }
+      if (hasUnreadNote(kept)) {
         const { record: next, done } = readThrough(kept, input, { home })
-        record = done ? null : { ...kept, parts: next.parts }
-        readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
         if (done) {
+          readChanged = true
           const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(kept.items)
-          completedOwnerItems = immediateOwnerItems
-          unreadableInnerNoteRefusals = unreadableRefusals
-          unreadableInnerNoteItems = unreadableItems
-          keptForPickupRetry =
-            immediateOwnerItems.length > 0
-              ? { ...kept, items: immediateOwnerItems, parts: next.parts }
-              : { ...kept, parts: next.parts }
-          if (unreadableItems.length > 0) {
-            record = {
-              ...kept,
-              items: unreadableItems,
-              parts: next.parts,
-              inner_note_pending: true,
-              inner_note_items: unreadableItems,
-              pickup_pending: false,
-              pickup_items: [],
-              pickup_refusals: unreadableRefusals,
-            }
+          completedOwnerItems.push(...immediateOwnerItems)
+          unreadableInnerNoteRefusals.push(...unreadableRefusals)
+          unreadableInnerNoteItems.push(...unreadableItems)
+        } else {
+          if (next.parts.length !== (kept.parts?.length ?? 0)) readChanged = true
+          unreadNoteRecord = {
+            version: kept.version,
+            note: kept.note,
+            parts: next.parts,
+            items: kept.items,
+            at: kept.at,
+            note_read: false,
           }
         }
+      }
+      keptForPickupRetry = { ...kept, note_read: !unreadNoteRecord }
+      if (unreadNoteRecord) {
+        record = {
+          ...unreadNoteRecord,
+          ...(unreadableInnerNoteItems.length > 0
+            ? {
+                inner_note_pending: true,
+                inner_note_items: unreadableInnerNoteItems,
+                pickup_refusals: unreadableInnerNoteRefusals,
+              }
+            : {}),
+        }
+      } else if (unreadableInnerNoteItems.length > 0) {
+        record = {
+          ...kept,
+          note_read: true,
+          items: unreadableInnerNoteItems,
+          inner_note_pending: true,
+          inner_note_items: unreadableInnerNoteItems,
+          pickup_pending: false,
+          pickup_items: [],
+          pickup_refusals: unreadableInnerNoteRefusals,
+        }
+      } else {
+        record = null
       }
     } else {
       giveBack(takenRecord)
@@ -1152,9 +1163,12 @@ export async function stepDeliveryHook(
           `step-delivery: report_pickup refused for ${connectionId}; retaining pending pickup for retry: ${JSON.stringify(pickupRefusals)}\n`,
         )
         if (completedOwnerItems.length > 0 && keptForPickupRetry) {
+          const base = record ?? keptForPickupRetry
+          const keepUnread = hasUnreadNote(base)
           record = {
-            ...(record ?? keptForPickupRetry),
-            items: [...unreadableInnerNoteItems, ...completedOwnerItems],
+            ...base,
+            note_read: !keepUnread,
+            items: keepUnread ? base.items : [...unreadableInnerNoteItems, ...completedOwnerItems],
             inner_note_pending: unreadableInnerNoteItems.length > 0,
             inner_note_items: unreadableInnerNoteItems,
             pickup_pending: true,
@@ -1199,9 +1213,12 @@ export async function stepDeliveryHook(
             return cmds.some((cmd) => unstartedIds.has(cmd?.messageId))
           })
           if (remainingOwnerItems.length > 0) {
+            const base = record ?? keptForPickupRetry
+            const keepUnread = hasUnreadNote(base)
             record = {
-              ...(record ?? keptForPickupRetry),
-              items: [...unreadableInnerNoteItems, ...remainingOwnerItems],
+              ...base,
+              note_read: !keepUnread,
+              items: keepUnread ? base.items : [...unreadableInnerNoteItems, ...remainingOwnerItems],
               inner_note_pending: unreadableInnerNoteItems.length > 0,
               inner_note_items: unreadableInnerNoteItems,
               pickup_pending: true,
@@ -1276,7 +1293,11 @@ export async function stepDeliveryHook(
       const refusalNotice =
         `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
       const buildFallback = (budget, noteError) => {
-        const fallbackBaseDirs = [null, ...(connDir ? [path.join(connDir, 'diagnostic-notes')] : [])]
+        const fallbackBaseDirs = [
+          null,
+          ...(connDir ? [path.join(connDir, 'diagnostic-notes')] : []),
+          path.join(steps, 'diagnostic-notes'),
+        ]
         let savedFallback = null
         for (const baseDir of fallbackBaseDirs) {
           try {
@@ -1291,6 +1312,8 @@ export async function stepDeliveryHook(
           maxChars: budget,
           noteError,
           savedNote: savedFallback,
+          recovery:
+            'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections, steps) were unwritable; unabridged refusal JSON was written to hook stderr. Inspect hook stderr for complete text and fix write permissions on ~/.devspec/notes.',
         })
         if (formatted) return formatted.trimEnd()
         if (savedFallback) {
@@ -1300,7 +1323,7 @@ export async function stepDeliveryHook(
         // When ALL note stores rejected writes AND the refusal payload exceeds `budget`,
         // NEVER drop the entire agent-facing diagnostic silently: emit an explicit,
         // budget-fitted omission + recovery notice stating the limit, actual size,
-        // omitted count, and how to restore note writes (requirements 3c5147a7 / 91d7b47c).
+        // omitted count, and where the unabridged JSON was written (requirements 3c5147a7 / 91d7b47c).
         const omittedKeys = [
           ...new Set(
             pickupRefusals.flatMap((entry) => {
@@ -1331,7 +1354,7 @@ export async function stepDeliveryHook(
             ...(readRefs.length > 0 ? { read_refs: readRefs } : {}),
             ...(omittedKeys.length > 0 ? { omitted_keys: omittedKeys } : {}),
             recovery:
-              'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections) were unwritable so oversized refusal details could not be saved; fix write permissions on ~/.devspec/notes (pickup retries next step) and check stderr.',
+              'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections, steps) were unwritable so oversized refusal details could not be saved; unabridged JSON was written to hook stderr. Fix write permissions on ~/.devspec/notes.',
           }),
           JSON.stringify({
             refused: 'report_pickup',
@@ -1341,9 +1364,9 @@ export async function stepDeliveryHook(
             limit_chars: budget,
             actual_chars: refusalNotice.length,
             ...(codes.length > 0 ? { codes } : {}),
-            recovery: 'Fix ~/.devspec/notes or TMPDIR permissions so full refusal can be saved on next retry; see stderr.',
+            recovery: 'Unabridged refusal JSON is in hook stderr; fix ~/.devspec/notes or TMPDIR permissions.',
           }),
-          `DevSpec report_pickup refused (${pickupRefusals.length} omitted: ${refusalNotice.length}>${budget} chars, note stores unwritable); fix ~/.devspec/notes permissions & retry.`,
+          `DevSpec report_pickup refused (${pickupRefusals.length} omitted: ${refusalNotice.length}>${budget} chars, note stores unwritable); unabridged JSON in hook stderr; fix ~/.devspec/notes permissions.`,
         ]
         for (const candidate of omissionCandidates) {
           if (candidate.length <= budget) return candidate
@@ -1406,13 +1429,100 @@ export async function stepDeliveryHook(
       return fbFull ?? existingContext
     }
 
+    // Merge any concurrent HANDED record written by a parallel postToolUse hook while
+    // this hook awaited `isOpen` or `startCommands`, so a refusal/retry write NEVER
+    // overwrites a freshly handed-over unread note (requirement 3ea2b201).
+    let mergedConcurrent = false
     try {
-      if (adding.length > 0) {
-        const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
+      const concurrent = readPrivateJson(path.join(steps, HANDED))
+      if (validRecord(concurrent)) {
+        const cUnread = hasUnreadNote(concurrent)
+        const rUnread = hasUnreadNote(record)
+        const cInner = concurrent.inner_note_pending ? (Array.isArray(concurrent.inner_note_items) ? concurrent.inner_note_items : concurrent.items) : []
+        const rInner = record?.inner_note_pending ? (Array.isArray(record.inner_note_items) ? record.inner_note_items : []) : []
+        const mergedInner = [...cInner, ...rInner]
+        const cPickup = concurrent.pickup_pending ? (Array.isArray(concurrent.pickup_items) ? concurrent.pickup_items : concurrent.items.filter((i) => i.kind === 'owner_messages')) : []
+        const rPickup = record?.pickup_pending ? (Array.isArray(record.pickup_items) ? record.pickup_items : []) : []
+        const mergedPickup = [...cPickup, ...rPickup]
+        const mergedRefusals = [
+          ...(Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
+          ...(Array.isArray(record?.pickup_refusals) ? record.pickup_refusals : []),
+        ]
+        const pendingMeta = {
+          ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : { inner_note_pending: false, inner_note_items: [] }),
+          ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : { pickup_pending: false, pickup_items: [] }),
+          ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
+        }
+        if (adding.length > 0 || (cUnread && rUnread)) {
+          const unreadItems = [
+            ...(cUnread ? concurrent.items : []),
+            ...(rUnread ? record.items : []),
+            ...adding.map((each) => each.item),
+          ]
+          const note = writeNote(stepNoteText(unreadItems, { connectionId }), { home })
+          record = {
+            version: RECORD_VERSION,
+            note: note.id,
+            parts: [],
+            items: unreadItems,
+            at: new Date().toISOString(),
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (cUnread) {
+          record = {
+            version: concurrent.version,
+            note: concurrent.note,
+            parts: Array.isArray(concurrent.parts) ? concurrent.parts : [],
+            items: concurrent.items,
+            at: concurrent.at,
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (rUnread) {
+          record = {
+            version: record.version,
+            note: record.note,
+            parts: Array.isArray(record.parts) ? record.parts : [],
+            items: record.items,
+            at: record.at,
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (mergedInner.length > 0 || mergedPickup.length > 0) {
+          record = {
+            ...(record ?? concurrent),
+            note_read: true,
+            items: [...mergedInner, ...mergedPickup],
+            ...pendingMeta,
+          }
+        } else {
+          record = null
+        }
+        mergedConcurrent = true
+      } else if (adding.length > 0) {
+        const keepPendingMeta = record
+          ? {
+              ...(record.inner_note_pending ? { inner_note_pending: true, inner_note_items: record.inner_note_items ?? [] } : {}),
+              ...(record.pickup_pending ? { pickup_pending: true, pickup_items: record.pickup_items ?? [] } : {}),
+              ...(Array.isArray(record.pickup_refusals) && record.pickup_refusals.length > 0 ? { pickup_refusals: record.pickup_refusals } : {}),
+            }
+          : {}
+        const items = [...(hasUnreadNote(record) ? record.items : []), ...adding.map((each) => each.item)]
         const note = writeNote(stepNoteText(items, { connectionId }), { home })
-        record = { version: RECORD_VERSION, note: note.id, parts: [], items, at: new Date().toISOString() }
+        record = {
+          version: RECORD_VERSION,
+          note: note.id,
+          parts: [],
+          items,
+          at: new Date().toISOString(),
+          note_read: false,
+          ...keepPendingMeta,
+        }
       }
-      if (record && (adding.length > 0 || readChanged)) writePrivateJson(path.join(steps, HANDED), record)
+      if (record && (adding.length > 0 || readChanged || mergedConcurrent)) {
+        writePrivateJson(path.join(steps, HANDED), record)
+      }
     } catch (deliveryWriteError) {
       // Not handed over, so not taken: everything goes back for the next step.
       for (const each of adding) giveBack(each.taken)
@@ -1440,7 +1550,7 @@ export async function stepDeliveryHook(
       recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
     let context =
-      record && record.pickup_pending !== true && record.inner_note_pending !== true
+      hasUnreadNote(record)
         ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
         : null
     context = formatPickupRefusals(context)

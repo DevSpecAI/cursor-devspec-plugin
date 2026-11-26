@@ -335,9 +335,11 @@ function findLargestShrinkableString(node, minLength, currentPath = [], best = n
 
 function findLargestRawArray(node, currentPath = [], best = null) {
   if (Array.isArray(node)) {
-    const size = JSON.stringify(node).length
-    if (node.length > 0 && (!best || size > best.size)) {
-      best = { path: currentPath, size }
+    if (currentPath.length > 0 && node.length > 0) {
+      const size = JSON.stringify(node).length
+      if (!best || size > best.size) {
+        best = { path: currentPath, size }
+      }
     }
     for (let i = 0; i < node.length; i += 1) {
       best = findLargestRawArray(node[i], [...currentPath, i], best)
@@ -530,7 +532,20 @@ export function formatStructuredRefusalsFallback(
     return fits(emptyLine) ? emptyLine : null
   }
 
-  // 1. Keep as many completely unmodified refusal objects as fit inside the budget.
+  // 1. If every refusal fits unmodified, return the complete list verbatim.
+  if (fits(wrap(list))) return wrap(list)
+
+  // 2. When multiple refusals exceed the budget because one or more carry oversized
+  //    string/array fields (e.g. a small unreadable-note refusal beside a large
+  //    pickup blocker), shrink ONLY oversized nested fields across ALL refusals first
+  //    so EVERY refusal's code, read reference, and blocking records survive together
+  //    instead of hiding later refusals behind an earlier small one (4e32d1a5 / 3c5147a7).
+  const allShrunk = shrinkObjectToFit(list, (shrunkList) => wrap(shrunkList), fits, limitChars, {
+    requireNonEmptyArrays: true,
+  })
+  if (allShrunk) return allShrunk
+
+  // 3. Otherwise keep as many completely unmodified refusal objects as fit inside the budget.
   let lo = 0
   let hi = list.length
   while (lo < hi) {
@@ -543,7 +558,7 @@ export function formatStructuredRefusalsFallback(
   }
   if (lo > 0) return wrap(list.slice(0, lo))
 
-  // 2. Single first refusal exceeds remaining budget: shrink only oversized string
+  // 4. Single first refusal exceeds remaining budget: shrink only oversized string
   // leaves and/or binary-search oversized nested arrays while keeping every field and
   // retained item complete with explicit omission counts, saved pointer, and recovery.
   const singleFitted = shrinkObjectToFit(list[0], (item) => wrap([item]), fits, limitChars, {
@@ -553,11 +568,29 @@ export function formatStructuredRefusalsFallback(
 
   if (!allowMinimalEnvelope) return null
 
-  // 3. Compact JSON envelope (drops verbose text prefix) with the exact same zero-cap
-  // budget-driven shrinker so every structured field and retained item stays complete.
+  // 5. Compact JSON envelope (drops verbose text prefix) with the exact same zero-cap
+  // budget-driven shrinker across ALL refusals first, then the primary refusal.
   const compactRecovery = savedCmd
     ? 'Read full original via `read`; fix ~/.devspec/notes.'
-    : 'Fix ~/.devspec/notes permissions and retry.'
+    : 'Unabridged JSON logged to stderr; fix ~/.devspec/notes permissions.'
+  const compactWrapList = (items) =>
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      note_write_failed: true,
+      shell_limit_chars: limitChars,
+      total_count: list.length,
+      returned_count: items.length,
+      omitted_count: list.length - items.length,
+      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
+      refusals: items,
+      recovery: compactRecovery,
+    })}\n`
+  if (list.length > 1) {
+    const compactAll = shrinkObjectToFit(list, compactWrapList, fits, limitChars, {
+      requireNonEmptyArrays: true,
+    })
+    if (compactAll) return compactAll
+  }
   const compactWrap = (item) =>
     `${JSON.stringify({
       refused: 'report_pickup',
