@@ -1975,29 +1975,12 @@ export async function runOneShotRoomCommandPickup({
       label: 'devspec-remote-wait',
       fallback,
       requireStructuredFallback: Boolean(refusals),
+      fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
     })
     diagnosticNote = fitted.note
-    let emittedDiag = fitted.text
-    if (!emittedDiag && refusals) {
-      // Last-resort explicit refusal + omission disclosure if even the structured
-      // fallback could not fit (e.g. a single oversized non-shrinkable blocking item
-      // with both note stores unwritable) so stderr is NEVER silently empty on exit 1.
-      const codes = refusals.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
-      const emergency = `${JSON.stringify({
-        refused: 'report_pickup',
-        ...(codes.length > 0 ? { codes } : {}),
-        omitted_count: refusals.length,
-        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
-        note_write_failed: true,
-        recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry devspec-remote-wait.',
-      })}\n`
-      if (fitsShellOutput(`${combinedPrior}${emergency}`)) {
-        emittedDiag = emergency
-      }
-    }
-    if (emittedDiag) {
-      writeStderr(emittedDiag)
-      stderrText = emittedDiag
+    if (fitted.text) {
+      writeStderr(fitted.text)
+      stderrText = fitted.text
     }
   }
   return {
@@ -2027,7 +2010,8 @@ export function createOneShotRetryStderrWriter({
   getEmittedStderr = () => '',
   home = os.homedir(),
   tmpDir = null,
-  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait'),
+  fallbackDir = null,
+  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { fallbackDir }),
   headroom = null,
 } = {}) {
   const transitionLine =
@@ -2113,12 +2097,15 @@ export function createOneShotRetryStderrWriter({
       primaryErr = error
     }
     if (!savedNote) {
-      try {
-        const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
-        const baseDir = tmpDir ? path.join(tmpDir, `devspec-notes-${uid}`) : null
-        savedNote = writeFallbackDiagnosticNote(fullText, { baseDir })
-      } catch (error) {
-        fallbackErr = error
+      const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+      const tmpBaseDir = tmpDir ? path.join(tmpDir, `devspec-notes-${uid}`) : null
+      for (const baseDir of [tmpBaseDir, ...(fallbackDir ? [fallbackDir] : [])]) {
+        try {
+          savedNote = writeFallbackDiagnosticNote(fullText, { baseDir })
+          if (savedNote) break
+        } catch (error) {
+          fallbackErr = error
+        }
       }
     }
     if (savedNote) {
@@ -2175,12 +2162,14 @@ async function main() {
   // diagnostics) so stdout sizing and fitShellDiagnostic enforce Cursor's combined
   // stdout + stderr Shell ceiling across the entire process (reqs 3c5147a7 / 91d7b47c).
   let emittedStderr = ''
-  const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait')
+  const diagnosticFallbackDir = path.join(CONNECTIONS_DIR, 'diagnostic-notes')
+  const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { fallbackDir: diagnosticFallbackDir })
   const retryStderr = createOneShotRetryStderrWriter({
     follow: Boolean(args.follow),
     writeStderr: (chunk) => process.stderr.write(chunk),
     getEmittedStderr: () => emittedStderr,
     diagnosticReserve: oneShotDiagnosticReserve,
+    fallbackDir: diagnosticFallbackDir,
   })
   const writeRetryStderr = (line) => retryStderr.write(line)
   if (!args.follow) {

@@ -869,12 +869,17 @@ export const SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS = 600
  * and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS` so `stdout + stderr` always fits
  * `fitsShellOutput` even when neither note store is writable (reqs 3c5147a7 / 91d7b47c).
  */
-export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
+export function shellDiagnosticReserve(label = 'devspec-wake-tail', { fallbackDir = null } = {}) {
   const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
-  const base = fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
+  let base = fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
+  if (fallbackDir) {
+    const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
+    const dirPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`)
+    if (dirPtr.length > base.length) base = dirPtr
+  }
   return base.length >= SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS
     ? base
     : base + ' '.repeat(SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS - base.length)
@@ -926,7 +931,7 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
 export function fitShellDiagnostic(
   stdoutText,
   diagnosticText,
-  { home = os.homedir(), label = 'devspec-wake-tail', fallback = null, requireStructuredFallback = false } = {},
+  { home = os.homedir(), label = 'devspec-wake-tail', fallback = null, requireStructuredFallback = false, fallbackDir = null } = {},
 ) {
   const stdout = String(stdoutText ?? '')
   const diag = String(diagnosticText ?? '')
@@ -954,10 +959,14 @@ export function fitShellDiagnostic(
     noteError = error
   }
   let fallbackNote = null
-  try {
-    fallbackNote = writeFallbackDiagnosticNote(diag)
-  } catch {
-    fallbackNote = null
+  const fallbackBaseDirs = [null, ...(fallbackDir ? [fallbackDir] : [])]
+  for (const baseDir of fallbackBaseDirs) {
+    try {
+      fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir })
+      if (fallbackNote) break
+    } catch {
+      fallbackNote = null
+    }
   }
   const fb = resolveFallback(noteError, fallbackNote)
   if (fb && fitsShellOutput(stdout + fb)) {

@@ -2406,4 +2406,43 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
+
+  it('startRoomCommands rejects an unrecognized report_pickup reply without recording started-command ledger or .turn (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    fs.writeFileSync(
+      path.join(dir, `${CONN}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: CONN,
+        session_id: ROOM,
+        local_id: CONVERSATION,
+        agent_name: 'Cursor',
+        token: 'dvs_test',
+        mcp_url: 'http://127.0.0.1:9/api/mcp',
+      }),
+      { mode: 0o600 },
+    )
+    const cmd = { turnId: TURN_ID, messageId: MSG_ID }
+    const logs = []
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [cmd],
+      sessionId: ROOM,
+      dir,
+      home,
+      call: async () => ({ unexpected: 'payload_without_pickup_outcome' }),
+      seedFn: async () => { throw new Error('must not seed trail on unrecognized pickup reply') },
+      ensureWatch: () => { throw new Error('must not ensure watch on unrecognized pickup reply') },
+      log: (line) => logs.push(line),
+    })
+    assert.equal(res.ok, false)
+    assert.equal(res.outcome, 'refused')
+    assert.deepEqual(res.started, [])
+    assert.equal(res.pickedUp, 0)
+    assert.equal(res.refusals[0].refusal.code, 'unrecognized_pickup_response')
+    assert.deepEqual(res.refusals[0].refusal.response, { unexpected: 'payload_without_pickup_outcome' })
+    assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false, '.turn must not be written')
+    const startedFile = path.join(dir, `${CONN}.started-commands.json`)
+    assert.equal(fs.existsSync(startedFile), false, 'started-command ledger must not advance on unconfirmed reply')
+  })
 })

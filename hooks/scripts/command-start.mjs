@@ -707,6 +707,27 @@ export function structuredRefusalFromError(error) {
   return refusal
 }
 
+const CONFIRMED_PICKUP_OUTCOMES = new Set(['picked_up', 'already_working', 'started'])
+
+/**
+ * Whether a `report_pickup` reply positively confirms DevSpec started or kept the
+ * working attempt (requirement 3ea2b201). Rejects empty or unexpected replies rather
+ * than marking a command started in the local ledger without server confirmation.
+ */
+function isConfirmedPickupResponse(res) {
+  if (!res || typeof res !== 'object') return false
+  if (typeof res.outcome === 'string' && CONFIRMED_PICKUP_OUTCOMES.has(res.outcome)) {
+    return true
+  }
+  if (res.phase === 'working' && typeof res.attempt_id === 'string' && res.attempt_id.length > 0) {
+    return true
+  }
+  if (res.ok === true && res.outcome === undefined && res.status === undefined) {
+    return true
+  }
+  return false
+}
+
 /** Whether a `report_pickup` response explicitly says DevSpec has no open attempt to start. */
 function isNothingOpenResponse(res) {
   if (!res || typeof res !== 'object') return false
@@ -981,8 +1002,18 @@ export async function startRoomCommands({
           const entry = { command_message_id: primary.messageId, command_turn_id: primary.turnId, response: res }
           nothingOpen.push(entry)
           log(`command-start: report_pickup nothing_open for ${connectionId} (${primary.messageId}): ${JSON.stringify(res)}\n`)
-        } else {
+        } else if (isConfirmedPickupResponse(res)) {
           succeeded.push(primary)
+        } else {
+          const unrecognized = {
+            code: 'unrecognized_pickup_response',
+            retryable: true,
+            error: 'report_pickup returned an unrecognized reply without confirming pickup.',
+            response: res ?? null,
+          }
+          const entry = { command_message_id: primary.messageId, command_turn_id: primary.turnId, refusal: unrecognized }
+          refusals.push(entry)
+          log(`command-start: report_pickup unrecognized response for ${connectionId} (${primary.messageId}): ${JSON.stringify(unrecognized)}\n`)
         }
       } catch (error) {
         const structured = structuredRefusalFromError(error)

@@ -1963,7 +1963,17 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
                 ok: false,
                 code: 'pickup_blocked_unwritable',
                 retryable: true,
-                blocking_items: [{ id: 'blk-unwritable-1', reason: 'active_turn' }],
+                blocking_items: [
+                  {
+                    id: 'blk-unwritable-1',
+                    reason: 'active_turn',
+                    f1: 'a', f2: 'b', f3: 'c', f4: 'd', f5: 'e', f6: 'f', f7: 'g', f8: 'h',
+                    f9: 'i', f10: 'j', f11: 'k', f12: 'l', f13: 'm', f14: 'n', f15: 'o', f16: 'p',
+                    f17: 'q', f18: 'r', f19: 's', f20: 't', f21: 'u', f22: 'v', f23: 'w', f24: 'x',
+                    f25: 'y', f26: 'z', f27: 'aa', f28: 'bb', f29: 'cc', f30: 'dd',
+                  },
+                  { id: 'blk-unwritable-2', reason: 'queued_review' },
+                ],
                 error: 'e'.repeat(2_000),
               }),
             }],
@@ -2033,9 +2043,12 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
         fitsShellOutput(res.stdout + res.stderr),
         `combined stdout (${res.stdout.length}) + stderr (${res.stderr.length}) must fit fitsShellOutput`,
       )
-      assert.match(res.stderr, /pickup_blocked_unwritable/, 'refusal code must reach caller inline')
-      assert.match(res.stderr, /blk-unwritable-1/, 'blocking item must reach caller inline')
-      assert.match(res.stderr, /recovery/, 'recovery guidance must reach caller inline')
+      const catMatch = /cat '([^']+)'/.exec(res.stderr)
+      assert.ok(catMatch, `stderr must provide exact cat path to saved diagnostic note when HOME and TMPDIR are unwritable; got: ${res.stderr}`)
+      const savedFull = fs.readFileSync(catMatch[1], 'utf8')
+      assert.match(savedFull, /pickup_blocked_unwritable/, 'saved note must contain refusal code')
+      assert.match(savedFull, /blk-unwritable-1/, 'saved note must contain first blocking item whole')
+      assert.match(savedFull, /blk-unwritable-2/, 'saved note must contain second blocking item whole')
       const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
       assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must remain untouched')
     } finally {
