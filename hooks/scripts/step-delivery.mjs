@@ -166,7 +166,9 @@ export function setWakeInlineHold(connectionId, { wakePositionPath, holdOffset }
   const steps = stepsDir(connectionId, dir)
   fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
   const target = path.join(steps, WAKE_INLINE_HOLD)
-  const current = readPrivateJson(target)
+  const currentRes = readPrivateJsonResult(target)
+  if (currentRes.status === STATE_UNREADABLE) return false
+  const current = currentRes.value
   const holds = current && typeof current.holds === 'object' && !Array.isArray(current.holds) ? { ...current.holds } : {}
   holds[wakePositionPath] = holdOffset
   writePrivateJson(target, { version: RECORD_VERSION, holds, at: new Date().toISOString() })
@@ -178,7 +180,9 @@ export function clearWakeInlineHold(connectionId, { wakePositionPath }, { dir = 
   if (!connectionId || typeof wakePositionPath !== 'string') return false
   const steps = stepsDir(connectionId, dir)
   const target = path.join(steps, WAKE_INLINE_HOLD)
-  const current = readPrivateJson(target)
+  const currentRes = readPrivateJsonResult(target)
+  if (currentRes.status === STATE_UNREADABLE) return false
+  const current = currentRes.value
   if (!current || typeof current.holds !== 'object' || !(wakePositionPath in current.holds)) return false
   const holds = { ...current.holds }
   delete holds[wakePositionPath]
@@ -191,8 +195,12 @@ export function clearWakeInlineHold(connectionId, { wakePositionPath }, { dir = 
 }
 
 function readWakeInlineHoldOffset(steps, wakePositionPath) {
-  const data = readPrivateJson(path.join(steps, WAKE_INLINE_HOLD))
-  const offset = data?.holds?.[wakePositionPath]
+  const res = readPrivateJsonResult(path.join(steps, WAKE_INLINE_HOLD))
+  // Fail closed on any transient read/parse error of `wake-inline-hold.json` so a later
+  // wake-note completing NEVER advances the wake cursor past an earlier unstarted inline
+  // command (requirement 3ea2b201).
+  if (res.status === STATE_UNREADABLE) return 0
+  const offset = res.value?.holds?.[wakePositionPath]
   return typeof offset === 'number' ? offset : null
 }
 
@@ -421,7 +429,9 @@ function advanceCompletedWakeNotePositions(steps) {
           if (start < minIncompleteStart) minIncompleteStart = start
         }
       }
-      const cur = readPrivateJson(posPath)
+      const curRes = readPrivateJsonResult(posPath)
+      if (curRes.status === STATE_UNREADABLE) continue
+      const cur = curRes.value
       const prevOffset = typeof cur?.offset === 'number' ? cur.offset : 0
       let nextOffset = prevOffset
       let wakeFile = cur?.file ?? null

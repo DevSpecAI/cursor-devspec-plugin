@@ -1190,14 +1190,65 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
  * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
+  /**
+   * Compact ONLY high-entropy opaque non-whitespace tokens (such as base64/hex blobs >= 48 chars)
+   * inside narrative fields (`reason`, `title`, `message`, `error`) so every human-readable word,
+   * approver name, and actionable instruction inside a structured reason survives 100% verbatim
+   * even under severe `ENOSPC` (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+   */
+  const compactOpaqueTokensInString = (str, { tokenPreviewChars = 16, includePunctuated = false } = {}) => {
+    const pattern = includePunctuated ? /[A-Za-z0-9+/=_-]{48,}/g : /[A-Za-z0-9+/=]{48,}/g
+    let changed = false
+    let omittedTotal = 0
+    const compacted = str.replace(pattern, (tok) => {
+      if (tok.length <= Math.max(48, tokenPreviewChars * 2 + 16)) return tok
+      if (includePunctuated) {
+        // Avoid compacting plain snake_case / kebab-case English phrases that lack mixed-case/digit entropy.
+        const hasDigit = /\d/.test(tok)
+        const hasUpper = /[A-Z]/.test(tok)
+        const hasLower = /[a-z]/.test(tok)
+        if (!hasDigit && !(hasUpper && hasLower)) return tok
+      }
+      changed = true
+      const omitted = Math.max(0, tok.length - tokenPreviewChars * 2)
+      omittedTotal += omitted
+      if (tokenPreviewChars <= 0) return `[omitted:${tok.length}c]`
+      return `${tok.slice(0, tokenPreviewChars)}...[omitted:${omitted}c]...${tok.slice(-tokenPreviewChars)}`
+    })
+    return { changed, compacted, omittedTotal }
+  }
+
   const shrinkValue = (
     val,
-    { maxVerbatimChars, previewChars, keyName = null, structuralOnly = false, compactReasons = false },
+    {
+      maxVerbatimChars,
+      previewChars,
+      keyName = null,
+      structuralOnly = false,
+      compactReasons = false,
+      compactOpaqueInNarrative = false,
+      includePunctuatedTokens = false,
+    },
   ) => {
     if (typeof val === 'string') {
       const isIdKey = keyName && ENOSPC_PRESERVED_ID_KEYS.has(keyName)
       const isNarrativeKey = keyName && ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(keyName)
       if (isIdKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (isNarrativeKey && compactOpaqueInNarrative) {
+        const res = compactOpaqueTokensInString(val, {
+          tokenPreviewChars: previewChars,
+          includePunctuated: includePunctuatedTokens,
+        })
+        if (res.changed) {
+          return {
+            truncated_due_to_enospc: true,
+            original_chars: val.length,
+            omitted_chars: res.omittedTotal,
+            text: res.compacted,
+          }
+        }
+        return val
+      }
       if (isNarrativeKey && !compactReasons && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       if (val.length <= maxVerbatimChars) return val
       return {
@@ -1213,7 +1264,16 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       }
     }
     if (Array.isArray(val)) {
-      return val.map((item) => shrinkValue(item, { maxVerbatimChars, previewChars, structuralOnly, compactReasons }))
+      return val.map((item) =>
+        shrinkValue(item, {
+          maxVerbatimChars,
+          previewChars,
+          structuralOnly,
+          compactReasons,
+          compactOpaqueInNarrative,
+          includePunctuatedTokens,
+        }),
+      )
     }
     if (val && typeof val === 'object') {
       const out = {}
@@ -1224,7 +1284,15 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           omittedFields.push(k)
           continue
         }
-        out[k] = shrinkValue(v, { maxVerbatimChars, previewChars, keyName: k, structuralOnly, compactReasons })
+        out[k] = shrinkValue(v, {
+          maxVerbatimChars,
+          previewChars,
+          keyName: k,
+          structuralOnly,
+          compactReasons,
+          compactOpaqueInNarrative,
+          includePunctuatedTokens,
+        })
       }
       if (omittedFields.length > 0) {
         out.enospc_omitted_blob_fields = omittedFields
@@ -1332,9 +1400,15 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       // while progressively shrinking non-structural opaque blobs.
       ...ENOSPC_COMPACT_STRING_TIERS.map((t) => ({ ...t, structuralOnly: false, compactReasons: false })),
       { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: false },
-      // Stage 2: ONLY if narrative fields (`reason`/`title`/`message`/`error`) themselves exceed
-      // every pre-allocated disk slot, summarize oversized narrative strings progressively while
-      // STILL preserving 100% of every blocking record, its ID, code, and reason head+tail previews.
+      // Stage 2A: when `reason`/`title`/`message`/`error` themselves overflow all pre-allocated slots,
+      // shrink ONLY high-entropy opaque tokens inside them first so 100% of human-readable words,
+      // approver names, and actionable instructions survive verbatim alongside every blocking record.
+      { maxVerbatimChars: 32, previewChars: 16, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: false },
+      { maxVerbatimChars: 32, previewChars: 8, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: false },
+      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: true },
+      // Stage 2B: ONLY if narrative fields STILL exceed every pre-allocated disk slot even without
+      // opaque tokens, summarize oversized narrative strings progressively while preserving 100% of
+      // every blocking record, its ID, code, and reason head+tail previews.
       ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true })),
     ]
     for (const tier of tiers) {

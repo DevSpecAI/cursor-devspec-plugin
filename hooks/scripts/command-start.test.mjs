@@ -7007,4 +7007,231 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.ok(nextRead.printed >= 1, 'next wake read MUST still surface unread note1')
     assert.ok(nextRead.text.includes(note1.id), 'next wake read MUST include note1 pointer')
   })
+
+  it('transient read error on wake-inline-hold.json fails closed so reading a later wake_in_note NEVER advances the wake cursor past an earlier unstarted inline command (3ea2b201)', async () => {
+    const { setWakeInlineHold } = await import('./step-delivery.mjs')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const posFile = path.join(dir, `${CONN}.wake-position`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+
+    const inlineBatch = ownerBatch('Earlier unstarted inline command', { messageId: '11111111-1111-4111-8111-1111111111b1', turnId: '22222222-2222-4222-8222-2222222222b1' })
+    const inlineText = wakeLines(buildOwnerMessageEvents(inlineBatch))
+    const msg2 = { message_id: '33333333-3333-4333-8333-3333333333b2', turn_id: '44444444-4444-4444-8444-4444444444b2', text: 'Later note command' }
+    const note2 = writeNote(wakeLines([{ type: 'owner_message', session_id: ROOM, message_id: msg2.message_id, turn_id: msg2.turn_id, message: msg2 }]), { home })
+    const wake2Text = wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note2.command, note: 'Read note 2' }])
+    const inlineEnd = Buffer.byteLength(inlineText, 'utf8')
+    const wake2End = inlineEnd + Buffer.byteLength(wake2Text, 'utf8')
+    fs.writeFileSync(wakeFile, `${inlineText}${wake2Text}`, { mode: 0o600 })
+
+    setWakeInlineHold(CONN, { wakePositionPath: posFile, holdOffset: 0 }, { dir })
+    registerPendingWakeNote(
+      CONN,
+      {
+        noteId: note2.id,
+        commands: [{ messageId: msg2.message_id, turnId: msg2.turn_id }],
+        messages: [msg2],
+        sessionId: ROOM,
+        wakeFile,
+        wakePositionPath: posFile,
+        wakePositionVersion: 1,
+        wakeStart: inlineEnd,
+        wakeThrough: wake2End,
+      },
+      { dir },
+    )
+
+    const note2Content = fs.readFileSync(note2.file, 'utf8')
+    const origReadFileSync = fs.readFileSync
+    let inlineHoldReadFailed = false
+    fs.readFileSync = (filePath, ...rest) => {
+      if (String(filePath).endsWith('wake-inline-hold.json')) {
+        inlineHoldReadFailed = true
+        throw Object.assign(new Error('transient EIO reading wake-inline-hold.json'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    try {
+      await stepDeliveryHook(
+        {
+          conversation_id: CONVERSATION,
+          tool_name: 'Shell',
+          tool_input: { command: note2.command },
+          tool_output: { exitCode: 0, output: note2Content },
+        },
+        {
+          home,
+          dir,
+          startCommands: async ({ commands }) => ({
+            ok: true,
+            outcome: 'started',
+            started: commands.map((c) => c.messageId),
+            refusals: [],
+          }),
+        },
+      )
+    } finally {
+      fs.readFileSync = origReadFileSync
+    }
+
+    assert.equal(inlineHoldReadFailed, true, 'transient read error on wake-inline-hold.json must have fired')
+    assert.equal(fs.existsSync(posFile), false, 'wake cursor MUST NOT advance past earlier unstarted inline command when wake-inline-hold.json is unreadable!')
+    const nextRead = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 0,
+      write: async () => {},
+      writeStderr: async () => {},
+    })
+    assert.ok(nextRead.printed >= 1, 'next wake read MUST still return the earlier unstarted inline command')
+    assert.match(nextRead.text, /Earlier unstarted inline command/)
+  })
+
+  it('tight-output fallback preserves enospc_incomplete and saved returned/total/omitted record counts even within 330 characters (3c5147a7 / 91d7b47c)', () => {
+    const out = formatStructuredRefusalsFallback(
+      [
+        {
+          command_message_id: 'msg-tight-partial-1',
+          refusal: {
+            code: 'blocked_by_items',
+            blocking_items: Array.from({ length: 1400 }, (_, i) => ({ id: `blk-${i}`, reason: `reason-${i}` })),
+          },
+        },
+      ],
+      {
+        maxChars: 330,
+        savedNote: {
+          command: "gzip -dc '/tmp/n/a.md' | head -c 18000",
+          parts: 4,
+          enospcCompacted: true,
+          enospcIncomplete: true,
+          totalRecords: 1400,
+          returnedRecords: 700,
+          omittedRecords: 700,
+        },
+      },
+    )
+    assert.ok(out, 'tight-output fallback must produce a bounded JSON envelope within 330 chars')
+    assert.ok(out.length <= 330, `must fit within 330 chars (got ${out.length})`)
+    const parsed = JSON.parse(out)
+    assert.equal(parsed.enospc_incomplete, true, 'tight-output fallback MUST preserve enospc_incomplete: true')
+    assert.equal(parsed.saved_total_records, 1400)
+    assert.equal(parsed.saved_returned_records, 700)
+    assert.equal(parsed.saved_omitted_records, 700)
+    assert.equal(parsed.read, "gzip -dc '/tmp/n/a.md' | head -c 18000")
+    assert.match(parsed.recovery, /Partial ENOSPC/i)
+  })
+
+  it('Stage-2A ENOSPC compaction shrinks ONLY opaque high-entropy tokens inside blocking reasons so actionable approval instructions survive verbatim across a fresh process (4e32d1a5)', async () => {
+    const { randomBytes } = await import('node:crypto')
+    const { spawnSync } = await import('node:child_process')
+    const { RESERVED_DIAGNOSTIC_SLOT_BYTES, clearPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('approval-instruction ENOSPC check'))), { mode: 0o600 })
+
+    // Embed an actionable approval instruction right in the MIDDLE of 600-char random blobs inside `reason`!
+    const records1400 = Array.from({ length: 1400 }, (_, idx) => ({
+      id: `blk-appr-${String(idx).padStart(4, '0')}`,
+      reason:
+        idx === 700
+          ? `${randomBytes(220).toString('base64')} Waiting for Ali Price approval on protected decision #700 before proceeding ${randomBytes(220).toString('base64')}`
+          : `${randomBytes(220).toString('base64')} Blocked by policy item ${idx} ${randomBytes(220).toString('base64')}`,
+    }))
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    const origWriteSync = fs.writeSync
+    let faultActive = false
+    try {
+      fs.openSync = (p, flags, ...rest) => {
+        if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origOpenSync(p, flags, ...rest)
+      }
+      fs.writeFileSync = (p, d, o) => {
+        if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origWriteFileSync(p, d, o)
+      }
+      fs.writeSync = (fd, buf, offset, length, position) => {
+        if (faultActive) {
+          const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+          if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        }
+        return origWriteSync(fd, buf, offset, length, position)
+      }
+      const pass1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async () => {},
+        startCommands: async () => {
+          faultActive = true
+          return {
+            ok: false,
+            outcome: 'refused',
+            refusals: [
+              {
+                command_message_id: 'msg-approval-enospc-1',
+                refusal: {
+                  code: 'waiting_for_ok',
+                  blocking_items: records1400,
+                },
+              },
+            ],
+          }
+        },
+      })
+      assert.equal(pass1.marked, false)
+      assert.equal(pass1.pickup_diagnostic_note?.enospcCompacted, true)
+      assert.notEqual(pass1.pickup_diagnostic_note?.enospcIncomplete, true)
+    } finally {
+      faultActive = false
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      fs.writeSync = origWriteSync
+    }
+
+    // Fresh OS process recovers the retry note after disk space returns — MUST contain BOTH
+    // blocker ID #700 AND the full approval instruction naming Ali Price!
+    const scriptUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+    const child = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+        import { readWakes } from ${JSON.stringify(scriptUrl)};
+        let stderr = '';
+        const res = await readWakes({
+          file: ${JSON.stringify(wakeFile)},
+          connectionId: ${JSON.stringify(CONN)},
+          home: ${JSON.stringify(home)},
+          dir: ${JSON.stringify(dir)},
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (c) => { stderr += String(c); },
+          startCommands: async ({ commands }) => ({ ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }),
+        });
+        process.stdout.write(JSON.stringify({ marked: res.marked, note: res.pickup_diagnostic_note ?? null, stderr }));
+        `,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(child.status, 0, child.stderr)
+    const out = JSON.parse(child.stdout)
+    assert.equal(out.marked, true)
+    const surfaced = out.note?.id ? readNoteText(out.note.id, { home }) : out.stderr
+    assert.match(surfaced, /blk-appr-0700/)
+    assert.match(surfaced, /Waiting for Ali Price approval on protected decision #700 before proceeding/, 'fresh process MUST recover the full approval instruction inside reason!')
+    clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+  })
 })

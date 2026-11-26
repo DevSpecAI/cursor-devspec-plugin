@@ -664,8 +664,14 @@ export function formatStructuredRefusalsFallback(
   ]
   const allCodes = list.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
   const needTopLevelCodes = Boolean(savedCmd) || list.length > 1 || !('code' in primaryInner)
-  const tightRecovery = savedCmd ? 'Read `read`; fix ~/.devspec/notes.' : 'Fix ~/.devspec/notes & retry.'
-  const buildTight = (fieldsObj, omittedFieldsCount, codesSlice = []) =>
+  const tightRecovery = savedCmd
+    ? savedEnospcIncomplete
+      ? 'Partial ENOSPC note via `read`; free disk & retry for full refusal.'
+      : savedEnospcCompacted
+        ? 'Compacted ENOSPC note via `read`; free disk & retry for full blobs.'
+        : 'Read `read`; fix ~/.devspec/notes.'
+    : 'Fix ~/.devspec/notes & retry.'
+  const buildTight = (fieldsObj, omittedFieldsCount, codesSlice = [], { ultraShortRecovery = false } = {}) =>
     `${JSON.stringify({
       refused: 'report_pickup',
       ...(needTopLevelCodes && codesSlice.length > 0 ? { codes: codesSlice } : {}),
@@ -673,8 +679,14 @@ export function formatStructuredRefusalsFallback(
       ...(omittedFieldsCount > 0 ? { omitted_field_count: omittedFieldsCount } : {}),
       omitted_count: list.length,
       shell_limit_chars: limitChars,
-      ...(savedCmd ? { read: savedCmd } : {}),
-      recovery: tightRecovery,
+      ...savedMetaFields,
+      recovery: ultraShortRecovery
+        ? savedEnospcIncomplete
+          ? 'Partial ENOSPC; free disk & retry.'
+          : savedEnospcCompacted
+            ? 'Compacted ENOSPC; free disk & retry.'
+            : tightRecovery
+        : tightRecovery,
     })}\n`
 
   let fittedCodes = []
@@ -724,11 +736,36 @@ export function formatStructuredRefusalsFallback(
 
   const omittedFieldsCount = Math.max(0, orderedKeys.length - pickedCount)
   if (savedCmd) {
-    // When original was saved, ALWAYS preserve `read` (plus any structured fields that fit).
+    // When original was saved, ALWAYS preserve `read` AND any ENOSPC partial/compacted
+    // metadata + record counts (plus any structured fields that fit) so callers are NEVER
+    // handed a link to a partial note without knowing it is partial and how much was omitted
+    // (requirements 3c5147a7 / 91d7b47c).
     const withRead = buildTight(pickedFields, omittedFieldsCount, fittedCodes)
     if (fits(withRead)) return withRead
     const readOnly = buildTight({}, orderedKeys.length, [])
-    return fits(readOnly) ? readOnly : null
+    if (fits(readOnly)) return readOnly
+    const ultraReadOnly = buildTight({}, orderedKeys.length, [], { ultraShortRecovery: true })
+    if (fits(ultraReadOnly)) return ultraReadOnly
+    const minimalWithMeta = `${JSON.stringify({
+      refused: 'report_pickup',
+      ...(savedEnospcIncomplete
+        ? {
+            enospc_incomplete: true,
+            ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+            ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+            ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
+          }
+        : savedEnospcCompacted
+          ? { enospc_compacted: true }
+          : {}),
+      read: savedCmd,
+      recovery: savedEnospcIncomplete
+        ? 'Partial ENOSPC; free disk & retry.'
+        : savedEnospcCompacted
+          ? 'Compacted ENOSPC; free disk & retry.'
+          : 'Read `read`; fix ~/.devspec/notes.',
+    })}\n`
+    return fits(minimalWithMeta) ? minimalWithMeta : null
   }
   // When no fallback note could be saved AND the refusal carried blocking details, require
   // at least one non-empty blocking detail to survive rather than returning a code-only
