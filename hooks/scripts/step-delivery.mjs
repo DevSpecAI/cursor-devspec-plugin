@@ -941,7 +941,18 @@ export async function stepDeliveryHook(
         )
       }
       if (extracted.unreadableNotes.length > 0) {
-        unreadableItems.push(item)
+        const innerOnlyEvents = item.events.filter(
+          (event) =>
+            event?.type === 'wake_in_note' &&
+            Array.isArray(event.carries) &&
+            event.carries.includes('owner_message'),
+        )
+        unreadableItems.push({
+          ...item,
+          events: innerOnlyEvents,
+          commands: [],
+          messages: [],
+        })
         for (const unreadable of extracted.unreadableNotes) {
           unreadableRefusals.push({
             command_message_id: null,
@@ -968,30 +979,40 @@ export async function stepDeliveryHook(
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
-      if (kept.inner_note_pending === true) {
-        // A previous step read the outer note whole, but the inner `wake_in_note` was
-        // missing/unreadable. Re-check the inner note without calling startCommands:
-        // once readable, register it as a pending wake note awaiting full agent read (3ea2b201).
-        const { unreadableItems, unreadableRefusals } = partitionOwnerItems(kept.items)
-        unreadableInnerNoteRefusals = unreadableRefusals
-        unreadableInnerNoteItems = unreadableItems
-        if (unreadableItems.length > 0) {
+      if (kept.inner_note_pending === true || kept.pickup_pending === true) {
+        // A previous step read this note whole and retained unreadable inner
+        // `wake_in_note` item(s), refused/unstarted inline pickup item(s), or BOTH
+        // (requirements 3ea2b201 / 4e32d1a5). Retry each pending set independently
+        // without re-prompting the agent to re-read the outer note.
+        if (kept.inner_note_pending === true) {
+          const innerSource = Array.isArray(kept.inner_note_items) ? kept.inner_note_items : kept.items
+          const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerSource)
+          unreadableInnerNoteRefusals = unreadableRefusals
+          unreadableInnerNoteItems = unreadableItems
+          if (immediateOwnerItems.length > 0) {
+            completedOwnerItems.push(...immediateOwnerItems)
+          }
+        }
+        if (kept.pickup_pending === true) {
+          const pickupSource = Array.isArray(kept.pickup_items)
+            ? kept.pickup_items
+            : kept.items.filter((item) => item.kind === 'owner_messages')
+          completedOwnerItems.push(...pickupSource)
+        }
+        keptForPickupRetry = completedOwnerItems.length > 0 ? { ...kept, items: completedOwnerItems } : kept
+        if (unreadableInnerNoteItems.length > 0) {
           record = {
             ...kept,
-            items: unreadableItems,
+            items: unreadableInnerNoteItems,
             inner_note_pending: true,
+            inner_note_items: unreadableInnerNoteItems,
             pickup_pending: false,
-            pickup_refusals: unreadableRefusals,
+            pickup_items: [],
+            pickup_refusals: unreadableInnerNoteRefusals,
           }
         } else {
           record = null
         }
-        readChanged = true
-      } else if (kept.pickup_pending === true) {
-        // A previous step read this note whole, but report_pickup refused; retry pickup now
-        // without re-prompting the agent to re-read the note.
-        completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
-        keptForPickupRetry = kept
         readChanged = true
       } else {
         const { record: next, done } = readThrough(kept, input, { home })
@@ -1005,14 +1026,16 @@ export async function stepDeliveryHook(
           keptForPickupRetry =
             immediateOwnerItems.length > 0
               ? { ...kept, items: immediateOwnerItems, parts: next.parts }
-              : null
+              : { ...kept, parts: next.parts }
           if (unreadableItems.length > 0) {
             record = {
               ...kept,
               items: unreadableItems,
               parts: next.parts,
               inner_note_pending: true,
+              inner_note_items: unreadableItems,
               pickup_pending: false,
+              pickup_items: [],
               pickup_refusals: unreadableRefusals,
             }
           }
@@ -1124,15 +1147,18 @@ export async function stepDeliveryHook(
         }
       }
       if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
-        pickupRefusals = pickupResult.refusals
+        pickupRefusals = [...unreadableInnerNoteRefusals, ...pickupResult.refusals]
         process.stderr.write(
           `step-delivery: report_pickup refused for ${connectionId}; retaining pending pickup for retry: ${JSON.stringify(pickupRefusals)}\n`,
         )
-        if (!record && keptForPickupRetry) {
+        if (completedOwnerItems.length > 0 && keptForPickupRetry) {
           record = {
-            ...keptForPickupRetry,
-            items: completedOwnerItems,
+            ...(record ?? keptForPickupRetry),
+            items: [...unreadableInnerNoteItems, ...completedOwnerItems],
+            inner_note_pending: unreadableInnerNoteItems.length > 0,
+            inner_note_items: unreadableInnerNoteItems,
             pickup_pending: true,
+            pickup_items: completedOwnerItems,
             pickup_refusals: pickupRefusals,
           }
           readChanged = true
@@ -1160,7 +1186,7 @@ export async function stepDeliveryHook(
             .map((cmd) => cmd?.messageId)
             .filter(Boolean),
         )
-        if (unstartedIds.size > 0 && !record && keptForPickupRetry) {
+        if (unstartedIds.size > 0 && completedOwnerItems.length > 0 && keptForPickupRetry) {
           const remainingOwnerItems = completedOwnerItems.filter((item) => {
             const cmds =
               Array.isArray(item.commands) && item.commands.length > 0
@@ -1174,9 +1200,13 @@ export async function stepDeliveryHook(
           })
           if (remainingOwnerItems.length > 0) {
             record = {
-              ...keptForPickupRetry,
-              items: remainingOwnerItems,
+              ...(record ?? keptForPickupRetry),
+              items: [...unreadableInnerNoteItems, ...remainingOwnerItems],
+              inner_note_pending: unreadableInnerNoteItems.length > 0,
+              inner_note_items: unreadableInnerNoteItems,
               pickup_pending: true,
+              pickup_items: remainingOwnerItems,
+              ...(pickupRefusals ? { pickup_refusals: pickupRefusals } : {}),
             }
             readChanged = true
           }
@@ -1266,6 +1296,57 @@ export async function stepDeliveryHook(
         if (savedFallback) {
           const ptr = shellDiagnosticPointer('step-delivery', savedFallback.command).trimEnd()
           if (ptr.length <= budget) return ptr
+        }
+        // When ALL note stores rejected writes AND the refusal payload exceeds `budget`,
+        // NEVER drop the entire agent-facing diagnostic silently: emit an explicit,
+        // budget-fitted omission + recovery notice stating the limit, actual size,
+        // omitted count, and how to restore note writes (requirements 3c5147a7 / 91d7b47c).
+        const omittedKeys = [
+          ...new Set(
+            pickupRefusals.flatMap((entry) => {
+              const inner = entry?.refusal && typeof entry.refusal === 'object' ? entry.refusal : entry
+              return inner && typeof inner === 'object' ? Object.keys(inner) : []
+            }),
+          ),
+        ]
+        const codes = pickupRefusals
+          .map((entry) => entry?.refusal?.code ?? entry?.code ?? null)
+          .filter((code) => typeof code === 'string' && code)
+        const readRefs = pickupRefusals
+          .map((entry) => entry?.refusal?.read ?? entry?.read ?? null)
+          .filter((ref) => typeof ref === 'string' && ref)
+        const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'all diagnostic note stores unwritable')
+        const omissionCandidates = [
+          JSON.stringify({
+            refused: 'report_pickup',
+            note_write_failed: true,
+            note_write_error: why,
+            omitted_due_to_hook_limit: true,
+            total_count: pickupRefusals.length,
+            returned_count: 0,
+            omitted_count: pickupRefusals.length,
+            limit_chars: budget,
+            actual_chars: refusalNotice.length,
+            ...(codes.length > 0 ? { codes } : {}),
+            ...(readRefs.length > 0 ? { read_refs: readRefs } : {}),
+            ...(omittedKeys.length > 0 ? { omitted_keys: omittedKeys } : {}),
+            recovery:
+              'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections) were unwritable so oversized refusal details could not be saved; fix write permissions on ~/.devspec/notes (pickup retries next step) and check stderr.',
+          }),
+          JSON.stringify({
+            refused: 'report_pickup',
+            note_write_failed: true,
+            omitted_due_to_hook_limit: true,
+            omitted_count: pickupRefusals.length,
+            limit_chars: budget,
+            actual_chars: refusalNotice.length,
+            ...(codes.length > 0 ? { codes } : {}),
+            recovery: 'Fix ~/.devspec/notes or TMPDIR permissions so full refusal can be saved on next retry; see stderr.',
+          }),
+          `DevSpec report_pickup refused (${pickupRefusals.length} omitted: ${refusalNotice.length}>${budget} chars, note stores unwritable); fix ~/.devspec/notes permissions & retry.`,
+        ]
+        for (const candidate of omissionCandidates) {
+          if (candidate.length <= budget) return candidate
         }
         return null
       }
