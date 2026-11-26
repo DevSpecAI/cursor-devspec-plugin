@@ -5879,13 +5879,42 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     }
 
     assert.equal(fitted.note?.compressed, 'gzip', 'must fall back to in-place gzip inside pre-allocated 128 KiB slot')
-    assert.match(fitted.note.command, /^gzip -dc /)
+    assert.match(fitted.note.command, /^gzip -dc .* \| head -c \d+$/)
     assert.match(fitted.text, /gzip -dc /, 'stderr output MUST include working gzip read command')
-    const decompressed = zlib.gunzipSync(fs.readFileSync(fitted.note.file)).toString('utf8')
-    assert.equal(decompressed, hugeRefusal, 'gzipped slot MUST preserve entire 200 KiB refusal byte-for-byte')
     assert.equal(spoolRes.persistedOnDisk, true, '16 KiB spool slot MUST persist gzip note_ref under ENOSPC')
 
-    // Brand-new OS process MUST gunzip and recover the full 200 KiB refusal including blk-over-128k-final!
+    // Execute the advertised gzip read command AND follow EVERY continuation command in a real
+    // shell: every single page MUST stay within Cursor's 20,000-char / 40,000-byte Shell ceiling
+    // (`fitsShellOutput`) AND the chain MUST reach the final blocking record (`blk-over-128k-final`)!
+    const { fitsShellOutput, CURSOR_SHELL_OUTPUT_MAX_CHARS } = await import('./hook-context-budget.mjs')
+    let nextCmd = fitted.note.command
+    let pagesVisited = 0
+    let combinedFromShell = ''
+    while (nextCmd) {
+      pagesVisited += 1
+      assert.ok(pagesVisited <= fitted.note.parts + 2, `pagination loop exceeded expected parts (${fitted.note.parts})`)
+      const shRes = spawnSync('sh', ['-c', nextCmd], { encoding: 'utf8' })
+      assert.equal(shRes.status, 0, `gzip page ${pagesVisited} failed: ${shRes.stderr}`)
+      assert.ok(
+        shRes.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        `gzip page ${pagesVisited} exceeded Cursor 20,000-char Shell cap (${shRes.stdout.length} chars)`,
+      )
+      assert.equal(
+        fitsShellOutput(shRes.stdout),
+        true,
+        `gzip page ${pagesVisited} must satisfy fitsShellOutput (${shRes.stdout.length} chars, ${Buffer.byteLength(shRes.stdout)} bytes)`,
+      )
+      combinedFromShell += shRes.stdout
+      const cont = /next part \(\d+\/\d+\): (gzip -dc [^\n]+ \| tail -c \+\d+ \| head -c \d+) ---\n$/.exec(shRes.stdout)
+      nextCmd = cont ? cont[1] : null
+    }
+    assert.equal(pagesVisited, fitted.note.parts, 'following continuations MUST visit every advertised gzip part')
+    assert.ok(pagesVisited > 1, '200 KiB refusal must span multiple Shell-bounded gzip pages')
+    assert.match(combinedFromShell, /blk-over-128k-first/)
+    assert.match(combinedFromShell, /blk-over-128k-final/, 'following gzip continuations MUST reach final blocking record')
+    assert.match(combinedFromShell, new RegExp(`--- part ${fitted.note.parts}/${fitted.note.parts} \\(end of \\d+ chars\\) ---\\n$`))
+
+    // Brand-new OS process MUST gunzip and recover the full 200 KiB refusal byte-for-byte (with footers stripped)!
     const childPeek = spawnSync(
       process.execPath,
       [
@@ -5997,5 +6026,171 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     )
     clearPendingUnsavedRefusals(deepSpoolKey, deepRecovered, deepSpoolOpts)
     assert.deepEqual(peekPendingUnsavedRefusals(deepSpoolKey, deepSpoolOpts), [])
+  })
+
+  it('fresh process discovers and surfaces a Pass-2 open-fd gzipped refusal saved when BOTH ENOSPC and note-path chmod 0o000 struck mid-pickup (3ea2b201 / 4e32d1a5 / 3c5147a7 / 91d7b47c)', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const tmpNotesDir = path.join(os.tmpdir(), `devspec-notes-${typeof process.getuid === 'function' ? process.getuid() : 'u'}`)
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(tmpNotesDir, { recursive: true, mode: 0o700 })
+
+    const wakeLine = wakeLines(buildOwnerMessageEvents(ownerBatch('ENOSPC + permission-loss Pass-2 gzip recovery')))
+    fs.writeFileSync(wakeFile, wakeLine, { mode: 0o600 })
+
+    const { readWakes, readPositionPath } = await import('./devspec-wake-tail.mjs')
+    const { RESERVED_DIAGNOSTIC_SLOT_BYTES, peekPendingUnsavedRefusals, readNoteText } = await import(
+      './hook-context-budget.mjs'
+    )
+    const wakeTailUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    const origWriteSync = fs.writeSync
+    let faultActive = false
+    const lockedDirs = []
+    const lockedFiles = []
+
+    const lockDir = (d) => {
+      if (!fs.existsSync(d)) return
+      fs.chmodSync(d, 0o000)
+      lockedDirs.push(d)
+    }
+    const lockBackupSlots = (d) => {
+      if (!fs.existsSync(d)) return
+      for (const name of fs.readdirSync(d)) {
+        if (/^d-[0-9a-f]+\.md$/.test(name)) {
+          const p = path.join(d, name)
+          fs.chmodSync(p, 0o000)
+          lockedFiles.push(p)
+        }
+      }
+    }
+
+    let firstPass = null
+    let firstStderr = ''
+    try {
+      fs.openSync = (filePath, flags, ...rest) => {
+        if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origOpenSync(filePath, flags, ...rest)
+      }
+      fs.writeFileSync = (filePath, data, opts) => {
+        if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origWriteFileSync(filePath, data, opts)
+      }
+      fs.writeSync = (fd, buf, offset, length, position) => {
+        if (faultActive) {
+          const endPos =
+            (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+          if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) {
+            throw Object.assign(new Error('ENOSPC extending past pre-allocated slot'), { code: 'ENOSPC' })
+          }
+        }
+        return origWriteSync(fd, buf, offset, length, position)
+      }
+
+      firstPass = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async (text) => {
+          firstStderr += text
+        },
+        startCommands: async () => {
+          // After preflight reserved open fds, BOTH disk space fills (ENOSPC) AND all note
+          // paths lose read/search permissions (chmod 0o000) mid-pickup!
+          faultActive = true
+          lockDir(notesDir)
+          lockDir(diagDir)
+          lockDir(tmpNotesDir)
+          lockBackupSlots(dir)
+          return {
+            ok: false,
+            outcome: 'refused',
+            refusals: [
+              {
+                command_message_id: 'msg-enospc-perm-1',
+                refusal: {
+                  code: 'blocked_by_items',
+                  blocking_items: [
+                    { id: 'blk-enospc-perm-first', detail: 'Z'.repeat(160_000) },
+                    { id: 'blk-enospc-perm-final', reason: 'must_be_recovered_by_fresh_process' },
+                  ],
+                },
+              },
+            ],
+          }
+        },
+      })
+    } finally {
+      faultActive = false
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      fs.writeSync = origWriteSync
+      for (const d of [...lockedDirs].reverse()) {
+        try { fs.chmodSync(d, 0o700) } catch { /* ignore */ }
+      }
+      for (const p of lockedFiles) {
+        try { fs.chmodSync(p, 0o600) } catch { /* ignore */ }
+      }
+    }
+
+    assert.equal(firstPass.marked, false, 'first pass MUST NOT advance wake position on pickup refusal')
+    assert.equal(firstPass.pickup_diagnostic_note?.compressed, 'gzip', 'Pass 2 MUST gzip >128 KiB refusal in place under ENOSPC')
+    assert.equal(firstPass.pickup_diagnostic_note?.pendingPermissionRecovery, true)
+    assert.ok(firstStderr.includes('gzip -dc '), 'first pass stderr must advertise gzip read command')
+    assert.equal(fs.existsSync(readPositionPath(CONN, dir)), false, 'wake position must remain unadvanced')
+
+    // Now permissions and disk space have returned. Run a BRAND-NEW FRESH OS PROCESS where
+    // retry pickup SUCCEEDS: it MUST discover the Pass-2 gzipped `.md` file, surface the full
+    // structured refusal (including `blk-enospc-perm-final`), and clear the pending file!
+    const childRetry = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+          import { readWakes } from ${JSON.stringify(wakeTailUrl)};
+          let stderr = '';
+          const res = await readWakes({
+            file: ${JSON.stringify(wakeFile)},
+            connectionId: ${JSON.stringify(CONN)},
+            home: ${JSON.stringify(home)},
+            dir: ${JSON.stringify(dir)},
+            settleMs: 0,
+            write: async () => {},
+            writeStderr: async (t) => { stderr += t; },
+            startCommands: async () => ({ ok: true, outcome: 'started', started: ['msg-enospc-perm-1'], refusals: [] }),
+          });
+          console.log(JSON.stringify({ marked: res.marked, stderr, note: res.pickup_diagnostic_note ?? null }));
+        `,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(childRetry.status, 0, childRetry.stderr)
+    const retryOut = JSON.parse(childRetry.stdout)
+    assert.equal(retryOut.marked, true, 'fresh successful retry advances wake position only after surfacing recovered refusal')
+    assert.ok(retryOut.stderr.length > 0, 'fresh successful retry MUST surface the recovered refusal on stderr')
+    assert.ok(retryOut.note?.id, 'oversized recovered refusal must be saved whole as a readable multi-part note')
+    const recoveredNoteText = readNoteText(retryOut.note.id, { home })
+    assert.ok(recoveredNoteText, 'recovered note must be readable whole')
+    assert.match(recoveredNoteText, /recovered previously unsaved pickup refusal/)
+    assert.match(recoveredNoteText, /blk-enospc-perm-first/)
+    assert.match(recoveredNoteText, /blk-enospc-perm-final/, 'final structured blocking record MUST survive ENOSPC + chmod 0o000 across fresh process')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    assert.deepEqual(
+      peekPendingUnsavedRefusals(spoolKey, spoolOpts),
+      [],
+      'Pass-2 gzipped .md file MUST be cleaned up once surfaced cleanly by the fresh process',
+    )
   })
 })

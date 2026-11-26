@@ -2095,6 +2095,8 @@ export async function runOneShotRoomCommandPickup({
       if (toClear.length > 0) {
         clearPendingUnsavedRefusals(spoolKey, toClear, spoolOpts)
       }
+    } else if (pendingSpoolEntries.length > 0 && !refusals) {
+      ok = false
     }
   }
   return {

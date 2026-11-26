@@ -940,17 +940,21 @@ export function shellDiagnosticReserve(label = 'devspec-wake-tail', { home = os.
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
   const fallbackHeadPtr = shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(fallbackSampleFile)}`)
+  const fallbackGzPtr = shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(fallbackSampleFile)} | head -c 40000`)
   const candidates = [
     notePtr,
     shellDiagnosticPointer(label, `cat ${shellQuotePath(homeSampleFile)}`),
     shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(homeSampleFile)}`),
+    shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(homeSampleFile)} | head -c 40000`),
     fallbackPtr,
     fallbackHeadPtr,
+    fallbackGzPtr,
   ]
   if (fallbackDir) {
     const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
     candidates.push(shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`))
     candidates.push(shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(dirSampleFile)}`))
+    candidates.push(shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(dirSampleFile)} | head -c 40000`))
   }
   return maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
 }
@@ -1080,7 +1084,7 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
   const expectedChars = Number(charsRaw)
   let body = content.slice(nl + 1)
   const footerRe = new RegExp(
-    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ [\\s\\S]*? \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
+    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): (?:gzip -dc [\\s\\S]*? \\| tail -c \\+\\d+|tail -c \\+\\d+ [\\s\\S]*?) \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
     'g',
   )
   body = body.replace(footerRe, '')
@@ -1297,49 +1301,60 @@ export function reserveDiagnosticNoteSlots({
     }
     const totalChars = payloadText.length
     const nonceSuffix = frameNonce ? ` [frame:${frameNonce}]` : ''
-    const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999${nonceSuffix} ---\n`
-    const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
-    const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
-    if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
-    const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
-    const totalParts = pieces.length
-    const nextLens = new Array(totalParts).fill(0)
-    const starts1 = new Array(totalParts).fill(1)
-    let pages = []
-    for (let pass = 0; pass < 4; pass += 1) {
-      const built = new Array(totalParts)
-      for (let i = totalParts - 1; i >= 0; i -= 1) {
-        const footer =
-          i + 1 < totalParts
-            ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]}${nonceSuffix} ---\n`
-            : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars)${nonceSuffix} ---\n`
-        built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
-        nextLens[i] = built[i].length
-      }
-      let offset = 1
-      let changed = false
-      for (let i = 0; i < totalParts; i += 1) {
-        if (starts1[i] !== offset) {
-          starts1[i] = offset
-          changed = true
+    const buildPaginatedPages = (compressed) => {
+      const nextCmdPrefix = (start1, len) =>
+        compressed ? `gzip -dc ${quoted} | tail -c +${start1} | head -c ${len}` : `tail -c +${start1} ${quoted} | head -c ${len}`
+      const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): ${nextCmdPrefix(999999999999, 999999)}${nonceSuffix} ---\n`
+      const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+      const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+      if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
+      const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
+      const totalParts = pieces.length
+      const nextLens = new Array(totalParts).fill(0)
+      const starts1 = new Array(totalParts).fill(1)
+      let builtPages = []
+      for (let pass = 0; pass < 4; pass += 1) {
+        const built = new Array(totalParts)
+        for (let i = totalParts - 1; i >= 0; i -= 1) {
+          const footer =
+            i + 1 < totalParts
+              ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): ${nextCmdPrefix(starts1[i + 1], nextLens[i + 1])}${nonceSuffix} ---\n`
+              : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars)${nonceSuffix} ---\n`
+          built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+          nextLens[i] = built[i].length
         }
-        offset += built[i].length
+        let offset = 1
+        let changed = false
+        for (let i = 0; i < totalParts; i += 1) {
+          if (starts1[i] !== offset) {
+            starts1[i] = offset
+            changed = true
+          }
+          offset += built[i].length
+        }
+        builtPages = built
+        if (!changed && pass > 0) break
       }
-      pages = built
-      if (!changed && pass > 0) break
+      if (!builtPages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+      return builtPages
     }
-    if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+    const pages = buildPaginatedPages(false)
+    if (!pages) return null
+    const totalParts = pages.length
     const contentBuf = Buffer.concat(pages)
     try {
       writeAllSync(activeSlot.fd, contentBuf)
     } catch (writeErr) {
       // If extending past the pre-allocated 128 KiB slot hits `ENOSPC` on a full
-      // filesystem, fall back to writing gzip-compressed `payloadText` IN PLACE into
-      // the pre-allocated slot (allocating ZERO new disk blocks) with a working
-      // `gzip -dc` read command AND lossless gunzip recovery on the next pass
-      // (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
-      const gzBuf = zlib.gzipSync(Buffer.from(payloadText, 'utf8'))
-      if (gzBuf.length <= (activeSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES)) {
+      // filesystem, fall back to writing gzip-compressed PAGINATED `gzPages` IN PLACE
+      // into the pre-allocated slot (allocating ZERO new disk blocks) so every single
+      // page fits Cursor's 20,000-char / 40,000-byte Shell ceiling AND carries an exact
+      // `gzip -dc <file> | tail -c +<start> | head -c <len>` continuation command all
+      // the way to the final record (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
+      const gzPages = buildPaginatedPages(true)
+      const gzContentBuf = gzPages ? Buffer.concat(gzPages) : null
+      const gzBuf = gzContentBuf ? zlib.gzipSync(gzContentBuf) : null
+      if (gzBuf && gzBuf.length <= (activeSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES)) {
         writeAllSync(activeSlot.fd, gzBuf)
         if (requireReadableByPath) {
           if (!verifySlotReadableByPath(activeSlot, gzBuf.length)) {
@@ -1352,12 +1367,11 @@ export function reserveDiagnosticNoteSlots({
           }
         }
         activeSlot.used = true
-        const rawBytes = Buffer.byteLength(payloadText, 'utf8')
-        const gzParts = Math.max(1, Math.ceil(rawBytes / NOTE_PART_BYTES))
+        const gzParts = gzPages.length
         const gzCommand =
           gzParts === 1
             ? `gzip -dc ${quoted}`
-            : `gzip -dc ${quoted} | head -c ${NOTE_PART_BYTES}`
+            : `gzip -dc ${quoted} | head -c ${gzPages[0].length}`
         return {
           id,
           file: activeSlot.filePath,
@@ -1366,7 +1380,8 @@ export function reserveDiagnosticNoteSlots({
           fallback: true,
           reserved: true,
           compressed: 'gzip',
-          rawBytes,
+          rawBytes: gzContentBuf.length,
+          ...(frameNonce ? { frameNonce } : {}),
           ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
         }
       }
@@ -1618,6 +1633,27 @@ export function formatDiagnosticStorePreflightError(label, errors = [], { priorT
  */
 const pendingUnsavedRefusals = new Map()
 
+function readPendingMdFile(fullPath) {
+  const rawBuf = fs.readFileSync(fullPath)
+  if (rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b) {
+    return zlib.gunzipSync(rawBuf).toString('utf8')
+  }
+  return rawBuf.toString('utf8')
+}
+
+function stripReservedFooters(content, quoted, frameNonce = null) {
+  const noncePat =
+    typeof frameNonce === 'string' && /^[0-9a-f]{16}$/.test(frameNonce)
+      ? ` \\[frame:${frameNonce}\\]`
+      : ''
+  const quotedPath = quoted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const footerRe = new RegExp(
+    `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): (?:gzip -dc ${quotedPath} \\| tail -c \\+\\d+|tail -c \\+\\d+ ${quotedPath}) \\| head -c \\d+)?${noncePat} ---\\n`,
+    'g',
+  )
+  return content.replace(footerRe, '')
+}
+
 function recoverNoteRefPayload(parsed) {
   if (!parsed || parsed.kind !== 'note_ref' || typeof parsed.file !== 'string' || !parsed.file) return null
   const partsCount = Number.isInteger(parsed.parts) && parsed.parts > 0 ? parsed.parts : 1
@@ -1627,25 +1663,25 @@ function recoverNoteRefPayload(parsed) {
       ? parsed.command
       : parsed.compressed === 'gzip'
         ? partsCount > 1
-          ? `gzip -dc ${quoted} | head -c ${NOTE_PART_BYTES}`
+          ? `gzip -dc ${quoted} | head -c ${NOTE_PART_CHARS}`
           : `gzip -dc ${quoted}`
         : `cat ${quoted}`
   try {
     if (parsed.compressed === 'gzip') {
-      const gunzipped = zlib.gunzipSync(fs.readFileSync(parsed.file)).toString('utf8')
+      let gunzipped = zlib.gunzipSync(fs.readFileSync(parsed.file)).toString('utf8')
+      if (gunzipped.startsWith(PENDING_DIAGNOSTIC_REFUSAL_PREFIX) && typeof parsed.scope === 'string') {
+        const rec = parsePendingDiagnosticRefusalFile(gunzipped, parsed.scope)
+        if (rec?.body) return { ok: rec.ok, text: rec.body }
+      }
+      gunzipped = stripReservedFooters(gunzipped, quoted, parsed.frame_nonce)
       if (gunzipped) return { ok: true, text: gunzipped }
     } else if (parsed.reserved) {
       let content = fs.readFileSync(parsed.file, 'utf8')
-      const noncePat =
-        typeof parsed.frame_nonce === 'string' && /^[0-9a-f]{16}$/.test(parsed.frame_nonce)
-          ? ` \\[frame:${parsed.frame_nonce}\\]`
-          : ''
-      const quotedPath = quoted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const footerRe = new RegExp(
-        `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ ${quotedPath} \\| head -c \\d+)?${noncePat} ---\\n`,
-        'g',
-      )
-      content = content.replace(footerRe, '')
+      if (content.startsWith(PENDING_DIAGNOSTIC_REFUSAL_PREFIX) && typeof parsed.scope === 'string') {
+        const rec = parsePendingDiagnosticRefusalFile(content, parsed.scope)
+        if (rec?.body) return { ok: rec.ok, text: rec.body }
+      }
+      content = stripReservedFooters(content, quoted, parsed.frame_nonce)
       if (content) return { ok: true, text: content }
     } else if (parsed.fallback) {
       const chunks = []
@@ -1852,7 +1888,7 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
       try {
-        const content = fs.readFileSync(fullPath, 'utf8')
+        const content = readPendingMdFile(fullPath)
         if (!content.startsWith(scopePrefix)) continue
         const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
         if (recovered?.body) pushUnique(recovered.body)
@@ -2000,7 +2036,7 @@ export function clearPendingUnsavedRefusals(
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
       try {
-        const content = fs.readFileSync(fullPath, 'utf8')
+        const content = readPendingMdFile(fullPath)
         if (!content.startsWith(scopePrefix)) continue
         const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
         // NEVER delete an original Pass-2 note whose integrity check failed; keep it on

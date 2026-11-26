@@ -1001,6 +1001,7 @@ export async function readWakes({
         : ''
     const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
 
+    let unsurfacedSpoolRemaining = false
     if (pickupRefusals && effectiveRawDiag) {
       const fittedWithStdout = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
         home,
@@ -1062,15 +1063,18 @@ export async function readWakes({
         spoolKey,
       })
       pickupDiagnosticNote = fitted.note
+      const savedReadableNow =
+        (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery && !fitted.note.compressed) ||
+        fitsShellOutput(printedStdout + effectiveRawDiag)
       if (fitted.text) {
         await writeStderr(fitted.text)
         pickupDiagnosticWritten = true
-        const savedReadableNow =
-          (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery && !fitted.note.compressed) ||
-          fitsShellOutput(printedStdout + effectiveRawDiag)
         if (pendingSpoolEntries.length > 0 && savedReadableNow) {
           clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
         }
+      }
+      if (pendingSpoolEntries.length > 0 && (!pickupDiagnosticWritten || !savedReadableNow)) {
+        unsurfacedSpoolRemaining = true
       }
     }
 
@@ -1097,17 +1101,21 @@ export async function readWakes({
 
     // Do not advance read position when report_pickup failed/refused: keep the wake queued
     // so the next read retries pickup and surfaces the structured refusal (req 3ea2b201 / 4e32d1a5).
-    if (pickupRefusals) {
+    if (pickupRefusals || unsurfacedSpoolRemaining) {
       return {
         ...page,
         text: pageText,
         remaining: effectiveRemaining,
         marked: false,
-        pickup_refusals: pickupRefusals,
+        ...(pickupRefusals ? { pickup_refusals: pickupRefusals } : {}),
         ...(pendingNoteReads.length > 0 ? { pending_note_reads: pendingNoteReads } : {}),
         ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
         pickup_diagnostic_written: pickupDiagnosticWritten,
-        error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
+        error: new Error(
+          pickupRefusals
+            ? `report_pickup refused: ${JSON.stringify(pickupRefusals)}`
+            : 'pending unsaved pickup refusal could not be surfaced cleanly yet',
+        ),
       }
     }
     // Never advance past either an unread deferred `wake_in_note` command OR an older
