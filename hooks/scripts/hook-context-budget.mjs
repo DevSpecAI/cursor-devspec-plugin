@@ -255,6 +255,39 @@ export const RESERVED_SPOOL_POINTER_BYTES = 16 * 1024
  */
 export const ENOSPC_COMPACT_BLOB_PREVIEW_CHARS = 512
 
+/**
+ * Progressive `(maxVerbatimChars, previewChars)` string-blob compaction tiers tried by
+ * `compactDiagnosticForSlotBudget` under `ENOSPC` when hundreds or thousands of blocking
+ * records each carry medium-sized incompressible blobs (e.g. 400–900 random chars). Each
+ * tier shrinks ONLY opaque long strings while keeping structured identifier/reason fields
+ * (`id`, `code`, `reason`, `status`, etc.) and 100% of every blocking record in arrays so
+ * thousands of distinct blocking items still compress inside pre-allocated slots.
+ */
+const ENOSPC_COMPACT_STRING_TIERS = [
+  { maxVerbatimChars: ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2, previewChars: ENOSPC_COMPACT_BLOB_PREVIEW_CHARS },
+  { maxVerbatimChars: 256, previewChars: 64 },
+  { maxVerbatimChars: 128, previewChars: 32 },
+  { maxVerbatimChars: 64, previewChars: 0 },
+]
+
+/** Structured refusal/blocker keys kept verbatim during emergency ENOSPC string compaction. */
+const ENOSPC_PRESERVED_STRUCTURAL_KEYS = new Set([
+  'id',
+  'code',
+  'reason',
+  'status',
+  'command_message_id',
+  'command_turn_id',
+  'blocking_turn_id',
+  'task_id',
+  'item_id',
+  'record_id',
+  'retryable',
+  'type',
+  'kind',
+  'title',
+])
+
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
 const NOTE_ID = /^[0-9a-f]{16}$/
@@ -1112,16 +1145,18 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
 /**
  * When a diagnostic refusal STILL exceeds all pre-allocated diagnostic slots even after
  * gzip compression under mid-pickup `ENOSPC`, shrink ONLY oversized opaque string blobs
- * inside embedded JSON structures while preserving 100% of every refusal code, metadata
- * field, and EVERY blocking record in arrays (never slicing arrays of blocking items!)
- * plus explicit omitted-byte counts so the refusal fits in pre-allocated slot capacity
- * (plain or gzipped) and survives durably across processes (reqs 3c5147a7 / 4e32d1a5 /
- * 91d7b47c / 3ea2b201).
+ * inside embedded JSON structures (parsing multi-line diagnostics line by line so an
+ * earlier log line's JSON never breaks parsing of the structured refusal line) while
+ * preserving 100% of every refusal code, structural field, and EVERY blocking record in
+ * arrays across progressive string-compaction tiers (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c /
+ * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
-  const shrinkValue = (val, previewChars) => {
+  const shrinkValue = (val, { maxVerbatimChars, previewChars, keyName = null, structuralOnly = false }) => {
     if (typeof val === 'string') {
-      if (val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      const keepKey = keyName && ENOSPC_PRESERVED_STRUCTURAL_KEYS.has(keyName)
+      if (keepKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (val.length <= maxVerbatimChars) return val
       return {
         truncated_due_to_enospc: true,
         original_chars: val.length,
@@ -1135,22 +1170,33 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       }
     }
     if (Array.isArray(val)) {
-      return val.map((item) => shrinkValue(item, previewChars))
+      return val.map((item) => shrinkValue(item, { maxVerbatimChars, previewChars, structuralOnly }))
     }
     if (val && typeof val === 'object') {
       const out = {}
+      const omittedFields = []
       for (const [k, v] of Object.entries(val)) {
-        out[k] = shrinkValue(v, previewChars)
+        if (
+          structuralOnly &&
+          !ENOSPC_PRESERVED_STRUCTURAL_KEYS.has(k) &&
+          typeof v === 'string' &&
+          v.length > maxVerbatimChars
+        ) {
+          omittedFields.push(k)
+          continue
+        }
+        out[k] = shrinkValue(v, { maxVerbatimChars, previewChars, keyName: k, structuralOnly })
+      }
+      if (omittedFields.length > 0) {
+        out.enospc_omitted_blob_fields = omittedFields
       }
       return out
     }
     return val
   }
 
-  const notice = {
+  const baseNotice = {
     enospc_compacted: true,
-    reason:
-      'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized opaque string blobs were summarized while preserving every structured refusal code and every blocking record.',
     original_bytes: originalBytes ?? Buffer.byteLength(rawText, 'utf8'),
     compressed_bytes: compressedBytes ?? null,
     reserved_slot_bytes: totalCapacityBytes,
@@ -1167,52 +1213,105 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     }
   }
 
-  const tryCompactJson = (str, previewChars) => {
+  // Extract structured JSON payload(s) cleanly whether `rawText` is raw JSON OR
+  // multi-line log output containing one or more prefixed JSON lines.
+  const extractJsonLines = (str) => {
     const trimmed = str.trim()
     if (!trimmed) return null
     try {
-      const parsed = JSON.parse(trimmed)
-      return JSON.stringify({ ...notice, preserved_refusal: shrinkValue(parsed, previewChars) })
+      return { kind: 'whole', parsed: JSON.parse(trimmed) }
     } catch {
-      /* try prefix + embedded JSON */
+      /* parse line-by-line below */
     }
-    const candidates = [str.indexOf('['), str.indexOf('{')].filter((i) => i >= 0)
-    if (candidates.length > 0) {
-      const firstBracket = Math.min(...candidates)
-      const prefix = str.slice(0, firstBracket).trim()
-      const rest = str.slice(firstBracket).trim()
-      const lastBracket = Math.max(rest.lastIndexOf(']'), rest.lastIndexOf('}'))
-      if (lastBracket > 0) {
-        const jsonPart = rest.slice(0, lastBracket + 1)
-        const suffix = rest.slice(lastBracket + 1).trim()
-        try {
-          const parsed = JSON.parse(jsonPart)
-          return `${prefix ? `${prefix}\n` : ''}${JSON.stringify({
-            ...notice,
-            preserved_refusal: shrinkValue(parsed, previewChars),
-            ...(suffix ? { trailing_text: shrinkValue(suffix, previewChars) } : {}),
-          })}\n`
-        } catch {
-          /* fall through */
+    const lines = str.split('\n').filter((line) => line.trim().length > 0)
+    const parsedLines = []
+    let foundAnyJson = false
+    for (const line of lines) {
+      let lineParsed = null
+      const trimmedLine = line.trim()
+      try {
+        lineParsed = { prefix: '', parsed: JSON.parse(trimmedLine), suffix: '' }
+      } catch {
+        const starts = [line.indexOf('['), line.indexOf('{')].filter((i) => i >= 0)
+        if (starts.length > 0) {
+          const first = Math.min(...starts)
+          const rest = line.slice(first)
+          const last = Math.max(rest.lastIndexOf(']'), rest.lastIndexOf('}'))
+          if (last > 0) {
+            try {
+              lineParsed = {
+                prefix: line.slice(0, first).trim(),
+                parsed: JSON.parse(rest.slice(0, last + 1)),
+                suffix: rest.slice(last + 1).trim(),
+              }
+            } catch {
+              lineParsed = null
+            }
+          }
         }
       }
+      if (lineParsed) {
+        foundAnyJson = true
+        parsedLines.push(lineParsed)
+      } else {
+        parsedLines.push({ plain: trimmedLine })
+      }
     }
-    return null
+    return foundAnyJson ? { kind: 'lines', entries: parsedLines } : null
   }
 
-  // Try full `ENOSPC_COMPACT_BLOB_PREVIEW_CHARS` first, stepping down ONLY oversized
-  // string-blob preview length (never dropping any structured blocking records!) if
-  // many multi-KB incompressible blobs still exceed compressed slot capacity.
-  for (const previewChars of [ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS / 8), 0]) {
-    const compactedJson = tryCompactJson(rawText, previewChars)
-    if (compactedJson && fitsCompressed(compactedJson)) {
-      return compactedJson
+  const extracted = extractJsonLines(rawText)
+  if (extracted) {
+    const noticeAllPreserved = {
+      ...baseNotice,
+      all_blocking_records_preserved: true,
+      reason:
+        'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized opaque string blobs were summarized while preserving every structured refusal code and every blocking record.',
+    }
+    const tiers = [
+      ...ENOSPC_COMPACT_STRING_TIERS.map((t) => ({ ...t, structuralOnly: false })),
+      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true },
+    ]
+    for (const tier of tiers) {
+      let candidate = null
+      if (extracted.kind === 'whole') {
+        candidate = JSON.stringify({
+          ...noticeAllPreserved,
+          preserved_refusal: shrinkValue(extracted.parsed, tier),
+        })
+      } else {
+        const rendered = extracted.entries.map((entry) => {
+          if (entry.plain) return entry.plain
+          const shrunk = shrinkValue(entry.parsed, tier)
+          const body = JSON.stringify({
+            ...noticeAllPreserved,
+            preserved_refusal: shrunk,
+            ...(entry.suffix ? { trailing_text: shrinkValue(entry.suffix, tier) } : {}),
+          })
+          return entry.prefix ? `${entry.prefix} ${body}` : body
+        })
+        candidate = `${rendered.join('\n')}\n`
+      }
+      if (fitsCompressed(candidate)) {
+        return candidate
+      }
     }
   }
+
+  // Last resort ONLY when even structural-only compaction of non-JSON or astronomically
+  // large output still exceeds every pre-allocated disk slot: NEVER claim all records were
+  // preserved — explicitly disclose omission and recovery instructions.
   const envelopeOverhead = ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2
   const halfBudget = Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor((totalCapacityBytes - envelopeOverhead) / 2))
   return `${JSON.stringify({
-    ...notice,
+    ...baseNotice,
+    enospc_incomplete: true,
+    all_blocking_records_preserved: false,
+    reason:
+      'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle bytes were omitted. Free disk space and re-run to retrieve the complete refusal.',
+    preserved_head_chars: Math.min(rawText.length, halfBudget),
+    preserved_tail_chars: Math.min(rawText.length, halfBudget),
+    omitted_chars: Math.max(0, rawText.length - halfBudget * 2),
     head_preview: rawText.slice(0, halfBudget),
     tail_preview: rawText.slice(-halfBudget),
   })}\n`

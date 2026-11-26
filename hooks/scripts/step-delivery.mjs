@@ -1187,7 +1187,13 @@ export async function stepDeliveryHook(
   for (const each of takenWakeNotes) {
     const entry = readPrivateJson(each.file)
     if (!entry || typeof entry.note !== 'string' || !Array.isArray(entry.commands)) {
-      drop(each)
+      // NEVER delete a pending wake-note tracking record on a transient read error:
+      // give it back so `advanceCompletedWakeNotePositions` holds the wake cursor and
+      // the next hook call retries once disk reads recover (requirement 3ea2b201).
+      giveBack(each)
+      process.stderr.write(
+        `step-delivery: pending wake-note tracking record ${path.basename(each.original)} could not be read; retaining for retry\n`,
+      )
       continue
     }
     if (entry.completed === true) {
