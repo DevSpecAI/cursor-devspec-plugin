@@ -270,6 +270,26 @@ const ENOSPC_COMPACT_STRING_TIERS = [
   { maxVerbatimChars: 64, previewChars: 0 },
 ]
 
+/**
+ * Maximum UTF-16 length of a structured actionable URL (`url`, `approval_url`,
+ * `review_url`, `link`, `href`, any `*_url`/`*_link`/`*_href` key, or any standalone
+ * `http(s)://` or relative app-path URL value) kept 100% verbatim during emergency
+ * `ENOSPC` compaction. Matches the 8 KiB HTTP request-URI ceiling enforced by common
+ * reverse proxies and runtimes (RFC 9110 §4.1 / Nginx `large_client_header_buffers`
+ * 8 KiB) so long signed approval links survive intact while preventing an adversarial
+ * multi-megabyte string from overflowing a 128 KiB pre-allocated diagnostic slot.
+ */
+export const ENOSPC_ACTIONABLE_URL_MAX_CHARS = 8_192
+
+/** URL-bearing keys preserved verbatim up to `ENOSPC_ACTIONABLE_URL_MAX_CHARS` during ENOSPC compaction. */
+const ENOSPC_PRESERVED_URL_KEYS = new Set([
+  'url',
+  'approval_url',
+  'review_url',
+  'link',
+  'href',
+])
+
 /** Short machine-identifier/code keys kept verbatim during emergency ENOSPC string compaction. */
 const ENOSPC_PRESERVED_ID_KEYS = new Set([
   'id',
@@ -284,11 +304,7 @@ const ENOSPC_PRESERVED_ID_KEYS = new Set([
   'retryable',
   'type',
   'kind',
-  'url',
-  'approval_url',
-  'review_url',
-  'link',
-  'href',
+  ...ENOSPC_PRESERVED_URL_KEYS,
 ])
 
 /**
@@ -1015,31 +1031,51 @@ export function maxShellReserve(candidates, minChars = 0) {
 /**
  * Exact ceiling reservation for Shell post-stdout diagnostics, derived at one shared
  * boundary from the worst-case UTF-16 length and UTF-8 byte length across all note stores
- * (`~/.devspec/notes`, `os.tmpdir()`, and `fallbackDir`) and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`
+ * (`~/.devspec/notes`, `os.tmpdir()`, `fallbackDir`, and `backupDir`) — including
+ * multi-slot sharded gzip recovery commands (`cat <slot1> <slot2> ... | gzip -dc | head -c 40000`)
+ * and ENOSPC partial/compacted pointer notices — plus `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`
  * so `stdout + stderr` always fits `fitsShellOutput` (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
  */
-export function shellDiagnosticReserve(label = 'devspec-wake-tail', { home = os.homedir(), fallbackDir = null } = {}) {
-  const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
-  const homeSampleFile = path.join(home, NOTES_DIR, `${'0'.repeat(16)}.md`)
+export function shellDiagnosticReserve(
+  label = 'devspec-wake-tail',
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
-  const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
-  const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
-  const fallbackHeadPtr = shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(fallbackSampleFile)}`)
-  const fallbackGzPtr = shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(fallbackSampleFile)} | head -c 40000`)
-  const candidates = [
-    notePtr,
-    shellDiagnosticPointer(label, `cat ${shellQuotePath(homeSampleFile)}`),
-    shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(homeSampleFile)}`),
-    shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(homeSampleFile)} | head -c 40000`),
-    fallbackPtr,
-    fallbackHeadPtr,
-    fallbackGzPtr,
+  const rawSampleFiles = [
+    path.join(home, NOTES_DIR, `${'0'.repeat(16)}.md`),
+    path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`),
+    ...(fallbackDir ? [path.join(fallbackDir, `${'0'.repeat(16)}.md`)] : []),
+    ...(backupDir ? [path.join(backupDir, `d-${'0'.repeat(14)}.md`)] : []),
   ]
-  if (fallbackDir) {
-    const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
-    candidates.push(shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`))
-    candidates.push(shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(dirSampleFile)}`))
-    candidates.push(shellDiagnosticPointer(label, `gzip -dc ${shellQuotePath(dirSampleFile)} | head -c 40000`))
+  const seenDirs = new Set()
+  const sampleFiles = []
+  for (const file of rawSampleFiles) {
+    const dirKey = path.resolve(path.dirname(file))
+    if (seenDirs.has(dirKey)) continue
+    seenDirs.add(dirKey)
+    sampleFiles.push(file)
+  }
+  const pointerVariants = [
+    null,
+    { enospcCompacted: true },
+    { enospcIncomplete: true, returnedRecords: 99999, totalRecords: 99999, omittedRecords: 99999 },
+  ]
+  const addCommandCandidates = (candidates, command) => {
+    for (const variant of pointerVariants) {
+      candidates.push(shellDiagnosticPointer(label, command, variant))
+    }
+  }
+  const candidates = []
+  addCommandCandidates(candidates, noteCommand('0'.repeat(16)))
+  for (const sampleFile of sampleFiles) {
+    const q = shellQuotePath(sampleFile)
+    addCommandCandidates(candidates, `cat ${q}`)
+    addCommandCandidates(candidates, `head -c 40000 ${q}`)
+    addCommandCandidates(candidates, `gzip -dc ${q} | head -c 40000`)
+  }
+  if (sampleFiles.length >= 2) {
+    const shardedQuotedList = sampleFiles.map(shellQuotePath).join(' ')
+    addCommandCandidates(candidates, `cat ${shardedQuotedList} | gzip -dc | head -c 40000`)
   }
   return maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
 }
@@ -1229,6 +1265,13 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     return { changed, compacted, omittedTotal }
   }
 
+  const isUrlKey = (k) =>
+    typeof k === 'string' && (ENOSPC_PRESERVED_URL_KEYS.has(k) || /(?:^|_)(?:url|href|link)$/i.test(k))
+  const isActionableUrlValue = (v) =>
+    typeof v === 'string' &&
+    v.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
+    (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
+
   const shrinkValue = (
     val,
     {
@@ -1239,9 +1282,15 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       compactReasons = false,
       compactOpaqueInNarrative = false,
       includePunctuatedTokens = false,
+      compactUrls = false,
     },
   ) => {
     if (typeof val === 'string') {
+      const isActionableUrl =
+        !compactUrls &&
+        val.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
+        (isUrlKey(keyName) || isActionableUrlValue(val))
+      if (isActionableUrl) return val
       const isIdKey = keyName && ENOSPC_PRESERVED_ID_KEYS.has(keyName)
       const isNarrativeKey = keyName && ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(keyName)
       if (isIdKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
@@ -1283,6 +1332,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactReasons,
           compactOpaqueInNarrative,
           includePunctuatedTokens,
+          compactUrls,
         }),
       )
     }
@@ -1290,7 +1340,10 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       const out = {}
       const omittedFields = []
       for (const [k, v] of Object.entries(val)) {
-        const isProtected = ENOSPC_PRESERVED_ID_KEYS.has(k) || ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k)
+        const isProtected =
+          ENOSPC_PRESERVED_ID_KEYS.has(k) ||
+          ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k) ||
+          (!compactUrls && (isUrlKey(k) || isActionableUrlValue(v)))
         if (structuralOnly && !isProtected && typeof v === 'string' && v.length > maxVerbatimChars) {
           omittedFields.push(k)
           continue
@@ -1303,6 +1356,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactReasons,
           compactOpaqueInNarrative,
           includePunctuatedTokens,
+          compactUrls,
         })
       }
       if (omittedFields.length > 0) {
@@ -1419,8 +1473,11 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: true },
       // Stage 2B: ONLY if narrative fields STILL exceed every pre-allocated disk slot even without
       // opaque tokens, summarize oversized narrative strings progressively while preserving 100% of
-      // every blocking record, its ID, code, and reason head+tail previews.
-      ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true })),
+      // every blocking record, its ID, code, actionable URLs (up to ENOSPC_ACTIONABLE_URL_MAX_CHARS),
+      // and reason head+tail previews.
+      ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true, compactUrls: false })),
+      // Stage 2C: Last all-records tier ONLY if thousands of long URLs themselves overflow every slot.
+      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: true },
     ]
     for (const tier of tiers) {
       const tierNotice = tier.compactReasons
@@ -2826,6 +2883,14 @@ export function fitShellDiagnostic(
     Number.isInteger(fallbackNote.totalRecords)
       ? `${fallbackNote.returnedRecords}/${fallbackNote.totalRecords} records, ${fallbackNote.omittedRecords ?? Math.max(0, fallbackNote.totalRecords - fallbackNote.returnedRecords)} omitted`
       : null
+  const shardCount = Array.isArray(fallbackNote?.files) && fallbackNote.files.length > 1 ? fallbackNote.files.length : 1
+  const statusTag = fallbackNote?.enospcIncomplete
+    ? `partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry)`
+    : fallbackNote?.enospcCompacted
+      ? 'compacted ENOSPC (all records; blobs shortened)'
+      : fallbackNote
+        ? `saved in ${shardCount} file(s)`
+        : 'note write failed'
   const readHint = fallbackNote
     ? fallbackNote.enospcIncomplete
       ? ` Partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`.`
@@ -2833,17 +2898,37 @@ export function fitShellDiagnostic(
         ? ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
         : ` Read original: \`${fallbackNote.command}\`.`
     : ''
-  const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).${readHint}\n`
-  if (fitsShellOutput(stdout + short)) {
-    return { text: short, note: fallbackNote, noteError }
-  }
-  const bare = `${label}: diagnostic omitted (note write failed).${readHint}\n`
-  if (fitsShellOutput(stdout + bare)) {
-    return { text: bare, note: fallbackNote, noteError }
-  }
+  const candidates = [
+    `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).${readHint}\n`,
+    `${label}: diagnostic omitted (note write failed).${readHint}\n`,
+  ]
   if (fallbackNote?.enospcIncomplete) {
-    const tinyPartial = `${label}: partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`\n`
-    return { text: fitsShellOutput(stdout + tinyPartial) ? tinyPartial : '', note: fallbackNote, noteError }
+    candidates.push(
+      `${label}: partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`\n`,
+    )
+  } else if (fallbackNote) {
+    candidates.push(`${label}: ${statusTag}: \`${fallbackNote.command}\`\n`)
+  }
+  // If the full recovery command itself exceeds remaining Shell headroom (e.g. a multi-file
+  // sharded note whose paths exceed the caller's reserve), NEVER return empty output:
+  // disclose the omission, the Shell limit, the shard count/location, and how to retrieve it
+  // (requirements 3c5147a7 / 91d7b47c).
+  if (fallbackNote) {
+    candidates.push(
+      `${label}: diagnostic omitted (${diag.length} chars; ${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, read cmd ${fallbackNote.command.length} chars; saved across ${shardCount} file(s) starting at ${fallbackNote.file} — inspect saved note or re-run wake read).\n`,
+      `${label}: diagnostic omitted (${diag.length} chars; ${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, read cmd ${fallbackNote.command.length} chars; saved in ${shardCount} file(s) under diagnostic note dirs — inspect saved note or re-run).\n`,
+      `${label}: diagnostic omitted (${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}; ${shardCount} file(s) saved; re-run).\n`,
+    )
+  } else {
+    candidates.push(
+      `${label}: diagnostic omitted (${diag.length} chars; note write failed; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}; fix permissions & re-run).\n`,
+      `${label}: diagnostic omitted (note write failed; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`,
+    )
+  }
+  for (const candidate of candidates) {
+    if (fitsShellOutput(stdout + candidate)) {
+      return { text: candidate, note: fallbackNote, noteError }
+    }
   }
   return { text: '', note: fallbackNote, noteError }
 }

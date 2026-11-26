@@ -2519,27 +2519,29 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const longDir = path.join(base, ...deepSegments)
     fs.mkdirSync(longDir, { recursive: true })
     const wakeFile = path.join(longDir, `${CONN}.wakes.jsonl`)
-    // Size the wake right at the maximum inline ceiling allowed beside the dynamic
-    // `longDir/diagnostic-notes` reserve so without accounting for `longDir`, the saved
-    // refusal's `cat` read command would overflow fitsShellOutput and vanish.
-    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
-      fallbackDir: path.join(longDir, 'diagnostic-notes'),
-    }).length
-    const targetWakeLen = CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - 250
-    let bodyLen = 8_000
-    for (let pass = 0; pass < 6; pass += 1) {
-      const measured = wakeLines(buildOwnerMessageEvents(ownerBatch('L'.repeat(bodyLen)))).length
-      bodyLen = Math.max(100, bodyLen + Math.floor((targetWakeLen - measured) / 2))
-    }
-    const batch = ownerBatch('L'.repeat(bodyLen))
-    const built = buildOwnerMessageEvents(batch)
-    appendWakeEvents(wakeFile, built)
-
     const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
     process.env.TMPDIR = blockedTmp
     process.env.TMP = blockedTmp
     process.env.TEMP = blockedTmp
     try {
+      // Size the wake right at the maximum inline ceiling allowed beside the dynamic
+      // `longDir/diagnostic-notes` reserve so without accounting for `longDir`, the saved
+      // refusal's `cat` read command would overflow fitsShellOutput and vanish.
+      const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
+        home: blockedHome,
+        fallbackDir: path.join(longDir, 'diagnostic-notes'),
+        backupDir: longDir,
+      }).length
+      const targetWakeLen = CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - 250
+      let bodyLen = 8_000
+      for (let pass = 0; pass < 6; pass += 1) {
+        const measured = wakeLines(buildOwnerMessageEvents(ownerBatch('L'.repeat(bodyLen)))).length
+        bodyLen = Math.max(100, bodyLen + Math.floor((targetWakeLen - measured) / 2))
+      }
+      const batch = ownerBatch('L'.repeat(bodyLen))
+      const built = buildOwnerMessageEvents(batch)
+      appendWakeEvents(wakeFile, built)
+
       let stdout = ''
       let stderr = ''
       const res = await readWakes({
@@ -2607,7 +2609,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     process.env.TEMP = blockedTmp
     try {
       const reserve = shellDiagnosticReserve('devspec-wake-tail', {
+        home: blockedHome,
         fallbackDir: path.join(utf8Dir, 'diagnostic-notes'),
+        backupDir: utf8Dir,
       })
       const reserveBytes = Buffer.byteLength(reserve, 'utf8')
       assert.ok(reserveBytes >= 800, `expected UTF-8 byte reserve >= 800, got ${reserveBytes}`)
@@ -3419,7 +3423,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const diagDir = path.join(dir, 'diagnostic-notes')
 
     // Build a near-ceiling wake that fits right beside readerHeader + pickupDiagnosticReserve.
-    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
+      home,
+      fallbackDir: diagDir,
+      backupDir: dir,
+    }).length
     const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
     const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
     const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
@@ -3576,7 +3584,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     fs.writeFileSync(blockedTmp, 'not-a-directory\n')
     const diagDir = path.join(dir, 'diagnostic-notes')
 
-    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
+      home,
+      fallbackDir: diagDir,
+      backupDir: dir,
+    }).length
     const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
     const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
     const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
@@ -3739,12 +3751,6 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     fs.writeFileSync(blockedTmp, 'not-a-directory\n')
     const diagDir = path.join(deepDir, 'diagnostic-notes')
 
-    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
-    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
-    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
-    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
-    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
-
     const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
     process.env.TMPDIR = blockedTmp
     process.env.TMP = blockedTmp
@@ -3752,6 +3758,16 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const stdoutChunks = []
     const stderrChunks = []
     try {
+      const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
+        home,
+        fallbackDir: diagDir,
+        backupDir: deepDir,
+      }).length
+      const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+      const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+      const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+      appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
       const page = await readWakes({
         file: wakeFile,
         connectionId: CONN,
@@ -7459,6 +7475,284 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       })
       assert.ok(read2.printed >= 1)
       assert.match(read2.text, /Unstarted inline before note/)
+    }
+  })
+
+  it('shellDiagnosticReserve budgets multi-slot sharded gzip commands, fitShellDiagnostic never returns empty on oversized sharded read commands, 1238-char approval_url survives ENOSPC compaction verbatim, and unsurfaced spooled refusal never lets a later note advance cursor past an unstarted inline command (3c5147a7 / 91d7b47c / 4e32d1a5 / 3ea2b201)', async () => {
+    const { randomBytes } = await import('node:crypto')
+    const { spawnSync } = await import('node:child_process')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      clearPendingUnsavedRefusals,
+      fitShellDiagnostic,
+      spoolUnsavedRefusal,
+    } = await import('./hook-context-budget.mjs')
+
+    // 1. Multi-slot sharded gzip command fits inside shellDiagnosticReserve, AND even an
+    //    over-budget tight stdout never gets silent empty output from fitShellDiagnostic!
+    {
+      const deepSeg = 'd'.repeat(180)
+      const deepHome = path.join('/tmp', deepSeg, deepSeg, deepSeg, 'home')
+      const deepFallback = path.join(deepHome, '.devspec', 'remote-control', 'connections', 'diagnostic-notes')
+      const deepBackup = path.join(deepHome, '.devspec', 'remote-control', 'connections')
+      const reserve = shellDiagnosticReserve('devspec-wake-tail', {
+        home: deepHome,
+        fallbackDir: deepFallback,
+        backupDir: deepBackup,
+      })
+      const shard1 = path.join(deepHome, '.devspec', 'notes', 'aaaaaaaaaaaaaaaa.md')
+      const shard2 = path.join(deepFallback, 'bbbbbbbbbbbbbbbb.md')
+      const shard3 = path.join(deepBackup, 'd-cccccccccccccc.md')
+      const shardedCmd = `cat '${shard1}' '${shard2}' '${shard3}' | gzip -dc | head -c 18000`
+      assert.ok(shardedCmd.length > 1_800, `expected long 3-file sharded command, got ${shardedCmd.length}`)
+      const stdoutAtReserve = 'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS - reserve.length)
+
+      const origWriteFileSync = fs.writeFileSync
+      let withReserve = null
+      let withTightStdout = null
+      try {
+        fs.writeFileSync = () => {
+          throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        }
+        const fakeShardedNote = {
+          id: 'abc1234567890def',
+          file: shard1,
+          files: [shard1, shard2, shard3],
+          command: shardedCmd,
+          parts: 4,
+          fallback: true,
+          reserved: true,
+          compressed: 'gzip',
+        }
+        withReserve = fitShellDiagnostic(stdoutAtReserve, 'z'.repeat(30_000), {
+          home: deepHome,
+          label: 'devspec-wake-tail',
+          reservedStore: { write: () => fakeShardedNote },
+        })
+        const tightStdout = 'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS - 600)
+        withTightStdout = fitShellDiagnostic(tightStdout, 'z'.repeat(30_000), {
+          home: deepHome,
+          label: 'devspec-wake-tail',
+          reservedStore: { write: () => fakeShardedNote },
+        })
+      } finally {
+        fs.writeFileSync = origWriteFileSync
+      }
+      assert.ok(withReserve.text.includes(shardedCmd), 'shared Shell reserve MUST fit the full 3-file sharded recovery command')
+      assert.equal(fitsShellOutput(stdoutAtReserve + withReserve.text), true)
+      assert.ok(withTightStdout.text.length > 0, 'tight fallback MUST NEVER return empty output when a sharded note was saved')
+      assert.match(withTightStdout.text, /diagnostic omitted/i)
+      assert.match(withTightStdout.text, /3 file\(s\)/)
+      assert.equal(fitsShellOutput('x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS - 600) + withTightStdout.text), true)
+    }
+
+    // 2. Long structured approval_url (1,238 chars > 1,024) survives ENOSPC compaction verbatim across fresh processes!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('long approval_url ENOSPC check'))), { mode: 0o600 })
+
+      const baseUrl = 'https://app.devspecstaging.com/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve?token='
+      const longApprovalUrl = `${baseUrl}${'A1b2C3d4E5f6'.repeat(95)}`.slice(0, 1238)
+      assert.equal(longApprovalUrl.length, 1238)
+      const records = Array.from({ length: 1200 }, (_, idx) => ({
+        id: `blk-longurl-${String(idx).padStart(4, '0')}`,
+        ...(idx === 600 ? { approval_url: longApprovalUrl } : {}),
+        opaque_blob: randomBytes(480).toString('base64'),
+      }))
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [{ command_message_id: 'msg-longurl-1', refusal: { code: 'waiting_for_ok', blocking_items: records } }],
+            }
+          },
+        })
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      const scriptUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+      const child = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
+          import { readWakes } from ${JSON.stringify(scriptUrl)};
+          let stderr = '';
+          const res = await readWakes({
+            file: ${JSON.stringify(wakeFile)},
+            connectionId: ${JSON.stringify(CONN)},
+            home: ${JSON.stringify(home)},
+            dir: ${JSON.stringify(dir)},
+            settleMs: 0,
+            write: async () => {},
+            writeStderr: async (c) => { stderr += String(c); },
+            startCommands: async ({ commands }) => ({ ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }),
+          });
+          process.stdout.write(JSON.stringify({ marked: res.marked, note: res.pickup_diagnostic_note ?? null, stderr }));
+          `,
+        ],
+        { encoding: 'utf8' },
+      )
+      assert.equal(child.status, 0, child.stderr)
+      const out = JSON.parse(child.stdout)
+      const surfaced = out.note?.id ? readNoteText(out.note.id, { home }) : out.stderr
+      assert.ok(surfaced.includes(longApprovalUrl), 'fresh process MUST recover the full 1,238-character approval_url verbatim!')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+
+    // 3. Unsurfaced spooled refusal skips saving wake-inline-hold: a later deferred note MUST NOT
+    //    receive cursor-advancement permission or move posFile past the earlier unstarted inline command!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const posFile = path.join(dir, `${CONN}.wake-position`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+
+      const inlineBatch = ownerBatch('Unstarted inline under unsurfaced spool', {
+        messageId: '11111111-1111-4111-8111-1111111111d1',
+        turnId: '22222222-2222-4222-8222-2222222222d1',
+      })
+      const inlineText = wakeLines(buildOwnerMessageEvents(inlineBatch))
+      const note2MsgId = '33333333-3333-4333-8333-3333333333d2'
+      const note2Batch = ownerBatch('Later note under unsurfaced spool', {
+        messageId: note2MsgId,
+        turnId: '44444444-4444-4444-8444-4444444444d2',
+      })
+      const note2 = writeNote(wakeLines(buildOwnerMessageEvents(note2Batch)), { home })
+      const wake2Text = wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note2.command, note: 'Read note 2' }])
+      fs.writeFileSync(wakeFile, `${inlineText}${wake2Text}`, { mode: 0o600 })
+
+      // Seed a huge previously unsaved refusal in the spool, then make saving notes during the
+      // read fail with ENOSPC so `unsurfacedSpoolRemaining === true`!
+      const hugeSpooled = `prior-refusal:${'P'.repeat(25_000)}`
+      spoolUnsavedRefusal(path.resolve(dir), hugeSpooled, { home, fallbackDir: diagDir, backupDir: dir })
+
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r' && !String(p).includes('wake-note-')) {
+            throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive && !String(p).includes('wake-note-')) {
+            throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        const read1 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async ({ commands }) => {
+            faultActive = true
+            return {
+              ok: true,
+              outcome: 'started',
+              started: [],
+              unstarted: commands,
+              refusals: [],
+            }
+          },
+        })
+        assert.equal(read1.marked, false)
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      // Now agent reads note2: note2 picks up, MUST NOT advance posFile past the earlier unstarted inline command!
+      const note2Content = fs.readFileSync(note2.file, 'utf8')
+      const pickedUp = []
+      await stepDeliveryHook(
+        {
+          conversation_id: CONVERSATION,
+          tool_name: 'Shell',
+          tool_input: { command: note2.command },
+          tool_output: { exitCode: 0, output: note2Content },
+        },
+        {
+          home,
+          dir,
+          startCommands: async ({ commands }) => {
+            for (const c of commands) pickedUp.push(c.messageId)
+            return { ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }
+          },
+        },
+      )
+      assert.deepEqual(pickedUp, [note2MsgId])
+      assert.equal(fs.existsSync(posFile), false, 'later note MUST NOT advance posFile when unsurfaced spooled refusal skipped inline hold!')
+      const read2 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async () => {},
+      })
+      assert.ok(read2.printed >= 1)
+      assert.match(read2.text, /Unstarted inline under unsurfaced spool/)
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
     }
   })
 })

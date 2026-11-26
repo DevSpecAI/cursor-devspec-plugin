@@ -2133,7 +2133,8 @@ export function createOneShotRetryStderrWriter({
   home = os.homedir(),
   tmpDir = null,
   fallbackDir = null,
-  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { fallbackDir }),
+  backupDir = null,
+  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { home, fallbackDir, backupDir }),
   headroom = null,
 } = {}) {
   const transitionLine =
@@ -2282,13 +2283,17 @@ async function main() {
   // stdout + stderr Shell ceiling across the entire process (reqs 3c5147a7 / 91d7b47c).
   let emittedStderr = ''
   const diagnosticFallbackDir = path.join(CONNECTIONS_DIR, 'diagnostic-notes')
-  const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { fallbackDir: diagnosticFallbackDir })
+  const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', {
+    fallbackDir: diagnosticFallbackDir,
+    backupDir: CONNECTIONS_DIR,
+  })
   const retryStderr = createOneShotRetryStderrWriter({
     follow: Boolean(args.follow),
     writeStderr: (chunk) => process.stderr.write(chunk),
     getEmittedStderr: () => emittedStderr,
     diagnosticReserve: oneShotDiagnosticReserve,
     fallbackDir: diagnosticFallbackDir,
+    backupDir: CONNECTIONS_DIR,
   })
   const writeRetryStderr = (line) => retryStderr.write(line)
   if (!args.follow) {
