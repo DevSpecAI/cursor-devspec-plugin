@@ -580,13 +580,12 @@ export function prepareAgentMirrorText(text) {
  * included — ensuring its eventual `turn_ended` still clears attribution before any
  * later unrelated wake (decision ce71a72b).
  */
-export function priorWakeSnapshotForTranscript(transcriptPath, { promptText = null } = {}) {
-  if (!transcriptPath) return null
+export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = null } = {}) {
+  if (!transcriptPath) return undefined
   const snapshot = activeTranscriptTurn(transcriptPath, { attempts: 1 })
-  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return null
+  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return undefined
   const trimmedPrompt = typeof promptText === 'string' ? promptText.trim() : ''
   const priorKeys = new Set()
-  const liveUnoutputKeys = new Set()
   for (const w of snapshot.endedNonTypedWakes) {
     if (typeof w?.key === 'string' && w.key) priorKeys.add(w.key)
   }
@@ -594,21 +593,10 @@ export function priorWakeSnapshotForTranscript(transcriptPath, { promptText = nu
     for (const w of snapshot.liveNonTypedWakes) {
       if (typeof w?.key !== 'string' || !w.key) continue
       if (trimmedPrompt && typeof w.rawText === 'string' && w.rawText.trim() === trimmedPrompt) continue
-      if (w.hasModelOutputAfter === true) {
-        priorKeys.add(w.key)
-      } else {
-        liveUnoutputKeys.add(w.key)
-      }
+      if (w.hasModelOutputAfter === true) priorKeys.add(w.key)
     }
   }
-  return {
-    priorEndedWakeKeys: [...priorKeys],
-    hookLiveUnoutputWakeKeys: [...liveUnoutputKeys],
-  }
-}
-
-export function priorEndedWakeKeysForTranscript(transcriptPath, opts = {}) {
-  return priorWakeSnapshotForTranscript(transcriptPath, opts)?.priorEndedWakeKeys
+  return [...priorKeys]
 }
 
 async function main() {
@@ -670,21 +658,16 @@ async function main() {
         !fromAPerson && origin && !midTurn
           ? hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId || conversationId)
           : null
-      const priorWakeSnap = hookTranscript
-        ? priorWakeSnapshotForTranscript(hookTranscript, { promptText: text })
-        : null
+      const priorEndedWakeKeys = hookTranscript
+        ? priorEndedWakeKeysForTranscript(hookTranscript, { promptText: text })
+        : undefined
       const arrival = promptArrival({
         fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
         origin,
         text,
         midTurn,
         state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
-        ...(priorWakeSnap
-          ? {
-              priorEndedWakeKeys: priorWakeSnap.priorEndedWakeKeys,
-              hookLiveUnoutputWakeKeys: priorWakeSnap.hookLiveUnoutputWakeKeys,
-            }
-          : {}),
+        ...(priorEndedWakeKeys !== undefined ? { priorEndedWakeKeys } : {}),
       })
       for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }
@@ -757,6 +740,7 @@ async function main() {
           patchOwnState(connectionId, {
             local_turn: admitted,
             local_turn_attachment_id: scope.expected_attachment_id,
+            local_turn_attached_at: scope.expected_attached_at,
             ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
           })
         }

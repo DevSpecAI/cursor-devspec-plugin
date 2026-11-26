@@ -6615,17 +6615,19 @@ describe('typed-turn-sync (item da03801e)', () => {
       })
     }
 
-    // Case 5: Earlier wake aborts BEFORE producing any model output, and its delayed
-    // `{"type":"turn_ended","status":"aborted"}` reaches the transcript AFTER `mirror-turn.mjs user_prompt`
-    // ran for Bob's scheduled wake -> sync MUST preserve Bob's requester!
+    // Case 5: If Cursor wrote the current scheduled wake's `<timestamp>` row before
+    // `mirror-turn.mjs user_prompt` ran and that scheduled wake ABORTS with ZERO model
+    // output (`{"type":"turn_ended","status":"aborted"}`), sync MUST fail closed and CLEAR
+    // Bob's requester before the next unrelated wake — NEVER stamp an unrelated wake with
+    // an aborted schedule's requester (decision ce71a72b).
     {
       const { home, dir, transcriptPath } = setupHookEnv()
-      const abortedEarlierRow = JSON.stringify({
+      const bobPrewrittenRow = JSON.stringify({
         role: 'user',
-        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
       })
       // No assistant output and no turn_ended yet when hook runs!
-      fs.writeFileSync(transcriptPath, `${abortedEarlierRow}\n`)
+      fs.writeFileSync(transcriptPath, `${bobPrewrittenRow}\n`)
 
       const hookRes = runPromptHook(home, {
         conversation_id: CONV,
@@ -6633,14 +6635,14 @@ describe('typed-turn-sync (item da03801e)', () => {
         prompt: 'bob scheduled check',
       })
       assert.equal(hookRes.status, 0, hookRes.stderr)
-      assert.equal(readRequestState(CONN, { dir }).currentWakeLiveUnoutputKeys.size, 1)
+      assert.equal(readRequestState(CONN, { dir }).currentWakePriorEndedKeys.size, 0)
 
-      // Delayed abort marker from earlier wake arrives, followed by Bob's wake row!
-      const bobWakeRow = JSON.stringify({
+      // Bob's scheduled wake aborts before producing model output, then an unrelated wake starts!
+      const unrelatedRow = JSON.stringify({
         role: 'user',
-        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:25 PM (UTC)</timestamp>' }] },
       })
-      fs.appendFileSync(transcriptPath, `${turnEndedRow('aborted')}\n${bobWakeRow}\n`)
+      fs.appendFileSync(transcriptPath, `${turnEndedRow('aborted')}\n${unrelatedRow}\n`)
 
       const syncAborted = await syncTypedTurnFromTranscript({
         connectionId: CONN,
@@ -6648,14 +6650,117 @@ describe('typed-turn-sync (item da03801e)', () => {
         connectionCapability: 'cap-secret',
         dir,
       })
-      assert.equal(syncAborted.action, 'preserved_wake_request', 'delayed abort marker of earlier zero-output wake MUST NOT clear Bob’s scheduled wake requester')
-      assert.equal(syncAborted.requestId, CMD_BOB)
       assert.equal(
-        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
-        CMD_BOB,
-        'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+        syncAborted.action,
+        'cleared_for_wake',
+        'zero-output abort of a pre-written scheduled wake MUST clear Bob’s requester so the next unrelated wake is never falsely attributed to Bob',
       )
+      assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+        args: { task_id: 'x' },
+      })
     }
+  })
+
+  it('if speech_attachment_id is temporarily cleared to null while callPickup is in flight, sync discards the old receipt and leaves the turn pending until the replacement attachment ID arrives (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const ATTACH_NEW = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8'
+    const REQ_TEMP_NULL = '88888888-8888-4888-8888-88888888888a'
+    appendRequestEvent(CONN, { op: 'open', id: REQ_TEMP_NULL, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_TEMP_NULL }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('In-flight null attachment test')}\n`)
+
+    const stateFile = path.join(dir, `${CONN}.json`)
+    const initialState = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    fs.writeFileSync(stateFile, JSON.stringify(initialState), { mode: 0o600 })
+
+    let patchCalls = 0
+    const memo = { stamp: null, synced: false }
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: initialState,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        // Simulate poller temporarily clearing speech_attachment_id & attached_at while reattaching!
+        fs.writeFileSync(
+          stateFile,
+          JSON.stringify({
+            connection_id: CONN,
+            session_id: ROOM,
+            speech_attachment_id: null,
+            attached_at: null,
+            local_turn: null,
+          }),
+          { mode: 0o600 },
+        )
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: () => {
+        patchCalls += 1
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(pass1.refusal?.code, 'room_attachment_changed_during_admission')
+    assert.equal(patchCalls, 0, 'MUST NOT persist old receipt when speech_attachment_id became null during pickup')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0, 'turn MUST remain pending, never marked synced')
+
+    // Once the replacement attachment ID arrives, a fresh sync MUST run pickup for ATTACH_NEW and complete!
+    const replacementState = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH_NEW,
+      attached_at: '2026-11-25T17:07:00.000Z',
+      local_turn: null,
+    }
+    fs.writeFileSync(stateFile, JSON.stringify(replacementState), { mode: 0o600 })
+    let newPickupCalls = 0
+    let savedPatch = null
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: replacementState,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        newPickupCalls += 1
+        assert.equal(args.expected_session_id, ROOM)
+        assert.equal(args.expected_attachment_id, ATTACH_NEW)
+        assert.equal(args.expected_attached_at, '2026-11-25T17:07:00.000Z')
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        savedPatch = patch
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(newPickupCalls, 1, 'fresh sync MUST run pickup with replacement attachment ID')
+    assert.equal(pass2.action, 'adopted_hook_request')
+    assert.equal(savedPatch?.local_turn_attachment_id, ATTACH_NEW)
+    assert.equal(savedPatch?.local_turn_attached_at, '2026-11-25T17:07:00.000Z')
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
 
   it('if the connection moves rooms while callPickup is in flight, sync discards the old room’s receipt and leaves the turn unsynced so a fresh sync admits in the new room (3ea2b201)', async () => {

@@ -3354,6 +3354,7 @@ async function main() {
         local_turn: null,
         local_turn_request_id: null,
         local_turn_attachment_id: null,
+        local_turn_attached_at: null,
       })
       continue
     }
