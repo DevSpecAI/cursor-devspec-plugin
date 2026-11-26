@@ -101,12 +101,17 @@ import {
   wakeLines,
 } from './devspec-wake-file.mjs'
 import {
+  clearPendingUnsavedRefusals,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
+  formatDiagnosticStorePreflightError,
+  hasPendingUnsavedRefusals,
   hasWritableDiagnosticNoteStore,
+  peekPendingUnsavedRefusals,
   reserveDiagnosticNoteSlots,
   shellDiagnosticReserve,
+  spoolUnsavedRefusal,
   wakeInNote,
   wakesForOneOutput,
 } from './hook-context-budget.mjs'
@@ -647,12 +652,15 @@ export async function readWakes({
         const ex = extractRoomCommandsFromWake(wake.text, { home })
         return ex.commands.length > 0 || ex.unreadableNotes.length > 0
       })
+    const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
+    const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey)
+    const hasSpool = pendingSpoolEntries.length > 0
     const page = readerPage(
       wakes.map((wake) => wake.text),
       {
         home,
         listener,
-        reserve: hasRoomCommands ? pickupDiagnosticReserve : '',
+        reserve: hasRoomCommands || hasSpool ? pickupDiagnosticReserve : '',
         skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '',
       },
     )
@@ -837,15 +845,8 @@ export async function readWakes({
         backupDir: dir,
       })
       if (!storeProbe.ok) {
-        const errPayload = {
-          error: 'no_writable_diagnostic_note_store',
-          stores_tried: storeProbe.errors,
-          recovery:
-            'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
-        }
-        writeStderr(
-          `devspec-wake-tail: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
-        )
+        const preflightErr = formatDiagnosticStorePreflightError('devspec-wake-tail', storeProbe.errors)
+        if (preflightErr) writeStderr(preflightErr)
         return {
           ...page,
           text: pageText,
@@ -931,8 +932,14 @@ export async function readWakes({
       }
     }
 
-    if (pickupRefusals && rawDiag) {
-      const fittedWithStdout = fitShellDiagnostic(printedStdout, rawDiag, {
+    const spooledPrefix =
+      pendingSpoolEntries.length > 0
+        ? `devspec-wake-tail: recovered previously unsaved pickup refusal(s):\n${pendingSpoolEntries.join('\n')}\n`
+        : ''
+    const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
+
+    if (pickupRefusals && effectiveRawDiag) {
+      const fittedWithStdout = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
         home,
         label: 'devspec-wake-tail',
         fallback: (noteError, savedNote) =>
@@ -944,32 +951,43 @@ export async function readWakes({
           }),
         requireStructuredFallback: true,
         fallbackDir: fallbackNoteDir,
+        backupDir: dir,
         reservedStore: reservedDiagnosticStore,
       })
       pickupDiagnosticNote = fittedWithStdout.note
+      const savedOrVerbatim = Boolean(fittedWithStdout.note) || fitsShellOutput(printedStdout + effectiveRawDiag)
+      if (!savedOrVerbatim) {
+        spoolUnsavedRefusal(spoolKey, rawDiag)
+      } else if (pendingSpoolEntries.length > 0 && fittedWithStdout.text) {
+        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+      }
       const diagText =
         fittedWithStdout.text ||
         formatShellRefusalOmissionNotice(pickupRefusals, {
           label: 'devspec-wake-tail',
           stdoutText: printedStdout,
-          actualChars: rawDiag.length,
+          actualChars: effectiveRawDiag.length,
           noteError: fittedWithStdout.noteError,
         })
       if (diagText) {
         writeStderr(diagText)
         pickupDiagnosticWritten = true
       }
-    } else if (rawDiag) {
-      const fitted = fitShellDiagnostic(printedStdout, rawDiag, {
+    } else if (effectiveRawDiag) {
+      const fitted = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
         home,
         label: 'devspec-wake-tail',
         fallbackDir: fallbackNoteDir,
+        backupDir: dir,
         reservedStore: reservedDiagnosticStore,
       })
       pickupDiagnosticNote = fitted.note
       if (fitted.text) {
         writeStderr(fitted.text)
         pickupDiagnosticWritten = true
+        if (pendingSpoolEntries.length > 0 && (Boolean(fitted.note) || fitsShellOutput(printedStdout + effectiveRawDiag))) {
+          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+        }
       }
     }
 

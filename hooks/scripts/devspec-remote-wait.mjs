@@ -85,14 +85,18 @@ import {
 } from './connect-phase-timing.mjs'
 import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
 import {
+  clearPendingUnsavedRefusals,
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
+  formatDiagnosticStorePreflightError,
   hasWritableDiagnosticNoteStore,
   maxShellReserve,
+  peekPendingUnsavedRefusals,
   reserveDiagnosticNoteSlots,
   shellDiagnosticPointer,
   shellDiagnosticReserve,
+  spoolUnsavedRefusal,
   wakeInNote,
   wakesForOneOutput,
   writeFallbackDiagnosticNote,
@@ -1970,7 +1974,14 @@ export async function runOneShotRoomCommandPickup({
   }
   let stderrText = ''
   let diagnosticNote = null
-  if (rawDiag) {
+  const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
+  const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey)
+  const spooledPrefix =
+    pendingSpoolEntries.length > 0
+      ? `devspec-remote-wait: recovered previously unsaved pickup refusal(s):\n${pendingSpoolEntries.join('\n')}\n`
+      : ''
+  const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
+  if (effectiveRawDiag) {
     const combinedPrior = `${priorStderr}${printedStdout}`
     const fallback = refusals
       ? (noteError, savedNote) =>
@@ -1981,22 +1992,29 @@ export async function runOneShotRoomCommandPickup({
             savedNote,
           })
       : null
-    const fitted = fitShellDiagnostic(combinedPrior, rawDiag, {
+    const fitted = fitShellDiagnostic(combinedPrior, effectiveRawDiag, {
       home,
       label: 'devspec-remote-wait',
       fallback,
       requireStructuredFallback: Boolean(refusals),
       fallbackDir: fallbackNoteDir,
+      backupDir: dir,
       reservedStore: reservedStore.ok ? reservedStore : null,
     })
     diagnosticNote = fitted.note
+    const savedOrVerbatim = Boolean(fitted.note) || fitsShellOutput(combinedPrior + effectiveRawDiag)
+    if (refusals && !savedOrVerbatim) {
+      spoolUnsavedRefusal(spoolKey, rawDiag)
+    } else if (pendingSpoolEntries.length > 0 && savedOrVerbatim && fitted.text) {
+      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+    }
     const diagText =
       fitted.text ||
       (refusals
         ? formatShellRefusalOmissionNotice(refusals, {
             label: 'devspec-remote-wait',
             stdoutText: combinedPrior,
-            actualChars: rawDiag.length,
+            actualChars: effectiveRawDiag.length,
             noteError: fitted.noteError,
           })
         : '')
@@ -2528,15 +2546,10 @@ async function main() {
             continue
           }
           if (frozenOut.noteStoreError) {
-            const errPayload = {
-              error: 'no_writable_diagnostic_note_store',
-              stores_tried: frozenOut.noteStoreError.errors,
-              recovery:
-                'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
-            }
-            process.stderr.write(
-              `devspec-remote-wait: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
-            )
+            const preflightErr = formatDiagnosticStorePreflightError('devspec-remote-wait', frozenOut.noteStoreError.errors, {
+              priorText: emittedStderr,
+            })
+            if (preflightErr) process.stderr.write(preflightErr)
             retryStderr.flush()
             process.exitCode = 1
             return
@@ -2680,15 +2693,10 @@ async function main() {
               backupDir: CONNECTIONS_DIR,
             })
             if (!storeProbe.ok) {
-              const errPayload = {
-                error: 'no_writable_diagnostic_note_store',
-                stores_tried: storeProbe.errors,
-                recovery:
-                  'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
-              }
-              process.stderr.write(
-                `devspec-remote-wait: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
-              )
+              const preflightErr = formatDiagnosticStorePreflightError('devspec-remote-wait', storeProbe.errors, {
+                priorText: emittedStderr,
+              })
+              if (preflightErr) process.stderr.write(preflightErr)
               retryStderr.flush()
               process.exitCode = 1
               return

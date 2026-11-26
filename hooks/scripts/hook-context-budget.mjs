@@ -1048,6 +1048,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       const slot = {
         store: candidate.store,
         dir: candidate.dir,
+        prefix: candidate.prefix || '',
         filePath,
         fd,
         ino: st.ino,
@@ -1100,20 +1101,32 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       const raw = String(text ?? '')
       const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
       for (const slot of slots) {
-        if (slot.fd === null || !verifySlotReadableByPath(slot)) continue
+        let activeSlot = slot
+        if (activeSlot.fd === null || !verifySlotReadableByPath(activeSlot)) {
+          // If the pre-opened file was unlinked while its parent directory is still
+          // writable, attempt to re-open a fresh slot in the same directory before
+          // falling through to the next reserved slot (reqs 3c5147a7 / 4e32d1a5).
+          try {
+            const reopened = openSlotIn({ store: slot.store, dir: slot.dir, prefix: slot.prefix })
+            slots.push(reopened)
+            activeSlot = reopened
+          } catch {
+            continue
+          }
+        }
         try {
-          const quoted = shellQuotePath(slot.filePath)
+          const quoted = shellQuotePath(activeSlot.filePath)
           const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
           if (fitsOneRead) {
             const rawBuf = Buffer.from(raw, 'utf8')
-            writeAllSync(slot.fd, rawBuf)
-            if (!verifySlotReadableByPath(slot, rawBuf.length)) {
-              throw new Error(`reserved diagnostic slot unreadable after write: ${slot.filePath}`)
+            writeAllSync(activeSlot.fd, rawBuf)
+            if (!verifySlotReadableByPath(activeSlot, rawBuf.length)) {
+              throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
             }
-            slot.used = true
+            activeSlot.used = true
             return {
               id,
-              file: slot.filePath,
+              file: activeSlot.filePath,
               command: `cat ${quoted}`,
               parts: 1,
               fallback: true,
@@ -1158,21 +1171,21 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
           }
           if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) continue
           const contentBuf = Buffer.concat(pages)
-          writeAllSync(slot.fd, contentBuf)
-          if (!verifySlotReadableByPath(slot, contentBuf.length)) {
-            throw new Error(`reserved diagnostic slot unreadable after write: ${slot.filePath}`)
+          writeAllSync(activeSlot.fd, contentBuf)
+          if (!verifySlotReadableByPath(activeSlot, contentBuf.length)) {
+            throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
           }
-          slot.used = true
+          activeSlot.used = true
           return {
             id,
-            file: slot.filePath,
+            file: activeSlot.filePath,
             command: `head -c ${pages[0].length} ${quoted}`,
             parts: totalParts,
             fallback: true,
             reserved: true,
           }
         } catch {
-          try { fs.ftruncateSync(slot.fd, 0) } catch { /* ignore */ }
+          try { fs.ftruncateSync(activeSlot.fd, 0) } catch { /* ignore */ }
           /* try next reserved slot */
         }
       }
@@ -1257,6 +1270,90 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
 }
 
 /**
+ * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`) at the shared boundary
+ * for diagnostic-store preflight failures so deep escaped paths NEVER exceed 20,000 UTF-16
+ * chars / 40,000 UTF-8 bytes or get silently cut by Cursor (reqs 3c5147a7 / 91d7b47c).
+ */
+export function formatDiagnosticStorePreflightError(label, errors = [], { priorText = '' } = {}) {
+  const prior = String(priorText ?? '')
+  const list = Array.isArray(errors) ? errors : []
+  const fullPayload = {
+    error: 'no_writable_diagnostic_note_store',
+    stores_tried: list,
+    recovery:
+      'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
+  }
+  const fullLine = `${label}: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(fullPayload)}\n`
+  if (fitsShellOutput(prior + fullLine)) return fullLine
+  const compactStores = list.map((entry) => ({
+    store: String(entry?.store ?? 'unknown'),
+    code: String(entry?.code ?? 'write_failed'),
+    error_chars: String(entry?.error ?? '').length,
+  }))
+  const compactPayload = {
+    error: 'no_writable_diagnostic_note_store',
+    omitted_due_to_shell_limit: true,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    actual_chars: fullLine.length,
+    total_stores_tried: list.length,
+    stores_tried: compactStores,
+    recovery:
+      'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections/diagnostic-notes) failed preflight and full error paths exceeded Cursor Shell limit. Fix write permissions on those directories and retry.',
+  }
+  const compactLine = `${label}: ${JSON.stringify(compactPayload)}\n`
+  if (fitsShellOutput(prior + compactLine)) return compactLine
+  const minimalLine = `${label}: ${JSON.stringify({
+    error: 'no_writable_diagnostic_note_store',
+    omitted_due_to_shell_limit: true,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    actual_chars: fullLine.length,
+    total_stores_tried: list.length,
+    recovery: 'Fix write permissions on ~/.devspec/notes, TMPDIR, or connections/diagnostic-notes & retry.',
+  })}\n`
+  return fitsShellOutput(prior + minimalLine) ? minimalLine : ''
+}
+
+/**
+ * In-memory spool for unabridged oversized refusals when EVERY disk diagnostic store and
+ * pre-opened slot vanished mid-pickup, so restoring a store and retrying recovers and
+ * emits a working read command for the original refusal even if the retry pickup succeeds
+ * (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ */
+const pendingUnsavedRefusals = new Map()
+
+export function spoolUnsavedRefusal(spoolKey, diagnosticText) {
+  const key = String(spoolKey ?? '')
+  const text = String(diagnosticText ?? '')
+  if (!key || !text) return
+  const existing = pendingUnsavedRefusals.get(key) ?? []
+  if (!existing.includes(text)) {
+    pendingUnsavedRefusals.set(key, [...existing, text])
+  }
+}
+
+export function hasPendingUnsavedRefusals(spoolKey) {
+  const list = pendingUnsavedRefusals.get(String(spoolKey ?? ''))
+  return Array.isArray(list) && list.length > 0
+}
+
+export function peekPendingUnsavedRefusals(spoolKey) {
+  const list = pendingUnsavedRefusals.get(String(spoolKey ?? ''))
+  return Array.isArray(list) ? [...list] : []
+}
+
+export function clearPendingUnsavedRefusals(spoolKey, count = null) {
+  const key = String(spoolKey ?? '')
+  if (count === null) {
+    pendingUnsavedRefusals.delete(key)
+    return
+  }
+  const existing = pendingUnsavedRefusals.get(key) ?? []
+  const rest = existing.slice(count)
+  if (rest.length === 0) pendingUnsavedRefusals.delete(key)
+  else pendingUnsavedRefusals.set(key, rest)
+}
+
+/**
  * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`, stdout + stderr)
  * at one shared boundary for stderr diagnostics (requirements 3c5147a7 / 91d7b47c).
  * Returns the diagnostic verbatim when `stdoutText + diagnosticText` fits; otherwise
@@ -1274,6 +1371,7 @@ export function fitShellDiagnostic(
     fallback = null,
     requireStructuredFallback = false,
     fallbackDir = null,
+    backupDir = null,
     reservedStore = null,
   } = {},
 ) {
@@ -1303,7 +1401,11 @@ export function fitShellDiagnostic(
     noteError = error
   }
   let fallbackNote = null
-  const fallbackBaseDirs = [null, ...(fallbackDir ? [fallbackDir] : [])]
+  const fallbackBaseDirs = [
+    null,
+    ...(fallbackDir ? [fallbackDir] : []),
+    ...(backupDir ? [backupDir] : []),
+  ]
   for (const baseDir of fallbackBaseDirs) {
     try {
       fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir })

@@ -4297,4 +4297,246 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.ok(sweep2Text.includes(MSG_NEW), 'newer command remains preserved too')
     assert.equal(fs.existsSync(path.join(stepsFolder, retryName)), false, 'retry file is deleted ONLY once actually read and delivered')
   })
+
+  it('readWakes preflight refusal enforces fitsShellOutput even with deep backslash paths (91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    // Construct deep directory paths with backslashes so raw JSON-escaped error messages exceed 20,000 chars.
+    const backslashSeg = `deep\\segment\\${'b'.repeat(80)}`
+    const deepBase = path.join(home, ...Array.from({ length: 18 }, (_, i) => `${i}-${backslashSeg}`))
+    fs.mkdirSync(deepBase, { recursive: true, mode: 0o700 })
+    const deepHome = path.join(deepBase, 'home')
+    const deepDir = path.join(deepBase, 'conn')
+    const blockedTmp = path.join(deepBase, 'tmp')
+    fs.mkdirSync(path.join(deepHome, '.devspec'), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(path.join(deepHome, '.devspec', 'notes'), 'blocked')
+    fs.mkdirSync(deepDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(path.join(deepDir, 'diagnostic-notes'), 'blocked')
+    fs.writeFileSync(blockedTmp, 'blocked')
+
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Preflight backslash overflow test')))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stderrChunks = []
+    try {
+      const page = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home: deepHome,
+        dir: deepDir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async () => {},
+        writeStderr: (text) => { stderrChunks.push(text) },
+      })
+      assert.equal(page.marked, false)
+      assert.equal(page.printed, 0)
+      const errOut = stderrChunks.join('')
+      assert.ok(errOut.length > 0, 'preflight refusal must emit a diagnostic')
+      assert.ok(
+        fitsShellOutput(errOut),
+        `preflight refusal (${errOut.length} chars) MUST stay inside fitsShellOutput (<= ${CURSOR_SHELL_OUTPUT_MAX_CHARS})`,
+      )
+      assert.match(errOut, /no_writable_diagnostic_note_store/)
+      assert.match(errOut, /recovery/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('readWakes recovers an unabridged oversized refusal once a diagnostic store is restored after all stores and pre-opened slots disappeared mid-pickup, even if the retry pickup succeeds (3c5147a7 / 4e32d1a5)', async () => {
+    const { execSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wakes`)
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(home, 'tmp-all-vanished')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { home, fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stderr1 = []
+    let dirChmod = false
+    try {
+      // Run 1: EVERY store + pre-opened backup slot vanishes during startCommands!
+      const page1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async () => {},
+        writeStderr: (text) => { stderr1.push(text) },
+        startCommands: async () => {
+          fs.rmSync(diagDir, { recursive: true, force: true })
+          fs.writeFileSync(diagDir, 'not-a-directory\n')
+          // Also delete the pre-opened backup slot in `dir` and make `dir` read-only!
+          for (const name of fs.readdirSync(dir)) {
+            if (name.startsWith('d-') && name.endsWith('.md')) fs.rmSync(path.join(dir, name), { force: true })
+          }
+          fs.chmodSync(dir, 0o500)
+          dirChmod = true
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_all_vanished',
+                  padding: 'v'.repeat(6_000),
+                  blocking_items: [{ id: 'blk-final-recovered-item', reason: 'must_survive_store_restore' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      assert.equal(page1.marked, false)
+      assert.equal(page1.pickup_diagnostic_note, null)
+      assert.ok(stderr1.join('').length > 0)
+
+      // Restore diagnostic store permissions and re-run readWakes where pickup now SUCCEEDS!
+      fs.chmodSync(dir, 0o700)
+      dirChmod = false
+      fs.rmSync(blockedNotes, { force: true })
+      fs.mkdirSync(blockedNotes, { recursive: true, mode: 0o700 })
+
+      const stdout2 = []
+      const stderr2 = []
+      const page2 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async (t) => { stdout2.push(t) },
+        writeStderr: (t) => { stderr2.push(t) },
+        startCommands: async ({ commands }) => ({
+          ok: true,
+          outcome: 'picked_up',
+          started: commands,
+          pickedUp: commands.length,
+          refusals: [],
+        }),
+      })
+      assert.equal(page2.marked, true)
+      const out2 = stdout2.join('')
+      const err2 = stderr2.join('')
+      assert.ok(fitsShellOutput(out2 + err2), 'recovered stderr pointer + stdout must fit fitsShellOutput')
+      assert.ok(page2.pickup_diagnostic_note?.command, 'retry MUST emit a saved diagnostic note pointer for the previously unsaved refusal')
+      assert.ok(err2.includes(page2.pickup_diagnostic_note.command))
+      const recovered = execSync(page2.pickup_diagnostic_note.command.replace('~', home), { encoding: 'utf8' })
+      assert.match(recovered, /turn_busy_all_vanished/)
+      assert.match(recovered, /blk-final-recovered-item/, 'restoring the store and retrying MUST recover the omitted blocking record')
+      assert.match(recovered, /must_survive_store_restore/)
+    } finally {
+      if (dirChmod) fs.chmodSync(dir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('releaseAtIdle fails closed without overwriting a concurrently written handed.json when reading it hits a transient error, then delivers both commands once readable (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_OLD = '33333333-3333-4333-8333-3333333333d9'
+    const TURN_OLD = '77777777-7777-4777-8777-7777777777d9'
+    const MSG_NEW = '33333333-3333-4333-8333-3333333333da'
+    const TURN_NEW = '77777777-7777-4777-8777-7777777777da'
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+    const handedPath = path.join(stepsFolder, 'handed.json')
+
+    // Step 1: hand over older command 1 into HANDED.
+    const batchOld = ownerBatch('Older unread command', { messageId: MSG_OLD, turnId: TURN_OLD })
+    holdForNextStep(CONN, batchOld, buildOwnerMessageEvents(batchOld), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+
+    // Step 2: while releaseAtIdle awaits isOpen, a concurrent hook writes newer command 2 into handed.json,
+    // and then reading handed.json inside withStepsLock hits a transient EIO!
+    let concurrentWritten = false
+    const origReadFileSync = fs.readFileSync
+    let failHandedRead = false
+    fs.readFileSync = (filePath, ...rest) => {
+      if (failHandedRead && String(filePath) === handedPath) {
+        throw Object.assign(new Error('transient EIO on concurrent handed.json'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    try {
+      await assert.rejects(
+        () =>
+          releaseAtIdle(CONN, {
+            dir,
+            state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+            wakeFile,
+            home,
+            turnState: 'between',
+            isOpen: async () => {
+              if (!concurrentWritten) {
+                concurrentWritten = true
+                const batchNew = ownerBatch('Newer concurrent unread command', { messageId: MSG_NEW, turnId: TURN_NEW })
+                holdForNextStep(CONN, batchNew, buildOwnerMessageEvents(batchNew), { dir })
+                await stepDeliveryHook(
+                  { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+                  { home, dir, listenerActive: () => true },
+                )
+                failHandedRead = true
+              }
+              return true
+            },
+          }),
+        /unreadable|refusing to overwrite/i,
+      )
+    } finally {
+      failHandedRead = false
+      fs.readFileSync = origReadFileSync
+    }
+
+    // Newer command MUST still be intact in handed.json, and older command preserved in retry-*.json!
+    const preservedHanded = JSON.parse(fs.readFileSync(handedPath, 'utf8'))
+    assert.ok(
+      preservedHanded.items.some((item) => item.events.some((e) => e.message?.message_id === MSG_NEW)),
+      'concurrent handed.json MUST NOT be overwritten when unreadable',
+    )
+
+    // Next idle sweep once readable delivers BOTH older and newer commands!
+    const released = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+    })
+    assert.ok(released?.note)
+    const combinedText = readNoteText(released.note, { home })
+    assert.ok(combinedText.includes(MSG_OLD), 'older command must be delivered on next sweep')
+    assert.ok(combinedText.includes(MSG_NEW), 'newer concurrent command must be delivered on next sweep')
+  })
 })

@@ -117,7 +117,7 @@ import {
 import { isDirectRun } from './is-direct-run.mjs'
 import { noticeReplyInstruction, recordTurnWake, turnWakeFromEvents } from './notice-reply.mjs'
 import { readOwnConnectionState } from './own-connection.mjs'
-import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { readPrivateJson, readPrivateJsonResult, STATE_UNREADABLE, writePrivateJson } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
 import { readLastTurnEnd, STABLE_READ_ATTEMPTS, STABLE_READ_GAP_MS } from './transcript-turn-end.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
@@ -1581,7 +1581,11 @@ export async function stepDeliveryHook(
     }
     let mergedConcurrent = false
     try {
-      const concurrent = readPrivateJson(path.join(steps, HANDED))
+      const concurrentRes = readPrivateJsonResult(path.join(steps, HANDED))
+      if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
+        throw new Error(`concurrent ${HANDED} could not be read; refusing to overwrite`)
+      }
+      const concurrent = concurrentRes.value
       if (validRecord(concurrent)) {
         const cUnread = hasUnreadNote(concurrent)
         const rUnread = hasUnreadNote(record)
@@ -1983,8 +1987,25 @@ export async function releaseAtIdle(
     }
     // Merge any concurrent HANDED record written by a parallel postToolUse hook while
     // `releaseAtIdle` awaited `isOpen`, so the idle handoff NEVER overwrites or drops
-    // a newer command handed over concurrently (requirement 3ea2b201).
-    const concurrent = readPrivateJson(handedPath)
+    // a newer command handed over concurrently (requirement 3ea2b201). If a concurrent
+    // HANDED file exists on disk but fails to read transiently, FAIL CLOSED: restore all
+    // taken items (preserving takenRecord into retry-*.json) and throw instead of treating
+    // it as absent and overwriting it!
+    const concurrentRes = readPrivateJsonResult(handedPath)
+    if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
+      for (const each of validTaken) giveBack(each)
+      for (const ov of consumedOverflows) giveBack(ov)
+      if (memoryOverflows.length > 0) {
+        const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+        unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+      }
+      preserveTakenRecord()
+      process.stderr.write(
+        `step-delivery: concurrent ${HANDED} could not be read during idle handoff for ${connectionId}; refusing to overwrite\n`,
+      )
+      throw new Error(`concurrent ${HANDED} unreadable during idle handoff; refusing to overwrite`)
+    }
+    const concurrent = concurrentRes.value
     const hasConcurrent = validRecord(concurrent)
     const concurrentUnread = hasConcurrent && hasUnreadNote(concurrent) ? concurrent.items : []
     const mergedOpen = []
