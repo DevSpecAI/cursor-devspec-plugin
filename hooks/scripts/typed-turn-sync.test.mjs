@@ -1005,9 +1005,10 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.equal(endedSync.action, 'open_write_failed')
       assert.equal(memo.synced, false, 'must NOT mark memo synced while an unpersisted server open remains')
 
-      // Idle cleanup closes the still-open server request when the log is readable (proving zero pending launches) even if append is blocked.
+      // While append is still blocked, idle cleanup closes on DevSpec but refuses to
+      // report completion or drop the recovery entry until the local close persists (3ea2b201).
       const closedIds = []
-      const idle = await finishIdleRequests({
+      const idleBlocked = await finishIdleRequests({
         connectionId: CONN,
         transcriptPath,
         connectionCapability: 'cap-secret',
@@ -1019,7 +1020,24 @@ describe('typed-turn-sync (item da03801e)', () => {
         log: () => {},
       })
       assert.deepEqual(closedIds, [openedId])
+      assert.deepEqual(idleBlocked.closed, [], 'must NOT report close complete while local close append fails')
+      assert.equal(idleBlocked.closeRefusal?.code, 'local_close_persist_failed')
+
+      // Once the request log is writable again, retry persists the local close and finishes cleanly.
+      fs.chmodSync(reqLog, 0o600)
+      const idle = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          if (args.action === 'close') closedIds.push(args.request_id)
+          return { status: 'closed' }
+        },
+        dir,
+        log: () => {},
+      })
       assert.deepEqual(idle.closed, [openedId])
+      assert.equal(idle.closeRefusal, undefined)
     } finally {
       try { fs.chmodSync(reqLog, 0o600) } catch { /* ignore */ }
       fs.rmSync(reqLog, { recursive: true, force: true })
@@ -3926,5 +3944,118 @@ describe('typed-turn-sync (item da03801e)', () => {
       log: () => {},
     })
     assert.deepEqual(idle2.closed, [], 'next idle pass MUST NOT close REQ_2 while its launch is pending')
+  })
+
+  it('finishIdleRequests does NOT report fallback close complete or remove .pending-opens.json when persisting the local close fails (ENOSPC / read-only), and retries cleanly once writable (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555e1'
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Fallback close with ENOSPC on local write')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+    // Make `.requests.jsonl` readable but unwritable (simulates ENOSPC/EACCES on local close append).
+    fs.writeFileSync(reqLog, '', { mode: 0o400 })
+    const logs = []
+    try {
+      const idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.deepEqual(idle1.closed, [], 'MUST NOT report fallback close complete when local close write fails')
+      assert.equal(idle1.closeRefusal?.code, 'local_close_persist_failed')
+      assert.equal(fs.existsSync(sidecar), true, 'recovery entry MUST remain in .pending-opens.json for retry')
+      assert.ok(logs.some((l) => /local_close_persist_failed|local close failed/i.test(l)))
+    } finally {
+      fs.chmodSync(reqLog, 0o600)
+    }
+
+    // Once disk is writable again, the next idle pass persists the local close, removes the recovery entry, and reports closed!
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ status: 'closed' }),
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle2.closed, [RECOVERED_REQ])
+    assert.equal(idle2.closeRefusal, undefined)
+    assert.equal(fs.existsSync(sidecar), false, 'recovery entry is removed ONLY after local close persists')
+    assert.match(fs.readFileSync(reqLog, 'utf8'), new RegExp(`"op":"close","id":"${RECOVERED_REQ}"`))
+  })
+
+  it('finishIdleRequests does NOT accept a fallback close locally if a pending launch for that request lands while awaiting DevSpec’s close reply (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const { requestForWake } = await import('./requests.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555e2'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Fallback close racing pending launch during callRequest')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        // While waiting for DevSpec's close reply, the open + pending launch land locally!
+        appendRequestEvent(CONN, { op: 'open', id: RECOVERED_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: RECOVERED_REQ }, { dir })
+        appendRequestEvent(
+          CONN,
+          { op: 'launch', key: 'bg-launch-during-close-reply', kind: 'background_task', request: RECOVERED_REQ },
+          { dir },
+        )
+        const duringWait = readRequestState(CONN, { dir })
+        assert.equal(
+          requestForWake({
+            origin: 'task-notification',
+            text: '<task-notification><task-id>bg-launch-during-close-reply</task-id></task-notification>',
+            state: duringWait,
+          }).ref,
+          RECOVERED_REQ,
+        )
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+
+    assert.deepEqual(res.closed, [], 'MUST NOT accept fallback close when a pending launch landed while awaiting reply')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(RECOVERED_REQ), true, 'request MUST remain open locally while its launch is pending')
+    const wakeAfter = requestForWake({
+      origin: 'task-notification',
+      text: '<task-notification><task-id>bg-launch-during-close-reply</task-id></task-notification>',
+      state: after,
+    })
+    assert.equal(
+      wakeAfter.ref,
+      RECOVERED_REQ,
+      'wake for pending launch MUST STILL resolve to the original request (not UNSTATED)',
+    )
   })
 })

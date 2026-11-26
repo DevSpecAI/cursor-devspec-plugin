@@ -2015,10 +2015,101 @@ export async function finishIdleRequests({
 
   const closed = []
   let closeRefusal = null
+  let abortedClose = false
   const maybeRotateLog = () => {
     const remainingPending = pendingOpensForConnectionDetailed(dir, connectionId)
     if (!remainingPending.readError && remainingPending.entries.length === 0) {
       rotateRequestLog(connectionId, { dir })
+    }
+  }
+  // Persist a server-acknowledged close locally ONLY under the sync lock after
+  // re-verifying that no pending launch/monitor/schedule was recorded for the request
+  // while `await callRequest` was in flight (decision ce71a72b) AND only mark the close
+  // complete / delete `.pending-opens.json` recovery state once the local close event
+  // actually persists (requirement 3ea2b201).
+  const commitServerClose = async (targetRequestId, { isCandidate = false, pendingKey = null, pendingEntry = null } = {}) => {
+    let commitOutcome = null
+    try {
+      commitOutcome = await withTypedSyncLock(connectionId, dir, async () => {
+        const postCloseState = readRequestState(connectionId, { dir })
+        if (postCloseState.readError) {
+          return {
+            status: 'refused',
+            refusal: {
+              code: 'request_log_unreadable',
+              error: postCloseState.readError?.message ?? 'request log unreadable after close reply',
+            },
+          }
+        }
+        const postCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+        const postCloseStillIdle = Boolean(
+          postCloseActive && postCloseActive.ended && postCloseActive.stamp === initialStamp,
+        )
+        const targetStillActive = postCloseState.current === targetRequestId && !postCloseStillIdle
+        if (targetStillActive || hasPendingWorkForRequest(postCloseState, targetRequestId)) {
+          return { status: 'aborted_pending_work' }
+        }
+        if (isCandidate && postCloseState.open.has(targetRequestId)) {
+          const postPending = pendingWorkWithoutHostLists(postCloseState)
+          if (!requestFinished(postCloseState, targetRequestId, postPending)) {
+            return { status: 'aborted_pending_work' }
+          }
+        }
+        const localClosed = appendRequestEvent(connectionId, { op: 'close', id: targetRequestId }, { dir })
+        if (!localClosed) {
+          return {
+            status: 'refused',
+            refusal: {
+              code: 'local_close_persist_failed',
+              retryable: true,
+              request_id: targetRequestId,
+              error: 'DevSpec acknowledged close but local close record failed to persist',
+            },
+          }
+        }
+        return { status: 'closed' }
+      })
+    } catch (lockErr) {
+      commitOutcome = {
+        status: 'refused',
+        refusal: {
+          code: 'local_close_persist_failed',
+          retryable: true,
+          request_id: targetRequestId,
+          ...structuredRefusalFromError(lockErr),
+        },
+      }
+    }
+    if (!commitOutcome) {
+      commitOutcome = {
+        status: 'refused',
+        refusal: {
+          code: 'lock_busy',
+          retryable: true,
+          request_id: targetRequestId,
+          error: 'Could not acquire typed-sync lock to persist close',
+        },
+      }
+    }
+    if (commitOutcome.status === 'closed') {
+      closed.push(targetRequestId)
+      if (pendingEntry) {
+        deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
+      } else {
+        for (const [pKey, entry] of pendingEntries) {
+          if (entry.requestId === targetRequestId) {
+            deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+          }
+        }
+      }
+      maybeRotateLog()
+    } else if (commitOutcome.status === 'aborted_pending_work') {
+      abortedClose = true
+    } else {
+      closeRefusal = commitOutcome.refusal
+      log(
+        `typed-turn-sync: idle local close failed for ${connectionId} (${targetRequestId}): ${JSON.stringify(closeRefusal)}\n`,
+      )
     }
   }
   if (candidateId && connectionCapability && typeof callRequest === 'function') {
@@ -2033,48 +2124,38 @@ export async function finishIdleRequests({
       }
       log(`typed-turn-sync: idle close skipped because request log is unreadable for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
     } else {
-    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
-    const preCloseStillIdle = Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
-    const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
-    const stillFinished =
-      preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
-    if (stillFinished) {
-    let lastCloseResponse = null
-    let lastCloseError = null
-    const ok = await closeRequest({
-      connectionId,
-      requestId: candidateId,
-      call: async (reqArgs) => {
-        lastCloseResponse = null
-        lastCloseError = null
+      const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+      const preCloseStillIdle = Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
+      const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
+      const stillFinished =
+        preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
+      if (stillFinished) {
+        let lastCloseResponse = null
+        let lastCloseError = null
+        let serverClosed = false
         try {
-          const res = await callRequest(reqArgs)
+          const res = await callRequest({
+            connection_id: connectionId,
+            action: 'close',
+            request_id: candidateId,
+            reason: 'host_finished',
+          })
           lastCloseResponse = res
-          return res
+          serverClosed = res?.status === 'closed'
         } catch (err) {
           lastCloseError = err
-          throw err
+          serverClosed = /unknown request/i.test(String(err?.message ?? err))
         }
-      },
-      dir,
-    }).catch((err) => {
-      lastCloseError = err
-      return false
-    })
-    if (ok) {
-      closed.push(candidateId)
-      for (const [pKey, entry] of pendingEntries) {
-        if (entry.requestId === candidateId) deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+        if (serverClosed) {
+          await commitServerClose(candidateId, { isCandidate: true })
+        } else {
+          closeRefusal =
+            refusalFromResponse(lastCloseResponse) ??
+            (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+            (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+          log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+        }
       }
-      maybeRotateLog()
-    } else {
-      closeRefusal =
-        refusalFromResponse(lastCloseResponse) ??
-        (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
-        (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
-      log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
-    }
-    }
     }
   } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
     const [pendingKey, pendingEntry] = pendingFallback
@@ -2086,45 +2167,41 @@ export async function finishIdleRequests({
       }
       log(`typed-turn-sync: idle pending-open close skipped because request log is unreadable for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
     } else {
-    const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
-    const preCloseStillIdle =
-      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
-      !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
-    if (preCloseStillIdle) {
-    let lastCloseResponse = null
-    let lastCloseError = null
-    let serverClosed = false
-    try {
-      const res = await callRequest({
-        connection_id: connectionId,
-        action: 'close',
-        request_id: pendingEntry.requestId,
-        reason: 'host_finished',
-      })
-      lastCloseResponse = res
-      serverClosed = res?.status === 'closed'
-    } catch (err) {
-      lastCloseError = err
-      serverClosed = /unknown request/i.test(String(err?.message ?? err))
-    }
-    if (serverClosed) {
-      deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
-      // Best-effort close record if disk is writable again; request was never opened on disk.
-      appendRequestEvent(connectionId, { op: 'close', id: pendingEntry.requestId }, { dir })
-      closed.push(pendingEntry.requestId)
-      maybeRotateLog()
-    } else {
-      closeRefusal =
-        refusalFromResponse(lastCloseResponse) ??
-        (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
-        (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
-      log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
-    }
-    }
+      const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
+      const preCloseStillIdle =
+        Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
+        !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
+      if (preCloseStillIdle) {
+        let lastCloseResponse = null
+        let lastCloseError = null
+        let serverClosed = false
+        try {
+          const res = await callRequest({
+            connection_id: connectionId,
+            action: 'close',
+            request_id: pendingEntry.requestId,
+            reason: 'host_finished',
+          })
+          lastCloseResponse = res
+          serverClosed = res?.status === 'closed'
+        } catch (err) {
+          lastCloseError = err
+          serverClosed = /unknown request/i.test(String(err?.message ?? err))
+        }
+        if (serverClosed) {
+          await commitServerClose(pendingEntry.requestId, { isCandidate: false, pendingKey, pendingEntry })
+        } else {
+          closeRefusal =
+            refusalFromResponse(lastCloseResponse) ??
+            (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+            (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+          log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+        }
+      }
     }
   }
 
-  if (!closeRefusal) await clearEndedForeground()
+  if (!closeRefusal && !abortedClose) await clearEndedForeground()
 
   return {
     closed,
