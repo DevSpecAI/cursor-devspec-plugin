@@ -5555,4 +5555,103 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, REQ_ALICE, 'completion wake MUST resolve to Alice’s original request')
   })
+
+  it('a later rotation NEVER deletes an older staged log where a still-open fd appends a launch or typed_turn_failed retry (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const REQ_ALICE_OLD = '55555555-5555-4555-8555-5555555555ab'
+    const REQ_BOB_NEW = '66666666-6666-4666-8666-6666666666ab'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob turn triggering a later rotation while an older staged log exists')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    const oldStagedPath = `${reqLogPath}.rotating-99999-old12345`
+    fs.mkdirSync(dir, { recursive: true })
+
+    // Create an older staged log (already idle: REQ_ALICE_OLD was if_idle-closed) and hold an open fd to it!
+    fs.writeFileSync(
+      oldStagedPath,
+      `${JSON.stringify({ op: 'open', id: REQ_ALICE_OLD, kind: 'typed_prompt', requested_by: ALICE })}\n` +
+        `${JSON.stringify({ op: 'current', ref: REQ_ALICE_OLD })}\n` +
+        `${JSON.stringify({ op: 'close', id: REQ_ALICE_OLD, if_idle: true, expected_current: REQ_ALICE_OLD, allow_joined: false })}\n`,
+      { mode: 0o600 },
+    )
+    const oldStagedFd = fs.openSync(oldStagedPath, 'a')
+
+    // Active log has >64 KiB + REQ_BOB_NEW ready for idle close and rotation.
+    const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad-2', ref: null, pad: 'q'.repeat(400) })}\n`
+    fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+    appendRequestEvent(CONN, { op: 'open', id: REQ_BOB_NEW, kind: 'typed_prompt', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_BOB_NEW }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_BOB_NEW }, { dir })
+
+    const origRenameSync = fs.renameSync
+    let appendedToOldStagedDuringLaterRotation = false
+    fs.renameSync = (from, to) => {
+      // Right as the later rotation archives the new active log, the writer holding an open fd
+      // to `oldStagedPath` appends a launch for REQ_ALICE_OLD AND a typed_turn_failed retry!
+      if (!appendedToOldStagedDuringLaterRotation && String(to) === `${reqLogPath}.1`) {
+        appendedToOldStagedDuringLaterRotation = true
+        fs.writeSync(
+          oldStagedFd,
+          `${JSON.stringify({ op: 'launch', key: 'old-staged-fd-launch', kind: 'shell', notifies: true, request: REQ_ALICE_OLD, also: [] })}\n` +
+            `${JSON.stringify({ op: 'typed_turn_failed', key: 'old-staged-fd-retry' })}\n`,
+        )
+      }
+      return origRenameSync(from, to)
+    }
+
+    try {
+      await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+    } finally {
+      fs.renameSync = origRenameSync
+      fs.closeSync(oldStagedFd)
+    }
+
+    assert.equal(appendedToOldStagedDuringLaterRotation, true)
+    assert.equal(fs.existsSync(oldStagedPath), true, 'later rotation MUST NOT unlink older staged log')
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.failedTranscriptTurns.has('old-staged-fd-retry'), true, 'typed_turn_failed appended to older staged log MUST stay queued')
+    assert.equal(after.launches.has('old-staged-fd-launch'), true, 'launch appended to older staged log MUST stay visible')
+    assert.equal(after.open.has(REQ_ALICE_OLD), true, 'REQ_ALICE_OLD MUST be restored open for its launch')
+    assert.equal(after.open.get(REQ_ALICE_OLD)?.requested_by, ALICE)
+
+    // Completion wake for the launch MUST resolve back to Alice’s original request!
+    const wakeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>old-staged-fd-launch</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo: {},
+    })
+    assert.equal(wakeSync.action, 'restored_wake_request')
+    assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE_OLD)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.args?.request_ref, REQ_ALICE_OLD, 'wake MUST still resolve to Alice after later rotation')
+  })
 })

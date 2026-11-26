@@ -1033,6 +1033,17 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
       onError?.(priorStaged.error)
       return false
     }
+    const priorStagedSizes = new Map()
+    for (const oldStaged of priorStaged.files) {
+      try {
+        priorStagedSizes.set(oldStaged, fs.statSync(oldStaged).size)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          onError?.(error)
+          return false
+        }
+      }
+    }
     const preBuf = fs.readFileSync(file)
     const preState = reduceRequestLog(preBuf.toString('utf8'))
     if (preState.open.size > 0 || preState.failedTranscriptTurns.size > 0) return false
@@ -1095,15 +1106,15 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
       fs.appendFileSync(file, initialLines.join(''), { mode: 0o600 })
       const archiveFile = `${file}.1`
       fs.renameSync(staged, archiveFile)
-      // Once the new active log and archive are cleanly in place and `effectiveState`
-      // had no pending work, remove any older orphaned `.rotating-*` files from prior
-      // failed rotations so they do not accumulate forever.
-      for (const oldStaged of priorStaged.files) {
-        try {
-          fs.rmSync(oldStaged, { force: true })
-        } catch {
-          /* ignore cleanup failure */
-        }
+      // NEVER delete older `.rotating-*` files from prior failed rotations: a writer
+      // may still hold an open fd to one of them and append a `launch` or
+      // `typed_turn_failed` at any time. `readRequestState` replays every `.rotating-*`
+      // file ahead of the active log; verify none of them grew or became unreadable
+      // during this rotation (requirements 3ea2b201 / ce71a72b).
+      let priorStagedGrew = false
+      for (const [oldStaged, beforeSize] of priorStagedSizes) {
+        const afterStat = fs.statSync(oldStaged)
+        if (afterStat.size > beforeSize) priorStagedGrew = true
       }
       // Re-stat the archived inode immediately after moving it into place: if a writer
       // with an already-open fd appended after `readFileSync(staged)`, carry those
@@ -1123,7 +1134,7 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
         fs.appendFileSync(file, `${lateCarry}${updatedWatermark}`, { mode: 0o600 })
         return false
       }
-      return !hasExtraTail
+      return !hasExtraTail && !priorStagedGrew
     } catch (error) {
       onError?.(error)
       try {
