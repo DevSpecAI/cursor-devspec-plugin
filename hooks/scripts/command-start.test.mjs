@@ -3201,4 +3201,145 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       }
     }
   })
+
+  it('stepDeliveryHook logs ALL unreadable inner-note refusals (every note_id and read command) to stderr when no startCommands runs and all note stores reject writes (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    // Build a delivery containing 25 unreadable inner wake_in_note pointers (no inline command).
+    const innerEvents = []
+    const expectedIds = []
+    for (let i = 0; i < 25; i += 1) {
+      const fakeId = String(i).padStart(16, 'a')
+      expectedIds.push(fakeId)
+      innerEvents.push({
+        type: 'wake_in_note',
+        carries: ['owner_message'],
+        read: `cat ~/.devspec/notes/${fakeId}.md`,
+        note: fakeId,
+      })
+    }
+    const batch = ownerBatch('Unreadable inner notes only')
+    holdForNextStep(CONN, batch, innerEvents, { dir })
+
+    const handOverRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo hi' }, tool_output: 'hi' },
+      { home, dir, listenerActive: () => true },
+    )
+    const outerNoteId = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOverRaw).additional_context)[1]
+    const outerParts = noteFiles(home, outerNoteId).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    // Block all 4 note stores (make ~/.devspec/notes read-only 0o500 so outerNoteId can still be read!).
+    const notesDir = path.join(home, '.devspec', 'notes')
+    const blockedTmp = path.join(dir, 'tmp-unreadable-only')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    fs.writeFileSync(path.join(dir, 'diagnostic-notes'), 'not-a-directory\n')
+    fs.writeFileSync(path.join(dir, `${CONN}.steps`, 'diagnostic-notes'), 'not-a-directory\n')
+    fs.chmodSync(notesDir, 0o500)
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stderrChunks = []
+    const origStderrWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk, ...rest) => {
+      stderrChunks.push(String(chunk))
+      return origStderrWrite(chunk, ...rest)
+    }
+    try {
+      let lastRaw = null
+      for (const partCall of outerParts) {
+        lastRaw = await stepDeliveryHook(partCall, { home, dir, listenerActive: () => true })
+      }
+      assert.ok(lastRaw)
+      const ctx = JSON.parse(lastRaw).additional_context
+      assert.match(ctx, /stderr/, 'fallback must direct agent to stderr when all note stores reject writes')
+      const logged = stderrChunks.join('')
+      for (const id of expectedIds) {
+        assert.ok(logged.includes(id), `stderr MUST contain every omitted unreadable note_id (${id})`)
+        assert.ok(logged.includes(`cat ~/.devspec/notes/${id}.md`), `stderr MUST contain read command for ${id}`)
+      }
+    } finally {
+      process.stderr.write = origStderrWrite
+      fs.chmodSync(notesDir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('stepDeliveryHook preserves the older refused command retry even when saving the merged HANDED record fails after a parallel hook wrote a fresh note (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const MSG_1 = '33333333-3333-4333-8333-3333333333d1'
+    const TURN_1 = '77777777-7777-4777-8777-7777777777d1'
+    const MSG_2 = '33333333-3333-4333-8333-3333333333d2'
+    const TURN_2 = '77777777-7777-4777-8777-7777777777d2'
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+
+    const batch1 = ownerBatch('Older command before concurrent write failure', { messageId: MSG_1, turnId: TURN_1 })
+    holdForNextStep(CONN, batch1, buildOwnerMessageEvents(batch1), { dir })
+    const handOver1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+    const note1Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOver1).additional_context)[1]
+    const note1Parts = noteFiles(home, note1Id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+
+    let note2Id = null
+    let chmodApplied = false
+    try {
+      for (const partCall of note1Parts) {
+        await stepDeliveryHook(partCall, {
+          home,
+          dir,
+          listenerActive: () => true,
+          startCommands: async () => {
+            const batch2 = ownerBatch('Fresh command during concurrent write failure', { messageId: MSG_2, turnId: TURN_2 })
+            holdForNextStep(CONN, batch2, buildOwnerMessageEvents(batch2), { dir })
+            const hook2Raw = await stepDeliveryHook(
+              { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+              { home, dir, listenerActive: () => true },
+            )
+            note2Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(hook2Raw).additional_context)[1]
+            // Make steps folder read-only right before Hook 1 tries to save the merged HANDED!
+            fs.chmodSync(stepsFolder, 0o500)
+            chmodApplied = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              started: [],
+              pickedUp: 0,
+              refusals: [
+                {
+                  command_message_id: MSG_1,
+                  command_turn_id: TURN_1,
+                  refusal: { code: 'turn_busy_write_err', blocking_turn_id: 'blk-write-err-1' },
+                },
+              ],
+            }
+          },
+        })
+      }
+    } finally {
+      if (chmodApplied) fs.chmodSync(stepsFolder, 0o700)
+    }
+
+    assert.ok(note2Id)
+    // Now the write error clears and the agent reads note 2: BOTH MSG_1 AND MSG_2 MUST be picked up!
+    const note2Parts = noteFiles(home, note2Id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+    const picked = []
+    for (const partCall of note2Parts) {
+      await stepDeliveryHook(partCall, {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands: async ({ commands }) => {
+          picked.push(commands.map((c) => c.messageId))
+          return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+        },
+      })
+    }
+    assert.equal(picked.length, 1)
+    assert.ok(picked[0].includes(MSG_1), 'older refused command MUST NOT be discarded when merged HANDED write fails')
+    assert.ok(picked[0].includes(MSG_2), 'fresh concurrent command MUST still be picked up')
+  })
 })

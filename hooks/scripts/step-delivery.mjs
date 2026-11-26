@@ -149,10 +149,12 @@ const RECORD_VERSION = 1
 const HANDED = 'handed.json'
 const STEPS_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
+const RETRY_OVERFLOW = /^retry-\d+-[0-9a-f]{8}\.json$/
 const WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json$/
 const TAKEN_WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json\.taken-(\d+)-[0-9a-f]{8}$/
 const WAKE_INLINE_HOLD = 'wake-inline-hold.json'
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
+const unpersistedRetryOverflow = new Map()
 
 /**
  * Record an active unstarted-inline-command cursor barrier for `wakePositionPath` so
@@ -661,12 +663,27 @@ export function reclaimAbandoned(steps) {
   for (const name of list(steps)) {
     const match = TAKEN.exec(name)
     if (!match || pidAlive(Number(match[2]))) continue
-    giveBack({ file: path.join(steps, name), original: path.join(steps, match[1]) })
+    const takenPath = path.join(steps, name)
+    const originalPath = path.join(steps, match[1])
+    if (match[1] === HANDED && fs.existsSync(originalPath)) {
+      try {
+        fs.renameSync(takenPath, path.join(steps, `retry-${Date.now()}-${randomBytes(4).toString('hex')}.json`))
+        continue
+      } catch {
+        /* leave in place for next reclaim */
+        continue
+      }
+    }
+    giveBack({ file: takenPath, original: originalPath })
   }
 }
 
 function waitingFiles(steps) {
   return list(steps).filter((name) => WAITING.test(name)).sort().map((name) => path.join(steps, name))
+}
+
+function retryOverflowFiles(steps) {
+  return list(steps).filter((name) => RETRY_OVERFLOW.test(name)).sort().map((name) => path.join(steps, name))
 }
 
 /** A waiting item's file name: when it was held, then its key, so names sort in arrival order. */
@@ -1058,6 +1075,50 @@ export async function stepDeliveryHook(
     }
   }
 
+  // Also drain any retry overflow preserved when a parallel hook wrote a fresh HANDED
+  // right before a transient write failure on an earlier hook (requirement 3ea2b201).
+  const takenOverflows = retryOverflowFiles(steps).map(take).filter(Boolean)
+  const memoryOverflows = unpersistedRetryOverflow.get(steps) ?? []
+  if (memoryOverflows.length > 0) unpersistedRetryOverflow.delete(steps)
+  const consumeOverflowEntry = (entry) => {
+    if (!entry || typeof entry !== 'object') return
+    const innerList = Array.isArray(entry.inner_note_items) ? entry.inner_note_items : []
+    if (innerList.length > 0) {
+      const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerList)
+      unreadableInnerNoteRefusals.push(...unreadableRefusals)
+      unreadableInnerNoteItems.push(...unreadableItems)
+      if (immediateOwnerItems.length > 0) completedOwnerItems.push(...immediateOwnerItems)
+      readChanged = true
+    }
+    const pickupList = Array.isArray(entry.pickup_items)
+      ? entry.pickup_items
+      : validRecord(entry) && entry.pickup_pending === true
+        ? entry.items.filter((i) => i.kind === 'owner_messages')
+        : validRecord(entry) && hasUnreadNote(entry)
+          ? entry.items.filter((i) => i.kind === 'owner_messages')
+          : []
+    if (pickupList.length > 0) {
+      completedOwnerItems.push(...pickupList)
+      readChanged = true
+    }
+    if (!keptForPickupRetry && (innerList.length > 0 || pickupList.length > 0)) {
+      keptForPickupRetry = {
+        version: RECORD_VERSION,
+        note: typeof entry.note === 'string' ? entry.note : '0'.repeat(16),
+        parts: [],
+        items: [...innerList, ...pickupList],
+        at: new Date().toISOString(),
+        note_read: true,
+      }
+    }
+  }
+  for (const ov of takenOverflows) {
+    consumeOverflowEntry(readPrivateJson(ov.file))
+  }
+  for (const ov of memoryOverflows) {
+    consumeOverflowEntry(ov)
+  }
+
   // Also track any oversized `wake_in_note` command pointers handed over via wake-tail
   // or one-shot wait: trigger `report_pickup` and advance the wake reader offset ONLY once
   // the agent has actually read the sealed note whole (`readThrough`, req 3ea2b201).
@@ -1112,6 +1173,7 @@ export async function stepDeliveryHook(
   // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
   // preserve/surface the full structured refusal details (req 4e32d1a5).
   let pickupRefusals = unreadableInnerNoteRefusals.length > 0 ? unreadableInnerNoteRefusals : null
+  let loggedRefusalsToStderr = false
   if (completedOwnerItems.length > 0 || completedWakeNotes.length > 0) {
     const combinedMessages = [
       ...completedOwnerItems.flatMap((item) =>
@@ -1162,6 +1224,7 @@ export async function stepDeliveryHook(
         process.stderr.write(
           `step-delivery: report_pickup refused for ${connectionId}; retaining pending pickup for retry: ${JSON.stringify(pickupRefusals)}\n`,
         )
+        loggedRefusalsToStderr = true
         if (completedOwnerItems.length > 0 && keptForPickupRetry) {
           const base = record ?? keptForPickupRetry
           const keepUnread = hasUnreadNote(base)
@@ -1269,6 +1332,12 @@ export async function stepDeliveryHook(
       for (const { taken: noteTaken } of completedWakeNotes) drop(noteTaken)
     }
   }
+  if (Array.isArray(pickupRefusals) && pickupRefusals.length > 0 && !loggedRefusalsToStderr) {
+    process.stderr.write(
+      `step-delivery: room-command note/pickup refusals for ${connectionId}; retaining pending retry: ${JSON.stringify(pickupRefusals)}\n`,
+    )
+    loggedRefusalsToStderr = true
+  }
 
   // From the check that the connection is still live until the pointer has been written
   // out, under the connection's steps lock, which every write that ends the connection
@@ -1306,6 +1375,12 @@ export async function stepDeliveryHook(
           } catch {
             savedFallback = null
           }
+        }
+        if (!savedFallback && !loggedRefusalsToStderr && Array.isArray(pickupRefusals) && pickupRefusals.length > 0) {
+          process.stderr.write(
+            `step-delivery: room-command note/pickup refusals for ${connectionId}; retaining pending retry: ${JSON.stringify(pickupRefusals)}\n`,
+          )
+          loggedRefusalsToStderr = true
         }
         const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
           prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
@@ -1526,7 +1601,54 @@ export async function stepDeliveryHook(
     } catch (deliveryWriteError) {
       // Not handed over, so not taken: everything goes back for the next step.
       for (const each of adding) giveBack(each.taken)
-      if (takenRecord) giveBack(takenRecord)
+      for (const ov of takenOverflows) giveBack(ov)
+      if (memoryOverflows.length > 0) {
+        const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+        unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+      }
+      if (takenRecord) {
+        if (!fs.existsSync(takenRecord.original)) {
+          giveBack(takenRecord)
+        } else {
+          // A parallel hook already wrote a fresh HANDED note while this hook awaited
+          // pickup: NEVER discard our pending retry record via giveBack() (req 3ea2b201).
+          const overflowPayload = {
+            version: RECORD_VERSION,
+            note: record?.note ?? '0'.repeat(16),
+            inner_note_items:
+              Array.isArray(record?.inner_note_items) && record.inner_note_items.length > 0
+                ? record.inner_note_items
+                : unreadableInnerNoteItems,
+            pickup_items:
+              Array.isArray(record?.pickup_items) && record.pickup_items.length > 0
+                ? record.pickup_items
+                : completedOwnerItems,
+            pickup_refusals: pickupRefusals ?? [],
+            at: new Date().toISOString(),
+          }
+          const overflowFile = path.join(steps, `retry-${Date.now()}-${randomBytes(4).toString('hex')}.json`)
+          let preservedOnDisk = false
+          try {
+            writePrivateJson(overflowFile, overflowPayload)
+            preservedOnDisk = true
+          } catch {
+            try {
+              fs.renameSync(takenRecord.file, overflowFile)
+              preservedOnDisk = true
+            } catch {
+              preservedOnDisk = false
+            }
+          }
+          if (preservedOnDisk) {
+            drop(takenRecord)
+          } else {
+            // `steps` itself rejected writes/renames transiently: retain in-memory overflow
+            // AND keep takenRecord.file on disk (do NOT unlink it).
+            const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+            unpersistedRetryOverflow.set(steps, [...existingMem, overflowPayload])
+          }
+        }
+      }
       for (const each of checked.filter((one) => !one.open)) drop(each.taken)
       // Even when saving a concurrent delivery note fails, NEVER swallow structured
       // pickup refusal details from this step — emit the budget-fitted refusal fallback
@@ -1542,6 +1664,7 @@ export async function stepDeliveryHook(
       return null
     }
     for (const each of checked) drop(each.taken)
+    for (const ov of takenOverflows) drop(ov)
     if (takenRecord) {
       if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
       else drop(takenRecord)
@@ -1761,6 +1884,11 @@ function discardLocked(connectionId, dir) {
     const record = readPrivateJson(takenRecord.file)
     if (validRecord(record)) items.push(...record.items)
     drop(takenRecord)
+  }
+  unpersistedRetryOverflow.delete(steps)
+  for (const file of retryOverflowFiles(steps)) {
+    const taken = take(file)
+    if (taken) drop(taken)
   }
   for (const file of waitingFiles(steps)) {
     const taken = take(file)
