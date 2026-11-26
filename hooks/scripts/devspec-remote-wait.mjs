@@ -1900,6 +1900,7 @@ export async function runOneShotRoomCommandPickup({
   state = null,
   startCommands = startRoomCommands,
   writeStderr = (text) => process.stderr.write(text),
+  reservedStore: callerReservedStore = null,
 } = {}) {
   const extracted = printedRoomCommands(printedWakes, fallbackSessionId, { home })
   const noteRefusals = extracted.unreadableNotes.map((note) => ({
@@ -1911,7 +1912,10 @@ export async function runOneShotRoomCommandPickup({
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
   const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
-  const reservedStore = reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir })
+  const ownedReservedStore = !callerReservedStore
+    ? reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir })
+    : null
+  const reservedStore = callerReservedStore ?? ownedReservedStore
   try {
   const capturedDiag = []
   let startResult = null
@@ -2013,7 +2017,7 @@ export async function runOneShotRoomCommandPickup({
     diagnosticNote,
   }
   } finally {
-    reservedStore.release()
+    ownedReservedStore?.release()
   }
 }
 
@@ -2433,53 +2437,61 @@ async function main() {
                 }
                 const frozenCmdInfo = extractRoomCommandsFromWake(plan.text)
                 const hasFrozenCmds = frozenCmdInfo.inlineCommands.length > 0 || frozenCmdInfo.unreadableNotes.length > 0
+                let frozenReservedStore = null
                 if (hasFrozenCmds) {
-                  const storeProbe = hasWritableDiagnosticNoteStore({
+                  const storeProbe = reserveDiagnosticNoteSlots({
                     home: os.homedir(),
-                    fallbackDir: path.join(CONNECTIONS_DIR, 'diagnostic-notes'),
+                    fallbackDir: diagnosticFallbackDir,
+                    backupDir: CONNECTIONS_DIR,
                   })
                   if (!storeProbe.ok) {
                     return { count: 0, noteStoreError: storeProbe, held: null, pickupFailed: false, shot: null, pickup }
                   }
+                  frozenReservedStore = storeProbe
                 }
-                // Write the selected wake to stdout FIRST and await completion before calling
-                // report_pickup, persisting started commands, writing `.turn`, or advancing
-                // wake_batch_progress / inbox cursor (req 3ea2b201).
                 try {
-                  await writeStdoutChecked(plan.text)
-                } catch (stdoutError) {
-                  return { count: 0, stdoutError, held: null, pickupFailed: false, shot: null, pickup }
-                }
-                for (const deferred of frozenCmdInfo.deferredNoteCommands) {
-                  registerPendingWakeNote(
-                    connectionId,
-                    {
-                      noteId: deferred.noteId,
-                      commands: deferred.commands,
-                      messages: deferred.messages,
-                      sessionId: deferred.sessionId ?? batch.session_id ?? null,
-                    },
-                    { dir: CONNECTIONS_DIR },
-                  )
-                }
-                if (hasFrozenCmds) {
-                  pickup = await runOneShotRoomCommandPickup({
-                    connectionId,
-                    printedWakes: plan.printedWakes,
-                    printedStdout: plan.text,
-                    priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
-                    fallbackSessionId: batch.session_id ?? null,
-                    dir: CONNECTIONS_DIR,
-                    state: live,
-                  })
-                  if (!pickup.ok) {
-                    return {
-                      count: 0,
-                      pickupFailed: true,
-                      shot: { count: plan.count, text: plan.text, printedWakes: plan.printedWakes },
-                      pickup,
+                  // Write the selected wake to stdout FIRST and await completion before calling
+                  // report_pickup, persisting started commands, writing `.turn`, or advancing
+                  // wake_batch_progress / inbox cursor (req 3ea2b201).
+                  try {
+                    await writeStdoutChecked(plan.text)
+                  } catch (stdoutError) {
+                    return { count: 0, stdoutError, held: null, pickupFailed: false, shot: null, pickup }
+                  }
+                  for (const deferred of frozenCmdInfo.deferredNoteCommands) {
+                    registerPendingWakeNote(
+                      connectionId,
+                      {
+                        noteId: deferred.noteId,
+                        commands: deferred.commands,
+                        messages: deferred.messages,
+                        sessionId: deferred.sessionId ?? batch.session_id ?? null,
+                      },
+                      { dir: CONNECTIONS_DIR },
+                    )
+                  }
+                  if (hasFrozenCmds) {
+                    pickup = await runOneShotRoomCommandPickup({
+                      connectionId,
+                      printedWakes: plan.printedWakes,
+                      printedStdout: plan.text,
+                      priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
+                      fallbackSessionId: batch.session_id ?? null,
+                      dir: CONNECTIONS_DIR,
+                      state: live,
+                      reservedStore: frozenReservedStore,
+                    })
+                    if (!pickup.ok) {
+                      return {
+                        count: 0,
+                        pickupFailed: true,
+                        shot: { count: plan.count, text: plan.text, printedWakes: plan.printedWakes },
+                        pickup,
+                      }
                     }
                   }
+                } finally {
+                  frozenReservedStore?.release()
                 }
                 shot = { count: plan.count, text: plan.text, printedWakes: plan.printedWakes }
                 printed = plan.count
@@ -2660,10 +2672,12 @@ async function main() {
           // CONNECTIONS_DIR/diagnostic-notes) is writable BEFORE writing stdout or calling
           // report_pickup. Otherwise an oversized refusal after near-ceiling stdout would have
           // nowhere on disk to save whole and could not fit inline (req 3c5147a7 / 4e32d1a5 / 91d7b47c).
+          let oneShotReservedStore = null
           if (hasOwnerCmds) {
-            const storeProbe = hasWritableDiagnosticNoteStore({
+            const storeProbe = reserveDiagnosticNoteSlots({
               home: os.homedir(),
-              fallbackDir: path.join(CONNECTIONS_DIR, 'diagnostic-notes'),
+              fallbackDir: diagnosticFallbackDir,
+              backupDir: CONNECTIONS_DIR,
             })
             if (!storeProbe.ok) {
               const errPayload = {
@@ -2679,47 +2693,53 @@ async function main() {
               process.exitCode = 1
               return
             }
+            oneShotReservedStore = storeProbe
           }
-          // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / closed
-          // pipe), exit immediately with zero report_pickup calls, zero started-command
-          // ledger writes, zero Working marker writes, and zero inbox cursor movement (req 3ea2b201).
           try {
-            await writeStdoutChecked(plan.text)
-          } catch (stdoutError) {
-            retryStderr.flush()
-            throw stdoutError
-          }
-          for (const deferred of ownerCmdInfo.deferredNoteCommands) {
-            registerPendingWakeNote(
-              connectionId,
-              {
-                noteId: deferred.noteId,
-                commands: deferred.commands,
-                messages: deferred.messages,
-                sessionId: deferred.sessionId ?? batch.session_id ?? null,
-              },
-              { dir: CONNECTIONS_DIR },
-            )
-          }
-          // In one-shot mode, start ONLY inline canonical room commands selected for this
-          // Shell output AFTER stdout succeeded and BEFORE advancing the inbox cursor /
-          // wake_batch_progress. Oversized commands sent as `wake_in_note` defer pickup
-          // until `stepDeliveryHook` observes the agent reading the note whole.
-          if (hasOwnerCmds) {
-            oneShotPickup = await runOneShotRoomCommandPickup({
-              connectionId,
-              printedWakes: plan.printedWakes,
-              printedStdout: plan.text,
-              priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
-              fallbackSessionId: batch.session_id ?? null,
-              dir: CONNECTIONS_DIR,
-              state: live,
-            })
-            if (!oneShotPickup.ok) {
-              retryStderr.flush({ stdoutText: plan.text })
-              process.exitCode = 1
-              return
+            // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / closed
+            // pipe), exit immediately with zero report_pickup calls, zero started-command
+            // ledger writes, zero Working marker writes, and zero inbox cursor movement (req 3ea2b201).
+            try {
+              await writeStdoutChecked(plan.text)
+            } catch (stdoutError) {
+              retryStderr.flush()
+              throw stdoutError
             }
+            for (const deferred of ownerCmdInfo.deferredNoteCommands) {
+              registerPendingWakeNote(
+                connectionId,
+                {
+                  noteId: deferred.noteId,
+                  commands: deferred.commands,
+                  messages: deferred.messages,
+                  sessionId: deferred.sessionId ?? batch.session_id ?? null,
+                },
+                { dir: CONNECTIONS_DIR },
+              )
+            }
+            // In one-shot mode, start ONLY inline canonical room commands selected for this
+            // Shell output AFTER stdout succeeded and BEFORE advancing the inbox cursor /
+            // wake_batch_progress. Oversized commands sent as `wake_in_note` defer pickup
+            // until `stepDeliveryHook` observes the agent reading the note whole.
+            if (hasOwnerCmds) {
+              oneShotPickup = await runOneShotRoomCommandPickup({
+                connectionId,
+                printedWakes: plan.printedWakes,
+                printedStdout: plan.text,
+                priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
+                fallbackSessionId: batch.session_id ?? null,
+                dir: CONNECTIONS_DIR,
+                state: live,
+                reservedStore: oneShotReservedStore,
+              })
+              if (!oneShotPickup.ok) {
+                retryStderr.flush({ stdoutText: plan.text })
+                process.exitCode = 1
+                return
+              }
+            }
+          } finally {
+            oneShotReservedStore?.release()
           }
           oneShot = { count: plan.count, text: plan.text, printedWakes: plan.printedWakes }
           const hasUnstartedCommands = Array.isArray(oneShotPickup?.unstarted) && oneShotPickup.unstarted.length > 0

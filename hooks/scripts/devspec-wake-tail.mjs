@@ -638,6 +638,7 @@ export async function readWakes({
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
     const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
     const pickupDiagnosticReserve = shellDiagnosticReserve('devspec-wake-tail', {
+      home,
       fallbackDir: fallbackNoteDir,
     })
     const hasRoomCommands =

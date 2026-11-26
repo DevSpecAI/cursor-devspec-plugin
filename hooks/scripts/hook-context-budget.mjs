@@ -895,13 +895,20 @@ export function maxShellReserve(candidates, minChars = 0) {
  * (`~/.devspec/notes`, `os.tmpdir()`, and `fallbackDir`) and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`
  * so `stdout + stderr` always fits `fitsShellOutput` (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
  */
-export function shellDiagnosticReserve(label = 'devspec-wake-tail', { fallbackDir = null } = {}) {
+export function shellDiagnosticReserve(label = 'devspec-wake-tail', { home = os.homedir(), fallbackDir = null } = {}) {
   const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
+  const homeSampleFile = path.join(home, NOTES_DIR, `${'0'.repeat(16)}.md`)
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
   const fallbackHeadPtr = shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(fallbackSampleFile)}`)
-  const candidates = [notePtr, fallbackPtr, fallbackHeadPtr]
+  const candidates = [
+    notePtr,
+    shellDiagnosticPointer(label, `cat ${shellQuotePath(homeSampleFile)}`),
+    shellDiagnosticPointer(label, `head -c 40000 ${shellQuotePath(homeSampleFile)}`),
+    fallbackPtr,
+    fallbackHeadPtr,
+  ]
   if (fallbackDir) {
     const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
     candidates.push(shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`))
@@ -973,6 +980,45 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
   ]
   const errors = []
   const slots = []
+  const writeAllSync = (fd, buf) => {
+    fs.ftruncateSync(fd, 0)
+    let offset = 0
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset)
+      if (!Number.isInteger(written) || written <= 0 || written > buf.length - offset) {
+        throw new Error(`short write to reserved diagnostic slot (${offset}/${buf.length} bytes written)`)
+      }
+      offset += written
+    }
+    fs.fsyncSync(fd)
+    const st = fs.fstatSync(fd)
+    if (st.size !== buf.length) {
+      throw new Error(`reserved diagnostic slot size mismatch (${st.size}/${buf.length} bytes on disk)`)
+    }
+  }
+  const verifySlotReadableByPath = (slot, expectedBytes = null) => {
+    let rfd = null
+    try {
+      rfd = fs.openSync(slot.filePath, 'r')
+      const st = fs.fstatSync(rfd)
+      if (st.ino !== slot.ino) return false
+      if (expectedBytes !== null) {
+        if (st.size !== expectedBytes) return false
+        if (expectedBytes > 0) {
+          const probe = Buffer.allocUnsafe(1)
+          if (fs.readSync(rfd, probe, 0, 1, 0) !== 1) return false
+          if (expectedBytes > 1 && fs.readSync(rfd, probe, 0, 1, expectedBytes - 1) !== 1) return false
+        }
+      }
+      return true
+    } catch {
+      return false
+    } finally {
+      if (rfd !== null) {
+        try { fs.closeSync(rfd) } catch { /* ignore */ }
+      }
+    }
+  }
   const openSlotIn = (candidate) => {
     const hex = randomBytes(8).toString('hex')
     const fileName = candidate.prefix ? `${candidate.prefix}${hex.slice(0, 16 - candidate.prefix.length)}.md` : `${hex}.md`
@@ -981,7 +1027,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
     const fd = fs.openSync(filePath, 'wx', 0o600)
     try {
       const st = fs.fstatSync(fd)
-      return {
+      const slot = {
         store: candidate.store,
         dir: candidate.dir,
         filePath,
@@ -989,6 +1035,10 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
         ino: st.ino,
         used: false,
       }
+      if (!verifySlotReadableByPath(slot)) {
+        throw new Error(`reserved diagnostic slot is not readable by path: ${filePath}`)
+      }
+      return slot
     } catch (error) {
       try { fs.closeSync(fd) } catch { /* ignore */ }
       try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
@@ -1023,17 +1073,6 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       /* optional backup slot: primary slot already passed preflight */
     }
   }
-  const slotStillLinked = (slot) => {
-    try {
-      const st = fs.lstatSync(slot.filePath)
-      return st.ino === slot.ino
-    } catch (error) {
-      // EACCES means the parent directory was chmod'd to 0o000 while the file remains linked
-      // at `slot.filePath` and will be readable verbatim once permissions are restored.
-      if (error && typeof error === 'object' && error.code === 'EACCES') return true
-      return false
-    }
-  }
   return {
     ok: true,
     store: slots[0].store,
@@ -1043,14 +1082,16 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       const raw = String(text ?? '')
       const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
       for (const slot of slots) {
-        if (slot.fd === null || !slotStillLinked(slot)) continue
+        if (slot.fd === null || !verifySlotReadableByPath(slot)) continue
         try {
           const quoted = shellQuotePath(slot.filePath)
           const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
           if (fitsOneRead) {
-            fs.ftruncateSync(slot.fd, 0)
-            fs.writeSync(slot.fd, raw, 0, 'utf8')
-            fs.fsyncSync(slot.fd)
+            const rawBuf = Buffer.from(raw, 'utf8')
+            writeAllSync(slot.fd, rawBuf)
+            if (!verifySlotReadableByPath(slot, rawBuf.length)) {
+              throw new Error(`reserved diagnostic slot unreadable after write: ${slot.filePath}`)
+            }
             slot.used = true
             return {
               id,
@@ -1099,9 +1140,10 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
           }
           if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) continue
           const contentBuf = Buffer.concat(pages)
-          fs.ftruncateSync(slot.fd, 0)
-          fs.writeSync(slot.fd, contentBuf, 0, contentBuf.length, 0)
-          fs.fsyncSync(slot.fd)
+          writeAllSync(slot.fd, contentBuf)
+          if (!verifySlotReadableByPath(slot, contentBuf.length)) {
+            throw new Error(`reserved diagnostic slot unreadable after write: ${slot.filePath}`)
+          }
           slot.used = true
           return {
             id,
@@ -1112,6 +1154,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
             reserved: true,
           }
         } catch {
+          try { fs.ftruncateSync(slot.fd, 0) } catch { /* ignore */ }
           /* try next reserved slot */
         }
       }
@@ -1155,8 +1198,21 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     for (let part = pieces.length; part >= 1; part -= 1) {
       const nextCmd = part < pieces.length ? `\n\n--- next part (${part + 1}/${pieces.length}): cat ${shellQuotePath(partPath(part + 1))} ---\n` : '\n'
-      writePrivateText(partPath(part), `${pieces[part - 1]}${nextCmd}`)
+      const partText = `${pieces[part - 1]}${nextCmd}`
+      if (!fitsShellOutput(partText)) {
+        throw new Error(`fallback diagnostic part ${part} exceeds Shell output limit`)
+      }
+      writePrivateText(partPath(part), partText)
     }
+  }
+  const verifyFd = fs.openSync(firstFile, 'r')
+  try {
+    const st = fs.fstatSync(verifyFd)
+    if (st.size <= 0 && raw.length > 0) {
+      throw new Error(`fallback diagnostic file is empty on disk: ${firstFile}`)
+    }
+  } finally {
+    try { fs.closeSync(verifyFd) } catch { /* ignore */ }
   }
   return {
     id,

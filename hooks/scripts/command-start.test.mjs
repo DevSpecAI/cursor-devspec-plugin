@@ -3870,4 +3870,259 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       'HANDED record MUST still track the concurrent newer command',
     )
   })
+
+  it('reserveDiagnosticNoteSlots handles partial fs.writeSync writes (loops to completion, and rejects/falls back if a slot cannot write all bytes) (3c5147a7 / 91d7b47c)', async () => {
+    const { execSync } = await import('node:child_process')
+    const { reserveDiagnosticNoteSlots } = await import('./hook-context-budget.mjs')
+    const { home, dir } = mkHome()
+    const payload = JSON.stringify({
+      code: 'turn_busy_partial_write',
+      padding: 'w'.repeat(45_000),
+      blocking_items: [{ id: 'blk-partial-write-tail', reason: 'must_reach_disk_whole' }],
+    })
+
+    // 1. Chunked short writes (1,200 bytes per writeSync call) -> MUST loop until all bytes reach disk!
+    const store1 = reserveDiagnosticNoteSlots({ home, fallbackDir: path.join(dir, 'diagnostic-notes'), backupDir: dir })
+    assert.equal(store1.ok, true)
+    const origWriteSync = fs.writeSync
+    let writeCalls = 0
+    fs.writeSync = (fd, buffer, offset, length, position) => {
+      if (fd === store1.slots[0].fd) {
+        writeCalls += 1
+        return origWriteSync(fd, buffer, offset, Math.min(length, 1200), position)
+      }
+      return origWriteSync(fd, buffer, offset, length, position)
+    }
+    let note1 = null
+    try {
+      note1 = store1.write(payload)
+    } finally {
+      fs.writeSync = origWriteSync
+      store1.release()
+    }
+    assert.ok(writeCalls > 20, `expected chunked write loop (>20 calls); got ${writeCalls}`)
+    assert.ok(note1?.command?.startsWith('head -c '), `expected paginated command; got ${note1?.command}`)
+    let cmd = note1.command
+    let collected = ''
+    while (cmd) {
+      const out = execSync(cmd, { encoding: 'utf8' })
+      assert.ok(fitsShellOutput(out))
+      collected += out
+      const next = /next part \(\d+\/\d+\): (tail -c \+\d+ '[^']+' \| head -c \d+) ---/.exec(out)
+      cmd = next ? next[1] : null
+    }
+    assert.match(collected, /blk-partial-write-tail/, 'looped short writes must deliver full blocking record at tail')
+
+    // 2. Primary slot writes ONLY 1,200 bytes then stops (returns 0) -> MUST NOT advertise truncated primary, falls back to complete backup slot!
+    const store2 = reserveDiagnosticNoteSlots({ home, fallbackDir: path.join(dir, 'diagnostic-notes'), backupDir: dir })
+    assert.equal(store2.ok, true)
+    assert.ok(store2.slots.length >= 2, 'must have primary + backup slot')
+    const primaryFd = store2.slots[0].fd
+    const primaryFile = store2.slots[0].filePath
+    const backupFile = store2.slots[1].filePath
+    let primaryFirstDone = false
+    fs.writeSync = (fd, buffer, offset, length, position) => {
+      if (fd === primaryFd) {
+        if (!primaryFirstDone) {
+          primaryFirstDone = true
+          return origWriteSync(fd, buffer, offset, Math.min(length, 1200), position)
+        }
+        return 0
+      }
+      return origWriteSync(fd, buffer, offset, length, position)
+    }
+    let note2 = null
+    try {
+      note2 = store2.write(payload)
+    } finally {
+      fs.writeSync = origWriteSync
+      store2.release()
+    }
+    assert.ok(note2, 'must succeed via backup slot when primary short-writes')
+    assert.equal(note2.file, backupFile, 'must advertise accessible complete backup slot, NEVER truncated primary')
+    assert.notEqual(note2.file, primaryFile)
+    let cmd2 = note2.command
+    let collected2 = ''
+    while (cmd2) {
+      const out = execSync(cmd2, { encoding: 'utf8' })
+      assert.ok(fitsShellOutput(out))
+      collected2 += out
+      const next = /next part \(\d+\/\d+\): (tail -c \+\d+ '[^']+' \| head -c \d+) ---/.exec(out)
+      cmd2 = next ? next[1] : null
+    }
+    assert.match(collected2, /blk-partial-write-tail/, 'backup slot must carry full blocking record and continuations')
+
+    // 3. ALL slots short-write (only 1,200 bytes) -> MUST return null rather than advertising an unmarked fragment!
+    const store3 = reserveDiagnosticNoteSlots({ home, fallbackDir: path.join(dir, 'diagnostic-notes'), backupDir: dir })
+    const allFds = new Set(store3.slots.map((s) => s.fd))
+    const doneOnce = new Set()
+    fs.writeSync = (fd, buffer, offset, length, position) => {
+      if (allFds.has(fd)) {
+        if (!doneOnce.has(fd)) {
+          doneOnce.add(fd)
+          return origWriteSync(fd, buffer, offset, Math.min(length, 1200), position)
+        }
+        return 0
+      }
+      return origWriteSync(fd, buffer, offset, length, position)
+    }
+    let note3 = null
+    try {
+      note3 = store3.write(payload)
+    } finally {
+      fs.writeSync = origWriteSync
+      store3.release()
+    }
+    assert.equal(note3, null, 'must return null instead of advertising a truncated 1,200-byte fragment')
+  })
+
+  it('readWakes falls back to the accessible backup slot when primary notes dir loses read access (chmod 0o000) during pickup so the advertised command is actually readable (4e32d1a5)', async () => {
+    const { execSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(dir, 'tmp-chmod000-blocked')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { home, fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stderrChunks = []
+    let chmodApplied = false
+    try {
+      const page = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async () => {},
+        writeStderr: (text) => { stderrChunks.push(text) },
+        startCommands: async () => {
+          // Primary diagnostic dir loses ALL read/traverse access during pickup!
+          fs.chmodSync(diagDir, 0o000)
+          chmodApplied = true
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_chmod000',
+                  padding: 'r'.repeat(5_000),
+                  blocking_items: [{ id: 'blk-readable-backup-item', reason: 'must_not_permission_denied' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      assert.equal(page.marked, false)
+      assert.ok(page.pickup_diagnostic_note?.command, 'must advertise readable backup slot command')
+      assert.equal(
+        path.dirname(page.pickup_diagnostic_note.file),
+        dir,
+        'must use accessible backup slot in dir rather than unreadable chmod-000 primary dir',
+      )
+      assert.ok(stderrChunks.join('').includes(page.pickup_diagnostic_note.command))
+      // Running the advertised command RIGHT NOW (while diagDir is STILL 0o000!) MUST succeed!
+      const readOut = execSync(page.pickup_diagnostic_note.command, { encoding: 'utf8' })
+      assert.match(readOut, /turn_busy_chmod00/)
+      assert.match(readOut, /blk-readable-backup-item/)
+      assert.match(readOut, /must_not_permission_denied/)
+    } finally {
+      if (chmodApplied) fs.chmodSync(diagDir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
+
+  it('releaseAtIdle preserves BOTH the older unread command AND the concurrent newer command when appending the merged idle wake fails (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_OLD = '33333333-3333-4333-8333-3333333333b1'
+    const TURN_OLD = '77777777-7777-4777-8777-7777777777b1'
+    const MSG_NEW = '33333333-3333-4333-8333-3333333333b2'
+    const TURN_NEW = '77777777-7777-4777-8777-7777777777b2'
+
+    // Step 1: hand over older unread command 1 into HANDED.
+    const batchOld = ownerBatch('Older unread command before failed append', { messageId: MSG_OLD, turnId: TURN_OLD })
+    holdForNextStep(CONN, batchOld, buildOwnerMessageEvents(batchOld), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+
+    // Step 2: releaseAtIdle runs; while awaiting isOpen, a second hook hands over newer command 2;
+    // then appendWakeEvents throws!
+    let concurrentHanded = false
+    await assert.rejects(
+      () =>
+        releaseAtIdle(CONN, {
+          dir,
+          state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+          wakeFile,
+          home,
+          turnState: 'between',
+          isOpen: async () => {
+            if (!concurrentHanded) {
+              concurrentHanded = true
+              const batchNew = ownerBatch('Newer concurrent command before failed append', {
+                messageId: MSG_NEW,
+                turnId: TURN_NEW,
+              })
+              holdForNextStep(CONN, batchNew, buildOwnerMessageEvents(batchNew), { dir })
+              await stepDeliveryHook(
+                { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+                { home, dir, listenerActive: () => true },
+              )
+            }
+            return true
+          },
+          append: () => {
+            throw new Error('simulated transient wake file EIO')
+          },
+        }),
+      /simulated transient wake file EIO/,
+    )
+
+    // Step 3: Subsequent successful releaseAtIdle MUST deliver BOTH the older AND the newer unread commands!
+    const released = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+    })
+    assert.ok(released?.note, 'subsequent releaseAtIdle must produce merged idle wake note')
+    const combinedText = readNoteText(released.note, { home })
+    assert.ok(combinedText.includes(MSG_OLD), 'older unread command MUST NOT be dropped by rollback after append failure')
+    assert.ok(combinedText.includes(MSG_NEW), 'newer concurrent command MUST also be present in idle wake note')
+    const handedRecord = JSON.parse(fs.readFileSync(path.join(dir, `${CONN}.steps`, 'handed.json'), 'utf8'))
+    assert.ok(
+      handedRecord.items.some((item) => item.events.some((e) => e.message?.message_id === MSG_OLD)),
+      'HANDED record must still track older command',
+    )
+    assert.ok(
+      handedRecord.items.some((item) => item.events.some((e) => e.message?.message_id === MSG_NEW)),
+      'HANDED record must still track newer command',
+    )
+  })
 })
