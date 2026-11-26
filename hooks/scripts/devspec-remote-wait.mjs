@@ -90,6 +90,7 @@ import {
   fitsShellOutput,
   hasWritableDiagnosticNoteStore,
   maxShellReserve,
+  reserveDiagnosticNoteSlots,
   shellDiagnosticPointer,
   shellDiagnosticReserve,
   wakeInNote,
@@ -1909,6 +1910,9 @@ export async function runOneShotRoomCommandPickup({
   if (extracted.commands.length === 0 && noteRefusals.length === 0) {
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
+  const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
+  const reservedStore = reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir })
+  try {
   const capturedDiag = []
   let startResult = null
   if (extracted.commands.length > 0) {
@@ -1978,7 +1982,8 @@ export async function runOneShotRoomCommandPickup({
       label: 'devspec-remote-wait',
       fallback,
       requireStructuredFallback: Boolean(refusals),
-      fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
+      fallbackDir: fallbackNoteDir,
+      reservedStore: reservedStore.ok ? reservedStore : null,
     })
     diagnosticNote = fitted.note
     const diagText =
@@ -2006,6 +2011,9 @@ export async function runOneShotRoomCommandPickup({
       : {}),
     stderrText,
     diagnosticNote,
+  }
+  } finally {
+    reservedStore.release()
   }
 }
 

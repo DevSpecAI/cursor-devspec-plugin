@@ -145,7 +145,7 @@
  *     messages are shown again. [loses nothing when hooks for parallel tool calls add
  *     to the same hand-over at once; loses nothing over a long random run…]
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -947,6 +947,139 @@ export function hasWritableDiagnosticNoteStore({ home = os.homedir(), fallbackDi
 }
 
 /**
+ * Preflight-reserve private diagnostic note file descriptors BEFORE printing a near-ceiling
+ * wake or calling `report_pickup` (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ *
+ * - Preflight passes (`ok: true`) only when at least one of the three diagnostic note stores
+ *   (`~/.devspec/notes`, `TMPDIR/devspec-notes-<uid>`, or `fallbackDir`) accepts a new
+ *   private `0o600` file, keeping that open `fd` across `startCommands` so even a mid-pickup
+ *   `chmod 0o500`/`0o000` on the store directory still allows writing the unabridged original
+ *   refusal via POSIX `writeSync(fd, ...)`.
+ * - When `backupDir` (e.g. the connections dir holding the wake lock) is distinct and writable,
+ *   also opens a backup slot (`d-<14hex>.md`, 19 chars — never longer than `0000000000000000.md`
+ *   in `shellDiagnosticReserve`) so even if the primary diagnostic store directory is deleted and
+ *   replaced mid-pickup, the exact original refusal is still saved on disk with a Shell-bounded
+ *   `cat` read command.
+ * - `release()` closes all fds and unlinks every unused slot so the happy path leaves zero files.
+ */
+export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const primaryCandidates = [
+    { store: 'home_notes', dir: path.join(home, NOTES_DIR), prefix: '' },
+    { store: 'tmp_notes', dir: path.join(os.tmpdir(), `devspec-notes-${uid}`), prefix: '' },
+    ...(fallbackDir ? [{ store: 'connections_diagnostic_notes', dir: fallbackDir, prefix: '' }] : []),
+  ]
+  const errors = []
+  const slots = []
+  const openSlotIn = (candidate) => {
+    const hex = randomBytes(8).toString('hex')
+    const fileName = candidate.prefix ? `${candidate.prefix}${hex.slice(0, 16 - candidate.prefix.length)}.md` : `${hex}.md`
+    const filePath = path.join(candidate.dir, fileName)
+    fs.mkdirSync(candidate.dir, { recursive: true, mode: 0o700 })
+    const fd = fs.openSync(filePath, 'wx', 0o600)
+    try {
+      const st = fs.fstatSync(fd)
+      return {
+        store: candidate.store,
+        dir: candidate.dir,
+        filePath,
+        fd,
+        ino: st.ino,
+        used: false,
+      }
+    } catch (error) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
+      try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
+      throw error
+    }
+  }
+  for (const candidate of primaryCandidates) {
+    try {
+      slots.push(openSlotIn(candidate))
+      break
+    } catch (error) {
+      errors.push({
+        store: candidate.store,
+        code: error && typeof error === 'object' && 'code' in error ? String(error.code) : 'write_failed',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  if (slots.length === 0) {
+    return {
+      ok: false,
+      errors,
+      slots: [],
+      write: () => null,
+      release: () => {},
+    }
+  }
+  if (backupDir && path.resolve(backupDir) !== path.resolve(slots[0].dir)) {
+    try {
+      slots.push(openSlotIn({ store: 'connections_backup_slot', dir: backupDir, prefix: 'd-' }))
+    } catch {
+      /* optional backup slot: primary slot already passed preflight */
+    }
+  }
+  const slotStillLinked = (slot) => {
+    try {
+      const st = fs.lstatSync(slot.filePath)
+      return st.ino === slot.ino
+    } catch (error) {
+      // EACCES means the parent directory was chmod'd to 0o000 while the file remains linked
+      // at `slot.filePath` and will be readable verbatim once permissions are restored.
+      if (error && typeof error === 'object' && error.code === 'EACCES') return true
+      return false
+    }
+  }
+  return {
+    ok: true,
+    store: slots[0].store,
+    dir: slots[0].dir,
+    slots,
+    write(text) {
+      const raw = String(text ?? '')
+      const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
+      for (const slot of slots) {
+        if (slot.fd === null || !slotStillLinked(slot)) continue
+        try {
+          fs.ftruncateSync(slot.fd, 0)
+          fs.writeSync(slot.fd, raw, 0, 'utf8')
+          fs.fsyncSync(slot.fd)
+          slot.used = true
+          const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
+          const command = fitsOneRead
+            ? `cat ${shellQuotePath(slot.filePath)}`
+            : `head -c ${NOTE_PART_CHARS} ${shellQuotePath(slot.filePath)}`
+          return {
+            id,
+            file: slot.filePath,
+            command,
+            parts: fitsOneRead ? 1 : Math.ceil(raw.length / NOTE_PART_CHARS),
+            fallback: true,
+            reserved: true,
+          }
+        } catch {
+          /* try next reserved slot */
+        }
+      }
+      return null
+    },
+    release() {
+      for (const slot of slots) {
+        if (slot.fd !== null) {
+          try { fs.closeSync(slot.fd) } catch { /* ignore */ }
+          slot.fd = null
+        }
+        if (!slot.used) {
+          try { fs.rmSync(slot.filePath, { force: true }) } catch { /* ignore */ }
+        }
+      }
+    },
+  }
+}
+
+/**
  * Private fallback note store under `os.tmpdir()` used only when `~/.devspec/notes`
  * cannot be written, so the exact original oversized refusal/diagnostic is still saved
  * whole in Shell-sized parts on disk and can be read back with `cat` without making a
@@ -988,7 +1121,14 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
 export function fitShellDiagnostic(
   stdoutText,
   diagnosticText,
-  { home = os.homedir(), label = 'devspec-wake-tail', fallback = null, requireStructuredFallback = false, fallbackDir = null } = {},
+  {
+    home = os.homedir(),
+    label = 'devspec-wake-tail',
+    fallback = null,
+    requireStructuredFallback = false,
+    fallbackDir = null,
+    reservedStore = null,
+  } = {},
 ) {
   const stdout = String(stdoutText ?? '')
   const diag = String(diagnosticText ?? '')
@@ -1021,6 +1161,13 @@ export function fitShellDiagnostic(
     try {
       fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir })
       if (fallbackNote) break
+    } catch {
+      fallbackNote = null
+    }
+  }
+  if (!fallbackNote && reservedStore && typeof reservedStore.write === 'function') {
+    try {
+      fallbackNote = reservedStore.write(diag)
     } catch {
       fallbackNote = null
     }

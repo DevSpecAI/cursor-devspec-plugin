@@ -1140,6 +1140,34 @@ export async function stepDeliveryHook(
   for (const ov of memoryOverflows) {
     consumeOverflowEntry(ov)
   }
+  if (unreadableInnerNoteItems.length > 0) {
+    if (record && hasUnreadNote(record)) {
+      record = {
+        ...record,
+        inner_note_pending: true,
+        inner_note_items: unreadableInnerNoteItems,
+        pickup_refusals: unreadableInnerNoteRefusals,
+      }
+    } else {
+      const base = record ?? keptForPickupRetry ?? {
+        version: RECORD_VERSION,
+        note: '0'.repeat(16),
+        parts: [],
+        at: new Date().toISOString(),
+      }
+      record = {
+        ...base,
+        note_read: true,
+        items: unreadableInnerNoteItems,
+        inner_note_pending: true,
+        inner_note_items: unreadableInnerNoteItems,
+        pickup_pending: false,
+        pickup_items: [],
+        pickup_refusals: unreadableInnerNoteRefusals,
+      }
+    }
+    readChanged = true
+  }
 
   // Also track any oversized `wake_in_note` command pointers handed over via wake-tail
   // or one-shot wait: trigger `report_pickup` and advance the wake reader offset ONLY once

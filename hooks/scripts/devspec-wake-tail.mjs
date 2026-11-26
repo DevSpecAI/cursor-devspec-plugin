@@ -105,6 +105,7 @@ import {
   fitShellDiagnostic,
   fitsShellOutput,
   hasWritableDiagnosticNoteStore,
+  reserveDiagnosticNoteSlots,
   shellDiagnosticReserve,
   wakeInNote,
   wakesForOneOutput,
@@ -823,13 +824,16 @@ export async function readWakes({
     }
 
     // Pre-flight check: when this page carries inline room commands that will call
-    // report_pickup, verify at least one diagnostic note store is writable BEFORE writing
-    // stdout or calling report_pickup so an oversized refusal can never be lost or truncated
-    // after a near-ceiling wake is printed (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    // report_pickup, verify and pre-open a private diagnostic note slot BEFORE writing
+    // stdout or calling report_pickup so an oversized refusal is still preserved whole on
+    // disk with a Shell-bounded read command even if the last writable store loses
+    // permissions or is removed during pickup (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    let reservedDiagnosticStore = null
     if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
-      const storeProbe = hasWritableDiagnosticNoteStore({
+      const storeProbe = reserveDiagnosticNoteSlots({
         home,
-        fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
+        fallbackDir: fallbackNoteDir,
+        backupDir: dir,
       })
       if (!storeProbe.ok) {
         const errPayload = {
@@ -851,8 +855,10 @@ export async function readWakes({
           error: new Error(`no_writable_diagnostic_note_store: ${JSON.stringify(storeProbe.errors)}`),
         }
       }
+      reservedDiagnosticStore = storeProbe
     }
 
+    try {
     // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / write error),
     // throw immediately with zero report_pickup calls, zero started-command writes, zero
     // Working marker writes, and zero wake-cursor movement (requirement 3ea2b201).
@@ -936,7 +942,8 @@ export async function readWakes({
             savedNote,
           }),
         requireStructuredFallback: true,
-        fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
+        fallbackDir: fallbackNoteDir,
+        reservedStore: reservedDiagnosticStore,
       })
       pickupDiagnosticNote = fittedWithStdout.note
       const diagText =
@@ -955,7 +962,8 @@ export async function readWakes({
       const fitted = fitShellDiagnostic(printedStdout, rawDiag, {
         home,
         label: 'devspec-wake-tail',
-        fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
+        fallbackDir: fallbackNoteDir,
+        reservedStore: reservedDiagnosticStore,
       })
       pickupDiagnosticNote = fitted.note
       if (fitted.text) {
@@ -1057,6 +1065,9 @@ export async function readWakes({
       return { ...page, ...extra, marked: true }
     } catch (error) {
       return { ...page, ...extra, marked: false, error }
+    }
+    } finally {
+      reservedDiagnosticStore?.release()
     }
   })
 }

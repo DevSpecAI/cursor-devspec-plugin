@@ -3482,18 +3482,86 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         fitsShellOutput(printedOut + printedErr),
         `combined stdout+stderr must fit Shell ceiling (${CURSOR_SHELL_OUTPUT_MAX_CHARS}); got ${(printedOut + printedErr).length}`,
       )
-      const jsonPart = printedErr.trim().replace(/^devspec-wake-tail:\s*/, '')
-      const parsed = JSON.parse(jsonPart)
-      assert.equal(parsed.note_write_failed, true)
-      assert.equal(parsed.omitted_due_to_shell_limit, true)
-      assert.equal(parsed.omitted_count, 1)
-      assert.ok(parsed.actual_chars > 4_000)
-      assert.match(parsed.recovery, /~\/\.devspec\/notes/)
+      assert.ok(page.pickup_diagnostic_note?.file, 'must save the original oversized refusal to a preflight-reserved slot')
+      assert.ok(
+        printedErr.includes(page.pickup_diagnostic_note.command),
+        `stderr must include the exact read command for the original refusal; got: ${printedErr}`,
+      )
+      const savedOriginal = fs.readFileSync(page.pickup_diagnostic_note.file, 'utf8')
+      assert.match(savedOriginal, /turn_busy_midflight_unwritable/, 'saved file must preserve refusal code verbatim')
+      assert.match(savedOriginal, /blk-wake-midflight/, 'saved file must preserve blocking_items verbatim')
+      assert.match(savedOriginal, /field_119/, 'saved file must preserve every field of the oversized blocking record')
     } finally {
       for (const [k, v] of Object.entries(prevTmp)) {
         if (v === undefined) delete process.env[k]
         else process.env[k] = v
       }
     }
+  })
+
+  it('stepDeliveryHook retains inner_note_pending when finishing a reclaimed outer note while its inner wake_in_note is temporarily unavailable, and triggers pickup once the inner note returns (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const INNER_MSG = '33333333-3333-4333-8333-3333333333f1'
+    const INNER_TURN = '77777777-7777-4777-8777-7777777777f1'
+    const OTHER_MSG = '33333333-3333-4333-8333-3333333333f2'
+    const OTHER_TURN = '77777777-7777-4777-8777-7777777777f2'
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+    const handedPath = path.join(stepsFolder, 'handed.json')
+
+    // Outer note 1 carries an inner wake_in_note pointer.
+    const innerBatch = ownerBatch('Reclaimed inner note command', { messageId: INNER_MSG, turnId: INNER_TURN })
+    const innerNote = writeNote(wakeLines(buildOwnerMessageEvents(innerBatch)), { home })
+    const innerNoteFile = noteFiles(home, innerNote.id)[0]
+    const savedInnerContent = fs.readFileSync(innerNoteFile, 'utf8')
+    const outerEvents = [
+      { type: 'wake_in_note', carries: ['owner_message'], read: innerNote.command, note: innerNote.id },
+    ]
+    holdForNextStep(CONN, innerBatch, outerEvents, { dir })
+    const handOver1 = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+    const outerNote1Id = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOver1).additional_context)[1]
+    const outer1Json = fs.readFileSync(handedPath, 'utf8')
+    fs.rmSync(handedPath, { force: true })
+
+    // Parallel hook hands over a second note into HANDED, then hook 1 dies leaving outer1 as a dead taken file.
+    const otherBatch = ownerBatch('Other command', { messageId: OTHER_MSG, turnId: OTHER_TURN })
+    holdForNextStep(CONN, otherBatch, buildOwnerMessageEvents(otherBatch), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+      { home, dir, listenerActive: () => true },
+    )
+    // Remove HANDED? No, keep HANDED with otherBatch (or read it) and put outer1 as dead taken file:
+    // Actually simulate exact scenario where HANDED exists (so reclaimAbandoned moves outer1 to retry-*.json),
+    // AND remove innerNoteFile before the agent finishes reading outerNote1Id!
+    fs.writeFileSync(path.join(stepsFolder, 'handed.json.taken-99999999-deadbeef'), outer1Json, { mode: 0o600 })
+    fs.rmSync(innerNoteFile, { force: true })
+
+    const picked = []
+    const spyStart = async ({ commands }) => {
+      picked.push(commands.map((c) => c.messageId))
+      return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+    }
+    const outer1Parts = noteFiles(home, outerNote1Id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+    for (const partCall of outer1Parts) {
+      await stepDeliveryHook(partCall, { home, dir, listenerActive: () => true, startCommands: spyStart })
+    }
+    assert.equal(picked.length, 0, 'unavailable inner note must not trigger pickup yet')
+    const afterHanded = JSON.parse(fs.readFileSync(handedPath, 'utf8'))
+    assert.equal(afterHanded.inner_note_pending, true, 'inner_note_pending MUST be retained on HANDED after reading reclaimed outer note')
+
+    // Restore the inner note, run a step to register wake-note-<innerId>.json, then read the inner note whole!
+    fs.writeFileSync(innerNoteFile, savedInnerContent)
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo retry' }, tool_output: 'retry' },
+      { home, dir, listenerActive: () => true, startCommands: spyStart },
+    )
+    const innerParts = noteFiles(home, innerNote.id).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+    for (const partCall of innerParts) {
+      await stepDeliveryHook(partCall, { home, dir, listenerActive: () => true, startCommands: spyStart })
+    }
+    assert.equal(picked.length, 1, 'reading the restored inner note MUST trigger pickup')
+    assert.ok(picked[0].includes(INNER_MSG))
   })
 })
