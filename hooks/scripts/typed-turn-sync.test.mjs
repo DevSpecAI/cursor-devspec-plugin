@@ -244,7 +244,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       },
       callComplete: async (args) => {
         completed.push(args)
-        return { ok: true }
+        return { phase: 'done', closed_as: 'completed' }
       },
       patchState: (patch) => { patched = patch; return true },
       dir,
@@ -1220,7 +1220,7 @@ describe('typed-turn-sync (item da03801e)', () => {
         ],
       },
     })
-    fs.writeFileSync(transcriptPath, `${typedRow('Start known job')}\n${otherJobWake}\n`)
+    fs.writeFileSync(transcriptPath, `${typedRow('Start known job')}\n${turnEndedRow()}\n${otherJobWake}\n`)
 
     const res = await syncTypedTurnFromTranscript({
       connectionId: CONN,
@@ -2895,6 +2895,103 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(after.joined.has(CMD_BOB), true, 'Bob’s request must be carried in joined')
     assert.equal(after.launches.get('bob-late-during-sched')?.notified, true, 'Bob’s launch must be marked notified')
     assert.ok(turnAmbiguity(after)?.length === 2, 'two-person ambiguity must be detected')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'writes must ask which person they serve instead of stamping Alice alone')
+  })
+
+  it('finishIdleRequests rejects an unrecognized report_complete reply without erasing local_turn or closing the request (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const TYPED = '11111111-1111-4111-8111-1111111111f6'
+    const ATTEMPT = '99999999-9999-4999-8999-9999999999f6'
+    appendRequestEvent(CONN, { op: 'open', id: TYPED, kind: 'typed_prompt' }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: TYPED }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Finish this turn')}\n${turnEndedRow()}\n`)
+
+    const state = {
+      session_id: 'sess-idle-unrec',
+      local_turn: { attempt_id: ATTEMPT, session_id: 'sess-idle-unrec' },
+    }
+    let patched = null
+    let closeCalls = 0
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async () => ({ ok: true }),
+      callRequest: async () => { closeCalls += 1; return { status: 'closed' } },
+      patchState: (patch) => { patched = patch; return true },
+      dir,
+      log: () => {},
+    })
+    assert.equal(res.localCompleted, false)
+    assert.deepEqual(res.closed, [])
+    assert.equal(res.localCompleteRefusal?.code, 'unrecognized_complete_response')
+    assert.equal(patched, null, 'must NOT clear local_turn retry state on unconfirmed report_complete')
+    assert.equal(closeCalls, 0, 'must NOT close request when report_complete was unconfirmed')
+    assert.equal(readRequestState(CONN, { dir }).current, TYPED, 'must NOT erase current foreground on unconfirmed completion')
+  })
+
+  it('preserves a live terminal-typed request across an unmatched mid-turn notification so the second person joins once its launch lands (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f7'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+
+    // Turn 1 starts with Bob's terminal-typed prompt, and Alice's background notification
+    // arrives mid-turn (no turn_ended) BEFORE Alice's launch record lands in .requests.jsonl!
+    const bobRow = typedRow('Bob types a live terminal prompt')
+    const aliceNotifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>alice-late-mid-typed</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceNotifRow}\n`)
+
+    const memo = {}
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(pass1.action, 'not_typed_live')
+    const afterPass1 = readRequestState(CONN, { dir })
+    assert.ok(afterPass1.current, 'Bob’s live typed_prompt must NOT be cleared by an unmatched mid-turn notification')
+    assert.equal(afterPass1.open.get(afterPass1.current)?.kind, 'typed_prompt')
+    const bobTypedId = afterPass1.current
+
+    // Alice's launch record lands in .requests.jsonl afterward!
+    appendRequestEvent(
+      CONN,
+      { op: 'launch', key: 'alice-late-mid-typed', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] },
+      { dir },
+    )
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('typed prompt already open') },
+      dir,
+      memo,
+    })
+    assert.equal(pass2.action, 'restored_wake_request')
+    assert.equal(pass2.midTurn, true, 'Alice’s late mid-turn completion must JOIN Bob’s live typed prompt')
+    const afterPass2 = readRequestState(CONN, { dir })
+    assert.equal(afterPass2.current, bobTypedId, 'Bob’s live typed prompt stays foreground current')
+    assert.equal(afterPass2.joined.has(CMD_ALICE), true, 'Alice’s request must join the live typed turn')
+    assert.equal(afterPass2.launches.get('alice-late-mid-typed')?.notified, true)
+    assert.ok(turnAmbiguity(afterPass2)?.length === 2)
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny, 'writes must ask which person they serve instead of stamping Alice alone')
   })

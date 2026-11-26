@@ -276,6 +276,24 @@ export function refusalFromResponse(res) {
   return null
 }
 
+const CONFIRMED_COMPLETE_OUTCOMES = new Set(['completed', 'stopped', 'already_finalized', 'nothing_open'])
+const CONFIRMED_CLOSED_AS = new Set(['completed', 'stopped', 'done'])
+
+/**
+ * Whether a `report_complete` reply positively confirms DevSpec closed (or had already
+ * finalized) the attempt (requirement 3ea2b201). Rejects empty, bare `{ ok: true }`,
+ * or unexpected replies so idle cleanup keeps local_turn queued for retry instead of
+ * erasing retry state and closing the request.
+ */
+function isConfirmedCompleteResponse(res) {
+  if (!res || typeof res !== 'object') return false
+  if (res.phase === 'done') return true
+  if (res.already_finalized === true) return true
+  if (typeof res.closed_as === 'string' && CONFIRMED_CLOSED_AS.has(res.closed_as)) return true
+  if (typeof res.outcome === 'string' && CONFIRMED_COMPLETE_OUTCOMES.has(res.outcome)) return true
+  return false
+}
+
 /**
  * Process-local retry cache for requests that DevSpec already opened (`status: 'open'`)
  * when local `appendRequestEvent` failed transiently. Keyed by resolved dir, connection
@@ -1494,13 +1512,25 @@ export async function syncTypedTurnFromTranscript({
   // a prior background wake — even if an unnotified background job or scheduled run exists —
   // unless this wake was explicitly restored by host promptArrival (`currentFromWake`) or
   // carried an explicit `<task-notification>` handled above (decisions 2fcd26bd / ce71a72b).
+  const hasPendingUnmatchedNotificationId =
+    active.kind === 'other' && notifiedKeys(active.rawText).length > 0
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
     if (reqState.current === NO_REQUEST) return true
     if (reqState.currentFromWake || reqState.currentBoundByWake) return true
     const info = reqState.open.get(reqState.current)
     if (!info) return false
-    return info.kind === 'typed_prompt' || (info.kind === 'command' && info.answered === true)
+    if (info.kind === 'typed_prompt') {
+      // Preserve a live terminal-typed turn when a mid-turn row (such as an unmatched
+      // `<task-notification>` whose launch record has not landed yet) arrives in the
+      // SAME live turn without an intervening `turn_ended`, so once the launch lands
+      // the notification joins the typed turn instead of replacing it (ce71a72b).
+      if (!active.precededByTurnEnded && active.liveTurnTypedKey) {
+        return false
+      }
+      return true
+    }
+    return info.kind === 'command' && info.answered === true
   }
 
   if (active.kind !== 'typed') {
@@ -1526,8 +1556,6 @@ export async function syncTypedTurnFromTranscript({
         // out of `seenTranscriptTurns` (both when preserving a foreground wake AND when
         // clearing stale foreground state) so appending the launch record later re-runs
         // sync (via `reqStamp`) and reconciles + joins the notification (3ea2b201 / ce71a72b).
-        const hasPendingUnmatchedNotificationId =
-          active.kind === 'other' && notifiedKeys(active.rawText).length > 0
         if (reqState.currentFromWake) {
           // Preserve attribution ONLY for a wake explicitly restored via promptArrival.
           if (hasPendingUnmatchedNotificationId) {
@@ -1663,6 +1691,14 @@ export async function finishIdleRequests({
         if (refused) {
           localCompleteRefusal = refused
           log(`typed-turn-sync: idle report_complete refused for ${connectionId}: ${JSON.stringify(refused)}\n`)
+        } else if (!isConfirmedCompleteResponse(res)) {
+          localCompleteRefusal = {
+            code: 'unrecognized_complete_response',
+            retryable: true,
+            error: 'report_complete returned an unrecognized response without a completion confirmation.',
+            response: res ?? null,
+          }
+          log(`typed-turn-sync: idle report_complete returned unrecognized response for ${connectionId}: ${JSON.stringify(localCompleteRefusal)}\n`)
         } else {
           localCompleted = true
           if (typeof patchState === 'function') patchState({ local_turn: null })
