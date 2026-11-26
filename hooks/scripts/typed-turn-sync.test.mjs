@@ -4339,4 +4339,107 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.match(stamped.deny, /--terminal/)
     assert.match(stamped.deny, /msg-alice-summary/)
   })
+
+  it('ended-turn pending-open flush does NOT mark transcript_turn seen when removing .pending-opens.json fails, and completes cleanly on retry (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555fa'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Ended turn whose pending-open cleanup fails')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const origRmSync = fs.rmSync
+    fs.rmSync = (targetPath, ...rest) => {
+      if (String(targetPath) === sidecar) {
+        throw Object.assign(new Error('EPERM removing pending-opens.json'), { code: 'EPERM' })
+      }
+      return origRmSync(targetPath, ...rest)
+    }
+    const memo = {}
+    try {
+      const pass1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { throw new Error('must not reopen') },
+        dir,
+        memo,
+      })
+      assert.equal(pass1.action, 'open_write_failed')
+      assert.equal(memo.synced, false)
+      assert.equal(
+        readRequestState(CONN, { dir }).seenTranscriptTurns.has(turnKey),
+        false,
+        'flushPendingLocalOpenEntry MUST NOT mark transcript_turn seen when deleting .pending-opens.json fails',
+      )
+    } finally {
+      fs.rmSync = origRmSync
+    }
+
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('must not reopen') },
+      dir,
+      memo,
+    })
+    assert.equal(pass2.action, 'not_typed_live')
+    assert.equal(fs.existsSync(sidecar), false)
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.get(turnKey), RECOVERED_REQ)
+  })
+
+  it('clears an ended prior terminal prompt when an unrelated non-wake row followed by a summary row arrives after turn_ended (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const bobRow = typedRow('Bob ended terminal prompt before unrelated wake and summary')
+    const unrelatedOther = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'System notice: unrelated scheduled event with no launch record' }] },
+    })
+    const summaryRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<available_subagent_types>summary</available_subagent_types>\n<dynamic_tool_catalog>tools</dynamic_tool_catalog>',
+          },
+        ],
+      },
+    })
+
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+    const memo = {}
+    const p1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(p1.action, 'opened')
+    assert.equal(readRequestState(CONN, { dir }).current, p1.requestId)
+
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${turnEndedRow()}\n${unrelatedOther}\n${summaryRow}\n`)
+    const p2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(p2.action, 'cleared_for_wake')
+    assert.equal(readRequestState(CONN, { dir }).current, null, 'ended Bob prompt MUST NOT stay current across unrelated turn + summary')
+  })
 })

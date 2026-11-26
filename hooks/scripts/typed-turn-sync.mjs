@@ -658,16 +658,19 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       savePendingLocalOpen(dir, connectionId, entry)
     }
   }
+  const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
+  if (!removed.ok) return false
   if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
     const boundOk = appendRequestEvent(
       connectionId,
       { op: 'transcript_turn', key: entry.turnKey, ref: entry.requestId },
       { dir },
     )
-    if (!boundOk) return false
+    if (!boundOk) {
+      savePendingLocalOpen(dir, connectionId, entry)
+      return false
+    }
   }
-  const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
-  if (!removed.ok) return false
   clearFailedTypedTurn(dir, connectionId, entry.turnKey)
   return true
 }
@@ -1050,7 +1053,6 @@ export async function syncTypedTurnFromTranscript({
         const entry = { requestId, requestedBy, turnKey: queuedKey }
         savePendingLocalOpen(dir, connectionId, entry)
         const persisted = flushPendingLocalOpenEntry(connectionId, dir, pKey, entry)
-        clearFailedTypedTurn(dir, connectionId, queuedKey)
         if (!persisted) {
           return {
             action: 'open_write_failed',
@@ -1058,6 +1060,7 @@ export async function syncTypedTurnFromTranscript({
             key: queuedKey,
           }
         }
+        clearFailedTypedTurn(dir, connectionId, queuedKey)
         return { action: 'opened', requestId, key: queuedKey }
       },
       { deadlineMs },
@@ -1231,7 +1234,21 @@ export async function syncTypedTurnFromTranscript({
         }
         const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir, active)
         const pKey = pendingOpenKey(dir, connectionId, turnKey)
-        const pendingOpen = getPendingLocalOpen(dir, connectionId, turnKey)
+        const pendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+        if (pendingLookup.readError) {
+          sawRequestLogReadError = true
+          log(
+            `typed-turn-sync: pending-opens retry queue unreadable in live sync for ${connectionId} (${turnKey}): ${pendingLookup.readError?.message ?? 'read failed'}\n`,
+          )
+          return {
+            action: 'pending_opens_unreadable',
+            key: turnKey,
+            error: pendingLookup.readError?.message ?? 'read failed',
+          }
+        }
+        const pendingOpen =
+          pendingLookup.entries.find(([, entry]) => entry?.turnKey === turnKey)?.[1] ??
+          getPendingLocalOpen(dir, connectionId, turnKey)
         const failPendingOpenCleanup = (entry, error) => {
           const refusal = {
             code: 'pending_open_cleanup_failed',
@@ -1764,6 +1781,9 @@ export async function syncTypedTurnFromTranscript({
       return flush.result
     }
     if (memo && canMarkSynced()) markMemoSynced()
+    if (lastSameTurnWakeOutcome) {
+      return lastSameTurnWakeOutcome
+    }
     if (sameTurnTypedOutcome && sameTurnTypedOutcome.action !== 'already_synced') {
       return sameTurnTypedOutcome
     }
@@ -1801,13 +1821,18 @@ export async function syncTypedTurnFromTranscript({
     active.kind === 'other' && notifiedKeys(active.rawText).length > 0
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
-    // A mid-turn Cursor `summary` row inside an active terminal prompt or background-wake
-    // turn (with no intervening `turn_ended`) is housekeeping, NOT an unrelated wake: it
-    // must never clear the live turn's requester or joined wake attribution (ce71a72b).
+    // A mid-turn Cursor `summary` row inside an active terminal prompt OR a turn whose
+    // own background wake bound `reqState.current` (with no intervening `turn_ended`) is
+    // housekeeping, NOT an unrelated wake: preserve the live turn's attribution while
+    // still clearing an ended prior turn's `typed_prompt` when an unrelated `other` row +
+    // `summary` arrives after `turn_ended` (ce71a72b).
+    const hasSameTurnBoundWake = sameTurnWakeRows.some(
+      (wakeRow) => wakeRow?.key && reqState.seenTranscriptTurns.get(wakeRow.key) === reqState.current,
+    )
     if (
       active.kind === 'summary' &&
       !active.precededByTurnEnded &&
-      (active.liveTurnTypedKey || sameTurnWakeRows.length > 0)
+      (active.liveTurnTypedKey || hasSameTurnBoundWake)
     ) {
       return false
     }
