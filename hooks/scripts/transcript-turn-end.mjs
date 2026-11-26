@@ -1069,6 +1069,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let lastNonResumedText = null
   let sawTurnEndedSinceLastNonResumed = false
   let lastNonResumedPrecededByTurnEnded = false
+  let sameTurnTypedRowIndex = -1
   const userRows = []
   let start = 0
   while (start < bytes.length) {
@@ -1103,10 +1104,13 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           lastUser = userDigest
           const rawText = userRowText(row)
           const kind = userRowKind(rawText)
+          const rowIndex = userRows.length
           if (kind !== 'resumed') {
             lastNonResumedText = rawText
             lastNonResumedPrecededByTurnEnded = sawTurnEndedSinceLastNonResumed
             sawTurnEndedSinceLastNonResumed = false
+            if (kind === 'typed') sameTurnTypedRowIndex = rowIndex
+            else if (kind === 'command_turn' || kind === 'timestamp') sameTurnTypedRowIndex = -1
           }
           userRows.push({ start, kind, digest: lastUser })
         }
@@ -1124,6 +1128,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           lastParsedRow = row
           if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
             sawTurnEndedSinceLastNonResumed = true
+            sameTurnTypedRowIndex = -1
           }
         }
       }
@@ -1169,6 +1174,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     userRows,
     lastNonResumedText,
     lastNonResumedPrecededByTurnEnded,
+    sameTurnTypedRowIndex,
   }
 }
 
@@ -1187,8 +1193,10 @@ function extractUserQueryText(rawText) {
  * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
  * Only intra-turn `resumed` rows are skipped; a `timestamp`-only wake row is returned
  * as `kind: 'timestamp'` so it never falls back to an earlier typed prompt.
- * Also reports all `typed` user row keys in chronological order (`typedTurnKeys`) and
- * whether a `turn_ended` row separated the latest non-resumed row from the turn before it.
+ * Also reports all `typed` user row keys in chronological order (`typedTurnKeys`),
+ * whether a `turn_ended` row separated the latest non-resumed row from the turn before it,
+ * and `liveTurnTypedKey` when an in-progress non-typed row (`kind: 'other'`, e.g. a
+ * mid-turn `<task-notification>`) shares its live turn with an earlier `typed` row.
  * Returns `{ budgetExhausted: true }` when `deadlineMs` expires before a clean read
  * completes, or null when the transcript cannot be read or does not exist yet.
  */
@@ -1211,12 +1219,23 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
       lastRow = row
     }
   }
+  const sameTurnIdx = typeof read.sameTurnTypedRowIndex === 'number' ? read.sameTurnTypedRowIndex : -1
+  const liveTurnTypedKey =
+    !read.end &&
+    lastRow &&
+    lastRow.kind === 'other' &&
+    !read.lastNonResumedPrecededByTurnEnded &&
+    sameTurnIdx >= 0 &&
+    sameTurnIdx < read.userRows.length
+      ? `${conversation}#${sameTurnIdx + 1}#${read.userRows[sameTurnIdx].digest}`
+      : null
   const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
   return {
     kind: lastRow ? lastRow.kind : 'none',
     ended: Boolean(read.end),
     key: lastRow ? `${conversation}#${lastIndex}#${lastRow.digest}` : null,
     typedTurnKeys,
+    liveTurnTypedKey,
     precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
     stamp: read.stamp,
     turns: read.turns,

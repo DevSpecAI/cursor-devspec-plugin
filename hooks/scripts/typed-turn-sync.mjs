@@ -938,11 +938,231 @@ export async function syncTypedTurnFromTranscript({
     return true
   }
 
-  // Queue every previously unseen typed turn (not covered by an open hook-created
-  // typed_prompt and not the live typed turn being opened right below) BEFORE
+  const syncLiveTypedTurn = async (turnKey) =>
+    withTypedSyncLock(
+      connectionId,
+      dir,
+      async () => {
+        const reqState = readRequestState(connectionId, { dir })
+        if (reqState.seenTranscriptTurns.has(turnKey)) {
+          return { action: 'already_synced', key: turnKey, ref: reqState.seenTranscriptTurns.get(turnKey) }
+        }
+
+        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
+        const deterministicId = deterministicTypedTurnRequestId(connectionId, turnKey)
+        const alreadyOpenForTurn =
+          reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
+        const unboundHook = unboundOpenTypedPrompt(reqState)
+        const safeUnboundHook =
+          unboundHook && !isFailedTurnDeterministicId(dir, connectionId, unboundHook, turnKey)
+            ? unboundHook
+            : null
+        const existingTyped = safeUnboundHook ?? alreadyOpenForTurn
+        let requestId = existingTyped
+        let openedNow = false
+        let openRefusal = null
+        if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
+          const currentWritten = appendRequestEvent(
+            connectionId,
+            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+            { dir },
+          )
+          if (!currentWritten) {
+            return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+          }
+        }
+        const pKey = pendingOpenKey(dir, connectionId, turnKey)
+        const pendingOpen = !requestId ? getPendingLocalOpen(dir, connectionId, turnKey) : null
+
+        if (pendingOpen) {
+          const persisted = appendRequestEvent(
+            connectionId,
+            {
+              op: 'open',
+              id: pendingOpen.requestId,
+              kind: 'typed_prompt',
+              ...(pendingOpen.requestedBy ? { requested_by: pendingOpen.requestedBy } : {}),
+            },
+            { dir },
+          )
+          if (!persisted) {
+            return {
+              action: 'open_write_failed',
+              requestId: pendingOpen.requestId,
+              key: turnKey,
+              midTurn,
+              refusal: {
+                code: 'local_open_persist_failed',
+                error: 'DevSpec opened request but local open record failed to persist',
+                request_id: pendingOpen.requestId,
+              },
+            }
+          }
+          deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
+          requestId = pendingOpen.requestId
+          openedNow = true
+          const currentWritten = appendRequestEvent(
+            connectionId,
+            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+            { dir },
+          )
+          if (!currentWritten) {
+            return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+          }
+        }
+
+        if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
+          const opened = await openTypedRequestPreservingRefusal({
+            connectionId,
+            callRequest: effectiveCallRequest,
+            dir,
+            id: deterministicId,
+          })
+          if (opened.ok) {
+            requestId = opened.requestId
+            openedNow = true
+            const currentWritten = appendRequestEvent(
+              connectionId,
+              midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+              { dir },
+            )
+            if (!currentWritten) {
+              return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+            }
+          } else if (opened.localPersistFailed) {
+            if (opened.requestId) {
+              savePendingLocalOpen(dir, connectionId, {
+                requestId: opened.requestId,
+                requestedBy: opened.requestedBy ?? null,
+                turnKey,
+              })
+            }
+            log(
+              `typed-turn-sync: local open_request persistence failed for ${connectionId} (${turnKey}): ${JSON.stringify(opened.refusal)}\n`,
+            )
+            return {
+              action: 'open_write_failed',
+              requestId: opened.requestId,
+              key: turnKey,
+              midTurn,
+              refusal: opened.refusal,
+            }
+          } else {
+            openRefusal = opened.refusal
+            log(
+              `typed-turn-sync: open_request failed for ${connectionId} (${turnKey}): ${JSON.stringify(openRefusal)}\n`,
+            )
+          }
+        }
+
+        if (requestId) {
+          // Verify the request actually exists in local open state before admitting or
+          // binding the transcript turn (requirement 3ea2b201).
+          if (!readRequestState(connectionId, { dir }).open.has(requestId)) {
+            return {
+              action: 'open_write_failed',
+              requestId,
+              key: turnKey,
+              midTurn,
+            }
+          }
+          // Admit the terminal turn with the connection capability when attached, matching
+          // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
+          // Only mark the transcript turn synced once admission, state persistence, and binding
+          // write all succeed; on refusal or write failure, preserve details and retry next tick.
+          const sessionId = state?.session_id || null
+          const scope =
+            !midTurn && sessionId && connectionCapability && typeof effectiveCallPickup === 'function' && !state?.local_turn
+              ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
+              : null
+
+          if (scope) {
+            const admission = await admitLocalTurnPreservingRefusal({
+              scope,
+              previousAttemptId: state?.local_turn?.attempt_id ?? null,
+              callPickup: effectiveCallPickup,
+            })
+            if (!admission.ok) {
+              log(
+                `typed-turn-sync: local turn admission failed for ${connectionId} (${turnKey}): ${JSON.stringify(admission.refusal)}\n`,
+              )
+              return {
+                action: 'admission_failed',
+                requestId,
+                key: turnKey,
+                midTurn,
+                refusal: admission.refusal,
+              }
+            }
+            if (typeof patchState === 'function') {
+              let saved = false
+              try {
+                saved = patchState({ local_turn: admission.admitted }) === true
+              } catch (error) {
+                log(
+                  `typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,
+                )
+                saved = false
+              }
+              if (!saved) {
+                log(`typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey})\n`)
+                return {
+                  action: 'state_write_failed',
+                  requestId,
+                  key: turnKey,
+                  midTurn,
+                }
+              }
+            }
+          }
+
+          const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: turnKey, ref: requestId }, { dir })
+          if (!bound) {
+            return {
+              action: 'binding_write_failed',
+              requestId,
+              key: turnKey,
+              midTurn,
+            }
+          }
+          return {
+            action: openedNow ? 'opened' : 'adopted_hook_request',
+            requestId,
+            key: turnKey,
+            midTurn,
+          }
+        }
+
+        // Could not open a typed_prompt right now (offline / no capability / DevSpec refused):
+        // still clear any stale foreground request so writes go out unstamped and DevSpec
+        // resolves who asked from the connection rather than stamping a closed command.
+        if (!midTurn && reqState.current !== null) {
+          appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+        }
+        return {
+          action: 'cleared_stale',
+          key: turnKey,
+          ...(openRefusal ? { refusal: openRefusal } : {}),
+        }
+      },
+      { deadlineMs },
+    )
+
+  // Live typed prompt key owned by the currently running turn: either `active.key` itself
+  // (when `active.kind === 'typed'`) or `active.liveTurnTypedKey` (when a mid-turn
+  // `<task-notification>` arrived in the SAME live turn without an intervening `turn_ended`).
+  const liveTypedKey =
+    !active.ended && active.kind === 'typed'
+      ? active.key
+      : !active.ended && active.liveTurnTypedKey
+        ? active.liveTurnTypedKey
+        : null
+
+  // Queue every previously unseen ENDED/historical typed turn (not covered by an open
+  // hook-created typed_prompt and not `liveTypedKey` for this live turn) BEFORE
   // advancing sync state so two (or more) typed turns that finish between poller
   // reads are never skipped or marked synced prematurely (requirement 3ea2b201).
-  if (!enqueueUnseenTypedTurns(!active.ended && active.kind === 'typed' ? active.key : null)) {
+  if (!enqueueUnseenTypedTurns(liveTypedKey)) {
     return { action: 'binding_write_failed', key: active.key, active }
   }
 
@@ -960,14 +1180,57 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'not_typed_live', active }
   }
 
+  // If a mid-turn non-typed row (e.g. a `<task-notification>`) arrived in the SAME live
+  // turn as an unseen or admission-pending terminal prompt (`active.liveTurnTypedKey`),
+  // run full live typed-turn registration + room admission for `liveTypedKey` FIRST so:
+  //  - a newly typed prompt becomes `current` BEFORE the background wake joins it
+  //    (keeping both requesters distinct rather than stamping the wake's requester alone — ce71a72b), and
+  //  - a previously refused room admission is retried cleanly rather than sent through
+  //    historical recovery and marked synced without admission (requirement 3ea2b201).
+  let sameTurnTypedOutcome = null
+  if (active.kind !== 'typed' && liveTypedKey && !readRequestState(connectionId, { dir }).seenTranscriptTurns.has(liveTypedKey)) {
+    sameTurnTypedOutcome = await syncLiveTypedTurn(liveTypedKey)
+    if (!sameTurnTypedOutcome) return { action: 'lock_busy', key: liveTypedKey }
+    if (
+      sameTurnTypedOutcome.action === 'opened' ||
+      sameTurnTypedOutcome.action === 'already_synced' ||
+      sameTurnTypedOutcome.action === 'adopted_hook_request'
+    ) {
+      clearFailedTypedTurn(dir, connectionId, liveTypedKey)
+    } else {
+      if (
+        sameTurnTypedOutcome.action === 'cleared_stale' ||
+        sameTurnTypedOutcome.action === 'admission_failed' ||
+        sameTurnTypedOutcome.action === 'state_write_failed' ||
+        sameTurnTypedOutcome.action === 'binding_write_failed'
+      ) {
+        recordFailedTypedTurn(dir, connectionId, liveTypedKey)
+      }
+      // If the live terminal prompt could NOT even be opened/retained locally, do not
+      // allow a same-turn background notification to overwrite foreground current with
+      // another requester alone; keep the turn unsynced and return the failure for retry.
+      const stateAfterLive = readRequestState(connectionId, { dir })
+      const liveRequestActive =
+        sameTurnTypedOutcome.requestId &&
+        stateAfterLive.open.has(sameTurnTypedOutcome.requestId) &&
+        stateAfterLive.current === sameTurnTypedOutcome.requestId
+      if (!liveRequestActive) {
+        return sameTurnTypedOutcome
+      }
+    }
+  }
+
   const initial = readRequestState(connectionId, { dir })
   if (initial.seenTranscriptTurns.has(active.key)) {
-    const flush = await retryQueuedFailedTurn({ excludeKey: null })
+    const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey })
     if (flush.ran) {
-      if (memo && flush.ok) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) memo.synced = true
       return flush.result
     }
     if (memo && canMarkSynced()) memo.synced = true
+    if (sameTurnTypedOutcome && sameTurnTypedOutcome.action !== 'already_synced') {
+      return sameTurnTypedOutcome
+    }
     return { action: 'already_synced', key: active.key, ref: initial.seenTranscriptTurns.get(active.key) }
   }
 
@@ -1055,7 +1318,7 @@ export async function syncTypedTurnFromTranscript({
         restored.action === 'already_carried_wake' ||
         restored.action === 'already_synced'
       ) {
-        const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+        const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
         if (memo && flush.ok && canMarkSynced()) memo.synced = true
         if (flush.ran) return { ...restored, retriedFailedTurn: flush.result }
       }
@@ -1079,7 +1342,7 @@ export async function syncTypedTurnFromTranscript({
 
   if (active.kind !== 'typed') {
     if (!isClearableForUnrelatedWake(initial)) {
-      const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+      const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
       if (memo && flush.ok && canMarkSynced()) memo.synced = true
       if (flush.ran) return { action: 'not_typed_live', active, retriedFailedTurn: flush.result }
       return { action: 'not_typed_live', active }
@@ -1119,221 +1382,14 @@ export async function syncTypedTurnFromTranscript({
         outcome.action === 'already_synced' ||
         outcome.action === 'not_typed_live')
     ) {
-      const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
+      const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
       if (memo && flush.ok && canMarkSynced()) memo.synced = true
       if (flush.ran) return { ...outcome, retriedFailedTurn: flush.result }
     }
     return outcome ?? { action: 'lock_busy' }
   }
 
-  const result = await withTypedSyncLock(
-    connectionId,
-    dir,
-    async () => {
-      const reqState = readRequestState(connectionId, { dir })
-      if (reqState.seenTranscriptTurns.has(active.key)) {
-        return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
-      }
-
-      const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
-      const deterministicId = deterministicTypedTurnRequestId(connectionId, active.key)
-      const alreadyOpenForTurn =
-        reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
-      const unboundHook = unboundOpenTypedPrompt(reqState)
-      const safeUnboundHook =
-        unboundHook && !isFailedTurnDeterministicId(dir, connectionId, unboundHook, active.key)
-          ? unboundHook
-          : null
-      const existingTyped = safeUnboundHook ?? alreadyOpenForTurn
-      let requestId = existingTyped
-      let openedNow = false
-      let openRefusal = null
-      if (alreadyOpenForTurn && !safeUnboundHook) {
-        const currentWritten = appendRequestEvent(
-          connectionId,
-          midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-          { dir },
-        )
-        if (!currentWritten) {
-          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
-        }
-      }
-      const pKey = pendingOpenKey(dir, connectionId, active.key)
-      const pendingOpen = !requestId ? getPendingLocalOpen(dir, connectionId, active.key) : null
-
-      if (pendingOpen) {
-        const persisted = appendRequestEvent(
-          connectionId,
-          {
-            op: 'open',
-            id: pendingOpen.requestId,
-            kind: 'typed_prompt',
-            ...(pendingOpen.requestedBy ? { requested_by: pendingOpen.requestedBy } : {}),
-          },
-          { dir },
-        )
-        if (!persisted) {
-          return {
-            action: 'open_write_failed',
-            requestId: pendingOpen.requestId,
-            key: active.key,
-            midTurn,
-            refusal: {
-              code: 'local_open_persist_failed',
-              error: 'DevSpec opened request but local open record failed to persist',
-              request_id: pendingOpen.requestId,
-            },
-          }
-        }
-        deletePendingLocalOpen(dir, connectionId, pKey, active.key, pendingOpen.requestId)
-        requestId = pendingOpen.requestId
-        openedNow = true
-        const currentWritten = appendRequestEvent(
-          connectionId,
-          midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-          { dir },
-        )
-        if (!currentWritten) {
-          return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
-        }
-      }
-
-      if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
-        const opened = await openTypedRequestPreservingRefusal({
-          connectionId,
-          callRequest: effectiveCallRequest,
-          dir,
-          id: deterministicId,
-        })
-        if (opened.ok) {
-          requestId = opened.requestId
-          openedNow = true
-          const currentWritten = appendRequestEvent(
-            connectionId,
-            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-            { dir },
-          )
-          if (!currentWritten) {
-            return { action: 'binding_write_failed', requestId, key: active.key, midTurn }
-          }
-        } else if (opened.localPersistFailed) {
-          if (opened.requestId) {
-            savePendingLocalOpen(dir, connectionId, {
-              requestId: opened.requestId,
-              requestedBy: opened.requestedBy ?? null,
-              turnKey: active.key,
-            })
-          }
-          log(
-            `typed-turn-sync: local open_request persistence failed for ${connectionId} (${active.key}): ${JSON.stringify(opened.refusal)}\n`,
-          )
-          return {
-            action: 'open_write_failed',
-            requestId: opened.requestId,
-            key: active.key,
-            midTurn,
-            refusal: opened.refusal,
-          }
-        } else {
-          openRefusal = opened.refusal
-          log(
-            `typed-turn-sync: open_request failed for ${connectionId} (${active.key}): ${JSON.stringify(openRefusal)}\n`,
-          )
-        }
-      }
-
-      if (requestId) {
-        // Verify the request actually exists in local open state before admitting or
-        // binding the transcript turn (requirement 3ea2b201).
-        if (!readRequestState(connectionId, { dir }).open.has(requestId)) {
-          return {
-            action: 'open_write_failed',
-            requestId,
-            key: active.key,
-            midTurn,
-          }
-        }
-        // Admit the terminal turn with the connection capability when attached, matching
-        // `mirror-turn.mjs user_prompt` so claims and replies resolve to the owner at terminal.
-        // Only mark the transcript turn synced once admission, state persistence, and binding
-        // write all succeed; on refusal or write failure, preserve details and retry next tick.
-        const sessionId = state?.session_id || null
-        const scope =
-          !midTurn && sessionId && connectionCapability && typeof effectiveCallPickup === 'function' && !state?.local_turn
-            ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
-            : null
-
-        if (scope) {
-          const admission = await admitLocalTurnPreservingRefusal({
-            scope,
-            previousAttemptId: state?.local_turn?.attempt_id ?? null,
-            callPickup: effectiveCallPickup,
-          })
-          if (!admission.ok) {
-            log(
-              `typed-turn-sync: local turn admission failed for ${connectionId} (${active.key}): ${JSON.stringify(admission.refusal)}\n`,
-            )
-            return {
-              action: 'admission_failed',
-              requestId,
-              key: active.key,
-              midTurn,
-              refusal: admission.refusal,
-            }
-          }
-          if (typeof patchState === 'function') {
-            let saved = false
-            try {
-              saved = patchState({ local_turn: admission.admitted }) === true
-            } catch (error) {
-              log(
-                `typed-turn-sync: failed to persist local_turn state for ${connectionId} (${active.key}): ${error instanceof Error ? error.message : String(error)}\n`,
-              )
-              saved = false
-            }
-            if (!saved) {
-              log(`typed-turn-sync: failed to persist local_turn state for ${connectionId} (${active.key})\n`)
-              return {
-                action: 'state_write_failed',
-                requestId,
-                key: active.key,
-                midTurn,
-              }
-            }
-          }
-        }
-
-        const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: requestId }, { dir })
-        if (!bound) {
-          return {
-            action: 'binding_write_failed',
-            requestId,
-            key: active.key,
-            midTurn,
-          }
-        }
-        return {
-          action: openedNow ? 'opened' : 'adopted_hook_request',
-          requestId,
-          key: active.key,
-          midTurn,
-        }
-      }
-
-      // Could not open a typed_prompt right now (offline / no capability / DevSpec refused):
-      // still clear any stale foreground request so writes go out unstamped and DevSpec
-      // resolves who asked from the connection rather than stamping a closed command.
-      if (!midTurn && reqState.current !== null) {
-        appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
-      }
-      return {
-        action: 'cleared_stale',
-        key: active.key,
-        ...(openRefusal ? { refusal: openRefusal } : {}),
-      }
-    },
-    { deadlineMs },
-  )
+  const result = await syncLiveTypedTurn(active.key)
 
   if (
     result &&

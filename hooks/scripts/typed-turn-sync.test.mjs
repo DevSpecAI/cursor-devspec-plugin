@@ -2264,4 +2264,168 @@ describe('typed-turn-sync (item da03801e)', () => {
       args: { task_id: 'x' },
     })
   })
+
+  it('retries refused room admission for a live typed prompt even after a same-turn background wake arrives instead of marking synced without admission (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111ae'
+    const SESSION = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bg-adm', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+
+    const bobRow = typedRow('Bob live terminal prompt with refused admission')
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>alice-bg-adm</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+
+    const memo = { stamp: null, synced: false }
+    const state = {
+      connection_id: CONN,
+      session_id: SESSION,
+      speech_attachment_id: '55555555-5555-4555-8555-555555555555',
+      attached_at: '2026-11-25T17:00:00.000Z',
+      local_turn: null,
+    }
+    let openCalls = 0
+    let pickupCalls = 0
+    let allowAdmission = false
+    const callRequest = async (args) => {
+      openCalls += 1
+      return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+    }
+    const callPickup = async (args) => {
+      pickupCalls += 1
+      if (!allowAdmission) {
+        throw Object.assign(new Error('Refused by server'), { code: 'turn_busy' })
+      }
+      return {
+        status: 'working',
+        connection_id: CONN,
+        attempt_id: args.attempt_id,
+        expected_session_id: SESSION,
+      }
+    }
+    const patchState = (patch) => {
+      Object.assign(state, patch)
+      return true
+    }
+
+    // Poll 1: opens Bob's request, room admission refused -> stays unsynced.
+    const poll1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      callPickup,
+      patchState,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(poll1.action, 'admission_failed')
+    assert.equal(memo.synced, false)
+    assert.equal(openCalls, 1)
+    assert.equal(pickupCalls, 1)
+    const TYPED_BOB = poll1.requestId
+
+    // Same-turn background wake arrives while admission is STILL refused!
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceWake}\n`)
+    const poll2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      callPickup,
+      patchState,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(poll2.action, 'restored_wake_request')
+    assert.equal(poll2.midTurn, true)
+    assert.equal(openCalls, 1, 'must NOT open a second request for Bob')
+    assert.equal(pickupCalls, 2, 'must retry room admission on Poll 2')
+    assert.equal(memo.synced, false, 'must NOT mark transcript synced while room admission is still refused')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+    const midState = readRequestState(CONN, { dir })
+    assert.equal(midState.current, TYPED_BOB)
+    assert.equal(midState.joined.has(CMD_ALICE), true)
+    assert.ok(turnAmbiguity(midState))
+
+    // Poll 3 (same unchanged transcript, admission now succeeds): retries admission, preserves ambiguity, and ONLY THEN marks synced!
+    allowAdmission = true
+    const poll3 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      callPickup,
+      patchState,
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.notEqual(poll3.action, 'unchanged', 'must NOT return unchanged while admission was pending')
+    assert.equal(pickupCalls, 3, 'must retry and complete room admission on Poll 3')
+    assert.ok(state.local_turn?.attempt_id, 'local_turn admission must be persisted')
+    assert.equal(memo.synced, true)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+    const finalState = readRequestState(CONN, { dir })
+    assert.equal(finalState.current, TYPED_BOB)
+    assert.equal(finalState.joined.has(CMD_ALICE), true, 'retried admission must preserve joined Alice request and ambiguity')
+    assert.ok(turnAmbiguity(finalState))
+  })
+
+  it('opens a live terminal prompt and joins another person’s same-turn background notification when both arrive before the first sync (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111af'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bg-both', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+
+    const bobRow = typedRow('Bob prompt written right before Alice wake')
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>alice-bg-both</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    // Both rows arrive BEFORE the first sync with NO turn_ended between them!
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceWake}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.midTurn, true)
+    const after = readRequestState(CONN, { dir })
+    assert.notEqual(after.current, CMD_ALICE, 'must NOT make Alice’s room request sole current over Bob’s same-turn prompt')
+    assert.equal(after.open.get(after.current)?.kind, 'typed_prompt')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'Alice’s background wake must JOIN Bob’s live typed prompt')
+    assert.ok(turnAmbiguity(after)?.length === 2, 'two-person ambiguity must be preserved')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write must ask which person it serves instead of stamping Alice’s room request')
+    assert.notEqual(stamped.args?.request_ref, CMD_ALICE)
+    assert.equal(memo.synced, true)
+  })
 })
