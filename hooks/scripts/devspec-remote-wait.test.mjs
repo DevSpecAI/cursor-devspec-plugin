@@ -40,9 +40,14 @@ import {
   consumeInboxSlice,
   resolveConnectionsDir,
   resolveOwnerPid,
+  tellRoomWakeHeld,
+  createOneShotRetryStderrWriter,
+  planOneShot,
 } from './devspec-remote-wait.mjs'
+import { CursorMcpRefusal } from './mcp-call.mjs'
+import { readStartedCommandIds } from './command-start.mjs'
 import { REMOTE_WAKE_NOTIFY_PATTERN, wakeLines } from './devspec-wake-file.mjs'
-import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, readNoteText, shellDiagnosticReserve } from './hook-context-budget.mjs'
 import { wakeNotice } from './room-unread.mjs'
 import { SYSTEM_NOTICE_CHANNEL_VERSION, remoteIngressNegotiationArgs } from './devspec-remote-poll.mjs'
 import { canonicalAcceptanceKey } from './remote-ingress-v1.mjs'
@@ -1114,6 +1119,30 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
     const connectionId = randomUUID()
     const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
     const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    const mcpServer = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: JSON.stringify({ outcome: 'picked_up' }) }] },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: 'sess-test',
+        mcp_url: `http://127.0.0.1:${port}/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
     const queuedBatch = canonicalBatch()
     queuedBatch.connection_id = connectionId
     queuedBatch.session_id = 'sess-test'
@@ -1123,7 +1152,7 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
     queuedBatch.acceptance_key = canonicalAcceptanceKey(queuedBatch.ingress.envelope)
     const line = `${JSON.stringify(queuedBatch)}\n`
     fs.writeFileSync(inbox, line)
-    const env = { ...process.env, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    const env = { ...process.env, HOME: dir, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
     delete env.DEVSPEC_MCP_TOKEN
     try {
       const { stdout, stderr, code } = await new Promise((resolve, reject) => {
@@ -1172,6 +1201,94 @@ describe('wait CLI (item e8832794 — queued owner_messages must wake, not throw
       assert.equal(persisted.inbox_cursor_evidence.offset, persisted.inbox_byte_offset)
       assert.equal(inboxCursorEvidenceMatches(inbox, persisted.inbox_byte_offset, persisted.inbox_cursor_evidence), true)
     } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('one-shot wait leaves inbox offset untouched and exits 1 when report_pickup refuses, then advances on retry (3ea2b201)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-pickup-retry-'))
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        const toolName = parsed?.params?.name
+        let payload = { outcome: 'picked_up' }
+        if (toolName === 'report_pickup') {
+          pickupCalls += 1
+          if (pickupCalls === 1) {
+            payload = { ok: false, code: 'pickup_busy', retryable: true, error: 'Try again shortly' }
+          }
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: 'sess-test',
+        mcp_url: `http://127.0.0.1:${port}/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    const queuedBatch = canonicalBatch()
+    queuedBatch.connection_id = connectionId
+    queuedBatch.session_id = 'sess-test'
+    queuedBatch.messages[0].addressee.connection_id = connectionId
+    queuedBatch.ingress.envelope.connection.connection_id = connectionId
+    queuedBatch.ingress.envelope.commands = queuedBatch.messages
+    queuedBatch.acceptance_key = canonicalAcceptanceKey(queuedBatch.ingress.envelope)
+    const line = `${JSON.stringify(queuedBatch)}\n`
+    fs.writeFileSync(inbox, line)
+    const env = { ...process.env, HOME: dir, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    delete env.DEVSPEC_MCP_TOKEN
+    const runWait = () =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { stdout += d.toString() })
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => {
+          child.kill()
+          reject(new Error(`wait CLI timed out\nstderr=${stderr}\nstdout=${stdout}`))
+        }, 15000)
+        child.on('error', (err) => { clearTimeout(timer); reject(err) })
+        child.on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }) })
+      })
+    try {
+      const first = await runWait()
+      assert.equal(first.code, 1, 'must exit non-zero on pickup refusal')
+      assert.match(first.stderr, /pickup_busy/)
+      const afterFirst = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(afterFirst.inbox_byte_offset ?? 0, 0, 'inbox offset must not advance past a refused pickup')
+
+      const second = await runWait()
+      assert.equal(second.code, 0, second.stderr)
+      const afterSecond = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(afterSecond.inbox_byte_offset, Buffer.byteLength(line, 'utf8'))
+      assert.equal(pickupCalls, 2)
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -1495,12 +1612,17 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
   const recallBlock = `== PROACTIVE PROJECT RECALL ==\n${Array.from({ length: 16 }, (_, n) => `- [MEMORY · decision] **Decision ${n}** — the settings page keeps its redirect`).join('\n')}`
 
   /** A home whose room holds unread messages, so the command's wake carries a room_unread note. */
-  function homeWithUnreadRoom() {
+  function homeWithUnreadRoom(mcpUrl = null) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-frozen-wakes-'))
     const dir = path.join(home, '.devspec', 'remote-control', 'connections')
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.json`), JSON.stringify({
-      enabled: true, connection_id: CANONICAL_CONNECTION, session_id: ROOM, local_id: 'chat-frozen', agent_name: 'Cursor',
+      enabled: true,
+      connection_id: CANONICAL_CONNECTION,
+      session_id: ROOM,
+      local_id: 'chat-frozen',
+      agent_name: 'Cursor',
+      ...(mcpUrl ? { mcp_url: mcpUrl, token: 'test-token' } : {}),
     }), { mode: 0o600 })
     fs.writeFileSync(path.join(dir, `${CANONICAL_CONNECTION}.${ROOM}.transcript-state.json`), JSON.stringify({ version: 1, self_label: 'Cursor · Amber Dolphin' }), { mode: 0o600 })
     const lines = Array.from({ length: 6 }, (_, n) => ({
@@ -1526,7 +1648,20 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
   }
 
   it('prints the rest of it as frozen when built, even after the room-unread context clears, before the cursor moves', async () => {
-    const room = homeWithUnreadRoom()
+    const mcpServer = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: JSON.stringify({ outcome: 'picked_up' }) }] },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    const room = homeWithUnreadRoom(`http://127.0.0.1:${port}/mcp`)
     try {
       const state = () => JSON.parse(fs.readFileSync(path.join(room.dir, `${CANONICAL_CONNECTION}.json`), 'utf8'))
       // Size the command so that with the room-unread note its wake needs a pointer wake of
@@ -1536,10 +1671,11 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
       const inbox = path.join(room.dir, `${CANONICAL_CONNECTION}.inbox.jsonl`)
       const batchFor = (body) => canonicalBatch(fixtureCommand(body), { session_id: ROOM, turn_recall: { version: 1, formatted_block: recallBlock, seen_keys: ['memory:00000000-0000-4000-8000-000000000001:v1'] } })
       const sizeWith = (body) => wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: notice, inboxFile: inbox })).length
+      const pickupReserveLen = shellDiagnosticReserve('devspec-remote-wait').length
       let body = 'a'.repeat(9_000)
-      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - sizeWith(body)) / 2))
+      for (let pass = 0; pass < 5; pass += 1) body = 'a'.repeat(body.length + Math.floor((19_850 - pickupReserveLen - sizeWith(body)) / 2))
       const sizeWithout = wakeLines(buildOwnerMessageEvents(batchFor(body), { unread: null, inboxFile: inbox })).length
-      assert.ok(sizeWithout < 19_700, `without the note the pointer fits beside it (${sizeWithout})`)
+      assert.ok(sizeWithout < 19_700 - pickupReserveLen, `without the note the pointer fits beside it (${sizeWithout})`)
       const batch = batchFor(body)
       fs.writeFileSync(inbox, JSON.stringify(batch) + '\n', { mode: 0o600 })
 
@@ -1564,7 +1700,443 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
       assert.equal(state().inbox_byte_offset, fs.statSync(inbox).size, 'and only now the cursor moves past it')
       assert.equal(state().wake_batch_progress, null)
     } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
       fs.rmSync(room.home, { recursive: true, force: true })
+    }
+  })
+
+  it('tellRoomWakeHeld preserves structured MCP refusal code and blocking items in diagnostic log (4e32d1a5)', async () => {
+    const logs = []
+    const told = new Set()
+    const batch = canonicalBatch(fixtureCommand('please check'), { session_id: ROOM })
+    const ok = await tellRoomWakeHeld({
+      connectionId: CANONICAL_CONNECTION,
+      batch,
+      state: { session_id: ROOM, mcp_url: 'http://127.0.0.1:9/mcp', token: 'tok', agent_name: 'Cursor' },
+      told,
+      call: async () => {
+        throw new CursorMcpRefusal('Room notice refused', {
+          code: 'room_locked',
+          blocking_items: [{ id: 'blk-1', title: 'Pending approval' }],
+        })
+      },
+      log: (line) => logs.push(line),
+    })
+    assert.equal(ok, false)
+    assert.equal(told.size, 0)
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /room_locked/)
+    assert.match(logs[0], /blocking_items/)
+    assert.match(logs[0], /blk-1/)
+  })
+
+  it('one-shot wait with closed stdout never calls report_pickup or advances started ledger, .turn, or offset (3ea2b201)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-closed-stdout-'))
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        if (parsed?.params?.name === 'report_pickup') pickupCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: { content: [{ type: 'text', text: JSON.stringify({ outcome: 'picked_up' }) }] },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: 'sess-closed',
+        mcp_url: `http://127.0.0.1:${port}/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    const queuedBatch = canonicalBatch(fixtureCommand('x'.repeat(12_000)), { session_id: 'sess-closed' })
+    queuedBatch.connection_id = connectionId
+    queuedBatch.messages[0].addressee.connection_id = connectionId
+    queuedBatch.ingress.envelope.connection.connection_id = connectionId
+    queuedBatch.ingress.envelope.commands = queuedBatch.messages
+    queuedBatch.acceptance_key = canonicalAcceptanceKey(queuedBatch.ingress.envelope)
+    fs.writeFileSync(inbox, `${JSON.stringify(queuedBatch)}\n`)
+    const env = { ...process.env, HOME: dir, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        )
+        // Destroy stdout read end immediately so the child hits EPIPE when writing the wake.
+        child.stdout.destroy()
+        let stderr = ''
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL')
+          reject(new Error(`closed-stdout child timed out\nstderr=${stderr}`))
+        }, 15_000)
+        child.once('close', (code) => { clearTimeout(timer); resolve({ code, stderr }) })
+      })
+      assert.notEqual(result.code, 0, 'closed stdout must fail non-zero')
+      assert.equal(pickupCalls, 0, 'must never call report_pickup when stdout write failed')
+      assert.deepEqual(readStartedCommandIds(connectionId, dir), [], 'started-command ledger must stay empty')
+      assert.equal(fs.existsSync(path.join(dir, `${connectionId}.turn`)), false, 'Working .turn marker must not be written')
+      const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must not advance')
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('one-shot retry stderr writer reserves pointer space so a full-budget page never drops the diagnostic pointer (91d7b47c)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-retry-reserve-'))
+    try {
+      let emittedStderr = ''
+      const writer = createOneShotRetryStderrWriter({
+        follow: false,
+        writeStderr: (chunk) => { emittedStderr += chunk },
+        getEmittedStderr: () => emittedStderr,
+        home,
+      })
+      assert.equal(writer.pendingReserve(), '', 'no reserve needed before diagnostics are buffered')
+      // Push retry warnings past the inline allowance so diagnostics are buffered.
+      for (let i = 0; i < 120; i += 1) {
+        writer.write(`devspec-remote-wait: retry warning ${i}: ${'w'.repeat(200)}\n`)
+      }
+      assert.ok(writer.suppressedCount() > 0, 'expected buffered retry warnings')
+      const reserve = writer.pendingReserve()
+      assert.ok(reserve.length > 0, 'must reserve space for diagnostic pointer when retry warnings are buffered')
+      // Build a wake that would fill the entire remaining ceiling without `reserve`.
+      const remainingWithoutReserve = CURSOR_SHELL_OUTPUT_MAX_CHARS - emittedStderr.length
+      const padLen = Math.max(100, remainingWithoutReserve - 120)
+      const wake = [{ type: 'owner_message', body: 'z'.repeat(padLen) }]
+      const plan = planOneShot([wake], { reserve: `${emittedStderr}${reserve}`, home })
+      assert.equal(plan.held, false)
+      const flushed = writer.flush({ stdoutText: plan.text })
+      assert.ok(flushed.savedNote, 'buffered diagnostics must be saved to a note')
+      assert.ok(flushed.line.length > 0, 'saved diagnostic pointer must be emitted, never dropped')
+      assert.ok(flushed.line.includes(flushed.savedNote.command), 'stderr must carry the exact cat pointer')
+      assert.ok(fitsShellOutput(`${emittedStderr}${plan.text}`), 'combined stdout + stderr must stay within Cursor Shell ceiling')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('one-shot CLI reserves pickup diagnostic pointer space so a 19,999-char page never hides a structured report_pickup refusal (3c5147a7 / 91d7b47c / 3ea2b201 / 4e32d1a5)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-full-page-refusal-'))
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        if (parsed?.params?.name === 'report_pickup') pickupCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'pickup_blocked_full_page',
+                retryable: true,
+                blocking_items: [{ id: 'blk-full-1', reason: 'active_turn' }],
+                error: 'Cannot pick up while active turn holds foreground',
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: 'sess-full',
+        mcp_url: `http://127.0.0.1:${port}/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    // Size the owner_message wake right up against the inline Shell budget (with reserve)
+    // so an unreserved 19,999-char wake would have starved the pickup refusal pointer.
+    const makeBatch = (len) => {
+      const b = canonicalBatch(fixtureCommand('q'.repeat(len)), { session_id: 'sess-full' })
+      b.connection_id = connectionId
+      b.messages[0].addressee.connection_id = connectionId
+      b.ingress.envelope.connection.connection_id = connectionId
+      b.ingress.envelope.commands = b.messages
+      b.acceptance_key = canonicalAcceptanceKey(b.ingress.envelope)
+      return b
+    }
+    const wakeSizeFor = (len) => wakeLines(buildOwnerMessageEvents(makeBatch(len), { inboxFile: inbox })).length
+    const targetInline = CURSOR_SHELL_OUTPUT_MAX_CHARS - shellDiagnosticReserve('devspec-remote-wait').length - 10
+    let len = 8_000
+    for (let pass = 0; pass < 6; pass += 1) {
+      len = Math.max(100, len + Math.floor((targetInline - wakeSizeFor(len)) / 2))
+    }
+    const batch = makeBatch(len)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`)
+    const env = { ...process.env, HOME: dir, DEVSPEC_REMOTE_CONNECTIONS_DIR: dir }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const res = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { stdout += d.toString() })
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+      })
+      assert.equal(res.code, 1, `expected exit 1 on pickup refusal; stderr=${res.stderr}`)
+      assert.equal(pickupCalls, 1)
+      assert.ok(res.stderr.trim().length > 0, 'stderr must NEVER be empty on pickup refusal')
+      assert.ok(
+        fitsShellOutput(res.stdout + res.stderr),
+        `combined stdout (${res.stdout.length}) + stderr (${res.stderr.length}) must fit fitsShellOutput`,
+      )
+      const noteMatch = /notes\/([0-9a-f]{16})\.md/.exec(res.stderr)
+      const surfaced = noteMatch ? readNoteText(noteMatch[1], { home: dir }) : res.stderr
+      assert.match(surfaced, /pickup_blocked_full_page/, 'refusal code must be surfaced inline or via linked note')
+      assert.match(surfaced, /blk-full-1/, 'blocking_items must be surfaced inline or via linked note')
+      const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must remain untouched on pickup refusal')
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('one-shot CLI surfaces structured refusal code, blocking item, and recovery on a near-limit page even when NEITHER note store is writable (3c5147a7 / 91d7b47c / 3ea2b201 / 4e32d1a5)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-wait-unwritable-notes-'))
+    const blockedHome = path.join(dir, 'home')
+    const blockedTmp = path.join(dir, 'blocked-tmp-file')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    // Place a regular file at `~/.devspec/notes` AND point TMPDIR at a regular file
+    // so BOTH primary and fallback diagnostic note stores fail with ENOTDIR/EEXIST.
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'not-a-directory')
+    fs.writeFileSync(blockedTmp, 'not-a-directory')
+    const connectionId = randomUUID()
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body || '{}')
+        if (parsed?.params?.name === 'report_pickup') pickupCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: parsed?.id ?? 1,
+          result: {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                ok: false,
+                code: 'pickup_blocked_unwritable',
+                retryable: true,
+                blocking_items: [
+                  {
+                    id: 'blk-unwritable-1',
+                    reason: 'active_turn',
+                    f1: 'a', f2: 'b', f3: 'c', f4: 'd', f5: 'e', f6: 'f', f7: 'g', f8: 'h',
+                    f9: 'i', f10: 'j', f11: 'k', f12: 'l', f13: 'm', f14: 'n', f15: 'o', f16: 'p',
+                    f17: 'q', f18: 'r', f19: 's', f20: 't', f21: 'u', f22: 'v', f23: 'w', f24: 'x',
+                    f25: 'y', f26: 'z', f27: 'aa', f28: 'bb', f29: 'cc', f30: 'dd',
+                  },
+                  { id: 'blk-unwritable-2', reason: 'queued_review' },
+                ],
+                error: 'e'.repeat(2_000),
+              }),
+            }],
+          },
+        }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: 'sess-unwritable',
+        mcp_url: `http://127.0.0.1:${port}/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    const reserveLen = shellDiagnosticReserve('devspec-remote-wait').length
+    const makeBatch = (len) => {
+      const b = canonicalBatch(fixtureCommand('r'.repeat(len)), { session_id: 'sess-unwritable' })
+      b.connection_id = connectionId
+      b.messages[0].addressee.connection_id = connectionId
+      b.ingress.envelope.connection.connection_id = connectionId
+      b.ingress.envelope.commands = b.messages
+      b.acceptance_key = canonicalAcceptanceKey(b.ingress.envelope)
+      return b
+    }
+    const wakeSizeFor = (len) => wakeLines(buildOwnerMessageEvents(makeBatch(len), { inboxFile: inbox })).length
+    // Size right at the maximum inline wake size allowed beside `shellDiagnosticReserve`!
+    const targetInline = CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - 10
+    let len = 8_000
+    for (let pass = 0; pass < 6; pass += 1) {
+      len = Math.max(100, len + Math.floor((targetInline - wakeSizeFor(len)) / 2))
+    }
+    const batch = makeBatch(len)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`)
+    const env = {
+      ...process.env,
+      HOME: blockedHome,
+      TMPDIR: blockedTmp,
+      TMP: blockedTmp,
+      TEMP: blockedTmp,
+      DEVSPEC_REMOTE_CONNECTIONS_DIR: dir,
+    }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const res = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { stdout += d.toString() })
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+      })
+      assert.equal(res.code, 1, `expected exit 1 on pickup refusal; stderr=${res.stderr}`)
+      assert.equal(pickupCalls, 1)
+      assert.ok(res.stderr.trim().length > 0, 'stderr must NEVER be empty when neither note store is writable')
+      assert.ok(
+        fitsShellOutput(res.stdout + res.stderr),
+        `combined stdout (${res.stdout.length}) + stderr (${res.stderr.length}) must fit fitsShellOutput`,
+      )
+      const catMatch = /cat '([^']+)'/.exec(res.stderr)
+      assert.ok(catMatch, `stderr must provide exact cat path to saved diagnostic note when HOME and TMPDIR are unwritable; got: ${res.stderr}`)
+      const savedFull = fs.readFileSync(catMatch[1], 'utf8')
+      assert.match(savedFull, /pickup_blocked_unwritable/, 'saved note must contain refusal code')
+      assert.match(savedFull, /blk-unwritable-1/, 'saved note must contain first blocking item whole')
+      assert.match(savedFull, /blk-unwritable-2/, 'saved note must contain second blocking item whole')
+      const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must remain untouched')
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('one-shot CLI refuses cleanly BEFORE stdout and report_pickup when ALL THREE diagnostic note stores are unwritable (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-wait-all-stores-blocked-'))
+    const blockedHome = path.join(dir, 'home')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'not-a-directory\n')
+    const blockedTmp = path.join(dir, 'tmp-not-a-dir')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    // Also block the 3rd fallback store (`dir/diagnostic-notes`) with a regular file.
+    fs.writeFileSync(path.join(dir, 'diagnostic-notes'), 'not-a-directory\n')
+
+    const connectionId = randomUUID()
+    const sessionId = 'sess-all-stores-blocked'
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        pickupCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ outcome: 'picked_up' }) }] } }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: sessionId,
+        mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    const batch = canonicalBatch(fixtureCommand('Please check the build.'), { session_id: sessionId })
+    batch.connection_id = connectionId
+    batch.messages[0].addressee.connection_id = connectionId
+    batch.ingress.envelope.connection.connection_id = connectionId
+    batch.ingress.envelope.commands = batch.messages
+    batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`)
+    const env = {
+      ...process.env,
+      HOME: blockedHome,
+      TMPDIR: blockedTmp,
+      TMP: blockedTmp,
+      TEMP: blockedTmp,
+      DEVSPEC_REMOTE_CONNECTIONS_DIR: dir,
+    }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const res = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { stdout += d.toString() })
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+      })
+      assert.equal(res.code, 1, `expected exit 1 when all diagnostic note stores are unwritable; stderr=${res.stderr}`)
+      assert.equal(res.stdout, '', 'stdout must remain empty when refusing before delivery')
+      assert.equal(pickupCalls, 0, 'must NOT call report_pickup when all diagnostic note stores are unwritable')
+      assert.match(res.stderr, /no_writable_diagnostic_note_store/)
+      assert.match(res.stderr, /home_notes/)
+      assert.match(res.stderr, /tmp_notes/)
+      assert.match(res.stderr, /connections_diagnostic_notes/)
+      assert.ok(fitsShellOutput(res.stdout + res.stderr))
+      const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must remain untouched')
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 })

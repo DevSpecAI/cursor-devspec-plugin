@@ -322,14 +322,17 @@ function commandRef(events) {
  * write in order, the command's wake, the pointer's own wake if any, the whole-wake note
  * if any, the wake it stands for, and the route the recall took.
  */
-export function recallWakeOut(base, recall, { home = os.homedir(), connectionId = null } = {}) {
+export function recallWakeOut(base, recall, { home = os.homedir(), connectionId = null, reserve = '' } = {}) {
+  const pad = typeof reserve === 'string' ? reserve : ''
   const events = Array.isArray(base) ? base : []
   const result = (wakes, extra) => ({ wakes, events: wakes[0], recallWake: wakes[1] ?? null, note: null, full: wakes[0], ...extra })
-  const fits = (wake) => fitsShellOutput(wakeLines(wake))
+  const fits = (wake) => fitsShellOutput(pad + wakeLines(wake))
   const deliverable = deliverableRecall(recall)
   const at = events.findLastIndex((event) => COMMAND_EVENTS.has(event?.type)) + 1
   if (!deliverable || at === 0) {
-    const out = wakeWithin(events, { home })
+    const out = pad
+      ? (fits(events) ? { events, note: null } : wakeInNote(events, { home }))
+      : wakeWithin(events, { home })
     return out.error ? { held: out.error } : result([out.events], { note: out.note, full: events, recall: 'none' })
   }
   const place = (event) => [...events.slice(0, at), event, ...events.slice(at)]

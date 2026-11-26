@@ -145,10 +145,11 @@
  *     messages are shown again. [loses nothing when hooks for parallel tool calls add
  *     to the same hand-over at once; loses nothing over a long random run…]
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 
 import { wakeLines } from './devspec-wake-file.mjs'
 import { readPrivateJson, writePrivateJson, writePrivateText } from './private-state.mjs'
@@ -225,6 +226,112 @@ export function fitsShellOutput(text) {
  */
 export const NOTE_PART_CHARS = 18_000
 export const NOTE_PART_BYTES = 36_000
+
+/**
+ * Pre-allocated size per reserved diagnostic note slot (128 KiB: >3x Cursor's 40,000-byte
+ * Shell move-to-file ceiling `CURSOR_SHELL_OUTPUT_MAX_BYTES`) so an oversized refusal
+ * saved after preflight can be overwritten in place without allocating new filesystem
+ * blocks even if the disk fills (`ENOSPC`) mid-pickup. Unlinked on clean `release()`.
+ */
+export const RESERVED_DIAGNOSTIC_SLOT_BYTES = 128 * 1024
+
+/**
+ * Pre-allocated size for the reserved pending-refusal spool pointer slot (16 KiB:
+ * 4 standard POSIX blocks, large enough for a single Linux `PATH_MAX` 4,096-byte path
+ * even under worst-case JSON escaping plus metadata fields, because `note_ref` stores
+ * `file` once and derives the shell read command on recovery) so even if the disk fills
+ * (`ENOSPC`) after a note is saved and `stderr` breaks (`EPIPE`), the pointer can be
+ * overwritten in place with zero new block allocation so the next OS process still
+ * discovers the saved note.
+ */
+export const RESERVED_SPOOL_POINTER_BYTES = 16 * 1024
+
+/**
+ * Head and tail character preview kept for each individual oversized opaque string blob
+ * (longer than 2 * 512 = 1,024 UTF-16 code units) during emergency `ENOSPC` diagnostic
+ * compaction (`compactDiagnosticForSlotBudget`) when the unabridged refusal exceeds every
+ * pre-allocated diagnostic slot even after gzip compression. Structured refusal envelopes,
+ * reason codes, and EVERY blocking record in arrays are NEVER sliced or dropped.
+ */
+export const ENOSPC_COMPACT_BLOB_PREVIEW_CHARS = 512
+
+/**
+ * Progressive `(maxVerbatimChars, previewChars)` string-blob compaction tiers tried by
+ * `compactDiagnosticForSlotBudget` under `ENOSPC` when hundreds or thousands of blocking
+ * records each carry medium-sized incompressible blobs (e.g. 400–900 random chars). Each
+ * tier shrinks ONLY opaque long strings while keeping structured identifier/reason fields
+ * (`id`, `code`, `reason`, `status`, etc.) and 100% of every blocking record in arrays so
+ * thousands of distinct blocking items still compress inside pre-allocated slots.
+ */
+const ENOSPC_COMPACT_STRING_TIERS = [
+  { maxVerbatimChars: ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2, previewChars: ENOSPC_COMPACT_BLOB_PREVIEW_CHARS },
+  { maxVerbatimChars: 256, previewChars: 64 },
+  { maxVerbatimChars: 128, previewChars: 32 },
+  { maxVerbatimChars: 64, previewChars: 0 },
+]
+
+/**
+ * Maximum UTF-16 length of a structured actionable URL (`url`, `approval_url`,
+ * `review_url`, `link`, `href`, any `*_url`/`*_link`/`*_href` key, or any standalone
+ * `http(s)://` or relative app-path URL value) kept 100% verbatim during emergency
+ * `ENOSPC` compaction. Matches the 8 KiB HTTP request-URI ceiling enforced by common
+ * reverse proxies and runtimes (RFC 9110 §4.1 / Nginx `large_client_header_buffers`
+ * 8 KiB) so long signed approval links survive intact while preventing an adversarial
+ * multi-megabyte string from overflowing a 128 KiB pre-allocated diagnostic slot.
+ */
+export const ENOSPC_ACTIONABLE_URL_MAX_CHARS = 8_192
+
+/** URL-bearing keys preserved verbatim up to `ENOSPC_ACTIONABLE_URL_MAX_CHARS` during ENOSPC compaction. */
+const ENOSPC_PRESERVED_URL_KEYS = new Set([
+  'url',
+  'approval_url',
+  'review_url',
+  'link',
+  'href',
+])
+
+/** Short machine-identifier/code keys kept verbatim during emergency ENOSPC string compaction. */
+const ENOSPC_PRESERVED_ID_KEYS = new Set([
+  'id',
+  'code',
+  'status',
+  'command_message_id',
+  'command_turn_id',
+  'blocking_turn_id',
+  'task_id',
+  'item_id',
+  'record_id',
+  'retryable',
+  'type',
+  'kind',
+  ...ENOSPC_PRESERVED_URL_KEYS,
+])
+
+/**
+ * Narrative structural keys kept verbatim during Stage-1 ENOSPC compaction (when non-structural
+ * opaque blobs are the cause of overflow) and progressively summarized ONLY in Stage-2 tiers
+ * when thousands of oversized incompressible `reason`/`title` values themselves exceed every
+ * pre-allocated diagnostic slot, so 100% of blocking record IDs and reason previews survive.
+ */
+const ENOSPC_NARRATIVE_STRUCTURAL_KEYS = new Set([
+  'reason',
+  'title',
+  'message',
+  'error',
+])
+
+/**
+ * Stage-2 progressive `(maxVerbatimChars, previewChars)` compaction tiers applied to
+ * oversized `reason`/`title`/`message`/`error` fields ONLY when Stage-1 (opaque-blob
+ * compaction) still overflows all pre-allocated diagnostic slots under `ENOSPC`.
+ */
+const ENOSPC_COMPACT_NARRATIVE_TIERS = [
+  { maxVerbatimChars: 256, previewChars: 64 },
+  { maxVerbatimChars: 128, previewChars: 32 },
+  { maxVerbatimChars: 64, previewChars: 16 },
+  { maxVerbatimChars: 32, previewChars: 8 },
+  { maxVerbatimChars: 16, previewChars: 0 },
+]
 
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
@@ -362,11 +469,29 @@ export function writeNote(text, { home = os.homedir() } = {}) {
   const id = createHash('sha256').update(text).digest('hex').slice(0, 16)
   const pieces = splitText(text)
   const first = partFile(id, 1, home)
-  // The same text is the same note: written once, the first part last, so a first
-  // part on disk means every part is.
-  if (!fs.existsSync(first)) {
-    for (let part = pieces.length; part >= 1; part -= 1) {
-      writePrivateText(partFile(id, part, home), partContent(id, part, pieces.length, pieces[part - 1]))
+  // Verify every part is present, readable, and intact; rewrite any missing or damaged
+  // part (highest part first so part 1 is still written last) and verify every part by
+  // path before returning so a cached note with a missing continuation is NEVER reused
+  // as complete (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  for (let part = pieces.length; part >= 1; part -= 1) {
+    const target = partFile(id, part, home)
+    const expected = partContent(id, part, pieces.length, pieces[part - 1])
+    let matches = false
+    try {
+      matches = fs.readFileSync(target, 'utf8') === expected
+    } catch {
+      matches = false
+    }
+    if (!matches) {
+      writePrivateText(target, expected)
+    }
+  }
+  for (let part = 1; part <= pieces.length; part += 1) {
+    const target = partFile(id, part, home)
+    const expected = partContent(id, part, pieces.length, pieces[part - 1])
+    const actual = fs.readFileSync(target, 'utf8')
+    if (actual !== expected) {
+      throw new Error(`note ${id} part ${part} verification failed on disk`)
     }
   }
   return { id, file: first, command: noteCommand(id), parts: pieces.length }
@@ -812,29 +937,2317 @@ export function postToolUseOutput(context, extra = {}) {
  * first) and the one-shot wait, each of whose output is one Shell result
  * (devspec-remote-wait.mjs). Of `wakes` (whole wakes
  * waiting, oldest first, each as `wakeLines` wrote it), as many as fit Cursor's rules
- * on one output together (`fitsShellOutput`), never part of one. When some are left and
- * `waiting(left)` is given, the line it returns goes after them, and room is kept for
- * it; it is left out only when the first wake alone leaves no room for it. The first
- * wake always goes, so a single wake over the rules on its own is printed as it always
- * was.
+ * on one output together (`fitsShellOutput`), never part of one. Optional `reserve`
+ * keeps room for stderr diagnostics emitted in the same Shell invocation so combined
+ * `stdout + stderr` stays inside Cursor's Shell ceiling (requirements 3c5147a7 / 91d7b47c).
+ * When some are left and `waiting(left)` is given, the line it returns goes after them,
+ * and room is kept for it; it is left out only when the first wake alone leaves no room
+ * for it. The first wake always goes, so a single wake over the rules on its own is
+ * printed as it always was.
  * @param {string[]} wakes
- * @param {{ waiting?: (left: number) => string }} [opts]
+ * @param {{ waiting?: (left: number) => string, reserve?: string }} [opts]
  * @returns {{ count: number, text: string }}
  */
-export function wakesForOneOutput(wakes, { waiting = null } = {}) {
+export function wakesForOneOutput(wakes, { waiting = null, reserve = '' } = {}) {
+  const pad = typeof reserve === 'string' ? reserve : ''
   let count = 0
   let text = ''
   for (const wake of wakes) {
-    if (count > 0 && !fitsShellOutput(text + wake)) break
+    if (count > 0 && !fitsShellOutput(pad + text + wake)) break
     text += wake
     count += 1
   }
   if (count === wakes.length || typeof waiting !== 'function') return { count, text }
   // Some are left: make room for the line that says so, giving back wakes (never the first).
-  while (count > 1 && !fitsShellOutput(wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
+  while (count > 1 && !fitsShellOutput(pad + wakes.slice(0, count).join('') + waiting(wakes.length - count))) count -= 1
   const taken = wakes.slice(0, count).join('')
   const line = waiting(wakes.length - count)
-  return { count, text: fitsShellOutput(taken + line) ? taken + line : taken }
+  return { count, text: fitsShellOutput(pad + taken + line) ? taken + line : taken }
+}
+
+/**
+ * Fixed-shape stderr pointer emitted when a Shell diagnostic would push stdout + stderr
+ * past Cursor's Shell ceiling. Never announces "full details saved whole" when `note`
+ * was compacted or partially saved under `ENOSPC` (requirements 3c5147a7 / 91d7b47c).
+ */
+export function shellDiagnosticPointer(label, command, note = null) {
+  if (note?.enospcIncomplete) {
+    const counts =
+      Number.isInteger(note.returnedRecords) && Number.isInteger(note.totalRecords)
+        ? `${note.returnedRecords}/${note.totalRecords} records, ${note.omittedRecords ?? Math.max(0, note.totalRecords - note.returnedRecords)} omitted`
+        : 'middle bytes omitted'
+    return `${label}: partial ENOSPC refusal saved (${counts}; disk full) — run \`${command}\` (and any further parts), then free disk space and re-run wake read for the full refusal.\n`
+  }
+  if (note?.enospcCompacted) {
+    const omittedUrls = Number.isInteger(note.enospcOmittedActionableUrls) ? note.enospcOmittedActionableUrls : 0
+    const whatShortened =
+      omittedUrls > 0
+        ? `blobs, reasons & ${omittedUrls} URL(s) omitted due to disk limit`
+        : note.enospcCompactedReasons
+          ? 'oversized blobs and reason text shortened; actionable URLs preserved'
+          : 'oversized blobs shortened'
+    return `${label}: ENOSPC-compacted refusal saved (all blocking records preserved; ${whatShortened}) — run \`${command}\` (and any further parts); free disk space and re-run wake read for unabridged details.\n`
+  }
+  return `${label}: full details saved whole — run \`${command}\` (and any further parts).\n`
+}
+
+/**
+ * Minimum stderr headroom (in UTF-16 code units) reserved inside Cursor's 20,000-char
+ * Shell ceiling whenever a Shell command may emit a structured pickup refusal after
+ * stdout has already been written (`shellDiagnosticReserve`).
+ *
+ * Logical justification (requirements 3c5147a7 / 91d7b47c / 4e32d1a5 / 3ea2b201):
+ *   - When either note store (`~/.devspec/notes` or private `os.tmpdir()`) is writable,
+ *     a `shellDiagnosticPointer` (`cat ...`) requires ~110–160 characters.
+ *   - When neither note store is writable, `formatStructuredRefusalsFallback` must still
+ *     fit an inline structured refusal envelope carrying `refused`, `code`, at least one
+ *     real blocking item (`blocking_items` / `blocking_turn_id`), `omitted_count`,
+ *     `shell_limit_chars`, and `recovery` (~350–550 characters).
+ *   - Reserving 600 characters (3% of Cursor's 20,000-character Shell ceiling) at this
+ *     single shared boundary guarantees room for either a saved-note pointer OR a
+ *     structured refusal fallback with blocking details without silently dropping output.
+ */
+export const SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS = 600
+
+/**
+ * Minimum headroom (in UTF-16 code units) `shellDiagnosticReserve` MUST leave inside
+ * Cursor's 20,000-char Shell ceiling (`CURSOR_SHELL_OUTPUT_MAX_CHARS`) so a wake reader
+ * can ALWAYS fit its header, listener advice, and at least one short inline command or
+ * `wake_in_note` pointer — even when valid note paths expand heavily under shell quoting
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+export const MIN_SHELL_WAKE_HEADROOM_CHARS = 2_000
+export const MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS = CURSOR_SHELL_OUTPUT_MAX_CHARS - MIN_SHELL_WAKE_HEADROOM_CHARS
+export const MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES = CURSOR_SHELL_OUTPUT_MAX_BYTES - MIN_SHELL_WAKE_HEADROOM_CHARS * 2
+
+/**
+ * Build one reserve string whose UTF-16 character length AND UTF-8 byte length are EACH
+ * at least as large as every candidate in `candidates` (and at least `minChars`).
+ * Ensures `fitsShellOutput` (which enforces BOTH 20,000 UTF-16 code units AND 40,000 UTF-8
+ * bytes) leaves enough room for whichever diagnostic pointer is emitted, even when one
+ * unavailable store has a longer ASCII path and a writable store has a shorter multibyte
+ * UTF-8 path (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ */
+export function maxShellReserve(candidates, minChars = 0) {
+  let maxChars = Math.max(0, minChars)
+  let maxByteCandidate = ''
+  let maxBytes = 0
+  for (const raw of candidates) {
+    const text = String(raw ?? '')
+    if (text.length > maxChars) maxChars = text.length
+    const bytes = Buffer.byteLength(text, 'utf8')
+    if (bytes > maxBytes) {
+      maxBytes = bytes
+      maxByteCandidate = text
+    }
+  }
+  return maxByteCandidate.length >= maxChars
+    ? maxByteCandidate
+    : maxByteCandidate + ' '.repeat(maxChars - maxByteCandidate.length)
+}
+
+/**
+ * Exact ceiling reservation for Shell post-stdout diagnostics, derived at one shared
+ * boundary from the worst-case UTF-16 length and UTF-8 byte length across all note stores
+ * (`~/.devspec/notes`, `os.tmpdir()`, `fallbackDir`, and `backupDir`) — including
+ * multi-slot sharded gzip recovery commands (`cat <slot1> <slot2> ... | gzip -dc | head -c 40000`)
+ * and ENOSPC partial/compacted pointer notices — plus `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`,
+ * bounded by `MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS` / `MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES` so
+ * heavily-quoted paths can NEVER starve wake delivery (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function shellDiagnosticReserve(
+  label = 'devspec-wake-tail',
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const rawSampleFiles = [
+    path.join(home, NOTES_DIR, `${'0'.repeat(16)}.md`),
+    path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`),
+    ...(fallbackDir ? [path.join(fallbackDir, `${'0'.repeat(16)}.md`)] : []),
+    ...(backupDir ? [path.join(backupDir, `d-${'0'.repeat(14)}.md`)] : []),
+  ]
+  const seenDirs = new Set()
+  const sampleFiles = []
+  for (const file of rawSampleFiles) {
+    const dirKey = path.resolve(path.dirname(file))
+    if (seenDirs.has(dirKey)) continue
+    seenDirs.add(dirKey)
+    sampleFiles.push(file)
+  }
+  const pointerVariants = [
+    null,
+    { enospcCompacted: true },
+    { enospcCompacted: true, enospcCompactedReasons: true },
+    { enospcCompacted: true, enospcCompactedReasons: true, enospcOmittedActionableUrls: 99999 },
+    { enospcIncomplete: true, returnedRecords: 99999, totalRecords: 99999, omittedRecords: 99999 },
+  ]
+  const addCommandCandidates = (candidates, command) => {
+    for (const variant of pointerVariants) {
+      const ptr = shellDiagnosticPointer(label, command, variant)
+      if (
+        ptr.length <= MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS &&
+        Buffer.byteLength(ptr, 'utf8') <= MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES
+      ) {
+        candidates.push(ptr)
+      }
+    }
+  }
+  const candidates = []
+  addCommandCandidates(candidates, noteCommand('0'.repeat(16)))
+  for (const sampleFile of sampleFiles) {
+    const q = shellQuotePath(sampleFile)
+    addCommandCandidates(candidates, `cat ${q}`)
+    addCommandCandidates(candidates, `head -c 40000 ${q}`)
+    addCommandCandidates(candidates, `gzip -dc ${q} | head -c 40000`)
+  }
+  if (sampleFiles.length >= 2) {
+    const shardedQuotedList = sampleFiles.map(shellQuotePath).join(' ')
+    addCommandCandidates(candidates, `cat ${shardedQuotedList} | gzip -dc | head -c 40000`)
+  }
+  const combined = maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
+  if (
+    combined.length <= MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS &&
+    Buffer.byteLength(combined, 'utf8') <= MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES
+  ) {
+    return combined
+  }
+  let out = combined.slice(0, MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS)
+  while (out.length > 0 && Buffer.byteLength(out, 'utf8') > MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES) {
+    out = out.slice(0, Math.max(0, out.length - 64))
+  }
+  return out
+}
+
+function shellQuotePath(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`
+}
+
+/**
+ * Probe whether at least one diagnostic note store (`~/.devspec/notes`, private
+ * `os.tmpdir()/devspec-notes-<uid>`, or `fallbackDir`) can write a file right now.
+ * Used before printing a room-command wake to stdout so a near-limit Shell command
+ * never emits stdout when NO store is available to save an oversized pickup refusal
+ * whole for retrieval (requirements 3c5147a7 / 91d7b47c / 4e32d1a5 / 3ea2b201).
+ */
+export function hasWritableDiagnosticNoteStore({ home = os.homedir(), fallbackDir = null } = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const candidates = [
+    { store: 'home_notes', dir: path.join(home, NOTES_DIR) },
+    { store: 'tmp_notes', dir: path.join(os.tmpdir(), `devspec-notes-${uid}`) },
+    ...(fallbackDir ? [{ store: 'connections_diagnostic_notes', dir: fallbackDir }] : []),
+  ]
+  const errors = []
+  for (const candidate of candidates) {
+    const probe = path.join(candidate.dir, `.probe-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.tmp`)
+    try {
+      fs.mkdirSync(candidate.dir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(probe, '', { mode: 0o600 })
+      try { fs.rmSync(probe, { force: true }) } catch { /* ignore cleanup */ }
+      return { ok: true, store: candidate.store, dir: candidate.dir }
+    } catch (error) {
+      try { fs.rmSync(probe, { force: true }) } catch { /* ignore cleanup */ }
+      errors.push({
+        store: candidate.store,
+        code: error && typeof error === 'object' && 'code' in error ? String(error.code) : 'write_failed',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return { ok: false, errors }
+}
+
+/**
+ * Preflight-reserve private diagnostic note file descriptors BEFORE printing a near-ceiling
+ * wake or calling `report_pickup` (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ *
+ * - Preflight passes (`ok: true`) only when at least one of the three diagnostic note stores
+ *   (`~/.devspec/notes`, `TMPDIR/devspec-notes-<uid>`, or `fallbackDir`) accepts a new
+ *   private `0o600` file, keeping that open `fd` across `startCommands` so even a mid-pickup
+ *   `chmod 0o500`/`0o000` on the store directory still allows writing the unabridged original
+ *   refusal via POSIX `writeSync(fd, ...)`.
+ * - When `backupDir` (e.g. the connections dir holding the wake lock) is distinct and writable,
+ *   also opens a backup slot (`d-<14hex>.md`, 19 chars — never longer than `0000000000000000.md`
+ *   in `shellDiagnosticReserve`) so even if the primary diagnostic store directory is deleted and
+ *   replaced mid-pickup, the exact original refusal is still saved on disk with a Shell-bounded
+ *   `cat` read command.
+ * - `release()` closes all fds and unlinks every unused slot so the happy path leaves zero files.
+ */
+const PENDING_DIAGNOSTIC_REFUSAL_PREFIX = '# DevSpec Pending Diagnostic Refusal [scope:'
+
+function spoolScopeTag(spoolKey) {
+  return createHash('sha256').update(String(spoolKey ?? 'default')).digest('hex').slice(0, 12)
+}
+
+function pendingDiagnosticRefusalHeader(spoolKey, { nonce, sha256, chars }) {
+  return `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${spoolScopeTag(spoolKey)}] [nonce:${nonce}] [sha256:${sha256}] [chars:${chars}]\n`
+}
+
+function spoolCandidateDirs({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const raw = [
+    backupDir,
+    fallbackDir,
+    home ? path.join(home, NOTES_DIR) : null,
+    home ? path.join(home, '.devspec', 'remote-control') : null,
+    path.join(os.tmpdir(), `devspec-notes-${uid}`),
+  ]
+  const seen = new Set()
+  const out = []
+  for (const dir of raw) {
+    if (typeof dir !== 'string' || !dir) continue
+    const resolved = path.resolve(dir)
+    if (seen.has(resolved)) continue
+    seen.add(resolved)
+    out.push(dir)
+  }
+  return out
+}
+
+function spoolEntryHash(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex').slice(0, 16)
+}
+
+function spoolEntryFilePrefix(scopeTag) {
+  return `devspec-unsaved-refusal-${scopeTag}-`
+}
+
+function spoolEntryFilePath(dir, scopeTag, entryHash) {
+  return path.join(dir, `${spoolEntryFilePrefix(scopeTag)}${entryHash}.json`)
+}
+
+function legacySpoolFilePath(dir, scopeTag) {
+  return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+}
+
+function legacyClaimFilePrefix(scopeTag) {
+  return `.devspec-legacy-claim-${scopeTag}-`
+}
+
+/**
+ * Reassemble a Pass-2 pending-refusal note losslessly by stripping ONLY the header and
+ * page footers tagged with that file's exact per-file cryptographic `nonce`, then
+ * verifying exact UTF-16 length and SHA-256 against the header seal. Uses `[\s\S]*?` for
+ * the shell-quoted path so legal POSIX paths containing newlines still reassemble cleanly,
+ * real diagnostic lines resembling page footers are never modified, and no generated
+ * continuation command can remain in the recovered payload (reqs 4e32d1a5 / 91d7b47c / 3c5147a7).
+ */
+function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
+  const nl = content.indexOf('\n')
+  if (nl < 0) return null
+  const firstLine = content.slice(0, nl)
+  const match = /^# DevSpec Pending Diagnostic Refusal \[scope:([0-9a-f]{12})\] \[nonce:([0-9a-f]{16})\] \[sha256:([0-9a-f]{64})\] \[chars:(\d+)\]$/.exec(
+    firstLine,
+  )
+  if (!match || match[1] !== expectedScopeTag) return null
+  const [, , nonce, expectedSha256, charsRaw] = match
+  const expectedChars = Number(charsRaw)
+  let body = content.slice(nl + 1)
+  const footerRe = new RegExp(
+    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): (?:cat [\\s\\S]*? \\| gzip -dc \\| tail -c \\+\\d+|gzip -dc [\\s\\S]*? \\| tail -c \\+\\d+|tail -c \\+\\d+ [\\s\\S]*?) \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
+    'g',
+  )
+  body = body.replace(footerRe, '')
+  const actualSha256 = createHash('sha256').update(body, 'utf8').digest('hex')
+  if (body.length !== expectedChars || actualSha256 !== expectedSha256) {
+    return {
+      ok: false,
+      body:
+        `[WARNING: recovered pending diagnostic refusal failed integrity check (expected ${expectedChars} chars sha256=${expectedSha256}, got ${body.length} chars sha256=${actualSha256})]\n` +
+        body,
+    }
+  }
+  return { ok: true, body }
+}
+
+/**
+ * When a diagnostic refusal STILL exceeds all pre-allocated diagnostic slots even after
+ * gzip compression under mid-pickup `ENOSPC`, shrink ONLY oversized opaque string blobs
+ * inside embedded JSON structures (parsing multi-line diagnostics line by line so an
+ * earlier log line's JSON never breaks parsing of the structured refusal line) while
+ * preserving 100% of every refusal code, structural field, and EVERY blocking record in
+ * arrays across progressive string-compaction tiers (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c /
+ * 3ea2b201).
+ */
+function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
+  // Shared RFC-3986-aware URL patterns supporting case-insensitive HTTP(S) schemes
+  // (`HTTPS://...`, `http://...`), IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`),
+  // balanced parentheses/brackets, and all valid RFC-3986 sub-delims (including trailing `!`,
+  // `)`, `,`, `;`, `:`, `.`, `?` in query tokens) without stripping valid URL characters
+  // (reqs 4e32d1a5 / 91d7b47c).
+  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`[Hh][Tt][Tt][Pp][Ss]?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>/]+)(?:[^\s"'<>]*)`
+  const ACTIONABLE_REL_URL_SOURCE = String.raw`\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>]+`
+  const countUnmatchedOpen = (prefix, openCh, closeCh) => {
+    let depth = 0
+    for (let i = 0; i < prefix.length; i += 1) {
+      const ch = prefix[i]
+      if (ch === openCh) depth += 1
+      else if (ch === closeCh && depth > 0) depth -= 1
+    }
+    return depth
+  }
+  const trimUnmatchedTrailingWrappers = (url, prefixBeforeMatch = '') => {
+    let cleaned = url
+    let openBracketsBefore = countUnmatchedOpen(prefixBeforeMatch, '[', ']')
+    let openParensBefore = countUnmatchedOpen(prefixBeforeMatch, '(', ')')
+    while (cleaned.length > 0) {
+      const last = cleaned[cleaned.length - 1]
+      if (last === ']' && openBracketsBefore > 0) {
+        const opens = (cleaned.match(/\[/g) ?? []).length
+        const closes = (cleaned.match(/\]/g) ?? []).length
+        if (closes > opens) {
+          cleaned = cleaned.slice(0, -1)
+          openBracketsBefore -= 1
+          continue
+        }
+      } else if (last === ')' && openParensBefore > 0) {
+        const opens = (cleaned.match(/\(/g) ?? []).length
+        const closes = (cleaned.match(/\)/g) ?? []).length
+        if (closes > opens) {
+          cleaned = cleaned.slice(0, -1)
+          openParensBefore -= 1
+          continue
+        }
+      }
+      break
+    }
+    return cleaned
+  }
+
+  /**
+   * Compact ONLY high-entropy opaque non-whitespace tokens (such as base64/hex blobs >= 48 chars)
+   * inside narrative fields (`reason`, `title`, `message`, `error`) so every human-readable word,
+   * approver name, and actionable instruction inside a structured reason survives 100% verbatim
+   * even under severe `ENOSPC` (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+   */
+  const compactOpaqueTokensInString = (str, { tokenPreviewChars = 16, includePunctuated = false } = {}) => {
+    // Match full HTTP(S) URLs (including IPv6 hosts) and relative app paths FIRST so actionable
+    // approval/review links inside structured reasons are NEVER split or treated as opaque blobs
+    // (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+    const pattern = includePunctuated
+      ? new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})|([A-Za-z0-9+/=_-]{48,})`, 'g')
+      : new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})|([A-Za-z0-9+/=]{48,})`, 'g')
+    let changed = false
+    let omittedTotal = 0
+    const compacted = str.replace(pattern, (match, fullUrl, relUrl, tok) => {
+      if (fullUrl || relUrl) return match
+      if (!tok || tok.length <= Math.max(48, tokenPreviewChars * 2 + 16)) return match
+      if (includePunctuated) {
+        // Avoid compacting plain snake_case / kebab-case English phrases that lack mixed-case/digit entropy.
+        const hasDigit = /\d/.test(tok)
+        const hasUpper = /[A-Z]/.test(tok)
+        const hasLower = /[a-z]/.test(tok)
+        if (!hasDigit && !(hasUpper && hasLower)) return tok
+      }
+      changed = true
+      const omitted = Math.max(0, tok.length - tokenPreviewChars * 2)
+      omittedTotal += omitted
+      if (tokenPreviewChars <= 0) return `[omitted:${tok.length}c]`
+      return `${tok.slice(0, tokenPreviewChars)}...[omitted:${omitted}c]...${tok.slice(-tokenPreviewChars)}`
+    })
+    return { changed, compacted, omittedTotal }
+  }
+
+  const isUrlKey = (k) =>
+    typeof k === 'string' && (ENOSPC_PRESERVED_URL_KEYS.has(k) || /(?:^|_)(?:url|href|link)$/i.test(k))
+  const isActionableUrlValue = (v) =>
+    typeof v === 'string' &&
+    v.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
+    (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
+  const extractAllActionableUrls = (str) => {
+    if (typeof str !== 'string' || !str) return { urls: [], oversizedCount: 0, totalCount: 0 }
+    const regex = new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})`, 'gi')
+    const seen = new Set()
+    const urls = []
+    let oversizedCount = 0
+    for (const match of str.matchAll(regex)) {
+      const raw = match[0]
+      const prefix = typeof match.index === 'number' ? str.slice(0, match.index) : ''
+      const cleaned = trimUnmatchedTrailingWrappers(raw, prefix)
+      if (!cleaned || seen.has(cleaned)) continue
+      seen.add(cleaned)
+      if (cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS) {
+        oversizedCount += 1
+        continue
+      }
+      urls.push(cleaned)
+    }
+    return { urls, oversizedCount, totalCount: urls.length + oversizedCount }
+  }
+
+  const shrinkValue = (
+    val,
+    {
+      maxVerbatimChars,
+      previewChars,
+      keyName = null,
+      structuralOnly = false,
+      compactReasons = false,
+      compactOpaqueInNarrative = false,
+      includePunctuatedTokens = false,
+      compactUrls = false,
+      ultraCompactNonUrl = false,
+      tracker = null,
+    },
+  ) => {
+    if (typeof val === 'string') {
+      const urlKeyOrValue = isUrlKey(keyName) || isActionableUrlValue(val)
+      const isActionableUrl =
+        !compactUrls &&
+        val.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
+        urlKeyOrValue
+      if (isActionableUrl) return val
+      const isIdKey = keyName && ENOSPC_PRESERVED_ID_KEYS.has(keyName)
+      const isNarrativeKey = keyName && ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(keyName)
+      if (isIdKey && !urlKeyOrValue && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (isNarrativeKey && compactOpaqueInNarrative) {
+        const res = compactOpaqueTokensInString(val, {
+          tokenPreviewChars: previewChars,
+          includePunctuated: includePunctuatedTokens,
+        })
+        if (res.changed) {
+          if (tracker) tracker.shortenedNarrative = true
+          return {
+            truncated_due_to_enospc: true,
+            original_chars: val.length,
+            omitted_chars: res.omittedTotal,
+            text: res.compacted,
+          }
+        }
+        return val
+      }
+      if (isNarrativeKey && !compactReasons && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (val.length <= maxVerbatimChars) return val
+      if (isNarrativeKey && tracker) tracker.shortenedNarrative = true
+      const extractedUrls = extractAllActionableUrls(val)
+      if (compactUrls) {
+        const lostUrls = Math.max(urlKeyOrValue ? 1 : 0, extractedUrls.totalCount)
+        if (lostUrls > 0 && tracker) tracker.omittedActionableUrls += lostUrls
+        if (ultraCompactNonUrl) {
+          return lostUrls > 0
+            ? `[omitted:${val.length}c;urls_omitted:${lostUrls}]`
+            : `[omitted:${val.length}c]`
+        }
+        return {
+          truncated_due_to_enospc: true,
+          original_chars: val.length,
+          omitted_chars: Math.max(0, val.length - previewChars * 2),
+          ...(previewChars > 0
+            ? {
+                head: val.slice(0, previewChars),
+                tail: val.slice(-previewChars),
+              }
+            : {}),
+          ...(lostUrls > 0 ? { omitted_actionable_urls: lostUrls } : {}),
+        }
+      }
+      // URL-preserving mode (`compactUrls === false`): keep every URL up to
+      // `ENOSPC_ACTIONABLE_URL_MAX_CHARS` verbatim; only count URLs that exceeded that
+      // ceiling as omitted/shortened.
+      const lostOversizedUrls =
+        extractedUrls.oversizedCount > 0
+          ? extractedUrls.oversizedCount
+          : urlKeyOrValue && val.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS
+            ? 1
+            : 0
+      if (lostOversizedUrls > 0 && tracker) tracker.omittedActionableUrls += lostOversizedUrls
+      if (ultraCompactNonUrl && extractedUrls.urls.length === 0 && lostOversizedUrls === 0) {
+        return `[omitted:${val.length}c]`
+      }
+      return {
+        truncated_due_to_enospc: true,
+        original_chars: val.length,
+        omitted_chars: Math.max(0, val.length - previewChars * 2),
+        ...(previewChars > 0
+          ? {
+              head: val.slice(0, previewChars),
+              tail: val.slice(-previewChars),
+            }
+          : {}),
+        ...(extractedUrls.urls.length > 0 ? { preserved_urls: extractedUrls.urls } : {}),
+        ...(lostOversizedUrls > 0 ? { omitted_actionable_urls: lostOversizedUrls } : {}),
+      }
+    }
+    if (Array.isArray(val)) {
+      return val.map((item) =>
+        shrinkValue(item, {
+          maxVerbatimChars,
+          previewChars,
+          structuralOnly,
+          compactReasons,
+          compactOpaqueInNarrative,
+          includePunctuatedTokens,
+          compactUrls,
+          ultraCompactNonUrl,
+          tracker,
+        }),
+      )
+    }
+    if (val && typeof val === 'object') {
+      const out = {}
+      const omittedFields = []
+      for (const [k, v] of Object.entries(val)) {
+        const vUrls = typeof v === 'string' ? extractAllActionableUrls(v) : { urls: [], oversizedCount: 0, totalCount: 0 }
+        const vIsUrlBearing = typeof v === 'string' && (isUrlKey(k) || isActionableUrlValue(v) || vUrls.totalCount > 0)
+        const isProtected =
+          ENOSPC_PRESERVED_ID_KEYS.has(k) ||
+          ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k) ||
+          (!compactUrls && vIsUrlBearing)
+        if (structuralOnly && !isProtected && typeof v === 'string' && v.length > maxVerbatimChars) {
+          if (vIsUrlBearing && tracker) {
+            tracker.omittedActionableUrls += Math.max(1, vUrls.totalCount)
+          }
+          omittedFields.push(k)
+          continue
+        }
+        out[k] = shrinkValue(v, {
+          maxVerbatimChars,
+          previewChars,
+          keyName: k,
+          structuralOnly,
+          compactReasons,
+          compactOpaqueInNarrative,
+          includePunctuatedTokens,
+          compactUrls,
+          ultraCompactNonUrl,
+          tracker,
+        })
+      }
+      if (omittedFields.length > 0) {
+        out.enospc_omitted_blob_fields = omittedFields
+      }
+      return out
+    }
+    return val
+  }
+
+  const baseNotice = {
+    enospc_compacted: true,
+    original_bytes: originalBytes ?? Buffer.byteLength(rawText, 'utf8'),
+    compressed_bytes: compressedBytes ?? null,
+    reserved_slot_bytes: totalCapacityBytes,
+  }
+
+  const fitsCompressed = (candidate) => {
+    if (!candidate) return false
+    const buf = Buffer.from(candidate, 'utf8')
+    if (buf.length <= totalCapacityBytes) return true
+    try {
+      return zlib.gzipSync(buf).length <= totalCapacityBytes
+    } catch {
+      return false
+    }
+  }
+
+  // Extract structured JSON payload(s) cleanly whether `rawText` is raw JSON OR
+  // multi-line log output containing one or more prefixed JSON lines.
+  const extractJsonLines = (str) => {
+    const trimmed = str.trim()
+    if (!trimmed) return null
+    try {
+      return { kind: 'whole', parsed: JSON.parse(trimmed) }
+    } catch {
+      /* parse line-by-line below */
+    }
+    const lines = str.split('\n').filter((line) => line.trim().length > 0)
+    const parsedLines = []
+    let foundAnyJson = false
+    for (const line of lines) {
+      let lineParsed = null
+      const trimmedLine = line.trim()
+      try {
+        lineParsed = { prefix: '', parsed: JSON.parse(trimmedLine), suffix: '' }
+      } catch {
+        const starts = [line.indexOf('['), line.indexOf('{')].filter((i) => i >= 0)
+        if (starts.length > 0) {
+          const first = Math.min(...starts)
+          const rest = line.slice(first)
+          const last = Math.max(rest.lastIndexOf(']'), rest.lastIndexOf('}'))
+          if (last > 0) {
+            try {
+              lineParsed = {
+                prefix: line.slice(0, first).trim(),
+                parsed: JSON.parse(rest.slice(0, last + 1)),
+                suffix: rest.slice(last + 1).trim(),
+              }
+            } catch {
+              lineParsed = null
+            }
+          }
+        }
+      }
+      if (lineParsed) {
+        foundAnyJson = true
+        parsedLines.push(lineParsed)
+      } else {
+        parsedLines.push({ plain: trimmedLine })
+      }
+    }
+    return foundAnyJson ? { kind: 'lines', entries: parsedLines } : null
+  }
+
+  const renderExtracted = (extracted, notice, transform) => {
+    if (extracted.kind === 'whole') {
+      return `${JSON.stringify({
+        ...notice,
+        preserved_refusal: transform(extracted.parsed),
+      })}\n`
+    }
+    const rendered = extracted.entries.map((entry) => {
+      if (entry.plain) return entry.plain
+      const body = JSON.stringify({
+        ...notice,
+        preserved_refusal: transform(entry.parsed),
+        ...(entry.suffix ? { trailing_text: entry.suffix } : {}),
+      })
+      return entry.prefix ? `${entry.prefix} ${body}` : body
+    })
+    return `${rendered.join('\n')}\n`
+  }
+
+  const extracted = extractJsonLines(rawText)
+  if (extracted) {
+    const noticeAllPreserved = {
+      ...baseNotice,
+      enospc_incomplete: false,
+      all_blocking_records_preserved: true,
+      reason:
+        'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized opaque string blobs were summarized while preserving every structured refusal code and every blocking record.',
+    }
+    const tiers = [
+      // Stage 1: preserve ALL narrative structural keys (`reason`, `title`, `message`, `error`) verbatim
+      // while progressively shrinking non-structural opaque blobs.
+      ...ENOSPC_COMPACT_STRING_TIERS.map((t) => ({ ...t, structuralOnly: false, compactReasons: false })),
+      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: false },
+      // Stage 2A: when `reason`/`title`/`message`/`error` themselves overflow all pre-allocated slots,
+      // shrink ONLY high-entropy opaque tokens inside them first so 100% of human-readable words,
+      // approver names, and actionable instructions survive verbatim alongside every blocking record.
+      { maxVerbatimChars: 32, previewChars: 16, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: false },
+      { maxVerbatimChars: 32, previewChars: 8, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: false },
+      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: true, compactOpaqueInNarrative: true, includePunctuatedTokens: true },
+      // Stage 2B: ONLY if narrative fields STILL exceed every pre-allocated disk slot even without
+      // opaque tokens, summarize oversized narrative strings progressively while preserving 100% of
+      // every blocking record, its ID, code, actionable URLs (up to ENOSPC_ACTIONABLE_URL_MAX_CHARS),
+      // and reason head+tail previews.
+      ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true, compactUrls: false })),
+      // Stage 2B-ultra: shrink non-URL truncated strings to minimal `[omitted:<N>c]` tokens while
+      // STILL keeping 100% of actionable URLs (`compactUrls: false`) so URLs survive even under
+      // extreme record counts before Stage 2C ever touches a URL (reqs 4e32d1a5 / 91d7b47c).
+      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: false, ultraCompactNonUrl: true },
+      // Stage 2C: Last all-records tier ONLY if actionable URLs themselves exceed every slot;
+      // truthfully discloses `enospc_omitted_actionable_urls` and NEVER claims URLs were preserved.
+      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: true, ultraCompactNonUrl: true },
+    ]
+    const buildTruthfulNotice = ({ compactedReasons, omittedActionableUrls }) => {
+      if (omittedActionableUrls > 0) {
+        return {
+          ...noticeAllPreserved,
+          actionable_urls_preserved: false,
+          enospc_omitted_actionable_urls: omittedActionableUrls,
+          reason:
+            `Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized blobs, reason text, and ${omittedActionableUrls} actionable URL(s) were omitted/shortened because they exceeded reserved disk space while preserving every structured refusal code and 100% of blocking records. Free disk space and re-run wake read for full links.`,
+        }
+      }
+      if (compactedReasons) {
+        return {
+          ...noticeAllPreserved,
+          actionable_urls_preserved: true,
+          reason:
+            'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code, actionable URLs, and 100% of blocking records.',
+        }
+      }
+      return noticeAllPreserved
+    }
+    for (const tier of tiers) {
+      const tracker = { shortenedNarrative: false, omittedActionableUrls: 0 }
+      const provisionalNotice = buildTruthfulNotice({
+        compactedReasons: Boolean(tier.compactReasons),
+        omittedActionableUrls: 0,
+      })
+      let candidate = renderExtracted(extracted, provisionalNotice, (v) => shrinkValue(v, { ...tier, tracker }))
+      const compactedReasons = Boolean(tier.compactReasons || tracker.shortenedNarrative)
+      const omittedActionableUrls = tracker.omittedActionableUrls
+      if ((compactedReasons && !tier.compactReasons) || omittedActionableUrls > 0) {
+        const truthfulNotice = buildTruthfulNotice({ compactedReasons, omittedActionableUrls })
+        candidate = renderExtracted(extracted, truthfulNotice, (v) => shrinkValue(v, tier))
+      }
+      if (fitsCompressed(candidate)) {
+        return {
+          text: candidate,
+          incomplete: false,
+          compactedReasons,
+          omittedActionableUrls,
+          totalRecords: null,
+          returnedRecords: null,
+          omittedRecords: 0,
+        }
+      }
+    }
+
+    // Stage 3: Structured array-budget fallback ONLY when even bare record IDs across an
+    // astronomical array exceed every pre-allocated slot under ENOSPC. Preserves the
+    // structured refusal envelope with head+tail records, exact `total_records`,
+    // `returned_records`, `omitted_records`, and explicit `enospc_incomplete: true`.
+    const strictestTier = { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true }
+    const countLargestArray = (val) => {
+      let maxLen = 0
+      if (Array.isArray(val)) {
+        maxLen = Math.max(maxLen, val.length)
+        for (const item of val) maxLen = Math.max(maxLen, countLargestArray(item))
+      } else if (val && typeof val === 'object') {
+        for (const v of Object.values(val)) maxLen = Math.max(maxLen, countLargestArray(v))
+      }
+      return maxLen
+    }
+    const maxArrayLen =
+      extracted.kind === 'whole'
+        ? countLargestArray(extracted.parsed)
+        : Math.max(0, ...extracted.entries.map((e) => (e.plain ? 0 : countLargestArray(e.parsed))))
+    if (maxArrayLen > 2) {
+      const sliceArrays = (val, keepCount, stats) => {
+        if (Array.isArray(val)) {
+          if (val.length > keepCount) {
+            const headCount = Math.ceil(keepCount / 2)
+            const tailCount = Math.floor(keepCount / 2)
+            const omitted = val.length - headCount - tailCount
+            stats.totalRecords += val.length
+            stats.returnedRecords += headCount + tailCount
+            stats.omittedRecords += omitted
+            return {
+              enospc_incomplete: true,
+              total_records: val.length,
+              returned_records: headCount + tailCount,
+              omitted_records: omitted,
+              head_records: val.slice(0, headCount).map((item) => shrinkValue(item, strictestTier)),
+              tail_records: tailCount > 0 ? val.slice(-tailCount).map((item) => shrinkValue(item, strictestTier)) : [],
+            }
+          }
+          return val.map((item) => sliceArrays(item, keepCount, stats))
+        }
+        if (val && typeof val === 'object') {
+          const out = {}
+          for (const [k, v] of Object.entries(val)) {
+            out[k] = sliceArrays(v, keepCount, stats)
+          }
+          return out
+        }
+        return shrinkValue(val, strictestTier)
+      }
+      const buildForKeep = (keepCount) => {
+        const stats = { totalRecords: 0, returnedRecords: 0, omittedRecords: 0 }
+        const rendered = renderExtracted(
+          extracted,
+          {
+            ...baseNotice,
+            enospc_incomplete: true,
+            all_blocking_records_preserved: false,
+            reason:
+              'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle records were omitted with exact counts. Free disk space and re-run the wake read to retrieve the full refusal.',
+          },
+          (v) => sliceArrays(v, keepCount, stats),
+        )
+        return { rendered, stats }
+      }
+      let lo = 1
+      let hi = maxArrayLen - 1
+      let best = null
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2)
+        const attempt = buildForKeep(mid)
+        if (fitsCompressed(attempt.rendered)) {
+          best = attempt
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      if (best) {
+        return {
+          text: best.rendered,
+          incomplete: true,
+          totalRecords: best.stats.totalRecords,
+          returnedRecords: best.stats.returnedRecords,
+          omittedRecords: best.stats.omittedRecords,
+        }
+      }
+    }
+  }
+
+  // Stage 4: Last resort ONLY for non-JSON or astronomically large output that still
+  // exceeds every pre-allocated disk slot: NEVER claim all records were preserved —
+  // explicitly disclose omission and recovery instructions.
+  const envelopeOverhead = ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2
+  const halfBudget = Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor((totalCapacityBytes - envelopeOverhead) / 2))
+  return {
+    text: `${JSON.stringify({
+      ...baseNotice,
+      enospc_incomplete: true,
+      all_blocking_records_preserved: false,
+      reason:
+        'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle bytes were omitted. Free disk space and re-run to retrieve the complete refusal.',
+      preserved_head_chars: Math.min(rawText.length, halfBudget),
+      preserved_tail_chars: Math.min(rawText.length, halfBudget),
+      omitted_chars: Math.max(0, rawText.length - halfBudget * 2),
+      head_preview: rawText.slice(0, halfBudget),
+      tail_preview: rawText.slice(-halfBudget),
+    })}\n`,
+    incomplete: true,
+    totalRecords: null,
+    returnedRecords: null,
+    omittedRecords: null,
+  }
+}
+
+export function reserveDiagnosticNoteSlots({
+  home = os.homedir(),
+  fallbackDir = null,
+  backupDir = null,
+  spoolKey = null,
+} = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const primaryCandidates = [
+    { store: 'home_notes', dir: path.join(home, NOTES_DIR), prefix: '' },
+    { store: 'tmp_notes', dir: path.join(os.tmpdir(), `devspec-notes-${uid}`), prefix: '' },
+    ...(fallbackDir ? [{ store: 'connections_diagnostic_notes', dir: fallbackDir, prefix: '' }] : []),
+  ]
+  const errors = []
+  const slots = []
+  const spoolSlots = []
+  const openedDirs = new Set()
+  const writeAllSync = (fd, buf) => {
+    // Write from offset 0 FIRST without truncating to 0 beforehand so overwriting a
+    // pre-allocated slot in place allocates ZERO new disk blocks even under `ENOSPC`,
+    // then trim trailing pre-allocated bytes only after the full payload is written.
+    let offset = 0
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset)
+      if (!Number.isInteger(written) || written <= 0 || written > buf.length - offset) {
+        throw new Error(`short write to reserved diagnostic slot (${offset}/${buf.length} bytes written)`)
+      }
+      offset += written
+    }
+    const postWriteStat = fs.fstatSync(fd)
+    if (postWriteStat.size > buf.length) {
+      fs.ftruncateSync(fd, buf.length)
+    }
+    fs.fsyncSync(fd)
+    const st = fs.fstatSync(fd)
+    if (st.size !== buf.length) {
+      throw new Error(`reserved diagnostic slot size mismatch (${st.size}/${buf.length} bytes on disk)`)
+    }
+  }
+  const writeFixedBlockSync = (fd, buf, expectedLen) => {
+    let offset = 0
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset)
+      if (!Number.isInteger(written) || written <= 0 || written > buf.length - offset) {
+        throw new Error(`short write to reserved spool slot (${offset}/${buf.length} bytes written)`)
+      }
+      offset += written
+    }
+    fs.fsyncSync(fd)
+    const st = fs.fstatSync(fd)
+    if (st.size !== expectedLen) {
+      throw new Error(`reserved spool slot size mismatch (${st.size}/${expectedLen} bytes on disk)`)
+    }
+  }
+  const verifySlotReadableByPath = (slot, expectedBytes = null) => {
+    let rfd = null
+    try {
+      rfd = fs.openSync(slot.filePath, 'r')
+      const st = fs.fstatSync(rfd)
+      if (st.ino !== slot.ino) return false
+      if (expectedBytes !== null) {
+        if (st.size !== expectedBytes) return false
+        if (expectedBytes > 0) {
+          const probe = Buffer.allocUnsafe(1)
+          if (fs.readSync(rfd, probe, 0, 1, 0) !== 1) return false
+          if (expectedBytes > 1 && fs.readSync(rfd, probe, 0, 1, expectedBytes - 1) !== 1) return false
+        }
+      }
+      return true
+    } catch {
+      return false
+    } finally {
+      if (rfd !== null) {
+        try { fs.closeSync(rfd) } catch { /* ignore */ }
+      }
+    }
+  }
+  const preallocDiagBuf = Buffer.alloc(RESERVED_DIAGNOSTIC_SLOT_BYTES, 0x20)
+  const openSlotIn = (candidate) => {
+    const hex = randomBytes(8).toString('hex')
+    const fileName = candidate.prefix ? `${candidate.prefix}${hex.slice(0, 16 - candidate.prefix.length)}.md` : `${hex}.md`
+    const filePath = path.join(candidate.dir, fileName)
+    fs.mkdirSync(candidate.dir, { recursive: true, mode: 0o700 })
+    const fd = fs.openSync(filePath, 'wx', 0o600)
+    try {
+      writeAllSync(fd, preallocDiagBuf)
+      const st = fs.fstatSync(fd)
+      const slot = {
+        store: candidate.store,
+        dir: candidate.dir,
+        prefix: candidate.prefix || '',
+        filePath,
+        fd,
+        ino: st.ino,
+        allocatedBytes: RESERVED_DIAGNOSTIC_SLOT_BYTES,
+        used: false,
+      }
+      if (!verifySlotReadableByPath(slot)) {
+        throw new Error(`reserved diagnostic slot is not readable by path: ${filePath}`)
+      }
+      return slot
+    } catch (error) {
+      try { fs.closeSync(fd) } catch { /* ignore */ }
+      try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
+      throw error
+    }
+  }
+  const openSpoolSlotIn = (dirPath, scopeTag) => {
+    const hex = randomBytes(8).toString('hex')
+    const filePath = path.join(dirPath, `${spoolEntryFilePrefix(scopeTag)}slot-${hex}.json`)
+    let fd = null
+    try {
+      fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 })
+      fd = fs.openSync(filePath, 'wx', 0o600)
+      const preallocBuf = Buffer.alloc(RESERVED_SPOOL_POINTER_BYTES, 0x20)
+      writeFixedBlockSync(fd, preallocBuf, RESERVED_SPOOL_POINTER_BYTES)
+      return { dir: dirPath, filePath, fd, scopeTag, used: false }
+    } catch {
+      if (fd !== null) {
+        try { fs.closeSync(fd) } catch { /* ignore */ }
+      }
+      try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
+      return null
+    }
+  }
+  // Open reserved slots in EVERY distinct writable primary store (not stopping after the
+  // first) so if one store is deleted or loses permissions mid-pickup, pre-opened slots in
+  // the remaining stores still survive (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  let primarySucceeded = false
+  for (const candidate of primaryCandidates) {
+    const resolvedDir = path.resolve(candidate.dir)
+    if (openedDirs.has(resolvedDir)) continue
+    try {
+      slots.push(openSlotIn(candidate))
+      openedDirs.add(resolvedDir)
+      primarySucceeded = true
+    } catch (error) {
+      errors.push({
+        store: candidate.store,
+        code: error && typeof error === 'object' && 'code' in error ? String(error.code) : 'write_failed',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  if (!primarySucceeded) {
+    return {
+      ok: false,
+      errors,
+      slots: [],
+      write: () => null,
+      writeSpoolPointer: () => ({ persistedOnDisk: false, file: null }),
+      release: () => {},
+    }
+  }
+  if (backupDir && !openedDirs.has(path.resolve(backupDir))) {
+    try {
+      slots.push(openSlotIn({ store: 'connections_backup_slot', dir: backupDir, prefix: 'd-' }))
+      openedDirs.add(path.resolve(backupDir))
+    } catch {
+      /* optional backup slot: primary slot already passed preflight */
+    }
+  }
+  const effectiveSpoolKey = String(spoolKey ?? backupDir ?? home)
+  const effectiveScopeTag = spoolScopeTag(effectiveSpoolKey)
+  for (const dirPath of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const sSlot = openSpoolSlotIn(dirPath, effectiveScopeTag)
+    if (sSlot) spoolSlots.push(sSlot)
+  }
+  const writeFormattedToSlot = (
+    activeSlot,
+    payloadText,
+    id,
+    { requireReadableByPath = true, pendingPermissionRecovery = false, frameNonce = null } = {},
+  ) => {
+    const quoted = shellQuotePath(activeSlot.filePath)
+    const fitsOneRead = payloadText.length <= NOTE_PART_CHARS && Buffer.byteLength(payloadText) <= NOTE_PART_BYTES
+    if (fitsOneRead) {
+      const rawBuf = Buffer.from(payloadText, 'utf8')
+      writeAllSync(activeSlot.fd, rawBuf)
+      if (requireReadableByPath) {
+        if (!verifySlotReadableByPath(activeSlot, rawBuf.length)) {
+          throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+        }
+      } else {
+        const st = fs.fstatSync(activeSlot.fd)
+        if (st.nlink <= 0 || st.size !== rawBuf.length) {
+          throw new Error(`reserved diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+        }
+      }
+      activeSlot.used = true
+      return {
+        id,
+        file: activeSlot.filePath,
+        command: `cat ${quoted}`,
+        parts: 1,
+        fallback: true,
+        reserved: true,
+        ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
+      }
+    }
+    const buildPaginatedPagesForText = (bodyText, nextCmdPrefix, { nonceSuffix = '' } = {}) => {
+      const totalChars = bodyText.length
+      const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): ${nextCmdPrefix(999999999999, 999999)}${nonceSuffix} ---\n`
+      const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+      const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+      if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
+      const pieces = splitText(bodyText, pageMaxChars, pageMaxBytes)
+      const totalParts = pieces.length
+      const nextLens = new Array(totalParts).fill(0)
+      const starts1 = new Array(totalParts).fill(1)
+      let builtPages = []
+      for (let pass = 0; pass < 4; pass += 1) {
+        const built = new Array(totalParts)
+        for (let i = totalParts - 1; i >= 0; i -= 1) {
+          const footer =
+            i + 1 < totalParts
+              ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): ${nextCmdPrefix(starts1[i + 1], nextLens[i + 1])}${nonceSuffix} ---\n`
+              : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars)${nonceSuffix} ---\n`
+          built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+          nextLens[i] = built[i].length
+        }
+        let offset = 1
+        let changed = false
+        for (let i = 0; i < totalParts; i += 1) {
+          if (starts1[i] !== offset) {
+            starts1[i] = offset
+            changed = true
+          }
+          offset += built[i].length
+        }
+        builtPages = built
+        if (!changed && pass > 0) break
+      }
+      if (!builtPages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+      return builtPages
+    }
+    const nonceSuffix = frameNonce ? ` [frame:${frameNonce}]` : ''
+    const pages = buildPaginatedPagesForText(
+      payloadText,
+      (start1, len) => `tail -c +${start1} ${quoted} | head -c ${len}`,
+      { nonceSuffix },
+    )
+    if (!pages) return null
+    const totalParts = pages.length
+    const contentBuf = Buffer.concat(pages)
+    try {
+      writeAllSync(activeSlot.fd, contentBuf)
+    } catch (writeErr) {
+      // If extending past the pre-allocated 128 KiB slot hits `ENOSPC` on a full
+      // filesystem, fall back to writing gzip-compressed PAGINATED `gzPages` IN PLACE
+      // into the pre-allocated slot (allocating ZERO new disk blocks) so every single
+      // page fits Cursor's 20,000-char / 40,000-byte Shell ceiling AND carries an exact
+      // `gzip -dc <file> | tail -c +<start> | head -c <len>` continuation command all
+      // the way to the final record (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
+      const gzPages = buildPaginatedPagesForText(
+        payloadText,
+        (start1, len) => `gzip -dc ${quoted} | tail -c +${start1} | head -c ${len}`,
+        { nonceSuffix },
+      )
+      const gzContentBuf = gzPages ? Buffer.concat(gzPages) : null
+      const gzBuf = gzContentBuf ? zlib.gzipSync(gzContentBuf) : null
+      if (gzBuf && gzBuf.length <= (activeSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES)) {
+        writeAllSync(activeSlot.fd, gzBuf)
+        if (requireReadableByPath) {
+          if (!verifySlotReadableByPath(activeSlot, gzBuf.length)) {
+            throw new Error(`reserved gzip diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+          }
+        } else {
+          const st = fs.fstatSync(activeSlot.fd)
+          if (st.nlink <= 0 || st.size !== gzBuf.length) {
+            throw new Error(`reserved gzip diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+          }
+        }
+        activeSlot.used = true
+        const gzParts = gzPages.length
+        const gzCommand =
+          gzParts === 1
+            ? `gzip -dc ${quoted}`
+            : `gzip -dc ${quoted} | head -c ${gzPages[0].length}`
+        return {
+          id,
+          file: activeSlot.filePath,
+          command: gzCommand,
+          parts: gzParts,
+          firstPageBytes: gzPages[0].length,
+          fallback: true,
+          reserved: true,
+          compressed: 'gzip',
+          rawBytes: gzContentBuf.length,
+          ...(frameNonce ? { frameNonce } : {}),
+          ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
+        }
+      }
+      throw writeErr
+    }
+    if (requireReadableByPath) {
+      if (!verifySlotReadableByPath(activeSlot, contentBuf.length)) {
+        throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+      }
+    } else {
+      const st = fs.fstatSync(activeSlot.fd)
+      if (st.nlink <= 0 || st.size !== contentBuf.length) {
+        throw new Error(`reserved diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+      }
+    }
+    activeSlot.used = true
+    return {
+      id,
+      file: activeSlot.filePath,
+      command: `head -c ${pages[0].length} ${quoted}`,
+      parts: totalParts,
+      firstPageBytes: pages[0].length,
+      fallback: true,
+      reserved: true,
+      ...(frameNonce ? { frameNonce } : {}),
+      ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
+    }
+  }
+  const writeShardedGzipToSlots = (usableSlots, payloadText, id) => {
+    if (!Array.isArray(usableSlots) || usableSlots.length < 2) return null
+    const buildShardedPages = (selected) => {
+      const quotedList = selected.map((s) => shellQuotePath(s.filePath)).join(' ')
+      const totalChars = payloadText.length
+      const nextCmdPrefix = (start1, len) => `cat ${quotedList} | gzip -dc | tail -c +${start1} | head -c ${len}`
+      const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): ${nextCmdPrefix(999999999999, 999999)} ---\n`
+      const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+      const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+      if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
+      const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
+      const totalParts = pieces.length
+      const nextLens = new Array(totalParts).fill(0)
+      const starts1 = new Array(totalParts).fill(1)
+      let builtPages = []
+      for (let pass = 0; pass < 4; pass += 1) {
+        const built = new Array(totalParts)
+        for (let i = totalParts - 1; i >= 0; i -= 1) {
+          const footer =
+            i + 1 < totalParts
+              ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): ${nextCmdPrefix(starts1[i + 1], nextLens[i + 1])} ---\n`
+              : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
+          built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+          nextLens[i] = built[i].length
+        }
+        let offset = 1
+        let changed = false
+        for (let i = 0; i < totalParts; i += 1) {
+          if (starts1[i] !== offset) {
+            starts1[i] = offset
+            changed = true
+          }
+          offset += built[i].length
+        }
+        builtPages = built
+        if (!changed && pass > 0) break
+      }
+      if (!builtPages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+      return { builtPages, quotedList }
+    }
+    for (let count = 2; count <= usableSlots.length; count += 1) {
+      const selected = usableSlots.slice(0, count)
+      const capacity = selected.reduce((sum, s) => sum + (s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES), 0)
+      const built = buildShardedPages(selected)
+      if (!built) continue
+      const gzContentBuf = Buffer.concat(built.builtPages)
+      const gzBuf = zlib.gzipSync(gzContentBuf)
+      if (gzBuf.length > capacity) continue
+      let offset = 0
+      try {
+        for (const s of selected) {
+          const cap = s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES
+          const chunk = gzBuf.subarray(offset, Math.min(gzBuf.length, offset + cap))
+          writeAllSync(s.fd, chunk)
+          if (!verifySlotReadableByPath(s, chunk.length)) {
+            throw new Error(`sharded gzip slot unreadable after write: ${s.filePath}`)
+          }
+          offset += chunk.length
+        }
+        for (const s of selected) s.used = true
+        const gzParts = built.builtPages.length
+        const gzCommand =
+          gzParts === 1
+            ? `cat ${built.quotedList} | gzip -dc`
+            : `cat ${built.quotedList} | gzip -dc | head -c ${built.builtPages[0].length}`
+        return {
+          id,
+          file: selected[0].filePath,
+          files: selected.map((s) => s.filePath),
+          command: gzCommand,
+          parts: gzParts,
+          firstPageBytes: built.builtPages[0].length,
+          fallback: true,
+          reserved: true,
+          compressed: 'gzip',
+          rawBytes: gzContentBuf.length,
+        }
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+  return {
+    ok: true,
+    store: slots[0].store,
+    dir: slots[0].dir,
+    slots,
+    write(text, { spoolKey = null } = {}) {
+      const raw = String(text ?? '')
+      const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
+      // Pass 1: prefer any slot immediately readable by path (or freshly re-opened in the same dir).
+      const initialCount = slots.length
+      const readableSlots = []
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
+        let activeSlot = slot
+        if (activeSlot.fd === null || !verifySlotReadableByPath(activeSlot)) {
+          try {
+            const reopened = openSlotIn({ store: slot.store, dir: slot.dir, prefix: slot.prefix })
+            slots.push(reopened)
+            activeSlot = reopened
+          } catch {
+            continue
+          }
+        }
+        readableSlots.push(activeSlot)
+        try {
+          const written = writeFormattedToSlot(activeSlot, raw, id, {
+            requireReadableByPath: true,
+          })
+          if (written) return written
+        } catch {
+          /* keep pre-allocated blocks intact for multi-slot sharding or compaction fallback */
+        }
+      }
+      // Pass 1.5: if a high-entropy refusal exceeded a single 128 KiB slot even after
+      // gzip compression under ENOSPC, shard the gzip stream across multiple pre-allocated
+      // 128 KiB slots (zero new disk blocks, 100% lossless byte-for-byte!).
+      if (readableSlots.length >= 2) {
+        const sharded = writeShardedGzipToSlots(readableSlots, raw, id)
+        if (sharded) return sharded
+      }
+      // Pass 1.75: if the refusal STILL exceeds all pre-allocated slots combined even after
+      // gzip under ENOSPC, compact ONLY oversized opaque string blobs while preserving EVERY
+      // refusal code and EVERY blocking record (first, middle, and final — never slicing arrays)
+      // inside a pre-allocated slot (or sharded across multiple slots if needed) so it is
+      // durable across processes.
+      if (readableSlots.length >= 1) {
+        const targetSlot = readableSlots[0]
+        const totalReadableBytes = readableSlots.reduce(
+          (sum, s) => sum + (s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES),
+          0,
+        )
+        const rawBytes = Buffer.byteLength(raw, 'utf8')
+        let compressedBytes = null
+        try {
+          compressedBytes = zlib.gzipSync(Buffer.from(raw, 'utf8')).length
+        } catch {
+          /* ignore */
+        }
+        const compacted = compactDiagnosticForSlotBudget(
+          raw,
+          Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 4, totalReadableBytes - ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 8),
+          { originalBytes: rawBytes, compressedBytes },
+        )
+        const compactMeta = {
+          enospcCompacted: true,
+          ...(compacted.compactedReasons ? { enospcCompactedReasons: true } : {}),
+          ...(Number.isInteger(compacted.omittedActionableUrls) && compacted.omittedActionableUrls > 0
+            ? { enospcOmittedActionableUrls: compacted.omittedActionableUrls }
+            : {}),
+          ...(compacted.incomplete
+            ? {
+                enospcIncomplete: true,
+                ...(Number.isInteger(compacted.totalRecords) ? { totalRecords: compacted.totalRecords } : {}),
+                ...(Number.isInteger(compacted.returnedRecords) ? { returnedRecords: compacted.returnedRecords } : {}),
+                ...(Number.isInteger(compacted.omittedRecords) ? { omittedRecords: compacted.omittedRecords } : {}),
+              }
+            : {}),
+        }
+        try {
+          const written = writeFormattedToSlot(targetSlot, compacted.text, id, {
+            requireReadableByPath: true,
+          })
+          if (written) return { ...written, ...compactMeta }
+        } catch {
+          /* try sharded gzip across all readable slots if compacted still > 1 slot */
+        }
+        if (readableSlots.length >= 2) {
+          const shardedCompacted = writeShardedGzipToSlots(readableSlots, compacted.text, id)
+          if (shardedCompacted) return { ...shardedCompacted, ...compactMeta }
+        }
+      }
+      // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.
+      // `chmod 0o000`), still persist the complete refusal durably through any pre-opened
+      // fd whose directory entry remains linked on disk (`nlink > 0`). Once permissions are
+      // restored, BOTH the printed read command works directly AND a fresh CLI process
+      // discovers the tagged file on disk and surfaces it even if retry pickup succeeds
+      // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+      const frameNonce = randomBytes(8).toString('hex')
+      const rawSha256 = createHash('sha256').update(raw, 'utf8').digest('hex')
+      const header = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home, {
+        nonce: frameNonce,
+        sha256: rawSha256,
+        chars: raw.length,
+      })
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
+        if (slot.fd === null) continue
+        try {
+          const preStat = fs.fstatSync(slot.fd)
+          if (preStat.nlink <= 0) continue
+          const written = writeFormattedToSlot(slot, `${header}${raw}`, id, {
+            requireReadableByPath: false,
+            pendingPermissionRecovery: true,
+            frameNonce,
+          })
+          if (written) return written
+        } catch {
+          /* try compacted Pass 2 below if incompressible >128 KiB under ENOSPC + chmod 0o000 */
+        }
+      }
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
+        if (slot.fd === null) continue
+        try {
+          const preStat = fs.fstatSync(slot.fd)
+          if (preStat.nlink <= 0) continue
+          const compacted = compactDiagnosticForSlotBudget(
+            raw,
+            Math.max(4096, (slot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES) - 4096),
+            { originalBytes: Buffer.byteLength(raw, 'utf8') },
+          )
+          const compactNonce = randomBytes(8).toString('hex')
+          const compactSha = createHash('sha256').update(compacted.text, 'utf8').digest('hex')
+          const compactHeader = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home, {
+            nonce: compactNonce,
+            sha256: compactSha,
+            chars: compacted.text.length,
+          })
+          const written = writeFormattedToSlot(slot, `${compactHeader}${compacted.text}`, id, {
+            requireReadableByPath: false,
+            pendingPermissionRecovery: true,
+            frameNonce: compactNonce,
+          })
+          if (written) {
+            return {
+              ...written,
+              enospcCompacted: true,
+              ...(compacted.compactedReasons ? { enospcCompactedReasons: true } : {}),
+              ...(Number.isInteger(compacted.omittedActionableUrls) && compacted.omittedActionableUrls > 0
+                ? { enospcOmittedActionableUrls: compacted.omittedActionableUrls }
+                : {}),
+              ...(compacted.incomplete
+                ? {
+                    enospcIncomplete: true,
+                    ...(Number.isInteger(compacted.totalRecords) ? { totalRecords: compacted.totalRecords } : {}),
+                    ...(Number.isInteger(compacted.returnedRecords) ? { returnedRecords: compacted.returnedRecords } : {}),
+                    ...(Number.isInteger(compacted.omittedRecords) ? { omittedRecords: compacted.omittedRecords } : {}),
+                  }
+                : {}),
+            }
+          }
+        } catch {
+          /* keep pre-allocated blocks intact */
+        }
+      }
+      return null
+    },
+    writeSpoolPointer(payload) {
+      const json = JSON.stringify(payload)
+      const jsonBuf = Buffer.from(json, 'utf8')
+      if (jsonBuf.length > RESERVED_SPOOL_POINTER_BYTES) {
+        return { persistedOnDisk: false, file: null }
+      }
+      const padded = Buffer.alloc(RESERVED_SPOOL_POINTER_BYTES, 0x20)
+      jsonBuf.copy(padded, 0)
+      for (const sSlot of spoolSlots) {
+        if (sSlot.fd === null || sSlot.used) continue
+        if (payload?.scope && sSlot.scopeTag !== payload.scope) continue
+        try {
+          writeFixedBlockSync(sSlot.fd, padded, RESERVED_SPOOL_POINTER_BYTES)
+          sSlot.used = true
+          return { persistedOnDisk: true, file: sSlot.filePath }
+        } catch {
+          /* try next pre-allocated spool slot */
+        }
+      }
+      return { persistedOnDisk: false, file: null }
+    },
+    release() {
+      for (const slot of slots) {
+        if (slot.fd !== null) {
+          try { fs.closeSync(slot.fd) } catch { /* ignore */ }
+          slot.fd = null
+        }
+        if (!slot.used) {
+          try { fs.rmSync(slot.filePath, { force: true }) } catch { /* ignore */ }
+        }
+      }
+      for (const sSlot of spoolSlots) {
+        if (sSlot.fd !== null) {
+          try { fs.closeSync(sSlot.fd) } catch { /* ignore */ }
+          sSlot.fd = null
+        }
+        if (!sSlot.used) {
+          try { fs.rmSync(sSlot.filePath, { force: true }) } catch { /* ignore */ }
+        }
+      }
+    },
+  }
+}
+
+/**
+ * Private fallback note store under `os.tmpdir()` used only when `~/.devspec/notes`
+ * cannot be written, so the exact original oversized refusal/diagnostic is still saved
+ * whole in Shell-sized parts on disk and can be read back with `cat` without making a
+ * new request whose response might differ (requirements 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
+  const raw = String(text ?? '')
+  const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const dir = baseDir ?? path.join(os.tmpdir(), `devspec-notes-${uid}`)
+  const partPath = (part) => path.join(dir, part === 1 ? `${id}.md` : `${id}-part-${part}.md`)
+  const worstNextCmd = `\n\n--- next part (99999/99999): cat ${shellQuotePath(partPath(99999))} ---\n`
+  const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstNextCmd.length)
+  const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstNextCmd, 'utf8'))
+  if (pageMaxChars <= 0 || pageMaxBytes <= 0) {
+    throw new Error(`fallback diagnostic path exceeds Shell output limit (${dir.length} chars)`)
+  }
+  const pieces = splitText(raw, pageMaxChars, pageMaxBytes)
+  const firstFile = partPath(1)
+  const partTexts = pieces.map((piece, idx) => {
+    const part = idx + 1
+    const nextCmd = part < pieces.length ? `\n\n--- next part (${part + 1}/${pieces.length}): cat ${shellQuotePath(partPath(part + 1))} ---\n` : '\n'
+    const partText = `${piece}${nextCmd}`
+    if (!fitsShellOutput(partText)) {
+      throw new Error(`fallback diagnostic part ${part} exceeds Shell output limit`)
+    }
+    return partText
+  })
+  // Verify every part exists, is readable, and matches expected content; rewrite any
+  // missing or damaged part (and verify all parts by path before returning) so a cached
+  // fallback note whose continuation part is missing is NEVER advertised as complete
+  // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  for (let part = pieces.length; part >= 1; part -= 1) {
+    const target = partPath(part)
+    const expected = partTexts[part - 1]
+    let matches = false
+    try {
+      matches = fs.readFileSync(target, 'utf8') === expected
+    } catch {
+      matches = false
+    }
+    if (!matches) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writePrivateText(target, expected)
+    }
+  }
+  for (let part = 1; part <= pieces.length; part += 1) {
+    const target = partPath(part)
+    const expected = partTexts[part - 1]
+    const actual = fs.readFileSync(target, 'utf8')
+    if (actual !== expected) {
+      throw new Error(`fallback diagnostic part ${part} verification failed on disk: ${target}`)
+    }
+  }
+  return {
+    id,
+    file: firstFile,
+    command: `cat ${shellQuotePath(firstFile)}`,
+    parts: pieces.length,
+    fallback: true,
+  }
+}
+
+/**
+ * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`) at the shared boundary
+ * for diagnostic-store preflight failures so deep escaped paths NEVER exceed 20,000 UTF-16
+ * chars / 40,000 UTF-8 bytes or get silently cut by Cursor (reqs 3c5147a7 / 91d7b47c).
+ */
+export function formatDiagnosticStorePreflightError(label, errors = [], { priorText = '' } = {}) {
+  const prior = String(priorText ?? '')
+  const list = Array.isArray(errors) ? errors : []
+  const fullPayload = {
+    error: 'no_writable_diagnostic_note_store',
+    stores_tried: list,
+    recovery:
+      'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
+  }
+  const fullLine = `${label}: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(fullPayload)}\n`
+  if (fitsShellOutput(prior + fullLine)) return fullLine
+  const compactStores = list.map((entry) => ({
+    store: String(entry?.store ?? 'unknown'),
+    code: String(entry?.code ?? 'write_failed'),
+    error_chars: String(entry?.error ?? '').length,
+  }))
+  const compactPayload = {
+    error: 'no_writable_diagnostic_note_store',
+    omitted_due_to_shell_limit: true,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    actual_chars: fullLine.length,
+    total_stores_tried: list.length,
+    stores_tried: compactStores,
+    recovery:
+      'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections/diagnostic-notes) failed preflight and full error paths exceeded Cursor Shell limit. Fix write permissions on those directories and retry.',
+  }
+  const compactLine = `${label}: ${JSON.stringify(compactPayload)}\n`
+  if (fitsShellOutput(prior + compactLine)) return compactLine
+  const minimalLine = `${label}: ${JSON.stringify({
+    error: 'no_writable_diagnostic_note_store',
+    omitted_due_to_shell_limit: true,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    actual_chars: fullLine.length,
+    total_stores_tried: list.length,
+    recovery: 'Fix write permissions on ~/.devspec/notes, TMPDIR, or connections/diagnostic-notes & retry.',
+  })}\n`
+  return fitsShellOutput(prior + minimalLine) ? minimalLine : ''
+}
+
+/**
+ * Durable cross-process spool for unabridged oversized refusals when note stores fail
+ * mid-pickup: persists ONE immutable content-addressed private JSON file per refusal
+ * entry (`devspec-unsaved-refusal-<scope>-<hash>.json`) so concurrent processes can
+ * NEVER race or delete each other's entries during cleanup, AND discovers Pass-2 open-fd
+ * pending-refusal notes once directory permissions are restored (reqs 3c5147a7 / 4e32d1a5 /
+ * 91d7b47c / 3ea2b201).
+ */
+const pendingUnsavedRefusals = new Map()
+
+function readPendingMdFile(fullPath) {
+  const rawBuf = fs.readFileSync(fullPath)
+  if (rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b) {
+    return zlib.gunzipSync(rawBuf).toString('utf8')
+  }
+  return rawBuf.toString('utf8')
+}
+
+function stripReservedFooters(content, quotedOrList, frameNonce = null) {
+  const noncePat =
+    typeof frameNonce === 'string' && /^[0-9a-f]{16}$/.test(frameNonce)
+      ? ` \\[frame:${frameNonce}\\]`
+      : ''
+  const quotedPath = quotedOrList.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const footerRe = new RegExp(
+    `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): (?:cat ${quotedPath} \\| gzip -dc \\| tail -c \\+\\d+|gzip -dc ${quotedPath} \\| tail -c \\+\\d+|tail -c \\+\\d+ ${quotedPath}) \\| head -c \\d+)?${noncePat} ---\\n`,
+    'g',
+  )
+  return content.replace(footerRe, '')
+}
+
+function recoverNoteRefPayload(parsed) {
+  if (!parsed || parsed.kind !== 'note_ref' || typeof parsed.file !== 'string' || !parsed.file) return null
+  const partsCount = Number.isInteger(parsed.parts) && parsed.parts > 0 ? parsed.parts : 1
+  const shardFiles =
+    Array.isArray(parsed.files) && parsed.files.length > 1 && parsed.files.every((f) => typeof f === 'string' && f)
+      ? parsed.files
+      : [parsed.file]
+  const quoted = shellQuotePath(parsed.file)
+  const quotedList = shardFiles.map(shellQuotePath).join(' ')
+  const firstPageBytes =
+    Number.isInteger(parsed.first_page_bytes) && parsed.first_page_bytes > 0 ? parsed.first_page_bytes : null
+  const readFallbackCmd =
+    typeof parsed.command === 'string' && parsed.command
+      ? parsed.command
+      : parsed.compressed === 'gzip'
+        ? shardFiles.length > 1
+          ? partsCount > 1
+            ? `cat ${quotedList} | gzip -dc | head -c ${firstPageBytes ?? CURSOR_SHELL_OUTPUT_MAX_CHARS}`
+            : `cat ${quotedList} | gzip -dc`
+          : partsCount > 1
+            ? `gzip -dc ${quoted} | head -c ${firstPageBytes ?? CURSOR_SHELL_OUTPUT_MAX_CHARS}`
+            : `gzip -dc ${quoted}`
+        : parsed.reserved && partsCount > 1 && firstPageBytes
+          ? `head -c ${firstPageBytes} ${quoted}`
+          : `cat ${quoted}`
+  try {
+    if (parsed.compressed === 'gzip') {
+      const gzRaw =
+        shardFiles.length > 1
+          ? Buffer.concat(shardFiles.map((f) => fs.readFileSync(f)))
+          : fs.readFileSync(parsed.file)
+      let gunzipped = zlib.gunzipSync(gzRaw).toString('utf8')
+      if (gunzipped.startsWith(PENDING_DIAGNOSTIC_REFUSAL_PREFIX) && typeof parsed.scope === 'string') {
+        const rec = parsePendingDiagnosticRefusalFile(gunzipped, parsed.scope)
+        if (rec?.body) return { ok: rec.ok, text: rec.body }
+      }
+      gunzipped = stripReservedFooters(gunzipped, shardFiles.length > 1 ? quotedList : quoted, parsed.frame_nonce)
+      if (gunzipped) return { ok: true, text: gunzipped }
+    } else if (parsed.reserved) {
+      let content = fs.readFileSync(parsed.file, 'utf8')
+      if (content.startsWith(PENDING_DIAGNOSTIC_REFUSAL_PREFIX) && typeof parsed.scope === 'string') {
+        const rec = parsePendingDiagnosticRefusalFile(content, parsed.scope)
+        if (rec?.body) return { ok: rec.ok, text: rec.body }
+      }
+      content = stripReservedFooters(content, quoted, parsed.frame_nonce)
+      if (content) return { ok: true, text: content }
+    } else if (parsed.fallback) {
+      const chunks = []
+      for (let p = 1; p <= partsCount; p += 1) {
+        const pFile = p === 1 ? parsed.file : parsed.file.replace(/\.md$/, `-part-${p}.md`)
+        let raw = fs.readFileSync(pFile, 'utf8')
+        raw = raw.replace(/\n\n--- next part \(\d+\/\d+\): cat [\s\S]*? ---\n$/, '')
+        if (p === partsCount && raw.endsWith('\n')) raw = raw.slice(0, -1)
+        chunks.push(raw)
+      }
+      const joined = chunks.join('')
+      if (joined) return { ok: true, text: joined }
+    } else {
+      const chunks = []
+      for (let p = 1; p <= partsCount; p += 1) {
+        const pFile = p === 1 ? parsed.file : parsed.file.replace(/\.md$/, `.${p}.md`)
+        const raw = fs.readFileSync(pFile, 'utf8')
+        const id = path.basename(parsed.file, '.md')
+        const unsealed = unseal(raw, partLabel(id, p, partsCount))
+        chunks.push(unsealed ?? raw)
+      }
+      const joined = chunks.join('')
+      if (joined) return { ok: true, text: joined }
+    }
+  } catch {
+    /* fall back to read pointer below */
+  }
+  return {
+    ok: false,
+    text: `Previously saved diagnostic note could not be re-read; inspect directly with \`${readFallbackCmd}\``,
+  }
+}
+
+export function spoolUnsavedRefusal(
+  spoolKey,
+  diagnosticText,
+  { home = os.homedir(), fallbackDir = null, backupDir = null, savedNote = null, reservedStore = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  const text = String(diagnosticText ?? '')
+  if (!key || !text) return { persistedOnDisk: false, file: null }
+  const existing = pendingUnsavedRefusals.get(key) ?? []
+  if (!existing.includes(text)) {
+    pendingUnsavedRefusals.set(key, [...existing, text])
+  }
+  const scopeTag = spoolScopeTag(key)
+  const entryHash = spoolEntryHash(text)
+  const dirs = spoolCandidateDirs({ home, fallbackDir, backupDir })
+
+  // If the full diagnostic is ALREADY saved whole on disk in `savedNote`, persist a
+  // compact `note_ref` pointer storing `file` ONCE (never duplicating the path inside
+  // `command`, so even a deep legal POSIX path fits easily inside the pre-allocated
+  // 16 KiB spool slot under `ENOSPC` + `EPIPE`) (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c).
+  if (savedNote && typeof savedNote.file === 'string' && savedNote.file) {
+    const refPayload = {
+      version: 2,
+      scope: scopeTag,
+      hash: entryHash,
+      kind: 'note_ref',
+      at: new Date().toISOString(),
+      file: savedNote.file,
+      ...(Array.isArray(savedNote.files) && savedNote.files.length > 1 ? { files: savedNote.files } : {}),
+      parts: savedNote.parts ?? 1,
+      ...(Number.isInteger(savedNote.firstPageBytes) && savedNote.firstPageBytes > 0
+        ? { first_page_bytes: savedNote.firstPageBytes }
+        : {}),
+      fallback: Boolean(savedNote.fallback),
+      ...(savedNote.reserved ? { reserved: true } : {}),
+      ...(savedNote.compressed ? { compressed: savedNote.compressed } : {}),
+      ...(savedNote.frameNonce ? { frame_nonce: savedNote.frameNonce } : {}),
+      ...(savedNote.enospcCompacted ? { enospc_compacted: true } : {}),
+      ...(savedNote.enospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+      ...(Number.isInteger(savedNote.enospcOmittedActionableUrls) && savedNote.enospcOmittedActionableUrls > 0
+        ? { enospc_omitted_actionable_urls: savedNote.enospcOmittedActionableUrls }
+        : {}),
+      ...(savedNote.enospcIncomplete
+        ? {
+            enospc_incomplete: true,
+            ...(Number.isInteger(savedNote.totalRecords) ? { total_records: savedNote.totalRecords } : {}),
+            ...(Number.isInteger(savedNote.returnedRecords) ? { returned_records: savedNote.returnedRecords } : {}),
+            ...(Number.isInteger(savedNote.omittedRecords) ? { omitted_records: savedNote.omittedRecords } : {}),
+          }
+        : {}),
+    }
+    const refDirs = [...dirs]
+    const noteDir = path.dirname(savedNote.file)
+    if (noteDir && !refDirs.some((d) => path.resolve(d) === path.resolve(noteDir))) {
+      refDirs.push(noteDir)
+    }
+    for (const dir of refDirs) {
+      const file = spoolEntryFilePath(dir, scopeTag, entryHash)
+      try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+        writePrivateJson(file, refPayload)
+        return { persistedOnDisk: true, file }
+      } catch {
+        /* try next dir or pre-allocated spool slot */
+      }
+    }
+    if (reservedStore && typeof reservedStore.writeSpoolPointer === 'function') {
+      const fromSlot = reservedStore.writeSpoolPointer(refPayload)
+      if (fromSlot?.persistedOnDisk) return fromSlot
+    }
+  }
+
+  for (const dir of dirs) {
+    const file = spoolEntryFilePath(dir, scopeTag, entryHash)
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writePrivateJson(file, {
+        version: 2,
+        scope: scopeTag,
+        hash: entryHash,
+        at: new Date().toISOString(),
+        text,
+      })
+      return { persistedOnDisk: true, file }
+    } catch {
+      /* try next candidate directory */
+    }
+  }
+  // Last-resort pre-allocated fallback under `ENOSPC`: write into a pre-allocated 16 KiB
+  // spool slot if small, or into a pre-allocated 128 KiB diagnostic slot (auto-gzipping
+  // in place if > 128 KiB) if oversized.
+  if (reservedStore && typeof reservedStore.writeSpoolPointer === 'function') {
+    const fromSlot = reservedStore.writeSpoolPointer({
+      version: 2,
+      scope: scopeTag,
+      hash: entryHash,
+      at: new Date().toISOString(),
+      text,
+    })
+    if (fromSlot?.persistedOnDisk) return fromSlot
+  }
+  if (!savedNote && reservedStore && typeof reservedStore.write === 'function') {
+    try {
+      const saved = reservedStore.write(text, { spoolKey: key })
+      if (saved?.file) {
+        const refPayload = {
+          version: 2,
+          scope: scopeTag,
+          hash: entryHash,
+          kind: 'note_ref',
+          at: new Date().toISOString(),
+          file: saved.file,
+          ...(Array.isArray(saved.files) && saved.files.length > 1 ? { files: saved.files } : {}),
+          parts: saved.parts ?? 1,
+          ...(Number.isInteger(saved.firstPageBytes) && saved.firstPageBytes > 0
+            ? { first_page_bytes: saved.firstPageBytes }
+            : {}),
+          fallback: Boolean(saved.fallback),
+          ...(saved.reserved ? { reserved: true } : {}),
+          ...(saved.compressed ? { compressed: saved.compressed } : {}),
+          ...(saved.frameNonce ? { frame_nonce: saved.frameNonce } : {}),
+        }
+        if (typeof reservedStore.writeSpoolPointer === 'function') {
+          const fromSlot = reservedStore.writeSpoolPointer(refPayload)
+          if (fromSlot?.persistedOnDisk) return fromSlot
+        }
+        return { persistedOnDisk: true, file: saved.file }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return { persistedOnDisk: false, file: null }
+}
+
+/**
+ * Check whether any candidate spool directory or scope-matching spool/pending-refusal
+ * file exists and currently CANNOT be read (e.g. temporary `EIO`/`EACCES` or corrupted
+ * non-empty JSON). Used alongside `peekPendingUnsavedRefusals` so a wake reader that
+ * surfaces one readable refusal still holds the cursor when a second refusal file is
+ * temporarily unreadable (requirement 3ea2b201).
+ */
+export function hasUnreadablePendingUnsavedRefusals(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return false
+  const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const legacyFile = legacySpoolFilePath(dir, scopeTag)
+    try {
+      const legacyRaw = fs.readFileSync(legacyFile, 'utf8')
+      if (legacyRaw.trim().length > 0) JSON.parse(legacyRaw)
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return true
+    }
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
+      return true
+    }
+    for (const name of names) {
+      if ((name.startsWith(entryPrefix) || name.startsWith(claimPrefix)) && name.endsWith('.json')) {
+        const fullPath = path.join(dir, name)
+        try {
+          const raw = fs.readFileSync(fullPath, 'utf8')
+          if (raw.trim().length === 0) continue
+          JSON.parse(raw)
+        } catch (error) {
+          if (error?.code === 'ENOENT') continue
+          return true
+        }
+        continue
+      }
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      try {
+        fs.readFileSync(fullPath)
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        return true
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Fail-closed check for whether any unsurfaced spooled pickup refusal may still be
+ * pending for `spoolKey`. Returns `true` whenever a refusal is queued in memory/on disk
+ * OR when any spool directory or scope-matching spool/pending-note file exists and
+ * cannot currently be read (e.g. temporary `EACCES`/`EIO`), so a later wake note NEVER
+ * advances the wake cursor past an unreadable pending refusal (requirement 3ea2b201).
+ */
+export function hasPendingUnsavedRefusals(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return false
+  if (peekPendingUnsavedRefusals(key, { home, fallbackDir, backupDir }).length > 0) return true
+  if (hasUnreadablePendingUnsavedRefusals(key, { home, fallbackDir, backupDir })) return true
+  return false
+}
+
+/**
+ * Single-pass inspection of pending unsaved refusals for `spoolKey`: returns BOTH all
+ * readable `entries` AND `hadReadError: true` if ANY candidate spool directory or
+ * scope-matching spool/pending-refusal file failed to read during this exact pass.
+ * Reading once eliminates the TOCTOU window where a file fails during peek and then
+ * recovers during a separate unreadability check without ever being surfaced (req 3ea2b201).
+ */
+export function peekPendingUnsavedRefusalsDetailed(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return { entries: [], hadReadError: false }
+  const seen = new Set()
+  const out = []
+  let hadReadError = false
+  const pushUnique = (text) => {
+    if (typeof text !== 'string' || !text || seen.has(text)) return
+    seen.add(text)
+    out.push(text)
+  }
+  const mem = pendingUnsavedRefusals.get(key)
+  if (Array.isArray(mem)) {
+    for (const entry of mem) pushUnique(entry)
+  }
+  const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
+  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
+  const readJsonStrict = (filePath) => {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8')
+      if (raw.trim().length === 0) return { empty: true, parsed: null }
+      return { empty: false, parsed: JSON.parse(raw) }
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { missing: true, parsed: null }
+      hadReadError = true
+      return { error, parsed: null }
+    }
+  }
+  const readLegacyEntries = (filePath) => {
+    const res = readJsonStrict(filePath)
+    const legacyParsed = res.parsed
+    if (Array.isArray(legacyParsed?.entries)) {
+      for (const entry of legacyParsed.entries) pushUnique(entry)
+    } else if (typeof legacyParsed?.text === 'string' && legacyParsed.text) {
+      pushUnique(legacyParsed.text)
+    }
+  }
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    // Also read any oversized refusals saved in the preceding v1 shared spool format
+    // (`devspec-unsaved-refusals-<scope>.json`) or an in-flight legacy claim file so
+    // upgrades never silently drop pending structured refusals already on disk
+    // (reqs 3c5147a7 / 4e32d1a5).
+    readLegacyEntries(legacySpoolFilePath(dir, scopeTag))
+    let names = []
+    try {
+      names = fs.readdirSync(dir).sort()
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') hadReadError = true
+      continue
+    }
+    for (const name of names) {
+      if (name.startsWith(claimPrefix) && name.endsWith('.json')) {
+        readLegacyEntries(path.join(dir, name))
+        continue
+      }
+      if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
+        const res = readJsonStrict(path.join(dir, name))
+        const parsed = res.parsed
+        if (parsed?.kind === 'note_ref') {
+          const recoveredRef = recoverNoteRefPayload(parsed)
+          if (recoveredRef?.text) pushUnique(recoveredRef.text)
+        } else if (typeof parsed?.text === 'string' && parsed.text) {
+          pushUnique(parsed.text)
+        }
+        continue
+      }
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      let rawBuf = null
+      try {
+        rawBuf = fs.readFileSync(fullPath)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') hadReadError = true
+        continue
+      }
+      try {
+        const content =
+          rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b
+            ? zlib.gunzipSync(rawBuf).toString('utf8')
+            : rawBuf.toString('utf8')
+        if (!content.startsWith(scopePrefix)) continue
+        const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
+        if (recovered?.body) pushUnique(recovered.body)
+      } catch {
+        /* ignore non-standalone gzip shards (e.g. part 1 of a multi-file sharded note) */
+      }
+    }
+  }
+  return { entries: out, hadReadError }
+}
+
+export function peekPendingUnsavedRefusals(spoolKey, opts = {}) {
+  return peekPendingUnsavedRefusalsDetailed(spoolKey, opts).entries
+}
+
+export function clearPendingUnsavedRefusals(
+  spoolKey,
+  cleared = null,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return
+  const clearedList = Array.isArray(cleared) ? cleared.filter((e) => typeof e === 'string' && e) : null
+  const clearedSet = clearedList ? new Set(clearedList) : null
+  const clearedHashes = clearedList ? new Set(clearedList.map(spoolEntryHash)) : null
+  if (cleared === null) {
+    pendingUnsavedRefusals.delete(key)
+  } else if (clearedSet) {
+    const existing = pendingUnsavedRefusals.get(key) ?? []
+    const rest = existing.filter((entry) => !clearedSet.has(entry))
+    if (rest.length === 0) pendingUnsavedRefusals.delete(key)
+    else pendingUnsavedRefusals.set(key, rest)
+  } else {
+    const existing = pendingUnsavedRefusals.get(key) ?? []
+    const rest = existing.slice(Number(cleared) || 0)
+    if (rest.length === 0) pendingUnsavedRefusals.delete(key)
+    else pendingUnsavedRefusals.set(key, rest)
+  }
+  const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
+  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
+  // Atomically claim a legacy v1 spool file via `renameSync` before reading/migrating any
+  // unsurfaced entries to immutable v2 per-entry files, then unlink ONLY the claimed path.
+  // An older v1 process appending concurrently either lands inside our claimed file (where
+  // it is migrated to v2 and preserved) or writes a brand-new legacy file after our rename
+  // (which we never unlink), eliminating the upgrade TOCTOU window (reqs 3c5147a7 / 4e32d1a5).
+  const drainLegacySpoolFile = (dir, filePath, { claimFirst }) => {
+    let targetPath = filePath
+    if (claimFirst) {
+      const claimPath = path.join(dir, `${claimPrefix}${process.pid}-${randomBytes(8).toString('hex')}.json`)
+      try {
+        fs.renameSync(filePath, claimPath)
+        targetPath = claimPath
+      } catch {
+        return
+      }
+    }
+    try {
+      if (!clearedSet) {
+        fs.rmSync(targetPath, { force: true })
+        return
+      }
+      const legacyParsed = readPrivateJson(targetPath)
+      if (!legacyParsed) return
+      const entries = Array.isArray(legacyParsed.entries)
+        ? legacyParsed.entries.filter((e) => typeof e === 'string' && e)
+        : typeof legacyParsed.text === 'string' && legacyParsed.text
+          ? [legacyParsed.text]
+          : null
+      if (!entries) return
+      const remaining = entries.filter((entry) => !clearedSet.has(entry))
+      for (const entry of remaining) {
+        const entryHash = spoolEntryHash(entry)
+        writePrivateJson(spoolEntryFilePath(dir, scopeTag, entryHash), {
+          version: 2,
+          scope: scopeTag,
+          hash: entryHash,
+          at: new Date().toISOString(),
+          text: entry,
+        })
+      }
+      fs.rmSync(targetPath, { force: true })
+    } catch {
+      /* leave claimed file intact on disk so the next pass still recovers every entry */
+    }
+  }
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const legacyFile = legacySpoolFilePath(dir, scopeTag)
+    if (fs.existsSync(legacyFile)) {
+      drainLegacySpoolFile(dir, legacyFile, { claimFirst: true })
+    }
+    if (clearedHashes) {
+      // Unlink ONLY the exact per-entry content-addressed files surfaced by this pass;
+      // any newer refusal appended concurrently by another process lives under its own
+      // distinct hash filename and is NEVER touched (requirements 3c5147a7 / 3ea2b201).
+      for (const hash of clearedHashes) {
+        const entryFile = spoolEntryFilePath(dir, scopeTag, hash)
+        try {
+          if (fs.existsSync(entryFile)) fs.rmSync(entryFile, { force: true })
+        } catch {
+          /* leave for next cleanup if transiently unwritable */
+        }
+      }
+    }
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (name.startsWith(claimPrefix) && name.endsWith('.json')) {
+        drainLegacySpoolFile(dir, path.join(dir, name), { claimFirst: false })
+        continue
+      }
+      if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
+        const fullPath = path.join(dir, name)
+        if (!clearedHashes) {
+          try {
+            fs.rmSync(fullPath, { force: true })
+          } catch {
+            /* ignore */
+          }
+          continue
+        }
+        // Match pre-allocated `slot-<hex>.json` or `note_ref` spool entries ONLY when
+        // their hash or recovered text was actually in `clearedSet` (never deleting
+        // concurrently added entries or unreadable originals).
+        const parsed = readPrivateJson(fullPath)
+        if (!parsed) continue
+        const matchesHash = typeof parsed.hash === 'string' && clearedHashes.has(parsed.hash)
+        const matchesText =
+          (typeof parsed.text === 'string' && clearedSet?.has(parsed.text)) ||
+          (parsed.kind === 'note_ref' &&
+            (() => {
+              const rec = recoverNoteRefPayload(parsed)
+              return Boolean(rec?.ok && clearedSet?.has(rec.text))
+            })())
+        if (matchesHash || matchesText) {
+          try {
+            fs.rmSync(fullPath, { force: true })
+          } catch {
+            /* ignore */
+          }
+        }
+        continue
+      }
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      try {
+        const content = readPendingMdFile(fullPath)
+        if (!content.startsWith(scopePrefix)) continue
+        const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
+        // NEVER delete an original Pass-2 note whose integrity check failed; keep it on
+        // disk so the full paginated original remains readable (reqs 4e32d1a5 / 91d7b47c).
+        if (!recovered?.ok) continue
+        if (!clearedSet || clearedSet.has(recovered.body)) {
+          fs.rmSync(fullPath, { force: true })
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Enforce Cursor's combined Shell output ceiling (`fitsShellOutput`, stdout + stderr)
+ * at one shared boundary for stderr diagnostics (requirements 3c5147a7 / 91d7b47c).
+ * Returns the diagnostic verbatim when `stdoutText + diagnosticText` fits; otherwise
+ * saves the full diagnostic whole in a sealed note (`writeNote`) and returns the
+ * fixed-shape pointer. If `~/.devspec/notes` cannot be written, saves the exact original
+ * content whole to a private fallback note in `os.tmpdir()` (`writeFallbackDiagnosticNote`)
+ * so callers can read the original response without retrying a network request.
+ */
+export function fitShellDiagnostic(
+  stdoutText,
+  diagnosticText,
+  {
+    home = os.homedir(),
+    label = 'devspec-wake-tail',
+    fallback = null,
+    requireStructuredFallback = false,
+    fallbackDir = null,
+    backupDir = null,
+    reservedStore = null,
+    spoolKey = null,
+  } = {},
+) {
+  const stdout = String(stdoutText ?? '')
+  const diag = String(diagnosticText ?? '')
+  if (!diag) return { text: '', note: null }
+  if (fitsShellOutput(stdout + diag)) {
+    return { text: diag, note: null }
+  }
+  const resolveFallback = (error, savedFallbackNote = null) => {
+    const candidate = typeof fallback === 'function' ? fallback(error, savedFallbackNote) : fallback
+    return typeof candidate === 'string' && candidate ? candidate : null
+  }
+  let noteError = null
+  try {
+    const note = writeNote(diag, { home })
+    const pointer = shellDiagnosticPointer(label, note.command)
+    if (fitsShellOutput(stdout + pointer)) {
+      return { text: pointer, note }
+    }
+    const fb = resolveFallback(null, note)
+    if (fb && fitsShellOutput(stdout + fb)) {
+      return { text: fb, note, overflow: true, usedFallback: true }
+    }
+    return { text: '', note, overflow: true }
+  } catch (error) {
+    noteError = error
+  }
+  let fallbackNote = null
+  const fallbackBaseDirs = [
+    null,
+    ...(fallbackDir ? [fallbackDir] : []),
+  ]
+  for (const baseDir of fallbackBaseDirs) {
+    try {
+      fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir })
+      if (fallbackNote) break
+    } catch {
+      fallbackNote = null
+    }
+  }
+  if (!fallbackNote && reservedStore && typeof reservedStore.write === 'function') {
+    try {
+      fallbackNote = reservedStore.write(diag, { spoolKey })
+    } catch {
+      fallbackNote = null
+    }
+  }
+  if (!fallbackNote && backupDir) {
+    try {
+      fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir: backupDir })
+    } catch {
+      fallbackNote = null
+    }
+  }
+  const fb = resolveFallback(noteError, fallbackNote)
+  if (fb && fitsShellOutput(stdout + fb)) {
+    return { text: fb, note: fallbackNote, noteError, usedFallback: true }
+  }
+  if (fallbackNote) {
+    const fallbackPointer = shellDiagnosticPointer(label, fallbackNote.command, fallbackNote)
+    if (fitsShellOutput(stdout + fallbackPointer)) {
+      return { text: fallbackPointer, note: fallbackNote, noteError }
+    }
+  }
+  if (requireStructuredFallback) {
+    return { text: '', note: fallbackNote, noteError, overflow: true }
+  }
+  const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
+  const partialCounts =
+    fallbackNote?.enospcIncomplete &&
+    Number.isInteger(fallbackNote.returnedRecords) &&
+    Number.isInteger(fallbackNote.totalRecords)
+      ? `${fallbackNote.returnedRecords}/${fallbackNote.totalRecords} records, ${fallbackNote.omittedRecords ?? Math.max(0, fallbackNote.totalRecords - fallbackNote.returnedRecords)} omitted`
+      : null
+  const shardCount = Array.isArray(fallbackNote?.files) && fallbackNote.files.length > 1 ? fallbackNote.files.length : 1
+  const omittedUrls = Number.isInteger(fallbackNote?.enospcOmittedActionableUrls)
+    ? fallbackNote.enospcOmittedActionableUrls
+    : 0
+  const statusTag = fallbackNote?.enospcIncomplete
+    ? `partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry)`
+    : fallbackNote?.enospcCompacted
+      ? omittedUrls > 0
+        ? `compacted ENOSPC (all records; blobs, reason text & ${omittedUrls} actionable URL(s) omitted/shortened due to disk limit)`
+        : fallbackNote.enospcCompactedReasons
+          ? 'compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved)'
+          : 'compacted ENOSPC (all records; blobs shortened)'
+      : fallbackNote
+        ? `saved in ${shardCount} file(s)`
+        : 'note write failed'
+  const readHint = fallbackNote
+    ? fallbackNote.enospcIncomplete
+      ? ` Partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`.`
+      : fallbackNote.enospcCompacted
+        ? omittedUrls > 0
+          ? ` Compacted ENOSPC (all records; blobs, reason text & ${omittedUrls} actionable URL(s) omitted/shortened due to disk limit): \`${fallbackNote.command}\`.`
+          : fallbackNote.enospcCompactedReasons
+            ? ` Compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved): \`${fallbackNote.command}\`.`
+            : ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
+        : ` Read original: \`${fallbackNote.command}\`.`
+    : ''
+  const candidates = [
+    `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).${readHint}\n`,
+    `${label}: diagnostic omitted (note write failed).${readHint}\n`,
+  ]
+  if (fallbackNote?.enospcIncomplete) {
+    candidates.push(
+      `${label}: partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`\n`,
+    )
+  } else if (fallbackNote) {
+    candidates.push(`${label}: ${statusTag}: \`${fallbackNote.command}\`\n`)
+  }
+  // If the full recovery command itself exceeds remaining Shell headroom (e.g. a multi-file
+  // sharded note whose paths exceed the caller's reserve), NEVER return empty output:
+  // disclose the omission, the Shell limit, the shard count/location, and how to retrieve it
+  // (requirements 3c5147a7 / 91d7b47c).
+  if (fallbackNote) {
+    candidates.push(
+      `${label}: diagnostic omitted (${diag.length} chars; ${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, read cmd ${fallbackNote.command.length} chars; saved across ${shardCount} file(s) starting at ${fallbackNote.file} — inspect saved note or re-run wake read).\n`,
+      `${label}: diagnostic omitted (${diag.length} chars; ${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}, read cmd ${fallbackNote.command.length} chars; saved in ${shardCount} file(s) under diagnostic note dirs — inspect saved note or re-run).\n`,
+      `${label}: diagnostic omitted (${statusTag}; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}; ${shardCount} file(s) saved; re-run).\n`,
+    )
+  } else {
+    candidates.push(
+      `${label}: diagnostic omitted (${diag.length} chars; note write failed; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}; fix permissions & re-run).\n`,
+      `${label}: diagnostic omitted (note write failed; Shell limit ${CURSOR_SHELL_OUTPUT_MAX_CHARS}).\n`,
+    )
+  }
+  for (const candidate of candidates) {
+    if (fitsShellOutput(stdout + candidate)) {
+      return { text: candidate, note: fallbackNote, noteError }
+    }
+  }
+  return { text: '', note: fallbackNote, noteError }
 }
 
 /** What a wake kept whole in a note says about itself: one fixed sentence. */

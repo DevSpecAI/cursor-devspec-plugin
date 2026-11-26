@@ -103,25 +103,40 @@ import path from 'node:path'
 
 import { appendWakeEvents, splitWakes, wakeLines } from './devspec-wake-file.mjs'
 import {
+  fitHookContext,
   fitsShellOutput,
+  hasPendingUnsavedRefusals,
   noteCommand,
   pointToNote,
   POST_TOOL_CONTEXT_SHARE,
   postToolUseOutput,
   readThrough,
+  shellDiagnosticPointer,
+  writeFallbackDiagnosticNote,
   writeNote,
 } from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { noticeReplyInstruction, recordTurnWake, turnWakeFromEvents } from './notice-reply.mjs'
 import { readOwnConnectionState } from './own-connection.mjs'
-import { readPrivateJson, writePrivateJson } from './private-state.mjs'
+import { readPrivateJson, readPrivateJsonResult, STATE_UNREADABLE, writePrivateJson } from './private-state.mjs'
 import { firingConversation } from './project-context.mjs'
 import { readLastTurnEnd, STABLE_READ_ATTEMPTS, STABLE_READ_GAP_MS } from './transcript-turn-end.mjs'
 import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
+import {
+  clearWakeListenerNeeded,
+  extractRoomCommandsFromWake,
+  formatStructuredRefusalsFallback,
+  isWakeListenerActive,
+  startRoomCommands,
+  structuredRefusalFromError,
+  wakeListenerReminder,
+  wakeNeededPath,
+} from './command-start.mjs'
+import { commandsHandedOver } from './turn-commands.mjs'
 
-/** The inbox batches that reach a working agent at its next step: check jobs and notices. */
-export const STEP_BATCH_TYPES = Object.freeze(['check_job_dispatches', 'canonical_system_notices'])
+/** The inbox batches that reach a working agent at its next step: canonical room messages, check jobs, and notices. */
+export const STEP_BATCH_TYPES = Object.freeze(['owner_messages', 'check_job_dispatches', 'canonical_system_notices'])
 
 /** Where DevSpec says how a check job is taken and ruled. Pointed at, never restated. */
 export const CHECK_JOB_RULES =
@@ -135,7 +150,362 @@ const RECORD_VERSION = 1
 const HANDED = 'handed.json'
 const STEPS_FOLDER = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.steps$/i
 const WAITING = /^w-\d{15}-[0-9a-f]{12}\.json$/
+const RETRY_OVERFLOW = /^retry-\d+-[0-9a-f]{8}\.json$/
+const WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json$/
+const TAKEN_WAKE_NOTE = /^wake-note-([0-9a-f]{16})\.json\.taken-(\d+)-[0-9a-f]{8}$/
+const WAKE_INLINE_HOLD = 'wake-inline-hold.json'
 const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
+const unpersistedRetryOverflow = new Map()
+
+/**
+ * Record an active unstarted-inline-command cursor barrier for `wakePositionPath` so
+ * completing a later `wake_in_note` via `stepDeliveryHook` can NEVER advance the wake
+ * cursor past an earlier unstarted inline command on the same wake file (req 3ea2b201).
+ */
+export function setWakeInlineHold(connectionId, { wakePositionPath, holdOffset }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string' || typeof holdOffset !== 'number') return false
+  const steps = stepsDir(connectionId, dir)
+  fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
+  const target = path.join(steps, WAKE_INLINE_HOLD)
+  const currentRes = readPrivateJsonResult(target)
+  if (currentRes.status === STATE_UNREADABLE) return false
+  const current = currentRes.value
+  const holds = current && typeof current.holds === 'object' && !Array.isArray(current.holds) ? { ...current.holds } : {}
+  holds[wakePositionPath] = holdOffset
+  writePrivateJson(target, { version: RECORD_VERSION, holds, at: new Date().toISOString() })
+  return true
+}
+
+/** Clear the unstarted-inline-command cursor barrier once all inline commands are started. */
+export function clearWakeInlineHold(connectionId, { wakePositionPath }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string') return false
+  const steps = stepsDir(connectionId, dir)
+  const target = path.join(steps, WAKE_INLINE_HOLD)
+  const currentRes = readPrivateJsonResult(target)
+  if (currentRes.status === STATE_UNREADABLE) return false
+  const current = currentRes.value
+  if (!current || typeof current.holds !== 'object' || !(wakePositionPath in current.holds)) return false
+  const holds = { ...current.holds }
+  delete holds[wakePositionPath]
+  if (Object.keys(holds).length === 0) {
+    try { fs.rmSync(target, { force: true }) } catch { /* ignore */ }
+  } else {
+    writePrivateJson(target, { version: RECORD_VERSION, holds, at: new Date().toISOString() })
+  }
+  return true
+}
+
+function readWakeInlineHoldOffset(steps, wakePositionPath) {
+  const res = readPrivateJsonResult(path.join(steps, WAKE_INLINE_HOLD))
+  // Fail closed on any transient read/parse error of `wake-inline-hold.json` so a later
+  // wake-note completing NEVER advances the wake cursor past an earlier unstarted inline
+  // command (requirement 3ea2b201).
+  if (res.status === STATE_UNREADABLE) return 0
+  const offset = res.value?.holds?.[wakePositionPath]
+  return typeof offset === 'number' ? offset : null
+}
+
+/** Whether a deferred `wake_in_note` has already been read whole and picked up. */
+export function isWakeNoteCompleted(connectionId, noteId, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || !/^[0-9a-f]{16}$/.test(String(noteId ?? ''))) return false
+  const entry = readPrivateJson(path.join(stepsDir(connectionId, dir), `wake-note-${noteId}.json`))
+  return entry?.note === noteId && entry?.completed === true
+}
+
+/** Remove completed wake-note markers whose byte span has already been passed by `offset`. */
+export function cleanupCompletedWakeNotesBefore(connectionId, { wakePositionPath, offset }, { dir = connectionsDirFor() } = {}) {
+  if (!connectionId || typeof wakePositionPath !== 'string' || typeof offset !== 'number') return
+  const steps = stepsDir(connectionId, dir)
+  for (const file of pendingWakeNoteFiles(steps)) {
+    const entry = readPrivateJson(file)
+    if (
+      entry?.completed === true &&
+      entry.wake_position_path === wakePositionPath &&
+      typeof entry.wake_through === 'number' &&
+      entry.wake_through <= offset
+    ) {
+      try { fs.rmSync(file, { force: true }) } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Record a `wake_in_note` carrying canonical room command(s) as awaiting full agent read
+ * before calling `report_pickup` or advancing the wake reader cursor (requirement 3ea2b201).
+ * Stored inside `<connectionId>.steps/` so the existing `postToolUse` glob wakes
+ * `stepDeliveryHook` automatically once the agent runs `cat ~/.devspec/notes/<noteId>.md`.
+ */
+export function registerPendingWakeNote(
+  connectionId,
+  {
+    noteId,
+    commands = [],
+    messages = [],
+    sessionId = null,
+    wakeFile = null,
+    wakePositionPath = null,
+    wakePositionVersion = 1,
+    wakeStart = null,
+    wakeThrough = null,
+    revokeCursorAdvance = false,
+  },
+  { dir = connectionsDirFor() } = {},
+) {
+  if (!connectionId || !/^[0-9a-f]{16}$/.test(String(noteId ?? '')) || !Array.isArray(commands) || commands.length === 0) {
+    return null
+  }
+  const steps = stepsDir(connectionId, dir)
+  fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
+  const target = path.join(steps, `wake-note-${noteId}.json`)
+  withWakeNoteLock(steps, () => {
+    const existing = readPrivateJson(target)
+    if (existing && existing.note === noteId) {
+      if (revokeCursorAdvance) {
+        if (existing.wake_position_path !== null || existing.wake_start !== null || existing.wake_through !== null) {
+          writePrivateJson(target, {
+            ...existing,
+            wake_position_path: null,
+            wake_start: null,
+            wake_through: null,
+          })
+        }
+        return
+      }
+      const nextStart =
+        typeof wakeStart === 'number'
+          ? typeof existing.wake_start === 'number'
+            ? Math.min(existing.wake_start, wakeStart)
+            : wakeStart
+          : existing.wake_start ?? null
+      const nextThrough =
+        typeof wakeThrough === 'number'
+          ? Math.max(existing.wake_through ?? 0, wakeThrough)
+          : existing.wake_through ?? null
+      if (
+        wakePositionPath &&
+        (nextThrough !== existing.wake_through || nextStart !== existing.wake_start || existing.wake_position_path !== wakePositionPath)
+      ) {
+        writePrivateJson(target, {
+          ...existing,
+          wake_file: wakeFile ?? existing.wake_file ?? null,
+          wake_position_path: wakePositionPath,
+          wake_position_version: wakePositionVersion,
+          wake_start: nextStart,
+          wake_through: nextThrough,
+        })
+      }
+      return
+    }
+    writePrivateJson(target, {
+      version: RECORD_VERSION,
+      note: noteId,
+      parts: [],
+      commands,
+      messages,
+      session_id: sessionId,
+      wake_file: wakeFile,
+      wake_position_path: revokeCursorAdvance ? null : wakePositionPath,
+      wake_position_version: wakePositionVersion,
+      wake_start: revokeCursorAdvance ? null : typeof wakeStart === 'number' ? wakeStart : null,
+      wake_through: revokeCursorAdvance ? null : typeof wakeThrough === 'number' ? wakeThrough : null,
+      completed: false,
+      at: new Date().toISOString(),
+    })
+  })
+  return target
+}
+
+/**
+ * Short synchronous lock around wake-note directory transitions (`take`, `giveBack`,
+ * `registerPendingWakeNote`, `advanceCompletedWakeNotePositions`) so a concurrent hook
+ * returning a `.taken-*` file to pending can NEVER slip between a directory scan and
+ * wake-cursor advancement (requirement 3ea2b201). Held only for local filesystem ops,
+ * never across network/MCP calls, and stored beside `steps` (not inside it) so Cursor's
+ * hook glob never sees it.
+ */
+function withWakeNoteLock(steps, fn) {
+  const parent = path.dirname(steps)
+  const target = path.join(parent, `${path.basename(steps)}.wakenotes.lock`)
+  const mine = `${target}.${process.pid}-${randomBytes(4).toString('hex')}`
+  fs.mkdirSync(parent, { recursive: true })
+  fs.writeFileSync(mine, String(process.pid), { mode: 0o600 })
+  let acquired = false
+  try {
+    const deadline = Date.now() + 2_000
+    while (Date.now() < deadline) {
+      try {
+        fs.linkSync(mine, target)
+        acquired = true
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
+      }
+      let holder = null
+      try {
+        holder = Number(fs.readFileSync(target, 'utf8'))
+      } catch {
+        continue
+      }
+      if (Number.isSafeInteger(holder) && holder > 0 && !pidAlive(holder)) {
+        try { fs.rmSync(target, { force: true }) } catch { /* ignore */ }
+        continue
+      }
+      sleepSync(LOCK_RETRY_MS)
+    }
+  } finally {
+    try { fs.rmSync(mine, { force: true }) } catch { /* ignore */ }
+  }
+  if (!acquired) return { locked: false, value: undefined }
+  try {
+    return { locked: true, value: fn() }
+  } finally {
+    try { fs.rmSync(target, { force: true }) } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Single atomic directory snapshot of BOTH pending (`wake-note-<id>.json`) AND in-flight
+ * (`wake-note-<id>.json.taken-*`) wake-note files. Returns `{ ok: false }` on any
+ * `readdirSync` error so cursor advancement fails closed instead of treating an
+ * unreadable directory as empty (requirement 3ea2b201).
+ */
+function scanWakeNoteFiles(steps) {
+  let names
+  try {
+    names = fs.readdirSync(steps)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, files: [], takenFiles: [] }
+    return { ok: false, files: [], takenFiles: [] }
+  }
+  const files = []
+  const takenFiles = []
+  for (const name of names) {
+    if (WAKE_NOTE.test(name)) files.push(path.join(steps, name))
+    else if (TAKEN_WAKE_NOTE.test(name)) takenFiles.push(path.join(steps, name))
+  }
+  files.sort()
+  takenFiles.sort()
+  return { ok: true, files, takenFiles }
+}
+
+/**
+ * Advance each wake reader cursor ONLY up to the highest contiguous completed wake-note
+ * offset that has no earlier incomplete wake-note before it (requirement 3ea2b201).
+ * Out-of-order completed notes remain marked `completed: true` until every earlier note
+ * on the same wake file is also read and picked up; once the cursor passes them, their
+ * marker files are deleted.
+ */
+function advanceCompletedWakeNotePositions(steps, { home = os.homedir(), dir = null } = {}) {
+  withWakeNoteLock(steps, () => {
+    const connDir = dir ?? path.dirname(steps)
+    const effectiveHome = typeof home === 'string' && home ? home : os.homedir()
+    // Never advance the wake reader cursor while an unsurfaced spooled refusal is still
+    // pending recovery on disk (requirement 3ea2b201).
+    if (
+      connDir &&
+      hasPendingUnsavedRefusals(path.resolve(connDir), {
+        home: effectiveHome,
+        fallbackDir: path.join(connDir, 'diagnostic-notes'),
+        backupDir: connDir,
+      })
+    ) {
+      return
+    }
+    const scan = scanWakeNoteFiles(steps)
+    if (!scan.ok) return
+    const { files, takenFiles } = scan
+    if (files.length === 0) return
+    const byPosPath = new Map()
+    let unknownIncompletePresent = false
+    for (const file of files) {
+      const entry = readPrivateJson(file)
+      if (!entry || typeof entry.wake_position_path !== 'string') {
+        unknownIncompletePresent = true
+        continue
+      }
+      if (!byPosPath.has(entry.wake_position_path)) byPosPath.set(entry.wake_position_path, [])
+      byPosPath.get(entry.wake_position_path).push({ file, entry, taken: false })
+    }
+    // Include in-flight wake-note markers currently renamed to `.taken-...` by a concurrent
+    // hook awaiting pickup so a later note completing out of order can NEVER advance the wake
+    // cursor past an earlier in-flight note (requirement 3ea2b201).
+    const takenIncompleteMinByPos = new Map()
+    for (const takenFile of takenFiles) {
+      const entry = readPrivateJson(takenFile)
+      if (!entry || typeof entry.wake_position_path !== 'string') {
+        unknownIncompletePresent = true
+        continue
+      }
+      const start = typeof entry.wake_start === 'number' ? entry.wake_start : 0
+      const prevMin = takenIncompleteMinByPos.get(entry.wake_position_path)
+      if (prevMin === undefined || start < prevMin) {
+        takenIncompleteMinByPos.set(entry.wake_position_path, start)
+      }
+    }
+    for (const [posPath, group] of byPosPath) {
+      let minIncompleteStart = unknownIncompletePresent ? 0 : Number.POSITIVE_INFINITY
+      const takenMin = takenIncompleteMinByPos.get(posPath)
+      if (typeof takenMin === 'number' && takenMin < minIncompleteStart) {
+        minIncompleteStart = takenMin
+      }
+      const inlineHoldOffset = readWakeInlineHoldOffset(steps, posPath)
+      if (typeof inlineHoldOffset === 'number' && inlineHoldOffset < minIncompleteStart) {
+        minIncompleteStart = inlineHoldOffset
+      }
+      for (const { entry } of group) {
+        if (entry.completed !== true) {
+          const start = typeof entry.wake_start === 'number' ? entry.wake_start : 0
+          if (start < minIncompleteStart) minIncompleteStart = start
+        }
+      }
+      const curRes = readPrivateJsonResult(posPath)
+      if (curRes.status === STATE_UNREADABLE) continue
+      const cur = curRes.value
+      const prevOffset = typeof cur?.offset === 'number' ? cur.offset : 0
+      let nextOffset = prevOffset
+      let wakeFile = cur?.file ?? null
+      let posVersion = cur?.version ?? 1
+      for (const { entry } of group) {
+        if (entry.completed === true && typeof entry.wake_through === 'number' && entry.wake_through <= minIncompleteStart) {
+          if (entry.wake_through > nextOffset) {
+            nextOffset = entry.wake_through
+            wakeFile = entry.wake_file ?? wakeFile
+            posVersion = entry.wake_position_version ?? posVersion
+          }
+        }
+      }
+      let advancedOk = nextOffset === prevOffset
+      if (nextOffset > prevOffset) {
+        try {
+          writePrivateJson(posPath, {
+            version: posVersion,
+            file: wakeFile,
+            offset: nextOffset,
+            at: new Date().toISOString(),
+          })
+          advancedOk = true
+        } catch {
+          advancedOk = false
+        }
+      }
+      if (advancedOk) {
+        for (const { file, entry } of group) {
+          if (entry.completed === true && typeof entry.wake_through === 'number' && entry.wake_through <= nextOffset) {
+            try {
+              fs.rmSync(file, { force: true })
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }
+  })
+}
+
+function pendingWakeNoteFiles(steps) {
+  return scanWakeNoteFiles(steps).files
+}
 
 /**
  * One check job's lookup on DevSpec: the budget the plugin's other postToolUse hook that
@@ -146,7 +516,9 @@ const TAKEN = /^(.+\.json)\.taken-(\d+)-[0-9a-f]{8}$/
 const CHECK_JOB_LOOKUP_MS = 5_000
 
 export function isStepBatch(batch) {
-  return STEP_BATCH_TYPES.includes(batch?.type)
+  if (!batch || typeof batch !== 'object') return false
+  if (batch.type === 'owner_messages') return batch?.ingress?.canonical === true
+  return STEP_BATCH_TYPES.includes(batch.type)
 }
 
 export function connectionsDirFor(home = os.homedir(), env = process.env) {
@@ -192,6 +564,22 @@ export async function readTurnState(conversationId, { home = os.homedir() } = {}
 /** One held batch: the wake events the follow built for it, and what it is. */
 export function stepItem(batch, events, { now = Date.now() } = {}) {
   const list = Array.isArray(events) ? events : []
+  if (batch?.type === 'owner_messages') {
+    const messages = Array.isArray(batch.messages) ? batch.messages : []
+    const commands = commandsHandedOver(messages)
+    return {
+      version: RECORD_VERSION,
+      key:
+        batch.acceptance_key ??
+        `owner_messages:${commands.map((c) => c.messageId).join(',') || list.length}`,
+      kind: 'owner_messages',
+      session_id: batch.session_id ?? null,
+      commands,
+      messages,
+      held_at: new Date(now).toISOString(),
+      events: list,
+    }
+  }
   if (batch?.type === 'check_job_dispatches') {
     const job = batch.messages?.[0]
     return {
@@ -215,12 +603,20 @@ export function stepItem(batch, events, { now = Date.now() } = {}) {
 
 function validItem(item) {
   return item?.version === RECORD_VERSION && typeof item.key === 'string' &&
-    (item.kind === 'check_job' || item.kind === 'notices') && Array.isArray(item.events)
+    (item.kind === 'owner_messages' || item.kind === 'check_job' || item.kind === 'notices') &&
+    Array.isArray(item.events)
 }
 
 function validRecord(record) {
   return record?.version === RECORD_VERSION && typeof record.note === 'string' &&
     Array.isArray(record.items) && record.items.every(validItem)
+}
+
+function hasUnreadNote(record) {
+  if (!record) return false
+  if (record.note_read === true) return false
+  if (record.note_read === false) return true
+  return record.pickup_pending !== true && record.inner_note_pending !== true
 }
 
 function list(dir) {
@@ -362,12 +758,27 @@ export function reclaimAbandoned(steps) {
   for (const name of list(steps)) {
     const match = TAKEN.exec(name)
     if (!match || pidAlive(Number(match[2]))) continue
-    giveBack({ file: path.join(steps, name), original: path.join(steps, match[1]) })
+    const takenPath = path.join(steps, name)
+    const originalPath = path.join(steps, match[1])
+    if (match[1] === HANDED && fs.existsSync(originalPath)) {
+      try {
+        fs.renameSync(takenPath, path.join(steps, `retry-${Date.now()}-${randomBytes(4).toString('hex')}.json`))
+        continue
+      } catch {
+        /* leave in place for next reclaim */
+        continue
+      }
+    }
+    giveBack({ file: takenPath, original: originalPath })
   }
 }
 
 function waitingFiles(steps) {
   return list(steps).filter((name) => WAITING.test(name)).sort().map((name) => path.join(steps, name))
+}
+
+function retryOverflowFiles(steps) {
+  return list(steps).filter((name) => RETRY_OVERFLOW.test(name)).sort().map((name) => path.join(steps, name))
 }
 
 /** A waiting item's file name: when it was held, then its key, so names sort in arrival order. */
@@ -444,9 +855,18 @@ export function itemStillOpen(item, options = {}) {
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`
 
 function itemCounts(items) {
+  const roomMessages = items.reduce(
+    (sum, item) =>
+      sum + (item.kind === 'owner_messages' ? item.events.filter((e) => e?.type === 'owner_message').length || 1 : 0),
+    0,
+  )
   const checks = items.filter((item) => item.kind === 'check_job').length
   const notices = items.reduce((sum, item) => sum + (item.kind === 'notices' ? item.events.filter((e) => e?.type === 'system_notice').length : 0), 0)
-  return [checks ? plural(checks, 'check job', 'check jobs') : null, notices ? plural(notices, 'notice', 'notices') : null]
+  return [
+    roomMessages ? plural(roomMessages, 'room message', 'room messages') : null,
+    checks ? plural(checks, 'check job', 'check jobs') : null,
+    notices ? plural(notices, 'notice', 'notices') : null,
+  ]
     .filter(Boolean)
     .join(' and ')
 }
@@ -460,6 +880,12 @@ export function stepNoteText(items, { connectionId = null } = {}) {
   const lines = [
     `DevSpec sent you ${itemCounts(items) || 'nothing'} while you were working. Deal with all of them now, in this one pause, then carry on with what you were doing.`,
   ]
+  if (items.some((item) => item.kind === 'owner_messages')) {
+    lines.push(
+      '',
+      'Answer each canonical room message (type: owner_message) before ending your turn via post_session_message({ connection_id, message, complete_turn: true }) (when attached). Preserve its authority, project_scope, and sender_response_style.',
+    )
+  }
   if (items.some((item) => item.kind === 'check_job')) {
     lines.push('', `How a check job is taken and ruled is DevSpec's rule: ${CHECK_JOB_RULES} (claim_check_job repeats the first as \`helpers\`).`)
   }
@@ -468,6 +894,17 @@ export function stepNoteText(items, { connectionId = null } = {}) {
     lines.push('', `What a notice asks of you, and whether and how you answer it, is DevSpec's rule too: ${NOTICE_RULES}.`)
   }
   for (const item of items) {
+    if (item.kind === 'owner_messages') {
+      const msgIds = item.events
+        .filter((event) => event?.type === 'owner_message')
+        .map((event) => event.message?.message_id)
+        .filter(Boolean)
+      lines.push('', `## Room message${msgIds.length > 1 ? 's' : ''}${msgIds.length ? ` (${msgIds.join(', ')})` : ''}`)
+      for (const event of item.events) {
+        lines.push(JSON.stringify(event))
+      }
+      continue
+    }
     if (item.kind === 'check_job') {
       const event = item.events.find((each) => each?.type === 'check_job') ?? {}
       const job = event.check_job ?? {}
@@ -505,7 +942,17 @@ const STEP_ALSO = 'Deal with all of it in one pause, then carry on with your tas
 function idlePointer(note, items, connectionId) {
   return {
     type: 'held_for_step',
-    holds: [...new Set(items.map((item) => (item.kind === 'check_job' ? 'check_job' : 'system_notice')))],
+    holds: [
+      ...new Set(
+        items.map((item) =>
+          item.kind === 'owner_messages'
+            ? 'owner_message'
+            : item.kind === 'check_job'
+              ? 'check_job'
+              : 'system_notice',
+        ),
+      ),
+    ],
     connection_id: connectionId,
     note: note.id,
     read_with: note.command,
@@ -522,7 +969,16 @@ function idlePointer(note, items, connectionId) {
  */
 export async function stepDeliveryHook(
   input,
-  { env = process.env, home = os.homedir(), dir = null, isOpen = itemStillOpen, share = POST_TOOL_CONTEXT_SHARE, emit = () => {} } = {},
+  {
+    env = process.env,
+    home = os.homedir(),
+    dir = null,
+    isOpen = itemStillOpen,
+    share = POST_TOOL_CONTEXT_SHARE,
+    emit = () => {},
+    startCommands = startRoomCommands,
+    listenerActive = isWakeListenerActive,
+  } = {},
 ) {
   if (!input || typeof input !== 'object') return null
   // A helper agent's call: its conversation id is its own, so the lookup below finds no
@@ -533,22 +989,332 @@ export async function stepDeliveryHook(
   const connectionId = state.connection_id
   const connDir = dir ?? connectionsDirFor(home, env)
   const steps = stepsDir(connectionId, connDir)
-  if (!fs.existsSync(steps)) return null
+  const neededFile = wakeNeededPath(connectionId, connDir)
+  const hasSteps = fs.existsSync(steps)
+  const hasWakeNeeded = fs.existsSync(neededFile)
+  if (!hasSteps && !hasWakeNeeded) return null
+
+  const toolCmd = String(input?.tool_input?.command ?? '')
+  const startingListener =
+    toolCmd.includes('devspec-wake-tail.mjs') && !/\bdevspec-wake-tail\.mjs\b[^;\n]*\bread\b/.test(toolCmd)
+  let needsListenerReminder = false
+  if (hasWakeNeeded) {
+    if (listenerActive(connectionId, { dir: connDir })) {
+      clearWakeListenerNeeded(connectionId, connDir)
+    } else if (!startingListener) {
+      needsListenerReminder = true
+    }
+  }
+
+  if (!hasSteps) {
+    if (!needsListenerReminder) return null
+    const reminder = fitHookContext(wakeListenerReminder(connectionId, { dir: connDir }), {
+      share,
+      what: 'A DevSpec wake-listener setup notice',
+      home,
+    })
+    if (!reminder) return null
+    const output = JSON.stringify(postToolUseOutput(reminder))
+    await emit(output)
+    return output
+  }
   reclaimAbandoned(steps)
 
   // What came back of the note already handed over, in this tool call.
   const takenRecord = take(path.join(steps, HANDED))
   let record = null
   let readChanged = false
+  const partitionOwnerItems = (items) => {
+    const immediateOwnerItems = []
+    const unreadableItems = []
+    const unreadableRefusals = []
+    for (const item of items) {
+      if (item.kind !== 'owner_messages') continue
+      const hasInnerWakeNote =
+        Array.isArray(item.events) &&
+        item.events.some(
+          (event) =>
+            event?.type === 'wake_in_note' &&
+            Array.isArray(event.carries) &&
+            event.carries.includes('owner_message'),
+        )
+      if (!hasInnerWakeNote) {
+        immediateOwnerItems.push(item)
+        continue
+      }
+      // The outer step note contained a `wake_in_note` pointer for an oversized
+      // room command whose body lives in an inner note. Do NOT trigger report_pickup
+      // or drop pending tracking yet: register each inner note via registerPendingWakeNote
+      // so pickup runs ONLY once the agent finishes reading the inner note whole (3ea2b201).
+      const extracted = extractRoomCommandsFromWake(wakeLines(item.events), { home })
+      for (const deferred of extracted.deferredNoteCommands) {
+        registerPendingWakeNote(
+          connectionId,
+          {
+            noteId: deferred.noteId,
+            commands: deferred.commands,
+            messages: deferred.messages,
+            sessionId: deferred.sessionId ?? item.session_id ?? null,
+          },
+          { dir: connDir },
+        )
+      }
+      if (extracted.unreadableNotes.length > 0) {
+        const innerOnlyEvents = item.events.filter(
+          (event) =>
+            event?.type === 'wake_in_note' &&
+            Array.isArray(event.carries) &&
+            event.carries.includes('owner_message'),
+        )
+        unreadableItems.push({
+          ...item,
+          events: innerOnlyEvents,
+          commands: [],
+          messages: [],
+        })
+        for (const unreadable of extracted.unreadableNotes) {
+          unreadableRefusals.push({
+            command_message_id: null,
+            command_turn_id: null,
+            refusal: unreadable,
+          })
+        }
+      }
+      if (extracted.inlineCommands.length > 0) {
+        immediateOwnerItems.push({
+          ...item,
+          commands: extracted.inlineCommands,
+          messages: extracted.inlineMessages,
+        })
+      }
+    }
+    return { immediateOwnerItems, unreadableItems, unreadableRefusals }
+  }
+
+  let completedOwnerItems = []
+  let keptForPickupRetry = null
+  let unreadableInnerNoteRefusals = []
+  let unreadableInnerNoteItems = []
+  let unreadNoteRecord = null
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
-      const { record: next, done } = readThrough(kept, input, { home })
-      record = done ? null : { ...kept, parts: next.parts }
-      readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
+      const hadPendingInner = kept.inner_note_pending === true
+      const hadPendingPickup = kept.pickup_pending === true
+      if (hadPendingInner) {
+        const innerSource = Array.isArray(kept.inner_note_items) ? kept.inner_note_items : kept.items
+        const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerSource)
+        unreadableInnerNoteRefusals.push(...unreadableRefusals)
+        unreadableInnerNoteItems.push(...unreadableItems)
+        if (immediateOwnerItems.length > 0) {
+          completedOwnerItems.push(...immediateOwnerItems)
+        }
+        readChanged = true
+      }
+      if (hadPendingPickup) {
+        const pickupSource = Array.isArray(kept.pickup_items)
+          ? kept.pickup_items
+          : kept.items.filter((item) => item.kind === 'owner_messages')
+        completedOwnerItems.push(...pickupSource)
+        readChanged = true
+      }
+      if (hasUnreadNote(kept)) {
+        const { record: next, done } = readThrough(kept, input, { home })
+        if (done) {
+          readChanged = true
+          const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(kept.items)
+          completedOwnerItems.push(...immediateOwnerItems)
+          unreadableInnerNoteRefusals.push(...unreadableRefusals)
+          unreadableInnerNoteItems.push(...unreadableItems)
+        } else {
+          if (next.parts.length !== (kept.parts?.length ?? 0)) readChanged = true
+          unreadNoteRecord = {
+            version: kept.version,
+            note: kept.note,
+            parts: next.parts,
+            items: kept.items,
+            at: kept.at,
+            note_read: false,
+          }
+        }
+      }
+      keptForPickupRetry = { ...kept, note_read: !unreadNoteRecord }
+      if (unreadNoteRecord) {
+        record = {
+          ...unreadNoteRecord,
+          ...(unreadableInnerNoteItems.length > 0
+            ? {
+                inner_note_pending: true,
+                inner_note_items: unreadableInnerNoteItems,
+                pickup_refusals: unreadableInnerNoteRefusals,
+              }
+            : {}),
+        }
+      } else if (unreadableInnerNoteItems.length > 0) {
+        record = {
+          ...kept,
+          note_read: true,
+          items: unreadableInnerNoteItems,
+          inner_note_pending: true,
+          inner_note_items: unreadableInnerNoteItems,
+          pickup_pending: false,
+          pickup_items: [],
+          pickup_refusals: unreadableInnerNoteRefusals,
+        }
+      } else {
+        record = null
+      }
     } else {
       giveBack(takenRecord)
       return null
+    }
+  }
+
+  // Also drain any retry overflow preserved when a parallel hook wrote a fresh HANDED
+  // right before a transient write failure on an earlier hook, or when reclaimAbandoned
+  // moved a dead hook's taken HANDED record alongside a newer HANDED (requirement 3ea2b201).
+  const takenOverflows = retryOverflowFiles(steps).map(take).filter(Boolean)
+  const memoryOverflows = unpersistedRetryOverflow.get(steps) ?? []
+  if (memoryOverflows.length > 0) unpersistedRetryOverflow.delete(steps)
+  const reclaimedUnreadItems = []
+  const consumeOverflowEntry = (entry) => {
+    if (!entry || typeof entry !== 'object') return
+    const innerList = Array.isArray(entry.inner_note_items) ? entry.inner_note_items : []
+    if (innerList.length > 0) {
+      const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(innerList)
+      unreadableInnerNoteRefusals.push(...unreadableRefusals)
+      unreadableInnerNoteItems.push(...unreadableItems)
+      if (immediateOwnerItems.length > 0) completedOwnerItems.push(...immediateOwnerItems)
+      readChanged = true
+    }
+    const pickupList = Array.isArray(entry.pickup_items)
+      ? entry.pickup_items
+      : validRecord(entry) && entry.pickup_pending === true
+        ? entry.items.filter((i) => i.kind === 'owner_messages')
+        : []
+    if (pickupList.length > 0) {
+      completedOwnerItems.push(...pickupList)
+      readChanged = true
+    }
+    if (Array.isArray(entry.unread_items) && entry.unread_items.length > 0) {
+      reclaimedUnreadItems.push(...entry.unread_items)
+      readChanged = true
+    } else if (validRecord(entry) && hasUnreadNote(entry)) {
+      // An abandoned unread note MUST NEVER be passed to startCommands on an unrelated
+      // tool step: only if THIS tool call actually finished reading that exact note whole
+      // may its items proceed to pickup; otherwise re-offer them in the unread note
+      // (requirement 3ea2b201).
+      const { done } = readThrough(entry, input, { home })
+      if (done) {
+        const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(entry.items)
+        completedOwnerItems.push(...immediateOwnerItems)
+        unreadableInnerNoteRefusals.push(...unreadableRefusals)
+        unreadableInnerNoteItems.push(...unreadableItems)
+        if (!keptForPickupRetry && (immediateOwnerItems.length > 0 || unreadableItems.length > 0)) {
+          keptForPickupRetry = { ...entry, note_read: true }
+        }
+      } else {
+        reclaimedUnreadItems.push(...entry.items)
+      }
+      readChanged = true
+    }
+    if (!keptForPickupRetry && (innerList.length > 0 || pickupList.length > 0)) {
+      keptForPickupRetry = {
+        version: RECORD_VERSION,
+        note: typeof entry.note === 'string' ? entry.note : '0'.repeat(16),
+        parts: [],
+        items: [...innerList, ...pickupList],
+        at: new Date().toISOString(),
+        note_read: true,
+      }
+    }
+  }
+  const consumedOverflows = []
+  for (const ov of takenOverflows) {
+    const parsed = readPrivateJson(ov.file)
+    if (!parsed || typeof parsed !== 'object') {
+      giveBack(ov)
+      process.stderr.write(
+        `step-delivery: retry overflow file ${path.basename(ov.original)} could not be read; leaving queued for next retry\n`,
+      )
+      continue
+    }
+    consumedOverflows.push(ov)
+    consumeOverflowEntry(parsed)
+  }
+  for (const ov of memoryOverflows) {
+    consumeOverflowEntry(ov)
+  }
+  if (unreadableInnerNoteItems.length > 0) {
+    if (record && hasUnreadNote(record)) {
+      record = {
+        ...record,
+        inner_note_pending: true,
+        inner_note_items: unreadableInnerNoteItems,
+        pickup_refusals: unreadableInnerNoteRefusals,
+      }
+    } else {
+      const base = record ?? keptForPickupRetry ?? {
+        version: RECORD_VERSION,
+        note: '0'.repeat(16),
+        parts: [],
+        at: new Date().toISOString(),
+      }
+      record = {
+        ...base,
+        note_read: true,
+        items: unreadableInnerNoteItems,
+        inner_note_pending: true,
+        inner_note_items: unreadableInnerNoteItems,
+        pickup_pending: false,
+        pickup_items: [],
+        pickup_refusals: unreadableInnerNoteRefusals,
+      }
+    }
+    readChanged = true
+  }
+
+  // Also track any oversized `wake_in_note` command pointers handed over via wake-tail
+  // or one-shot wait: trigger `report_pickup` and advance the wake reader offset ONLY once
+  // the agent has actually read the sealed note whole (`readThrough`, req 3ea2b201).
+  const takenWakeNotes = withWakeNoteLock(steps, () => pendingWakeNoteFiles(steps).map(take).filter(Boolean)).value ?? []
+  const giveBackWakeNote = (taken) => withWakeNoteLock(steps, () => giveBack(taken))
+  const completedWakeNotes = []
+  for (const each of takenWakeNotes) {
+    const entry = readPrivateJson(each.file)
+    if (!entry || typeof entry.note !== 'string' || !Array.isArray(entry.commands)) {
+      // NEVER delete a pending wake-note tracking record on a transient read error:
+      // give it back so `advanceCompletedWakeNotePositions` holds the wake cursor and
+      // the next hook call retries once disk reads recover (requirement 3ea2b201).
+      giveBackWakeNote(each)
+      process.stderr.write(
+        `step-delivery: pending wake-note tracking record ${path.basename(each.original)} could not be read; retaining for retry\n`,
+      )
+      continue
+    }
+    if (entry.completed === true) {
+      // Already picked up; waiting only for an earlier wake-note on the same page before cursor advance.
+      giveBackWakeNote(each)
+      continue
+    }
+    if (entry.pickup_pending === true) {
+      completedWakeNotes.push({ taken: each, entry })
+      continue
+    }
+    const { record: next, done } = readThrough({ note: entry.note, parts: Array.isArray(entry.parts) ? entry.parts : [] }, input, { home })
+    if (done) {
+      completedWakeNotes.push({ taken: each, entry: { ...entry, parts: next.parts } })
+    } else if (next.parts.length !== (entry.parts?.length ?? 0)) {
+      try {
+        withWakeNoteLock(steps, () => {
+          writePrivateJson(each.original, { ...entry, parts: next.parts })
+          drop(each)
+        })
+      } catch {
+        giveBackWakeNote(each)
+      }
+    } else {
+      giveBackWakeNote(each)
     }
   }
 
@@ -564,6 +1330,184 @@ export async function stepDeliveryHook(
     fresh.map(async (each) => ({ ...each, open: await isOpen(each.item, { connectionId, state }) })),
   )
   const adding = checked.filter((each) => each.open)
+
+  // The agent just finished reading a step note or wake_in_note holding room message(s) (or a previous
+  // pickup refused and is retrying): combine all owner items into ONE single startCommands
+  // call (no per-item loop, req c900f599). If report_pickup refuses, keep the record as
+  // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
+  // preserve/surface the full structured refusal details (req 4e32d1a5).
+  let pickupRefusals = unreadableInnerNoteRefusals.length > 0 ? unreadableInnerNoteRefusals : null
+  let loggedRefusalsToStderr = false
+  if (completedOwnerItems.length > 0 || completedWakeNotes.length > 0) {
+    const combinedMessages = [
+      ...completedOwnerItems.flatMap((item) =>
+        Array.isArray(item.messages) && item.messages.length > 0
+          ? item.messages
+          : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+      ),
+      ...completedWakeNotes.flatMap(({ entry }) => (Array.isArray(entry.messages) ? entry.messages : [])),
+    ]
+    const combinedCommands = [
+      ...completedOwnerItems.flatMap((item) =>
+        Array.isArray(item.commands) && item.commands.length > 0
+          ? item.commands
+          : commandsHandedOver(
+              Array.isArray(item.messages) && item.messages.length > 0
+                ? item.messages
+                : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+            ),
+      ),
+      ...completedWakeNotes.flatMap(({ entry }) => (Array.isArray(entry.commands) ? entry.commands : [])),
+    ]
+    const firstSessionId =
+      completedOwnerItems.find((item) => typeof item.session_id === 'string' && item.session_id)?.session_id ??
+      completedWakeNotes.find(({ entry }) => typeof entry.session_id === 'string' && entry.session_id)?.entry.session_id ??
+      state.session_id ??
+      null
+    if (combinedCommands.length > 0) {
+      let pickupResult = null
+      try {
+        pickupResult = await startCommands({
+          connectionId,
+          commands: combinedCommands,
+          batch: { type: 'owner_messages', session_id: firstSessionId, messages: combinedMessages },
+          sessionId: firstSessionId,
+          dir: connDir,
+          home,
+          state,
+        })
+      } catch (error) {
+        pickupResult = {
+          ok: false,
+          outcome: 'refused',
+          refusals: [structuredRefusalFromError(error)],
+        }
+      }
+      if (Array.isArray(pickupResult?.refusals) && pickupResult.refusals.length > 0) {
+        pickupRefusals = [...unreadableInnerNoteRefusals, ...pickupResult.refusals]
+        process.stderr.write(
+          `step-delivery: report_pickup refused for ${connectionId}; retaining pending pickup for retry: ${JSON.stringify(pickupRefusals)}\n`,
+        )
+        loggedRefusalsToStderr = true
+        if (completedOwnerItems.length > 0 && keptForPickupRetry) {
+          const base = record ?? keptForPickupRetry
+          const keepUnread = hasUnreadNote(base)
+          record = {
+            ...base,
+            note_read: !keepUnread,
+            items: keepUnread ? base.items : [...unreadableInnerNoteItems, ...completedOwnerItems],
+            inner_note_pending: unreadableInnerNoteItems.length > 0,
+            inner_note_items: unreadableInnerNoteItems,
+            pickup_pending: true,
+            pickup_items: completedOwnerItems,
+            pickup_refusals: pickupRefusals,
+          }
+          readChanged = true
+        }
+        for (const { taken: noteTaken, entry } of completedWakeNotes) {
+          try {
+            withWakeNoteLock(steps, () => {
+              writePrivateJson(noteTaken.original, {
+                ...entry,
+                pickup_pending: true,
+                pickup_refusals: pickupRefusals,
+              })
+              drop(noteTaken)
+            })
+          } catch {
+            giveBackWakeNote(noteTaken)
+          }
+        }
+      } else {
+        if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+          process.stderr.write(
+            `step-delivery: report_pickup returned nothing_open for ${connectionId}: ${JSON.stringify(pickupResult.nothingOpen)}\n`,
+          )
+        }
+        const unstartedIds = new Set(
+          (Array.isArray(pickupResult?.unstarted) ? pickupResult.unstarted : [])
+            .map((cmd) => cmd?.messageId)
+            .filter(Boolean),
+        )
+        if (unstartedIds.size > 0 && completedOwnerItems.length > 0 && keptForPickupRetry) {
+          const remainingOwnerItems = completedOwnerItems.filter((item) => {
+            const cmds =
+              Array.isArray(item.commands) && item.commands.length > 0
+                ? item.commands
+                : commandsHandedOver(
+                    Array.isArray(item.messages) && item.messages.length > 0
+                      ? item.messages
+                      : item.events.filter((e) => e?.type === 'owner_message' && e.message).map((e) => e.message),
+                  )
+            return cmds.some((cmd) => unstartedIds.has(cmd?.messageId))
+          })
+          if (remainingOwnerItems.length > 0) {
+            const base = record ?? keptForPickupRetry
+            const keepUnread = hasUnreadNote(base)
+            record = {
+              ...base,
+              note_read: !keepUnread,
+              items: keepUnread ? base.items : [...unreadableInnerNoteItems, ...remainingOwnerItems],
+              inner_note_pending: unreadableInnerNoteItems.length > 0,
+              inner_note_items: unreadableInnerNoteItems,
+              pickup_pending: true,
+              pickup_items: remainingOwnerItems,
+              ...(pickupRefusals ? { pickup_refusals: pickupRefusals } : {}),
+            }
+            readChanged = true
+          }
+        }
+        let hasPositionTrackedCompleted = false
+        for (const { taken: noteTaken, entry } of completedWakeNotes) {
+          const noteHasUnstarted =
+            unstartedIds.size > 0 &&
+            Array.isArray(entry.commands) &&
+            entry.commands.some((cmd) => unstartedIds.has(cmd?.messageId))
+          if (noteHasUnstarted) {
+            try {
+              withWakeNoteLock(steps, () => {
+                writePrivateJson(noteTaken.original, {
+                  ...entry,
+                  pickup_pending: true,
+                })
+                drop(noteTaken)
+              })
+            } catch {
+              giveBackWakeNote(noteTaken)
+            }
+          } else if (typeof entry.wake_position_path === 'string' && typeof entry.wake_through === 'number') {
+            hasPositionTrackedCompleted = true
+            try {
+              withWakeNoteLock(steps, () => {
+                writePrivateJson(noteTaken.original, {
+                  ...entry,
+                  completed: true,
+                  pickup_pending: false,
+                  pickup_refusals: null,
+                })
+                drop(noteTaken)
+              })
+            } catch {
+              giveBackWakeNote(noteTaken)
+            }
+          } else {
+            withWakeNoteLock(steps, () => drop(noteTaken))
+          }
+        }
+        if (hasPositionTrackedCompleted) {
+          withStepsLock(connectionId, connDir, () => advanceCompletedWakeNotePositions(steps, { home, dir: connDir }))
+        }
+      }
+    } else {
+      for (const { taken: noteTaken } of completedWakeNotes) drop(noteTaken)
+    }
+  }
+  if (Array.isArray(pickupRefusals) && pickupRefusals.length > 0 && !loggedRefusalsToStderr) {
+    process.stderr.write(
+      `step-delivery: room-command note/pickup refusals for ${connectionId}; retaining pending retry: ${JSON.stringify(pickupRefusals)}\n`,
+    )
+    loggedRefusalsToStderr = true
+  }
 
   // From the check that the connection is still live until the pointer has been written
   // out, under the connection's steps lock, which every write that ends the connection
@@ -583,36 +1527,376 @@ export async function stepDeliveryHook(
       logDiscarded('stepDeliveryHook', connectionId, discardLocked(connectionId, connDir))
       return null
     }
-    try {
-      if (adding.length > 0) {
-        const items = [...(record?.items ?? []), ...adding.map((each) => each.item)]
-        const note = writeNote(stepNoteText(items, { connectionId }), { home })
-        record = { version: RECORD_VERSION, note: note.id, parts: [], items, at: new Date().toISOString() }
+    const formatPickupRefusals = (existingContext, priorNoteError = null) => {
+      if (!pickupRefusals) return existingContext
+      const refusalNotice =
+        `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
+      const buildFallback = (budget, noteError) => {
+        const fallbackBaseDirs = [
+          null,
+          ...(connDir ? [path.join(connDir, 'diagnostic-notes')] : []),
+          path.join(steps, 'diagnostic-notes'),
+        ]
+        let savedFallback = null
+        for (const baseDir of fallbackBaseDirs) {
+          try {
+            savedFallback = writeFallbackDiagnosticNote(refusalNotice, { baseDir })
+            if (savedFallback) break
+          } catch {
+            savedFallback = null
+          }
+        }
+        if (!savedFallback && !loggedRefusalsToStderr && Array.isArray(pickupRefusals) && pickupRefusals.length > 0) {
+          process.stderr.write(
+            `step-delivery: room-command note/pickup refusals for ${connectionId}; retaining pending retry: ${JSON.stringify(pickupRefusals)}\n`,
+          )
+          loggedRefusalsToStderr = true
+        }
+        const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
+          prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
+          maxChars: budget,
+          noteError,
+          savedNote: savedFallback,
+          recovery:
+            'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections, steps) were unwritable; unabridged refusal JSON was written to hook stderr. Inspect hook stderr for complete text and fix write permissions on ~/.devspec/notes.',
+        })
+        if (formatted) return formatted.trimEnd()
+        if (savedFallback) {
+          const ptr = shellDiagnosticPointer('step-delivery', savedFallback.command).trimEnd()
+          if (ptr.length <= budget) return ptr
+        }
+        // When ALL note stores rejected writes AND the refusal payload exceeds `budget`,
+        // NEVER drop the entire agent-facing diagnostic silently: emit an explicit,
+        // budget-fitted omission + recovery notice stating the limit, actual size,
+        // omitted count, and where the unabridged JSON was written (requirements 3c5147a7 / 91d7b47c).
+        const omittedKeys = [
+          ...new Set(
+            pickupRefusals.flatMap((entry) => {
+              const inner = entry?.refusal && typeof entry.refusal === 'object' ? entry.refusal : entry
+              return inner && typeof inner === 'object' ? Object.keys(inner) : []
+            }),
+          ),
+        ]
+        const codes = pickupRefusals
+          .map((entry) => entry?.refusal?.code ?? entry?.code ?? null)
+          .filter((code) => typeof code === 'string' && code)
+        const readRefs = pickupRefusals
+          .map((entry) => entry?.refusal?.read ?? entry?.read ?? null)
+          .filter((ref) => typeof ref === 'string' && ref)
+        const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'all diagnostic note stores unwritable')
+        const omissionCandidates = [
+          JSON.stringify({
+            refused: 'report_pickup',
+            note_write_failed: true,
+            note_write_error: why,
+            omitted_due_to_hook_limit: true,
+            total_count: pickupRefusals.length,
+            returned_count: 0,
+            omitted_count: pickupRefusals.length,
+            limit_chars: budget,
+            actual_chars: refusalNotice.length,
+            ...(codes.length > 0 ? { codes } : {}),
+            ...(readRefs.length > 0 ? { read_refs: readRefs } : {}),
+            ...(omittedKeys.length > 0 ? { omitted_keys: omittedKeys } : {}),
+            recovery:
+              'All diagnostic note stores (~/.devspec/notes, TMPDIR, connections, steps) were unwritable so oversized refusal details could not be saved; unabridged JSON was written to hook stderr. Fix write permissions on ~/.devspec/notes.',
+          }),
+          JSON.stringify({
+            refused: 'report_pickup',
+            note_write_failed: true,
+            omitted_due_to_hook_limit: true,
+            omitted_count: pickupRefusals.length,
+            limit_chars: budget,
+            actual_chars: refusalNotice.length,
+            ...(codes.length > 0 ? { codes } : {}),
+            recovery: 'Unabridged refusal JSON is in hook stderr; fix ~/.devspec/notes or TMPDIR permissions.',
+          }),
+          `DevSpec report_pickup refused (${pickupRefusals.length} omitted: ${refusalNotice.length}>${budget} chars, note stores unwritable); unabridged JSON in hook stderr; fix ~/.devspec/notes permissions.`,
+        ]
+        for (const candidate of omissionCandidates) {
+          if (candidate.length <= budget) return candidate
+        }
+        return null
       }
-      if (record && (adding.length > 0 || readChanged)) writePrivateJson(path.join(steps, HANDED), record)
-    } catch {
+      if (!existingContext) {
+        if (priorNoteError) {
+          return buildFallback(share, priorNoteError)
+        }
+        try {
+          return fitHookContext(refusalNotice, {
+            share,
+            what: 'DevSpec room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          return buildFallback(share, noteError)
+        }
+      }
+      const remainingShare = share - existingContext.length - 2
+      let fittedInlineOrPointer = null
+      let inlineNoteError = priorNoteError
+      if (remainingShare > 0 && !priorNoteError) {
+        try {
+          fittedInlineOrPointer = fitHookContext(refusalNotice, {
+            share: remainingShare,
+            what: 'DevSpec room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          inlineNoteError = noteError
+        }
+      }
+      if (fittedInlineOrPointer && existingContext.length + 2 + fittedInlineOrPointer.length <= share) {
+        return `${existingContext}\n\n${fittedInlineOrPointer}`
+      }
+      // Never drop the structured pickup refusal when a concurrent delivery note
+      // fills the hook share: combine both into one sealed note, or if note writing
+      // fails, surface a budget-fitted structured refusal fallback inline (req 4e32d1a5 / 3c5147a7).
+      let combined = null
+      let combinedNoteError = inlineNoteError
+      if (!priorNoteError) {
+        try {
+          combined = fitHookContext(`${existingContext}\n\n${refusalNotice}`, {
+            share,
+            what: 'DevSpec pending delivery and room-command pickup refusal details',
+            home,
+          })
+        } catch (noteError) {
+          combinedNoteError = noteError
+        }
+      }
+      if (combined) return combined
+      const fbWithContext = remainingShare > 0 ? buildFallback(remainingShare, combinedNoteError) : null
+      if (fbWithContext && existingContext.length + 2 + fbWithContext.length <= share) {
+        return `${existingContext}\n\n${fbWithContext}`
+      }
+      const fbFull = buildFallback(share, combinedNoteError)
+      return fbFull ?? existingContext
+    }
+
+    // Merge any concurrent HANDED record written by a parallel postToolUse hook while
+    // this hook awaited `isOpen` or `startCommands`, so a refusal/retry write NEVER
+    // overwrites a freshly handed-over unread note (requirement 3ea2b201).
+    const dedupeStepItems = (list) => {
+      const seen = new Set()
+      const out = []
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue
+        const key = typeof item.key === 'string' && item.key ? item.key : null
+        if (key && seen.has(key)) continue
+        if (key) seen.add(key)
+        out.push(item)
+      }
+      return out
+    }
+    let mergedConcurrent = false
+    try {
+      const concurrentRes = readPrivateJsonResult(path.join(steps, HANDED))
+      if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
+        throw new Error(`concurrent ${HANDED} could not be read; refusing to overwrite`)
+      }
+      const concurrent = concurrentRes.value
+      if (validRecord(concurrent)) {
+        const cUnread = hasUnreadNote(concurrent)
+        const rUnread = hasUnreadNote(record)
+        const cInner = concurrent.inner_note_pending ? (Array.isArray(concurrent.inner_note_items) ? concurrent.inner_note_items : concurrent.items) : []
+        const rInner = record?.inner_note_pending ? (Array.isArray(record.inner_note_items) ? record.inner_note_items : []) : []
+        const mergedInner = [...cInner, ...rInner]
+        const cPickup = concurrent.pickup_pending ? (Array.isArray(concurrent.pickup_items) ? concurrent.pickup_items : concurrent.items.filter((i) => i.kind === 'owner_messages')) : []
+        const rPickup = record?.pickup_pending ? (Array.isArray(record.pickup_items) ? record.pickup_items : []) : []
+        const mergedPickup = [...cPickup, ...rPickup]
+        const mergedRefusals = [
+          ...(Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
+          ...(Array.isArray(record?.pickup_refusals) ? record.pickup_refusals : []),
+        ]
+        const pendingMeta = {
+          ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : { inner_note_pending: false, inner_note_items: [] }),
+          ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : { pickup_pending: false, pickup_items: [] }),
+          ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
+        }
+        if (adding.length > 0 || reclaimedUnreadItems.length > 0 || (cUnread && rUnread)) {
+          const unreadItems = dedupeStepItems([
+            ...reclaimedUnreadItems,
+            ...(cUnread ? concurrent.items : []),
+            ...(rUnread ? record.items : []),
+            ...adding.map((each) => each.item),
+          ])
+          const note = writeNote(stepNoteText(unreadItems, { connectionId }), { home })
+          record = {
+            version: RECORD_VERSION,
+            note: note.id,
+            parts: [],
+            items: unreadItems,
+            at: new Date().toISOString(),
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (cUnread) {
+          record = {
+            version: concurrent.version,
+            note: concurrent.note,
+            parts: Array.isArray(concurrent.parts) ? concurrent.parts : [],
+            items: concurrent.items,
+            at: concurrent.at,
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (rUnread) {
+          record = {
+            version: record.version,
+            note: record.note,
+            parts: Array.isArray(record.parts) ? record.parts : [],
+            items: record.items,
+            at: record.at,
+            note_read: false,
+            ...pendingMeta,
+          }
+        } else if (mergedInner.length > 0 || mergedPickup.length > 0) {
+          record = {
+            ...(record ?? concurrent),
+            note_read: true,
+            items: [...mergedInner, ...mergedPickup],
+            ...pendingMeta,
+          }
+        } else {
+          record = null
+        }
+        mergedConcurrent = true
+      } else if (adding.length > 0 || reclaimedUnreadItems.length > 0) {
+        const keepPendingMeta = record
+          ? {
+              ...(record.inner_note_pending ? { inner_note_pending: true, inner_note_items: record.inner_note_items ?? [] } : {}),
+              ...(record.pickup_pending ? { pickup_pending: true, pickup_items: record.pickup_items ?? [] } : {}),
+              ...(Array.isArray(record.pickup_refusals) && record.pickup_refusals.length > 0 ? { pickup_refusals: record.pickup_refusals } : {}),
+            }
+          : {}
+        const items = dedupeStepItems([
+          ...reclaimedUnreadItems,
+          ...(hasUnreadNote(record) ? record.items : []),
+          ...adding.map((each) => each.item),
+        ])
+        const note = writeNote(stepNoteText(items, { connectionId }), { home })
+        record = {
+          version: RECORD_VERSION,
+          note: note.id,
+          parts: [],
+          items,
+          at: new Date().toISOString(),
+          note_read: false,
+          ...keepPendingMeta,
+        }
+      }
+      if (record && (adding.length > 0 || reclaimedUnreadItems.length > 0 || readChanged || mergedConcurrent)) {
+        writePrivateJson(path.join(steps, HANDED), record)
+      }
+    } catch (deliveryWriteError) {
       // Not handed over, so not taken: everything goes back for the next step.
       for (const each of adding) giveBack(each.taken)
-      if (takenRecord) giveBack(takenRecord)
+      for (const ov of consumedOverflows) giveBack(ov)
+      if (memoryOverflows.length > 0) {
+        const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+        unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+      }
+      if (takenRecord) {
+        if (!fs.existsSync(takenRecord.original)) {
+          giveBack(takenRecord)
+        } else {
+          // A parallel hook already wrote a fresh HANDED note while this hook awaited
+          // pickup: NEVER discard our pending retry record via giveBack() (req 3ea2b201).
+          const overflowPayload = {
+            version: RECORD_VERSION,
+            note: record?.note ?? '0'.repeat(16),
+            ...(hasUnreadNote(record) ? { unread_items: record.items } : {}),
+            inner_note_items:
+              Array.isArray(record?.inner_note_items) && record.inner_note_items.length > 0
+                ? record.inner_note_items
+                : unreadableInnerNoteItems,
+            pickup_items:
+              Array.isArray(record?.pickup_items) && record.pickup_items.length > 0
+                ? record.pickup_items
+                : completedOwnerItems,
+            pickup_refusals: pickupRefusals ?? [],
+            at: new Date().toISOString(),
+          }
+          const overflowFile = path.join(steps, `retry-${Date.now()}-${randomBytes(4).toString('hex')}.json`)
+          let preservedOnDisk = false
+          try {
+            writePrivateJson(overflowFile, overflowPayload)
+            preservedOnDisk = true
+          } catch {
+            try {
+              fs.renameSync(takenRecord.file, overflowFile)
+              preservedOnDisk = true
+            } catch {
+              preservedOnDisk = false
+            }
+          }
+          if (preservedOnDisk) {
+            drop(takenRecord)
+          } else {
+            // `steps` itself rejected writes/renames transiently: retain in-memory overflow
+            // AND keep takenRecord.file on disk (do NOT unlink it).
+            const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+            unpersistedRetryOverflow.set(steps, [...existingMem, overflowPayload])
+          }
+        }
+      }
       for (const each of checked.filter((one) => !one.open)) drop(each.taken)
+      // Even when saving a concurrent delivery note fails, NEVER swallow structured
+      // pickup refusal details from this step — emit the budget-fitted refusal fallback
+      // as agent-facing additional_context (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+      if (pickupRefusals) {
+        const refusalContext = formatPickupRefusals(null, deliveryWriteError)
+        const refusalOutput = refusalContext ? JSON.stringify(postToolUseOutput(refusalContext)) : null
+        if (refusalOutput) {
+          await emit(refusalOutput)
+          return refusalOutput
+        }
+      }
       return null
     }
     for (const each of checked) drop(each.taken)
+    for (const ov of consumedOverflows) drop(ov)
     if (takenRecord) {
-      if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
+      if (record && adding.length === 0 && reclaimedUnreadItems.length === 0 && !readChanged && !mergedConcurrent) giveBack(takenRecord)
       else drop(takenRecord)
     }
     if (adding.length > 0) {
       recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
-    if (!record) return null
-    const context = pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+    let context =
+      hasUnreadNote(record)
+        ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
+        : null
+    context = formatPickupRefusals(context)
+    if (needsListenerReminder) {
+      const rawReminder = wakeListenerReminder(connectionId, { dir: connDir })
+      if (!context) {
+        try {
+          context = fitHookContext(rawReminder, {
+            share,
+            what: 'A DevSpec wake-listener setup notice',
+            home,
+          })
+        } catch {
+          context = rawReminder.length <= share ? rawReminder : null
+        }
+      } else if (context.length + 2 + rawReminder.length <= share) {
+        context = `${context}\n\n${rawReminder}`
+      }
+    }
     const output = context ? JSON.stringify(postToolUseOutput(context)) : null
     // Written out, and the write finished, before the lock goes, so no end comes between
     // the check and the agent's pointer.
     if (output) await emit(output)
     return output
   })
+}
+
+function overflowHasUnread(entry) {
+  if (!entry || typeof entry !== 'object') return false
+  if (Array.isArray(entry.unread_items) && entry.unread_items.length > 0) return true
+  return validRecord(entry) && hasUnreadNote(entry)
 }
 
 /**
@@ -631,81 +1915,397 @@ export async function releaseAtIdle(
   if (!fs.existsSync(steps)) return null
   reclaimAbandoned(steps)
   const handedPath = path.join(steps, HANDED)
-  if (waitingFiles(steps).length === 0) {
-    // Nothing new, and nothing handed over, or a note the idle wake already pointed at.
-    if (!fs.existsSync(handedPath) || readPrivateJson(handedPath)?.woken === true) return null
+  const hasUnreadOverflow =
+    retryOverflowFiles(steps).some((file) => overflowHasUnread(readPrivateJson(file))) ||
+    (unpersistedRetryOverflow.get(steps) ?? []).some(overflowHasUnread)
+  if (waitingFiles(steps).length === 0 && !hasUnreadOverflow) {
+    // Nothing new, and nothing handed over, or a note already woken / awaiting pickup retry only.
+    const handed = fs.existsSync(handedPath) ? readPrivateJson(handedPath) : null
+    if (
+      !handed ||
+      handed.woken === true ||
+      (!hasUnreadNote(handed) && (handed.pickup_pending === true || handed.inner_note_pending === true))
+    ) {
+      return null
+    }
   }
   const now = turnState ?? (await readTurnState(state?.local_id, { home }))
   if (now !== 'between') return null
 
   const takenRecord = take(handedPath)
-  const kept = takenRecord ? readPrivateJson(takenRecord.file) : null
-  const record = validRecord(kept) ? kept : null
-  if (takenRecord && !record) giveBack(takenRecord)
+  let record = null
+  if (takenRecord) {
+    const keptRes = readPrivateJsonResult(takenRecord.file)
+    if (keptRes.status === STATE_UNREADABLE) {
+      // Transient read error on HANDED at sweep start: restore it untouched and fail closed
+      // so this sweep NEVER proceeds on waiting items alone and later merges the unchecked
+      // older HANDED check job as a concurrent record (requirement 3ea2b201).
+      giveBack(takenRecord)
+      process.stderr.write(
+        `step-delivery: ${HANDED} could not be read during idle sweep for ${connectionId}; leaving queued for retry\n`,
+      )
+      return null
+    }
+    record = validRecord(keptRes.value) ? keptRes.value : null
+    if (!record) giveBack(takenRecord)
+  }
+  const takenOverflows = retryOverflowFiles(steps).map(take).filter(Boolean)
+  const memoryOverflows = unpersistedRetryOverflow.get(steps) ?? []
+  if (memoryOverflows.length > 0) unpersistedRetryOverflow.delete(steps)
+  const overflowUnreadItems = []
+  const overflowInnerItems = []
+  const overflowPickupItems = []
+  const overflowRefusals = []
+  const collectOverflow = (entry) => {
+    if (!entry || typeof entry !== 'object') return
+    if (Array.isArray(entry.unread_items) && entry.unread_items.length > 0) {
+      overflowUnreadItems.push(...entry.unread_items)
+    } else if (validRecord(entry) && hasUnreadNote(entry)) {
+      overflowUnreadItems.push(...entry.items)
+    }
+    if (Array.isArray(entry.inner_note_items) && entry.inner_note_items.length > 0) {
+      overflowInnerItems.push(...entry.inner_note_items)
+    } else if (validRecord(entry) && entry.inner_note_pending === true) {
+      overflowInnerItems.push(...entry.items)
+    }
+    if (Array.isArray(entry.pickup_items) && entry.pickup_items.length > 0) {
+      overflowPickupItems.push(...entry.pickup_items)
+    } else if (validRecord(entry) && entry.pickup_pending === true) {
+      overflowPickupItems.push(...entry.items.filter((i) => i.kind === 'owner_messages'))
+    }
+    if (Array.isArray(entry.pickup_refusals) && entry.pickup_refusals.length > 0) {
+      overflowRefusals.push(...entry.pickup_refusals)
+    }
+  }
+  const consumedOverflows = []
+  const skippedUnreadableOverflows = []
+  for (const ov of takenOverflows) {
+    const parsed = readPrivateJson(ov.file)
+    if (!parsed || typeof parsed !== 'object') {
+      // Transient read error: NEVER delete an unreadable retry overflow file; restore it
+      // to disk and report that it remained queued for retry (requirement 3ea2b201).
+      giveBack(ov)
+      skippedUnreadableOverflows.push(path.basename(ov.original))
+      process.stderr.write(
+        `step-delivery: retry overflow file ${path.basename(ov.original)} could not be read during idle sweep; leaving queued for retry\n`,
+      )
+      continue
+    }
+    consumedOverflows.push(ov)
+    collectOverflow(parsed)
+  }
+  for (const ov of memoryOverflows) collectOverflow(ov)
+
   const taken = waitingFiles(steps).map(take).filter(Boolean)
+  const validTaken = []
   const fresh = []
   for (const each of taken) {
     const item = readPrivateJson(each.file)
-    if (validItem(item)) fresh.push(item)
+    if (validItem(item)) {
+      fresh.push(item)
+      validTaken.push(each)
+    } else {
+      giveBack(each)
+      process.stderr.write(
+        `step-delivery: waiting file ${path.basename(each.original)} could not be read during idle sweep; leaving queued for retry\n`,
+      )
+    }
   }
-  if (record?.woken === true && fresh.length === 0) {
-    for (const each of taken) giveBack(each)
+  if (record?.woken === true && fresh.length === 0 && overflowUnreadItems.length === 0) {
+    for (const each of validTaken) giveBack(each)
+    for (const ov of consumedOverflows) giveBack(ov)
+    if (memoryOverflows.length > 0) {
+      const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+      unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+    }
     giveBack(takenRecord)
     return null
   }
-  const items = [...(record?.items ?? []), ...fresh]
+  // Preserve any refused pickup retry / pending inner wake-note retry on HANDED (and any
+  // retry overflow) when handing over fresh unread items at idle so a refused command is
+  // NEVER dropped from the retry queue (requirement 3ea2b201).
+  const recordInner =
+    record?.inner_note_pending === true
+      ? Array.isArray(record.inner_note_items)
+        ? record.inner_note_items
+        : record.items
+      : []
+  const recordPickup =
+    record?.pickup_pending === true
+      ? Array.isArray(record.pickup_items)
+        ? record.pickup_items
+        : record.items.filter((i) => i.kind === 'owner_messages')
+      : []
+  const recordRefusals = Array.isArray(record?.pickup_refusals) ? record.pickup_refusals : []
+  const combinedInner = [...overflowInnerItems, ...recordInner]
+  const combinedPickup = [...overflowPickupItems, ...recordPickup]
+  const combinedRefusals = [...overflowRefusals, ...recordRefusals]
+  const pendingRetryMeta = {
+    ...(combinedInner.length > 0 ? { inner_note_pending: true, inner_note_items: combinedInner } : {}),
+    ...(combinedPickup.length > 0 ? { pickup_pending: true, pickup_items: combinedPickup } : {}),
+    ...(combinedRefusals.length > 0 ? { pickup_refusals: combinedRefusals } : {}),
+  }
+  const hasPendingRetry = Boolean(pendingRetryMeta.pickup_pending || pendingRetryMeta.inner_note_pending)
+  const unreadPrior = hasUnreadNote(record) ? record.items : []
+  const seenKeys = new Set()
+  const items = []
+  for (const item of [...overflowUnreadItems, ...unreadPrior, ...fresh]) {
+    const key = typeof item?.key === 'string' && item.key ? item.key : null
+    if (key && seenKeys.has(key)) continue
+    if (key) seenKeys.add(key)
+    items.push(item)
+  }
   const open = []
   const dropped = []
+  const checkedOpenKeys = new Set()
+  const checkedSettledKeys = new Set()
   for (const item of items) {
-    if (await isOpen(item, { connectionId, state })) open.push(item)
-    else dropped.push(item.key)
+    if (await isOpen(item, { connectionId, state })) {
+      open.push(item)
+      if (typeof item?.key === 'string' && item.key) checkedOpenKeys.add(item.key)
+    } else {
+      dropped.push(item.key)
+      if (typeof item?.key === 'string' && item.key) checkedSettledKeys.add(item.key)
+    }
   }
   const finish = () => {
-    for (const each of taken) drop(each)
+    for (const each of validTaken) drop(each)
+    for (const ov of consumedOverflows) drop(ov)
     if (takenRecord && record) drop(takenRecord)
+  }
+  const preserveTakenRecord = () => {
+    if (!takenRecord || !record) return
+    if (!fs.existsSync(takenRecord.original)) {
+      giveBack(takenRecord)
+      return
+    }
+    // Never delete `takenRecord` via `giveBack()` when a concurrent `HANDED` exists at
+    // `handedPath` (for example after restoring `previousConcurrent` on wake-append error):
+    // move `takenRecord` into a `retry-*.json` overflow file (or in-memory overflow if
+    // `steps` rejects writes) so older unread commands are NEVER lost (requirement 3ea2b201).
+    const overflowFile = path.join(steps, `retry-${Date.now()}-${randomBytes(4).toString('hex')}.json`)
+    let preservedOnDisk = false
+    try {
+      fs.renameSync(takenRecord.file, overflowFile)
+      preservedOnDisk = true
+    } catch {
+      try {
+        writePrivateJson(overflowFile, record)
+        preservedOnDisk = true
+        drop(takenRecord)
+      } catch {
+        preservedOnDisk = false
+      }
+    }
+    if (!preservedOnDisk) {
+      const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+      unpersistedRetryOverflow.set(steps, [...existingMem, record])
+    }
   }
   // From the check that the connection is still live to appending the wake, under the
   // connection's steps lock, which every write that ends the connection takes too
-  // (`endConnectionSteps`).
-  return withStepsLock(connectionId, dir, () => {
-    // An end that landed during the lookups left these items to this hold: they are
-    // discarded and named as the end would have, and no record or wake is written.
-    if (connectionEnded(dir, connectionId)) {
-      for (const each of taken) giveBack(each)
-      if (takenRecord && record) giveBack(takenRecord)
-      logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
-      return { pointed: [], dropped, note: null, discarded: true }
-    }
-    if (open.length === 0) {
+  // (`endConnectionSteps`). If a concurrent `HANDED` record appears holding any `check_job`
+  // that this sweep has not yet verified via `isOpen`, release the lock and verify it first
+  // (bounded passes) so an unchecked check job is NEVER marked handed off or woken (3ea2b201).
+  for (let pass = 0; pass < 3; pass += 1) {
+    const stepOutcome = withStepsLock(connectionId, dir, () => {
+      // An end that landed during the lookups left these items to this hold: they are
+      // discarded and named as the end would have, and no record or wake is written.
+      if (connectionEnded(dir, connectionId)) {
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (takenRecord && record) giveBack(takenRecord)
+        logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
+        return { done: true, result: { pointed: [], dropped, note: null, discarded: true } }
+      }
+      // Merge any concurrent HANDED record written by a parallel postToolUse hook while
+      // `releaseAtIdle` awaited `isOpen`, so the idle handoff NEVER overwrites or drops
+      // a newer command handed over concurrently (requirement 3ea2b201). If a concurrent
+      // HANDED file exists on disk but fails to read transiently, FAIL CLOSED: restore all
+      // taken items (preserving takenRecord into retry-*.json) and throw instead of treating
+      // it as absent and overwriting it!
+      const concurrentRes = readPrivateJsonResult(handedPath)
+      if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
+          const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+          unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+        }
+        preserveTakenRecord()
+        process.stderr.write(
+          `step-delivery: concurrent ${HANDED} could not be read during idle handoff for ${connectionId}; refusing to overwrite\n`,
+        )
+        throw new Error(`concurrent ${HANDED} unreadable during idle handoff; refusing to overwrite`)
+      }
+      const concurrent = concurrentRes.value
+      const hasConcurrent = validRecord(concurrent)
+      const concurrentUnread = hasConcurrent && hasUnreadNote(concurrent) ? concurrent.items : []
+      const uncheckedConcurrentChecks = concurrentUnread.filter(
+        (item) =>
+          item?.kind === 'check_job' &&
+          typeof item.key === 'string' &&
+          !checkedOpenKeys.has(item.key) &&
+          !checkedSettledKeys.has(item.key),
+      )
+      if (uncheckedConcurrentChecks.length > 0) {
+        if (pass < 2) {
+          return { done: false, needCheck: uncheckedConcurrentChecks }
+        }
+        // Still seeing new unchecked concurrent check jobs on the final pass: roll back
+        // without touching `HANDED` or waking unchecked items; next idle tick retries.
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
+          const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+          unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+        }
+        preserveTakenRecord()
+        return { done: true, result: null }
+      }
+      const openConcurrentUnread = concurrentUnread.filter(
+        (item) => !(typeof item?.key === 'string' && checkedSettledKeys.has(item.key)),
+      )
+      const mergedOpen = []
+      const mergedKeys = new Set()
+      for (const item of [...open, ...openConcurrentUnread]) {
+        const key = typeof item?.key === 'string' && item.key ? item.key : null
+        if (key && mergedKeys.has(key)) continue
+        if (key) mergedKeys.add(key)
+        mergedOpen.push(item)
+      }
+      const cInner =
+        hasConcurrent && concurrent.inner_note_pending === true
+          ? Array.isArray(concurrent.inner_note_items)
+            ? concurrent.inner_note_items
+            : concurrent.items
+          : []
+      const rInner = Array.isArray(pendingRetryMeta.inner_note_items) ? pendingRetryMeta.inner_note_items : []
+      const mergedInner = [...cInner, ...rInner]
+      const cPickup =
+        hasConcurrent && concurrent.pickup_pending === true
+          ? Array.isArray(concurrent.pickup_items)
+            ? concurrent.pickup_items
+            : concurrent.items.filter((i) => i.kind === 'owner_messages')
+          : []
+      const rPickup = Array.isArray(pendingRetryMeta.pickup_items) ? pendingRetryMeta.pickup_items : []
+      const mergedPickup = [...cPickup, ...rPickup]
+      const mergedRefusals = [
+        ...(hasConcurrent && Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
+        ...(Array.isArray(pendingRetryMeta.pickup_refusals) ? pendingRetryMeta.pickup_refusals : []),
+      ]
+      const mergedPendingMeta = {
+        ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : {}),
+        ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : {}),
+        ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
+      }
+
+      if (mergedOpen.length === 0) {
+        for (const each of validTaken) drop(each)
+        if (hasConcurrent && hasPendingRetry) {
+          try {
+            writePrivateJson(handedPath, { ...concurrent, ...mergedPendingMeta })
+            for (const ov of consumedOverflows) drop(ov)
+            if (takenRecord && record) drop(takenRecord)
+          } catch {
+            for (const ov of consumedOverflows) giveBack(ov)
+            if (memoryOverflows.length > 0) {
+              const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+              unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+            }
+            preserveTakenRecord()
+          }
+        } else {
+          if (hasConcurrent && openConcurrentUnread.length === 0 && concurrentUnread.length > 0) {
+            // All concurrent unread items were verified settled; remove stale HANDED if no pending retries remain.
+            if (!mergedPendingMeta.pickup_pending && !mergedPendingMeta.inner_note_pending) {
+              try { fs.rmSync(handedPath, { force: true }) } catch { /* ignore */ }
+            }
+          }
+          for (const ov of consumedOverflows) {
+            if (hasPendingRetry) giveBack(ov)
+            else drop(ov)
+          }
+          if (hasPendingRetry && memoryOverflows.length > 0) {
+            const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+            unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+          }
+          if (takenRecord && record) {
+            if (hasPendingRetry) preserveTakenRecord()
+            else drop(takenRecord)
+          }
+        }
+        return {
+          done: true,
+          result: {
+            pointed: [],
+            dropped,
+            note: null,
+            ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+          },
+        }
+      }
+      let note = null
+      let wroteHanded = false
+      const previousConcurrent = hasConcurrent ? concurrent : null
+      try {
+        note = writeNote(stepNoteText(mergedOpen, { connectionId }), { home })
+        const wake = [idlePointer(note, mergedOpen, connectionId)]
+        // The pointer is a few hundred characters whatever the note holds; checked against
+        // Cursor's rules on one output all the same, in the one place they are kept.
+        if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
+        writePrivateJson(handedPath, {
+          version: RECORD_VERSION,
+          note: note.id,
+          parts: record?.note === note.id ? record.parts ?? [] : [],
+          items: mergedOpen,
+          at: new Date().toISOString(),
+          note_read: false,
+          woken: true,
+          ...mergedPendingMeta,
+        })
+        wroteHanded = true
+        append(wakeFile, wake)
+      } catch (error) {
+        if (wroteHanded) {
+          if (previousConcurrent) {
+            try { writePrivateJson(handedPath, previousConcurrent) } catch { /* ignore */ }
+          } else {
+            fs.rmSync(handedPath, { force: true })
+          }
+        }
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
+          const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+          unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+        }
+        preserveTakenRecord()
+        throw error
+      }
       finish()
-      return { pointed: [], dropped, note: null }
+      recordTurnWake(connectionId, turnWakeFromEvents(mergedOpen.flatMap((item) => item.events)), { dir })
+      return {
+        done: true,
+        result: {
+          pointed: mergedOpen.map((item) => item.key),
+          dropped,
+          note: note.id,
+          ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+        },
+      }
+    })
+    if (stepOutcome.done) return stepOutcome.result
+    for (const item of stepOutcome.needCheck) {
+      if (await isOpen(item, { connectionId, state })) {
+        checkedOpenKeys.add(item.key)
+      } else {
+        checkedSettledKeys.add(item.key)
+        dropped.push(item.key)
+      }
     }
-    let note = null
-    try {
-      note = writeNote(stepNoteText(open, { connectionId }), { home })
-      const wake = [idlePointer(note, open, connectionId)]
-      // The pointer is a few hundred characters whatever the note holds; checked against
-      // Cursor's rules on one output all the same, in the one place they are kept.
-      if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
-      writePrivateJson(handedPath, {
-        version: RECORD_VERSION,
-        note: note.id,
-        parts: record?.note === note.id ? record.parts ?? [] : [],
-        items: open,
-        at: new Date().toISOString(),
-        woken: true,
-      })
-      append(wakeFile, wake)
-    } catch (error) {
-      if (note) fs.rmSync(handedPath, { force: true })
-      for (const each of taken) giveBack(each)
-      if (takenRecord && record) giveBack(takenRecord)
-      throw error
-    }
-    finish()
-    recordTurnWake(connectionId, turnWakeFromEvents(open.flatMap((item) => item.events)), { dir })
-    return { pointed: open.map((item) => item.key), dropped, note: note.id }
-  })
+  }
+  return null
 }
 
 /**
@@ -797,6 +2397,11 @@ function discardLocked(connectionId, dir) {
     const record = readPrivateJson(takenRecord.file)
     if (validRecord(record)) items.push(...record.items)
     drop(takenRecord)
+  }
+  unpersistedRetryOverflow.delete(steps)
+  for (const file of retryOverflowFiles(steps)) {
+    const taken = take(file)
+    if (taken) drop(taken)
   }
   for (const file of waitingFiles(steps)) {
     const taken = take(file)

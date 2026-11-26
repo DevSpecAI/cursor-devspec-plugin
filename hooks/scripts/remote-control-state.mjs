@@ -105,6 +105,8 @@ import {
 } from './hook-context-budget.mjs'
 import { writePrivateText } from './private-state.mjs'
 import { endConnectionSteps, logDiscarded } from './step-delivery.mjs'
+import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
+import { clearWakeListenerNeeded, markWakeListenerNeeded, wakeListenerInfo } from './command-start.mjs'
 import { UUID, candidate, choiceFromFailure, readProjectContext, selectProjectContext, blockProjectContext } from './project-context.mjs'
 import { storeRepositorySnapshot, refreshRepositoryRules, githubIdentity, renderGithubIdentity, withoutOwnerReplyStyle } from './repository-context.mjs'
 import {
@@ -625,6 +627,242 @@ function persistOwnerPidOnConnection(connectionId, ownerPid) {
  * fake log and pid file in the developer's real `~/.devspec` — where a stray pid file
  * is not inert, since `findWakeFollowPidForConnection` reads exactly those (76e1affb).
  */
+/**
+ * Exclusive lock retry cadence for `ensureWakeFollowForConnection`, matching
+ * `private-state.mjs` and `step-delivery.mjs` (`LOCK_RETRY_MS = 20`) so concurrent
+ * connection setup and poller startup serialize without busy-spinning.
+ */
+export const WAKE_FOLLOW_LOCK_RETRY_MS = 20
+
+/**
+ * Maximum wait for the per-connection wake-follow spawn lock. Bounded well below
+ * connect timeouts so a wedged lock never stalls `fast-connect`, while comfortably
+ * exceeding a single detached `spawn()` + `.follow.pid` write (<50 ms).
+ */
+export const WAKE_FOLLOW_LOCK_WAIT_MS = 2_000
+
+/**
+ * Grace period before an empty/unparseable wake-follow lockfile (e.g. left by an
+ * older plugin version crashing between create and write) is treated as abandoned
+ * and reclaimed. Well above local disk write latency (<5 ms) and below
+ * `WAKE_FOLLOW_LOCK_WAIT_MS` (2 s).
+ */
+export const WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS = 1_000
+
+function wakeFollowLockPath(connectionId) {
+  return path.join(CONNECTIONS_DIR, `${connectionId}.follow.lock`)
+}
+
+function sleepSyncMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function readWakeFollowLockInfo(lockFile) {
+  let fd = null
+  try {
+    fd = fs.openSync(lockFile, 'r')
+    const stat = fs.fstatSync(fd)
+    const raw = fs.readFileSync(fd, 'utf8').trim()
+    let pid = null
+    let token = null
+    if (raw.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(raw)
+        if (Number.isInteger(parsed?.pid)) pid = parsed.pid
+        if (typeof parsed?.token === 'string' && /^[0-9a-f]{8,64}$/i.test(parsed.token)) token = parsed.token
+      } catch {
+        /* malformed JSON -> treat as empty/stale candidate */
+      }
+    } else if (raw) {
+      const parsedPid = Number.parseInt(raw, 10)
+      if (Number.isInteger(parsedPid)) pid = parsedPid
+    }
+    return {
+      raw,
+      pid,
+      token,
+      ino: String(stat.ino),
+      mtimeMs: stat.mtimeMs,
+    }
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function sameLockIdentity(a, b) {
+  if (!a || !b) return false
+  if (a.token || b.token) return a.token !== null && a.token === b.token
+  return a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.raw === b.raw
+}
+
+/**
+ * Reclaim a stale lock file without racing another caller that already replaced it
+ * with a live lock (decision 2df26cd2).
+ *
+ * Uses an immutable reclaim chain (`<lock>.reclaim.<token>`) keyed first to the exact
+ * stale lock's token/inode and, if a prior reclaimer died mid-reclaim, chained onto
+ * that dead guard's own unique token instead of unlinking the dead guard in place.
+ * Because no caller ever unlinks a live or dead guard while acquiring the chain,
+ * two callers can never race to remove a replacement guard; at most one live reclaimer
+ * reaches `unlinkSync(lockFile)`, and dead predecessor guards are cleaned up only
+ * after the stale lock is gone. Walks until an unclaimed tip is reached (bounded only
+ * by cycle detection via `visitedKeys`) so a dead follower is always recoverable
+ * regardless of how many prior reclaimers crashed.
+ */
+function tryReclaimStaleWakeFollowLock(lockFile, staleInfo) {
+  const myGuardToken = crypto.randomBytes(8).toString('hex')
+  const reclaimTemp = `${lockFile}.reclaim.tmp.${process.pid}-${myGuardToken}`
+  let claimedFile = null
+  const deadPredecessors = []
+  try {
+    fs.writeFileSync(reclaimTemp, `${JSON.stringify({ pid: process.pid, token: myGuardToken })}\n`, { mode: 0o600 })
+    let currKey = staleInfo.token || `ino-${staleInfo.ino}-${Math.trunc(staleInfo.mtimeMs)}`
+    const visitedKeys = new Set()
+    while (!visitedKeys.has(currKey)) {
+      visitedKeys.add(currKey)
+      const reclaimFile = `${lockFile}.reclaim.${currKey}`
+      try {
+        fs.linkSync(reclaimTemp, reclaimFile)
+        claimedFile = reclaimFile
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') return false
+        const guard = readWakeFollowLockInfo(reclaimFile)
+        if (!guard) return false
+        const liveGuard = Number.isInteger(guard.pid) && guard.pid > 1 && ownerAlive(guard.pid)
+        if (liveGuard) return false
+        if (!guard.token) {
+          // A guard created without a token (or mid-write) must not be stepped past
+          // until the empty-lock grace window expires.
+          const expired =
+            typeof guard.mtimeMs === 'number' &&
+            Date.now() - guard.mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
+          if (!expired) return false
+          const fallbackKey = `ino-${guard.ino}-${Math.trunc(guard.mtimeMs)}`
+          deadPredecessors.push({ file: reclaimFile, info: guard })
+          currKey = fallbackKey
+          continue
+        }
+        deadPredecessors.push({ file: reclaimFile, info: guard })
+        currKey = guard.token
+      }
+    }
+    if (!claimedFile) return false
+    const current = readWakeFollowLockInfo(lockFile)
+    if (!sameLockIdentity(staleInfo, current)) return false
+    try {
+      fs.unlinkSync(lockFile)
+    } catch {
+      return false
+    }
+    // Stale lock is now gone; clean up dead predecessor guards whose identity still matches.
+    for (const pred of deadPredecessors) {
+      const still = readWakeFollowLockInfo(pred.file)
+      if (sameLockIdentity(pred.info, still)) {
+        try {
+          fs.unlinkSync(pred.file)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return true
+  } finally {
+    try {
+      fs.unlinkSync(reclaimTemp)
+    } catch {
+      /* ignore */
+    }
+    if (claimedFile) {
+      const stillMine = readWakeFollowLockInfo(claimedFile)
+      if (stillMine?.token === myGuardToken) {
+        try {
+          fs.unlinkSync(claimedFile)
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Serialize wake-follow check-and-spawn across concurrent callers (for example
+ * `writeConnectionState` and the newly spawned `devspec-remote-poll.mjs`), keeping
+ * strictly one inbox follower per connection (decision 2df26cd2).
+ *
+ * Uses atomic temp-file + `linkSync` with a unique per-acquisition token so the lock
+ * file never exists without its owner PID + token, and stale-lock reclaim is guarded
+ * per stale token/inode so a delayed caller can never unlink a live replacement lock.
+ */
+export function withWakeFollowLock(connectionId, io, work, { dir = CONNECTIONS_DIR } = {}) {
+  if (io !== fs) return work()
+  fs.mkdirSync(dir, { recursive: true })
+  const lockFile = path.join(dir, `${connectionId}.follow.lock`)
+  const myToken = crypto.randomBytes(8).toString('hex')
+  const tempLock = `${lockFile}.${process.pid}-${myToken}`
+  fs.writeFileSync(tempLock, `${JSON.stringify({ pid: process.pid, token: myToken })}\n`, { mode: 0o600 })
+  const deadline = Date.now() + WAKE_FOLLOW_LOCK_WAIT_MS
+  let acquired = false
+  try {
+    while (Date.now() < deadline) {
+      try {
+        fs.linkSync(tempLock, lockFile)
+        acquired = true
+        break
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error
+      }
+      const info = readWakeFollowLockInfo(lockFile)
+      if (!info) continue
+      const deadHolder = Number.isInteger(info.pid) && info.pid > 1 && !ownerAlive(info.pid)
+      const staleEmpty =
+        (!info.raw || !Number.isInteger(info.pid) || info.pid <= 1) &&
+        typeof info.mtimeMs === 'number' &&
+        Date.now() - info.mtimeMs >= WAKE_FOLLOW_EMPTY_LOCK_GRACE_MS
+      if (deadHolder || staleEmpty) {
+        if (tryReclaimStaleWakeFollowLock(lockFile, info)) continue
+      }
+      sleepSyncMs(WAKE_FOLLOW_LOCK_RETRY_MS)
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tempLock)
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!acquired) {
+    return {
+      ok: false,
+      code: 'wake_follow_lock_busy',
+      retryable: true,
+      error: 'wake-follow startup lock busy; retry shortly',
+      lock_wait_ms: WAKE_FOLLOW_LOCK_WAIT_MS,
+    }
+  }
+  try {
+    return work()
+  } finally {
+    const current = readWakeFollowLockInfo(lockFile)
+    if (current?.token === myToken) {
+      try {
+        fs.unlinkSync(lockFile)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   const io = opts.io || fs
   if (!connectionId || connectionId.length < 8) {
@@ -635,6 +873,11 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   if (!io.existsSync(WAIT_SCRIPT)) {
     return { ok: false, error: `wait script missing: ${WAIT_SCRIPT}` }
   }
+
+  return withWakeFollowLock(connectionId, io, () => ensureWakeFollowLocked(connectionId, wakeFile, io, opts))
+}
+
+function ensureWakeFollowLocked(connectionId, wakeFile, io, opts) {
 
   const findPid = opts.findPid || findWakeFollowPidForConnection
   const running = findPid(connectionId)
@@ -726,7 +969,16 @@ export function ensureWakeFollowForConnection(connectionId, opts = {}) {
   try {
     io.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
   } catch (e) {
-    return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath }
+    // Terminate the newly spawned follower so a failed PID-file write never leaves an
+    // untracked live reader running (decision 2df26cd2).
+    const killFn = opts.killPid || ((p, sig) => process.kill(p, sig))
+    try {
+      if (typeof child.kill === 'function') child.kill('SIGTERM')
+      else killFn(pid, 'SIGTERM')
+    } catch {
+      /* already gone */
+    }
+    return { ok: false, error: `wrote follow but failed pid file: ${e.message}`, pid, log: logPath, killed_orphan: true }
   }
 
   return {
@@ -1081,7 +1333,13 @@ export function ensurePollerForConnection(connectionId, opts = {}) {
   try {
     fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 })
   } catch (e) {
-    return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped }
+    try {
+      if (typeof child.kill === 'function') child.kill('SIGTERM')
+      else process.kill(pid, 'SIGTERM')
+    } catch {
+      /* already gone */
+    }
+    return { ok: false, error: `wrote poller but failed pid file: ${e.message}`, pid, log: logPath, stopped, killed_orphan: true }
   }
 
   return {
@@ -1147,6 +1405,7 @@ function disableConnectionState(connectionId, { agent = null, localId = null } =
   }
   const bonds = markBondsStoppedForConnection(connectionId, 'local_stop')
   const capability_cleared = clearConnectionCapability(connectionId)
+  clearWakeListenerNeeded(connectionId, CONNECTIONS_DIR)
   const killResult = stopPollerForConnection(connectionId)
   return {
     ok: true,
@@ -2500,9 +2759,33 @@ export async function writeConnectionState(opts) {
     result.poller = poller
     if (!poller.ok) {
       result.warning_poller = poller.error
+    } else {
+      const wakeFile = resolveSpaceFreeWakeFile(connectionId)
+      const wakeFollow = ensureWakeFollowForConnection(connectionId, {
+        cwd,
+        ownerPid,
+        launchId,
+        wakeFile,
+        fromEnd: !prev.connection_id || prev.enabled === false,
+      })
+      result.wake_follow = wakeFollow
+      if (!wakeFollow.ok) {
+        result.warning_wake_follow = wakeFollow.error
+      } else {
+        const listener = wakeListenerInfo(connectionId, {
+          wakeFile: wakeFollow.wake_file || wakeFile,
+          followPid: wakeFollow.pid ?? null,
+          dir: CONNECTIONS_DIR,
+        })
+        result.wake_listener = listener
+        if (!listener.active) {
+          markWakeListenerNeeded(connectionId, CONNECTIONS_DIR)
+        }
+      }
     }
   } else if (opts.noPoller) {
     result.poller = { ok: true, skipped: true, reason: 'no-poller' }
+    result.wake_follow = { ok: true, skipped: true, reason: 'no-poller' }
   }
 
   await emitPhase({

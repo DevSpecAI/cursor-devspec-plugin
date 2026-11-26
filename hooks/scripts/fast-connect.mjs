@@ -690,6 +690,24 @@ export async function fastConnect(opts = {}) {
     }
   }
 
+  const wakeFollow = written.wake_follow || null
+  if (wakeFollow && !wakeFollow.ok && !wakeFollow.skipped && !opts.noPoller) {
+    return {
+      ok: false,
+      code: typeof wakeFollow.code === 'string' && wakeFollow.code ? wakeFollow.code : 'wake_follow_failed',
+      error: wakeFollow.error || written.warning_wake_follow || 'ensure_wake_follow_failed',
+      ...(typeof wakeFollow.lock_wait_ms === 'number' ? { lock_wait_ms: wakeFollow.lock_wait_ms } : {}),
+      ...(typeof wakeFollow.retryable === 'boolean' ? { retryable: wakeFollow.retryable } : {}),
+      local_id: localId,
+      launch_id: launchId,
+      connection_id: connectionId,
+      session_id: attachedSessionId,
+      codename: written.session_codename || codename,
+      poller,
+      wake_follow: wakeFollow,
+    }
+  }
+
   const projectSnapshot = readRepositorySnapshot(localId, opts.projectHome)
   const githubStatus = renderGithubIdentity(projectSnapshot?.github_identity)
   const repoCount = Array.isArray(projectSnapshot?.repository_context?.repositories)
@@ -714,6 +732,7 @@ export async function fastConnect(opts = {}) {
     ...(projectSnapshot?.github_identity ? { github_identity: projectSnapshot.github_identity } : {}),
     ...(githubStatus ? { github_status: githubStatus } : {}),
     poller,
+    ...(written.wake_listener ? { wake_listener: written.wake_listener } : {}),
     ...(auth.signed_in_now ? { signed_in_now: true } : {}),
   }
 }

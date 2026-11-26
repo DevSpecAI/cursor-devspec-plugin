@@ -100,10 +100,45 @@ import {
   wakeFileConnectionId,
   wakeLines,
 } from './devspec-wake-file.mjs'
-import { fitsShellOutput, wakeInNote, wakesForOneOutput } from './hook-context-budget.mjs'
+import {
+  clearPendingUnsavedRefusals,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitShellDiagnostic,
+  fitsShellOutput,
+  formatDiagnosticStorePreflightError,
+  hasPendingUnsavedRefusals,
+  hasWritableDiagnosticNoteStore,
+  peekPendingUnsavedRefusals,
+  peekPendingUnsavedRefusalsDetailed,
+  reserveDiagnosticNoteSlots,
+  shellDiagnosticReserve,
+  spoolUnsavedRefusal,
+  wakeInNote,
+  wakesForOneOutput,
+} from './hook-context-budget.mjs'
 import { isDirectRun } from './is-direct-run.mjs'
 import { readPrivateJson, writePrivateJson } from './private-state.mjs'
-import { connectionsDirFor, withoutEndedConnectionWakes, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import {
+  cleanupCompletedWakeNotesBefore,
+  clearWakeInlineHold,
+  connectionsDirFor,
+  isWakeNoteCompleted,
+  registerPendingWakeNote,
+  setWakeInlineHold,
+  withoutEndedConnectionWakes,
+  withStepsLock,
+  withStepsLockAsync,
+} from './step-delivery.mjs'
+import {
+  clearWakeListenerNeeded,
+  extractRoomCommandsFromWake,
+  formatShellRefusalOmissionNotice,
+  formatStructuredRefusalsFallback,
+  markWakeListenerNeeded,
+  readStartedCommandIds,
+  startRoomCommands,
+  structuredRefusalFromError,
+} from './command-start.mjs'
 
 /**
  * How often the tail looks for new wakes, and how long the reader waits to see whether
@@ -389,6 +424,7 @@ function tail({ file, connectionId, scriptPath }) {
       }
     }
     lease('listening')
+    clearWakeListenerNeeded(key, dir)
   })
 
   /** One look's announcements, holding the steps lock: what to stop for, or null to carry on. */
@@ -420,6 +456,7 @@ function tail({ file, connectionId, scriptPath }) {
     if (text) process.stdout.write(text)
     offset = through
     lease(full ? 'retired' : matches >= LISTENER_RELIEF_AT ? 'relief' : 'listening')
+    if (full) markWakeListenerNeeded(key, dir)
     return full
       ? `printed ${matches} notify matches; the next would reach Cursor's limit of ${CURSOR_NOTIFY_MATCH_LIMIT}, so stopping here. The wake reader tells the agent to start a new listener, which announces the rest.`
       : null
@@ -500,33 +537,67 @@ function eventsOf(wake) {
  * cannot write just now stops the read before it: the wakes before it go out, and when
  * it is the first, the header alone says so, so it is tried again on the next read.
  */
-export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null } = {}) {
+export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null, reserve = '' } = {}) {
   const kept = []
   for (let i = 0; i < wakes.length; i += 1) if (wakes[i].trim() && !skip(wakes[i])) kept.push(i)
   const total = kept.length
   if (total === 0) return { text: readerHeader(0, 0, NOTHING_UNREAD, listener), printed: 0, remaining: 0, through: wakes.length }
   const longest = readerHeader(total, total, null, listener)
-  const fitted = []
-  let held = null
-  for (const i of kept) {
-    let wake = wakes[i]
-    if (!fitsShellOutput(longest + wake)) {
-      const out = wakeInNote(eventsOf(wake), { home })
-      if (out.error) {
-        held = out.error
-        break
+  const layoutWithReserve = (activeReserve) => {
+    const reservedHeader = longest + activeReserve
+    const fitted = []
+    let held = null
+    for (const i of kept) {
+      let wake = wakes[i]
+      if (!fitsShellOutput(reservedHeader + wake)) {
+        const out = wakeInNote(eventsOf(wake), { home })
+        if (out.error) {
+          held = out.error
+          break
+        }
+        wake = wakeLines(out.events)
       }
-      wake = wakeLines(out.events)
+      fitted.push(wake)
+      // Nothing after this one can go out with it: no note is written for a wake that waits.
+      if (!fitsShellOutput(reservedHeader + fitted.join(''))) break
     }
-    fitted.push(wake)
-    // Nothing after this one can go out with it: no note is written for a wake that waits.
-    if (!fitsShellOutput(longest + fitted.join(''))) break
+    const printed = wakesForOneOutput([reservedHeader, ...fitted]).count - 1
+    return { fitted, held, printed }
   }
-  const printed = wakesForOneOutput([longest, ...fitted]).count - 1
+  let { fitted, held, printed } = layoutWithReserve(reserve)
+  // If an oversized diagnostic `reserve` (e.g. heavily shell-quoted paths) starved even the
+  // first wake or its `wake_in_note` pointer, retry without the overflowing reserve so the
+  // queued wake still comes through whole instead of deadlocking at 0 of N (3c5147a7 / 91d7b47c).
+  if (printed === 0 && !held && reserve) {
+    ;({ fitted, held, printed } = layoutWithReserve(''))
+  }
   const remaining = total - printed
   const through = printed < total ? kept[printed] : wakes.length
-  if (printed === 0 && held) return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through }
-  return { text: readerHeader(printed, remaining, null, listener) + fitted.slice(0, printed).join(''), printed, remaining, through }
+  const printedWakes = fitted.slice(0, printed).map((text, idx) => ({ text, sourceIndex: kept[idx] }))
+  if (printed === 0 && held) {
+    return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through, printedWakes: [] }
+  }
+  if (printed === 0 && remaining > 0) {
+    const firstWake = wakes[kept[0]]
+    const out = wakeInNote(eventsOf(firstWake), { home })
+    const overflowNote = out.note
+      ? `Wake output reserve (${reserve.length} chars) + header exceeded Cursor's Shell ceiling; first wake saved whole — run \`${out.note.command}\`.`
+      : `Wake output reserve (${reserve.length} chars) + header exceeded Cursor's Shell ceiling and saving a note failed; shorten note/connection paths and re-run.`
+    return {
+      text: readerHeader(0, remaining, overflowNote, listener),
+      printed: 0,
+      remaining,
+      through: kept[0],
+      printedWakes: [],
+    }
+  }
+  return {
+    text: readerHeader(printed, remaining, null, listener) + fitted.slice(0, printed).join(''),
+    printed,
+    remaining,
+    through,
+    printedWakes,
+  }
 }
 
 function sleep(ms) {
@@ -576,34 +647,618 @@ function writeStdout(text) {
  * (`listenerAdvice`, read from its lease under the same lock), the header says so and
  * names it by `scriptPath`, the copy this reader runs from.
  */
+export function writeStderrChecked(text, stream = process.stderr) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onError = (error) => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+    const detachLater = () => {
+      // Node.js Writable may emit 'error' on a later process.nextTick turn after
+      // invoking the write callback (via errorOrDestroy); keep `onError` attached
+      // until the setImmediate check phase so the emitted stream error is absorbed
+      // instead of crashing the process before callers can handle the rejection
+      // (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c / 3c5147a7).
+      const timer = setImmediate(() => stream.removeListener('error', onError))
+      timer.unref?.()
+    }
+    stream.on('error', onError)
+    try {
+      stream.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        stream.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
+      })
+    } catch (error) {
+      detachLater()
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
+}
+
 export async function readWakes({
   file,
   connectionId = null,
   home = os.homedir(),
   dir = connectionsDirFor(home),
   write = writeStdout,
+  writeStderr = writeStderrChecked,
   settleMs = POLL_MS,
   scriptPath = SCRIPT_PATH,
   isAlive = pidAlive,
+  startCommands = startRoomCommands,
 } = {}) {
   const resolved = path.resolve(String(file ?? ''))
   const key = readerKey(resolved, connectionId)
+  const resolvedConnectionId = (SAFE_ID.test(connectionId ?? '') ? connectionId : null) ?? wakeFileConnectionId(resolved)
   return withStepsLockAsync(key, dir, async () => {
     const position = readPosition(resolved, key, dir)
     const { start, wakes } = await unreadWakes(resolved, position, { settleMs })
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
+    const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
+    const pickupDiagnosticReserve = shellDiagnosticReserve('devspec-wake-tail', {
+      home,
+      fallbackDir: fallbackNoteDir,
+      backupDir: dir,
+    })
+    const hasRoomCommands =
+      Boolean(resolvedConnectionId) &&
+      wakes.some((wake) => {
+        const ex = extractRoomCommandsFromWake(wake.text, { home })
+        return ex.commands.length > 0 || ex.unreadableNotes.length > 0
+      })
+    const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
+    const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
+    const spoolSnapshot = peekPendingUnsavedRefusalsDetailed(spoolKey, spoolOpts)
+    const pendingSpoolEntries = spoolSnapshot.entries
+    const unreadablePendingSpool = spoolSnapshot.hadReadError
+    const hasSpool = pendingSpoolEntries.length > 0 || unreadablePendingSpool
     const page = readerPage(
       wakes.map((wake) => wake.text),
-      { home, listener, skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '' },
+      {
+        home,
+        listener,
+        reserve: hasRoomCommands || hasSpool ? pickupDiagnosticReserve : '',
+        skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '',
+      },
     )
-    await write(page.text)
+    let pickupRefusals = null
+    let pickupNothingOpen = null
+    let pickupDiagnosticNote = null
+    let pickupDiagnosticWritten = false
+    const pendingNoteReads = []
     const through = page.through > 0 ? wakes[page.through - 1].end : start
-    if (through === position) return { ...page, marked: true }
+    let earliestDeferredStart = null
+    let deferredEntries = []
+    let inlineCommands = []
+    let inlineCommandSpans = []
+    let inlineMessages = []
+    let noteRefusals = []
+    let extractedSessionId = null
+    if (resolvedConnectionId && page.printed > 0) {
+      // Inspect each printed wake individually so every `wake_in_note` command AND every
+      // inline room command records its OWN exact `[wakeStart, wakeEnd]` byte span instead
+      // of the whole page's end offset: reading one note out of order or picking up only
+      // the newest command on a multi-command page can never advance the cursor past an
+      // unstarted or unread command (requirement 3ea2b201).
+      const printedItems = Array.isArray(page.printedWakes)
+        ? page.printedWakes
+        : [{ text: page.text, sourceIndex: Math.max(0, page.through - 1) }]
+      for (const item of printedItems) {
+        const wakeStart = item.sourceIndex === 0 ? start : wakes[item.sourceIndex - 1].end
+        const wakeEnd = wakes[item.sourceIndex]?.end ?? through
+        const extracted = extractRoomCommandsFromWake(item.text, { home })
+        if (!extractedSessionId && extracted.sessionId) extractedSessionId = extracted.sessionId
+        inlineCommands.push(...extracted.inlineCommands)
+        for (const cmd of extracted.inlineCommands) {
+          inlineCommandSpans.push({ messageId: cmd.messageId, wakeStart, wakeEnd })
+        }
+        inlineMessages.push(...extracted.inlineMessages)
+        for (const note of extracted.unreadableNotes) {
+          noteRefusals.push({
+            command_message_id: null,
+            command_turn_id: null,
+            refusal: note,
+          })
+        }
+        for (const deferred of extracted.deferredNoteCommands) {
+          if (isWakeNoteCompleted(resolvedConnectionId, deferred.noteId, { dir })) {
+            continue
+          }
+          if (earliestDeferredStart === null || wakeStart < earliestDeferredStart) {
+            earliestDeferredStart = wakeStart
+          }
+          deferredEntries.push({
+            ...deferred,
+            wakeStart,
+            wakeThrough: wakeEnd,
+          })
+        }
+      }
+    }
+
+    // If local note reads already failed before stdout (unreadable wake_in_note), refuse
+    // without calling startCommands or marking anything started.
+    if (noteRefusals.length > 0 && inlineCommands.length === 0) {
+      pickupRefusals = noteRefusals
+      const noteDiag = `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n`
+      const fittedWithStdout = fitShellDiagnostic(page.text, noteDiag, {
+        home,
+        label: 'devspec-wake-tail',
+        fallback: (noteError, savedNote) =>
+          formatStructuredRefusalsFallback(pickupRefusals, {
+            prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: page.text,
+            noteError,
+            savedNote,
+            allowMinimalEnvelope: false,
+          }),
+        requireStructuredFallback: true,
+        fallbackDir: fallbackNoteDir,
+      })
+      if (fittedWithStdout.text) {
+        await write(page.text)
+        pickupDiagnosticNote = fittedWithStdout.note
+        const savedEarlyNote = Boolean(fittedWithStdout.note) || fitsShellOutput(page.text + noteDiag)
+        spoolUnsavedRefusal(spoolKey, noteDiag, {
+          ...spoolOpts,
+          savedNote: fittedWithStdout.note,
+        })
+        await writeStderr(fittedWithStdout.text)
+        pickupDiagnosticWritten = true
+        if (savedEarlyNote) {
+          clearPendingUnsavedRefusals(spoolKey, [noteDiag], spoolOpts)
+        }
+      } else {
+        const fittedFullBudget = fitShellDiagnostic('', noteDiag, {
+          home,
+          label: 'devspec-wake-tail',
+          fallback: (noteError, savedNote) =>
+            formatStructuredRefusalsFallback(pickupRefusals, {
+              prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+              stdoutText: '',
+              noteError,
+              savedNote,
+            }),
+          requireStructuredFallback: true,
+          fallbackDir: fallbackNoteDir,
+        })
+        pickupDiagnosticNote = fittedFullBudget.note
+        const savedEarlyNote = Boolean(fittedFullBudget.note) || fitsShellOutput(noteDiag)
+        const fallbackNotice =
+          fittedFullBudget.text ||
+          formatShellRefusalOmissionNotice(pickupRefusals, {
+            label: 'devspec-wake-tail',
+            stdoutText: '',
+            actualChars: noteDiag.length,
+            noteError: fittedFullBudget.noteError,
+            savedNote: fittedFullBudget.note,
+          })
+        spoolUnsavedRefusal(spoolKey, noteDiag, {
+          ...spoolOpts,
+          savedNote: fittedFullBudget.note,
+        })
+        if (fallbackNotice) {
+          await writeStderr(fallbackNotice)
+          pickupDiagnosticWritten = true
+          if (savedEarlyNote && fittedFullBudget.text) {
+            clearPendingUnsavedRefusals(spoolKey, [noteDiag], spoolOpts)
+          }
+        }
+      }
+      return {
+        ...page,
+        marked: false,
+        pickup_refusals: pickupRefusals,
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        pickup_diagnostic_written: pickupDiagnosticWritten,
+        error: new Error(`report_pickup refused: ${JSON.stringify(pickupRefusals)}`),
+      }
+    }
+
+    // Preview whether multiple unstarted inline commands sit on this page BEFORE writing
+    // stdout so the header discloses queued pickup work upfront while strictly ensuring
+    // `await write(pageText)` completes BEFORE calling `startCommands` (`report_pickup`,
+    // started-command persistence, and `.turn` Working marker — requirement 3ea2b201).
+    let pageText = page.text
+    let effectiveRemaining = page.remaining
+    if (resolvedConnectionId && page.printed > 0 && inlineCommands.length > 1) {
+      const alreadyStarted = new Set(readStartedCommandIds(resolvedConnectionId, dir))
+      const seen = new Set()
+      const unstartedPreview = []
+      for (const cmd of inlineCommands) {
+        if (!cmd?.messageId || seen.has(cmd.messageId) || alreadyStarted.has(cmd.messageId)) continue
+        seen.add(cmd.messageId)
+        unstartedPreview.push(cmd)
+      }
+      if (unstartedPreview.length > 1) {
+        const previewOlder = unstartedPreview.slice(0, -1)
+        const previewOlderIds = new Set(previewOlder.map((cmd) => cmd.messageId))
+        let earliestPreviewStart = null
+        for (const span of inlineCommandSpans) {
+          if (previewOlderIds.has(span.messageId)) {
+            if (earliestPreviewStart === null || span.wakeStart < earliestPreviewStart) {
+              earliestPreviewStart = span.wakeStart
+            }
+          }
+        }
+        const heldWakeCount = Math.max(
+          1,
+          Array.isArray(page.printedWakes)
+            ? page.printedWakes.filter((item) => {
+                const wStart = item.sourceIndex === 0 ? start : wakes[item.sourceIndex - 1].end
+                return typeof earliestPreviewStart === 'number' && wStart >= earliestPreviewStart
+              }).length
+            : 1,
+        )
+        effectiveRemaining = page.remaining + heldWakeCount
+        const nlIdx = pageText.indexOf('\n')
+        if (nlIdx >= 0) {
+          const body = pageText.slice(nlIdx + 1)
+          const detailedNote = `${previewOlder.length} of ${inlineCommands.length} room command(s) remain queued for pickup (${previewOlder.map((cmd) => cmd.messageId).join(', ')}); run this wake reader again to pick up the rest.`
+          const shortNote = `${previewOlder.length} older room command(s) remain queued for pickup; run this wake reader again.`
+          const candidateDetailed = readerHeader(page.printed, effectiveRemaining, detailedNote, listener) + body
+          const candidateShort = readerHeader(page.printed, effectiveRemaining, shortNote, listener) + body
+          const candidateCounts = readerHeader(page.printed, effectiveRemaining, null, listener) + body
+          if (fitsShellOutput(`${candidateDetailed}${pickupDiagnosticReserve}`)) pageText = candidateDetailed
+          else if (fitsShellOutput(`${candidateShort}${pickupDiagnosticReserve}`)) pageText = candidateShort
+          else if (fitsShellOutput(`${candidateCounts}${pickupDiagnosticReserve}`)) pageText = candidateCounts
+        }
+      }
+    }
+
+    // Pre-flight check: when this page carries inline room commands that will call
+    // report_pickup, verify and pre-open a private diagnostic note slot BEFORE writing
+    // stdout or calling report_pickup so an oversized refusal is still preserved whole on
+    // disk with a Shell-bounded read command even if the last writable store loses
+    // permissions or is removed during pickup (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    let reservedDiagnosticStore = null
+    if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
+      const storeProbe = reserveDiagnosticNoteSlots({
+        home,
+        fallbackDir: fallbackNoteDir,
+        backupDir: dir,
+        spoolKey,
+      })
+      if (!storeProbe.ok) {
+        const preflightErr = formatDiagnosticStorePreflightError('devspec-wake-tail', storeProbe.errors)
+        if (preflightErr) await writeStderr(preflightErr)
+        return {
+          ...page,
+          text: pageText,
+          printed: 0,
+          remaining: effectiveRemaining,
+          marked: false,
+          pickup_diagnostic_written: true,
+          error: new Error(`no_writable_diagnostic_note_store: ${JSON.stringify(storeProbe.errors)}`),
+        }
+      }
+      reservedDiagnosticStore = storeProbe
+    }
+
     try {
-      writePrivateJson(readPositionPath(key, dir), { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
-      return { ...page, marked: true }
+    // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / write error),
+    // throw immediately with zero report_pickup calls, zero started-command writes, zero
+    // Working marker writes, and zero wake-cursor movement (requirement 3ea2b201).
+    await write(pageText)
+    const printedStdout = pageText
+
+    let rawDiag = ''
+    let unstartedCommands = []
+    if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
+      const capturedDiag = []
+      let pickupResult = null
+      if (inlineCommands.length > 0) {
+        try {
+          pickupResult = await startCommands({
+            connectionId: resolvedConnectionId,
+            commands: inlineCommands,
+            batch: { type: 'owner_messages', session_id: extractedSessionId, messages: inlineMessages },
+            sessionId: extractedSessionId,
+            dir,
+            home,
+            fromWakeTurn: true,
+            // Capture command-start stderr so ALL stderr for this Shell call passes
+            // once through the shared Shell output ceiling (`fitShellDiagnostic`).
+            log: (line) => capturedDiag.push(String(line ?? '')),
+          })
+        } catch (error) {
+          pickupResult = {
+            ok: false,
+            outcome: 'refused',
+            refusals: [structuredRefusalFromError(error)],
+          }
+        }
+      }
+      if (Array.isArray(pickupResult?.unstarted) && pickupResult.unstarted.length > 0) {
+        unstartedCommands = pickupResult.unstarted
+      }
+      const unstartedNotice =
+        unstartedCommands.length > 0
+          ? `devspec-wake-tail: ${unstartedCommands.length} of ${inlineCommands.length} room command(s) remain queued for pickup (${unstartedCommands.map((cmd) => cmd?.messageId).filter(Boolean).join(', ')}); cursor held — run this wake reader again to pick up the rest.\n`
+          : ''
+      const combinedRefusals = [
+        ...noteRefusals,
+        ...(Array.isArray(pickupResult?.refusals) ? pickupResult.refusals : []),
+      ]
+      if (combinedRefusals.length > 0) {
+        pickupRefusals = combinedRefusals
+        rawDiag =
+          `${capturedDiag.join('')}` +
+          `devspec-wake-tail: report_pickup refused; wake position not advanced so next read retries: ${JSON.stringify(pickupRefusals)}\n` +
+          unstartedNotice
+      } else if (Array.isArray(pickupResult?.nothingOpen) && pickupResult.nothingOpen.length > 0) {
+        pickupNothingOpen = pickupResult.nothingOpen
+        rawDiag =
+          `${capturedDiag.join('')}` +
+          `devspec-wake-tail: report_pickup returned nothing_open: ${JSON.stringify(pickupNothingOpen)}\n` +
+          unstartedNotice
+      } else if (capturedDiag.length > 0 || unstartedNotice) {
+        rawDiag = `${capturedDiag.join('')}${unstartedNotice}`
+      }
+    }
+
+    const unstartedIds = new Set(unstartedCommands.map((cmd) => cmd?.messageId).filter(Boolean))
+    let earliestUnstartedStart = null
+    for (const span of inlineCommandSpans) {
+      if (unstartedIds.has(span.messageId)) {
+        if (earliestUnstartedStart === null || span.wakeStart < earliestUnstartedStart) {
+          earliestUnstartedStart = span.wakeStart
+        }
+      }
+    }
+
+    const spooledPrefix =
+      pendingSpoolEntries.length > 0
+        ? `devspec-wake-tail: recovered previously unsaved pickup refusal(s):\n${pendingSpoolEntries.join('\n')}\n`
+        : ''
+    const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
+
+    let unsurfacedSpoolRemaining = false
+    if (pickupRefusals && effectiveRawDiag) {
+      const fittedWithStdout = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
+        home,
+        label: 'devspec-wake-tail',
+        fallback: (noteError, savedNote) =>
+          formatStructuredRefusalsFallback(pickupRefusals, {
+            prefix: 'devspec-wake-tail: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: printedStdout,
+            noteError,
+            savedNote,
+          }),
+        requireStructuredFallback: true,
+        fallbackDir: fallbackNoteDir,
+        backupDir: dir,
+        reservedStore: reservedDiagnosticStore,
+        spoolKey,
+      })
+      pickupDiagnosticNote = fittedWithStdout.note
+      const savedReadableNow =
+        (Boolean(fittedWithStdout.note) &&
+          !fittedWithStdout.note.pendingPermissionRecovery &&
+          !fittedWithStdout.note.compressed &&
+          !fittedWithStdout.note.enospcCompacted) ||
+        fitsShellOutput(printedStdout + effectiveRawDiag)
+      const diagText =
+        fittedWithStdout.text ||
+        formatShellRefusalOmissionNotice(pickupRefusals, {
+          label: 'devspec-wake-tail',
+          stdoutText: printedStdout,
+          actualChars: effectiveRawDiag.length,
+          noteError: fittedWithStdout.noteError,
+          savedNote: fittedWithStdout.note,
+        })
+      // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a
+      // fatal broken-pipe crash mid-write leaves the refusal durably queued for the next
+      // pass, and clear it ONLY AFTER stderr flush completes (reqs 3ea2b201 / 4e32d1a5 /
+      // 91d7b47c / 3c5147a7).
+      const spooledLiveAhead = Boolean(rawDiag && !fittedWithStdout.note?.pendingPermissionRecovery)
+      if (spooledLiveAhead) {
+        spoolUnsavedRefusal(spoolKey, rawDiag, {
+          ...spoolOpts,
+          savedNote: fittedWithStdout.note,
+          reservedStore: reservedDiagnosticStore,
+        })
+      }
+      if (diagText) {
+        await writeStderr(diagText)
+        pickupDiagnosticWritten = true
+      }
+      if (savedReadableNow && fittedWithStdout.text && pickupDiagnosticWritten) {
+        const toClear = spooledLiveAhead ? [...pendingSpoolEntries, rawDiag] : pendingSpoolEntries
+        if (toClear.length > 0) {
+          clearPendingUnsavedRefusals(spoolKey, toClear, spoolOpts)
+        }
+      }
+    } else if (effectiveRawDiag) {
+      const fitted = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
+        home,
+        label: 'devspec-wake-tail',
+        fallbackDir: fallbackNoteDir,
+        backupDir: dir,
+        reservedStore: reservedDiagnosticStore,
+        spoolKey,
+      })
+      pickupDiagnosticNote = fitted.note
+      const savedReadableNow =
+        (Boolean(fitted.note) &&
+          !fitted.note.pendingPermissionRecovery &&
+          !fitted.note.compressed &&
+          !fitted.note.enospcCompacted) ||
+        fitsShellOutput(printedStdout + effectiveRawDiag)
+      if (fitted.text) {
+        await writeStderr(fitted.text)
+        pickupDiagnosticWritten = true
+        if (pendingSpoolEntries.length > 0 && savedReadableNow) {
+          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
+        }
+      }
+      if (pendingSpoolEntries.length > 0 && (!pickupDiagnosticWritten || !savedReadableNow)) {
+        unsurfacedSpoolRemaining = true
+      }
+    }
+    // Always hold the wake cursor if ANY pending spool refusal remains unsurfaced
+    // (unreadable at snapshot time, newly queued concurrently while wake output was
+    // being written, or still remaining after clearing the surfaced snapshot)
+    // (requirement 3ea2b201).
+    if (
+      !unsurfacedSpoolRemaining &&
+      (unreadablePendingSpool || hasPendingUnsavedRefusals(spoolKey, spoolOpts))
+    ) {
+      unsurfacedSpoolRemaining = true
+    }
+
+    const posFile = readPositionPath(key, dir)
+    // Persist any earlier-unstarted-inline-command cursor barrier BEFORE registering
+    // deferred `wake_in_note` markers. If saving `wake-inline-hold.json` fails (returns
+    // `false` or throws), OR if an unsurfaced spooled refusal prevented saving the hold
+    // and keeps this read unmarked, omit `wakePositionPath` / `wakeThrough` on deferred
+    // notes so reading a later note can STILL pick up its command without EVER advancing
+    // the wake cursor past the earlier unstarted inline command or unsurfaced refusal
+    // (requirement 3ea2b201).
+    let inlineHoldSaved = typeof earliestUnstartedStart !== 'number'
+    if (resolvedConnectionId && !pickupRefusals && !unsurfacedSpoolRemaining) {
+      if (typeof earliestUnstartedStart === 'number') {
+        try {
+          inlineHoldSaved =
+            setWakeInlineHold(
+              resolvedConnectionId,
+              { wakePositionPath: posFile, holdOffset: earliestUnstartedStart },
+              { dir },
+            ) === true
+        } catch {
+          inlineHoldSaved = false
+        }
+        if (!inlineHoldSaved) {
+          const holdErrMsg =
+            'devspec-wake-tail: failed to save wake-inline-hold barrier for earlier unstarted inline command; holding wake cursor.\n'
+          if (fitsShellOutput(printedStdout + holdErrMsg)) {
+            await writeStderr(holdErrMsg)
+          }
+        }
+      } else {
+        try {
+          clearWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile }, { dir })
+        } catch {
+          /* non-fatal: a lingering hold only keeps the cursor conservative */
+        }
+      }
+    }
+
+    if (resolvedConnectionId && deferredEntries.length > 0 && !pickupRefusals) {
+      for (const deferred of deferredEntries) {
+        const blockedByCursorHold =
+          unsurfacedSpoolRemaining ||
+          (!inlineHoldSaved &&
+            typeof earliestUnstartedStart === 'number' &&
+            (typeof deferred.wakeThrough !== 'number' || deferred.wakeThrough > earliestUnstartedStart))
+        registerPendingWakeNote(
+          resolvedConnectionId,
+          {
+            noteId: deferred.noteId,
+            commands: deferred.commands,
+            messages: deferred.messages,
+            sessionId: deferred.sessionId,
+            wakeFile: resolved,
+            wakePositionPath: blockedByCursorHold ? null : posFile,
+            wakePositionVersion: POSITION_VERSION,
+            wakeStart: blockedByCursorHold ? null : deferred.wakeStart,
+            wakeThrough: blockedByCursorHold ? null : deferred.wakeThrough,
+            revokeCursorAdvance: blockedByCursorHold,
+          },
+          { dir },
+        )
+        pendingNoteReads.push(deferred.noteId)
+      }
+    }
+
+    // Do not advance read position when report_pickup failed/refused: keep the wake queued
+    // so the next read retries pickup and surfaces the structured refusal (req 3ea2b201 / 4e32d1a5).
+    if (pickupRefusals || unsurfacedSpoolRemaining) {
+      return {
+        ...page,
+        text: pageText,
+        remaining: effectiveRemaining,
+        marked: false,
+        ...(pickupRefusals ? { pickup_refusals: pickupRefusals } : {}),
+        ...(pendingNoteReads.length > 0 ? { pending_note_reads: pendingNoteReads } : {}),
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        pickup_diagnostic_written: pickupDiagnosticWritten,
+        error: new Error(
+          pickupRefusals
+            ? `report_pickup refused: ${JSON.stringify(pickupRefusals)}`
+            : 'pending unsaved pickup refusal could not be surfaced cleanly yet',
+        ),
+      }
+    }
+    // Never advance past either an unread deferred `wake_in_note` command OR an older
+    // inline room command returned in `unstarted` because only the newest command on this
+    // page received a `report_pickup` (requirement 3ea2b201). Completed wakes strictly
+    // before the earliest held start may advance up to `holdAt`, leaving every unstarted
+    // or unread command queued for the next read.
+    if (pendingNoteReads.length > 0 || unstartedCommands.length > 0) {
+      const holdCandidates = [earliestDeferredStart, earliestUnstartedStart].filter((n) => typeof n === 'number')
+      const holdAt = holdCandidates.length > 0 ? Math.min(...holdCandidates) : null
+      if (holdAt !== null && holdAt > position) {
+        try {
+          writePrivateJson(posFile, {
+            version: POSITION_VERSION,
+            file: resolved,
+            offset: holdAt,
+            at: new Date().toISOString(),
+          })
+          if (resolvedConnectionId) {
+            cleanupCompletedWakeNotesBefore(resolvedConnectionId, { wakePositionPath: posFile, offset: holdAt }, { dir })
+          }
+        } catch {
+          /* non-fatal: deferred/unstarted wakes stay queued from earlier offset */
+        }
+      }
+      return {
+        ...page,
+        text: pageText,
+        remaining: effectiveRemaining,
+        marked: false,
+        ...(pendingNoteReads.length > 0 ? { pending_note_reads: pendingNoteReads } : {}),
+        ...(unstartedCommands.length > 0 ? { unstarted_commands: unstartedCommands } : {}),
+        ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
+        ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+        ...(pickupDiagnosticWritten ? { pickup_diagnostic_written: true } : {}),
+      }
+    }
+    const extra = {
+      ...(pickupNothingOpen ? { pickup_nothing_open: pickupNothingOpen } : {}),
+      ...(pickupDiagnosticNote ? { pickup_diagnostic_note: pickupDiagnosticNote } : {}),
+      ...(pickupDiagnosticWritten ? { pickup_diagnostic_written: true } : {}),
+    }
+    if (through === position) return { ...page, ...extra, marked: true }
+    try {
+      writePrivateJson(posFile, { version: POSITION_VERSION, file: resolved, offset: through, at: new Date().toISOString() })
+      if (resolvedConnectionId) {
+        cleanupCompletedWakeNotesBefore(resolvedConnectionId, { wakePositionPath: posFile, offset: through }, { dir })
+      }
+      return { ...page, ...extra, marked: true }
     } catch (error) {
-      return { ...page, marked: false, error }
+      return { ...page, ...extra, marked: false, error }
+    }
+    } finally {
+      reservedDiagnosticStore?.release()
     }
   })
 }
@@ -644,10 +1299,36 @@ async function main() {
     return
   }
   if (!page.marked) {
-    // Said only when it keeps the output within what Cursor shows whole.
-    const said = `devspec-wake-tail: the wakes above could not be marked read (${page.error?.message ?? 'unknown error'}); they print again next time.\n`
-    if (fitsShellOutput(page.text + said)) process.stderr.write(said)
-    process.exitCode = 1
+    // Said only when no pickup diagnostic was already emitted and it keeps output within Cursor's ceiling.
+    if (!page.pickup_diagnostic_written) {
+      let said = ''
+      if (page.error) {
+        said = `devspec-wake-tail: the wakes above could not be marked read (${page.error.message ?? 'unknown error'}); they print again next time.\n`
+      } else if (Array.isArray(page.unstarted_commands) && page.unstarted_commands.length > 0) {
+        said = `devspec-wake-tail: ${page.unstarted_commands.length} older room command(s) remain queued for pickup on the next read.\n`
+      } else if (Array.isArray(page.pending_note_reads) && page.pending_note_reads.length > 0) {
+        said = `devspec-wake-tail: ${page.pending_note_reads.length} wake note(s) remain pending read before advancing the cursor.\n`
+      } else {
+        said = 'devspec-wake-tail: the wakes above could not be marked read (unknown error); they print again next time.\n'
+      }
+      if (fitsShellOutput(page.text + said)) {
+        process.stderr.write(said)
+      } else {
+        const fallbackSaid =
+          Array.isArray(page.pickup_refusals) && page.pickup_refusals.length > 0
+            ? formatShellRefusalOmissionNotice(page.pickup_refusals, {
+                label: 'devspec-wake-tail',
+                stdoutText: page.text,
+                actualChars: said.length,
+                savedNote: page.pickup_diagnostic_note ?? null,
+              })
+            : 'devspec-wake-tail: wake read incomplete (error omitted for Shell limit); fix note permissions & re-run.\n'
+        if (fallbackSaid && fitsShellOutput(page.text + fallbackSaid)) {
+          process.stderr.write(fallbackSaid)
+        }
+      }
+    }
+    if (page.error || page.pickup_refusals) process.exitCode = 1
   }
 }
 

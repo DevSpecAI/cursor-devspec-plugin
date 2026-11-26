@@ -37,6 +37,7 @@ import {
   fixtureUuid,
 } from './remote-ingress-test-fixtures.mjs'
 import { resolveSpaceFreeWakeFile } from './devspec-wake-file.mjs'
+import { startRoomCommands } from './command-start.mjs'
 
 const POLL_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'devspec-remote-poll.mjs')
 const CONNECTION = FIXTURE_ID.connection
@@ -173,11 +174,30 @@ async function startPoller() {
   child.stderr.on('data', (chunk) => { stderr += chunk })
   const marker = path.join(dir, `${CONNECTION}.turn`)
   const turnCommands = path.join(dir, `${CONNECTION}.turn-commands.json`)
+  const inbox = path.join(dir, `${CONNECTION}.inbox.jsonl`)
+  const inboxCount = () => {
+    try {
+      return fs.readFileSync(inbox, 'utf8').trim().split('\n').filter(Boolean).length
+    } catch {
+      return 0
+    }
+  }
   return {
     stub,
+    dir,
+    home,
+    inboxCount,
     stderr: () => stderr,
     /** A turn already running, as a typed prompt or another wake leaves it. */
     startTurn: (over = {}) => fs.writeFileSync(marker, JSON.stringify({ startedAt: Date.now(), held: true, ...over })),
+    /** Simulate the agent actually reading the command from the wake reader / step note. */
+    startCommand: (identity) =>
+      startRoomCommands({
+        connectionId: CONNECTION,
+        commands: [identity],
+        dir,
+        home,
+      }),
     /** The turn ends with nothing else reporting it, so the poller's backstop does. */
     endTurn: () => fs.rmSync(marker, { force: true }),
     recorded: () => {
@@ -203,13 +223,21 @@ const pickupOf = (identity) => ({
   command_message_id: identity.messageId,
 })
 
-describe('the poller names the room command each pickup starts (item a4391300)', () => {
-  it('starts a command handed over at idle by name, and the turn it starts ends by naming it', async () => {
+describe('the plugin names the room command each pickup starts only once the agent begins it (items a4391300, 3d327b4a)', () => {
+  it('leaves a command waiting while only the poller has fetched it, then starts it by name once the agent reads it', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       run.stub.serve(commandPoll(FIRST, 'ship the release notes', 1))
-      assert.ok(await until(() => run.stub.named('report_pickup').length >= 1), `no pickup; stderr:\n${run.stderr()}`)
+      assert.ok(await until(() => run.inboxCount() >= 1), `no inbox write; stderr:\n${run.stderr()}`)
+      // Wait a couple of polls: poller alone must NOT send report_pickup or flip busy to true.
+      const afterInboxPolls = run.stub.polls.length
+      assert.ok(await until(() => run.stub.polls.length >= afterInboxPolls + 2))
+      assert.deepEqual(run.stub.named('report_pickup'), [], 'poller receipt must not prematurely report pickup')
+      assert.equal(run.busySince(afterInboxPolls), false, 'poller receipt must not prematurely show Working')
+
+      // Now the agent actually reads the wake and begins handling it.
+      await run.startCommand(FIRST)
       assert.deepEqual(run.stub.named('report_pickup'), [pickupOf(FIRST)])
       assert.deepEqual(run.recorded(), [{ turn_id: FIRST.turnId, message_id: FIRST.messageId }])
 
@@ -225,7 +253,7 @@ describe('the poller names the room command each pickup starts (item a4391300)',
     }
   })
 
-  it('starts a command handed over mid-turn by name, and the running turn\'s end does not finish it', async () => {
+  it('starts a command handed over mid-turn by name once read, and the running turn\'s end does not finish it', async () => {
     const run = await startPoller()
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
@@ -234,7 +262,10 @@ describe('the poller names the room command each pickup starts (item a4391300)',
       assert.deepEqual(run.stub.named('report_pickup'), [], 'a running turn no command started sends no pickup')
 
       run.stub.serve(commandPoll(FIRST, 'and update the changelog too', 1))
-      assert.ok(await until(() => run.stub.named('report_pickup').length >= 1), `no pickup; stderr:\n${run.stderr()}`)
+      assert.ok(await until(() => run.inboxCount() >= 1), `no inbox write; stderr:\n${run.stderr()}`)
+      assert.deepEqual(run.stub.named('report_pickup'), [], 'mid-turn inbox receipt alone sends no pickup')
+
+      await run.startCommand(FIRST)
       assert.deepEqual(run.stub.named('report_pickup'), [pickupOf(FIRST)])
       assert.equal(run.recorded(), null, 'a command joining a running turn is not one the turn started')
 
@@ -277,12 +308,15 @@ describe('the poller names the room command each pickup starts (item a4391300)',
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       run.stub.serve(commandPoll(FIRST, 'ship the release notes', 1))
-      assert.ok(await until(() => run.stub.named('report_pickup').length >= 1), `no pickup; stderr:\n${run.stderr()}`)
+      assert.ok(await until(() => run.inboxCount() >= 1), `no first inbox write; stderr:\n${run.stderr()}`)
+      await run.startCommand(FIRST)
+      assert.equal(run.stub.named('report_pickup').length, 1)
 
       // The turn is still open but has gone quiet for longer than the hung-turn window.
       run.startTurn({ startedAt: Date.now() - 5 * 60_000 })
       run.stub.serve(commandPoll(SECOND, 'are you still there?', 2))
-      assert.ok(await until(() => run.stub.named('report_pickup').length >= 2), `no second pickup; stderr:\n${run.stderr()}`)
+      assert.ok(await until(() => run.inboxCount() >= 2), `no second inbox write; stderr:\n${run.stderr()}`)
+      await run.startCommand(SECOND)
 
       const order = run.stub.calls
         .filter((call) => call.name === 'report_pickup' || call.name === 'report_complete')

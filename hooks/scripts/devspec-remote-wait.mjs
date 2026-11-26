@@ -84,7 +84,26 @@ import {
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
 import { appendWakeEvents, ensureWakeFile, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
-import { wakesForOneOutput } from './hook-context-budget.mjs'
+import {
+  clearPendingUnsavedRefusals,
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
+  fitShellDiagnostic,
+  fitsShellOutput,
+  formatDiagnosticStorePreflightError,
+  hasPendingUnsavedRefusals,
+  hasWritableDiagnosticNoteStore,
+  maxShellReserve,
+  peekPendingUnsavedRefusals,
+  peekPendingUnsavedRefusalsDetailed,
+  reserveDiagnosticNoteSlots,
+  shellDiagnosticPointer,
+  shellDiagnosticReserve,
+  spoolUnsavedRefusal,
+  wakeInNote,
+  wakesForOneOutput,
+  writeFallbackDiagnosticNote,
+  writeNote,
+} from './hook-context-budget.mjs'
 import {
   buildInteractionAnswerEvents,
   INTERACTION_ANSWER_RECORD_TYPE,
@@ -105,13 +124,20 @@ import {
   turnWakeFromEvents,
 } from './notice-reply.mjs'
 import { wakeNotice } from './room-unread.mjs'
-import { recallConversation, recallWakeOut, settleRecallHandover } from './turn-recall.mjs'
+import { RECALL_WHOLE_NOTE, recallConversation, recallWakeOut, settleRecallHandover } from './turn-recall.mjs'
 import { turnFailureNotice } from './turn-failure.mjs'
 import { closeCursorOnEnd } from './close-on-end.mjs'
 import { turnActivityPath } from './turn-liveness.mjs'
-import { clearTurnCommands, completionArguments, readTurnCommands } from './turn-commands.mjs'
+import { clearTurnCommands, commandsHandedOver, completionArguments, readTurnCommands } from './turn-commands.mjs'
 import { localTurnToComplete } from './local-turn.mjs'
-import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, registerPendingWakeNote, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
+import {
+  extractRoomCommandsFromWake,
+  formatShellRefusalOmissionNotice,
+  formatStructuredRefusalsFallback,
+  startRoomCommands,
+  structuredRefusalFromError,
+} from './command-start.mjs'
 
 export function resolveConnectionsDir(env = process.env, homedir = os.homedir()) {
   const override =
@@ -1615,7 +1641,14 @@ export function wakeHeldMessage(agentName) {
  * turn-failure.mjs: by `session_id`, tied to no turn). A connection with no room has
  * no one to tell; the wait's log has it. A post that fails is tried again next lap.
  */
-export async function tellRoomWakeHeld({ connectionId, batch, state, told, call = mcpToolsCall }) {
+export async function tellRoomWakeHeld({
+  connectionId,
+  batch,
+  state,
+  told,
+  call = mcpToolsCall,
+  log = (line) => process.stderr.write(line),
+}) {
   const key = heldWakeKey(batch)
   if (!key || told.has(key)) return false
   const sessionId = batch?.session_id ?? state?.session_id ?? null
@@ -1635,7 +1668,13 @@ export async function tellRoomWakeHeld({ connectionId, batch, state, told, call 
       timeoutMs: 15_000,
     })
   } catch (e) {
-    process.stderr.write(`devspec-remote-wait: could not tell the room a wake is held: ${e instanceof Error ? e.message : String(e)}\n`)
+    const refusal = structuredRefusalFromError(e)
+    const hasStructured =
+      refusal &&
+      typeof refusal === 'object' &&
+      Object.keys(refusal).some((k) => k !== 'error' && k !== 'name' && refusal[k] !== undefined)
+    const detail = hasStructured ? JSON.stringify(refusal) : (e instanceof Error ? e.message : String(e))
+    log(`devspec-remote-wait: could not tell the room a wake is held: ${detail}\n`)
     return false
   }
   told.add(key)
@@ -1666,21 +1705,614 @@ function frozenWakesOf(state, offset, batch) {
 }
 
 /**
- * Print `wakes` as one Shell result (a one-shot run): whole wakes while they fit one
- * output together, and a line saying how many wait (`wakesForOneOutput`,
- * hook-context-budget.mjs, the same sizing the wake file's reader uses). Returns how many
- * were printed.
+ * Extract canonical room commands present ONLY in the printed wakes (never an unprinted
+ * remainder), expanding any `wake_in_note` pointer that carries `owner_message` so an
+ * oversized command stored in a sealed note still triggers `report_pickup` before the
+ * inbox cursor advances (requirement 3ea2b201).
  */
-async function printOneShot(wakes) {
-  const { count, text } = wakesForOneOutput(wakes.map(wakeLines), { waiting: (left) => wakeLines([wakesWaitingEvent(left)]) })
-  await new Promise((resolve, reject) => process.stdout.write(text, (error) => (error ? reject(error) : resolve())))
-  return count
+export function printedRoomCommands(printedWakes, fallbackSessionId = null, { home = os.homedir() } = {}) {
+  const wakes = Array.isArray(printedWakes) ? printedWakes : []
+  const wakeText = wakes.map((wake) => (Array.isArray(wake) ? wakeLines(wake) : '')).join('')
+  const extracted = extractRoomCommandsFromWake(wakeText, { home })
+  return {
+    commands: extracted.commands,
+    messages: extracted.messages,
+    sessionId: extracted.sessionId ?? fallbackSessionId ?? null,
+    unreadableNotes: extracted.unreadableNotes,
+  }
+}
+
+/**
+ * Plan which wakes fit in one one-shot Shell result without writing stdout yet.
+ * Running `report_pickup` on `printedWakes` before writing stdout guarantees that a
+ * pickup refusal leaves stdout empty (so the full Shell budget holds the structured
+ * refusal diagnostic) and that any non-fatal stderr emitted beforehand is accounted for
+ * before stdout is written (reqs 3ea2b201 / 3c5147a7 / 91d7b47c).
+ */
+/**
+ * Whether `wakes` is the exact two-wake recall hand-off (`[... , recall_in_next_wake]`
+ * followed by `[turn_recall]`), where `wakes[0]` already discloses the queued recall in
+ * its own closing `recall_in_next_wake` line when no room remains for `wakes_waiting`.
+ */
+function isRecallInNextWakePair(wakes) {
+  if (!Array.isArray(wakes) || wakes.length !== 2) return false
+  const first = wakes[0]
+  const second = wakes[1]
+  return (
+    Array.isArray(first) &&
+    first.at(-1)?.type === 'recall_in_next_wake' &&
+    Array.isArray(second) &&
+    second[0]?.type === 'turn_recall'
+  )
+}
+
+export function planOneShot(wakes, { reserve = '', home = os.homedir() } = {}) {
+  const recallPair = isRecallInNextWakePair(wakes)
+  const fitted = []
+  for (let i = 0; i < wakes.length; i += 1) {
+    const wake = wakes[i]
+    const raw = wakeLines(wake)
+    const minTrailing =
+      i === 0 && wakes.length > 1 && !recallPair ? wakeLines([wakesWaitingEvent(wakes.length - 1)]) : ''
+    if (fitsShellOutput(`${reserve}${raw}${minTrailing}`)) {
+      fitted.push(raw)
+      continue
+    }
+    const note = wakeInNote(wake, { home })
+    const pointer = note.error ? null : wakeLines(note.events)
+    if (pointer && fitsShellOutput(`${reserve}${pointer}${minTrailing}`)) {
+      fitted.push(pointer)
+      continue
+    }
+    // Never emit an oversized wake (> 20,000 combined chars) or omit a required remainder
+    // disclosure when note fallback fails: hold the wake instead (reqs 3c5147a7 / 91d7b47c).
+    if (i === 0) {
+      return {
+        held: true,
+        error: note.error ?? new Error(`first wake (${raw.length} chars) + stderr (${reserve.length} chars) exceeds Cursor Shell ceiling`),
+        count: 0,
+        text: '',
+        printedWakes: [],
+      }
+    }
+    break
+  }
+  if (fitted.length === 0) {
+    return { held: false, count: 0, text: '', printedWakes: [] }
+  }
+  const omittedTail = wakes.length - fitted.length
+  let { count, text } = wakesForOneOutput(fitted, {
+    waiting: (left) => wakeLines([wakesWaitingEvent(left + omittedTail)]),
+    reserve,
+  })
+  let finalText = text
+  let remaining = wakes.length - count
+  const alreadyDisclosedRecall = recallPair && count === 1 && remaining === 1 && finalText.includes('"recall_in_next_wake"')
+  if (remaining > 0 && !alreadyDisclosedRecall) {
+    const waitingLine = wakeLines([wakesWaitingEvent(remaining)])
+    if (!finalText.endsWith(waitingLine)) {
+      if (fitsShellOutput(`${reserve}${finalText}${waitingLine}`)) {
+        finalText += waitingLine
+      } else {
+        // Reduce printed count or note-wrap the first wake so remaining wakes are NEVER
+        // left undisclosed (requirements 3c5147a7 / 91d7b47c).
+        let adjusted = false
+        for (let k = count - 1; k >= 1; k -= 1) {
+          const wLine = wakeLines([wakesWaitingEvent(wakes.length - k)])
+          const candidate = `${fitted.slice(0, k).join('')}${wLine}`
+          if (fitsShellOutput(`${reserve}${candidate}`)) {
+            count = k
+            finalText = candidate
+            remaining = wakes.length - k
+            adjusted = true
+            break
+          }
+        }
+        if (!adjusted) {
+          const note = wakeInNote(wakes[0], { home })
+          const wLine = wakeLines([wakesWaitingEvent(wakes.length - 1)])
+          const candidate = note.error ? null : `${wakeLines(note.events)}${wLine}`
+          if (candidate && fitsShellOutput(`${reserve}${candidate}`)) {
+            count = 1
+            finalText = candidate
+            remaining = wakes.length - 1
+            adjusted = true
+          }
+        }
+        if (!adjusted) {
+          return {
+            held: true,
+            error: new Error(`cannot fit wake + remainder disclosure (${remaining} queued) inside Cursor Shell ceiling`),
+            count: 0,
+            text: '',
+            printedWakes: [],
+          }
+        }
+      }
+    }
+  }
+  if (!fitsShellOutput(`${reserve}${finalText}`)) {
+    return {
+      held: true,
+      error: new Error(`planned one-shot output (${(reserve + finalText).length} chars) exceeds Cursor Shell ceiling`),
+      count: 0,
+      text: '',
+      printedWakes: [],
+    }
+  }
+  return { held: false, count, text: finalText, printedWakes: wakes.slice(0, count) }
+}
+
+/**
+ * Write text to stdout and await flush, catching synchronous/asynchronous stream errors
+ * (such as EPIPE / closed pipe) so callers never advance pickup or cursor state when
+ * stdout failed (requirement 3ea2b201).
+ */
+function writeStdoutChecked(text) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onError = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
+    const detachLater = () => {
+      const timer = setImmediate(() => process.stdout.removeListener('error', onError))
+      timer.unref?.()
+    }
+    process.stdout.on('error', onError)
+    try {
+      process.stdout.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        process.stdout.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
+      })
+    } catch (error) {
+      detachLater()
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
+}
+
+export async function printOneShot(
+  wakes,
+  {
+    reserve = '',
+    home = os.homedir(),
+    write = (text) => writeStdoutChecked(text),
+  } = {},
+) {
+  const plan = planOneShot(wakes, { reserve, home })
+  if (plan.held) return plan
+  await write(plan.text)
+  return plan
+}
+
+export function writeStderrChecked(text, stream = process.stderr) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onError = (error) => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+    const detachLater = () => {
+      // Node.js Writable may emit 'error' on a later process.nextTick turn after
+      // invoking the write callback (via errorOrDestroy); keep `onError` attached
+      // until the setImmediate check phase so the emitted stream error is absorbed
+      // instead of crashing the process before callers can handle the rejection
+      // (reqs 3ea2b201 / 4e32d1a5 / 91d7b47c / 3c5147a7).
+      const timer = setImmediate(() => stream.removeListener('error', onError))
+      timer.unref?.()
+    }
+    stream.on('error', onError)
+    try {
+      stream.write(text, (error) => {
+        if (error) {
+          detachLater()
+          if (!settled) {
+            settled = true
+            reject(error)
+          }
+          return
+        }
+        stream.removeListener('error', onError)
+        if (!settled) {
+          settled = true
+          resolve()
+        }
+      })
+    } catch (error) {
+      detachLater()
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
+}
+
+/**
+ * Start canonical room commands from ONLY the wakes printed in this one-shot Shell call,
+ * capturing command-start logs and routing all stderr diagnostics once through the shared
+ * Shell output ceiling (`fitShellDiagnostic`). Callers advance the inbox offset / frozen
+ * progress ONLY when this returns `ok: true` (reqs 3ea2b201 / 3c5147a7 / 91d7b47c / 4e32d1a5).
+ */
+export async function runOneShotRoomCommandPickup({
+  connectionId,
+  printedWakes,
+  printedStdout = '',
+  priorStderr = '',
+  fallbackSessionId = null,
+  dir = CONNECTIONS_DIR,
+  home = os.homedir(),
+  state = null,
+  startCommands = startRoomCommands,
+  writeStderr = writeStderrChecked,
+  reservedStore: callerReservedStore = null,
+} = {}) {
+  const extracted = printedRoomCommands(printedWakes, fallbackSessionId, { home })
+  const noteRefusals = extracted.unreadableNotes.map((note) => ({
+    command_message_id: null,
+    command_turn_id: null,
+    refusal: note,
+  }))
+  const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
+  const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
+  const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
+  const spoolSnapshot = peekPendingUnsavedRefusalsDetailed(spoolKey, spoolOpts)
+  const pendingSpoolEntries = spoolSnapshot.entries
+  const unreadablePendingSpool = spoolSnapshot.hadReadError
+  if (extracted.commands.length === 0 && noteRefusals.length === 0 && pendingSpoolEntries.length === 0) {
+    return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
+  }
+  const ownedReservedStore = !callerReservedStore
+    ? reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir, spoolKey })
+    : null
+  const reservedStore = callerReservedStore ?? ownedReservedStore
+  try {
+  const capturedDiag = []
+  let startResult = null
+  if (extracted.commands.length > 0) {
+    try {
+      startResult = await startCommands({
+        connectionId,
+        commands: extracted.commands,
+        batch: { type: 'owner_messages', session_id: extracted.sessionId, messages: extracted.messages },
+        sessionId: extracted.sessionId,
+        dir,
+        home,
+        state,
+        log: (line) => capturedDiag.push(String(line ?? '')),
+      })
+    } catch (error) {
+      startResult = {
+        ok: false,
+        outcome: 'refused',
+        refusals: [structuredRefusalFromError(error)],
+      }
+    }
+  }
+  let rawDiag = ''
+  let ok = true
+  let refusals = null
+  let nothingOpen = null
+  const unstartedList = Array.isArray(startResult?.unstarted) ? startResult.unstarted : []
+  const unstartedNotice =
+    unstartedList.length > 0
+      ? `devspec-remote-wait: ${unstartedList.length} older room command(s) remain queued for pickup (${unstartedList.map((cmd) => cmd?.messageId).filter(Boolean).join(', ')}); inbox position held — run devspec-remote-wait again to pick up the rest.\n`
+      : ''
+  const combinedRefusals = [
+    ...noteRefusals,
+    ...(Array.isArray(startResult?.refusals) ? startResult.refusals : []),
+  ]
+  if (combinedRefusals.length > 0) {
+    ok = false
+    refusals = combinedRefusals
+    rawDiag =
+      `${capturedDiag.join('')}` +
+      `devspec-remote-wait: report_pickup refused; inbox position not advanced so next read retries: ${JSON.stringify(refusals)}\n` +
+      unstartedNotice
+  } else if (Array.isArray(startResult?.nothingOpen) && startResult.nothingOpen.length > 0) {
+    nothingOpen = startResult.nothingOpen
+    rawDiag =
+      `${capturedDiag.join('')}` +
+      `devspec-remote-wait: report_pickup returned nothing_open: ${JSON.stringify(nothingOpen)}\n` +
+      unstartedNotice
+  } else if (capturedDiag.length > 0 || unstartedNotice) {
+    rawDiag = `${capturedDiag.join('')}${unstartedNotice}`
+  }
+  let stderrText = ''
+  let diagnosticNote = null
+  const spooledPrefix =
+    pendingSpoolEntries.length > 0
+      ? `devspec-remote-wait: recovered previously unsaved pickup refusal(s):\n${pendingSpoolEntries.join('\n')}\n`
+      : ''
+  const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
+  if (effectiveRawDiag) {
+    const combinedPrior = `${priorStderr}${printedStdout}`
+    const fallback = refusals
+      ? (noteError, savedNote) =>
+          formatStructuredRefusalsFallback(refusals, {
+            prefix: 'devspec-remote-wait: report_pickup refused (note write failed; structured refusal): ',
+            stdoutText: combinedPrior,
+            noteError,
+            savedNote,
+          })
+      : null
+    const fitted = fitShellDiagnostic(combinedPrior, effectiveRawDiag, {
+      home,
+      label: 'devspec-remote-wait',
+      fallback,
+      requireStructuredFallback: Boolean(refusals),
+      fallbackDir: fallbackNoteDir,
+      backupDir: dir,
+      reservedStore: reservedStore.ok ? reservedStore : null,
+      spoolKey,
+    })
+    diagnosticNote = fitted.note
+    const savedReadableNow =
+      (Boolean(fitted.note) &&
+        !fitted.note.pendingPermissionRecovery &&
+        !fitted.note.compressed &&
+        !fitted.note.enospcCompacted) ||
+      fitsShellOutput(combinedPrior + effectiveRawDiag)
+    const diagText =
+      fitted.text ||
+      (refusals
+        ? formatShellRefusalOmissionNotice(refusals, {
+            label: 'devspec-remote-wait',
+            stdoutText: combinedPrior,
+            actualChars: effectiveRawDiag.length,
+            noteError: fitted.noteError,
+            savedNote: fitted.note,
+          })
+        : '')
+    // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a
+    // fatal broken-pipe crash mid-write leaves the refusal durably queued for the next
+    // pass, and clear it ONLY AFTER stderr flush completes (reqs 3ea2b201 / 4e32d1a5 /
+    // 91d7b47c / 3c5147a7).
+    const spooledLiveAhead = Boolean(refusals && rawDiag && !fitted.note?.pendingPermissionRecovery)
+    if (spooledLiveAhead) {
+      spoolUnsavedRefusal(spoolKey, rawDiag, {
+        ...spoolOpts,
+        savedNote: fitted.note,
+        reservedStore: reservedStore?.ok ? reservedStore : null,
+      })
+    }
+    if (diagText) {
+      await writeStderr(diagText)
+      stderrText = diagText
+    }
+    if (savedReadableNow && fitted.text && stderrText) {
+      const toClear = spooledLiveAhead ? [...pendingSpoolEntries, rawDiag] : pendingSpoolEntries
+      if (toClear.length > 0) {
+        clearPendingUnsavedRefusals(spoolKey, toClear, spoolOpts)
+      }
+    } else if (pendingSpoolEntries.length > 0 && !refusals) {
+      ok = false
+    }
+    if (ok && (unreadablePendingSpool || hasPendingUnsavedRefusals(spoolKey, spoolOpts))) {
+      ok = false
+    }
+  } else if (ok && (unreadablePendingSpool || hasPendingUnsavedRefusals(spoolKey, spoolOpts))) {
+    ok = false
+  }
+  return {
+    ok,
+    hadCommands: true,
+    ...(refusals ? { refusals } : {}),
+    ...(nothingOpen ? { nothingOpen } : {}),
+    ...(Array.isArray(startResult?.unstarted) && startResult.unstarted.length > 0
+      ? { unstarted: startResult.unstarted }
+      : {}),
+    stderrText,
+    diagnosticNote,
+  }
+  } finally {
+    ownedReservedStore?.release()
+  }
+}
+
+/**
+ * Bounded one-shot retry stderr writer that NEVER silently drops retry diagnostics when
+ * stderr approaches Cursor's combined Shell output ceiling (requirements 3c5147a7 / 91d7b47c).
+ * Every retry diagnostic beyond the inline allowance is buffered whole in memory and saved
+ * to a sealed note (`writeNote` -> private `writeFallbackDiagnosticNote` under `tmpDir`) on
+ * `flush()`, emitting the exact `cat` continuation command inside the reserved headroom
+ * (or explicit omission counts + recovery if neither note store is writable).
+ */
+export function createOneShotRetryStderrWriter({
+  follow = false,
+  writeStderr = (chunk) => process.stderr.write(chunk),
+  getEmittedStderr = () => '',
+  home = os.homedir(),
+  tmpDir = null,
+  fallbackDir = null,
+  backupDir = null,
+  diagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', { home, fallbackDir, backupDir }),
+  headroom = null,
+} = {}) {
+  const transitionLine =
+    'devspec-remote-wait: retry stderr allowance reached; buffering further retry warnings to a saved diagnostic note on exit\n'
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const fallbackBaseDir = tmpDir ? path.join(tmpDir, `devspec-notes-${uid}`) : path.join(os.tmpdir(), `devspec-notes-${uid}`)
+  const fallbackSamplePath = path.join(fallbackBaseDir, `${'0'.repeat(16)}.md`)
+  const fallbackPointerReserve = shellDiagnosticPointer(
+    'devspec-remote-wait',
+    `cat '${String(fallbackSamplePath).replaceAll("'", `'\\''`)}'`,
+  )
+  const unwritableCompactReserve = `devspec-remote-wait: ${JSON.stringify({
+    retry_diagnostics_omitted: true,
+    omitted_count: 999999,
+    omitted_chars: 999999999,
+    shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+    recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry.',
+  })}\n`
+  const flushReserveText = maxShellReserve([diagnosticReserve, fallbackPointerReserve, unwritableCompactReserve])
+  const effectiveHeadroom =
+    typeof headroom === 'string'
+      ? headroom
+      : wakeLines([
+          {
+            type: 'wake_in_note',
+            carries: ['owner_message'],
+            read: 'cat ~/.devspec/notes/0000000000000000.md',
+            note: RECALL_WHOLE_NOTE,
+          },
+          wakesWaitingEvent(CURSOR_SHELL_OUTPUT_MAX_CHARS),
+        ]) +
+        diagnosticReserve +
+        flushReserveText +
+        transitionLine
+  const suppressedLines = []
+  let buffering = false
+  let flushed = false
+
+  const pendingReserve = () => {
+    if (follow || flushed || suppressedLines.length === 0) return ''
+    return flushReserveText
+  }
+
+  const write = (line) => {
+    const text = String(line ?? '')
+    if (!text) return
+    if (follow) {
+      writeStderr(text)
+      return
+    }
+    const emitted = String(getEmittedStderr() ?? '')
+    if (!buffering && fitsShellOutput(`${emitted}${text}${effectiveHeadroom}`)) {
+      writeStderr(text)
+      return
+    }
+    suppressedLines.push(text)
+    if (!buffering) {
+      buffering = true
+      if (fitsShellOutput(`${emitted}${transitionLine}${flushReserveText}`)) {
+        writeStderr(transitionLine)
+      }
+    }
+  }
+
+  const flush = ({ stdoutText = '' } = {}) => {
+    if (follow || flushed || suppressedLines.length === 0) return { savedNote: null, omittedCount: 0, line: '' }
+    flushed = true
+    const omittedCount = suppressedLines.length
+    const fullText =
+      `# Omitted one-shot retry diagnostics (${omittedCount} message(s))\n` +
+      suppressedLines.join('')
+    const emitted = String(getEmittedStderr() ?? '')
+    const stdout = String(stdoutText ?? '')
+    let savedNote = null
+    let primaryErr = null
+    let fallbackErr = null
+    try {
+      savedNote = writeNote(fullText, { home })
+    } catch (error) {
+      primaryErr = error
+    }
+    if (!savedNote) {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+      const tmpBaseDir = tmpDir ? path.join(tmpDir, `devspec-notes-${uid}`) : null
+      for (const baseDir of [tmpBaseDir, ...(fallbackDir ? [fallbackDir] : [])]) {
+        try {
+          savedNote = writeFallbackDiagnosticNote(fullText, { baseDir })
+          if (savedNote) break
+        } catch (error) {
+          fallbackErr = error
+        }
+      }
+    }
+    if (savedNote) {
+      const detailedLine = `devspec-remote-wait: saved ${omittedCount} omitted retry diagnostic(s) (${fullText.length} chars) whole — run \`${savedNote.command}\`${savedNote.parts > 1 ? ` (${savedNote.parts} parts)` : ''}.\n`
+      const pointerLine = shellDiagnosticPointer('devspec-remote-wait', savedNote.command)
+      const chosen = fitsShellOutput(`${emitted}${stdout}${detailedLine}`)
+        ? detailedLine
+        : fitsShellOutput(`${emitted}${stdout}${pointerLine}`)
+          ? pointerLine
+          : ''
+      if (chosen) writeStderr(chosen)
+      return { savedNote, omittedCount, line: chosen }
+    }
+    const errMsg =
+      (primaryErr instanceof Error ? primaryErr.message : String(primaryErr ?? 'notes unwritable')) +
+      (fallbackErr ? `; tmp fallback: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}` : '')
+    const detailedUnwritable = `devspec-remote-wait: ${JSON.stringify({
+      retry_diagnostics_omitted: true,
+      omitted_count: omittedCount,
+      omitted_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      note_write_error: errMsg,
+      recovery: 'Fix write permissions on ~/.devspec/notes or temp dir and retry so omitted retry diagnostics can be saved whole.',
+    })}\n`
+    const compactUnwritable = `devspec-remote-wait: ${JSON.stringify({
+      retry_diagnostics_omitted: true,
+      omitted_count: omittedCount,
+      omitted_chars: fullText.length,
+      shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry.',
+    })}\n`
+    const chosen = fitsShellOutput(`${emitted}${stdout}${detailedUnwritable}`)
+      ? detailedUnwritable
+      : fitsShellOutput(`${emitted}${stdout}${compactUnwritable}`)
+        ? compactUnwritable
+        : ''
+    if (chosen) writeStderr(chosen)
+    return { savedNote: null, omittedCount, line: chosen }
+  }
+
+  return {
+    write,
+    flush,
+    pendingReserve,
+    suppressedCount: () => suppressedLines.length,
+  }
 }
 
 async function main() {
   const armStarted = Date.now()
   const args = parseArgs(process.argv.slice(2))
   const connectionId = args.connectionId
+  // In one-shot mode, track every byte written to stderr (startup lines, soft-fails,
+  // diagnostics) so stdout sizing and fitShellDiagnostic enforce Cursor's combined
+  // stdout + stderr Shell ceiling across the entire process (reqs 3c5147a7 / 91d7b47c).
+  let emittedStderr = ''
+  const diagnosticFallbackDir = path.join(CONNECTIONS_DIR, 'diagnostic-notes')
+  const oneShotDiagnosticReserve = shellDiagnosticReserve('devspec-remote-wait', {
+    fallbackDir: diagnosticFallbackDir,
+    backupDir: CONNECTIONS_DIR,
+  })
+  const retryStderr = createOneShotRetryStderrWriter({
+    follow: Boolean(args.follow),
+    writeStderr: (chunk) => process.stderr.write(chunk),
+    getEmittedStderr: () => emittedStderr,
+    diagnosticReserve: oneShotDiagnosticReserve,
+    fallbackDir: diagnosticFallbackDir,
+    backupDir: CONNECTIONS_DIR,
+  })
+  const writeRetryStderr = (line) => retryStderr.write(line)
+  if (!args.follow) {
+    const rawStderrWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk, ...rest) => {
+      emittedStderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+      return rawStderrWrite(chunk, ...rest)
+    }
+  }
   if (!connectionId) {
     process.stderr.write('devspec-remote-wait: missing --connection-id\n')
     process.exit(2)
@@ -1743,9 +2375,11 @@ async function main() {
 
   const pollMs = args.pollMs || POLL_MS
   const started = Date.now()
-  process.stderr.write(
-    `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
-  )
+  if (args.follow) {
+    process.stderr.write(
+      `devspec-remote-wait: watching ${file} offset=${offset} connection=${connectionId}\n`,
+    )
+  }
 
   // First connect arm only — mid-turn --pending re-arms are not cold-launch phases.
   if (args.fromEnd && !args.pending) {
@@ -1796,11 +2430,13 @@ async function main() {
         { type: 'session_ended', reason: 'ended_from_ui', connection_id: connectionId },
         args.wakeFile,
       )
+      retryStderr.flush()
       process.exit(1)
     }
     if (live && live.enabled === false) {
       discardOnEnd()
       if (live.end_reason === 'signed_out') await emitSignedOut(live, connectionId, args.wakeFile)
+      retryStderr.flush()
       process.stderr.write('devspec-remote-wait: disabled — exit 1\n')
       process.exit(1)
     }
@@ -1810,6 +2446,7 @@ async function main() {
         { type: 'session_ended', reason: 'owner_gone', connection_id: connectionId },
         args.wakeFile,
       )
+      retryStderr.flush()
       process.stderr.write(`devspec-remote-wait: owner process ${ownerAnchor} gone — exit 1\n`)
       process.exit(1)
     }
@@ -1888,41 +2525,146 @@ async function main() {
         // wake reader skips one appended just before an end (`withoutEndedConnectionWakes`).
         const frozen = frozenWakesOf(readState(connectionId), offset, batch)
         if (frozen) {
-          let count
+          let frozenOut
           try {
-            count = await withStepsLockAsync(connectionId, CONNECTIONS_DIR, async () => {
+            frozenOut = await withStepsLockAsync(connectionId, CONNECTIONS_DIR, async () => {
               if (connectionEnded(connectionId)) return null
               let printed = frozen.length
+              let shot = null
+              let pickup = { ok: true, hadCommands: false, stderrText: '' }
               if (args.follow) {
                 for (const wake of frozen) {
                   for (const event of wake) await emitStdoutEvent(event)
                   appendWakeEvents(args.wakeFile, wake)
                 }
               } else {
-                printed = await printOneShot(frozen)
+                const retryReserve = retryStderr.pendingReserve()
+                const frozenHasOwnerMessage = frozen.some(
+                  (wake) => Array.isArray(wake) && wake.some((event) => event?.type === 'owner_message'),
+                )
+                const pickupReserve = frozenHasOwnerMessage ? oneShotDiagnosticReserve : ''
+                const plan = planOneShot(frozen, { reserve: `${emittedStderr}${retryReserve}${pickupReserve}` })
+                if (plan.held) {
+                  return { count: 0, held: plan.error, pickupFailed: false, shot: null, pickup }
+                }
+                const frozenCmdInfo = extractRoomCommandsFromWake(plan.text)
+                const hasFrozenCmds = frozenCmdInfo.inlineCommands.length > 0 || frozenCmdInfo.unreadableNotes.length > 0
+                let frozenReservedStore = null
+                if (hasFrozenCmds) {
+                  const storeProbe = reserveDiagnosticNoteSlots({
+                    home: os.homedir(),
+                    fallbackDir: diagnosticFallbackDir,
+                    backupDir: CONNECTIONS_DIR,
+                    spoolKey: path.resolve(CONNECTIONS_DIR),
+                  })
+                  if (!storeProbe.ok) {
+                    return { count: 0, noteStoreError: storeProbe, held: null, pickupFailed: false, shot: null, pickup }
+                  }
+                  frozenReservedStore = storeProbe
+                }
+                try {
+                  // Write the selected wake to stdout FIRST and await completion before calling
+                  // report_pickup, persisting started commands, writing `.turn`, or advancing
+                  // wake_batch_progress / inbox cursor (req 3ea2b201).
+                  try {
+                    await writeStdoutChecked(plan.text)
+                  } catch (stdoutError) {
+                    return { count: 0, stdoutError, held: null, pickupFailed: false, shot: null, pickup }
+                  }
+                  for (const deferred of frozenCmdInfo.deferredNoteCommands) {
+                    registerPendingWakeNote(
+                      connectionId,
+                      {
+                        noteId: deferred.noteId,
+                        commands: deferred.commands,
+                        messages: deferred.messages,
+                        sessionId: deferred.sessionId ?? batch.session_id ?? null,
+                      },
+                      { dir: CONNECTIONS_DIR },
+                    )
+                  }
+                  if (hasFrozenCmds) {
+                    pickup = await runOneShotRoomCommandPickup({
+                      connectionId,
+                      printedWakes: plan.printedWakes,
+                      printedStdout: plan.text,
+                      priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
+                      fallbackSessionId: batch.session_id ?? null,
+                      dir: CONNECTIONS_DIR,
+                      state: live,
+                      reservedStore: frozenReservedStore,
+                    })
+                    if (!pickup.ok) {
+                      return {
+                        count: 0,
+                        pickupFailed: true,
+                        shot: { count: plan.count, text: plan.text, printedWakes: plan.printedWakes },
+                        pickup,
+                      }
+                    }
+                  }
+                } finally {
+                  frozenReservedStore?.release()
+                }
+                shot = { count: plan.count, text: plan.text, printedWakes: plan.printedWakes }
+                printed = plan.count
               }
-              if (printed < frozen.length) {
+              if (Array.isArray(pickup?.unstarted) && pickup.unstarted.length > 0) {
+                // Older commands in this batch were not yet picked up; keep frozen state
+                // and inbox cursor untouched so the next run picks them up (req 3ea2b201).
+              } else if (printed < frozen.length) {
                 writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: frozen.slice(printed) } })
               } else {
                 offset = newOffset
                 offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
                 writeStatePatch(connectionId, { wake_batch_progress: null })
               }
-              return printed
+              return { count: printed, held: null, pickupFailed: false, shot, pickup }
             })
           } catch (e) {
             // Most likely the lock could not be taken; the cursor and the frozen rest stand
             // until all of it is out, so it is tried again next lap.
-            process.stderr.write(`devspec-remote-wait: could not hand on waiting wakes (${e instanceof Error ? e.message : String(e)}); trying again\n`)
+            writeRetryStderr(`devspec-remote-wait: could not hand on waiting wakes (${e instanceof Error ? e.message : String(e)}); trying again\n`)
             await sleep(pollMs)
             continue
           }
-          if (count === null) {
+          if (frozenOut === null) {
             process.stderr.write(`devspec-remote-wait: skipped ${frozen.length} waiting wake(s): the connection has ended; never printed\n`)
             await sleep(pollMs)
             continue
           }
-          process.stderr.write(`devspec-remote-wait: handed on ${count} of ${frozen.length} waiting wake(s)\n`)
+          if (frozenOut.held) {
+            writeRetryStderr(
+              `devspec-remote-wait: holding a wake: it needs a note to fit beside stderr, and the note could not be written (${frozenOut.held instanceof Error ? frozenOut.held.message : String(frozenOut.held)}); trying again\n`,
+            )
+            await sleep(pollMs)
+            continue
+          }
+          if (frozenOut.noteStoreError) {
+            const preflightErr = formatDiagnosticStorePreflightError('devspec-remote-wait', frozenOut.noteStoreError.errors, {
+              priorText: emittedStderr,
+            })
+            if (preflightErr) process.stderr.write(preflightErr)
+            retryStderr.flush()
+            process.exitCode = 1
+            return
+          }
+          if (frozenOut.stdoutError) {
+            retryStderr.flush()
+            throw frozenOut.stdoutError
+          }
+          if (frozenOut.pickupFailed) {
+            retryStderr.flush({ stdoutText: frozenOut.shot?.text ?? '' })
+            process.exitCode = 1
+            return
+          }
+          if (!args.follow) {
+            retryStderr.flush({ stdoutText: frozenOut.shot?.text ?? '' })
+          }
+          const handedLine = `devspec-remote-wait: handed on ${frozenOut.count} of ${frozen.length} waiting wake(s)\n`
+          if (args.follow || fitsShellOutput(`${emittedStderr}${frozenOut.shot?.text ?? ''}${handedLine}`)) {
+            process.stderr.write(handedLine)
+          }
           if (args.follow) {
             args.fromEnd = false
             args.pending = true
@@ -1950,21 +2692,40 @@ async function main() {
           : batch.type === 'canonical_system_notices'
             ? (Array.isArray(batch.execute_notice_ids) ? batch.execute_notice_ids.length : (batch.messages?.length ?? 1))
             : batch.messages.length
-        // A check job or notice that arrives while Cursor is in a turn waits for the
-        // agent's next step instead (step-delivery.mjs): Cursor would hold the wake
-        // file until the turn ended. Held before the offset moves, so nothing is lost;
-        // if it cannot be held, it goes to the wake file as before.
+        // A room message, check job, or notice that arrives while Cursor is in a turn
+        // waits for the agent's next step instead (step-delivery.mjs): Cursor would hold
+        // the wake file until the turn ended. Held before the offset moves, so nothing is
+        // lost; if it cannot be held, it goes to the wake file as before.
         if (args.follow && args.wakeFile && isStepBatch(batch) && (await readTurnState(live?.local_id)) === 'in_turn') {
+          let stepEvents = built
+          let stepRecallOut = null
+          if (batch.type === 'owner_messages') {
+            stepRecallOut = recallWakeOut(built, batch?.turn_recall, { connectionId })
+            if (stepRecallOut.held) {
+              process.stderr.write(
+                `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${stepRecallOut.held instanceof Error ? stepRecallOut.held.message : String(stepRecallOut.held)}); trying again\n`,
+              )
+              await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold })
+              await sleep(pollMs)
+              continue
+            }
+            stepEvents = stepRecallOut.recallWake
+              ? [...stepRecallOut.events, ...stepRecallOut.recallWake]
+              : stepRecallOut.events
+          }
           let held = false
           try {
-            held = holdForNextStep(connectionId, batch, built, { dir: CONNECTIONS_DIR }).held
+            held = holdForNextStep(connectionId, batch, stepEvents, { dir: CONNECTIONS_DIR }).held
           } catch (e) {
             process.stderr.write(`devspec-remote-wait: hold for the next step failed: ${e instanceof Error ? e.message : String(e)}\n`)
           }
           if (held) {
-            for (const event of built) await emitStdoutEvent(event)
+            for (const event of stepEvents) await emitStdoutEvent(event)
             offset = newOffset
             offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
+            if (stepRecallOut) {
+              settleRecallHandover(recallConversation(readState(connectionId), connectionId), stepRecallOut, batch)
+            }
             process.stderr.write(`devspec-remote-wait: held (${wakeCount} msg) for the agent's next step — follow\n`)
             continue
           }
@@ -1977,12 +2738,14 @@ async function main() {
         // tried again every lap until it goes, with no cap: notes live in the same home
         // folder as the wake file, so this is a disk problem that clears, and the room is
         // told once (`tellRoomWakeHeld`).
-        const out = recallWakeOut(built, batch?.turn_recall, { connectionId })
+        const pickupReserve = !args.follow && batch.type === 'owner_messages' ? oneShotDiagnosticReserve : ''
+        const oneShotReserve = !args.follow ? `${emittedStderr}${retryStderr.pendingReserve()}${pickupReserve}` : ''
+        const out = recallWakeOut(built, batch?.turn_recall, { connectionId, reserve: oneShotReserve })
         if (out.held) {
-          process.stderr.write(
+          writeRetryStderr(
             `devspec-remote-wait: holding a wake: it needs a note to reach the agent whole, and the note could not be written (${out.held instanceof Error ? out.held.message : String(out.held)}); trying again\n`,
           )
-          await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold })
+          await tellRoomWakeHeld({ connectionId, batch, state: live, told: heldTold, log: writeRetryStderr })
           await sleep(pollMs)
           continue
         }
@@ -1995,23 +2758,111 @@ async function main() {
         // this delivery only once all its wakes are printed (`printOneShot`,
         // `wakesForOneOutput`, `frozenWakesOf`).
         let printedAll = true
+        let oneShot = null
+        let oneShotPickup = { ok: true, hadCommands: false, stderrText: '' }
         if (args.follow) {
           for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
         } else {
-          const count = await printOneShot(out.wakes)
-          printedAll = count >= out.wakes.length
+          const plan = planOneShot(out.wakes, { reserve: `${emittedStderr}${retryStderr.pendingReserve()}${pickupReserve}` })
+          if (plan.held) {
+            writeRetryStderr(
+              `devspec-remote-wait: holding a wake: it needs a note to fit beside stderr, and the note could not be written (${plan.error instanceof Error ? plan.error.message : String(plan.error)}); trying again\n`,
+            )
+            await sleep(pollMs)
+            continue
+          }
+          const ownerCmdInfo = extractRoomCommandsFromWake(plan.text)
+          const hasOwnerCmds =
+            batch.type === 'owner_messages' &&
+            (ownerCmdInfo.inlineCommands.length > 0 || ownerCmdInfo.unreadableNotes.length > 0)
+          // Pre-flight check: when this wake carries room commands that will call report_pickup,
+          // verify at least one diagnostic note store (~/.devspec/notes, os.tmpdir(), or
+          // CONNECTIONS_DIR/diagnostic-notes) is writable BEFORE writing stdout or calling
+          // report_pickup. Otherwise an oversized refusal after near-ceiling stdout would have
+          // nowhere on disk to save whole and could not fit inline (req 3c5147a7 / 4e32d1a5 / 91d7b47c).
+          let oneShotReservedStore = null
+          if (hasOwnerCmds) {
+            const storeProbe = reserveDiagnosticNoteSlots({
+              home: os.homedir(),
+              fallbackDir: diagnosticFallbackDir,
+              backupDir: CONNECTIONS_DIR,
+              spoolKey: path.resolve(CONNECTIONS_DIR),
+            })
+            if (!storeProbe.ok) {
+              const preflightErr = formatDiagnosticStorePreflightError('devspec-remote-wait', storeProbe.errors, {
+                priorText: emittedStderr,
+              })
+              if (preflightErr) process.stderr.write(preflightErr)
+              retryStderr.flush()
+              process.exitCode = 1
+              return
+            }
+            oneShotReservedStore = storeProbe
+          }
+          try {
+            // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / closed
+            // pipe), exit immediately with zero report_pickup calls, zero started-command
+            // ledger writes, zero Working marker writes, and zero inbox cursor movement (req 3ea2b201).
+            try {
+              await writeStdoutChecked(plan.text)
+            } catch (stdoutError) {
+              retryStderr.flush()
+              throw stdoutError
+            }
+            for (const deferred of ownerCmdInfo.deferredNoteCommands) {
+              registerPendingWakeNote(
+                connectionId,
+                {
+                  noteId: deferred.noteId,
+                  commands: deferred.commands,
+                  messages: deferred.messages,
+                  sessionId: deferred.sessionId ?? batch.session_id ?? null,
+                },
+                { dir: CONNECTIONS_DIR },
+              )
+            }
+            // In one-shot mode, start ONLY inline canonical room commands selected for this
+            // Shell output AFTER stdout succeeded and BEFORE advancing the inbox cursor /
+            // wake_batch_progress. Oversized commands sent as `wake_in_note` defer pickup
+            // until `stepDeliveryHook` observes the agent reading the note whole.
+            if (hasOwnerCmds) {
+              oneShotPickup = await runOneShotRoomCommandPickup({
+                connectionId,
+                printedWakes: plan.printedWakes,
+                printedStdout: plan.text,
+                priorStderr: `${emittedStderr}${retryStderr.pendingReserve()}`,
+                fallbackSessionId: batch.session_id ?? null,
+                dir: CONNECTIONS_DIR,
+                state: live,
+                reservedStore: oneShotReservedStore,
+              })
+              if (!oneShotPickup.ok) {
+                retryStderr.flush({ stdoutText: plan.text })
+                process.exitCode = 1
+                return
+              }
+            }
+          } finally {
+            oneShotReservedStore?.release()
+          }
+          oneShot = { count: plan.count, text: plan.text, printedWakes: plan.printedWakes }
+          const hasUnstartedCommands = Array.isArray(oneShotPickup?.unstarted) && oneShotPickup.unstarted.length > 0
+          printedAll = plan.count >= out.wakes.length && !hasUnstartedCommands
           // The rest is frozen as built, for the next re-arm to print as it is: kept only
           // while the connection is live, under its steps lock (see the frozen wakes above).
-          if (!printedAll) {
+          if (!printedAll && !hasUnstartedCommands) {
             try {
               withStepsLock(connectionId, CONNECTIONS_DIR, () => {
                 if (!connectionEnded(connectionId)) {
-                  writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: out.wakes.slice(count) } })
+                  writeStatePatch(connectionId, { wake_batch_progress: { offset, key: heldWakeKey(batch), wakes: out.wakes.slice(oneShot.count) } })
                 }
               })
             } catch (e) {
               // Not kept: the cursor has not moved, so the next re-arm builds this delivery again.
-              process.stderr.write(`devspec-remote-wait: could not keep the rest of this delivery (${e instanceof Error ? e.message : String(e)})\n`)
+              const keepErr = `devspec-remote-wait: could not keep the rest of this delivery (${e instanceof Error ? e.message : String(e)})\n`
+              if (fitsShellOutput(`${emittedStderr}${oneShot.text}${keepErr}`)) {
+                process.stderr.write(keepErr)
+              }
             }
           }
         }
@@ -2043,7 +2894,13 @@ async function main() {
           offsetEvidence = persistInboxCursor(connectionId, file, offset, readEvidence)
         }
         // A delivery's bookkeeping is done once, when its first wake is printed.
-        recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        // For canonical room messages handed to the wake file in follow mode,
+        // `devspec-wake-tail.mjs read` records requests + reports pickup once the
+        // woken agent actually reads the wake. In one-shot mode, pickup ran above
+        // before advancing the cursor.
+        if (!(!args.follow && batch.type === 'owner_messages') && !(args.follow && batch.type === 'owner_messages')) {
+          recordDeliveredBatchRequests(connectionId, batch, { dir: CONNECTIONS_DIR })
+        }
         // What this delivery brings into the turn: notice ids, or that something
         // other than a notice woke it (notice-reply.mjs).
         recordTurnWake(connectionId, turnWakeFromEvents(out.full), { dir: CONNECTIONS_DIR })
@@ -2058,9 +2915,11 @@ async function main() {
           args.pending = true
           continue
         }
-        process.stderr.write(
-          `devspec-remote-wait: wake (${wakeCount} msg) — exit 0\n`,
-        )
+        retryStderr.flush({ stdoutText: oneShot?.text ?? '' })
+        const exitLine = `devspec-remote-wait: wake (${wakeCount} msg) — exit 0\n`
+        if (fitsShellOutput(`${emittedStderr}${oneShot?.text ?? ''}${exitLine}`)) {
+          process.stderr.write(exitLine)
+        }
         return
       }
       offset = newOffset
@@ -2070,6 +2929,7 @@ async function main() {
     await sleep(pollMs)
   }
 
+  retryStderr.flush()
   process.stderr.write('devspec-remote-wait: max wait elapsed — exit 1\n')
   process.exit(1)
 }

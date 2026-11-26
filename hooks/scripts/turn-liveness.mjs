@@ -41,6 +41,14 @@ import { answerCursorAtExit } from './hook-answer.mjs'
  */
 export const NO_SIGN_OF_LIFE_MS = 60 * 60 * 1000
 
+/**
+ * Hung-turn silence window (90 s), independent of `NO_SIGN_OF_LIFE_MS` (1 h).
+ * A turn marker with no recorded activity past this window is treated as abandoned
+ * before starting the next room command. Shared single definition for both
+ * `devspec-remote-poll.mjs` and `command-start.mjs`.
+ */
+export const TURN_SILENCE_MS = 90_000
+
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 export function connectionsDir(home = os.homedir()) {

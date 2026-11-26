@@ -241,6 +241,8 @@ async function performMcpToolsCall({
       body: bodyText,
       signal: controller.signal,
     })
+    // Keep the timeout and owner-liveness abort timers armed through the response body
+    // read so a slow/stalled streaming body cannot outrun `timeoutMs` (req 3c5147a7).
     text = await res.text()
   } catch (e) {
     if (abortCode) {
