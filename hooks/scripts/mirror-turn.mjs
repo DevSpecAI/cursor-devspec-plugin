@@ -580,24 +580,35 @@ export function prepareAgentMirrorText(text) {
  * included — ensuring its eventual `turn_ended` still clears attribution before any
  * later unrelated wake (decision ce71a72b).
  */
-export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = null } = {}) {
-  if (!transcriptPath) return undefined
+export function priorWakeSnapshotForTranscript(transcriptPath, { promptText = null } = {}) {
+  if (!transcriptPath) return null
   const snapshot = activeTranscriptTurn(transcriptPath, { attempts: 1 })
-  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return undefined
+  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return null
   const trimmedPrompt = typeof promptText === 'string' ? promptText.trim() : ''
-  const keys = new Set()
+  const priorKeys = new Set()
+  const liveUnoutputKeys = new Set()
   for (const w of snapshot.endedNonTypedWakes) {
-    if (typeof w?.key === 'string' && w.key) keys.add(w.key)
+    if (typeof w?.key === 'string' && w.key) priorKeys.add(w.key)
   }
   if (Array.isArray(snapshot.liveNonTypedWakes)) {
     for (const w of snapshot.liveNonTypedWakes) {
       if (typeof w?.key !== 'string' || !w.key) continue
-      if (w.hasModelOutputAfter !== true) continue
       if (trimmedPrompt && typeof w.rawText === 'string' && w.rawText.trim() === trimmedPrompt) continue
-      keys.add(w.key)
+      if (w.hasModelOutputAfter === true) {
+        priorKeys.add(w.key)
+      } else {
+        liveUnoutputKeys.add(w.key)
+      }
     }
   }
-  return [...keys]
+  return {
+    priorEndedWakeKeys: [...priorKeys],
+    hookLiveUnoutputWakeKeys: [...liveUnoutputKeys],
+  }
+}
+
+export function priorEndedWakeKeysForTranscript(transcriptPath, opts = {}) {
+  return priorWakeSnapshotForTranscript(transcriptPath, opts)?.priorEndedWakeKeys
 }
 
 async function main() {
@@ -659,16 +670,21 @@ async function main() {
         !fromAPerson && origin && !midTurn
           ? hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId || conversationId)
           : null
-      const priorEndedWakeKeys = hookTranscript
-        ? priorEndedWakeKeysForTranscript(hookTranscript, { promptText: text })
-        : undefined
+      const priorWakeSnap = hookTranscript
+        ? priorWakeSnapshotForTranscript(hookTranscript, { promptText: text })
+        : null
       const arrival = promptArrival({
         fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
         origin,
         text,
         midTurn,
         state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
-        ...(priorEndedWakeKeys !== undefined ? { priorEndedWakeKeys } : {}),
+        ...(priorWakeSnap
+          ? {
+              priorEndedWakeKeys: priorWakeSnap.priorEndedWakeKeys,
+              hookLiveUnoutputWakeKeys: priorWakeSnap.hookLiveUnoutputWakeKeys,
+            }
+          : {}),
       })
       for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }

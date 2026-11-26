@@ -6614,6 +6614,141 @@ describe('typed-turn-sync (item da03801e)', () => {
         args: { task_id: 'x' },
       })
     }
+
+    // Case 5: Earlier wake aborts BEFORE producing any model output, and its delayed
+    // `{"type":"turn_ended","status":"aborted"}` reaches the transcript AFTER `mirror-turn.mjs user_prompt`
+    // ran for Bob's scheduled wake -> sync MUST preserve Bob's requester!
+    {
+      const { home, dir, transcriptPath } = setupHookEnv()
+      const abortedEarlierRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+      })
+      // No assistant output and no turn_ended yet when hook runs!
+      fs.writeFileSync(transcriptPath, `${abortedEarlierRow}\n`)
+
+      const hookRes = runPromptHook(home, {
+        conversation_id: CONV,
+        origin: { kind: 'scheduled-trigger' },
+        prompt: 'bob scheduled check',
+      })
+      assert.equal(hookRes.status, 0, hookRes.stderr)
+      assert.equal(readRequestState(CONN, { dir }).currentWakeLiveUnoutputKeys.size, 1)
+
+      // Delayed abort marker from earlier wake arrives, followed by Bob's wake row!
+      const bobWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${turnEndedRow('aborted')}\n${bobWakeRow}\n`)
+
+      const syncAborted = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(syncAborted.action, 'preserved_wake_request', 'delayed abort marker of earlier zero-output wake MUST NOT clear Bob’s scheduled wake requester')
+      assert.equal(syncAborted.requestId, CMD_BOB)
+      assert.equal(
+        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+        CMD_BOB,
+        'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+      )
+    }
+  })
+
+  it('if the connection moves rooms while callPickup is in flight, sync discards the old room’s receipt and leaves the turn unsynced so a fresh sync admits in the new room (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const ROOM_NEW = '99999999-9999-4999-8999-999999999998'
+    const ATTACH_NEW = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9'
+    const REQ_MOVE = '88888888-8888-4888-8888-888888888889'
+    appendRequestEvent(CONN, { op: 'open', id: REQ_MOVE, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_MOVE }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('In-flight room move test')}\n`)
+
+    const stateFile = path.join(dir, `${CONN}.json`)
+    const initialState = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    fs.writeFileSync(stateFile, JSON.stringify(initialState), { mode: 0o600 })
+
+    let patchCalls = 0
+    const memo = { stamp: null, synced: false }
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: initialState,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        // Simulate poller moving the connection to ROOM_NEW while pickup for ROOM is in flight!
+        fs.writeFileSync(
+          stateFile,
+          JSON.stringify({
+            connection_id: CONN,
+            session_id: ROOM_NEW,
+            speech_attachment_id: ATTACH_NEW,
+            attached_at: '2026-11-25T17:06:00.000Z',
+            local_turn: null,
+          }),
+          { mode: 0o600 },
+        )
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: () => {
+        patchCalls += 1
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(pass1.refusal?.code, 'room_attachment_changed_during_admission')
+    assert.equal(patchCalls, 0, 'MUST NOT overwrite state with stale old-room receipt after reattachment')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0, 'turn MUST stay unsynced after in-flight room move')
+
+    // Now a fresh sync with the new room state MUST run pickup in ROOM_NEW!
+    let newRoomPickup = 0
+    let savedNew = null
+    const freshState = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: freshState,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        newRoomPickup += 1
+        assert.equal(args.expected_session_id, ROOM_NEW)
+        assert.equal(args.expected_attachment_id, ATTACH_NEW)
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM_NEW,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        savedNew = patch
+        return true
+      },
+      dir,
+      memo: { stamp: null, synced: false },
+      log: () => {},
+    })
+    assert.equal(newRoomPickup, 1, 'fresh sync MUST run pickup in the new room')
+    assert.equal(pass2.action, 'adopted_hook_request')
+    assert.equal(savedNew?.local_turn?.session_id, ROOM_NEW)
+    assert.equal(savedNew?.local_turn_attachment_id, ATTACH_NEW)
   })
 
   it('when a connection reattaches to a different room (or rotates attachment id), an earlier room admission matching request_id MUST NOT suppress admission in the new room (3ea2b201)', async () => {

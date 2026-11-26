@@ -1586,6 +1586,57 @@ export async function syncTypedTurnFromTranscript({
                 refusal: admission.refusal,
               }
             }
+            // Re-verify the live room session & speech attachment AFTER awaiting report_pickup
+            // (reading the connection state file on disk when present) so if the connection
+            // moved rooms or reattached while pickup was in flight, we NEVER persist the old
+            // room's receipt or mark the turn synced (requirement 3ea2b201).
+            const stateFile = path.join(dir, `${connectionId}.json`)
+            let diskState = null
+            if (fs.existsSync(stateFile)) {
+              try {
+                diskState = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+              } catch (error) {
+                log(
+                  `typed-turn-sync: failed to re-read connection state after admission for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,
+                )
+                return {
+                  action: 'state_write_failed',
+                  requestId,
+                  key: turnKey,
+                  midTurn: effectiveMidTurn,
+                }
+              }
+            }
+            const currentSessionAfterPickup = diskState ? diskState.session_id || null : state?.session_id || null
+            const currentAttachmentAfterPickup = diskState
+              ? diskState.speech_attachment_id || null
+              : state?.speech_attachment_id || null
+            const movedRoomOrAttachment =
+              currentSessionAfterPickup !== scope.expected_session_id ||
+              (Boolean(currentAttachmentAfterPickup) &&
+                currentAttachmentAfterPickup !== scope.expected_attachment_id)
+            if (movedRoomOrAttachment) {
+              const refusal = {
+                code: 'room_attachment_changed_during_admission',
+                retryable: true,
+                admitted_session_id: scope.expected_session_id,
+                admitted_attachment_id: scope.expected_attachment_id,
+                current_session_id: currentSessionAfterPickup,
+                current_attachment_id: currentAttachmentAfterPickup,
+                error:
+                  'Connection switched rooms or rotated attachment while local turn admission was in flight; discarding stale receipt and deferring retry.',
+              }
+              log(
+                `typed-turn-sync: discarding stale local turn admission for ${connectionId} (${turnKey}): ${JSON.stringify(refusal)}\n`,
+              )
+              return {
+                action: 'admission_failed',
+                requestId,
+                key: turnKey,
+                midTurn: effectiveMidTurn,
+                refusal,
+              }
+            }
             if (typeof patchState === 'function') {
               let saved = false
               try {
@@ -2079,6 +2130,8 @@ export async function syncTypedTurnFromTranscript({
             requestForWake({ origin: 'scheduled-trigger', text: active.rawText, state: reqState }).ref === reqState.current
           const priorEndedKeys =
             reqState.currentWakePriorEndedKeys instanceof Set ? reqState.currentWakePriorEndedKeys : new Set()
+          const hookLiveUnoutputKeys =
+            reqState.currentWakeLiveUnoutputKeys instanceof Set ? reqState.currentWakeLiveUnoutputKeys : new Set()
           const candidateEndedWakes =
             active.precededByTurnEnded && Array.isArray(active.endedNonTypedWakes)
               ? active.endedNonTypedWakes.filter((w) => {
@@ -2095,11 +2148,19 @@ export async function syncTypedTurnFromTranscript({
                 })
               : []
           // Ended wakes already present in the transcript when `beforeSubmitPrompt` fired
-          // for the current wake (`prior_ended_wake_keys`) belong to earlier turns (even if
-          // those earlier turns never fired `beforeSubmitPrompt`): mark them seen without
-          // letting them consume the current wake's known attribution (decision ce71a72b).
-          const priorEndedWakes = candidateEndedWakes.filter((w) => priorEndedKeys.has(w.key))
-          const unseenEndedWakes = candidateEndedWakes.filter((w) => !priorEndedKeys.has(w.key))
+          // for the current wake (`prior_ended_wake_keys`) — OR an earlier unoutput wake
+          // already present at hook time (`hook_live_unoutput_wake_keys`) that later flushed
+          // a delayed `aborted`/`error` marker with ZERO model output — belong to earlier
+          // turns: mark them seen without consuming the current wake's known attribution
+          // (decision ce71a72b). A pre-written row that produced model output or ended with
+          // `status: 'success'` is NOT excluded so a finished scheduled wake still clears.
+          const isPriorEndedWake = (w) =>
+            priorEndedKeys.has(w.key) ||
+            (hookLiveUnoutputKeys.has(w.key) &&
+              w.hasModelOutputAfter !== true &&
+              (w.endStatus === 'aborted' || w.endStatus === 'error'))
+          const priorEndedWakes = candidateEndedWakes.filter(isPriorEndedWake)
+          const unseenEndedWakes = candidateEndedWakes.filter((w) => !isPriorEndedWake(w))
           const wakeCount = typeof reqState.unconsumedWakeCount === 'number' ? reqState.unconsumedWakeCount : 1
           const staleFromEndedWake = !activeMatchesSchedule && unseenEndedWakes.length >= wakeCount
           for (const endedWake of priorEndedWakes) {

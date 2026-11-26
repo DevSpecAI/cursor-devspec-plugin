@@ -126,6 +126,7 @@ export function reduceRequestLog(text) {
   let unconsumedWakeCount = 0
   let currentWakeNotifiedKeys = new Set()
   let currentWakePriorEndedKeys = new Set()
+  let currentWakeLiveUnoutputKeys = new Set()
   let joined = new Set()
   let priorTurnJoined = new Set()
   let chosen = false
@@ -204,6 +205,7 @@ export function reduceRequestLog(text) {
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
           currentWakePriorEndedKeys = new Set()
+          currentWakeLiveUnoutputKeys = new Set()
         }
         break
       case 'current':
@@ -240,6 +242,11 @@ export function reduceRequestLog(text) {
         const hasPriorEndedKeys = Boolean(currentFromWake && Array.isArray(event.prior_ended_wake_keys))
         currentWakePriorEndedKeys = new Set(
           hasPriorEndedKeys ? event.prior_ended_wake_keys.filter((k) => typeof k === 'string' && k) : [],
+        )
+        currentWakeLiveUnoutputKeys = new Set(
+          currentFromWake && Array.isArray(event.hook_live_unoutput_wake_keys)
+            ? event.hook_live_unoutput_wake_keys.filter((k) => typeof k === 'string' && k)
+            : [],
         )
         unconsumedWakeCount = hasPriorEndedKeys
           ? 1
@@ -291,6 +298,7 @@ export function reduceRequestLog(text) {
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
           currentWakePriorEndedKeys = new Set()
+          currentWakeLiveUnoutputKeys = new Set()
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
@@ -311,6 +319,7 @@ export function reduceRequestLog(text) {
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
           currentWakePriorEndedKeys = new Set()
+          currentWakeLiveUnoutputKeys = new Set()
           // Any other requests already in `joined` belonged to this answered turn,
           // so a subsequent turn after `turn_ended` knows not to inherit them while
           // still preserving any fresh join that arrives after `current` became null.
@@ -339,6 +348,7 @@ export function reduceRequestLog(text) {
             unconsumedWakeCount = 0
             currentWakeNotifiedKeys = new Set()
             currentWakePriorEndedKeys = new Set()
+            currentWakeLiveUnoutputKeys = new Set()
           } else if (event.consumes_ended_wake === true && unconsumedWakeCount > 0) {
             unconsumedWakeCount -= 1
           }
@@ -410,7 +420,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, currentWakeLiveUnoutputKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 /**
@@ -817,6 +827,7 @@ export function promptArrival({
   state,
   newId = randomUUID,
   priorEndedWakeKeys = undefined,
+  hookLiveUnoutputWakeKeys = undefined,
 }) {
   const events = []
   if (fromAPerson) {
@@ -833,11 +844,16 @@ export function promptArrival({
       resolvedRef !== null && Array.isArray(priorEndedWakeKeys)
         ? priorEndedWakeKeys.filter((k) => typeof k === 'string' && k)
         : null
+    const liveUnoutputKeys =
+      resolvedRef !== null && Array.isArray(hookLiveUnoutputWakeKeys)
+        ? hookLiveUnoutputWakeKeys.filter((k) => typeof k === 'string' && k)
+        : null
     events.push({
       op: 'current',
       ref: resolvedRef,
       ...(resolvedRef !== null ? { from_wake: true } : {}),
       ...(priorKeys !== null ? { prior_ended_wake_keys: priorKeys } : {}),
+      ...(liveUnoutputKeys && liveUnoutputKeys.length > 0 ? { hook_live_unoutput_wake_keys: liveUnoutputKeys } : {}),
     })
     for (const id of also) events.push({ op: 'joined', id })
   }

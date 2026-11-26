@@ -1170,7 +1170,12 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
             sameTurnTypedRowIndex = -1
             sameTurnOtherRows = []
             if (currentTurnNonTypedRows.length > 0) {
-              endedNonTypedRows.push(...currentTurnNonTypedRows)
+              endedNonTypedRows.push(
+                ...currentTurnNonTypedRows.map((entry) => ({
+                  ...entry,
+                  endStatus: row.status,
+                })),
+              )
               currentTurnNonTypedRows = []
             }
           }
@@ -1313,6 +1318,8 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
         key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
         kind: entry.kind,
         rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+        hasModelOutputAfter: Boolean(entry.hasModelOutputAfter),
+        endStatus: typeof entry.endStatus === 'string' ? entry.endStatus : null,
       }))
     : []
   const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
