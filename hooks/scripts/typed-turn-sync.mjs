@@ -497,6 +497,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       current: reqState.current,
       fromWake: reqState.currentFromWake,
       boundByWake: reqState.currentBoundByWake,
+      wakeNotifiedKeys: [...(reqState.currentWakeNotifiedKeys ?? [])],
       joined: [...reqState.joined],
       currentRestored: false,
     }
@@ -519,6 +520,9 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
             ref: fg.current,
             ...(fg.fromWake && fg.current !== null ? { from_wake: true } : {}),
             ...(fg.boundByWake && fg.current !== null ? { bound_by_wake: true } : {}),
+            ...(fg.fromWake && fg.current !== null && Array.isArray(fg.wakeNotifiedKeys) && fg.wakeNotifiedKeys.length > 0
+              ? { wake_notified_keys: fg.wakeNotifiedKeys }
+              : {}),
           },
           { dir },
         )
@@ -889,11 +893,53 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'budget_exhausted', budget_ms: budgetMs }
   }
   if (!active) return { action: 'unreadable' }
+  const resolveWakeForText = (rawText, reqState) => {
+    if (typeof rawText !== 'string' || !rawText) return null
+    const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
+    if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
+    return null
+  }
+
+  const sameTurnWakeRows = Array.isArray(active.sameTurnWakes) ? active.sameTurnWakes : []
+  const liveWakeKeySet = new Set(sameTurnWakeRows.map((w) => w?.key).filter(Boolean))
+  const historicalWakeRows = (Array.isArray(active.notificationWakes) ? active.notificationWakes : []).filter(
+    (w) => w?.key && (active.ended || !liveWakeKeySet.has(w.key)),
+  )
+
+  const hasUnseenMatchableNotification = (reqState) => {
+    for (const wakeRow of historicalWakeRows) {
+      if (!wakeRow?.key || reqState.seenTranscriptTurns.has(wakeRow.key)) continue
+      if (resolveWakeForText(wakeRow.rawText, reqState)) return true
+    }
+    if (!active.ended && active.kind !== 'typed') {
+      for (const wakeRow of sameTurnWakeRows) {
+        if (!wakeRow?.key || reqState.seenTranscriptTurns.has(wakeRow.key)) continue
+        if (resolveWakeForText(wakeRow.rawText, reqState)) return true
+      }
+      if (active.key && !reqState.seenTranscriptTurns.has(active.key) && resolveWakeForText(active.rawText, reqState)) {
+        return true
+      }
+    }
+    return false
+  }
+
   const markMemoSynced = () => {
     if (!memo) return
+    // Capture the request-log stamp BEFORE reading `.requests.jsonl` to confirm no
+    // previously unmatched `<task-notification>` now matches a launch appended while
+    // this pass awaited an earlier request/admission (requirement 3ea2b201).
+    const verifiedReqStamp = currentReqStamp()
+    const verifyState = readRequestState(connectionId, { dir })
+    if (hasUnseenMatchableNotification(verifyState)) {
+      memo.stamp = active.stamp
+      memo.reqFile = reqFile
+      memo.reqStamp = reqStampAtStart
+      memo.synced = false
+      return
+    }
     memo.stamp = active.stamp
     memo.reqFile = reqFile
-    memo.reqStamp = currentReqStamp()
+    memo.reqStamp = verifiedReqStamp
     memo.synced = true
   }
   if (memo) {
@@ -1183,25 +1229,6 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'binding_write_failed', key: active.key, active }
   }
 
-  // Resolve explicit host-injected `<task-notification>` wakes whose `<task-id>` /
-  // `<tool-use-id>` / `owner_message` / `automation_run` positively matches a recorded
-  // launch or command in `requests.mjs` (`requestForWake`, decision ce71a72b).
-  // Never guess from pending launches when a generic `command_turn` row or ID-less
-  // notification carries no matching job ID: leaving the requester unstated prevents
-  // misattributing another person's or unrelated background work (decisions ce71a72b / 2fcd26bd).
-  const resolveWakeForText = (rawText, reqState) => {
-    if (typeof rawText !== 'string' || !rawText) return null
-    const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
-    if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
-    return null
-  }
-
-  const sameTurnWakeRows = Array.isArray(active.sameTurnWakes) ? active.sameTurnWakes : []
-  const liveWakeKeySet = new Set(sameTurnWakeRows.map((w) => w?.key).filter(Boolean))
-  const historicalWakeRows = (Array.isArray(active.notificationWakes) ? active.notificationWakes : []).filter(
-    (w) => w?.key && (active.ended || !liveWakeKeySet.has(w.key)),
-  )
-
   // Reconcile any unseen historical/ended `<task-notification>` rows BEFORE returning on
   // an ended turn or setting `memo.synced = true`, marking completed launches `notified`
   // without altering live turn foreground state (requirement 3ea2b201).
@@ -1219,6 +1246,18 @@ export async function syncTypedTurnFromTranscript({
         }
         const wake = resolveWakeForText(wakeRow.rawText, reqState)
         if (!wake) return { action: 'not_a_wake', key: wakeRow.key }
+        // Only consume `currentFromWake` -> `currentBoundByWake` on THIS historical row
+        // when the prompt hook actually restored `current` for THIS specific background
+        // notification (its notified launch key is in `reqState.currentWakeNotifiedKeys`).
+        // Otherwise a newer scheduled wake (or another completion) for the SAME request
+        // would lose its provenance (decision ce71a72b).
+        const rowNotifiedKeys = notifiedKeys(wakeRow.rawText)
+        const wakeRef = wake.match.ref === UNSTATED ? null : wake.match.ref
+        const consumesWakeCurrent =
+          reqState.currentFromWake &&
+          wakeRef !== null &&
+          reqState.current === wakeRef &&
+          rowNotifiedKeys.some((key) => reqState.currentWakeNotifiedKeys?.has(key))
         const notifiedEvents = promptArrival({
           fromAPerson: false,
           origin: wake.origin,
@@ -1227,20 +1266,10 @@ export async function syncTypedTurnFromTranscript({
           state: reqState,
         }).events.filter((event) => event.op === 'notified')
         for (const event of notifiedEvents) {
-          if (!appendRequestEvent(connectionId, event, { dir })) {
+          if (!appendRequestEvent(connectionId, { ...event, historical: true }, { dir })) {
             return { action: 'binding_write_failed', key: wakeRow.key, active }
           }
         }
-        const wakeRef = wake.match.ref === UNSTATED ? null : wake.match.ref
-        // If a prompt hook restored `current` with `from_wake: true` for this earlier
-        // historical background completion and transcript sync first ran after a later
-        // unrelated wake started, consume `currentFromWake` -> `currentBoundByWake` on
-        // THIS historical row so the later unrelated wake clears it instead of inheriting
-        // the previous command's provenance reference (decision ce71a72b).
-        const consumesWakeCurrent =
-          reqState.currentFromWake &&
-          wakeRef !== null &&
-          reqState.current === wakeRef
         if (
           !appendRequestEvent(
             connectionId,

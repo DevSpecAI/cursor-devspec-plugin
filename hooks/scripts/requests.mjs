@@ -103,6 +103,7 @@ function uuids(value) {
  *   current: string|null,
  *   currentFromWake: boolean,
  *   currentBoundByWake: boolean,
+ *   currentWakeNotifiedKeys: Set<string>,
  *   joined: Set<string>,
  *   chosen: boolean,
  *   seenTranscriptTurns: Map<string, string|null>,
@@ -120,6 +121,7 @@ export function reduceRequestLog(text) {
   let current = null
   let currentFromWake = false
   let currentBoundByWake = false
+  let currentWakeNotifiedKeys = new Set()
   let joined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
@@ -149,6 +151,7 @@ export function reduceRequestLog(text) {
           current = null
           currentFromWake = false
           currentBoundByWake = false
+          currentWakeNotifiedKeys = new Set()
         }
         break
       case 'current':
@@ -156,6 +159,11 @@ export function reduceRequestLog(text) {
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
+        currentWakeNotifiedKeys = new Set(
+          currentFromWake && Array.isArray(event.wake_notified_keys)
+            ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
+            : [],
+        )
         joined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
@@ -181,6 +189,7 @@ export function reduceRequestLog(text) {
           current = next
           currentFromWake = false
           currentBoundByWake = false
+          currentWakeNotifiedKeys = new Set()
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
@@ -198,6 +207,7 @@ export function reduceRequestLog(text) {
           current = null
           currentFromWake = false
           currentBoundByWake = false
+          currentWakeNotifiedKeys = new Set()
         }
         joined.delete(event.id)
         break
@@ -213,6 +223,7 @@ export function reduceRequestLog(text) {
           if (!event.historical && current !== null && boundRef === current) {
             if (currentFromWake) currentBoundByWake = true
             currentFromWake = false
+            currentWakeNotifiedKeys = new Set()
           }
         }
         break
@@ -238,6 +249,9 @@ export function reduceRequestLog(text) {
       case 'notified': {
         const launch = launchOf(event.key)
         if (launch) launch.notified = true
+        if (currentFromWake && !event.historical && KEY.test(event.key ?? '')) {
+          currentWakeNotifiedKeys.add(event.key)
+        }
         break
       }
       case 'absent': {
@@ -263,7 +277,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, currentFromWake, currentBoundByWake, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {

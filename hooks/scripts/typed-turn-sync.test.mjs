@@ -2716,4 +2716,113 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.deepEqual(stamped, { args: { task_id: 'x' } }, 'next write must NOT receive the previous command’s provenance_ref')
   })
+
+  it('does not mark memo synced when a matching launch is appended to .requests.jsonl while sync awaits a later request (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f3'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+
+    // Turn 1 (ended): completion notification whose launch record has NOT been written yet.
+    // Turn 2 (live): typed prompt whose open_request is async.
+    const histWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>race-launch-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    const liveTyped = typedRow('Bob types while race-launch-1 lands mid-await')
+    fs.writeFileSync(transcriptPath, `${histWake}\n${turnEndedRow()}\n${liveTyped}\n`)
+
+    const memo = {}
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        // Append the matching launch DURING the async await for the later typed turn!
+        appendRequestEvent(
+          CONN,
+          { op: 'launch', key: 'race-launch-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] },
+          { dir },
+        )
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+      },
+      dir,
+      memo,
+    })
+    assert.equal(pass1.action, 'opened')
+    assert.equal(memo.synced, false, 'memo must NOT be marked synced while an appended launch matches an unexamined notification')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true, 'next pass must be pending, never unchanged')
+
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('typed turn already opened') },
+      dir,
+      memo,
+    })
+    assert.notEqual(pass2.action, 'unchanged', 'second pass must reconcile the earlier completion instead of returning unchanged')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.launches.get('race-launch-1')?.notified, true, 'earlier launch completion must be recorded as notified')
+    assert.equal(memo.synced, true)
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+  })
+
+  it('preserves a scheduled wake’s prompt-hook provenance when an older historical background completion for the same request is reconciled (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { promptArrival } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f4'
+    const PROV_ALICE = '99999999-9999-4999-8999-9999999999f4'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE, provenance_ref: PROV_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'older-bg-same-req', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'sched-1', prompt: 'check deploy status', request: CMD_ALICE, also: [] }, { dir })
+
+    // Turn 1: earlier background completion for CMD_ALICE (ended before sync ran).
+    const turn1WakeText = '<task-notification><task-id>older-bg-same-req</task-id><status>completed</status></task-notification>'
+    const turn1Wake = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: turn1WakeText }] },
+    })
+
+    // Turn 2: scheduled wake for the SAME request CMD_ALICE, attributed by the prompt hook!
+    const schedEvents = promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'check deploy status',
+      midTurn: false,
+      state: readRequestState(CONN, { dir }),
+    }).events
+    for (const ev of schedEvents) appendRequestEvent(CONN, ev, { dir })
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE)
+    assert.equal(readRequestState(CONN, { dir }).currentFromWake, true)
+
+    const turn2Scheduled = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'check deploy status' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${turn1Wake}\n${turnEndedRow()}\n${turn2Scheduled}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'preserved_wake_request', 'scheduled wake must keep its prompt-hook attribution')
+    assert.equal(res.requestId, CMD_ALICE)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'current request must remain CMD_ALICE for the scheduled wake')
+    assert.equal(after.launches.get('older-bg-same-req')?.notified, true, 'older historical completion must still be marked notified')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.args?.request_ref, CMD_ALICE, 'writes during scheduled wake must still carry CMD_ALICE request_ref')
+  })
 })
