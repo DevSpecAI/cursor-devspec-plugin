@@ -1349,7 +1349,10 @@ describe('the request a turn served is closed at its end with no stop hook', () 
       await run.deliver()
       run.recordCommandRequest()
       writeTranscript(run.transcript, [...run.connected, WAKE, ended('error', LIMIT)])
-      assert.ok(await until(() => run.requestCloses().length >= 1), `no close; stderr:\n${run.stderr()}`)
+      assert.ok(
+        await until(() => run.requestCloses().length >= 1 && run.openRequests().length === 0),
+        `no close; stderr:\n${run.stderr()}`,
+      )
       assert.equal(run.failurePosts().length, 1)
       assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
       assert.deepEqual(run.openRequests(), [], 'recorded closed')
@@ -1370,7 +1373,10 @@ describe('the request a turn served is closed at its end with no stop hook', () 
       run.recordCommandRequest()
       run.recordAnswered()
       writeTranscript(run.transcript, [...run.connected, WAKE, answer('Done.'), ended('success')])
-      assert.ok(await until(() => run.requestCloses().length >= 1), `no close; stderr:\n${run.stderr()}`)
+      assert.ok(
+        await until(() => run.requestCloses().length >= 1 && run.openRequests().length === 0),
+        `no close; stderr:\n${run.stderr()}`,
+      )
       assert.deepEqual(run.requestCloses().map((args) => args.request_id), [REQUEST])
       assert.deepEqual(run.openRequests(), [])
       assert.deepEqual(run.completions(), [finished()])

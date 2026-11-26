@@ -107,7 +107,6 @@ import {
   fitsShellOutput,
   formatDiagnosticStorePreflightError,
   hasPendingUnsavedRefusals,
-  hasUnreadablePendingUnsavedRefusals,
   hasWritableDiagnosticNoteStore,
   peekPendingUnsavedRefusals,
   peekPendingUnsavedRefusalsDetailed,
@@ -1114,12 +1113,13 @@ export async function readWakes({
         unsurfacedSpoolRemaining = true
       }
     }
-    // Always hold the wake cursor if any spool refusal file was temporarily unreadable
-    // (either at snapshot time OR after clearing readable entries), even when another
-    // readable refusal was surfaced on this pass (requirement 3ea2b201).
+    // Always hold the wake cursor if ANY pending spool refusal remains unsurfaced
+    // (unreadable at snapshot time, newly queued concurrently while wake output was
+    // being written, or still remaining after clearing the surfaced snapshot)
+    // (requirement 3ea2b201).
     if (
       !unsurfacedSpoolRemaining &&
-      (unreadablePendingSpool || hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts))
+      (unreadablePendingSpool || hasPendingUnsavedRefusals(spoolKey, spoolOpts))
     ) {
       unsurfacedSpoolRemaining = true
     }

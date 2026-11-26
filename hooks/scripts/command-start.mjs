@@ -811,6 +811,54 @@ export function formatStructuredRefusalsFallback(
  * `saved_note_basenames`, first file + basenames, and finally basenames + store hint
  * so callers ALWAYS have a way to open the saved note (reqs 3c5147a7 / 91d7b47c).
  */
+function buildSavedNoteStatusSummary(savedNote, savedStatusFields = {}) {
+  const hasCounts =
+    Number.isInteger(savedNote?.returnedRecords) && Number.isInteger(savedNote?.totalRecords)
+  const inferredOmitted = hasCounts
+    ? Math.max(0, savedNote.totalRecords - savedNote.returnedRecords)
+    : Number.isInteger(savedNote?.omittedRecords)
+      ? savedNote.omittedRecords
+      : null
+  const isPartial =
+    Boolean(savedNote?.enospcIncomplete || savedStatusFields?.enospc_incomplete) ||
+    (typeof inferredOmitted === 'number' && inferredOmitted > 0)
+  const omittedUrls = Number.isInteger(savedNote?.enospcOmittedActionableUrls)
+    ? savedNote.enospcOmittedActionableUrls
+    : Number.isInteger(savedStatusFields?.enospc_omitted_actionable_urls)
+      ? savedStatusFields.enospc_omitted_actionable_urls
+      : 0
+  const isCompacted = Boolean(savedNote?.enospcCompacted || savedStatusFields?.enospc_compacted)
+  const fields = {
+    ...savedStatusFields,
+    ...(isPartial
+      ? {
+          ...(savedNote?.enospcIncomplete || savedStatusFields?.enospc_incomplete
+            ? { enospc_incomplete: true }
+            : { saved_note_partial: true }),
+          ...(Number.isInteger(savedNote?.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+          ...(Number.isInteger(savedNote?.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+          ...(typeof inferredOmitted === 'number' && inferredOmitted > 0
+            ? { saved_omitted_records: inferredOmitted }
+            : {}),
+        }
+      : {}),
+  }
+  let compactTag = ''
+  if (isPartial) {
+    compactTag = hasCounts
+      ? `PARTIAL ${savedNote.returnedRecords}/${savedNote.totalRecords} (${inferredOmitted} omitted)`
+      : typeof inferredOmitted === 'number' && inferredOmitted > 0
+        ? `PARTIAL (${inferredOmitted} omitted)`
+        : 'PARTIAL ENOSPC (records omitted)'
+  } else if (isCompacted) {
+    compactTag =
+      omittedUrls > 0
+        ? `COMPACTED (${omittedUrls} URL(s) omitted)`
+        : 'COMPACTED ENOSPC'
+  }
+  return { fields, compactTag, isPartial, isCompacted }
+}
+
 function buildShortenedSavedNoteRecovery(
   savedNote,
   { savedStatusFields = {}, limitChars = CURSOR_SHELL_OUTPUT_MAX_CHARS, codes = [], fits } = {},
@@ -827,6 +875,7 @@ function buildShortenedSavedNoteRecovery(
   const uniqueDirs = [...new Set(savedFiles.map((f) => path.dirname(f)))]
   const cmdChars = typeof savedNote.command === 'string' ? savedNote.command.length : null
   const compressedMeta = savedNote.compressed ? { saved_note_compressed: savedNote.compressed } : {}
+  const { fields: effectiveStatusFields, compactTag } = buildSavedNoteStatusSummary(savedNote, savedStatusFields)
   const partsMeta = {
     ...(Number.isInteger(savedNote.parts) && savedNote.parts > 1 ? { saved_note_parts: savedNote.parts } : {}),
     ...(Number.isInteger(savedNote.firstPageBytes) && savedNote.firstPageBytes > 0
@@ -840,7 +889,7 @@ function buildShortenedSavedNoteRecovery(
   const base = {
     refused: 'report_pickup',
     ...(codes.length > 0 ? { codes } : {}),
-    ...savedStatusFields,
+    ...effectiveStatusFields,
     read_command_omitted_for_shell_limit: true,
     ...(cmdChars !== null ? { read_command_chars: cmdChars } : {}),
     shell_limit_chars: limitChars,
@@ -848,6 +897,7 @@ function buildShortenedSavedNoteRecovery(
     ...compressedMeta,
     ...partsMeta,
   }
+  const tagBracket = compactTag ? ` [${compactTag}]` : ''
   const candidates = [
     `${JSON.stringify({ ...base, saved_note_files: savedFiles, recovery: howToOpen })}\n`,
     ...(uniqueDirs.length === 1
@@ -884,7 +934,7 @@ function buildShortenedSavedNoteRecovery(
         ]),
     `${JSON.stringify({
       refused: 'report_pickup',
-      ...savedStatusFields,
+      ...effectiveStatusFields,
       read_command_omitted_for_shell_limit: true,
       ...(cmdChars !== null ? { read_command_chars: cmdChars } : {}),
       saved_note_count: savedFiles.length,
@@ -899,7 +949,7 @@ function buildShortenedSavedNoteRecovery(
     })}\n`,
     `${JSON.stringify({
       refused: 'report_pickup',
-      ...savedStatusFields,
+      ...effectiveStatusFields,
       read_command_omitted_for_shell_limit: true,
       saved_note_count: savedFiles.length,
       saved_note_dirs_omitted_for_shell_limit: true,
@@ -910,10 +960,11 @@ function buildShortenedSavedNoteRecovery(
     })}\n`,
     // Ultra-compact structured and plain-text fallbacks for tight Shell budgets (e.g. <=300 chars)
     // so an already-saved note NEVER falls through to a misleading "note storage failed" message
+    // AND ALWAYS discloses when the saved note itself is partial or compacted
     // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
     `${JSON.stringify({
       refused: 'report_pickup',
-      ...savedStatusFields,
+      ...effectiveStatusFields,
       saved_note_count: savedFiles.length,
       saved_note_basenames: basenames,
       ...compressedMeta,
@@ -921,13 +972,15 @@ function buildShortenedSavedNoteRecovery(
     })}\n`,
     `${JSON.stringify({
       refused: 'report_pickup',
+      ...effectiveStatusFields,
       saved_note_basenames: basenames,
       ...compressedMeta,
       recovery: 'Open in notes/TMPDIR/connections or re-run.',
     })}\n`,
-    `report_pickup refused: saved in ${savedFiles.length} file(s) (${basenames.join(', ')}) under ~/.devspec/notes, TMPDIR, or connections dir${savedNote.compressed ? ` (${savedNote.compressed})` : ''}; Shell limit cut read cmd; re-run.\n`,
-    `report_pickup refused: saved (${savedFiles.length} shards: ${basenames.join(',')})${savedNote.compressed ? ` [${savedNote.compressed}]` : ''} in notes/TMPDIR/connections; re-run.\n`,
-    `report_pickup refused: saved (${savedFiles.length} shards, first=${basenames[0]}); Shell limit; re-run.\n`,
+    `report_pickup refused: saved in ${savedFiles.length} file(s) (${basenames.join(', ')}) under ~/.devspec/notes, TMPDIR, or connections dir${savedNote.compressed ? ` (${savedNote.compressed})` : ''}${tagBracket}; Shell limit cut read cmd; re-run.\n`,
+    `report_pickup refused: saved (${savedFiles.length} shards: ${basenames.join(',')})${savedNote.compressed ? ` [${savedNote.compressed}]` : ''}${tagBracket} in notes/TMPDIR/connections; re-run.\n`,
+    `report_pickup refused: saved (${savedFiles.length} shards: ${basenames.join(',')})${savedNote.compressed ? ` [${savedNote.compressed}]` : ''}${tagBracket}; re-run.\n`,
+    `report_pickup refused: saved (${savedFiles.length} shards, first=${basenames[0]})${tagBracket}; Shell limit; re-run.\n`,
   ]
   for (const candidate of candidates) {
     if (fits(candidate)) return candidate
@@ -978,22 +1031,25 @@ export function formatShellRefusalOmissionNotice(
     ),
   ]
   if (savedNote) {
-    const savedStatusFields = savedNote.enospcIncomplete
-      ? {
-          enospc_incomplete: true,
-          ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
-          ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
-          ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
-        }
-      : savedNote.enospcCompacted
+    const { fields: savedStatusFields, compactTag } = buildSavedNoteStatusSummary(
+      savedNote,
+      savedNote.enospcIncomplete
         ? {
-            enospc_compacted: true,
-            ...(savedNote.enospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
-            ...(Number.isInteger(savedNote.enospcOmittedActionableUrls) && savedNote.enospcOmittedActionableUrls > 0
-              ? { actionable_urls_preserved: false, enospc_omitted_actionable_urls: savedNote.enospcOmittedActionableUrls }
-              : {}),
+            enospc_incomplete: true,
+            ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+            ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+            ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
           }
-        : {}
+        : savedNote.enospcCompacted
+          ? {
+              enospc_compacted: true,
+              ...(savedNote.enospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+              ...(Number.isInteger(savedNote.enospcOmittedActionableUrls) && savedNote.enospcOmittedActionableUrls > 0
+                ? { actionable_urls_preserved: false, enospc_omitted_actionable_urls: savedNote.enospcOmittedActionableUrls }
+                : {}),
+            }
+          : {},
+    )
     const directRead =
       typeof savedNote.command === 'string' && savedNote.command
         ? `${label}: ${JSON.stringify({
@@ -1012,16 +1068,18 @@ export function formatShellRefusalOmissionNotice(
       fits: (candidate) => fitsShellOutput(stdout + candidate),
     })
     if (shortened) return shortened
-    // A note WAS saved — NEVER fall through to misleading `note_write_failed` / permissions messages.
+    // A note WAS saved — NEVER fall through to misleading `note_write_failed` / permissions messages,
+    // and ALWAYS disclose when the saved note itself is partial or compacted (reqs 3c5147a7 / 91d7b47c).
     const savedFiles =
       Array.isArray(savedNote.files) && savedNote.files.length > 0
         ? savedNote.files.filter((f) => typeof f === 'string' && f)
         : typeof savedNote.file === 'string' && savedNote.file
           ? [savedNote.file]
           : []
+    const tagBracket = compactTag ? ` [${compactTag}]` : ''
     const fallbackSavedLines = [
-      `${label}: refused; saved in ${Math.max(1, savedFiles.length)} file(s) (Shell limit); re-run.\n`,
-      `${label}: refused; saved (Shell limit); re-run.\n`,
+      `${label}: refused; saved in ${Math.max(1, savedFiles.length)} file(s)${tagBracket} (Shell limit); re-run.\n`,
+      `${label}: refused; saved${tagBracket} (Shell limit); re-run.\n`,
     ]
     for (const line of fallbackSavedLines) {
       if (fitsShellOutput(stdout + line)) return line

@@ -57,6 +57,7 @@ import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.
 import { postTurnFailure } from './turn-failure.mjs'
 import { hookTranscriptPath, noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import {
+  activeTranscriptTurn,
   claimTurnEnd,
   noteTurnEndCompleted,
   noteTurnEndTold,
@@ -72,12 +73,20 @@ const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
-function patchOwnState(connectionId, patch) {
+function patchOwnState(connectionId, patch, { expectedScope = null } = {}) {
   const file = path.join(CONNECTIONS_DIR, `${connectionId}.json`)
   if (!connectionId || !fs.existsSync(file)) return false
   try {
     const existing = JSON.parse(fs.readFileSync(file, 'utf8'))
     if (!existing || typeof existing !== 'object') return false
+    if (
+      expectedScope &&
+      ((existing.session_id || null) !== expectedScope.expected_session_id ||
+        (existing.speech_attachment_id || null) !== expectedScope.expected_attachment_id ||
+        (existing.attached_at || null) !== expectedScope.expected_attached_at)
+    ) {
+      return false
+    }
     const next = { ...existing, ...patch, updated_at: new Date().toISOString() }
     const tmp = `${file}.tmp.${process.pid}`
     fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
@@ -567,6 +576,37 @@ export function prepareAgentMirrorText(text) {
   return fitRoomMessage(t, { whereRest: 'The full reply is in the Cursor conversation that wrote it.' })
 }
 
+/**
+ * Snapshot the keys of non-typed wakes proven to belong to earlier turns before a
+ * prompt hook fired:
+ *  - every wake in `endedNonTypedWakes` (already followed by `turn_ended`), AND
+ *  - any live non-typed wake in `liveNonTypedWakes` that ALREADY has model output
+ *    after it (`hasModelOutputAfter: true`), proving it already ran before this
+ *    `beforeSubmitPrompt` hook and is only awaiting a delayed `turn_ended` marker.
+ * A bare `<timestamp>` row at the tail of the transcript with NO model output yet
+ * could be THIS scheduled wake's own row written before the hook ran, so it is NOT
+ * included — ensuring its eventual `turn_ended` still clears attribution before any
+ * later unrelated wake (decision ce71a72b).
+ */
+export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = null } = {}) {
+  if (!transcriptPath) return undefined
+  const snapshot = activeTranscriptTurn(transcriptPath, { attempts: 1 })
+  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return undefined
+  const trimmedPrompt = typeof promptText === 'string' ? promptText.trim() : ''
+  const priorKeys = new Set()
+  for (const w of snapshot.endedNonTypedWakes) {
+    if (typeof w?.key === 'string' && w.key) priorKeys.add(w.key)
+  }
+  if (Array.isArray(snapshot.liveNonTypedWakes)) {
+    for (const w of snapshot.liveNonTypedWakes) {
+      if (typeof w?.key !== 'string' || !w.key) continue
+      if (trimmedPrompt && typeof w.rawText === 'string' && w.rawText.trim() === trimmedPrompt) continue
+      if (w.hasModelOutputAfter === true) priorKeys.add(w.key)
+    }
+  }
+  return [...priorKeys]
+}
+
 async function main() {
   const raw = readStdin()
   if (mode === 'background_launch') {
@@ -622,12 +662,20 @@ async function main() {
   if (mode === 'user_prompt' && connectionId && (fromAPerson || origin)) {
     try {
       const midTurn = promptTurnId(raw) !== null
+      const hookTranscript =
+        !fromAPerson && origin && !midTurn
+          ? hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId || conversationId)
+          : null
+      const priorEndedWakeKeys = hookTranscript
+        ? priorEndedWakeKeysForTranscript(hookTranscript, { promptText: text })
+        : undefined
       const arrival = promptArrival({
         fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
         origin,
         text,
         midTurn,
         state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
+        ...(priorEndedWakeKeys !== undefined ? { priorEndedWakeKeys } : {}),
       })
       for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }
@@ -696,7 +744,18 @@ async function main() {
               timeoutMs: 10_000,
             }),
         })
-        if (admitted) patchOwnState(connectionId, { local_turn: admitted })
+        if (admitted) {
+          patchOwnState(
+            connectionId,
+            {
+              local_turn: admitted,
+              local_turn_attachment_id: scope.expected_attachment_id,
+              local_turn_attached_at: scope.expected_attached_at,
+              ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
+            },
+            { expectedScope: scope },
+          )
+        }
       }
     }
 

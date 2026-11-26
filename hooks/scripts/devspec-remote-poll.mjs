@@ -188,6 +188,12 @@ import {
 } from './turn-commands.mjs'
 import { clearTrailState, resolveAgentTranscriptPath } from './work-trail.mjs'
 import {
+  finishIdleRequests,
+  syncTypedTurnFromTranscript,
+  TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+  typedTurnSyncPending,
+} from './typed-turn-sync.mjs'
+import {
   claimTurnEnd,
   clearSettle,
   nextReportTry,
@@ -2161,6 +2167,7 @@ async function main() {
   const transcriptTurnEndMemo = {}
   const turnEndProbeMemo = {}
   const settleProbeMemo = {}
+  const typedTurnMemo = {}
   // A report of this poller's that did not reach DevSpec: which turn end, how many tries,
   // and when the next is due (nextReportTry). Null once due is null: given up.
   let reportRetry = null
@@ -2181,14 +2188,23 @@ async function main() {
   })
   let pendingInteractionAck = null
 
-  /** Persist a state patch without clobbering concurrent fields. Best-effort. */
-  function patchState(patch) {
+  /** Persist a state patch without clobbering concurrent fields. Returns true only when written. */
+  function patchState(patch, { expectedScope = null } = {}) {
     try {
       const s = readState(connectionId) || {}
+      if (
+        expectedScope &&
+        ((s.session_id || null) !== expectedScope.expected_session_id ||
+          (s.speech_attachment_id || null) !== expectedScope.expected_attachment_id ||
+          (s.attached_at || null) !== expectedScope.expected_attached_at)
+      ) {
+        return false
+      }
       Object.assign(s, patch, { connection_id: connectionId, updated_at: new Date().toISOString() })
       writeState(s, connectionId)
+      return true
     } catch {
-      /* ignore */
+      return false
     }
   }
 
@@ -2886,6 +2902,10 @@ async function main() {
           if (!m && settleDue({ connectionId, transcriptPath: lapTranscriptPath, dir: CONNECTIONS_DIR, memo: settleProbeMemo })) {
             return true
           }
+          // A new terminal-typed turn or turn end in Cursor's transcript when Cursor skips beforeSubmitPrompt/stop.
+          if (typedTurnSyncPending({ transcriptPath: lapTranscriptPath, memo: typedTurnMemo })) {
+            return true
+          }
           const nextCont = activeContinuation(s?.interaction_continuation, {
             connectionId,
             sessionId,
@@ -2951,6 +2971,45 @@ async function main() {
     // ran: a usage-limit stop is reported on every poll until it lifts or a turn runs
     // (usage-refusal.mjs).
     observeTurnEnd(connectionId, transcriptPath, { dir: CONNECTIONS_DIR, memo: turnEndMemo })
+    // Register any new terminal-typed turn from Cursor's transcript when Cursor CLI
+    // skips beforeSubmitPrompt (item da03801e). Idle request cleanup runs below only
+    // when no tracked turn marker is being handled by reportTranscriptTurnEnd.
+    if (transcriptPath) {
+      const capability = readConnectionCapability(connectionId)
+      const callRequest = (reqArgs) =>
+        mcpToolsCall({
+          mcpUrl,
+          token,
+          connectionCapability: capability,
+          name: 'report_request',
+          arguments: reqArgs,
+          timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+        })
+      const callPickup = (pickupArgs) =>
+        mcpToolsCall({
+          mcpUrl,
+          token,
+          connectionCapability: capability,
+          name: 'report_pickup',
+          arguments: pickupArgs,
+          timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+        })
+      try {
+        await syncTypedTurnFromTranscript({
+          connectionId,
+          transcriptPath,
+          state: liveState || state,
+          connectionCapability: capability,
+          callRequest,
+          callPickup,
+          patchState,
+          dir: CONNECTIONS_DIR,
+          memo: typedTurnMemo,
+        })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: typed turn sync failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
     // Cursor ended the tracked turn and no stop hook has reported it: Cursor runs a
     // plugin's stop hook only when the person has a hooks file of their own
     // (transcript-turn-end.mjs). Report it now, not after the no-sign-of-life backstop.
@@ -2994,6 +3053,41 @@ async function main() {
     // A turn end the poller could only notice settles (transcript-turn-end.mjs
     // "Settling and watching"): answered at its settle point, or decided by a wake turn Cursor starts.
     await lapSettle(marker, transcriptPath)
+    // When no tracked turn marker or pending turn-end settle is active and Cursor is
+    // between turns, close any finished typed_prompt or answered room commands that
+    // missed a stop hook (item da03801e), without racing an in-flight settle / stop hook.
+    if (!marker && transcriptPath && !readSettle(connectionId, { dir: CONNECTIONS_DIR })) {
+      const capability = readConnectionCapability(connectionId)
+      try {
+        await finishIdleRequests({
+          connectionId,
+          transcriptPath,
+          state: readState(connectionId) || liveState || state,
+          connectionCapability: capability,
+          callRequest: (reqArgs) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              connectionCapability: capability,
+              name: 'report_request',
+              arguments: reqArgs,
+              timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+            }),
+          callComplete: (completeArgs) =>
+            mcpToolsCall({
+              mcpUrl,
+              token,
+              name: 'report_complete',
+              arguments: completeArgs,
+              timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+            }),
+          patchState,
+          dir: CONNECTIONS_DIR,
+        })
+      } catch (e) {
+        process.stderr.write(`devspec-remote-poll: idle request cleanup failed: ${e instanceof Error ? e.message : String(e)}\n`)
+      }
+    }
     if (marker) trackedTurnStartedAt = marker.startedAt
     const activity = readTurnActivity(connectionId, CONNECTIONS_DIR)
     const turnElapsed = marker ? Date.now() - marker.startedAt : 0
@@ -3236,6 +3330,10 @@ async function main() {
         active_session_plans: null,
         speech_attachment_id: null,
         attached_at: null,
+        local_turn: null,
+        local_turn_request_id: null,
+        local_turn_attachment_id: null,
+        local_turn_attached_at: null,
       })
       continue
     }

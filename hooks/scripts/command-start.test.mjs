@@ -10,6 +10,7 @@ import { after, describe, it } from 'node:test'
 import {
   clearWakeListenerNeeded,
   extractRoomCommandsFromWake,
+  formatShellRefusalOmissionNotice,
   formatStructuredRefusalsFallback,
   isWakeListenerActive,
   markWakeListenerNeeded,
@@ -4941,7 +4942,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
       },
     })
-    assert.equal(page1.marked, true)
+    // Because another process queued Refusal B while Pass 1 was in flight, Pass 1 MUST hold
+    // the wake cursor until Refusal B has actually been surfaced (requirement 3ea2b201).
+    assert.equal(page1.marked, false)
     assert.match(stderr1.join(''), /blk-A/, 'Pass 1 must surface Refusal A')
     assert.equal(stderr1.join('').includes('blk-B-appended-mid-pickup'), false, 'Pass 1 had not snapshotted Refusal B')
 
@@ -4949,9 +4952,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const remaining = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
     assert.deepEqual(remaining, [refusalB], 'Refusal B appended mid-pickup MUST remain queued')
 
-    // Next read surfaces Refusal B and drains the queue cleanly.
+    // Next read surfaces Refusal B, drains the queue cleanly, and NOW advances the wake cursor.
     const stderr2 = []
-    await readWakes({
+    const page2 = await readWakes({
       file: wakeFile,
       connectionId: CONN,
       home,
@@ -4960,7 +4963,15 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       scriptPath: '/tmp/tail.mjs',
       write: async () => {},
       writeStderr: (t) => { stderr2.push(t) },
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
     })
+    assert.equal(page2.marked, true, 'Pass 2 advances cursor once Refusal B has been surfaced and cleared')
     const err2 = stderr2.join('')
     const recovered2 = err2.includes('cat ') ? execSync(/cat [^\n`]+/.exec(err2)[0].replace('~', home), { encoding: 'utf8' }) : err2
     assert.match(recovered2, /blk-B-appended-mid-pickup/, 'next read MUST surface concurrently appended Refusal B')
@@ -6047,6 +6058,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
   it('fresh process discovers and surfaces a Pass-2 open-fd gzipped refusal saved when BOTH ENOSPC and note-path chmod 0o000 struck mid-pickup (3ea2b201 / 4e32d1a5 / 3c5147a7 / 91d7b47c)', async () => {
     const { spawnSync } = await import('node:child_process')
     const { home, dir } = mkHome()
+    const isolatedTmpDir = path.join(home, 'isolated-tmp')
+    fs.mkdirSync(isolatedTmpDir, { recursive: true, mode: 0o700 })
+    const origTmpdir = process.env.TMPDIR
+    process.env.TMPDIR = isolatedTmpDir
+    try {
     const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
     const notesDir = path.join(home, '.devspec', 'notes')
     const diagDir = path.join(dir, 'diagnostic-notes')
@@ -6188,7 +6204,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
           console.log(JSON.stringify({ marked: res.marked, stderr, note: res.pickup_diagnostic_note ?? null }));
         `,
       ],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', env: { ...process.env, TMPDIR: isolatedTmpDir } },
     )
     assert.equal(childRetry.status, 0, childRetry.stderr)
     const retryOut = JSON.parse(childRetry.stdout)
@@ -6208,6 +6224,10 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       [],
       'Pass-2 gzipped .md file MUST be cleaned up once surfaced cleanly by the fresh process',
     )
+    } finally {
+      if (origTmpdir === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = origTmpdir
+    }
   })
 
   it('transient note read error fallback command emits exact first_page_bytes (preserving continuation footer), AND incompressible >128 KiB refusals under ENOSPC survive durably via multi-slot gzip sharding and structured compaction across fresh processes (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
@@ -8496,6 +8516,201 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       const savedText = savedNote.compressed === 'gzip' ? zlib.gunzipSync(rawBuf).toString('utf8') : rawBuf.toString('utf8')
       assert.ok(savedText.includes(ipv6Url), 'IPv6 approval URL MUST survive whole inside preserved_urls without splitting at `]`')
       assert.doesNotMatch(savedText, /"https:\/\/\[2001:db8:85a3::8a2e:370:7334"/, 'IPv6 URL MUST NOT be split into an unusable fragment')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+  })
+
+  it('discloses partial saved-note counts at 300-char Shell headroom, holds cursor on concurrent readable spool arrival, and preserves uppercase-scheme + trailing-paren URLs under ENOSPC (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const zlib = await import('node:zlib')
+    const { readPositionPath } = await import('./devspec-wake-tail.mjs')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      spoolUnsavedRefusal,
+      clearPendingUnsavedRefusals,
+    } = await import('./hook-context-budget.mjs')
+
+    // 1. With only 300 Shell chars left and a 3-shard PARTIAL saved note (700 of 1,400 records),
+    //    BOTH formatShellRefusalOmissionNotice AND formatStructuredRefusalsFallback MUST
+    //    explicitly disclose that the saved note only holds 700/1400 records (700 omitted)
+    //    instead of listing the shards as if they were complete!
+    {
+      const savedNote = {
+        file: '/tmp/very-long-store-a/shard-alpha-001.gz.p1',
+        files: [
+          '/tmp/very-long-store-a/shard-alpha-001.gz.p1',
+          '/tmp/very-long-store-b/shard-beta-002.gz.p2',
+          '/tmp/very-long-store-c/shard-gamma-003.gz.p3',
+        ],
+        compressed: 'gzip',
+        parts: 3,
+        enospcIncomplete: true,
+        totalRecords: 1400,
+        returnedRecords: 700,
+        omittedRecords: 700,
+        command: `cat ${"'/tmp/x'".repeat(3000)} | gzip -dc`,
+      }
+      const stdoutPad = 'x'.repeat(20_000 - 300)
+      const refusals = [{ command_message_id: 'm1', refusal: { code: 'waiting_for_ok', blocking_items: [{ id: '1' }] } }]
+      for (const notice of [
+        formatShellRefusalOmissionNotice(refusals, { label: 'devspec-wake-tail', stdoutText: stdoutPad, savedNote }),
+        formatStructuredRefusalsFallback(refusals, { stdoutText: stdoutPad, savedNote, noteError: new Error('ENOSPC') }),
+      ]) {
+        assert.ok(notice.length > 0 && notice.length <= 300, `expected non-empty <=300c notice, got ${notice.length}c: ${notice}`)
+        assert.match(notice, /700/, 'must disclose returned record count (700)')
+        assert.match(notice, /1400/, 'must disclose total record count (1400)')
+        assert.match(notice, /PARTIAL|enospc_incomplete|omitted/i, 'must explicitly disclose that the saved note is partial')
+        assert.match(notice, /shard-alpha-001\.gz\.p1/, 'must still name saved shard(s)')
+        assert.doesNotMatch(notice, /note_write_failed|permissions/i, 'must never blame storage permissions when note was saved')
+      }
+    }
+
+    // 2. Concurrent readable pickup refusal queued WHILE wake output is being written (after
+    //    the initial spool scan): readWakes MUST hold the wake cursor until that refusal is surfaced!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const posFile = readPositionPath(CONN, dir)
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('concurrent spool race check'))), { mode: 0o600 })
+      const spoolKey = path.resolve(dir)
+      let queuedDuringWrite = false
+      const r1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {
+          if (!queuedDuringWrite) {
+            queuedDuringWrite = true
+            spoolUnsavedRefusal(spoolKey, 'concurrently queued readable refusal payload', {
+              home,
+              fallbackDir: diagDir,
+              backupDir: dir,
+            })
+          }
+        },
+        writeStderr: async () => {},
+        startCommands: async ({ commands }) => ({
+          ok: true,
+          outcome: 'started',
+          started: commands.map((c) => c.messageId),
+          refusals: [],
+        }),
+      })
+      assert.equal(queuedDuringWrite, true)
+      assert.equal(r1.marked, false, 'cursor MUST NOT advance when a readable refusal was spooled concurrently while writing wake output')
+      assert.equal(fs.existsSync(posFile), false, 'posFile MUST NOT be written while newly spooled refusal remains unsurfaced')
+
+      let stderr2 = ''
+      const r2 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async (c) => { stderr2 += String(c) },
+        startCommands: async ({ commands }) => ({
+          ok: true,
+          outcome: 'started',
+          started: commands.map((c) => c.messageId),
+          refusals: [],
+        }),
+      })
+      assert.match(stderr2, /concurrently queued readable refusal payload/, 'concurrently queued refusal MUST surface on next read')
+      assert.equal(r2.marked, true, 'cursor advances once the queued refusal has been surfaced and cleared')
+      clearPendingUnsavedRefusals(spoolKey, null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+
+    // 3. Uppercase-scheme HTTPS approval link AND link with closing `)` in its query token MUST
+    //    both survive 100% verbatim under ENOSPC Stage-2B compaction (while prose-wrapped `(url)`
+    //    still cleanly trims its enclosing `)`).
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('uppercase + paren url enospc check'))), { mode: 0o600 })
+
+      const upperUrl = 'HTTPS://APP.DEVSPEC.AI/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-upper?token=UPPER123'
+      const parenTokenUrl = 'https://app.devspec.ai/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-paren?token=abc)'
+      const wrappedUrl = 'https://app.devspec.ai/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-wrapped?token=xyz'
+      const vocab = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango']
+      const proseFor = (idx) => {
+        const words = []
+        let seed = (idx + 11) * 2654435761
+        for (let w = 0; w < 90; w += 1) {
+          seed = (seed * 1664525 + 1013904223) >>> 0
+          words.push(`${vocab[seed % vocab.length]}${(seed >>> 8) % 97}`)
+        }
+        return words.join(' ')
+      }
+      const records = Array.from({ length: 1800 }, (_, idx) => ({
+        id: `blk-url-${String(idx).padStart(4, '0')}`,
+        reason:
+          idx === 300
+            ? `${proseFor(idx)} Use ${upperUrl} and ${parenTokenUrl} or (${wrappedUrl}) to approve ${proseFor(idx + 5000)}`
+            : `${proseFor(idx)} ${proseFor(idx + 2000)}`,
+      }))
+
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      let savedNote = null
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        const res = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [{ command_message_id: 'msg-url-edge-1', refusal: { code: 'waiting_for_ok', blocking_items: records } }],
+            }
+          },
+        })
+        savedNote = res.pickup_diagnostic_note
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      assert.ok(savedNote?.file)
+      const rawBuf = Array.isArray(savedNote.files) && savedNote.files.length > 1
+        ? Buffer.concat(savedNote.files.map((f) => fs.readFileSync(f)))
+        : fs.readFileSync(savedNote.file)
+      const savedText = savedNote.compressed === 'gzip' ? zlib.gunzipSync(rawBuf).toString('utf8') : rawBuf.toString('utf8')
+      assert.ok(savedText.includes(JSON.stringify(upperUrl)), 'uppercase-scheme HTTPS approval link MUST survive verbatim')
+      assert.ok(savedText.includes(JSON.stringify(parenTokenUrl)), 'approval link ending in query-token `)` MUST survive verbatim')
+      assert.ok(savedText.includes(JSON.stringify(wrappedUrl)), 'prose-wrapped `(url)` MUST still trim its enclosing `)` cleanly')
       clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
     }
   })

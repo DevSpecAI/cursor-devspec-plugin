@@ -32,6 +32,11 @@ import { stampRequest } from './request-ref.mjs'
 import { readRequestState } from './requests.mjs'
 import { currentTurnNoticeIds, normalizeNoticeIds, prepareNoticeReply, recordNoticeReply } from './notice-reply.mjs'
 import { readToolReply } from './tool-reply.mjs'
+import { syncTypedTurnFromTranscript, TYPED_SYNC_HOOK_BUDGET_MS } from './typed-turn-sync.mjs'
+import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
+import { readConnectionCapability } from './manage-plan-bridge.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 
 const CAPABILITY_BRIDGE_HELPERS = {
   manage_plan: 'manage-plan',
@@ -267,6 +272,72 @@ export function hookOutput(mode, rawInput, options) {
   }
 }
 
+function patchConnectionStateFile(connectionId, patch, home = os.homedir()) {
+  const file = path.join(home, '.devspec', 'remote-control', 'connections', `${connectionId}.json`)
+  try {
+    if (!fs.existsSync(file)) return false
+    const prev = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const next = { ...prev, ...patch, updated_at: new Date().toISOString() }
+    const tmp = `${file}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+    fs.renameSync(tmp, file)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function syncTypedTurnForHook(rawInput, { home = os.homedir(), env = process.env } = {}) {
+  let parsed
+  try {
+    parsed = JSON.parse(rawInput || '{}')
+  } catch {
+    return
+  }
+  const verb = namespacedVerb(parsed?.tool_name ?? parsed?.toolName)
+  if (!verb || PROJECTLESS.has(verb) || CAPABILITY_BRIDGE_HELPERS[verb]) return
+  const id = firingConversation(parsed)
+  if (!id) return
+  const connState = readOwnConnectionState(id, { home, env })
+  if (!connState?.connection_id || !connState.local_id) return
+  const transcriptPath = resolveAgentTranscriptPath(connState.local_id, { home })
+  if (!transcriptPath) return
+  const credential = connectionCredential(connState)
+  const capability = connState.connection_capability || readConnectionCapability(connState.connection_id)
+  const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+  await syncTypedTurnFromTranscript({
+    connectionId: connState.connection_id,
+    transcriptPath,
+    state: connState,
+    connectionCapability: credential.ok ? capability : null,
+    budgetMs: TYPED_SYNC_HOOK_BUDGET_MS,
+    callRequest: credential.ok
+      ? (args, timeoutMs) =>
+          mcpToolsCall({
+            mcpUrl: credential.mcp_url,
+            token: credential.token,
+            connectionCapability: capability,
+            name: 'report_request',
+            arguments: args,
+            timeoutMs,
+          })
+      : null,
+    callPickup: credential.ok
+      ? (args, timeoutMs) =>
+          mcpToolsCall({
+            mcpUrl: credential.mcp_url,
+            token: credential.token,
+            connectionCapability: capability,
+            name: 'report_pickup',
+            arguments: args,
+            timeoutMs,
+          })
+      : null,
+    patchState: (patch) => patchConnectionStateFile(connState.connection_id, patch, home),
+    dir,
+  })
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let raw = ''
   try {
@@ -274,5 +345,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   } catch {
     /* unreadable input is refused by hookOutput, like any other unparseable input */
   }
-  process.stdout.write(hookOutput(process.argv[2], raw))
+  const mode = process.argv[2]
+  if (mode === 'pre') {
+    await syncTypedTurnForHook(raw).catch(() => {})
+  }
+  process.stdout.write(hookOutput(mode, raw))
 }

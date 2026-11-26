@@ -1269,27 +1269,42 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
  * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
-  // Shared RFC-3986-aware URL patterns supporting IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`),
-  // balanced parentheses/brackets, and all valid RFC-3986 sub-delims (including trailing `!`, `,`, `;`,
-  // `:`, `.`, `?` in query tokens) without stripping valid URL characters (reqs 4e32d1a5 / 91d7b47c).
-  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`https?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>/]+)(?:[^\s"'<>]*)`
+  // Shared RFC-3986-aware URL patterns supporting case-insensitive HTTP(S) schemes
+  // (`HTTPS://...`, `http://...`), IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`),
+  // balanced parentheses/brackets, and all valid RFC-3986 sub-delims (including trailing `!`,
+  // `)`, `,`, `;`, `:`, `.`, `?` in query tokens) without stripping valid URL characters
+  // (reqs 4e32d1a5 / 91d7b47c).
+  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`[Hh][Tt][Tt][Pp][Ss]?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>/]+)(?:[^\s"'<>]*)`
   const ACTIONABLE_REL_URL_SOURCE = String.raw`\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>]+`
-  const trimUnmatchedTrailingWrappers = (url) => {
+  const countUnmatchedOpen = (prefix, openCh, closeCh) => {
+    let depth = 0
+    for (let i = 0; i < prefix.length; i += 1) {
+      const ch = prefix[i]
+      if (ch === openCh) depth += 1
+      else if (ch === closeCh && depth > 0) depth -= 1
+    }
+    return depth
+  }
+  const trimUnmatchedTrailingWrappers = (url, prefixBeforeMatch = '') => {
     let cleaned = url
+    let openBracketsBefore = countUnmatchedOpen(prefixBeforeMatch, '[', ']')
+    let openParensBefore = countUnmatchedOpen(prefixBeforeMatch, '(', ')')
     while (cleaned.length > 0) {
       const last = cleaned[cleaned.length - 1]
-      if (last === ']') {
+      if (last === ']' && openBracketsBefore > 0) {
         const opens = (cleaned.match(/\[/g) ?? []).length
         const closes = (cleaned.match(/\]/g) ?? []).length
         if (closes > opens) {
           cleaned = cleaned.slice(0, -1)
+          openBracketsBefore -= 1
           continue
         }
-      } else if (last === ')') {
+      } else if (last === ')' && openParensBefore > 0) {
         const opens = (cleaned.match(/\(/g) ?? []).length
         const closes = (cleaned.match(/\)/g) ?? []).length
         if (closes > opens) {
           cleaned = cleaned.slice(0, -1)
+          openParensBefore -= 1
           continue
         }
       }
@@ -1340,13 +1355,14 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
   const extractAllActionableUrls = (str) => {
     if (typeof str !== 'string' || !str) return { urls: [], oversizedCount: 0, totalCount: 0 }
-    const matches = str.match(new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})`, 'g'))
-    if (!matches) return { urls: [], oversizedCount: 0, totalCount: 0 }
+    const regex = new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})`, 'gi')
     const seen = new Set()
     const urls = []
     let oversizedCount = 0
-    for (const raw of matches) {
-      const cleaned = trimUnmatchedTrailingWrappers(raw)
+    for (const match of str.matchAll(regex)) {
+      const raw = match[0]
+      const prefix = typeof match.index === 'number' ? str.slice(0, match.index) : ''
+      const cleaned = trimUnmatchedTrailingWrappers(raw, prefix)
       if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)
       if (cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS) {

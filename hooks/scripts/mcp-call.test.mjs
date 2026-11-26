@@ -264,4 +264,77 @@ describe('a failed response in an error', () => {
       await new Promise((resolve) => server.close(resolve))
     }
   })
+
+  it('aborts a slow response body after quick headers within timeoutMs (3c5147a7 / 91d7b47c)', async () => {
+    let bodyTimer = null
+    const server = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.flushHeaders()
+      bodyTimer = setTimeout(() => {
+        if (!res.writableEnded) {
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }))
+        }
+      }, 600)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    const started = Date.now()
+    try {
+      const error = await mcpToolsCall({
+        mcpUrl,
+        token: 'dvs_fixture',
+        name: 'report_request',
+        arguments: {},
+        timeoutMs: 80,
+      }).then(
+        () => assert.fail('slow body must abort on timeout'),
+        (e) => e,
+      )
+      const elapsed = Date.now() - started
+      assert.equal(error.code, 'timeout')
+      assert.ok(elapsed < 450, `expected abort near 80ms timeout, took ${elapsed}ms`)
+    } finally {
+      if (bodyTimer) clearTimeout(bodyTimer)
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+
+  it('preserves JSON-RPC error code and structured data on thrown errors (4e32d1a5)', async () => {
+    const server = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          error: {
+            code: -32001,
+            message: 'Connection capability refused',
+            data: { retryable: false, reason: 'invalid_connection_capability' },
+          },
+        }),
+      )
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const mcpUrl = `http://127.0.0.1:${server.address().port}/api/mcp`
+    try {
+      const error = await mcpToolsCall({
+        mcpUrl,
+        token: 'dvs_fixture',
+        name: 'report_request',
+        arguments: {},
+      }).then(
+        () => assert.fail('JSON-RPC error must reject'),
+        (e) => e,
+      )
+      assert.equal(error.code, -32001)
+      assert.deepEqual(error.data, { retryable: false, reason: 'invalid_connection_capability' })
+      assert.equal(error.rpcError.code, -32001)
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
 })
