@@ -6798,4 +6798,213 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const finalPos = JSON.parse(fs.readFileSync(posFile, 'utf8'))
     assert.equal(finalPos.offset, wake2End, 'wake cursor advances past both notes ONLY after both are read and picked up')
   })
+
+  it('blocking reasons themselves exceeding reserved ENOSPC disk space still preserve ALL 1,400 blocking records with visible reason previews and honest stderr notice (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { randomBytes } = await import('node:crypto')
+    const { spawnSync } = await import('node:child_process')
+    const { RESERVED_DIAGNOSTIC_SLOT_BYTES, clearPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('1400-reason-bloat ENOSPC check'))), { mode: 0o600 })
+
+    // Put the 600-char random incompressible blobs INSIDE `reason` ITSELF across 1,400 records!
+    const records1400 = Array.from({ length: 1400 }, (_, idx) => ({
+      id: `blk-rsn-${String(idx).padStart(4, '0')}`,
+      reason: `prefix_${idx}_${randomBytes(440).toString('base64')}_suffix_${idx}`,
+    }))
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    const origWriteSync = fs.writeSync
+    let faultActive = false
+    let pass1 = null
+    let stderrText = ''
+    try {
+      fs.openSync = (p, flags, ...rest) => {
+        if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origOpenSync(p, flags, ...rest)
+      }
+      fs.writeFileSync = (p, d, o) => {
+        if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        return origWriteFileSync(p, d, o)
+      }
+      fs.writeSync = (fd, buf, offset, length, position) => {
+        if (faultActive) {
+          const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+          if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        }
+        return origWriteSync(fd, buf, offset, length, position)
+      }
+      pass1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async (chunk) => {
+          stderrText += String(chunk)
+        },
+        startCommands: async () => {
+          faultActive = true
+          return {
+            ok: false,
+            outcome: 'refused',
+            refusals: [
+              {
+                command_message_id: 'msg-1400-reason-1',
+                refusal: {
+                  code: 'blocked_by_items',
+                  blocking_items: records1400,
+                },
+              },
+            ],
+          }
+        },
+      })
+    } finally {
+      faultActive = false
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      fs.writeSync = origWriteSync
+    }
+
+    assert.equal(pass1.marked, false)
+    assert.equal(pass1.pickup_diagnostic_note?.enospcCompacted, true)
+    assert.notEqual(pass1.pickup_diagnostic_note?.enospcIncomplete, true, 'Stage-2 reason compaction must preserve ALL 1,400 blocking records without omitting any')
+    assert.doesNotMatch(stderrText, /full details saved whole|Read the complete original refusal/, 'stderr MUST NOT claim full unabridged refusal was saved when compacted under ENOSPC')
+    assert.match(stderrText, /ENOSPC/i)
+
+    let cmd = pass1.pickup_diagnostic_note.command
+    let fullText = ''
+    let pages = 0
+    while (cmd) {
+      pages += 1
+      assert.ok(pages <= pass1.pickup_diagnostic_note.parts + 2)
+      const sh = spawnSync('sh', ['-c', cmd], { encoding: 'utf8' })
+      assert.equal(sh.status, 0, sh.stderr)
+      assert.equal(fitsShellOutput(sh.stdout), true)
+      fullText += sh.stdout.replace(/\n\n--- part \d+\/\d+ [^\n]*---\n$/, '')
+      const next = /next part \(\d+\/\d+\): ([^\n]+ \| head -c \d+) ---\n$/.exec(sh.stdout)
+      cmd = next ? next[1] : null
+    }
+    const uniqueIds = new Set(fullText.match(/blk-rsn-\d{4}/g) ?? [])
+    assert.equal(uniqueIds.size, 1400, `ALL 1,400 blocking records MUST survive when reasons themselves overflow ENOSPC slots (got ${uniqueIds.size})`)
+    assert.match(fullText, /prefix_0_/)
+    assert.match(fullText, /prefix_700_/)
+    assert.match(fullText, /prefix_1399_/)
+    assert.match(fullText, /"truncated_due_to_enospc":true/)
+    assert.doesNotMatch(fullText, /"head_preview"/, 'must NOT collapse structured refusal into raw head/tail excerpts')
+    clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+  })
+
+  it('advanceCompletedWakeNotePositions scans pending and taken wake-notes in a single snapshot so a concurrent giveBack NEVER lets a later note skip an earlier unread command (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+    const posFile = path.join(dir, `${CONN}.wake-position`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+
+    const msg1 = { message_id: 'msg-race-note-1', turn_id: 'turn-race-note-1', text: 'Earlier command in note 1' }
+    const msg2 = { message_id: 'msg-race-note-2', turn_id: 'turn-race-note-2', text: 'Later command in note 2' }
+    const note1 = writeNote(wakeLines([{ type: 'owner_message', session_id: ROOM, message_id: msg1.message_id, turn_id: msg1.turn_id, message: msg1 }]), { home })
+    const note2 = writeNote(wakeLines([{ type: 'owner_message', session_id: ROOM, message_id: msg2.message_id, turn_id: msg2.turn_id, message: msg2 }]), { home })
+
+    const wake1Text = wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note1.command, note: 'Read note 1' }])
+    const wake2Text = wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note2.command, note: 'Read note 2' }])
+    const wake1End = Buffer.byteLength(wake1Text, 'utf8')
+    const wake2End = wake1End + Buffer.byteLength(wake2Text, 'utf8')
+    fs.writeFileSync(wakeFile, `${wake1Text}${wake2Text}`, { mode: 0o600 })
+
+    const track1 = registerPendingWakeNote(
+      CONN,
+      {
+        noteId: note1.id,
+        commands: [{ messageId: msg1.message_id, turnId: msg1.turn_id }],
+        messages: [msg1],
+        sessionId: ROOM,
+        wakeFile,
+        wakePositionPath: posFile,
+        wakePositionVersion: 1,
+        wakeStart: 0,
+        wakeThrough: wake1End,
+      },
+      { dir },
+    )
+    registerPendingWakeNote(
+      CONN,
+      {
+        noteId: note2.id,
+        commands: [{ messageId: msg2.message_id, turnId: msg2.turn_id }],
+        messages: [msg2],
+        sessionId: ROOM,
+        wakeFile,
+        wakePositionPath: posFile,
+        wakePositionVersion: 1,
+        wakeStart: wake1End,
+        wakeThrough: wake2End,
+      },
+      { dir },
+    )
+
+    // Simulate a concurrent hook currently holding note1 as `.taken-...` and returning it to
+    // pending right after the first `readdirSync` inside `advanceCompletedWakeNotePositions`!
+    const takenTrack1 = `${track1}.taken-${process.pid}-cafebabe`
+    fs.renameSync(track1, takenTrack1)
+
+    const stepsFolder = path.dirname(track1)
+    const note2Content = fs.readFileSync(note2.file, 'utf8')
+    const origReaddirSync = fs.readdirSync
+    let gaveBackDuringScan = false
+    let note2PickedUp = false
+    fs.readdirSync = (target, ...rest) => {
+      const res = origReaddirSync(target, ...rest)
+      if (note2PickedUp && !gaveBackDuringScan && path.resolve(String(target)) === path.resolve(stepsFolder)) {
+        // Rename takenTrack1 back to pending right after the first readdirSync post-pickup:
+        // a buggy two-scan implementation misses note1 on BOTH scans!
+        gaveBackDuringScan = true
+        fs.renameSync(takenTrack1, track1)
+      }
+      return res
+    }
+    try {
+      await stepDeliveryHook(
+        {
+          conversation_id: CONVERSATION,
+          tool_name: 'Shell',
+          tool_input: { command: note2.command },
+          tool_output: { exitCode: 0, output: note2Content },
+        },
+        {
+          home,
+          dir,
+          startCommands: async ({ commands }) => {
+            note2PickedUp = true
+            return { ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }
+          },
+        },
+      )
+    } finally {
+      fs.readdirSync = origReaddirSync
+    }
+
+    assert.equal(gaveBackDuringScan, true, 'concurrent giveBack simulation must have fired')
+    assert.equal(fs.existsSync(track1), true, 'note1 tracking file must still be pending on disk')
+    assert.equal(fs.existsSync(posFile), false, 'wake cursor MUST NOT advance past note1 when note1 is returned concurrently!')
+
+    const nextRead = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      home,
+      dir,
+      settleMs: 0,
+      write: async () => {},
+      writeStderr: async () => {},
+    })
+    assert.ok(nextRead.printed >= 1, 'next wake read MUST still surface unread note1')
+    assert.ok(nextRead.text.includes(note1.id), 'next wake read MUST include note1 pointer')
+  })
 })

@@ -505,8 +505,29 @@ export function formatStructuredRefusalsFallback(
   const list = Array.isArray(refusals) ? refusals.map((item) => cloneJsonSafe(item)) : []
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
   const savedCmd = typeof savedNote?.command === 'string' && savedNote.command ? savedNote.command : null
+  const savedEnospcIncomplete = Boolean(savedNote?.enospcIncomplete)
+  const savedEnospcCompacted = Boolean(savedNote?.enospcCompacted)
+  const savedMetaFields = savedCmd
+    ? {
+        read: savedCmd,
+        ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}),
+        ...(savedEnospcCompacted ? { enospc_compacted: true } : {}),
+        ...(savedEnospcIncomplete
+          ? {
+              enospc_incomplete: true,
+              ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+              ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+              ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
+            }
+          : {}),
+      }
+    : {}
   const effectiveRecovery = savedCmd
-    ? `Read the complete original refusal with \`${savedCmd}\` (and any further parts it names); fix write permissions on ~/.devspec/notes.`
+    ? savedEnospcIncomplete
+      ? `Partial ENOSPC refusal saved (${Number.isInteger(savedNote.returnedRecords) && Number.isInteger(savedNote.totalRecords) ? `${savedNote.returnedRecords}/${savedNote.totalRecords} records, ${savedNote.omittedRecords} omitted` : 'some bytes omitted'} because disk is full); inspect saved excerpt with \`${savedCmd}\`, then free disk space and re-run wake read for the complete refusal.`
+      : savedEnospcCompacted
+        ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized string blobs shortened); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged blobs.`
+        : `Read the complete original refusal with \`${savedCmd}\` (and any further parts it names); fix write permissions on ~/.devspec/notes.`
     : recovery
   const limitChars = typeof maxChars === 'number' && maxChars > 0 ? maxChars : CURSOR_SHELL_OUTPUT_MAX_CHARS
   const fits = (candidate) =>
@@ -521,7 +542,7 @@ export function formatStructuredRefusalsFallback(
       total_count: list.length,
       returned_count: slice.length,
       omitted_count: list.length - slice.length,
-      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
+      ...savedMetaFields,
       refusals: slice,
       recovery: effectiveRecovery,
       ...extra,
@@ -571,7 +592,11 @@ export function formatStructuredRefusalsFallback(
   // 5. Compact JSON envelope (drops verbose text prefix) with the exact same zero-cap
   // budget-driven shrinker across ALL refusals first, then the primary refusal.
   const compactRecovery = savedCmd
-    ? 'Read full original via `read`; fix ~/.devspec/notes.'
+    ? savedEnospcIncomplete
+      ? 'Partial ENOSPC excerpt via `read`; free disk space and retry for full refusal.'
+      : savedEnospcCompacted
+        ? 'ENOSPC-compacted refusal (all records preserved) via `read`; free disk space + retry for full blobs.'
+        : 'Read full original via `read`; fix ~/.devspec/notes.'
     : 'Unabridged JSON logged to stderr; fix ~/.devspec/notes permissions.'
   const compactWrapList = (items) =>
     `${JSON.stringify({
@@ -581,7 +606,7 @@ export function formatStructuredRefusalsFallback(
       total_count: list.length,
       returned_count: items.length,
       omitted_count: list.length - items.length,
-      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
+      ...savedMetaFields,
       refusals: items,
       recovery: compactRecovery,
     })}\n`
@@ -599,7 +624,7 @@ export function formatStructuredRefusalsFallback(
       total_count: list.length,
       returned_count: 1,
       omitted_count: list.length - 1,
-      ...(savedCmd ? { read: savedCmd, ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}) } : {}),
+      ...savedMetaFields,
       refusal: item,
       recovery: compactRecovery,
     })}\n`

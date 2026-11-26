@@ -270,11 +270,10 @@ const ENOSPC_COMPACT_STRING_TIERS = [
   { maxVerbatimChars: 64, previewChars: 0 },
 ]
 
-/** Structured refusal/blocker keys kept verbatim during emergency ENOSPC string compaction. */
-const ENOSPC_PRESERVED_STRUCTURAL_KEYS = new Set([
+/** Short machine-identifier/code keys kept verbatim during emergency ENOSPC string compaction. */
+const ENOSPC_PRESERVED_ID_KEYS = new Set([
   'id',
   'code',
-  'reason',
   'status',
   'command_message_id',
   'command_turn_id',
@@ -285,8 +284,33 @@ const ENOSPC_PRESERVED_STRUCTURAL_KEYS = new Set([
   'retryable',
   'type',
   'kind',
-  'title',
 ])
+
+/**
+ * Narrative structural keys kept verbatim during Stage-1 ENOSPC compaction (when non-structural
+ * opaque blobs are the cause of overflow) and progressively summarized ONLY in Stage-2 tiers
+ * when thousands of oversized incompressible `reason`/`title` values themselves exceed every
+ * pre-allocated diagnostic slot, so 100% of blocking record IDs and reason previews survive.
+ */
+const ENOSPC_NARRATIVE_STRUCTURAL_KEYS = new Set([
+  'reason',
+  'title',
+  'message',
+  'error',
+])
+
+/**
+ * Stage-2 progressive `(maxVerbatimChars, previewChars)` compaction tiers applied to
+ * oversized `reason`/`title`/`message`/`error` fields ONLY when Stage-1 (opaque-blob
+ * compaction) still overflows all pre-allocated diagnostic slots under `ENOSPC`.
+ */
+const ENOSPC_COMPACT_NARRATIVE_TIERS = [
+  { maxVerbatimChars: 256, previewChars: 64 },
+  { maxVerbatimChars: 128, previewChars: 32 },
+  { maxVerbatimChars: 64, previewChars: 16 },
+  { maxVerbatimChars: 32, previewChars: 8 },
+  { maxVerbatimChars: 16, previewChars: 0 },
+]
 
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
@@ -920,8 +944,22 @@ export function wakesForOneOutput(wakes, { waiting = null, reserve = '' } = {}) 
   return { count, text: fitsShellOutput(pad + taken + line) ? taken + line : taken }
 }
 
-/** Fixed-shape stderr pointer emitted when a Shell diagnostic would push stdout + stderr past Cursor's Shell ceiling. */
-export function shellDiagnosticPointer(label, command) {
+/**
+ * Fixed-shape stderr pointer emitted when a Shell diagnostic would push stdout + stderr
+ * past Cursor's Shell ceiling. Never announces "full details saved whole" when `note`
+ * was compacted or partially saved under `ENOSPC` (requirements 3c5147a7 / 91d7b47c).
+ */
+export function shellDiagnosticPointer(label, command, note = null) {
+  if (note?.enospcIncomplete) {
+    const counts =
+      Number.isInteger(note.returnedRecords) && Number.isInteger(note.totalRecords)
+        ? `${note.returnedRecords}/${note.totalRecords} records, ${note.omittedRecords ?? Math.max(0, note.totalRecords - note.returnedRecords)} omitted`
+        : 'middle bytes omitted'
+    return `${label}: partial ENOSPC refusal saved (${counts}; disk full) — run \`${command}\` (and any further parts), then free disk space and re-run wake read for the full refusal.\n`
+  }
+  if (note?.enospcCompacted) {
+    return `${label}: ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs shortened) — run \`${command}\` (and any further parts); free disk space and re-run wake read for unabridged blobs.\n`
+  }
   return `${label}: full details saved whole — run \`${command}\` (and any further parts).\n`
 }
 
@@ -1152,15 +1190,20 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
  * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
-  const shrinkValue = (val, { maxVerbatimChars, previewChars, keyName = null, structuralOnly = false }) => {
+  const shrinkValue = (
+    val,
+    { maxVerbatimChars, previewChars, keyName = null, structuralOnly = false, compactReasons = false },
+  ) => {
     if (typeof val === 'string') {
-      const keepKey = keyName && ENOSPC_PRESERVED_STRUCTURAL_KEYS.has(keyName)
-      if (keepKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      const isIdKey = keyName && ENOSPC_PRESERVED_ID_KEYS.has(keyName)
+      const isNarrativeKey = keyName && ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(keyName)
+      if (isIdKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (isNarrativeKey && !compactReasons && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       if (val.length <= maxVerbatimChars) return val
       return {
         truncated_due_to_enospc: true,
         original_chars: val.length,
-        omitted_chars: val.length - previewChars * 2,
+        omitted_chars: Math.max(0, val.length - previewChars * 2),
         ...(previewChars > 0
           ? {
               head: val.slice(0, previewChars),
@@ -1170,22 +1213,18 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       }
     }
     if (Array.isArray(val)) {
-      return val.map((item) => shrinkValue(item, { maxVerbatimChars, previewChars, structuralOnly }))
+      return val.map((item) => shrinkValue(item, { maxVerbatimChars, previewChars, structuralOnly, compactReasons }))
     }
     if (val && typeof val === 'object') {
       const out = {}
       const omittedFields = []
       for (const [k, v] of Object.entries(val)) {
-        if (
-          structuralOnly &&
-          !ENOSPC_PRESERVED_STRUCTURAL_KEYS.has(k) &&
-          typeof v === 'string' &&
-          v.length > maxVerbatimChars
-        ) {
+        const isProtected = ENOSPC_PRESERVED_ID_KEYS.has(k) || ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k)
+        if (structuralOnly && !isProtected && typeof v === 'string' && v.length > maxVerbatimChars) {
           omittedFields.push(k)
           continue
         }
-        out[k] = shrinkValue(v, { maxVerbatimChars, previewChars, keyName: k, structuralOnly })
+        out[k] = shrinkValue(v, { maxVerbatimChars, previewChars, keyName: k, structuralOnly, compactReasons })
       }
       if (omittedFields.length > 0) {
         out.enospc_omitted_blob_fields = omittedFields
@@ -1260,61 +1299,176 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     return foundAnyJson ? { kind: 'lines', entries: parsedLines } : null
   }
 
+  const renderExtracted = (extracted, notice, transform) => {
+    if (extracted.kind === 'whole') {
+      return `${JSON.stringify({
+        ...notice,
+        preserved_refusal: transform(extracted.parsed),
+      })}\n`
+    }
+    const rendered = extracted.entries.map((entry) => {
+      if (entry.plain) return entry.plain
+      const body = JSON.stringify({
+        ...notice,
+        preserved_refusal: transform(entry.parsed),
+        ...(entry.suffix ? { trailing_text: entry.suffix } : {}),
+      })
+      return entry.prefix ? `${entry.prefix} ${body}` : body
+    })
+    return `${rendered.join('\n')}\n`
+  }
+
   const extracted = extractJsonLines(rawText)
   if (extracted) {
     const noticeAllPreserved = {
       ...baseNotice,
+      enospc_incomplete: false,
       all_blocking_records_preserved: true,
       reason:
         'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized opaque string blobs were summarized while preserving every structured refusal code and every blocking record.',
     }
     const tiers = [
-      ...ENOSPC_COMPACT_STRING_TIERS.map((t) => ({ ...t, structuralOnly: false })),
-      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true },
+      // Stage 1: preserve ALL narrative structural keys (`reason`, `title`, `message`, `error`) verbatim
+      // while progressively shrinking non-structural opaque blobs.
+      ...ENOSPC_COMPACT_STRING_TIERS.map((t) => ({ ...t, structuralOnly: false, compactReasons: false })),
+      { maxVerbatimChars: 32, previewChars: 0, structuralOnly: true, compactReasons: false },
+      // Stage 2: ONLY if narrative fields (`reason`/`title`/`message`/`error`) themselves exceed
+      // every pre-allocated disk slot, summarize oversized narrative strings progressively while
+      // STILL preserving 100% of every blocking record, its ID, code, and reason head+tail previews.
+      ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true })),
     ]
     for (const tier of tiers) {
-      let candidate = null
-      if (extracted.kind === 'whole') {
-        candidate = JSON.stringify({
-          ...noticeAllPreserved,
-          preserved_refusal: shrinkValue(extracted.parsed, tier),
-        })
-      } else {
-        const rendered = extracted.entries.map((entry) => {
-          if (entry.plain) return entry.plain
-          const shrunk = shrinkValue(entry.parsed, tier)
-          const body = JSON.stringify({
+      const tierNotice = tier.compactReasons
+        ? {
             ...noticeAllPreserved,
-            preserved_refusal: shrunk,
-            ...(entry.suffix ? { trailing_text: shrinkValue(entry.suffix, tier) } : {}),
-          })
-          return entry.prefix ? `${entry.prefix} ${body}` : body
-        })
-        candidate = `${rendered.join('\n')}\n`
-      }
+            reason:
+              'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code and 100% of blocking records.',
+          }
+        : noticeAllPreserved
+      const candidate = renderExtracted(extracted, tierNotice, (v) => shrinkValue(v, tier))
       if (fitsCompressed(candidate)) {
-        return candidate
+        return {
+          text: candidate,
+          incomplete: false,
+          totalRecords: null,
+          returnedRecords: null,
+          omittedRecords: 0,
+        }
+      }
+    }
+
+    // Stage 3: Structured array-budget fallback ONLY when even bare record IDs across an
+    // astronomical array exceed every pre-allocated slot under ENOSPC. Preserves the
+    // structured refusal envelope with head+tail records, exact `total_records`,
+    // `returned_records`, `omitted_records`, and explicit `enospc_incomplete: true`.
+    const strictestTier = { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true }
+    const countLargestArray = (val) => {
+      let maxLen = 0
+      if (Array.isArray(val)) {
+        maxLen = Math.max(maxLen, val.length)
+        for (const item of val) maxLen = Math.max(maxLen, countLargestArray(item))
+      } else if (val && typeof val === 'object') {
+        for (const v of Object.values(val)) maxLen = Math.max(maxLen, countLargestArray(v))
+      }
+      return maxLen
+    }
+    const maxArrayLen =
+      extracted.kind === 'whole'
+        ? countLargestArray(extracted.parsed)
+        : Math.max(0, ...extracted.entries.map((e) => (e.plain ? 0 : countLargestArray(e.parsed))))
+    if (maxArrayLen > 2) {
+      const sliceArrays = (val, keepCount, stats) => {
+        if (Array.isArray(val)) {
+          if (val.length > keepCount) {
+            const headCount = Math.ceil(keepCount / 2)
+            const tailCount = Math.floor(keepCount / 2)
+            const omitted = val.length - headCount - tailCount
+            stats.totalRecords += val.length
+            stats.returnedRecords += headCount + tailCount
+            stats.omittedRecords += omitted
+            return {
+              enospc_incomplete: true,
+              total_records: val.length,
+              returned_records: headCount + tailCount,
+              omitted_records: omitted,
+              head_records: val.slice(0, headCount).map((item) => shrinkValue(item, strictestTier)),
+              tail_records: tailCount > 0 ? val.slice(-tailCount).map((item) => shrinkValue(item, strictestTier)) : [],
+            }
+          }
+          return val.map((item) => sliceArrays(item, keepCount, stats))
+        }
+        if (val && typeof val === 'object') {
+          const out = {}
+          for (const [k, v] of Object.entries(val)) {
+            out[k] = sliceArrays(v, keepCount, stats)
+          }
+          return out
+        }
+        return shrinkValue(val, strictestTier)
+      }
+      const buildForKeep = (keepCount) => {
+        const stats = { totalRecords: 0, returnedRecords: 0, omittedRecords: 0 }
+        const rendered = renderExtracted(
+          extracted,
+          {
+            ...baseNotice,
+            enospc_incomplete: true,
+            all_blocking_records_preserved: false,
+            reason:
+              'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle records were omitted with exact counts. Free disk space and re-run the wake read to retrieve the full refusal.',
+          },
+          (v) => sliceArrays(v, keepCount, stats),
+        )
+        return { rendered, stats }
+      }
+      let lo = 1
+      let hi = maxArrayLen - 1
+      let best = null
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2)
+        const attempt = buildForKeep(mid)
+        if (fitsCompressed(attempt.rendered)) {
+          best = attempt
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      if (best) {
+        return {
+          text: best.rendered,
+          incomplete: true,
+          totalRecords: best.stats.totalRecords,
+          returnedRecords: best.stats.returnedRecords,
+          omittedRecords: best.stats.omittedRecords,
+        }
       }
     }
   }
 
-  // Last resort ONLY when even structural-only compaction of non-JSON or astronomically
-  // large output still exceeds every pre-allocated disk slot: NEVER claim all records were
-  // preserved — explicitly disclose omission and recovery instructions.
+  // Stage 4: Last resort ONLY for non-JSON or astronomically large output that still
+  // exceeds every pre-allocated disk slot: NEVER claim all records were preserved —
+  // explicitly disclose omission and recovery instructions.
   const envelopeOverhead = ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2
   const halfBudget = Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor((totalCapacityBytes - envelopeOverhead) / 2))
-  return `${JSON.stringify({
-    ...baseNotice,
-    enospc_incomplete: true,
-    all_blocking_records_preserved: false,
-    reason:
-      'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle bytes were omitted. Free disk space and re-run to retrieve the complete refusal.',
-    preserved_head_chars: Math.min(rawText.length, halfBudget),
-    preserved_tail_chars: Math.min(rawText.length, halfBudget),
-    omitted_chars: Math.max(0, rawText.length - halfBudget * 2),
-    head_preview: rawText.slice(0, halfBudget),
-    tail_preview: rawText.slice(-halfBudget),
-  })}\n`
+  return {
+    text: `${JSON.stringify({
+      ...baseNotice,
+      enospc_incomplete: true,
+      all_blocking_records_preserved: false,
+      reason:
+        'Original refusal exceeded every pre-allocated diagnostic slot even after gzip compression and structural compaction under ENOSPC; middle bytes were omitted. Free disk space and re-run to retrieve the complete refusal.',
+      preserved_head_chars: Math.min(rawText.length, halfBudget),
+      preserved_tail_chars: Math.min(rawText.length, halfBudget),
+      omitted_chars: Math.max(0, rawText.length - halfBudget * 2),
+      head_preview: rawText.slice(0, halfBudget),
+      tail_preview: rawText.slice(-halfBudget),
+    })}\n`,
+    incomplete: true,
+    totalRecords: null,
+    returnedRecords: null,
+    omittedRecords: null,
+  }
 }
 
 export function reserveDiagnosticNoteSlots({
@@ -1780,17 +1934,28 @@ export function reserveDiagnosticNoteSlots({
           Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 4, totalReadableBytes - ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 8),
           { originalBytes: rawBytes, compressedBytes },
         )
+        const compactMeta = {
+          enospcCompacted: true,
+          ...(compacted.incomplete
+            ? {
+                enospcIncomplete: true,
+                ...(Number.isInteger(compacted.totalRecords) ? { totalRecords: compacted.totalRecords } : {}),
+                ...(Number.isInteger(compacted.returnedRecords) ? { returnedRecords: compacted.returnedRecords } : {}),
+                ...(Number.isInteger(compacted.omittedRecords) ? { omittedRecords: compacted.omittedRecords } : {}),
+              }
+            : {}),
+        }
         try {
-          const written = writeFormattedToSlot(targetSlot, compacted, id, {
+          const written = writeFormattedToSlot(targetSlot, compacted.text, id, {
             requireReadableByPath: true,
           })
-          if (written) return { ...written, enospcCompacted: true }
+          if (written) return { ...written, ...compactMeta }
         } catch {
           /* try sharded gzip across all readable slots if compacted still > 1 slot */
         }
         if (readableSlots.length >= 2) {
-          const shardedCompacted = writeShardedGzipToSlots(readableSlots, compacted, id)
-          if (shardedCompacted) return { ...shardedCompacted, enospcCompacted: true }
+          const shardedCompacted = writeShardedGzipToSlots(readableSlots, compacted.text, id)
+          if (shardedCompacted) return { ...shardedCompacted, ...compactMeta }
         }
       }
       // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.
@@ -1834,18 +1999,31 @@ export function reserveDiagnosticNoteSlots({
             { originalBytes: Buffer.byteLength(raw, 'utf8') },
           )
           const compactNonce = randomBytes(8).toString('hex')
-          const compactSha = createHash('sha256').update(compacted, 'utf8').digest('hex')
+          const compactSha = createHash('sha256').update(compacted.text, 'utf8').digest('hex')
           const compactHeader = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home, {
             nonce: compactNonce,
             sha256: compactSha,
-            chars: compacted.length,
+            chars: compacted.text.length,
           })
-          const written = writeFormattedToSlot(slot, `${compactHeader}${compacted}`, id, {
+          const written = writeFormattedToSlot(slot, `${compactHeader}${compacted.text}`, id, {
             requireReadableByPath: false,
             pendingPermissionRecovery: true,
             frameNonce: compactNonce,
           })
-          if (written) return { ...written, enospcCompacted: true }
+          if (written) {
+            return {
+              ...written,
+              enospcCompacted: true,
+              ...(compacted.incomplete
+                ? {
+                    enospcIncomplete: true,
+                    ...(Number.isInteger(compacted.totalRecords) ? { totalRecords: compacted.totalRecords } : {}),
+                    ...(Number.isInteger(compacted.returnedRecords) ? { returnedRecords: compacted.returnedRecords } : {}),
+                    ...(Number.isInteger(compacted.omittedRecords) ? { omittedRecords: compacted.omittedRecords } : {}),
+                  }
+                : {}),
+            }
+          }
         } catch {
           /* keep pre-allocated blocks intact */
         }
@@ -2150,6 +2328,15 @@ export function spoolUnsavedRefusal(
       ...(savedNote.reserved ? { reserved: true } : {}),
       ...(savedNote.compressed ? { compressed: savedNote.compressed } : {}),
       ...(savedNote.frameNonce ? { frame_nonce: savedNote.frameNonce } : {}),
+      ...(savedNote.enospcCompacted ? { enospc_compacted: true } : {}),
+      ...(savedNote.enospcIncomplete
+        ? {
+            enospc_incomplete: true,
+            ...(Number.isInteger(savedNote.totalRecords) ? { total_records: savedNote.totalRecords } : {}),
+            ...(Number.isInteger(savedNote.returnedRecords) ? { returned_records: savedNote.returnedRecords } : {}),
+            ...(Number.isInteger(savedNote.omittedRecords) ? { omitted_records: savedNote.omittedRecords } : {}),
+          }
+        : {}),
     }
     const refDirs = [...dirs]
     const noteDir = path.dirname(savedNote.file)
@@ -2539,7 +2726,7 @@ export function fitShellDiagnostic(
     return { text: fb, note: fallbackNote, noteError, usedFallback: true }
   }
   if (fallbackNote) {
-    const fallbackPointer = shellDiagnosticPointer(label, fallbackNote.command)
+    const fallbackPointer = shellDiagnosticPointer(label, fallbackNote.command, fallbackNote)
     if (fitsShellOutput(stdout + fallbackPointer)) {
       return { text: fallbackPointer, note: fallbackNote, noteError }
     }
