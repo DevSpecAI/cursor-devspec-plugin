@@ -719,6 +719,90 @@ export function formatStructuredRefusalsFallback(
   return fits(withoutRead) ? withoutRead : null
 }
 
+/**
+ * Last-resort Shell-output-bounded omission + recovery notice used when a pickup refusal
+ * cannot fit inside the remaining Shell budget AND every diagnostic note store became
+ * unwritable after preflight (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ *
+ * Returns the richest structured omission notice (falling back down to an explicit
+ * one-line omission + recovery message) that satisfies `fitsShellOutput(stdoutText + notice)`.
+ */
+export function formatShellRefusalOmissionNotice(
+  refusals,
+  {
+    label = 'devspec-wake-tail',
+    stdoutText = '',
+    actualChars = null,
+    noteError = null,
+    recovery = null,
+  } = {},
+) {
+  const list = Array.isArray(refusals) ? refusals : refusals ? [refusals] : []
+  if (list.length === 0) return ''
+  const stdout = String(stdoutText ?? '')
+  const actual =
+    typeof actualChars === 'number' && Number.isFinite(actualChars)
+      ? actualChars
+      : JSON.stringify(list).length
+  const codes = list
+    .map((entry) => entry?.refusal?.code ?? entry?.code ?? null)
+    .filter((code) => typeof code === 'string' && code)
+  const readRefs = list
+    .map((entry) => entry?.refusal?.read ?? entry?.read ?? null)
+    .filter((ref) => typeof ref === 'string' && ref)
+  const omittedKeys = [
+    ...new Set(
+      list.flatMap((entry) => {
+        const inner = entry?.refusal && typeof entry.refusal === 'object' ? entry.refusal : entry
+        return inner && typeof inner === 'object' ? Object.keys(inner) : []
+      }),
+    ),
+  ]
+  const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'all diagnostic note stores unwritable')
+  const candidates = [
+    `${label}: ${JSON.stringify({
+      refused: 'report_pickup',
+      note_write_failed: true,
+      note_write_error: why,
+      omitted_due_to_shell_limit: true,
+      total_count: list.length,
+      returned_count: 0,
+      omitted_count: list.length,
+      limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      actual_chars: actual,
+      ...(codes.length > 0 ? { codes } : {}),
+      ...(readRefs.length > 0 ? { read_refs: readRefs } : {}),
+      ...(omittedKeys.length > 0 ? { omitted_keys: omittedKeys } : {}),
+      recovery:
+        recovery ??
+        'All diagnostic note stores became unwritable after preflight so oversized refusal details could not be saved; position was not advanced — fix ~/.devspec/notes or TMPDIR permissions and re-run.',
+    })}\n`,
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      note_write_failed: true,
+      omitted_due_to_shell_limit: true,
+      omitted_count: list.length,
+      actual_chars: actual,
+      ...(codes.length > 0 ? { codes } : {}),
+      recovery: 'Note stores unwritable; cursor held. Fix ~/.devspec/notes & re-run.',
+    })}\n`,
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      note_write_failed: true,
+      omitted_due_to_shell_limit: true,
+      omitted_count: list.length,
+      actual_chars: actual,
+      recovery: 'Fix ~/.devspec/notes & re-run.',
+    })}\n`,
+    `${label}: report_pickup refused (${list.length} omitted, ${actual}>${CURSOR_SHELL_OUTPUT_MAX_CHARS} chars, note write failed); fix ~/.devspec/notes & re-run.\n`,
+    `${label}: refusal omitted (note write failed); fix notes & re-run.\n`,
+  ]
+  for (const candidate of candidates) {
+    if (fitsShellOutput(stdout + candidate)) return candidate
+  }
+  return ''
+}
+
 /** Extract structured refusal details from a thrown MCP / transport error without flattening. */
 export function structuredRefusalFromError(error) {
   if (!error || typeof error !== 'object') {

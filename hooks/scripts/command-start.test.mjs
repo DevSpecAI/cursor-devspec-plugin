@@ -3342,4 +3342,158 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.ok(picked[0].includes(MSG_1), 'older refused command MUST NOT be discarded when merged HANDED write fails')
     assert.ok(picked[0].includes(MSG_2), 'fresh concurrent command MUST still be picked up')
   })
+
+  it('stepDeliveryHook NEVER picks up a reclaimed abandoned unread note on an unrelated tool step; it re-offers both commands until the note is read whole (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const MSG_OLD = '33333333-3333-4333-8333-3333333333e1'
+    const TURN_OLD = '77777777-7777-4777-8777-7777777777e1'
+    const MSG_NEW = '33333333-3333-4333-8333-3333333333e2'
+    const TURN_NEW = '77777777-7777-4777-8777-7777777777e2'
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+    const handedPath = path.join(stepsFolder, 'handed.json')
+
+    // Step 1: hand over older unread note 1 into HANDED and snapshot it as a dead hook's taken file.
+    const batchOld = ownerBatch('Older unread command from dead hook', { messageId: MSG_OLD, turnId: TURN_OLD })
+    holdForNextStep(CONN, batchOld, buildOwnerMessageEvents(batchOld), { dir })
+    const handOverOld = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+    assert.ok(handOverOld)
+    const deadTakenJson = fs.readFileSync(handedPath, 'utf8')
+    fs.rmSync(handedPath, { force: true })
+
+    // Step 2: a parallel hook hands over newer command 2 into a fresh unread `handed.json`.
+    const batchNew = ownerBatch('Newer unread command from parallel hook', { messageId: MSG_NEW, turnId: TURN_NEW })
+    holdForNextStep(CONN, batchNew, buildOwnerMessageEvents(batchNew), { dir })
+    const handOverNew = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+      { home, dir, listenerActive: () => true },
+    )
+    assert.ok(handOverNew)
+
+    // Place the dead hook's unread `handed.json.taken-<deadPid>-...` alongside the newer `handed.json`
+    // so `reclaimAbandoned()` MUST move it to `retry-*.json` and `consumeOverflowEntry()` drains it!
+    const deadTakenPath = path.join(stepsFolder, 'handed.json.taken-99999999-deadbeef')
+    fs.writeFileSync(deadTakenPath, deadTakenJson, { mode: 0o600 })
+
+    // Unrelated tool step: MUST NOT call startCommands for the reclaimed unread note!
+    const picked = []
+    const spyStart = async ({ commands }) => {
+      picked.push(commands.map((c) => c.messageId))
+      return { ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [] }
+    }
+    const unrelatedRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo unrelated' }, tool_output: 'unrelated' },
+      { home, dir, listenerActive: () => true, startCommands: spyStart },
+    )
+    assert.equal(picked.length, 0, 'unrelated tool step MUST NOT call startCommands for an unread reclaimed note')
+    assert.ok(unrelatedRaw, 'unrelated step must re-offer the combined unread note')
+    const mergedHanded = JSON.parse(fs.readFileSync(handedPath, 'utf8'))
+    assert.equal(mergedHanded.note_read, false, 'merged HANDED must remain unread until read whole')
+    const combinedNoteId = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(unrelatedRaw).additional_context)[1]
+    const combinedText = readNoteText(combinedNoteId, { home })
+    assert.ok(combinedText.includes(MSG_OLD), 'combined unread note must contain the older reclaimed command')
+    assert.ok(combinedText.includes(MSG_NEW), 'combined unread note must contain the newer command')
+
+    // Once the agent actually reads the combined note whole, BOTH commands are picked up together.
+    const combinedParts = noteFiles(home, combinedNoteId).map((file) => catCall(home, file, { conversation: CONVERSATION }))
+    for (const partCall of combinedParts) {
+      await stepDeliveryHook(partCall, { home, dir, listenerActive: () => true, startCommands: spyStart })
+    }
+    assert.equal(picked.length, 1, 'reading the combined note whole must trigger pickup once')
+    assert.ok(picked[0].includes(MSG_OLD))
+    assert.ok(picked[0].includes(MSG_NEW))
+  })
+
+  it('readWakes emits a Shell-bounded omission + recovery notice when the last writable diagnostic store fails after preflight on a near-ceiling wake with an oversized refusal (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    // Make ~/.devspec/notes and TMPDIR unwritable BEFORE preflight so ONLY dir/diagnostic-notes
+    // lets preflight pass; then block dir/diagnostic-notes DURING startCommands!
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(dir, 'tmp-midflight-blocked')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+
+    // Build a near-ceiling wake that fits right beside readerHeader + pickupDiagnosticReserve.
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    const batch = ownerBatch('x'.repeat(padLen))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(batch))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stdoutChunks = []
+    const stderrChunks = []
+    try {
+      const page = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async (text) => {
+          stdoutChunks.push(text)
+        },
+        writeStderr: (text) => {
+          stderrChunks.push(text)
+        },
+        startCommands: async () => {
+          // Last writable diagnostic store becomes unwritable AFTER preflight!
+          fs.rmSync(diagDir, { recursive: true, force: true })
+          fs.writeFileSync(diagDir, 'not-a-directory\n')
+          const hugeBlocker = { id: 'blk-wake-midflight', reason: 'active_edit' }
+          for (let i = 0; i < 120; i += 1) hugeBlocker[`field_${i}`] = i
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_midflight_unwritable',
+                  blocking_items: [hugeBlocker],
+                  detail: 'z'.repeat(4_500),
+                },
+              },
+            ],
+          }
+        },
+      })
+      const printedOut = stdoutChunks.join('')
+      const printedErr = stderrChunks.join('')
+      assert.equal(page.printed, 1, 'near-ceiling wake must have printed inline before startCommands')
+      assert.ok(printedOut.length > 18_500, `wake output must be near Shell ceiling; got ${printedOut.length}`)
+      assert.equal(page.marked, false, 'wake cursor must NOT advance on refused pickup')
+      assert.equal(page.pickup_diagnostic_written, true, 'must mark pickup_diagnostic_written=true so stderr notice is reported')
+      assert.ok(printedErr.length > 0, 'must NEVER silently drop stderr diagnostic when last note store fails mid-pickup')
+      assert.ok(
+        fitsShellOutput(printedOut + printedErr),
+        `combined stdout+stderr must fit Shell ceiling (${CURSOR_SHELL_OUTPUT_MAX_CHARS}); got ${(printedOut + printedErr).length}`,
+      )
+      const jsonPart = printedErr.trim().replace(/^devspec-wake-tail:\s*/, '')
+      const parsed = JSON.parse(jsonPart)
+      assert.equal(parsed.note_write_failed, true)
+      assert.equal(parsed.omitted_due_to_shell_limit, true)
+      assert.equal(parsed.omitted_count, 1)
+      assert.ok(parsed.actual_chars > 4_000)
+      assert.match(parsed.recovery, /~\/\.devspec\/notes/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
 })

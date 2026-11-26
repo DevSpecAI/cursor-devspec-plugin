@@ -1076,10 +1076,12 @@ export async function stepDeliveryHook(
   }
 
   // Also drain any retry overflow preserved when a parallel hook wrote a fresh HANDED
-  // right before a transient write failure on an earlier hook (requirement 3ea2b201).
+  // right before a transient write failure on an earlier hook, or when reclaimAbandoned
+  // moved a dead hook's taken HANDED record alongside a newer HANDED (requirement 3ea2b201).
   const takenOverflows = retryOverflowFiles(steps).map(take).filter(Boolean)
   const memoryOverflows = unpersistedRetryOverflow.get(steps) ?? []
   if (memoryOverflows.length > 0) unpersistedRetryOverflow.delete(steps)
+  const reclaimedUnreadItems = []
   const consumeOverflowEntry = (entry) => {
     if (!entry || typeof entry !== 'object') return
     const innerList = Array.isArray(entry.inner_note_items) ? entry.inner_note_items : []
@@ -1094,11 +1096,31 @@ export async function stepDeliveryHook(
       ? entry.pickup_items
       : validRecord(entry) && entry.pickup_pending === true
         ? entry.items.filter((i) => i.kind === 'owner_messages')
-        : validRecord(entry) && hasUnreadNote(entry)
-          ? entry.items.filter((i) => i.kind === 'owner_messages')
-          : []
+        : []
     if (pickupList.length > 0) {
       completedOwnerItems.push(...pickupList)
+      readChanged = true
+    }
+    if (Array.isArray(entry.unread_items) && entry.unread_items.length > 0) {
+      reclaimedUnreadItems.push(...entry.unread_items)
+      readChanged = true
+    } else if (validRecord(entry) && hasUnreadNote(entry)) {
+      // An abandoned unread note MUST NEVER be passed to startCommands on an unrelated
+      // tool step: only if THIS tool call actually finished reading that exact note whole
+      // may its items proceed to pickup; otherwise re-offer them in the unread note
+      // (requirement 3ea2b201).
+      const { done } = readThrough(entry, input, { home })
+      if (done) {
+        const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(entry.items)
+        completedOwnerItems.push(...immediateOwnerItems)
+        unreadableInnerNoteRefusals.push(...unreadableRefusals)
+        unreadableInnerNoteItems.push(...unreadableItems)
+        if (!keptForPickupRetry && (immediateOwnerItems.length > 0 || unreadableItems.length > 0)) {
+          keptForPickupRetry = { ...entry, note_read: true }
+        }
+      } else {
+        reclaimedUnreadItems.push(...entry.items)
+      }
       readChanged = true
     }
     if (!keptForPickupRetry && (innerList.length > 0 || pickupList.length > 0)) {
@@ -1507,6 +1529,18 @@ export async function stepDeliveryHook(
     // Merge any concurrent HANDED record written by a parallel postToolUse hook while
     // this hook awaited `isOpen` or `startCommands`, so a refusal/retry write NEVER
     // overwrites a freshly handed-over unread note (requirement 3ea2b201).
+    const dedupeStepItems = (list) => {
+      const seen = new Set()
+      const out = []
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue
+        const key = typeof item.key === 'string' && item.key ? item.key : null
+        if (key && seen.has(key)) continue
+        if (key) seen.add(key)
+        out.push(item)
+      }
+      return out
+    }
     let mergedConcurrent = false
     try {
       const concurrent = readPrivateJson(path.join(steps, HANDED))
@@ -1528,12 +1562,13 @@ export async function stepDeliveryHook(
           ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : { pickup_pending: false, pickup_items: [] }),
           ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
         }
-        if (adding.length > 0 || (cUnread && rUnread)) {
-          const unreadItems = [
+        if (adding.length > 0 || reclaimedUnreadItems.length > 0 || (cUnread && rUnread)) {
+          const unreadItems = dedupeStepItems([
+            ...reclaimedUnreadItems,
             ...(cUnread ? concurrent.items : []),
             ...(rUnread ? record.items : []),
             ...adding.map((each) => each.item),
-          ]
+          ])
           const note = writeNote(stepNoteText(unreadItems, { connectionId }), { home })
           record = {
             version: RECORD_VERSION,
@@ -1575,7 +1610,7 @@ export async function stepDeliveryHook(
           record = null
         }
         mergedConcurrent = true
-      } else if (adding.length > 0) {
+      } else if (adding.length > 0 || reclaimedUnreadItems.length > 0) {
         const keepPendingMeta = record
           ? {
               ...(record.inner_note_pending ? { inner_note_pending: true, inner_note_items: record.inner_note_items ?? [] } : {}),
@@ -1583,7 +1618,11 @@ export async function stepDeliveryHook(
               ...(Array.isArray(record.pickup_refusals) && record.pickup_refusals.length > 0 ? { pickup_refusals: record.pickup_refusals } : {}),
             }
           : {}
-        const items = [...(hasUnreadNote(record) ? record.items : []), ...adding.map((each) => each.item)]
+        const items = dedupeStepItems([
+          ...reclaimedUnreadItems,
+          ...(hasUnreadNote(record) ? record.items : []),
+          ...adding.map((each) => each.item),
+        ])
         const note = writeNote(stepNoteText(items, { connectionId }), { home })
         record = {
           version: RECORD_VERSION,
@@ -1595,7 +1634,7 @@ export async function stepDeliveryHook(
           ...keepPendingMeta,
         }
       }
-      if (record && (adding.length > 0 || readChanged || mergedConcurrent)) {
+      if (record && (adding.length > 0 || reclaimedUnreadItems.length > 0 || readChanged || mergedConcurrent)) {
         writePrivateJson(path.join(steps, HANDED), record)
       }
     } catch (deliveryWriteError) {
@@ -1615,6 +1654,7 @@ export async function stepDeliveryHook(
           const overflowPayload = {
             version: RECORD_VERSION,
             note: record?.note ?? '0'.repeat(16),
+            ...(hasUnreadNote(record) ? { unread_items: record.items } : {}),
             inner_note_items:
               Array.isArray(record?.inner_note_items) && record.inner_note_items.length > 0
                 ? record.inner_note_items
@@ -1666,7 +1706,7 @@ export async function stepDeliveryHook(
     for (const each of checked) drop(each.taken)
     for (const ov of takenOverflows) drop(ov)
     if (takenRecord) {
-      if (record && adding.length === 0 && !readChanged) giveBack(takenRecord)
+      if (record && adding.length === 0 && reclaimedUnreadItems.length === 0 && !readChanged && !mergedConcurrent) giveBack(takenRecord)
       else drop(takenRecord)
     }
     if (adding.length > 0) {

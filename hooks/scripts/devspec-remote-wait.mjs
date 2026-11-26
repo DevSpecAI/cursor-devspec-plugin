@@ -126,6 +126,7 @@ import { localTurnToComplete } from './local-turn.mjs'
 import { discardSteps, holdForNextStep, isStepBatch, logDiscarded, readTurnState, registerPendingWakeNote, releaseAtIdle, withStepsLock, withStepsLockAsync } from './step-delivery.mjs'
 import {
   extractRoomCommandsFromWake,
+  formatShellRefusalOmissionNotice,
   formatStructuredRefusalsFallback,
   startRoomCommands,
   structuredRefusalFromError,
@@ -1980,9 +1981,19 @@ export async function runOneShotRoomCommandPickup({
       fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
     })
     diagnosticNote = fitted.note
-    if (fitted.text) {
-      writeStderr(fitted.text)
-      stderrText = fitted.text
+    const diagText =
+      fitted.text ||
+      (refusals
+        ? formatShellRefusalOmissionNotice(refusals, {
+            label: 'devspec-remote-wait',
+            stdoutText: combinedPrior,
+            actualChars: rawDiag.length,
+            noteError: fitted.noteError,
+          })
+        : '')
+    if (diagText) {
+      writeStderr(diagText)
+      stderrText = diagText
     }
   }
   return {

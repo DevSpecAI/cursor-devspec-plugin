@@ -125,6 +125,7 @@ import {
 import {
   clearWakeListenerNeeded,
   extractRoomCommandsFromWake,
+  formatShellRefusalOmissionNotice,
   formatStructuredRefusalsFallback,
   markWakeListenerNeeded,
   readStartedCommandIds,
@@ -747,8 +748,16 @@ export async function readWakes({
           fallbackDir: fallbackNoteDir,
         })
         pickupDiagnosticNote = fittedFullBudget.note
-        if (fittedFullBudget.text) {
-          writeStderr(fittedFullBudget.text)
+        const fallbackNotice =
+          fittedFullBudget.text ||
+          formatShellRefusalOmissionNotice(pickupRefusals, {
+            label: 'devspec-wake-tail',
+            stdoutText: '',
+            actualChars: noteDiag.length,
+            noteError: fittedFullBudget.noteError,
+          })
+        if (fallbackNotice) {
+          writeStderr(fallbackNotice)
           pickupDiagnosticWritten = true
         }
       }
@@ -930,8 +939,16 @@ export async function readWakes({
         fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
       })
       pickupDiagnosticNote = fittedWithStdout.note
-      if (fittedWithStdout.text) {
-        writeStderr(fittedWithStdout.text)
+      const diagText =
+        fittedWithStdout.text ||
+        formatShellRefusalOmissionNotice(pickupRefusals, {
+          label: 'devspec-wake-tail',
+          stdoutText: printedStdout,
+          actualChars: rawDiag.length,
+          noteError: fittedWithStdout.noteError,
+        })
+      if (diagText) {
+        writeStderr(diagText)
         pickupDiagnosticWritten = true
       }
     } else if (rawDiag) {
@@ -1092,7 +1109,21 @@ async function main() {
       } else {
         said = 'devspec-wake-tail: the wakes above could not be marked read (unknown error); they print again next time.\n'
       }
-      if (fitsShellOutput(page.text + said)) process.stderr.write(said)
+      if (fitsShellOutput(page.text + said)) {
+        process.stderr.write(said)
+      } else {
+        const fallbackSaid =
+          Array.isArray(page.pickup_refusals) && page.pickup_refusals.length > 0
+            ? formatShellRefusalOmissionNotice(page.pickup_refusals, {
+                label: 'devspec-wake-tail',
+                stdoutText: page.text,
+                actualChars: said.length,
+              })
+            : 'devspec-wake-tail: wake read incomplete (error omitted for Shell limit); fix note permissions & re-run.\n'
+        if (fallbackSaid && fitsShellOutput(page.text + fallbackSaid)) {
+          process.stderr.write(fallbackSaid)
+        }
+      }
     }
     if (page.error || page.pickup_refusals) process.exitCode = 1
   }
