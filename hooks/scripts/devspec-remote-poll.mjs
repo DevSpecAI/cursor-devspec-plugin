@@ -956,13 +956,34 @@ export const PUSH_HEALTHY_MS = 30_000
 export const PUSH_SAFETY_MS = 45_000
 export const PUSH_LOCAL_CHECK_MS = 1_000
 
+/**
+ * The push gate: whether the loop may sleep on the open stream, and when it must look.
+ *
+ * Nudges are COUNTED, not flagged (item 2540fd35). `produced` counts every frame that
+ * says "look now", plus every poll the loop owes itself after a failure; `acknowledged`
+ * is the highest count that a poll which read the live end of the room has covered. A
+ * poll takes a ticket (the count when it starts) and acknowledges only that ticket once
+ * it has succeeded, so a nudge stays pending until a poll that started after it has
+ * actually looked:
+ * - a nudge that lands while the loop pages back through older history is still
+ *   pending when the drain ends (a history page never reads the live end), so the next
+ *   lap looks at once instead of sleeping until the safety timer;
+ * - a failed or timed-out poll acknowledges nothing, and the loop owes itself a retry
+ *   after its error back-off;
+ * - a nudge that lands during a live poll leaves exactly one more poll owed.
+ * With no nudges and no failures nothing is ever owed, so an idle agent polls exactly
+ * as often as before.
+ */
 export function createPushGate({
   safetyMs = PUSH_SAFETY_MS,
   localCheckMs = PUSH_LOCAL_CHECK_MS,
 } = {}) {
   let connected = false
-  let wakePending = false
+  let produced = 0
+  let acknowledged = 0
   let wakeWaiter = null
+
+  const pending = () => produced > acknowledged
 
   const notify = () => {
     if (wakeWaiter) {
@@ -974,7 +995,7 @@ export function createPushGate({
 
   return {
     isConnected: () => connected,
-    hasWakePending: () => wakePending,
+    hasWakePending: pending,
     onEvent(evt) {
       if (!evt) return
       if (evt.kind === 'hello') {
@@ -988,7 +1009,7 @@ export function createPushGate({
         evt.kind === 'interaction_event' ||
         evt.kind === 'question_dismissal_event'
       ) {
-        wakePending = true
+        produced += 1
         notify()
       }
     },
@@ -996,13 +1017,25 @@ export function createPushGate({
       connected = false
       notify()
     },
-    consumePollWaitMs(fallbackWaitMs) {
-      const waitMs = wakePending || connected ? 0 : fallbackWaitMs
-      wakePending = false
-      return waitMs
+    /** The loop owes itself a poll (a failed one is retried rather than slept on). */
+    requestPoll() {
+      produced += 1
+      notify()
+    },
+    /**
+     * A poll is starting. `waitMs` is unchanged from before: no hold while something is
+     * pending or the stream is open, else the fallback hold. `ticket` is what this poll
+     * covers once it succeeds; it takes nothing off the count by itself.
+     */
+    beginPoll(fallbackWaitMs) {
+      return { waitMs: pending() || connected ? 0 : fallbackWaitMs, ticket: produced }
+    },
+    /** A poll that read the live end of the room succeeded: what it started with is handled. */
+    acknowledge(ticket) {
+      if (Number.isFinite(ticket) && ticket > acknowledged) acknowledged = Math.min(ticket, produced)
     },
     async waitIfIdle({ shouldWakeImmediately } = {}) {
-      if (!connected || wakePending) return
+      if (!connected || pending()) return
       if (typeof shouldWakeImmediately === 'function' && shouldWakeImmediately()) return
       await new Promise((resolve) => {
         let settled = false
@@ -1017,7 +1050,7 @@ export function createPushGate({
         wakeWaiter = finish
         const safetyTimer = setTimeout(finish, safetyMs)
         const localTimer = setInterval(() => {
-          if (!connected || wakePending) {
+          if (!connected || pending()) {
             finish()
             return
           }
@@ -3190,10 +3223,13 @@ async function main() {
     let res = null
     const drainingCatchUp = Boolean(catchUpCursor)
     const sentControlAck = pendingControlAck
+    // What this poll covers once it has looked at the live end (createPushGate).
+    let pollTicket = null
     try {
-      const effectiveWaitMs = pushGate.consumePollWaitMs(tier.waitMs)
+      const begun = pushGate.beginPoll(tier.waitMs)
+      pollTicket = begun.ticket
       res = await pollOnce({
-        waitMs: effectiveWaitMs,
+        waitMs: begun.waitMs,
         busy: busyArg,
         checkTier: tier.checkTier,
         catchUp: needsSeed || drainingCatchUp,
@@ -3228,6 +3264,8 @@ async function main() {
           return
         }
         process.stderr.write(`devspec-remote-poll: DevSpec refused the credential (${refusal.code}); trying once more with the current one\n`)
+        // "Once more" means the next lap, not the next nudge or safety tick.
+        pushGate.requestPoll()
         await sleep(1_000)
         continue
       }
@@ -3255,6 +3293,11 @@ async function main() {
         reason: rateLimited ? 'rate_limited' : 'poll_failed',
         data: { consecutiveErrors, backoff_ms: backoff },
       })
+      // The failed poll looked at nothing, so whatever sent it is still unhandled: retry
+      // after the back-off instead of sleeping until the next nudge or the 45 s safety
+      // tick (item 2540fd35). errorBackoffMs grows and caps at 30 s, so an outage still
+      // costs at most one poll per 30 s per agent.
+      pushGate.requestPoll()
       await sleep(backoff)
       continue
     }
@@ -3275,6 +3318,8 @@ async function main() {
           `devspec-remote-poll: ${label} — recoverable, not a UI end; ` +
             `retrying in ${backoff}ms (${consecutiveRecoverableEnds}/${RECOVERABLE_TERMINAL_MAX})\n`,
         )
+        // Retry after the back-off, as the line above says, rather than on the next nudge.
+        pushGate.requestPoll()
         await sleep(backoff)
         continue
       }
@@ -3396,6 +3441,17 @@ async function main() {
     }
 
     const delivered = await consumePollResult(res, { drainingCatchUp })
+    // The nudges this poll started with are handled only once it has actually read the
+    // live end of the room: its canonical room ingress (or a clean changed:false live
+    // answer) was accepted and applied. Nothing else counts (item 2540fd35):
+    // - a backward history page (catch_up_cursor) read only older messages and never
+    //   moves the live cursor, so a nudge that landed during the drain stays pending and
+    //   the lap after the drain looks at once;
+    // - an interaction-event-only answer (the lane above `continue`s before here) carries
+    //   no room ingress at all, delivered or not;
+    // - a rejected ingress read nothing, and is retried after its empty-turn back-off;
+    // - a failed poll, a server-side end and an attachment change never reach here.
+    if (lastIngressAccepted && !drainingCatchUp) pushGate.acknowledge(pollTicket)
     if (lastIngressAccepted) needsSeed = false
     if (delivered || (lastIngressAccepted && res.changed !== true)) {
       consecutiveEmpty = 0
