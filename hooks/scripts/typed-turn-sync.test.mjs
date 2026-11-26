@@ -5230,4 +5230,212 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, REQ_ALICE)
   })
+
+  it('syncLiveTypedTurn NEVER replaces a different sender’s room command that became current IMMEDIATELY BEFORE op:current is written (after post-open readRequestState) (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE_LIVE = '11111111-1111-4111-8111-1111111111a7'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob terminal turn raced by Alice becoming current right before op:current write')}\n`)
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    const origAppendFileSync = fs.appendFileSync
+    let injectedAliceCurrent = false
+    fs.appendFileSync = (filePath, data, ...rest) => {
+      if (!injectedAliceCurrent && String(filePath) === reqLogPath && String(data).includes('"op":"current"')) {
+        injectedAliceCurrent = true
+        origAppendFileSync(
+          filePath,
+          `${JSON.stringify({ op: 'open', id: CMD_ALICE_LIVE, kind: 'command', requested_by: ALICE })}\n` +
+            `${JSON.stringify({ op: 'current', ref: CMD_ALICE_LIVE })}\n`,
+          ...rest,
+        )
+      }
+      return origAppendFileSync(filePath, data, ...rest)
+    }
+
+    let res = null
+    try {
+      res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+        dir,
+        memo: {},
+      })
+    } finally {
+      fs.appendFileSync = origAppendFileSync
+    }
+
+    assert.equal(injectedAliceCurrent, true, 'test hook must have made Alice current right before Bob op:current')
+    assert.equal(res.action, 'opened')
+    assert.equal(res.superseded, true, 'Bob terminal binding must recognize CAS supersession')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE_LIVE, 'Alice’s live room command MUST stay current and NOT be replaced by Bob')
+    assert.equal(after.joined.size, 0, 'superseded terminal binding must not pollute Alice’s room turn')
+    assert.equal(after.started.has(res.requestId), true, 'superseded terminal request must still be marked started for idle cleanup')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined, 'next write must not fail or name Bob')
+    assert.equal(stamped.args?.request_ref, CMD_ALICE_LIVE, 'next write MUST name Alice’s live room sender')
+  })
+
+  it('finishIdleRequests and readRequestState recover launch + typed_turn_failed appended to an already-open old-log fd AFTER rotation’s final read (both pre-archive and post-archive) (3ea2b201 / ce71a72b)', async () => {
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+
+    // Part 1: Writer with an already-open fd appends AFTER `readFileSync(staged)` and right before `renameSync(staged, '.1')`!
+    {
+      const { home, dir, transcriptPath } = makeEnv()
+      const REQ_ALICE = '55555555-5555-4555-8555-5555555555a8'
+      fs.writeFileSync(transcriptPath, `${typedRow('Alice turn raced by open fd after rotation read')}\n${turnEndedRow()}\n`)
+      const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+      assert.ok(turnKey)
+
+      const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+      fs.mkdirSync(dir, { recursive: true })
+      const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad', ref: null, pad: 'p'.repeat(400) })}\n`
+      fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+      appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ALICE }, { dir })
+
+      // Open a separate fd to the original inode BEFORE rotation starts!
+      const oldFd = fs.openSync(reqLogPath, 'a')
+      const origRenameSync = fs.renameSync
+      let wroteViaOldFd = false
+      fs.renameSync = (from, to) => {
+        // Fire on the SECOND rename (`staged -> .requests.jsonl.1`), which happens AFTER
+        // `rotateRequestLog` has already read `staged`!
+        if (!wroteViaOldFd && String(to) === `${reqLogPath}.1`) {
+          wroteViaOldFd = true
+          fs.writeSync(
+            oldFd,
+            `${JSON.stringify({ op: 'launch', key: 'open-fd-launch-1', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n` +
+              `${JSON.stringify({ op: 'typed_turn_failed', key: 'open-fd-retry-1' })}\n`,
+          )
+        }
+        return origRenameSync(from, to)
+      }
+
+      let idleRes = null
+      try {
+        idleRes = await finishIdleRequests({
+          connectionId: CONN,
+          transcriptPath,
+          connectionCapability: 'cap-secret',
+          callRequest: async () => ({ status: 'closed' }),
+          dir,
+          log: () => {},
+        })
+      } finally {
+        fs.renameSync = origRenameSync
+        fs.closeSync(oldFd)
+      }
+
+      assert.equal(wroteViaOldFd, true, 'test hook must have written via already-open fd after rotation read')
+      assert.deepEqual(idleRes.closed, [], 'idle cleanup MUST NOT report request closed when open fd appended launch during rotation')
+      const after = readRequestState(CONN, { dir })
+      assert.equal(after.failedTranscriptTurns.has('open-fd-retry-1'), true, 'typed_turn_failed retry MUST be recovered from open-fd append')
+      assert.equal(after.launches.has('open-fd-launch-1'), true, 'launch MUST be recovered from open-fd append')
+      assert.equal(after.open.has(REQ_ALICE), true, 'request MUST remain open for the launch')
+      assert.equal(after.open.get(REQ_ALICE)?.requested_by, ALICE)
+
+      const wakeRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>open-fd-launch-1</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+      const wakeSync = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo: {},
+      })
+      assert.equal(wakeSync.action, 'restored_wake_request')
+      assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+      assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, REQ_ALICE)
+    }
+
+    // Part 2: Writer holding an already-open fd flushes AFTER rotation and finishIdleRequests have ALREADY completed!
+    {
+      const { home, dir, transcriptPath } = makeEnv()
+      const REQ_ALICE = '55555555-5555-4555-8555-5555555555a9'
+      fs.writeFileSync(transcriptPath, `${typedRow('Alice turn whose open fd flushes after archive completes')}\n${turnEndedRow()}\n`)
+      const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+      assert.ok(turnKey)
+
+      const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+      fs.mkdirSync(dir, { recursive: true })
+      const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad', ref: null, pad: 'p'.repeat(400) })}\n`
+      fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+      appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ALICE }, { dir })
+
+      const oldFd = fs.openSync(reqLogPath, 'a')
+      try {
+        const idleRes = await finishIdleRequests({
+          connectionId: CONN,
+          transcriptPath,
+          connectionCapability: 'cap-secret',
+          callRequest: async () => ({ status: 'closed' }),
+          dir,
+          log: () => {},
+        })
+        assert.deepEqual(idleRes.closed, [REQ_ALICE])
+        assert.equal(fs.existsSync(`${reqLogPath}.1`), true, 'rotation must have archived old log to .1')
+
+        // Now the already-open fd flushes a launch + typed_turn_failed into the archived inode!
+        fs.writeSync(
+          oldFd,
+          `${JSON.stringify({ op: 'launch', key: 'open-fd-launch-2', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n` +
+            `${JSON.stringify({ op: 'typed_turn_failed', key: 'open-fd-retry-2' })}\n`,
+        )
+      } finally {
+        fs.closeSync(oldFd)
+      }
+
+      const recovered = readRequestState(CONN, { dir })
+      assert.equal(recovered.failedTranscriptTurns.has('open-fd-retry-2'), true, 'active reader MUST NOT ignore post-archive typed_turn_failed')
+      assert.equal(recovered.launches.has('open-fd-launch-2'), true, 'active reader MUST NOT ignore post-archive launch')
+      assert.equal(recovered.open.has(REQ_ALICE), true, 'active reader MUST restore idle-closed request for post-archive launch')
+      assert.equal(recovered.open.get(REQ_ALICE)?.requested_by, ALICE)
+
+      const wakeRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>open-fd-launch-2</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+      const wakeSync = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo: {},
+      })
+      assert.equal(wakeSync.action, 'restored_wake_request')
+      assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+      assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, REQ_ALICE)
+    }
+  })
 })

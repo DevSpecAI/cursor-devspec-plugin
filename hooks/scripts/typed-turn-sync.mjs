@@ -1289,30 +1289,43 @@ export async function syncTypedTurnFromTranscript({
         let requestId = existingTyped
         let openedNow = false
         let openRefusal = null
+        let supersededByNewerTurn = false
         // Stale joined ids that belonged to a PREVIOUS turn (to drop explicitly via
         // `preserve_live_joined: true` + `drop_joined_ids`). Using a denylist instead
         // of an allowlist guarantees that ANY room command joining THIS live turn —
         // before registration, during `open_request`, OR immediately before our
         // `op: 'current'` append — is preserved atomically in `reduceRequestLog`
-        // without inheriting stale joins from earlier turns (decision ce71a72b).
+        // without inheriting stale joins from earlier turns. Passing `expected_current`
+        // additionally guarantees a room command that became `current` immediately
+        // before our append is NEVER replaced (decision ce71a72b).
         const stalePriorJoinedIds =
           reqState.current !== null
             ? [...reqState.joined]
             : [...(reqState.priorTurnJoined ?? [])]
-        const currentBindingEvent = (targetId) => ({
+        const currentBindingEvent = (targetId, expectedCurrent) => ({
           op: 'current',
           ref: targetId,
+          expected_current: expectedCurrent,
           preserve_live_joined: true,
           ...(stalePriorJoinedIds.length > 0 ? { drop_joined_ids: stalePriorJoinedIds } : {}),
         })
         if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
           const currentWritten = appendRequestEvent(
             connectionId,
-            midTurn ? { op: 'joined', id: requestId } : currentBindingEvent(requestId),
+            midTurn ? { op: 'joined', id: requestId } : currentBindingEvent(requestId, reqState.current),
             { dir },
           )
           if (!currentWritten) {
             return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+          }
+          if (!midTurn) {
+            const afterBind = readRequestState(connectionId, { dir })
+            if (isBlockingReadError(afterBind.readError)) {
+              return { action: 'request_log_unreadable', requestId, key: turnKey, midTurn }
+            }
+            if (afterBind.current !== requestId) {
+              supersededByNewerTurn = true
+            }
           }
         }
 
@@ -1353,11 +1366,22 @@ export async function syncTypedTurnFromTranscript({
             if (needsBinding) {
               const currentWritten = appendRequestEvent(
                 connectionId,
-                midTurn ? { op: 'joined', id: pendingOpen.requestId } : currentBindingEvent(pendingOpen.requestId),
+                midTurn
+                  ? { op: 'joined', id: pendingOpen.requestId }
+                  : currentBindingEvent(pendingOpen.requestId, reqState.current),
                 { dir },
               )
               if (!currentWritten) {
                 return { action: 'binding_write_failed', requestId: pendingOpen.requestId, key: turnKey, midTurn }
+              }
+              if (!midTurn) {
+                const afterBind = readRequestState(connectionId, { dir })
+                if (isBlockingReadError(afterBind.readError)) {
+                  return { action: 'request_log_unreadable', requestId: pendingOpen.requestId, key: turnKey, midTurn }
+                }
+                if (afterBind.current !== pendingOpen.requestId) {
+                  supersededByNewerTurn = true
+                }
               }
             }
             const removed = deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
@@ -1367,7 +1391,6 @@ export async function syncTypedTurnFromTranscript({
           }
         }
 
-        let supersededByNewerTurn = false
         let effectiveMidTurn = midTurn
         if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
           const opened = await openTypedRequestPreservingRefusal({
@@ -1413,11 +1436,22 @@ export async function syncTypedTurnFromTranscript({
             if (!supersededByNewerTurn) {
               const currentWritten = appendRequestEvent(
                 connectionId,
-                effectiveMidTurn ? { op: 'joined', id: requestId } : currentBindingEvent(requestId),
+                effectiveMidTurn
+                  ? { op: 'joined', id: requestId }
+                  : currentBindingEvent(requestId, postOpenState.current),
                 { dir },
               )
               if (!currentWritten) {
                 return { action: 'binding_write_failed', requestId, key: turnKey, midTurn: effectiveMidTurn }
+              }
+              if (!effectiveMidTurn) {
+                const afterBind = readRequestState(connectionId, { dir })
+                if (isBlockingReadError(afterBind.readError)) {
+                  return { action: 'request_log_unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
+                }
+                if (afterBind.current !== requestId) {
+                  supersededByNewerTurn = true
+                }
               }
             }
           } else if (opened.localPersistFailed) {
@@ -1552,7 +1586,11 @@ export async function syncTypedTurnFromTranscript({
           latestBeforeClear.current !== null &&
           latestBeforeClear.current === reqState.current
         ) {
-          appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+          appendRequestEvent(
+            connectionId,
+            { op: 'current', ref: null, expected_current: latestBeforeClear.current },
+            { dir },
+          )
         }
         return {
           action: 'cleared_stale',
@@ -2113,7 +2151,7 @@ export async function finishIdleRequests({
         curState.currentBoundByWake ||
         curInfo?.kind === 'typed_prompt'
       if (shouldClear) {
-        appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+        appendRequestEvent(connectionId, { op: 'current', ref: null, expected_current: curState.current }, { dir })
       }
     })
   }
@@ -2390,11 +2428,23 @@ export async function finishIdleRequests({
           }
         }
         // Attempt log rotation INSIDE the sync lock before declaring close complete:
-        // if a concurrent background launch arrived during rotation and restored
-        // `targetRequestId` into active `.requests.jsonl`, abort reporting closed!
+        // if a concurrent background launch arrived during rotation (including via an
+        // already-open fd on the archived inode) and restored `targetRequestId`, abort
+        // reporting closed; if the post-rotation log/archive cannot be read, fail closed!
         maybeRotateLog()
         const afterRotateState = readRequestState(connectionId, { dir })
-        if (!afterRotateState.readError && (afterRotateState.open.has(targetRequestId) || hasPendingWorkForRequest(afterRotateState, targetRequestId))) {
+        if (afterRotateState.readError) {
+          return {
+            status: 'refused',
+            refusal: {
+              code: 'request_log_unreadable',
+              retryable: true,
+              request_id: targetRequestId,
+              error: afterRotateState.readError?.message ?? 'request log unreadable after rotation',
+            },
+          }
+        }
+        if (afterRotateState.open.has(targetRequestId) || hasPendingWorkForRequest(afterRotateState, targetRequestId)) {
           return { status: 'aborted_pending_work' }
         }
         return { status: 'closed' }
