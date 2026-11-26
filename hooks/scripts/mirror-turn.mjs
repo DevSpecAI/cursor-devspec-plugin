@@ -73,12 +73,20 @@ const mode = MODES.has(process.argv[2]) ? process.argv[2] : 'stop'
 const LEGACY_STATE_PATH = path.join(os.homedir(), '.devspec', 'remote-control.json')
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
 
-function patchOwnState(connectionId, patch) {
+function patchOwnState(connectionId, patch, { expectedScope = null } = {}) {
   const file = path.join(CONNECTIONS_DIR, `${connectionId}.json`)
   if (!connectionId || !fs.existsSync(file)) return false
   try {
     const existing = JSON.parse(fs.readFileSync(file, 'utf8'))
     if (!existing || typeof existing !== 'object') return false
+    if (
+      expectedScope &&
+      ((existing.session_id || null) !== expectedScope.expected_session_id ||
+        (existing.speech_attachment_id || null) !== expectedScope.expected_attachment_id ||
+        (existing.attached_at || null) !== expectedScope.expected_attached_at)
+    ) {
+      return false
+    }
     const next = { ...existing, ...patch, updated_at: new Date().toISOString() }
     const tmp = `${file}.tmp.${process.pid}`
     fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
@@ -737,12 +745,16 @@ async function main() {
             }),
         })
         if (admitted) {
-          patchOwnState(connectionId, {
-            local_turn: admitted,
-            local_turn_attachment_id: scope.expected_attachment_id,
-            local_turn_attached_at: scope.expected_attached_at,
-            ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
-          })
+          patchOwnState(
+            connectionId,
+            {
+              local_turn: admitted,
+              local_turn_attachment_id: scope.expected_attachment_id,
+              local_turn_attached_at: scope.expected_attached_at,
+              ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
+            },
+            { expectedScope: scope },
+          )
         }
       }
     }

@@ -121,6 +121,7 @@ export function reduceRequestLog(text) {
   const seenTranscriptTurns = new Map()
   const failedTranscriptTurns = new Set()
   let current = null
+  let currentSeq = 0
   let currentFromWake = false
   let currentBoundByWake = false
   let unconsumedWakeCount = 0
@@ -199,6 +200,7 @@ export function reduceRequestLog(text) {
         priorTurnJoined.delete(event.id)
         if (current === event.id) {
           current = null
+          currentSeq += 1
           currentFromWake = false
           currentBoundByWake = false
           unconsumedWakeCount = 0
@@ -212,6 +214,13 @@ export function reduceRequestLog(text) {
         // between the caller's last read and this append, do NOT replace it! Still
         // record a newly opened UUID ref in `started` so idle cleanup can close it
         // cleanly (decision ce71a72b).
+        if (
+          typeof event.expected_current_seq === 'number' &&
+          currentSeq !== event.expected_current_seq
+        ) {
+          if (UUID.test(event.ref ?? '')) started.add(event.ref)
+          break
+        }
         if (
           Object.prototype.hasOwnProperty.call(event, 'expected_current') &&
           current !== event.expected_current &&
@@ -228,6 +237,7 @@ export function reduceRequestLog(text) {
         // joining the same live turn even immediately before this event is written
         // NEVER disappears from `joined` (decision ce71a72b).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
+        currentSeq += 1
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
         // When the prompt hook recorded which non-typed wakes had ALREADY ended in the
@@ -286,6 +296,7 @@ export function reduceRequestLog(text) {
           if (previous !== (next ?? UNSTATED)) joined.add(previous)
           joined.delete(next ?? UNSTATED)
           current = next
+          currentSeq += 1
           currentFromWake = false
           currentBoundByWake = false
           unconsumedWakeCount = 0
@@ -306,6 +317,7 @@ export function reduceRequestLog(text) {
         if (info) info.answered = true
         if (current === event.id) {
           current = null
+          currentSeq += 1
           currentFromWake = false
           currentBoundByWake = false
           unconsumedWakeCount = 0
@@ -410,7 +422,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentSeq, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 /**

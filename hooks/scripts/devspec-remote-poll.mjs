@@ -2213,9 +2213,17 @@ async function main() {
   let pendingInteractionAck = null
 
   /** Persist a state patch without clobbering concurrent fields. Returns true only when written. */
-  function patchState(patch) {
+  function patchState(patch, { expectedScope = null } = {}) {
     try {
       const s = readState(connectionId) || {}
+      if (
+        expectedScope &&
+        ((s.session_id || null) !== expectedScope.expected_session_id ||
+          (s.speech_attachment_id || null) !== expectedScope.expected_attachment_id ||
+          (s.attached_at || null) !== expectedScope.expected_attached_at)
+      ) {
+        return false
+      }
       Object.assign(s, patch, { connection_id: connectionId, updated_at: new Date().toISOString() })
       writeState(s, connectionId)
       return true

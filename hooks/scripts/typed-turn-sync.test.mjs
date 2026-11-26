@@ -7018,4 +7018,182 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(memo.synced, true)
     assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
+
+  it('if the attachment changes BETWEEN the post-pickup check and patchState writing local_turn, sync rolls back the stale receipt, leaves the turn unsynced, and retries pickup on the replacement attachment (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const ATTACH_NEW = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7'
+    const REQ_RACE = '88888888-8888-4888-8888-88888888888b'
+    appendRequestEvent(CONN, { op: 'open', id: REQ_RACE, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_RACE }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Between check and write attachment rotation test')}\n`)
+
+    const stateFile = path.join(dir, `${CONN}.json`)
+    const initialState = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+    fs.writeFileSync(stateFile, JSON.stringify(initialState), { mode: 0o600 })
+
+    const memo = { stamp: null, synced: false }
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: initialState,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => ({
+        connection_id: CONN,
+        expected_session_id: ROOM,
+        attempt_id: args.attempt_id,
+        status: 'working',
+      }),
+      patchState: (patch) => {
+        // Simulate a concurrent poller rotating the attachment RIGHT BETWEEN the pre-patch
+        // check and a non-scope-aware patchState writing the old receipt onto the new attachment!
+        fs.writeFileSync(
+          stateFile,
+          JSON.stringify({
+            connection_id: CONN,
+            session_id: ROOM,
+            speech_attachment_id: ATTACH_NEW,
+            attached_at: '2026-11-25T17:09:00.000Z',
+            ...patch,
+          }),
+          { mode: 0o600 },
+        )
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(pass1.refusal?.code, 'room_attachment_changed_during_admission')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0, 'turn MUST remain unsynced')
+    const afterRollback = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.equal(afterRollback.speech_attachment_id, ATTACH_NEW, 'replacement attachment MUST be preserved')
+    assert.equal(afterRollback.local_turn, null, 'stale old-attachment receipt MUST be rolled back')
+
+    // Now a fresh sync on the replacement attachment MUST run pickup and complete!
+    let retriedPickup = 0
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state: afterRollback,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        retriedPickup += 1
+        assert.equal(args.expected_attachment_id, ATTACH_NEW)
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        fs.writeFileSync(stateFile, JSON.stringify({ ...afterRollback, ...patch }), { mode: 0o600 })
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(retriedPickup, 1, 'fresh sync MUST retry pickup on the replacement attachment')
+    assert.equal(pass2.action, 'adopted_hook_request')
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
+  })
+
+  it('an in-flight sync cleanup for an older wake NEVER erases a newer prompt hook’s scheduled wake requester via expected_current_seq CAS (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111ea'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222eb'
+
+    // 1. Direct CAS test in requests.mjs: stale `{ op: 'current', ref: null, from_sync: true, expected_current_seq }`
+    //    appended AFTER a newer prompt hook set Bob's (or even Alice's own re-fired!) scheduled wake MUST be ignored.
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE, from_wake: true }, { dir })
+    const beforeHook = readRequestState(CONN, { dir })
+    assert.equal(beforeHook.current, CMD_ALICE)
+    const staleSeq = beforeHook.currentSeq
+
+    // Newer prompt hook sets Bob's scheduled wake!
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_BOB, from_wake: true }, { dir })
+    // Stale sync cleanup lands afterwards with the older `expected_current_seq`!
+    appendRequestEvent(
+      CONN,
+      { op: 'current', ref: null, from_sync: true, expected_current: CMD_ALICE, expected_current_seq: staleSeq },
+      { dir },
+    )
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_BOB, 'stale clear MUST NOT erase newer different-requester scheduled wake')
+    assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, CMD_BOB)
+
+    // Same-requester re-fired schedule test: even when the new prompt hook sets CMD_BOB again,
+    // `currentSeq` advanced so a stale cleanup capturing the earlier seq for CMD_BOB MUST NOT erase it!
+    const bobSeq1 = readRequestState(CONN, { dir }).currentSeq
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_BOB, from_wake: true }, { dir })
+    appendRequestEvent(
+      CONN,
+      { op: 'current', ref: null, from_sync: true, expected_current: CMD_BOB, expected_current_seq: bobSeq1 },
+      { dir },
+    )
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_BOB, 'stale clear MUST NOT erase newer same-requester scheduled wake')
+    assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, CMD_BOB)
+
+    // 2. Live lock-wait race test in syncTypedTurnFromTranscript: while sync waits on the typed-sync
+    //    lock to clear an old wake, a prompt hook updates `current` to CMD_BOB -> sync MUST abort
+    //    the stale clear and leave CMD_BOB intact!
+    const oldWake = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 7:00 PM (UTC)</timestamp>' }] },
+    })
+    const oldUnrelated = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 7:05 PM (UTC)</timestamp>' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${oldWake}\n${turnEndedRow()}\n${oldUnrelated}\n`)
+    // Set current to CMD_ALICE (stale ended wake) before starting sync:
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE, from_wake: true }, { dir })
+
+    // Hold the typed-sync lock briefly from a child process (since withTypedSyncLock sleeps
+    // synchronously) so sync reads `initial.current === CMD_ALICE`, waits on the lock while
+    // the child appends Bob's newer prompt-hook `{ op: 'current', ref: CMD_BOB, from_wake: true }`
+    // and releases the lock -> sync MUST abort the stale clear and leave CMD_BOB intact!
+    const lockFile = path.join(dir, `${CONN}.typed-sync.lock`)
+    fs.writeFileSync(lockFile, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+    const { spawn } = await import('node:child_process')
+    const reqLogFile = path.join(dir, `${CONN}.requests.jsonl`)
+    const child = spawn(
+      process.execPath,
+      [
+        '-e',
+        `setTimeout(() => {
+          const fs = require('node:fs');
+          fs.appendFileSync(${JSON.stringify(reqLogFile)}, JSON.stringify({ op: 'current', ref: ${JSON.stringify(CMD_BOB)}, from_wake: true }) + '\\n');
+          fs.rmSync(${JSON.stringify(lockFile)}, { force: true });
+        }, 80);`,
+      ],
+      { stdio: 'ignore' },
+    )
+    const raceRes = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    await new Promise((resolve) => child.once('exit', resolve))
+    assert.equal(raceRes.action, 'superseded_by_newer_current')
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_BOB, 'in-flight sync cleanup MUST NOT erase newer prompt hook requester')
+    assert.equal(
+      stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+      CMD_BOB,
+      'new scheduled wake write MUST stay stamped with Bob’s request_ref',
+    )
+  })
 })

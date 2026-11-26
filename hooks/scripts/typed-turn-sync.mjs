@@ -1592,54 +1592,62 @@ export async function syncTypedTurnFromTranscript({
                 refusal: admission.refusal,
               }
             }
-            // Re-verify the live room session, speech attachment ID, and attached_at AFTER
-            // awaiting report_pickup (reading the connection state file on disk when present)
-            // so if the connection moved rooms, rotated attachment, temporarily cleared
-            // speech_attachment_id during reattachment, or disconnected while pickup was in
-            // flight, we NEVER persist the old receipt or mark the turn synced (3ea2b201).
-            let diskState = null
-            const hasStateFileAfterPickup = fs.existsSync(stateFile)
-            if (hasStateFileAfterPickup) {
-              try {
-                diskState = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
-              } catch (error) {
-                log(
-                  `typed-turn-sync: failed to re-read connection state after admission for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,
-                )
-                return {
-                  action: 'state_write_failed',
-                  requestId,
-                  key: turnKey,
-                  midTurn: effectiveMidTurn,
+            // Helper to re-verify the live room session, speech attachment ID, and attached_at
+            // against `scope` (reading the connection state file on disk when present) both
+            // BEFORE and AFTER `patchState` so a concurrent attachment rotation between the
+            // check and the write NEVER persists an old receipt against a replacement attachment
+            // or marks the turn synced (requirement 3ea2b201).
+            const inspectLiveScope = () => {
+              let diskState = null
+              const hasFile = fs.existsSync(stateFile)
+              if (hasFile) {
+                try {
+                  diskState = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+                } catch (error) {
+                  return { readError: error }
                 }
               }
+              const removed = hadStateFileBeforePickup && !hasFile
+              const curSession = diskState ? diskState.session_id || null : state?.session_id || null
+              const curAttachment = diskState
+                ? diskState.speech_attachment_id || null
+                : state?.speech_attachment_id || null
+              const curAttachedAt = diskState
+                ? diskState.attached_at || null
+                : state?.attached_at || null
+              const moved =
+                removed ||
+                curSession !== scope.expected_session_id ||
+                curAttachment !== scope.expected_attachment_id ||
+                curAttachedAt !== scope.expected_attached_at
+              return { readError: null, diskState, hasFile, curSession, curAttachment, curAttachedAt, moved }
             }
-            const stateFileRemovedDuringPickup = hadStateFileBeforePickup && !hasStateFileAfterPickup
-            const currentSessionAfterPickup = diskState ? diskState.session_id || null : state?.session_id || null
-            const currentAttachmentAfterPickup = diskState
-              ? diskState.speech_attachment_id || null
-              : state?.speech_attachment_id || null
-            const currentAttachedAtAfterPickup = diskState
-              ? diskState.attached_at || null
-              : state?.attached_at || null
-            const movedRoomOrAttachment =
-              stateFileRemovedDuringPickup ||
-              currentSessionAfterPickup !== scope.expected_session_id ||
-              currentAttachmentAfterPickup !== scope.expected_attachment_id ||
-              currentAttachedAtAfterPickup !== scope.expected_attached_at
-            if (movedRoomOrAttachment) {
-              const refusal = {
-                code: 'room_attachment_changed_during_admission',
-                retryable: true,
-                admitted_session_id: scope.expected_session_id,
-                admitted_attachment_id: scope.expected_attachment_id,
-                admitted_attached_at: scope.expected_attached_at,
-                current_session_id: currentSessionAfterPickup,
-                current_attachment_id: currentAttachmentAfterPickup,
-                current_attached_at: currentAttachedAtAfterPickup,
-                error:
-                  'Connection switched rooms, rotated or temporarily cleared attachment, or disconnected while local turn admission was in flight; discarding stale receipt and deferring retry.',
+            const buildMovedRefusal = (live) => ({
+              code: 'room_attachment_changed_during_admission',
+              retryable: true,
+              admitted_session_id: scope.expected_session_id,
+              admitted_attachment_id: scope.expected_attachment_id,
+              admitted_attached_at: scope.expected_attached_at,
+              current_session_id: live.curSession,
+              current_attachment_id: live.curAttachment,
+              current_attached_at: live.curAttachedAt,
+              error:
+                'Connection switched rooms, rotated or temporarily cleared attachment, or disconnected while local turn admission was in flight; discarding stale receipt and deferring retry.',
+            })
+            const prePatchLive = inspectLiveScope()
+            if (prePatchLive.readError) {
+              log(
+                `typed-turn-sync: failed to re-read connection state after admission for ${connectionId} (${turnKey}): ${prePatchLive.readError instanceof Error ? prePatchLive.readError.message : String(prePatchLive.readError)}\n`,
+              )
+              return {
+                action: 'state_write_failed',
+                requestId,
+                key: turnKey,
+                midTurn: effectiveMidTurn,
               }
+            }
+            if (prePatchLive.moved) {
+              const refusal = buildMovedRefusal(prePatchLive)
               log(
                 `typed-turn-sync: discarding stale local turn admission for ${connectionId} (${turnKey}): ${JSON.stringify(refusal)}\n`,
               )
@@ -1655,17 +1663,78 @@ export async function syncTypedTurnFromTranscript({
               let saved = false
               try {
                 saved =
-                  patchState({
-                    local_turn: { ...admission.admitted, turn_key: turnKey },
-                    local_turn_request_id: requestId,
-                    local_turn_attachment_id: scope.expected_attachment_id,
-                    local_turn_attached_at: scope.expected_attached_at,
-                  }) === true
+                  patchState(
+                    {
+                      local_turn: { ...admission.admitted, turn_key: turnKey },
+                      local_turn_request_id: requestId,
+                      local_turn_attachment_id: scope.expected_attachment_id,
+                      local_turn_attached_at: scope.expected_attached_at,
+                    },
+                    { expectedScope: scope },
+                  ) === true
               } catch (error) {
                 log(
                   `typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,
                 )
                 saved = false
+              }
+              const postPatchLive = inspectLiveScope()
+              if (postPatchLive.readError) {
+                log(
+                  `typed-turn-sync: failed to verify connection state after patching local_turn for ${connectionId} (${turnKey}): ${postPatchLive.readError instanceof Error ? postPatchLive.readError.message : String(postPatchLive.readError)}\n`,
+                )
+                return {
+                  action: 'state_write_failed',
+                  requestId,
+                  key: turnKey,
+                  midTurn: effectiveMidTurn,
+                }
+              }
+              if (postPatchLive.moved) {
+                // If a non-scope-aware `patchState` wrote our stale receipt onto the
+                // replacement attachment, roll back ONLY our stale `local_turn*` fields
+                // while preserving the replacement room/attachment untouched (3ea2b201).
+                if (
+                  saved &&
+                  postPatchLive.diskState &&
+                  postPatchLive.diskState.local_turn?.attempt_id === admission.admitted.attempt_id
+                ) {
+                  try {
+                    const cleaned = {
+                      ...postPatchLive.diskState,
+                      local_turn: null,
+                      local_turn_request_id: null,
+                      local_turn_attachment_id: null,
+                      local_turn_attached_at: null,
+                    }
+                    const tmpFile = `${stateFile}.tmp.${process.pid}.${Date.now()}`
+                    fs.writeFileSync(tmpFile, `${JSON.stringify(cleaned, null, 2)}\n`, { mode: 0o600 })
+                    fs.renameSync(tmpFile, stateFile)
+                  } catch {
+                    /* non-fatal: turn stays unsynced and attachment_id mismatch still forces retry */
+                  }
+                } else if (
+                  saved &&
+                  !postPatchLive.hasFile &&
+                  state &&
+                  state.local_turn?.attempt_id === admission.admitted.attempt_id
+                ) {
+                  state.local_turn = null
+                  state.local_turn_request_id = null
+                  state.local_turn_attachment_id = null
+                  state.local_turn_attached_at = null
+                }
+                const refusal = buildMovedRefusal(postPatchLive)
+                log(
+                  `typed-turn-sync: attachment changed during local_turn state write for ${connectionId} (${turnKey}); rolled back stale receipt: ${JSON.stringify(refusal)}\n`,
+                )
+                return {
+                  action: 'admission_failed',
+                  requestId,
+                  key: turnKey,
+                  midTurn: effectiveMidTurn,
+                  refusal,
+                }
               }
               if (!saved) {
                 log(`typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey})\n`)
@@ -1713,11 +1782,18 @@ export async function syncTypedTurnFromTranscript({
           !effectiveMidTurn &&
           !hasActiveRemoteCommandTurn(connectionId, latestBeforeClear, dir, active) &&
           latestBeforeClear.current !== null &&
-          latestBeforeClear.current === reqState.current
+          latestBeforeClear.current === reqState.current &&
+          latestBeforeClear.currentSeq === reqState.currentSeq
         ) {
           appendRequestEvent(
             connectionId,
-            { op: 'current', ref: null, from_sync: true, expected_current: latestBeforeClear.current },
+            {
+              op: 'current',
+              ref: null,
+              from_sync: true,
+              expected_current: latestBeforeClear.current,
+              expected_current_seq: latestBeforeClear.currentSeq,
+            },
             { dir },
           )
         }
@@ -2116,6 +2192,12 @@ export async function syncTypedTurnFromTranscript({
         if (reqState.readError) {
           return { action: 'request_log_unreadable', key: active.key }
         }
+        // If a newer prompt hook or command updated `current` after our initial read
+        // (before we acquired the lock), abort this stale wake cleanup so the next sync
+        // re-reads the transcript and request log together (decision ce71a72b).
+        if (reqState.currentSeq !== initial.currentSeq) {
+          return { action: 'superseded_by_newer_current', key: active.key, active }
+        }
         if (reqState.seenTranscriptTurns.has(active.key)) {
           return { action: 'already_synced', key: active.key, ref: reqState.seenTranscriptTurns.get(active.key) }
         }
@@ -2205,8 +2287,35 @@ export async function syncTypedTurnFromTranscript({
             return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
           }
         }
-        if (!appendRequestEvent(connectionId, { op: 'current', ref: null, from_sync: true }, { dir })) {
+        // Compare-and-swap against `currentSeq` so an in-flight sync cleanup for an older
+        // wake can NEVER erase a newer prompt hook's requester (even if the prompt hook
+        // ran between `readRequestState` and this append, or fired for the same request ID)
+        // (decision ce71a72b).
+        const latestBeforeWakeClear = readRequestState(connectionId, { dir })
+        if (latestBeforeWakeClear.readError) {
+          return { action: 'request_log_unreadable', key: active.key }
+        }
+        if (latestBeforeWakeClear.currentSeq !== reqState.currentSeq) {
+          return { action: 'superseded_by_newer_current', key: active.key, active }
+        }
+        if (
+          !appendRequestEvent(
+            connectionId,
+            {
+              op: 'current',
+              ref: null,
+              from_sync: true,
+              expected_current: reqState.current,
+              expected_current_seq: reqState.currentSeq,
+            },
+            { dir },
+          )
+        ) {
           return { action: 'binding_write_failed', key: active.key, active }
+        }
+        const afterWakeClear = readRequestState(connectionId, { dir })
+        if (!afterWakeClear.readError && afterWakeClear.current !== null) {
+          return { action: 'superseded_by_newer_current', key: active.key, active }
         }
         if (
           !hasPendingUnmatchedNotificationId &&
@@ -2333,26 +2442,38 @@ export async function finishIdleRequests({
       : null
 
   const initialCurrent = reqState.current
+  const initialCurrentSeq = reqState.currentSeq
   const initialJoined = new Set(reqState.joined)
   const initialStamp = active.stamp
   const clearEndedForeground = async () => {
     if (!initialCurrent) return
     await withTypedSyncLock(connectionId, dir, async () => {
       // Re-verify the transcript FIRST, then `.requests.jsonl` immediately after, so a
-      // new live typed turn OR room command arriving while reading the transcript is
-      // NEVER cleared (ce71a72b).
+      // new live typed turn OR prompt hook arriving while reading the transcript is
+      // NEVER cleared — even if the new scheduled wake carries the same request ID
+      // (compare-and-swap via `expected_current_seq`, decision ce71a72b).
       const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
       if (!latestActive || !latestActive.ended || latestActive.stamp !== initialStamp) return
       const curState = readRequestState(connectionId, { dir })
       if (curState.readError) return
-      if (!curState.current || curState.current !== initialCurrent) return
+      if (!curState.current || curState.current !== initialCurrent || curState.currentSeq !== initialCurrentSeq) return
       const curInfo = curState.open.get(curState.current)
       const shouldClear =
         curState.currentFromWake ||
         curState.currentBoundByWake ||
         curInfo?.kind === 'typed_prompt'
       if (shouldClear) {
-        appendRequestEvent(connectionId, { op: 'current', ref: null, from_sync: true, expected_current: curState.current }, { dir })
+        appendRequestEvent(
+          connectionId,
+          {
+            op: 'current',
+            ref: null,
+            from_sync: true,
+            expected_current: curState.current,
+            expected_current_seq: curState.currentSeq,
+          },
+          { dir },
+        )
       }
     })
   }
