@@ -104,6 +104,7 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
+  hasWritableDiagnosticNoteStore,
   shellDiagnosticReserve,
   wakeInNote,
   wakesForOneOutput,
@@ -804,6 +805,37 @@ export async function readWakes({
           if (fitsShellOutput(`${candidateDetailed}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateDetailed
           else if (fitsShellOutput(`${candidateShort}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateShort
           else if (fitsShellOutput(`${candidateCounts}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateCounts
+        }
+      }
+    }
+
+    // Pre-flight check: when this page carries inline room commands that will call
+    // report_pickup, verify at least one diagnostic note store is writable BEFORE writing
+    // stdout or calling report_pickup so an oversized refusal can never be lost or truncated
+    // after a near-ceiling wake is printed (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    if (resolvedConnectionId && page.printed > 0 && (inlineCommands.length > 0 || noteRefusals.length > 0)) {
+      const storeProbe = hasWritableDiagnosticNoteStore({
+        home,
+        fallbackDir: dir ? path.join(dir, 'diagnostic-notes') : null,
+      })
+      if (!storeProbe.ok) {
+        const errPayload = {
+          error: 'no_writable_diagnostic_note_store',
+          stores_tried: storeProbe.errors,
+          recovery:
+            'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
+        }
+        writeStderr(
+          `devspec-wake-tail: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
+        )
+        return {
+          ...page,
+          text: pageText,
+          printed: 0,
+          remaining: effectiveRemaining,
+          marked: false,
+          pickup_diagnostic_written: true,
+          error: new Error(`no_writable_diagnostic_note_store: ${JSON.stringify(storeProbe.errors)}`),
         }
       }
     }

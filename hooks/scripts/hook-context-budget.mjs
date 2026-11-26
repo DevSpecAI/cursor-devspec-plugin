@@ -890,6 +890,40 @@ function shellQuotePath(value) {
 }
 
 /**
+ * Probe whether at least one diagnostic note store (`~/.devspec/notes`, private
+ * `os.tmpdir()/devspec-notes-<uid>`, or `fallbackDir`) can write a file right now.
+ * Used before printing a room-command wake to stdout so a near-limit Shell command
+ * never emits stdout when NO store is available to save an oversized pickup refusal
+ * whole for retrieval (requirements 3c5147a7 / 91d7b47c / 4e32d1a5 / 3ea2b201).
+ */
+export function hasWritableDiagnosticNoteStore({ home = os.homedir(), fallbackDir = null } = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const candidates = [
+    { store: 'home_notes', dir: path.join(home, NOTES_DIR) },
+    { store: 'tmp_notes', dir: path.join(os.tmpdir(), `devspec-notes-${uid}`) },
+    ...(fallbackDir ? [{ store: 'connections_diagnostic_notes', dir: fallbackDir }] : []),
+  ]
+  const errors = []
+  for (const candidate of candidates) {
+    const probe = path.join(candidate.dir, `.probe-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.tmp`)
+    try {
+      fs.mkdirSync(candidate.dir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(probe, '', { mode: 0o600 })
+      try { fs.rmSync(probe, { force: true }) } catch { /* ignore cleanup */ }
+      return { ok: true, store: candidate.store, dir: candidate.dir }
+    } catch (error) {
+      try { fs.rmSync(probe, { force: true }) } catch { /* ignore cleanup */ }
+      errors.push({
+        store: candidate.store,
+        code: error && typeof error === 'object' && 'code' in error ? String(error.code) : 'write_failed',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return { ok: false, errors }
+}
+
+/**
  * Private fallback note store under `os.tmpdir()` used only when `~/.devspec/notes`
  * cannot be written, so the exact original oversized refusal/diagnostic is still saved
  * whole in Shell-sized parts on disk and can be read back with `cat` without making a

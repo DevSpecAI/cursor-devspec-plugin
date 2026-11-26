@@ -88,6 +88,7 @@ import {
   CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
+  hasWritableDiagnosticNoteStore,
   shellDiagnosticPointer,
   shellDiagnosticReserve,
   wakeInNote,
@@ -2413,6 +2414,17 @@ async function main() {
                 if (plan.held) {
                   return { count: 0, held: plan.error, pickupFailed: false, shot: null, pickup }
                 }
+                const frozenCmdInfo = extractRoomCommandsFromWake(plan.text)
+                const hasFrozenCmds = frozenCmdInfo.inlineCommands.length > 0 || frozenCmdInfo.unreadableNotes.length > 0
+                if (hasFrozenCmds) {
+                  const storeProbe = hasWritableDiagnosticNoteStore({
+                    home: os.homedir(),
+                    fallbackDir: path.join(CONNECTIONS_DIR, 'diagnostic-notes'),
+                  })
+                  if (!storeProbe.ok) {
+                    return { count: 0, noteStoreError: storeProbe, held: null, pickupFailed: false, shot: null, pickup }
+                  }
+                }
                 // Write the selected wake to stdout FIRST and await completion before calling
                 // report_pickup, persisting started commands, writing `.turn`, or advancing
                 // wake_batch_progress / inbox cursor (req 3ea2b201).
@@ -2421,7 +2433,6 @@ async function main() {
                 } catch (stdoutError) {
                   return { count: 0, stdoutError, held: null, pickupFailed: false, shot: null, pickup }
                 }
-                const frozenCmdInfo = extractRoomCommandsFromWake(plan.text)
                 for (const deferred of frozenCmdInfo.deferredNoteCommands) {
                   registerPendingWakeNote(
                     connectionId,
@@ -2434,7 +2445,6 @@ async function main() {
                     { dir: CONNECTIONS_DIR },
                   )
                 }
-                const hasFrozenCmds = frozenCmdInfo.inlineCommands.length > 0 || frozenCmdInfo.unreadableNotes.length > 0
                 if (hasFrozenCmds) {
                   pickup = await runOneShotRoomCommandPickup({
                     connectionId,
@@ -2487,6 +2497,20 @@ async function main() {
             )
             await sleep(pollMs)
             continue
+          }
+          if (frozenOut.noteStoreError) {
+            const errPayload = {
+              error: 'no_writable_diagnostic_note_store',
+              stores_tried: frozenOut.noteStoreError.errors,
+              recovery:
+                'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
+            }
+            process.stderr.write(
+              `devspec-remote-wait: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
+            )
+            retryStderr.flush()
+            process.exitCode = 1
+            return
           }
           if (frozenOut.stdoutError) {
             retryStderr.flush()
@@ -2610,6 +2634,35 @@ async function main() {
             await sleep(pollMs)
             continue
           }
+          const ownerCmdInfo = extractRoomCommandsFromWake(plan.text)
+          const hasOwnerCmds =
+            batch.type === 'owner_messages' &&
+            (ownerCmdInfo.inlineCommands.length > 0 || ownerCmdInfo.unreadableNotes.length > 0)
+          // Pre-flight check: when this wake carries room commands that will call report_pickup,
+          // verify at least one diagnostic note store (~/.devspec/notes, os.tmpdir(), or
+          // CONNECTIONS_DIR/diagnostic-notes) is writable BEFORE writing stdout or calling
+          // report_pickup. Otherwise an oversized refusal after near-ceiling stdout would have
+          // nowhere on disk to save whole and could not fit inline (req 3c5147a7 / 4e32d1a5 / 91d7b47c).
+          if (hasOwnerCmds) {
+            const storeProbe = hasWritableDiagnosticNoteStore({
+              home: os.homedir(),
+              fallbackDir: path.join(CONNECTIONS_DIR, 'diagnostic-notes'),
+            })
+            if (!storeProbe.ok) {
+              const errPayload = {
+                error: 'no_writable_diagnostic_note_store',
+                stores_tried: storeProbe.errors,
+                recovery:
+                  'Fix write permissions on ~/.devspec/notes, the system temp directory, or ~/.devspec/remote-control/connections/diagnostic-notes and retry.',
+              }
+              process.stderr.write(
+                `devspec-remote-wait: refusing wake delivery because no diagnostic note store is writable: ${JSON.stringify(errPayload)}\n`,
+              )
+              retryStderr.flush()
+              process.exitCode = 1
+              return
+            }
+          }
           // Hand the wake over to stdout FIRST. If stdout fails (e.g. broken pipe / closed
           // pipe), exit immediately with zero report_pickup calls, zero started-command
           // ledger writes, zero Working marker writes, and zero inbox cursor movement (req 3ea2b201).
@@ -2619,7 +2672,6 @@ async function main() {
             retryStderr.flush()
             throw stdoutError
           }
-          const ownerCmdInfo = extractRoomCommandsFromWake(plan.text)
           for (const deferred of ownerCmdInfo.deferredNoteCommands) {
             registerPendingWakeNote(
               connectionId,
@@ -2632,9 +2684,6 @@ async function main() {
               { dir: CONNECTIONS_DIR },
             )
           }
-          const hasOwnerCmds =
-            batch.type === 'owner_messages' &&
-            (ownerCmdInfo.inlineCommands.length > 0 || ownerCmdInfo.unreadableNotes.length > 0)
           // In one-shot mode, start ONLY inline canonical room commands selected for this
           // Shell output AFTER stdout succeeded and BEFORE advancing the inbox cursor /
           // wake_batch_progress. Oversized commands sent as `wake_in_note` defer pickup

@@ -722,9 +722,6 @@ function isConfirmedPickupResponse(res) {
   if (res.phase === 'working' && typeof res.attempt_id === 'string' && res.attempt_id.length > 0) {
     return true
   }
-  if (res.ok === true && res.outcome === undefined && res.status === undefined) {
-    return true
-  }
   return false
 }
 

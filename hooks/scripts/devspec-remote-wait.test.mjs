@@ -2056,4 +2056,87 @@ describe('the one-shot wait freezes a delivery it splits over two results', () =
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('one-shot CLI refuses cleanly BEFORE stdout and report_pickup when ALL THREE diagnostic note stores are unwritable (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-wait-all-stores-blocked-'))
+    const blockedHome = path.join(dir, 'home')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'not-a-directory\n')
+    const blockedTmp = path.join(dir, 'tmp-not-a-dir')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    // Also block the 3rd fallback store (`dir/diagnostic-notes`) with a regular file.
+    fs.writeFileSync(path.join(dir, 'diagnostic-notes'), 'not-a-directory\n')
+
+    const connectionId = randomUUID()
+    const sessionId = 'sess-all-stores-blocked'
+    let pickupCalls = 0
+    const mcpServer = http.createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        pickupCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ outcome: 'picked_up' }) }] } }))
+      })
+    })
+    await new Promise((resolve) => mcpServer.listen(0, '127.0.0.1', resolve))
+    const { port } = mcpServer.address()
+
+    const inbox = path.join(dir, `${connectionId}.inbox.jsonl`)
+    const script = fileURLToPath(new URL('./devspec-remote-wait.mjs', import.meta.url))
+    fs.writeFileSync(
+      path.join(dir, `${connectionId}.json`),
+      JSON.stringify({
+        enabled: true,
+        connection_id: connectionId,
+        session_id: sessionId,
+        mcp_url: `http://127.0.0.1:${port}/api/mcp`,
+        token: 'test-token',
+      }),
+      { mode: 0o600 },
+    )
+    const batch = canonicalBatch(fixtureCommand('Please check the build.'), { session_id: sessionId })
+    batch.connection_id = connectionId
+    batch.messages[0].addressee.connection_id = connectionId
+    batch.ingress.envelope.connection.connection_id = connectionId
+    batch.ingress.envelope.commands = batch.messages
+    batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
+    fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`)
+    const env = {
+      ...process.env,
+      HOME: blockedHome,
+      TMPDIR: blockedTmp,
+      TMP: blockedTmp,
+      TEMP: blockedTmp,
+      DEVSPEC_REMOTE_CONNECTIONS_DIR: dir,
+    }
+    delete env.DEVSPEC_MCP_TOKEN
+    try {
+      const res = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [script, '--connection-id', connectionId, '--pending', '--poll-ms', '20'],
+          { env, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (d) => { stdout += d.toString() })
+        child.stderr.on('data', (d) => { stderr += d.toString() })
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('timeout')) }, 15_000)
+        child.once('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }) })
+      })
+      assert.equal(res.code, 1, `expected exit 1 when all diagnostic note stores are unwritable; stderr=${res.stderr}`)
+      assert.equal(res.stdout, '', 'stdout must remain empty when refusing before delivery')
+      assert.equal(pickupCalls, 0, 'must NOT call report_pickup when all diagnostic note stores are unwritable')
+      assert.match(res.stderr, /no_writable_diagnostic_note_store/)
+      assert.match(res.stderr, /home_notes/)
+      assert.match(res.stderr, /tmp_notes/)
+      assert.match(res.stderr, /connections_diagnostic_notes/)
+      assert.ok(fitsShellOutput(res.stdout + res.stderr))
+      const stateAfter = JSON.parse(fs.readFileSync(path.join(dir, `${connectionId}.json`), 'utf8'))
+      assert.equal(stateAfter.inbox_byte_offset ?? 0, 0, 'inbox offset must remain untouched')
+    } finally {
+      await new Promise((resolve) => mcpServer.close(resolve))
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })

@@ -2444,5 +2444,27 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false, '.turn must not be written')
     const startedFile = path.join(dir, `${CONN}.started-commands.json`)
     assert.equal(fs.existsSync(startedFile), false, 'started-command ledger must not advance on unconfirmed reply')
+
+    // Bare `{ ok: true }` without explicit pickup outcome (`picked_up` / `already_working` / `started`)
+    // or working-attempt receipt (`phase: 'working'` + `attempt_id`) MUST also be rejected.
+    const bareOkRes = await startRoomCommands({
+      connectionId: CONN,
+      commands: [cmd],
+      sessionId: ROOM,
+      dir,
+      home,
+      call: async () => ({ ok: true }),
+      seedFn: async () => { throw new Error('must not seed trail on bare { ok: true }') },
+      ensureWatch: () => { throw new Error('must not ensure watch on bare { ok: true }') },
+      log: (line) => logs.push(line),
+    })
+    assert.equal(bareOkRes.ok, false)
+    assert.equal(bareOkRes.outcome, 'refused')
+    assert.deepEqual(bareOkRes.started, [])
+    assert.equal(bareOkRes.pickedUp, 0)
+    assert.equal(bareOkRes.refusals[0].refusal.code, 'unrecognized_pickup_response')
+    assert.deepEqual(bareOkRes.refusals[0].refusal.response, { ok: true })
+    assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false)
+    assert.equal(fs.existsSync(startedFile), false)
   })
 })
