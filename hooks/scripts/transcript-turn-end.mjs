@@ -1134,7 +1134,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
-              currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText })
+              currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText, hasModelOutputAfter: false })
             } else if (kind === 'other') {
               if (sameTurnTypedRowIndex < 0 && sameTurnOtherRows.length === 0) {
                 liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
@@ -1144,7 +1144,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               sameTurnOtherRows.push(otherEntry)
               allOtherRows.push(otherEntry)
               if (sameTurnTypedRowIndex < 0) {
-                currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText })
+                currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText, hasModelOutputAfter: false })
               }
             }
           }
@@ -1153,6 +1153,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
       } else {
         const hasTurnEndedMarker = sliceContainsMarker(bytes, s, e, TURN_ENDED_MARKER, deadlineMs)
         if (hasTurnEndedMarker === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+        let matchedTurnEnded = false
         if (hasTurnEndedMarker) {
           let row = null
           try {
@@ -1163,6 +1164,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
           lastParsedRow = row
           if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
+            matchedTurnEnded = true
             sawTurnEndedSinceLastNonResumed = true
             liveTurnPrecededByTurnEnded = false
             sameTurnTypedRowIndex = -1
@@ -1171,6 +1173,14 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               endedNonTypedRows.push(...currentTurnNonTypedRows)
               currentTurnNonTypedRows = []
             }
+          }
+        }
+        // Any non-user, non-turn_ended row (e.g. assistant output / tool result) after a
+        // live non-typed wake proves that wake ALREADY ran the model — so a subsequent
+        // `beforeSubmitPrompt` hook cannot possibly be firing for that row (ce71a72b).
+        if (!matchedTurnEnded && currentTurnNonTypedRows.length > 0) {
+          for (const entry of currentTurnNonTypedRows) {
+            entry.hasModelOutputAfter = true
           }
         }
       }
@@ -1295,6 +1305,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
           key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
           kind: entry.kind,
           rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+          hasModelOutputAfter: Boolean(entry.hasModelOutputAfter),
         }))
       : []
   const endedNonTypedWakes = Array.isArray(read.endedNonTypedRows)

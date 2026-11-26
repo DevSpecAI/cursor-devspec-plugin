@@ -569,13 +569,16 @@ export function prepareAgentMirrorText(text) {
 }
 
 /**
- * Snapshot the keys of non-typed wakes already present in `transcriptPath` before a
- * prompt hook fired — both those that already ended (`endedNonTypedWakes`) AND any
- * earlier non-typed wake still open because its `turn_ended` marker has not reached
- * disk yet (`liveNonTypedWakes`, excluding any row already matching `promptText`).
- * `syncTypedTurnFromTranscript` excludes these keys when counting wakes that ended
- * AFTER the hook ran so an earlier wake never consumes a later wake's known
- * prompt-hook attribution (decision ce71a72b).
+ * Snapshot the keys of non-typed wakes proven to belong to earlier turns before a
+ * prompt hook fired:
+ *  - every wake in `endedNonTypedWakes` (already followed by `turn_ended`), AND
+ *  - any live non-typed wake in `liveNonTypedWakes` that ALREADY has model output
+ *    after it (`hasModelOutputAfter: true`), proving it already ran before this
+ *    `beforeSubmitPrompt` hook and is only awaiting a delayed `turn_ended` marker.
+ * A bare `<timestamp>` row at the tail of the transcript with NO model output yet
+ * could be THIS scheduled wake's own row written before the hook ran, so it is NOT
+ * included — ensuring its eventual `turn_ended` still clears attribution before any
+ * later unrelated wake (decision ce71a72b).
  */
 export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = null } = {}) {
   if (!transcriptPath) return undefined
@@ -589,6 +592,7 @@ export function priorEndedWakeKeysForTranscript(transcriptPath, { promptText = n
   if (Array.isArray(snapshot.liveNonTypedWakes)) {
     for (const w of snapshot.liveNonTypedWakes) {
       if (typeof w?.key !== 'string' || !w.key) continue
+      if (w.hasModelOutputAfter !== true) continue
       if (trimmedPrompt && typeof w.rawText === 'string' && w.rawText.trim() === trimmedPrompt) continue
       keys.add(w.key)
     }
@@ -736,6 +740,7 @@ async function main() {
         if (admitted) {
           patchOwnState(connectionId, {
             local_turn: admitted,
+            local_turn_attachment_id: scope.expected_attachment_id,
             ...(typedRequest?.id ? { local_turn_request_id: typedRequest.id } : {}),
           })
         }

@@ -1523,8 +1523,16 @@ export async function syncTypedTurnFromTranscript({
           // Only mark the transcript turn synced once admission, state persistence, and binding
           // write all succeed; on refusal or write failure, preserve details and retry next tick.
           const sessionId = state?.session_id || null
+          const currentAttachmentId = state?.speech_attachment_id || null
+          const attachmentMatches =
+            !currentAttachmentId ||
+            (typeof state?.local_turn_attachment_id === 'string' &&
+              state.local_turn_attachment_id === currentAttachmentId)
           const alreadyAdmittedForThisTurn =
             Boolean(state?.local_turn) &&
+            Boolean(sessionId) &&
+            state.local_turn.session_id === sessionId &&
+            attachmentMatches &&
             (state.local_turn.turn_key === turnKey ||
               (typeof state.local_turn_request_id === 'string' && state.local_turn_request_id === requestId))
           const needsRoomAdmission =
@@ -1585,6 +1593,7 @@ export async function syncTypedTurnFromTranscript({
                   patchState({
                     local_turn: { ...admission.admitted, turn_key: turnKey },
                     local_turn_request_id: requestId,
+                    local_turn_attachment_id: scope.expected_attachment_id,
                   }) === true
               } catch (error) {
                 log(

@@ -3351,6 +3351,9 @@ async function main() {
         active_session_plans: null,
         speech_attachment_id: null,
         attached_at: null,
+        local_turn: null,
+        local_turn_request_id: null,
+        local_turn_attachment_id: null,
       })
       continue
     }

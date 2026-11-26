@@ -6508,17 +6508,22 @@ describe('typed-turn-sync (item da03801e)', () => {
       })
     }
 
-    // Case 3: Earlier wake's `turn_ended` reaches the transcript AFTER `mirror-turn.mjs user_prompt`
-    // ran for Bob's scheduled wake -> sync MUST NOT mistake that delayed end marker for the end of
-    // Bob's wake (ce71a72b), and a later real end of Bob's wake MUST still clear attribution!
+    // Case 3: Earlier wake ALREADY ran (assistant output present) and its `turn_ended` reaches the
+    // transcript AFTER `mirror-turn.mjs user_prompt` ran for Bob's scheduled wake -> sync MUST NOT
+    // mistake that delayed end marker for the end of Bob's wake (ce71a72b), and a later real end of
+    // Bob's wake MUST still clear attribution!
     {
       const { home, dir, transcriptPath } = setupHookEnv()
       const earlierOpenWakeRow = JSON.stringify({
         role: 'user',
         message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
       })
-      // Note: NO `turn_ended` yet when mirror-turn.mjs runs!
-      fs.writeFileSync(transcriptPath, `${earlierOpenWakeRow}\n`)
+      const earlierAssistantRow = JSON.stringify({
+        role: 'assistant',
+        message: { content: [{ type: 'text', text: 'Earlier wake finished responding.' }] },
+      })
+      // Note: assistant output is present, NO `turn_ended` yet when mirror-turn.mjs runs!
+      fs.writeFileSync(transcriptPath, `${earlierOpenWakeRow}\n${earlierAssistantRow}\n`)
 
       const hookRes = runPromptHook(home, {
         conversation_id: CONV,
@@ -6566,6 +6571,132 @@ describe('typed-turn-sync (item da03801e)', () => {
         args: { task_id: 'x' },
       })
     }
+
+    // Case 4: If the scheduled wake's OWN `<timestamp>` row is ALREADY at the tail of the transcript
+    // (with no model output yet) when `mirror-turn.mjs user_prompt` runs, the hook MUST NOT record
+    // that row as a prior ended wake — so when that scheduled wake ends and a later unrelated wake
+    // starts (even if sync never ran during the scheduled wake), sync MUST clear Bob's requester!
+    {
+      const { home, dir, transcriptPath } = setupHookEnv()
+      const bobOwnTimestampRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${bobOwnTimestampRow}\n`)
+
+      const hookRes = runPromptHook(home, {
+        conversation_id: CONV,
+        origin: { kind: 'scheduled-trigger' },
+        prompt: 'bob scheduled check',
+      })
+      assert.equal(hookRes.status, 0, hookRes.stderr)
+      assert.equal(
+        readRequestState(CONN, { dir }).currentWakePriorEndedKeys.size,
+        0,
+        'tail <timestamp> row with no model output yet MUST NOT be treated as a prior wake',
+      )
+
+      // Bob's wake runs, ends, and an unrelated timestamp wake starts BEFORE sync ever runs!
+      const unrelatedRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:30 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n${unrelatedRow}\n`)
+
+      const syncAfter = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(syncAfter.action, 'cleared_for_wake', 'finished scheduled wake whose timestamp was already in transcript at hook time MUST clear for a later unrelated wake')
+      assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+        args: { task_id: 'x' },
+      })
+    }
+  })
+
+  it('when a connection reattaches to a different room (or rotates attachment id), an earlier room admission matching request_id MUST NOT suppress admission in the new room (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const ROOM_NEW = '99999999-9999-4999-8999-999999999999'
+    const ATTACH_OLD = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'
+    const ATTACH_NEW = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2'
+    const OLD_ATTEMPT = '77777777-7777-4777-8777-777777777771'
+    const REQ_REATTACH = '88888888-8888-4888-8888-888888888881'
+    appendRequestEvent(CONN, { op: 'open', id: REQ_REATTACH, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_REATTACH }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Reattached room admission test')}\n`)
+
+    // State holds an earlier admission for REQ_REATTACH in the OLD room (`ROOM`, `ATTACH_OLD`),
+    // while the connection is now attached to `ROOM_NEW` (`ATTACH_NEW`)!
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM_NEW,
+      speech_attachment_id: ATTACH_NEW,
+      attached_at: '2026-11-25T17:05:00.000Z',
+      local_turn: { attempt_id: OLD_ATTEMPT, session_id: ROOM },
+      local_turn_request_id: REQ_REATTACH,
+      local_turn_attachment_id: ATTACH_OLD,
+    }
+    const memo = { stamp: null, synced: false }
+    let pickupCalls = 0
+
+    // Pass 1: room refuses admission in ROOM_NEW -> MUST attempt pickup in ROOM_NEW and stay unsynced!
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        pickupCalls += 1
+        assert.equal(args.expected_session_id, ROOM_NEW)
+        assert.equal(args.expected_attachment_id, ATTACH_NEW)
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM_NEW,
+          attempt_id: args.attempt_id,
+          status: 'foreground_owned_by_command',
+        }
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pickupCalls, 1, 'earlier room admission MUST NOT suppress admission in the new room')
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0)
+
+    // Pass 2: ROOM_NEW admits -> persists new session_id + attachment_id and marks synced!
+    let patched = null
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM_NEW,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        patched = patch
+        return true
+      },
+      dir,
+      memo,
+      log: () => {},
+    })
+    assert.equal(pickupCalls, 2)
+    assert.equal(pass2.action, 'adopted_hook_request')
+    assert.equal(patched?.local_turn?.session_id, ROOM_NEW)
+    assert.equal(patched?.local_turn_attachment_id, ATTACH_NEW)
+    assert.equal(memo.synced, true)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
   })
 
   it('a leftover local_turn admission from an earlier turn is NEVER mistaken for a new prompt-hook typed request whose own admission failed (3ea2b201)', async () => {
