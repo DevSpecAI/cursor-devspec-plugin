@@ -475,9 +475,10 @@ function clearFailedTypedTurn(dir, connectionId, turnKey) {
   if (set.size === 0) failedTypedTurnKeys.delete(fKey)
 }
 
-function allPendingFailedTypedTurns(dir, connectionId) {
+function allPendingFailedTypedTurnsDetailed(dir, connectionId) {
   const combined = new Set()
   const reqState = readRequestState(connectionId, { dir })
+  const readError = reqState.readError ?? null
   for (const key of reqState.failedTranscriptTurns) {
     if (!reqState.seenTranscriptTurns.has(key)) combined.add(key)
   }
@@ -487,22 +488,33 @@ function allPendingFailedTypedTurns(dir, connectionId) {
       if (!reqState.seenTranscriptTurns.has(key)) combined.add(key)
     }
   }
-  return combined
+  return { keys: combined, readError }
+}
+
+function allPendingFailedTypedTurns(dir, connectionId) {
+  return allPendingFailedTypedTurnsDetailed(dir, connectionId).keys
 }
 
 function hasPendingFailedTypedTurns(dir, connectionId) {
-  return allPendingFailedTypedTurns(dir, connectionId).size > 0
+  const detailed = allPendingFailedTypedTurnsDetailed(dir, connectionId)
+  return Boolean(detailed.readError) || detailed.keys.size > 0
 }
 
-function nextQueuedFailedTypedTurn(dir, connectionId, excludeKey = null) {
-  for (const key of allPendingFailedTypedTurns(dir, connectionId)) {
-    if (key !== excludeKey) return key
+function nextQueuedFailedTypedTurnDetailed(dir, connectionId, excludeKey = null) {
+  const detailed = allPendingFailedTypedTurnsDetailed(dir, connectionId)
+  if (detailed.readError) {
+    return { key: null, readError: detailed.readError }
   }
-  return null
+  for (const key of detailed.keys) {
+    if (key !== excludeKey) return { key, readError: null }
+  }
+  return { key: null, readError: null }
 }
 
 function isFailedTurnDeterministicId(dir, connectionId, requestId, excludeKey) {
-  for (const key of allPendingFailedTypedTurns(dir, connectionId)) {
+  const detailed = allPendingFailedTypedTurnsDetailed(dir, connectionId)
+  if (detailed.readError) return true
+  for (const key of detailed.keys) {
     if (key !== excludeKey && deterministicTypedTurnRequestId(connectionId, key) === requestId) {
       return true
     }
@@ -581,23 +593,33 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
     }
     if (entry.restoreForeground) {
       // Re-read the request log AFTER `{ op: 'current', ... }` (which resets `joined`
-      // and `chosen`), never comparing against the stale pre-flush snapshot, so every
-      // joined second-person request and explicit serve choice is faithfully restored
-      // (decision ce71a72b).
+      // and `chosen`), never comparing against the stale pre-flush snapshot, and ONLY
+      // restore `joined` / `serve` when `fg.current` is STILL the active foreground
+      // request. If recovery was interrupted after `currentRestored: true` and a
+      // different live turn replaced `current` before retry, NEVER reapply the older
+      // turn's `joined` or `serve` selection onto the new turn (decision ce71a72b).
       const afterRestore = readRequestState(connectionId, { dir })
       if (afterRestore.readError) return false
-      for (const joinedId of fg.joined) {
-        if (afterRestore.joined.has(joinedId) && afterRestore.current === fg.current) continue
-        if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
-          return false
+      const stillSameForeground =
+        afterRestore.current === fg.current &&
+        (fg.current === null ||
+          (afterRestore.open.has(fg.current) && !afterRestore.open.get(fg.current)?.answered))
+      if (stillSameForeground) {
+        for (const joinedId of fg.joined) {
+          if (afterRestore.joined.has(joinedId)) continue
+          if (!afterRestore.open.has(joinedId) || afterRestore.open.get(joinedId)?.answered) continue
+          if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
+            return false
+          }
         }
-      }
-      if (fg.chosen && fg.current !== null && !afterRestore.chosen) {
-        if (!appendRequestEvent(connectionId, { op: 'serve', ref: fg.current }, { dir })) {
-          return false
+        if (fg.chosen && fg.current !== null && !afterRestore.chosen) {
+          if (!appendRequestEvent(connectionId, { op: 'serve', ref: fg.current }, { dir })) {
+            return false
+          }
         }
       }
       delete entry.restoreForeground
+      savePendingLocalOpen(dir, connectionId, entry)
     }
   }
   if (entry.turnKey && !reqState.seenTranscriptTurns.has(entry.turnKey)) {
@@ -810,10 +832,22 @@ export async function syncTypedTurnFromTranscript({
   }
   const canMarkSynced = () => {
     if (sawRequestLogReadError) return false
-    if (hasPendingFailedTypedTurns(dir, connectionId)) return false
+    const failedLookup = allPendingFailedTypedTurnsDetailed(dir, connectionId)
+    if (failedLookup.readError) {
+      sawRequestLogReadError = true
+      return false
+    }
+    if (failedLookup.keys.size > 0) return false
     const pendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
-    if (pendingLookup.readError || pendingLookup.entries.length > 0) return false
-    if (readRequestState(connectionId, { dir }).readError) return false
+    if (pendingLookup.readError) {
+      sawRequestLogReadError = true
+      return false
+    }
+    if (pendingLookup.entries.length > 0) return false
+    if (readRequestState(connectionId, { dir }).readError) {
+      sawRequestLogReadError = true
+      return false
+    }
     return true
   }
 
@@ -850,6 +884,7 @@ export async function syncTypedTurnFromTranscript({
       }
     }
     if (pendingLookup.readError) {
+      sawRequestLogReadError = true
       log(
         `typed-turn-sync: pending-opens retry queue unreadable for ${connectionId}: ${pendingLookup.readError?.message ?? 'read failed'}\n`,
       )
@@ -863,15 +898,37 @@ export async function syncTypedTurnFromTranscript({
       }
     }
 
-    const queuedKey = nextQueuedFailedTypedTurn(dir, connectionId, excludeKey)
+    const queuedLookup = nextQueuedFailedTypedTurnDetailed(dir, connectionId, excludeKey)
+    if (queuedLookup.readError) {
+      sawRequestLogReadError = true
+      log(
+        `typed-turn-sync: failed-turn retry index unreadable for ${connectionId}: ${queuedLookup.readError?.message ?? 'read failed'}\n`,
+      )
+      return {
+        ran: true,
+        ok: false,
+        result: {
+          action: 'request_log_unreadable',
+          error: queuedLookup.readError?.message ?? 'read failed',
+        },
+      }
+    }
+    const queuedKey = queuedLookup.key
     if (!queuedKey) return { ran: false, ok: canMarkSynced(), result: null }
 
     const reqState = readRequestState(connectionId, { dir })
     if (isBlockingReadError(reqState.readError)) {
+      log(
+        `typed-turn-sync: request log unreadable during retry for ${connectionId} (${queuedKey}): ${reqState.readError?.message ?? 'read failed'}\n`,
+      )
       return {
         ran: true,
         ok: false,
-        result: { action: 'request_log_unreadable', key: queuedKey },
+        result: {
+          action: 'request_log_unreadable',
+          key: queuedKey,
+          error: reqState.readError?.message ?? 'read failed',
+        },
       }
     }
     if (reqState.seenTranscriptTurns.has(queuedKey)) {
@@ -1028,7 +1085,7 @@ export async function syncTypedTurnFromTranscript({
     // if reading `.requests.jsonl` failed transiently (requirement 3ea2b201).
     const verifiedReqStamp = currentReqStamp()
     const verifyState = readRequestState(connectionId, { dir })
-    if (sawRequestLogReadError || verifyState.readError || hasUnseenMatchableNotification(verifyState)) {
+    if (sawRequestLogReadError || verifyState.readError || hasUnseenMatchableNotification(verifyState) || !canMarkSynced()) {
       memo.stamp = active.stamp
       memo.reqFile = reqFile
       memo.reqStamp = reqStampAtStart
@@ -1065,18 +1122,32 @@ export async function syncTypedTurnFromTranscript({
         : active.kind === 'typed' && active.key
           ? [active.key]
           : []
-    if (typedKeys.length === 0) return true
+    if (typedKeys.length === 0) return { ok: true }
     const reqState = readRequestState(connectionId, { dir })
-    if (isBlockingReadError(reqState.readError)) return false
+    if (isBlockingReadError(reqState.readError)) {
+      log(
+        `typed-turn-sync: request log unreadable while scanning unseen typed turns for ${connectionId}: ${reqState.readError?.message ?? 'read failed'}\n`,
+      )
+      return { ok: false, action: 'request_log_unreadable', error: reqState.readError?.message ?? 'read failed' }
+    }
+    const pendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+    if (pendingLookup.readError) {
+      sawRequestLogReadError = true
+      log(
+        `typed-turn-sync: pending-opens retry queue unreadable while scanning unseen typed turns for ${connectionId}: ${pendingLookup.readError?.message ?? 'read failed'}\n`,
+      )
+      return { ok: false, action: 'pending_opens_unreadable', error: pendingLookup.readError?.message ?? 'read failed' }
+    }
+    const pendingByTurnKey = new Set(pendingLookup.entries.map(([, e]) => e.turnKey))
     const unseen = typedKeys.filter(
       (key) =>
         key !== excludeLiveKey &&
         !reqState.seenTranscriptTurns.has(key) &&
-        !getPendingLocalOpen(dir, connectionId, key),
+        !pendingByTurnKey.has(key),
     )
-    if (unseen.length === 0) return true
+    if (unseen.length === 0) return { ok: true }
     const boundRefs = new Set(reqState.seenTranscriptTurns.values())
-    const pendingIds = new Set(pendingOpensForConnection(dir, connectionId).map(([, e]) => e.requestId))
+    const pendingIds = new Set(pendingLookup.entries.map(([, e]) => e.requestId))
     const unboundHookIds = []
     for (const [id, info] of reqState.open) {
       if (
@@ -1106,10 +1177,10 @@ export async function syncTypedTurnFromTranscript({
     }
     for (let i = 0; i < pairCount; i += 1) {
       if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: coveredUnseen[i], ref: matchedHooks[i], historical: true }, { dir })) {
-        return false
+        return { ok: false, action: 'binding_write_failed' }
       }
     }
-    return true
+    return { ok: true }
   }
 
   const syncLiveTypedTurn = async (turnKey) =>
@@ -1347,8 +1418,14 @@ export async function syncTypedTurnFromTranscript({
   // hook-created typed_prompt and not `liveTypedKey` for this live turn) BEFORE
   // advancing sync state so two (or more) typed turns that finish between poller
   // reads are never skipped or marked synced prematurely (requirement 3ea2b201).
-  if (!enqueueUnseenTypedTurns(liveTypedKey)) {
-    return { action: 'binding_write_failed', key: active.key, active }
+  const enqueued = enqueueUnseenTypedTurns(liveTypedKey)
+  if (!enqueued.ok) {
+    return {
+      action: enqueued.action ?? 'binding_write_failed',
+      key: active.key,
+      active,
+      ...(enqueued.error ? { error: enqueued.error } : {}),
+    }
   }
 
   // Reconcile any unseen historical/ended `<task-notification>` rows BEFORE returning on
@@ -1356,7 +1433,13 @@ export async function syncTypedTurnFromTranscript({
   // without altering live turn foreground state (requirement 3ea2b201).
   for (const wakeRow of historicalWakeRows) {
     const preState = readRequestState(connectionId, { dir })
-    if (preState.readError) return { action: 'request_log_unreadable', key: wakeRow.key }
+    if (preState.readError) {
+      sawRequestLogReadError = true
+      log(
+        `typed-turn-sync: request log unreadable while reconciling historical wake for ${connectionId}: ${preState.readError?.message ?? 'read failed'}\n`,
+      )
+      return { action: 'request_log_unreadable', key: wakeRow.key, error: preState.readError?.message ?? 'read failed' }
+    }
     if (preState.seenTranscriptTurns.has(wakeRow.key)) continue
     if (!resolveWakeForText(wakeRow.rawText, preState)) continue
     const histRes = await withTypedSyncLock(
@@ -1364,7 +1447,13 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const reqState = readRequestState(connectionId, { dir })
-        if (reqState.readError) return { action: 'request_log_unreadable', key: wakeRow.key }
+        if (reqState.readError) {
+          sawRequestLogReadError = true
+          log(
+            `typed-turn-sync: request log unreadable while reconciling historical wake for ${connectionId}: ${reqState.readError?.message ?? 'read failed'}\n`,
+          )
+          return { action: 'request_log_unreadable', key: wakeRow.key, error: reqState.readError?.message ?? 'read failed' }
+        }
         if (reqState.seenTranscriptTurns.has(wakeRow.key)) {
           return { action: 'already_synced', key: wakeRow.key }
         }

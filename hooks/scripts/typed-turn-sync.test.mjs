@@ -3486,4 +3486,163 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(after.open.has(QUEUED_REQ), true, 'queued request must be persisted once retry queue reads recover')
     assert.equal(after.seenTranscriptTurns.get(turnKey), QUEUED_REQ)
   })
+
+  it('failed request-log read in the retry index logs the error, keeps memo unsynced, and retries the queued request once readable (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+
+    // Turn 1 failed earlier and is queued via typed_turn_failed in .requests.jsonl;
+    // Transcript is now ended on a non-typed row so sync runs retryQueuedFailedTurn().
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier failed turn')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+    appendRequestEvent(CONN, { op: 'typed_turn_failed', key: turnKey }, { dir })
+    const assistantRow = JSON.stringify({
+      role: 'assistant',
+      message: { content: [{ type: 'text', text: 'Idle turn complete' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${assistantRow}\n${turnEndedRow()}\n`)
+
+    const reqFile = path.join(dir, `${CONN}.requests.jsonl`)
+    const origReadFileSync = fs.readFileSync
+    let reqReads = 0
+    let injectedFail = false
+    const logs = []
+    const memo = {}
+    let openedIds = []
+
+    // Let the initial startReqState read succeed, then inject a transient EACCES read error
+    // specifically when the failed-turn retry index reads .requests.jsonl!
+    fs.readFileSync = (targetPath, ...rest) => {
+      if (String(targetPath) === reqFile) {
+        reqReads += 1
+        if (reqReads === 2) {
+          injectedFail = true
+          const err = new Error('EACCES: permission denied reading retry index')
+          err.code = 'EACCES'
+          throw err
+        }
+      }
+      return origReadFileSync.call(fs, targetPath, ...rest)
+    }
+    try {
+      const failedPass = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openedIds.push(args.request_id)
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+        log: (line) => logs.push(line),
+      })
+      assert.equal(injectedFail, true, 'must have injected read error on retry index read')
+      assert.equal(failedPass.action, 'request_log_unreadable')
+      assert.equal(memo.synced, false, 'poller must NOT mark sync complete when retry index read fails')
+      assert.ok(
+        logs.some((l) => /retry index unreadable|EACCES/i.test(l)),
+        `must log the retry index read error; got logs=${JSON.stringify(logs)}`,
+      )
+      assert.equal(openedIds.length, 0)
+    } finally {
+      fs.readFileSync = origReadFileSync
+    }
+
+    // Next pending-sync probe MUST report work still pending, and next pass MUST open the queued turn!
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), true)
+    const recovered = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        openedIds.push(args.request_id)
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      dir,
+      memo,
+    })
+    assert.equal(recovered.action, 'opened')
+    assert.equal(openedIds.length, 1, 'queued request must be opened once retry index reads recover')
+    assert.equal(memo.synced, true)
+  })
+
+  it('interrupted older-turn recovery after currentRestored never reapplies previous sender selection or joined onto a different live turn (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CAROL = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222f2'
+    const CMD_CAROL = '33333333-3333-4333-8333-3333333333f3'
+    const OLDER_REQ = '77777777-7777-4777-8777-7777777777f4'
+
+    // Older terminal turn had already been opened and started, then recovery was interrupted
+    // right after `currentRestored: true` (restoring CMD_ALICE) and BEFORE restoring `joined`
+    // and `serve CMD_ALICE`. Before retry runs, a DIFFERENT live room turn from Carol starts!
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier terminal turn')}\n${turnEndedRow()}\n${cmdRow}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: OLDER_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: OLDER_REQ }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    // New live room turn from Carol arrives before interrupted recovery retries!
+    appendRequestEvent(CONN, { op: 'open', id: CMD_CAROL, kind: 'command', requested_by: CAROL }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_CAROL }, { dir })
+
+    const beforeStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(beforeStamped.args?.request_ref, CMD_CAROL, 'live claim before retry carries Carol’s reference')
+
+    // Persist the interrupted recovery state in `.pending-opens.json` with `currentRestored: true`.
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({
+        [turnKey]: {
+          requestId: OLDER_REQ,
+          requestedBy: ALI,
+          turnKey,
+          restoreForeground: {
+            current: CMD_ALICE,
+            fromWake: false,
+            boundByWake: false,
+            wakeNotifiedKeys: [],
+            joined: [CMD_BOB],
+            chosen: true,
+            currentRestored: true,
+          },
+        },
+      }),
+      { mode: 0o600 },
+    )
+
+    await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('already opened on DevSpec') },
+      dir,
+    })
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_CAROL, 'Carol’s live room command MUST remain current')
+    assert.equal(after.joined.has(CMD_BOB), false, 'previous turn’s joined sender MUST NOT be reapplied onto Carol’s live turn')
+    assert.equal(after.chosen, false, 'previous turn’s serve selection MUST NOT be reapplied onto Carol’s live turn')
+    const afterStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(
+      afterStamped.args?.request_ref,
+      CMD_CAROL,
+      'the same claim MUST still carry Carol’s reference, never reverting to Alice’s previous turn',
+    )
+    assert.equal(after.seenTranscriptTurns.get(turnKey), OLDER_REQ)
+  })
 })
