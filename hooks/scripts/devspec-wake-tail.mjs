@@ -529,8 +529,6 @@ function eventsOf(wake) {
  * cannot write just now stops the read before it: the wakes before it go out, and when
  * it is the first, the header alone says so, so it is tried again on the next read.
  */
-const PICKUP_DIAGNOSTIC_RESERVE = shellDiagnosticReserve('devspec-wake-tail')
-
 export function readerPage(wakes, { home = os.homedir(), skip = () => false, listener = null, reserve = '' } = {}) {
   const kept = []
   for (let i = 0; i < wakes.length; i += 1) if (wakes[i].trim() && !skip(wakes[i])) kept.push(i)
@@ -636,6 +634,10 @@ export async function readWakes({
     const position = readPosition(resolved, key, dir)
     const { start, wakes } = await unreadWakes(resolved, position, { settleMs })
     const listener = listenerAdvice(readListenerLease(resolved, key, dir), resolved, { scriptPath, connectionId, isAlive })
+    const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
+    const pickupDiagnosticReserve = shellDiagnosticReserve('devspec-wake-tail', {
+      fallbackDir: fallbackNoteDir,
+    })
     const hasRoomCommands =
       Boolean(resolvedConnectionId) &&
       wakes.some((wake) => {
@@ -647,7 +649,7 @@ export async function readWakes({
       {
         home,
         listener,
-        reserve: hasRoomCommands ? PICKUP_DIAGNOSTIC_RESERVE : '',
+        reserve: hasRoomCommands ? pickupDiagnosticReserve : '',
         skip: (wake) => withoutEndedConnectionWakes(wake, { dir, write: () => {} }) === '',
       },
     )
@@ -723,6 +725,7 @@ export async function readWakes({
             allowMinimalEnvelope: false,
           }),
         requireStructuredFallback: true,
+        fallbackDir: fallbackNoteDir,
       })
       if (fittedWithStdout.text) {
         await write(page.text)
@@ -741,6 +744,7 @@ export async function readWakes({
               savedNote,
             }),
           requireStructuredFallback: true,
+          fallbackDir: fallbackNoteDir,
         })
         pickupDiagnosticNote = fittedFullBudget.note
         if (fittedFullBudget.text) {
@@ -802,9 +806,9 @@ export async function readWakes({
           const candidateDetailed = readerHeader(page.printed, effectiveRemaining, detailedNote, listener) + body
           const candidateShort = readerHeader(page.printed, effectiveRemaining, shortNote, listener) + body
           const candidateCounts = readerHeader(page.printed, effectiveRemaining, null, listener) + body
-          if (fitsShellOutput(`${candidateDetailed}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateDetailed
-          else if (fitsShellOutput(`${candidateShort}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateShort
-          else if (fitsShellOutput(`${candidateCounts}${PICKUP_DIAGNOSTIC_RESERVE}`)) pageText = candidateCounts
+          if (fitsShellOutput(`${candidateDetailed}${pickupDiagnosticReserve}`)) pageText = candidateDetailed
+          else if (fitsShellOutput(`${candidateShort}${pickupDiagnosticReserve}`)) pageText = candidateShort
+          else if (fitsShellOutput(`${candidateCounts}${pickupDiagnosticReserve}`)) pageText = candidateCounts
         }
       }
     }

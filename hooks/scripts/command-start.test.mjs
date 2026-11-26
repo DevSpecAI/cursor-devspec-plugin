@@ -17,7 +17,7 @@ import {
   wakeListenerInfo,
   wakeNeededPath,
 } from './command-start.mjs'
-import { appendWakeEvents, REMOTE_WAKE_NOTIFY_PATTERN } from './devspec-wake-file.mjs'
+import { appendWakeEvents, REMOTE_WAKE_NOTIFY_PATTERN, wakeLines } from './devspec-wake-file.mjs'
 import { readWakes } from './devspec-wake-tail.mjs'
 import {
   buildOwnerMessageEvents,
@@ -27,7 +27,7 @@ import {
   runOneShotRoomCommandPickup,
 } from './devspec-remote-wait.mjs'
 import { fastConnect } from './fast-connect.mjs'
-import { fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote, writeNote } from './hook-context-budget.mjs'
+import { CURSOR_SHELL_OUTPUT_MAX_CHARS, fitsShellOutput, readNoteText, shellDiagnosticReserve, wakeInNote, writeNote } from './hook-context-budget.mjs'
 import { mcpToolsCall } from './mcp-call.mjs'
 import { ensureWakeFollowForConnection, withWakeFollowLock } from './remote-control-state.mjs'
 import { readRequestState } from './requests.mjs'
@@ -465,7 +465,10 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       dir,
       home,
       call: async (req) => {
-        if (req.name === 'report_complete') completeCalls.push(req.arguments)
+        if (req.name === 'report_complete') {
+          completeCalls.push(req.arguments)
+          return { phase: 'done', closed_as: 'completed' }
+        }
         return { outcome: 'picked_up' }
       },
       seedFn: async () => {},
@@ -491,7 +494,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       call: async (req) => {
         seenTimeouts.push({ name: req.name, timeoutMs: req.timeoutMs })
         clock += 5_000
-        return { outcome: 'picked_up' }
+        return req.name === 'report_complete'
+          ? { phase: 'done', closed_as: 'completed' }
+          : { outcome: 'picked_up' }
       },
       seedFn: async (opts) => {
         seenTimeouts.push({ name: 'seed', timeoutMs: opts.timeoutMs })
@@ -2466,5 +2471,118 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.deepEqual(bareOkRes.refusals[0].refusal.response, { ok: true })
     assert.equal(fs.existsSync(path.join(dir, `${CONN}.turn`)), false)
     assert.equal(fs.existsSync(startedFile), false)
+  })
+
+  it('startRoomCommands preserves stale .turn and turn-commands and does not call report_pickup on an unrecognized report_complete reply (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const staleTurnFile = path.join(dir, `${CONN}.turn`)
+    const staleCmdsFile = path.join(dir, `${CONN}.turn-commands.json`)
+    fs.writeFileSync(staleTurnFile, JSON.stringify({ startedAt: Date.now() - 120_000, connection_id: CONN }))
+    fs.writeFileSync(
+      staleCmdsFile,
+      JSON.stringify({
+        version: 1,
+        commands: [{ turn_id: '11111111-1111-4111-8111-111111111111', message_id: '22222222-2222-4222-8222-222222222222' }],
+      }),
+    )
+    const calls = []
+    const res = await startRoomCommands({
+      connectionId: CONN,
+      commands: [{ turnId: TURN_ID, messageId: MSG_ID }],
+      dir,
+      home,
+      call: async (req) => {
+        calls.push(req.name)
+        return { ok: true }
+      },
+      seedFn: async () => { throw new Error('must not seed on unrecognized report_complete') },
+      ensureWatch: () => { throw new Error('must not ensure watch on unrecognized report_complete') },
+      log: () => {},
+    })
+    assert.equal(res.ok, false)
+    assert.equal(res.outcome, 'refused')
+    assert.deepEqual(calls, ['report_complete'], 'must NOT call report_pickup when stale report_complete was unconfirmed')
+    assert.equal(res.refusals[0].refusal.code, 'unrecognized_complete_response')
+    assert.equal(fs.existsSync(staleTurnFile), true, 'stale .turn marker must remain intact for retry')
+    assert.equal(fs.existsSync(staleCmdsFile), true, 'stale turn-commands record must remain intact for retry')
+  })
+
+  it('readWakes reserves space for a long connections-directory diagnostic-notes fallback path so near-ceiling refusal pointers never disappear (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-wake-long-dir-'))
+    const blockedHome = path.join(base, 'home')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'not-a-directory\n')
+    const blockedTmp = path.join(base, 'tmp-not-a-dir')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    // Create a deeply nested writable connections directory whose fallback note path exceeds 600 chars!
+    const deepSegments = Array.from({ length: 12 }, (_, i) => `nested-connections-segment-${String(i).padStart(2, '0')}-${'x'.repeat(45)}`)
+    const longDir = path.join(base, ...deepSegments)
+    fs.mkdirSync(longDir, { recursive: true })
+    const wakeFile = path.join(longDir, `${CONN}.wakes.jsonl`)
+    // Size the wake right at the maximum inline ceiling allowed beside the dynamic
+    // `longDir/diagnostic-notes` reserve so without accounting for `longDir`, the saved
+    // refusal's `cat` read command would overflow fitsShellOutput and vanish.
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', {
+      fallbackDir: path.join(longDir, 'diagnostic-notes'),
+    }).length
+    const targetWakeLen = CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - 250
+    let bodyLen = 8_000
+    for (let pass = 0; pass < 6; pass += 1) {
+      const measured = wakeLines(buildOwnerMessageEvents(ownerBatch('L'.repeat(bodyLen)))).length
+      bodyLen = Math.max(100, bodyLen + Math.floor((targetWakeLen - measured) / 2))
+    }
+    const batch = ownerBatch('L'.repeat(bodyLen))
+    const built = buildOwnerMessageEvents(batch)
+    appendWakeEvents(wakeFile, built)
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    try {
+      let stdout = ''
+      let stderr = ''
+      const res = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home: blockedHome,
+        dir: longDir,
+        settleMs: 10,
+        write: async (text) => { stdout += text },
+        writeStderr: (text) => { stderr += text },
+        startCommands: async () => ({
+          ok: false,
+          outcome: 'refused',
+          started: [],
+          pickedUp: 0,
+          refusals: [
+            {
+              command_message_id: MSG_ID,
+              command_turn_id: TURN_ID,
+              refusal: {
+                code: 'turn_busy_long_dir',
+                blocking_items: [{ id: 'blk-long-1', reason: 'active_edit' }],
+                detail: 'd'.repeat(3_000),
+              },
+            },
+          ],
+        }),
+      })
+      assert.equal(res.marked, false)
+      assert.equal(res.pickup_diagnostic_written, true, `expected diagnostic to be written; stderr=${stderr}`)
+      assert.ok(stderr.trim().length > 0, 'stderr must NOT be empty with a long connections fallback path')
+      assert.ok(fitsShellOutput(stdout + stderr), `combined stdout (${stdout.length}) + stderr (${stderr.length}) must fit fitsShellOutput`)
+      const catMatch = /cat '([^']+)'/.exec(stderr)
+      assert.ok(catMatch, `stderr must contain the exact cat read command; got: ${stderr}`)
+      const saved = fs.readFileSync(catMatch[1], 'utf8')
+      assert.match(saved, /turn_busy_long_dir/)
+      assert.match(saved, /blk-long-1/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+      fs.rmSync(base, { recursive: true, force: true })
+    }
   })
 })

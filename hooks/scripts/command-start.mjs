@@ -708,6 +708,22 @@ export function structuredRefusalFromError(error) {
 }
 
 const CONFIRMED_PICKUP_OUTCOMES = new Set(['picked_up', 'already_working', 'started'])
+const CONFIRMED_COMPLETE_OUTCOMES = new Set(['completed', 'stopped', 'already_finalized', 'nothing_open'])
+const CONFIRMED_CLOSED_AS = new Set(['completed', 'stopped', 'done'])
+
+/**
+ * Whether a `report_complete` reply positively confirms DevSpec closed (or had already
+ * finalized) the stale attempt (requirement 3ea2b201). Rejects empty, bare `{ ok: true }`,
+ * or unexpected replies so `.turn` and `.turn-commands.json` remain intact for retry.
+ */
+function isConfirmedCompleteResponse(res) {
+  if (!res || typeof res !== 'object') return false
+  if (res.phase === 'done') return true
+  if (res.already_finalized === true) return true
+  if (typeof res.closed_as === 'string' && CONFIRMED_CLOSED_AS.has(res.closed_as)) return true
+  if (typeof res.outcome === 'string' && CONFIRMED_COMPLETE_OUTCOMES.has(res.outcome)) return true
+  return false
+}
 
 /**
  * Whether a `report_pickup` reply positively confirms DevSpec started or kept the
@@ -896,6 +912,21 @@ export async function startRoomCommands({
           })
           log(
             `command-start: stale-turn report_complete refused for ${connectionId}: ${JSON.stringify(completeRefused)}\n`,
+          )
+        } else if (!isConfirmedCompleteResponse(completeRes)) {
+          const unrecognized = {
+            code: 'unrecognized_complete_response',
+            retryable: true,
+            error: 'report_complete returned an unrecognized response without a completion confirmation.',
+            response: completeRes ?? null,
+          }
+          staleCompleteRefusals.push({
+            step: 'stale_turn_report_complete',
+            ...completeArgs,
+            refusal: unrecognized,
+          })
+          log(
+            `command-start: stale-turn report_complete returned unrecognized response for ${connectionId}: ${JSON.stringify(unrecognized)}\n`,
           )
         } else {
           staleCompleteCleared = true
