@@ -7234,4 +7234,231 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(surfaced, /Waiting for Ali Price approval on protected decision #700 before proceeding/, 'fresh process MUST recover the full approval instruction inside reason!')
     clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
   })
+
+  it('approval URL inside a structured ENOSPC reason survives verbatim across fresh processes, generic fitShellDiagnostic fallback never mislabels a partial ENOSPC note as Read original, and mixed-page wake read holds cursor if saving wake-inline-hold fails (3c5147a7 / 4e32d1a5 / 91d7b47c / 3ea2b201)', async () => {
+    const { randomBytes } = await import('node:crypto')
+    const { spawnSync } = await import('node:child_process')
+    const { RESERVED_DIAGNOSTIC_SLOT_BYTES, clearPendingUnsavedRefusals, fitShellDiagnostic } = await import('./hook-context-budget.mjs')
+
+    // 1. Approval URL inside structured reason survives Stage-2A ENOSPC compaction verbatim!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('approval-url ENOSPC check'))), { mode: 0o600 })
+
+      const approvalUrl = 'https://app.devspecstaging.com/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approval-request-0123456789abcdef0123456789abcdef'
+      const records1400 = Array.from({ length: 1400 }, (_, idx) => ({
+        id: `blk-url-${String(idx).padStart(4, '0')}`,
+        reason:
+          idx === 700
+            ? `${randomBytes(220).toString('base64')} Approve at ${approvalUrl} to unblock ${randomBytes(220).toString('base64')}`
+            : `${randomBytes(220).toString('base64')} Blocked item ${idx} ${randomBytes(220).toString('base64')}`,
+      }))
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [{ command_message_id: 'msg-url-1', refusal: { code: 'waiting_for_ok', blocking_items: records1400 } }],
+            }
+          },
+        })
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      const scriptUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+      const child = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
+          import { readWakes } from ${JSON.stringify(scriptUrl)};
+          let stderr = '';
+          const res = await readWakes({
+            file: ${JSON.stringify(wakeFile)},
+            connectionId: ${JSON.stringify(CONN)},
+            home: ${JSON.stringify(home)},
+            dir: ${JSON.stringify(dir)},
+            settleMs: 0,
+            write: async () => {},
+            writeStderr: async (c) => { stderr += String(c); },
+            startCommands: async ({ commands }) => ({ ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }),
+          });
+          process.stdout.write(JSON.stringify({ marked: res.marked, note: res.pickup_diagnostic_note ?? null, stderr }));
+          `,
+        ],
+        { encoding: 'utf8' },
+      )
+      assert.equal(child.status, 0, child.stderr)
+      const out = JSON.parse(child.stdout)
+      const surfaced = out.note?.id ? readNoteText(out.note.id, { home }) : out.stderr
+      assert.ok(surfaced.includes(approvalUrl), 'fresh process MUST recover the full intact approval URL verbatim!')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+
+    // 2. Tight generic fitShellDiagnostic fallback (< 220 chars left) MUST disclose partial ENOSPC + record counts, NEVER "Read original"!
+    {
+      const { home } = mkHome()
+      const almostFullStdout = 'x'.repeat(CURSOR_SHELL_OUTPUT_MAX_CHARS - 190)
+      const origWriteFileSync = fs.writeFileSync
+      let res = null
+      try {
+        fs.writeFileSync = () => {
+          throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+        }
+        res = fitShellDiagnostic(almostFullStdout, 'y'.repeat(30000), {
+          home,
+          label: 'devspec-wake-tail',
+          reservedStore: {
+            write: () => ({
+              id: 'abc1234567890def',
+              file: '/tmp/n/a.md',
+              command: "gzip -dc '/tmp/n/a.md' | head -c 18000",
+              parts: 2,
+              fallback: true,
+              reserved: true,
+              enospcCompacted: true,
+              enospcIncomplete: true,
+              totalRecords: 1400,
+              returnedRecords: 700,
+              omittedRecords: 700,
+            }),
+          },
+        })
+      } finally {
+        fs.writeFileSync = origWriteFileSync
+      }
+      assert.ok(res.text.length > 0, 'tight generic fallback must still emit a bounded partial ENOSPC notice')
+      assert.equal(fitsShellOutput(almostFullStdout + res.text), true)
+      assert.doesNotMatch(res.text, /Read original|full details saved whole/, 'MUST NEVER label a partial ENOSPC note as Read original!')
+      assert.match(res.text, /partial ENOSPC/i)
+      assert.match(res.text, /700\/1400 records, 700 omitted/)
+    }
+
+    // 3. Mixed page where saving wake-inline-hold.json fails: reading the later note MUST NOT advance posFile past the earlier unstarted inline command!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const posFile = path.join(dir, `${CONN}.wake-position`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+
+      const inlineBatch = ownerBatch('Unstarted inline before note', {
+        messageId: '11111111-1111-4111-8111-1111111111c1',
+        turnId: '22222222-2222-4222-8222-2222222222c1',
+      })
+      const inlineText = wakeLines(buildOwnerMessageEvents(inlineBatch))
+      const note2MsgId = '33333333-3333-4333-8333-3333333333c2'
+      const note2Batch = ownerBatch('Later note cmd', {
+        messageId: note2MsgId,
+        turnId: '44444444-4444-4444-8444-4444444444c2',
+      })
+      const note2 = writeNote(wakeLines(buildOwnerMessageEvents(note2Batch)), { home })
+      const wake2Text = wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note2.command, note: 'Read note 2' }])
+      fs.writeFileSync(wakeFile, `${inlineText}${wake2Text}`, { mode: 0o600 })
+
+      // Fail saving `wake-inline-hold.json` during mixed-page readWakes!
+      const origWriteFileSync = fs.writeFileSync
+      let holdSaveFailed = false
+      fs.writeFileSync = (filePath, ...rest) => {
+        if (String(filePath).includes('wake-inline-hold.json')) {
+          holdSaveFailed = true
+          throw Object.assign(new Error('transient EIO saving wake-inline-hold'), { code: 'EIO' })
+        }
+        return origWriteFileSync(filePath, ...rest)
+      }
+      try {
+        const read1 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async ({ commands }) => ({
+            ok: true,
+            outcome: 'started',
+            started: [],
+            unstarted: commands,
+            refusals: [],
+          }),
+        })
+        assert.equal(read1.marked, false)
+      } finally {
+        fs.writeFileSync = origWriteFileSync
+      }
+      assert.equal(holdSaveFailed, true, 'failure saving wake-inline-hold.json must have fired')
+
+      // Now agent reads note2 -> note2 picks up, but wake cursor MUST NOT advance past the earlier unstarted inline command!
+      const note2Content = fs.readFileSync(note2.file, 'utf8')
+      const pickedUp = []
+      await stepDeliveryHook(
+        {
+          conversation_id: CONVERSATION,
+          tool_name: 'Shell',
+          tool_input: { command: note2.command },
+          tool_output: { exitCode: 0, output: note2Content },
+        },
+        {
+          home,
+          dir,
+          startCommands: async ({ commands }) => {
+            for (const c of commands) pickedUp.push(c.messageId)
+            return { ok: true, outcome: 'started', started: commands.map((c) => c.messageId), refusals: [] }
+          },
+        },
+      )
+      assert.deepEqual(pickedUp, [note2MsgId])
+      assert.equal(fs.existsSync(posFile), false, 'wake cursor MUST NOT advance past earlier unstarted inline command when wake-inline-hold save failed!')
+      const read2 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 0,
+        write: async () => {},
+        writeStderr: async () => {},
+      })
+      assert.ok(read2.printed >= 1)
+      assert.match(read2.text, /Unstarted inline before note/)
+    }
+  })
 })

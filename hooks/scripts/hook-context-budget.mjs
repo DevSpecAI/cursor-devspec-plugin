@@ -284,6 +284,11 @@ const ENOSPC_PRESERVED_ID_KEYS = new Set([
   'retryable',
   'type',
   'kind',
+  'url',
+  'approval_url',
+  'review_url',
+  'link',
+  'href',
 ])
 
 /**
@@ -1197,11 +1202,17 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
    * even under severe `ENOSPC` (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
    */
   const compactOpaqueTokensInString = (str, { tokenPreviewChars = 16, includePunctuated = false } = {}) => {
-    const pattern = includePunctuated ? /[A-Za-z0-9+/=_-]{48,}/g : /[A-Za-z0-9+/=]{48,}/g
+    // Match full HTTP(S) URLs and relative app paths FIRST so actionable approval/review
+    // links inside structured reasons are NEVER treated as opaque base64/hex blobs
+    // (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
+    const pattern = includePunctuated
+      ? /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)|([A-Za-z0-9+/=_-]{48,})/g
+      : /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)|([A-Za-z0-9+/=]{48,})/g
     let changed = false
     let omittedTotal = 0
-    const compacted = str.replace(pattern, (tok) => {
-      if (tok.length <= Math.max(48, tokenPreviewChars * 2 + 16)) return tok
+    const compacted = str.replace(pattern, (match, fullUrl, relUrl, tok) => {
+      if (fullUrl || relUrl) return match
+      if (!tok || tok.length <= Math.max(48, tokenPreviewChars * 2 + 16)) return match
       if (includePunctuated) {
         // Avoid compacting plain snake_case / kebab-case English phrases that lack mixed-case/digit entropy.
         const hasDigit = /\d/.test(tok)
@@ -2809,13 +2820,32 @@ export function fitShellDiagnostic(
     return { text: '', note: fallbackNote, noteError, overflow: true }
   }
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'note write failed')
-  const readHint = fallbackNote ? ` Read original: \`${fallbackNote.command}\`.` : ''
+  const partialCounts =
+    fallbackNote?.enospcIncomplete &&
+    Number.isInteger(fallbackNote.returnedRecords) &&
+    Number.isInteger(fallbackNote.totalRecords)
+      ? `${fallbackNote.returnedRecords}/${fallbackNote.totalRecords} records, ${fallbackNote.omittedRecords ?? Math.max(0, fallbackNote.totalRecords - fallbackNote.returnedRecords)} omitted`
+      : null
+  const readHint = fallbackNote
+    ? fallbackNote.enospcIncomplete
+      ? ` Partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`.`
+      : fallbackNote.enospcCompacted
+        ? ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
+        : ` Read original: \`${fallbackNote.command}\`.`
+    : ''
   const short = `${label}: diagnostic omitted (${diag.length} chars; could not save note: ${why}).${readHint}\n`
   if (fitsShellOutput(stdout + short)) {
     return { text: short, note: fallbackNote, noteError }
   }
   const bare = `${label}: diagnostic omitted (note write failed).${readHint}\n`
-  return { text: fitsShellOutput(stdout + bare) ? bare : '', note: fallbackNote, noteError }
+  if (fitsShellOutput(stdout + bare)) {
+    return { text: bare, note: fallbackNote, noteError }
+  }
+  if (fallbackNote?.enospcIncomplete) {
+    const tinyPartial = `${label}: partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`\n`
+    return { text: fitsShellOutput(stdout + tinyPartial) ? tinyPartial : '', note: fallbackNote, noteError }
+  }
+  return { text: '', note: fallbackNote, noteError }
 }
 
 /** What a wake kept whole in a note says about itself: one fixed sentence. */

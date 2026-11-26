@@ -1084,8 +1084,48 @@ export async function readWakes({
       }
     }
 
+    const posFile = readPositionPath(key, dir)
+    // Persist any earlier-unstarted-inline-command cursor barrier BEFORE registering
+    // deferred `wake_in_note` markers. If saving `wake-inline-hold.json` fails (returns
+    // `false` or throws), omit `wakePositionPath` / `wakeThrough` on every deferred note
+    // whose span starts at or after `earliestUnstartedStart` so reading that later note
+    // can STILL pick up its command without EVER advancing the wake cursor past the
+    // earlier unstarted inline command (requirement 3ea2b201).
+    let inlineHoldSaved = true
+    if (resolvedConnectionId && !pickupRefusals && !unsurfacedSpoolRemaining) {
+      if (typeof earliestUnstartedStart === 'number') {
+        try {
+          inlineHoldSaved =
+            setWakeInlineHold(
+              resolvedConnectionId,
+              { wakePositionPath: posFile, holdOffset: earliestUnstartedStart },
+              { dir },
+            ) === true
+        } catch {
+          inlineHoldSaved = false
+        }
+        if (!inlineHoldSaved) {
+          const holdErrMsg =
+            'devspec-wake-tail: failed to save wake-inline-hold barrier for earlier unstarted inline command; holding wake cursor.\n'
+          if (fitsShellOutput(printedStdout + holdErrMsg)) {
+            await writeStderr(holdErrMsg)
+          }
+        }
+      } else {
+        try {
+          clearWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile }, { dir })
+        } catch {
+          /* non-fatal: a lingering hold only keeps the cursor conservative */
+        }
+      }
+    }
+
     if (resolvedConnectionId && deferredEntries.length > 0 && !pickupRefusals) {
       for (const deferred of deferredEntries) {
+        const blockedByUnsavedInlineHold =
+          !inlineHoldSaved &&
+          typeof earliestUnstartedStart === 'number' &&
+          (typeof deferred.wakeThrough !== 'number' || deferred.wakeThrough > earliestUnstartedStart)
         registerPendingWakeNote(
           resolvedConnectionId,
           {
@@ -1094,10 +1134,10 @@ export async function readWakes({
             messages: deferred.messages,
             sessionId: deferred.sessionId,
             wakeFile: resolved,
-            wakePositionPath: readPositionPath(key, dir),
+            wakePositionPath: blockedByUnsavedInlineHold ? null : posFile,
             wakePositionVersion: POSITION_VERSION,
-            wakeStart: deferred.wakeStart,
-            wakeThrough: deferred.wakeThrough,
+            wakeStart: blockedByUnsavedInlineHold ? null : deferred.wakeStart,
+            wakeThrough: blockedByUnsavedInlineHold ? null : deferred.wakeThrough,
           },
           { dir },
         )
@@ -1129,14 +1169,6 @@ export async function readWakes({
     // page received a `report_pickup` (requirement 3ea2b201). Completed wakes strictly
     // before the earliest held start may advance up to `holdAt`, leaving every unstarted
     // or unread command queued for the next read.
-    const posFile = readPositionPath(key, dir)
-    if (resolvedConnectionId) {
-      if (typeof earliestUnstartedStart === 'number') {
-        setWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile, holdOffset: earliestUnstartedStart }, { dir })
-      } else {
-        clearWakeInlineHold(resolvedConnectionId, { wakePositionPath: posFile }, { dir })
-      }
-    }
     if (pendingNoteReads.length > 0 || unstartedCommands.length > 0) {
       const holdCandidates = [earliestDeferredStart, earliestUnstartedStart].filter((n) => typeof n === 'number')
       const holdAt = holdCandidates.length > 0 ? Math.min(...holdCandidates) : null
