@@ -2428,4 +2428,107 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.notEqual(stamped.args?.request_ref, CMD_ALICE)
     assert.equal(memo.synced, true)
   })
+
+  it('processes ALL same-turn background notifications (not only the last) so earlier launches are notified and two-person ambiguity is preserved (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111b1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222b2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-first-bg', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bob-second-bg', kind: 'shell', notifies: true, request: CMD_BOB, also: [] }, { dir })
+
+    const bobRow = typedRow('Bob live prompt before two background notifications')
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>alice-first-bg</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    const bobWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>bob-second-bg</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    // Terminal prompt + Alice notification + Bob notification all arrive between reads in the same turn.
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceWake}\n${bobWake}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.midTurn, true)
+    assert.equal(memo.synced, true)
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.get(after.current)?.kind, 'typed_prompt')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'earlier Alice notification must be joined, not skipped')
+    assert.equal(after.joined.has(CMD_BOB), true, 'later Bob notification must also be joined')
+    assert.equal(after.launches.get('alice-first-bg')?.notified, true, 'earlier launch must be marked notified')
+    assert.equal(after.launches.get('bob-second-bg')?.notified, true, 'later launch must be marked notified')
+    assert.ok(turnAmbiguity(after)?.length >= 2, 'two-person ambiguity must survive when last wake belongs to terminal owner')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'implementation write must ask which person it serves instead of stamping terminal owner')
+  })
+
+  it('processes two back-to-back same-turn notifications without a typed prompt and preserves both launches and ambiguity (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111c1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222c2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-bare-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'bob-bare-2', kind: 'shell', notifies: true, request: CMD_BOB, also: [] }, { dir })
+
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>alice-bare-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    const bobWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>bob-bare-2</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${aliceWake}\n${bobWake}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.midTurn, true)
+    assert.equal(memo.synced, true)
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'first notification establishes current')
+    assert.equal(after.joined.has(CMD_BOB), true, 'second same-turn notification joins instead of overwriting current')
+    assert.equal(after.launches.get('alice-bare-1')?.notified, true)
+    assert.equal(after.launches.get('bob-bare-2')?.notified, true)
+    assert.ok(turnAmbiguity(after)?.length === 2)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny)
+  })
 })
