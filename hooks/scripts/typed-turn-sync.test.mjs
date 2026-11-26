@@ -5438,4 +5438,121 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, REQ_ALICE)
     }
   })
+
+  it('finishIdleRequests fails closed with a diagnostic AND readRequestState keeps staged launch + typed_turn_failed visible when a transient read error strikes rotation after a parallel hook recreates the active log (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const REQ_ALICE = '55555555-5555-4555-8555-5555555555aa'
+    const REQ_BOB_PARALLEL = '66666666-6666-4666-8666-6666666666aa'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Alice turn whose rotation hits transient staged read error while parallel hook writes active log')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(dir, { recursive: true })
+    const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad', ref: null, pad: 'p'.repeat(400) })}\n`
+    fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ALICE }, { dir })
+
+    const origRenameSync = fs.renameSync
+    const origReadFileSync = fs.readFileSync
+    let stagedPath = null
+    let recreatedActiveLog = false
+    let threwStagedReadErr = false
+
+    fs.renameSync = (from, to) => {
+      if (String(from) === reqLogPath && String(to).includes('.requests.jsonl.rotating-')) {
+        // Concurrent launch + typed_turn_failed land in the original log right before rename -> staged.
+        fs.appendFileSync(
+          reqLogPath,
+          `${JSON.stringify({ op: 'launch', key: 'staged-err-launch', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n` +
+            `${JSON.stringify({ op: 'typed_turn_failed', key: 'staged-err-retry' })}\n`,
+          { mode: 0o600 },
+        )
+        stagedPath = String(to)
+        const r = origRenameSync(from, to)
+        // Immediately after rename, a parallel hook recreates the active log!
+        recreatedActiveLog = true
+        fs.appendFileSync(
+          reqLogPath,
+          `${JSON.stringify({ op: 'open', id: REQ_BOB_PARALLEL, kind: 'command', requested_by: BOB })}\n`,
+          { mode: 0o600 },
+        )
+        return r
+      }
+      return origRenameSync(from, to)
+    }
+
+    fs.readFileSync = (filePath, ...rest) => {
+      if (!threwStagedReadErr && stagedPath && String(filePath) === stagedPath) {
+        threwStagedReadErr = true
+        throw Object.assign(new Error('transient EIO reading staged request log'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+
+    const logs = []
+    let idleRes = null
+    try {
+      idleRes = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: (line) => logs.push(line),
+      })
+    } finally {
+      fs.renameSync = origRenameSync
+      fs.readFileSync = origReadFileSync
+    }
+
+    assert.equal(recreatedActiveLog, true, 'parallel hook must have recreated active log')
+    assert.equal(threwStagedReadErr, true, 'transient read error on staged log must have fired')
+    assert.ok(stagedPath && fs.existsSync(stagedPath), 'staged file must remain intact on disk when active log exists')
+    assert.deepEqual(idleRes.closed, [], 'idle cleanup MUST NOT report request closed when rotation read failed')
+    assert.equal(idleRes.closeRefusal?.code, 'request_log_rotation_failed')
+    assert.equal(idleRes.closeRefusal?.cause_code, 'EIO')
+    assert.ok(logs.some((l) => /request_log_rotation_failed/i.test(l)), 'diagnostic MUST be logged')
+
+    // Once reads recover, `readRequestState` MUST read the staged file ahead of the recreated active log!
+    const recovered = readRequestState(CONN, { dir })
+    assert.equal(recovered.failedTranscriptTurns.has('staged-err-retry'), true, 'typed_turn_failed in staged file MUST remain queued for next pass')
+    assert.equal(recovered.launches.has('staged-err-launch'), true, 'launch in staged file MUST stay visible')
+    assert.equal(recovered.open.has(REQ_ALICE), true, 'original request MUST remain open for the staged launch')
+    assert.equal(recovered.open.get(REQ_ALICE)?.requested_by, ALICE)
+    assert.equal(recovered.open.has(REQ_BOB_PARALLEL), true, 'parallel hook’s write to recreated active log MUST also be preserved')
+
+    // When the staged launch’s completion wake arrives, it MUST resolve back to Alice’s original request!
+    const wakeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>staged-err-launch</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo: {},
+    })
+    assert.equal(wakeSync.action, 'restored_wake_request')
+    assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.args?.request_ref, REQ_ALICE, 'completion wake MUST resolve to Alice’s original request')
+  })
 })

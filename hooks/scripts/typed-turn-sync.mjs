@@ -2289,10 +2289,10 @@ export async function finishIdleRequests({
   const closed = []
   let closeRefusal = null
   let abortedClose = false
-  const maybeRotateLog = () => {
+  const maybeRotateLog = (onError = null) => {
     const remainingPending = pendingOpensForConnectionDetailed(dir, connectionId)
     if (!remainingPending.readError && remainingPending.entries.length === 0) {
-      rotateRequestLog(connectionId, { dir })
+      rotateRequestLog(connectionId, { dir, onError })
     }
   }
   // Persist a server-acknowledged close locally ONLY under the sync lock after
@@ -2428,19 +2428,27 @@ export async function finishIdleRequests({
           }
         }
         // Attempt log rotation INSIDE the sync lock before declaring close complete:
-        // if a concurrent background launch arrived during rotation (including via an
-        // already-open fd on the archived inode) and restored `targetRequestId`, abort
-        // reporting closed; if the post-rotation log/archive cannot be read, fail closed!
-        maybeRotateLog()
+        // if rotation hits an I/O error or the post-rotation log/staged/archive cannot
+        // be read, fail closed with a structured diagnostic; if a concurrent background
+        // launch arrived during rotation (including via an already-open fd or a staged
+        // `.rotating-*` file) and restored `targetRequestId`, abort reporting closed!
+        let rotateError = null
+        maybeRotateLog((err) => {
+          rotateError = err
+        })
         const afterRotateState = readRequestState(connectionId, { dir })
-        if (afterRotateState.readError) {
+        if (rotateError || afterRotateState.readError) {
+          const err = afterRotateState.readError ?? rotateError
+          const errRefusal = structuredRefusalFromError(err)
           return {
             status: 'refused',
             refusal: {
-              code: 'request_log_unreadable',
+              ...errRefusal,
+              ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
+              code: afterRotateState.readError ? 'request_log_unreadable' : 'request_log_rotation_failed',
               retryable: true,
               request_id: targetRequestId,
-              error: afterRotateState.readError?.message ?? 'request log unreadable after rotation',
+              error: err?.message ?? 'request log rotation or verification failed',
             },
           }
         }

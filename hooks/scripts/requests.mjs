@@ -414,20 +414,67 @@ function latestArchiveWatermark(text) {
   return watermark
 }
 
+/**
+ * Find any leftover `.requests.jsonl.rotating-*` staged files in `dir` for
+ * `connectionId`, sorted oldest-first. Returns `{ files, error }` so callers
+ * fail closed if `dir` itself cannot be listed.
+ */
+function stagedRequestLogFiles(connectionId, dir) {
+  const prefix = `${connectionId}.requests.jsonl.rotating-`
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { files: [], error: null }
+    return { files: [], error }
+  }
+  const matched = []
+  for (const name of entries) {
+    if (!name.startsWith(prefix)) continue
+    const fullPath = path.join(dir, name)
+    let mtimeMs = 0
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+    }
+    matched.push({ fullPath, name, mtimeMs })
+  }
+  matched.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+  return { files: matched.map((m) => m.fullPath), error: null }
+}
+
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
   const file = requestLogPath(connectionId, dir)
   let text = ''
   let readError = null
+  const stagedTexts = []
+  const staged = stagedRequestLogFiles(connectionId, dir)
+  if (staged.error) {
+    readError = staged.error
+  } else {
+    for (const stagedFile of staged.files) {
+      try {
+        stagedTexts.push(fs.readFileSync(stagedFile, 'utf8'))
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          readError = error
+          break
+        }
+      }
+    }
+  }
   try {
     text = fs.readFileSync(file, 'utf8')
   } catch (error) {
-    if (error?.code !== 'ENOENT') readError = error
+    if (error?.code !== 'ENOENT') readError ??= error
   }
   // If a writer that already had the rotated log's fd open appended after
   // `rotateRequestLog`'s final read, the archive `${file}.1` on the recorded inode
   // will have grown past `archive_bytes`. Replay the archive ahead of the active
   // log so NO late `launch`, `schedule`, `open`, or `typed_turn_failed` is ever
   // ignored (requirement 3ea2b201 / decision ce71a72b).
+  let archiveText = ''
   if (!readError && text) {
     const watermark = latestArchiveWatermark(text)
     if (watermark) {
@@ -439,15 +486,15 @@ export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
           (archStat.ino === watermark.archive_ino &&
             (watermark.archive_dev == null || archStat.dev === watermark.archive_dev))
         if (sameArchive && archStat.size > watermark.archive_bytes) {
-          const archiveText = fs.readFileSync(archiveFile, 'utf8')
-          text = `${archiveText}\n${text}`
+          archiveText = fs.readFileSync(archiveFile, 'utf8')
         }
       } catch (error) {
         if (error?.code !== 'ENOENT') readError = error
       }
     }
   }
-  const state = reduceRequestLog(text)
+  const combined = [...stagedTexts, ...(archiveText ? [archiveText] : []), ...(text ? [text] : [])].join('\n')
+  const state = reduceRequestLog(combined)
   return readError ? { ...state, readError } : state
 }
 
@@ -949,12 +996,22 @@ function carryForwardTailLines(fullBuf, knownBytes) {
  * and schedules made for nobody's request are carried over while they may still
  * wake the agent, so their wakes stay positively nobody's.
  */
-export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = ROTATE_BYTES } = {}) {
+export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = ROTATE_BYTES, onError = null } = {}) {
   const file = requestLogPath(connectionId, dir)
   try {
-    if (fs.statSync(file).size < minBytes) return false
+    let fileStat
+    try {
+      fileStat = fs.statSync(file)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') onError?.(error)
+      return false
+    }
+    if (fileStat.size < minBytes) return false
     const effectiveState = readRequestState(connectionId, { dir })
-    if (effectiveState.readError) return false
+    if (effectiveState.readError) {
+      onError?.(effectiveState.readError)
+      return false
+    }
     if (effectiveState.open.size > 0 || effectiveState.failedTranscriptTurns.size > 0) return false
     // Never rotate while a `.pending-opens.json` recovery file exists or while any
     // unnotified launch/monitor/schedule for a request awaiting recovery sits in the log
@@ -970,6 +1027,11 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
     }
     for (const schedule of effectiveState.schedules) {
       if (schedule.request !== NO_REQUEST) return false
+    }
+    const priorStaged = stagedRequestLogFiles(connectionId, dir)
+    if (priorStaged.error) {
+      onError?.(priorStaged.error)
+      return false
     }
     const preBuf = fs.readFileSync(file)
     const preState = reduceRequestLog(preBuf.toString('utf8'))
@@ -1033,6 +1095,16 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
       fs.appendFileSync(file, initialLines.join(''), { mode: 0o600 })
       const archiveFile = `${file}.1`
       fs.renameSync(staged, archiveFile)
+      // Once the new active log and archive are cleanly in place and `effectiveState`
+      // had no pending work, remove any older orphaned `.rotating-*` files from prior
+      // failed rotations so they do not accumulate forever.
+      for (const oldStaged of priorStaged.files) {
+        try {
+          fs.rmSync(oldStaged, { force: true })
+        } catch {
+          /* ignore cleanup failure */
+        }
+      }
       // Re-stat the archived inode immediately after moving it into place: if a writer
       // with an already-open fd appended after `readFileSync(staged)`, carry those
       // bytes + restored open refs into the active log right away and advance the
@@ -1052,17 +1124,19 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
         return false
       }
       return !hasExtraTail
-    } catch {
+    } catch (error) {
+      onError?.(error)
       try {
         if (!fs.existsSync(file) && fs.existsSync(staged)) {
           fs.renameSync(staged, file)
         }
       } catch {
-        /* ignore rollback failure */
+        /* ignore rollback failure; `readRequestState` still reads `.rotating-*` */
       }
       return false
     }
-  } catch {
+  } catch (error) {
+    onError?.(error)
     return false
   }
 }
