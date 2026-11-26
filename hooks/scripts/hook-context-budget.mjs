@@ -1084,7 +1084,7 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
   const expectedChars = Number(charsRaw)
   let body = content.slice(nl + 1)
   const footerRe = new RegExp(
-    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): (?:gzip -dc [\\s\\S]*? \\| tail -c \\+\\d+|tail -c \\+\\d+ [\\s\\S]*?) \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
+    `\\n\\n--- part \\d+/\\d+ \\([^\\n]*\\)(?: · next part \\(\\d+/\\d+\\): (?:cat [\\s\\S]*? \\| gzip -dc \\| tail -c \\+\\d+|gzip -dc [\\s\\S]*? \\| tail -c \\+\\d+|tail -c \\+\\d+ [\\s\\S]*?) \\| head -c \\d+)? \\[frame:${nonce}\\] ---\\n`,
     'g',
   )
   body = body.replace(footerRe, '')
@@ -1098,6 +1098,105 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
     }
   }
   return { ok: true, body }
+}
+
+/**
+ * When a diagnostic refusal STILL exceeds all pre-allocated diagnostic slots even after
+ * gzip compression under mid-pickup `ENOSPC`, shrink only oversized high-entropy string
+ * blobs inside embedded JSON structures while preserving EVERY refusal code and blocking
+ * record (including the first and final blockers), head/tail previews, and exact omitted
+ * byte counts so the refusal still fits in a pre-allocated slot and survives durably
+ * across processes (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c / 3ea2b201).
+ */
+function compactDiagnosticForSlotBudget(rawText, budgetBytes, { originalBytes, compressedBytes } = {}) {
+  const maxStrLen = 256
+  const shrinkValue = (val, depth = 0) => {
+    if (depth > 12) return '[max-depth]'
+    if (typeof val === 'string') {
+      if (val.length <= maxStrLen * 2 + 64) return val
+      return {
+        truncated_due_to_enospc: true,
+        original_chars: val.length,
+        omitted_chars: val.length - maxStrLen * 2,
+        head: val.slice(0, maxStrLen),
+        tail: val.slice(-maxStrLen),
+      }
+    }
+    if (Array.isArray(val)) {
+      if (val.length <= 200) return val.map((item) => shrinkValue(item, depth + 1))
+      return [
+        ...val.slice(0, 100).map((item) => shrinkValue(item, depth + 1)),
+        {
+          truncated_due_to_enospc: true,
+          omitted_items: val.length - 200,
+          total_items: val.length,
+        },
+        ...val.slice(-100).map((item) => shrinkValue(item, depth + 1)),
+      ]
+    }
+    if (val && typeof val === 'object') {
+      const out = {}
+      for (const [k, v] of Object.entries(val)) {
+        out[k] = shrinkValue(v, depth + 1)
+      }
+      return out
+    }
+    return val
+  }
+
+  const notice = {
+    enospc_compacted: true,
+    reason:
+      'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized string fields were compacted while preserving structured refusal codes and blocking records (including first and final blockers).',
+    original_bytes: originalBytes ?? Buffer.byteLength(rawText, 'utf8'),
+    compressed_bytes: compressedBytes ?? null,
+    reserved_slot_bytes: budgetBytes,
+  }
+
+  const tryCompactJson = (str) => {
+    const trimmed = str.trim()
+    if (!trimmed) return null
+    try {
+      const parsed = JSON.parse(trimmed)
+      return JSON.stringify({ ...notice, preserved_refusal: shrinkValue(parsed) })
+    } catch {
+      /* try prefix + embedded JSON */
+    }
+    const candidates = [str.indexOf('['), str.indexOf('{')].filter((i) => i >= 0)
+    if (candidates.length > 0) {
+      const firstBracket = Math.min(...candidates)
+      const prefix = str.slice(0, firstBracket).trim()
+      const rest = str.slice(firstBracket).trim()
+      const lastBracket = Math.max(rest.lastIndexOf(']'), rest.lastIndexOf('}'))
+      if (lastBracket > 0) {
+        const jsonPart = rest.slice(0, lastBracket + 1)
+        const suffix = rest.slice(lastBracket + 1).trim()
+        try {
+          const parsed = JSON.parse(jsonPart)
+          return `${prefix ? `${prefix}\n` : ''}${JSON.stringify({
+            ...notice,
+            preserved_refusal: shrinkValue(parsed),
+            ...(suffix ? { trailing_text: suffix.slice(0, 512) } : {}),
+          })}\n`
+        } catch {
+          /* fall through to head + tail preservation */
+        }
+      }
+    }
+    return null
+  }
+
+  const compactedJson = tryCompactJson(rawText)
+  if (compactedJson && Buffer.byteLength(compactedJson, 'utf8') <= budgetBytes) {
+    return compactedJson
+  }
+  const envelopeOverhead = 1024
+  const halfBudget = Math.max(512, Math.floor((budgetBytes - envelopeOverhead) / 2))
+  return `${JSON.stringify({
+    ...notice,
+    head_preview: rawText.slice(0, halfBudget),
+    tail_preview: rawText.slice(-halfBudget),
+  })}\n`
 }
 
 export function reserveDiagnosticNoteSlots({
@@ -1299,16 +1398,13 @@ export function reserveDiagnosticNoteSlots({
         ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
       }
     }
-    const totalChars = payloadText.length
-    const nonceSuffix = frameNonce ? ` [frame:${frameNonce}]` : ''
-    const buildPaginatedPages = (compressed) => {
-      const nextCmdPrefix = (start1, len) =>
-        compressed ? `gzip -dc ${quoted} | tail -c +${start1} | head -c ${len}` : `tail -c +${start1} ${quoted} | head -c ${len}`
+    const buildPaginatedPagesForText = (bodyText, nextCmdPrefix, { nonceSuffix = '' } = {}) => {
+      const totalChars = bodyText.length
       const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): ${nextCmdPrefix(999999999999, 999999)}${nonceSuffix} ---\n`
       const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
       const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
       if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
-      const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
+      const pieces = splitText(bodyText, pageMaxChars, pageMaxBytes)
       const totalParts = pieces.length
       const nextLens = new Array(totalParts).fill(0)
       const starts1 = new Array(totalParts).fill(1)
@@ -1338,7 +1434,12 @@ export function reserveDiagnosticNoteSlots({
       if (!builtPages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
       return builtPages
     }
-    const pages = buildPaginatedPages(false)
+    const nonceSuffix = frameNonce ? ` [frame:${frameNonce}]` : ''
+    const pages = buildPaginatedPagesForText(
+      payloadText,
+      (start1, len) => `tail -c +${start1} ${quoted} | head -c ${len}`,
+      { nonceSuffix },
+    )
     if (!pages) return null
     const totalParts = pages.length
     const contentBuf = Buffer.concat(pages)
@@ -1351,7 +1452,11 @@ export function reserveDiagnosticNoteSlots({
       // page fits Cursor's 20,000-char / 40,000-byte Shell ceiling AND carries an exact
       // `gzip -dc <file> | tail -c +<start> | head -c <len>` continuation command all
       // the way to the final record (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
-      const gzPages = buildPaginatedPages(true)
+      const gzPages = buildPaginatedPagesForText(
+        payloadText,
+        (start1, len) => `gzip -dc ${quoted} | tail -c +${start1} | head -c ${len}`,
+        { nonceSuffix },
+      )
       const gzContentBuf = gzPages ? Buffer.concat(gzPages) : null
       const gzBuf = gzContentBuf ? zlib.gzipSync(gzContentBuf) : null
       if (gzBuf && gzBuf.length <= (activeSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES)) {
@@ -1377,6 +1482,7 @@ export function reserveDiagnosticNoteSlots({
           file: activeSlot.filePath,
           command: gzCommand,
           parts: gzParts,
+          firstPageBytes: gzPages[0].length,
           fallback: true,
           reserved: true,
           compressed: 'gzip',
@@ -1403,11 +1509,95 @@ export function reserveDiagnosticNoteSlots({
       file: activeSlot.filePath,
       command: `head -c ${pages[0].length} ${quoted}`,
       parts: totalParts,
+      firstPageBytes: pages[0].length,
       fallback: true,
       reserved: true,
       ...(frameNonce ? { frameNonce } : {}),
       ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
     }
+  }
+  const writeShardedGzipToSlots = (usableSlots, payloadText, id) => {
+    if (!Array.isArray(usableSlots) || usableSlots.length < 2) return null
+    const buildShardedPages = (selected) => {
+      const quotedList = selected.map((s) => shellQuotePath(s.filePath)).join(' ')
+      const totalChars = payloadText.length
+      const nextCmdPrefix = (start1, len) => `cat ${quotedList} | gzip -dc | tail -c +${start1} | head -c ${len}`
+      const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): ${nextCmdPrefix(999999999999, 999999)} ---\n`
+      const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+      const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+      if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
+      const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
+      const totalParts = pieces.length
+      const nextLens = new Array(totalParts).fill(0)
+      const starts1 = new Array(totalParts).fill(1)
+      let builtPages = []
+      for (let pass = 0; pass < 4; pass += 1) {
+        const built = new Array(totalParts)
+        for (let i = totalParts - 1; i >= 0; i -= 1) {
+          const footer =
+            i + 1 < totalParts
+              ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): ${nextCmdPrefix(starts1[i + 1], nextLens[i + 1])} ---\n`
+              : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
+          built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+          nextLens[i] = built[i].length
+        }
+        let offset = 1
+        let changed = false
+        for (let i = 0; i < totalParts; i += 1) {
+          if (starts1[i] !== offset) {
+            starts1[i] = offset
+            changed = true
+          }
+          offset += built[i].length
+        }
+        builtPages = built
+        if (!changed && pass > 0) break
+      }
+      if (!builtPages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+      return { builtPages, quotedList }
+    }
+    for (let count = 2; count <= usableSlots.length; count += 1) {
+      const selected = usableSlots.slice(0, count)
+      const capacity = selected.reduce((sum, s) => sum + (s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES), 0)
+      const built = buildShardedPages(selected)
+      if (!built) continue
+      const gzContentBuf = Buffer.concat(built.builtPages)
+      const gzBuf = zlib.gzipSync(gzContentBuf)
+      if (gzBuf.length > capacity) continue
+      let offset = 0
+      try {
+        for (const s of selected) {
+          const cap = s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES
+          const chunk = gzBuf.subarray(offset, Math.min(gzBuf.length, offset + cap))
+          writeAllSync(s.fd, chunk)
+          if (!verifySlotReadableByPath(s, chunk.length)) {
+            throw new Error(`sharded gzip slot unreadable after write: ${s.filePath}`)
+          }
+          offset += chunk.length
+        }
+        for (const s of selected) s.used = true
+        const gzParts = built.builtPages.length
+        const gzCommand =
+          gzParts === 1
+            ? `cat ${built.quotedList} | gzip -dc`
+            : `cat ${built.quotedList} | gzip -dc | head -c ${built.builtPages[0].length}`
+        return {
+          id,
+          file: selected[0].filePath,
+          files: selected.map((s) => s.filePath),
+          command: gzCommand,
+          parts: gzParts,
+          firstPageBytes: built.builtPages[0].length,
+          fallback: true,
+          reserved: true,
+          compressed: 'gzip',
+          rawBytes: gzContentBuf.length,
+        }
+      } catch {
+        return null
+      }
+    }
+    return null
   }
   return {
     ok: true,
@@ -1419,6 +1609,7 @@ export function reserveDiagnosticNoteSlots({
       const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
       // Pass 1: prefer any slot immediately readable by path (or freshly re-opened in the same dir).
       const initialCount = slots.length
+      const readableSlots = []
       for (let idx = 0; idx < initialCount; idx += 1) {
         const slot = slots[idx]
         let activeSlot = slot
@@ -1431,13 +1622,48 @@ export function reserveDiagnosticNoteSlots({
             continue
           }
         }
+        readableSlots.push(activeSlot)
         try {
           const written = writeFormattedToSlot(activeSlot, raw, id, {
             requireReadableByPath: true,
           })
           if (written) return written
         } catch {
-          /* keep pre-allocated blocks intact for Pass 2 or fallback without freeing via ftruncate(0) */
+          /* keep pre-allocated blocks intact for multi-slot sharding or compaction fallback */
+        }
+      }
+      // Pass 1.5: if a high-entropy refusal exceeded a single 128 KiB slot even after
+      // gzip compression under ENOSPC, shard the gzip stream across multiple pre-allocated
+      // 128 KiB slots (zero new disk blocks, 100% lossless byte-for-byte!).
+      if (readableSlots.length >= 2) {
+        const sharded = writeShardedGzipToSlots(readableSlots, raw, id)
+        if (sharded) return sharded
+      }
+      // Pass 1.75: if the refusal STILL exceeds all pre-allocated slots combined even after
+      // gzip under ENOSPC, compact only oversized string blobs while preserving EVERY
+      // refusal code and blocking record (including first and final blockers) + explicit
+      // ENOSPC disclosure inside a pre-allocated slot so it is durable across processes.
+      if (readableSlots.length >= 1) {
+        const targetSlot = readableSlots[0]
+        const rawBytes = Buffer.byteLength(raw, 'utf8')
+        let compressedBytes = null
+        try {
+          compressedBytes = zlib.gzipSync(Buffer.from(raw, 'utf8')).length
+        } catch {
+          /* ignore */
+        }
+        const compacted = compactDiagnosticForSlotBudget(
+          raw,
+          Math.max(4096, (targetSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES) - 4096),
+          { originalBytes: rawBytes, compressedBytes },
+        )
+        try {
+          const written = writeFormattedToSlot(targetSlot, compacted, id, {
+            requireReadableByPath: true,
+          })
+          if (written) return { ...written, enospcCompacted: true }
+        } catch {
+          /* fall through to Pass 2 */
         }
       }
       // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.
@@ -1465,6 +1691,34 @@ export function reserveDiagnosticNoteSlots({
             frameNonce,
           })
           if (written) return written
+        } catch {
+          /* try compacted Pass 2 below if incompressible >128 KiB under ENOSPC + chmod 0o000 */
+        }
+      }
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
+        if (slot.fd === null) continue
+        try {
+          const preStat = fs.fstatSync(slot.fd)
+          if (preStat.nlink <= 0) continue
+          const compacted = compactDiagnosticForSlotBudget(
+            raw,
+            Math.max(4096, (slot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES) - 4096),
+            { originalBytes: Buffer.byteLength(raw, 'utf8') },
+          )
+          const compactNonce = randomBytes(8).toString('hex')
+          const compactSha = createHash('sha256').update(compacted, 'utf8').digest('hex')
+          const compactHeader = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home, {
+            nonce: compactNonce,
+            sha256: compactSha,
+            chars: compacted.length,
+          })
+          const written = writeFormattedToSlot(slot, `${compactHeader}${compacted}`, id, {
+            requireReadableByPath: false,
+            pendingPermissionRecovery: true,
+            frameNonce: compactNonce,
+          })
+          if (written) return { ...written, enospcCompacted: true }
         } catch {
           /* keep pre-allocated blocks intact */
         }
@@ -1641,14 +1895,14 @@ function readPendingMdFile(fullPath) {
   return rawBuf.toString('utf8')
 }
 
-function stripReservedFooters(content, quoted, frameNonce = null) {
+function stripReservedFooters(content, quotedOrList, frameNonce = null) {
   const noncePat =
     typeof frameNonce === 'string' && /^[0-9a-f]{16}$/.test(frameNonce)
       ? ` \\[frame:${frameNonce}\\]`
       : ''
-  const quotedPath = quoted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const quotedPath = quotedOrList.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const footerRe = new RegExp(
-    `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): (?:gzip -dc ${quotedPath} \\| tail -c \\+\\d+|tail -c \\+\\d+ ${quotedPath}) \\| head -c \\d+)?${noncePat} ---\\n`,
+    `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): (?:cat ${quotedPath} \\| gzip -dc \\| tail -c \\+\\d+|gzip -dc ${quotedPath} \\| tail -c \\+\\d+|tail -c \\+\\d+ ${quotedPath}) \\| head -c \\d+)?${noncePat} ---\\n`,
     'g',
   )
   return content.replace(footerRe, '')
@@ -1657,23 +1911,40 @@ function stripReservedFooters(content, quoted, frameNonce = null) {
 function recoverNoteRefPayload(parsed) {
   if (!parsed || parsed.kind !== 'note_ref' || typeof parsed.file !== 'string' || !parsed.file) return null
   const partsCount = Number.isInteger(parsed.parts) && parsed.parts > 0 ? parsed.parts : 1
+  const shardFiles =
+    Array.isArray(parsed.files) && parsed.files.length > 1 && parsed.files.every((f) => typeof f === 'string' && f)
+      ? parsed.files
+      : [parsed.file]
   const quoted = shellQuotePath(parsed.file)
+  const quotedList = shardFiles.map(shellQuotePath).join(' ')
+  const firstPageBytes =
+    Number.isInteger(parsed.first_page_bytes) && parsed.first_page_bytes > 0 ? parsed.first_page_bytes : null
   const readFallbackCmd =
     typeof parsed.command === 'string' && parsed.command
       ? parsed.command
       : parsed.compressed === 'gzip'
-        ? partsCount > 1
-          ? `gzip -dc ${quoted} | head -c ${NOTE_PART_CHARS}`
-          : `gzip -dc ${quoted}`
-        : `cat ${quoted}`
+        ? shardFiles.length > 1
+          ? partsCount > 1
+            ? `cat ${quotedList} | gzip -dc | head -c ${firstPageBytes ?? CURSOR_SHELL_OUTPUT_MAX_CHARS}`
+            : `cat ${quotedList} | gzip -dc`
+          : partsCount > 1
+            ? `gzip -dc ${quoted} | head -c ${firstPageBytes ?? CURSOR_SHELL_OUTPUT_MAX_CHARS}`
+            : `gzip -dc ${quoted}`
+        : parsed.reserved && partsCount > 1 && firstPageBytes
+          ? `head -c ${firstPageBytes} ${quoted}`
+          : `cat ${quoted}`
   try {
     if (parsed.compressed === 'gzip') {
-      let gunzipped = zlib.gunzipSync(fs.readFileSync(parsed.file)).toString('utf8')
+      const gzRaw =
+        shardFiles.length > 1
+          ? Buffer.concat(shardFiles.map((f) => fs.readFileSync(f)))
+          : fs.readFileSync(parsed.file)
+      let gunzipped = zlib.gunzipSync(gzRaw).toString('utf8')
       if (gunzipped.startsWith(PENDING_DIAGNOSTIC_REFUSAL_PREFIX) && typeof parsed.scope === 'string') {
         const rec = parsePendingDiagnosticRefusalFile(gunzipped, parsed.scope)
         if (rec?.body) return { ok: rec.ok, text: rec.body }
       }
-      gunzipped = stripReservedFooters(gunzipped, quoted, parsed.frame_nonce)
+      gunzipped = stripReservedFooters(gunzipped, shardFiles.length > 1 ? quotedList : quoted, parsed.frame_nonce)
       if (gunzipped) return { ok: true, text: gunzipped }
     } else if (parsed.reserved) {
       let content = fs.readFileSync(parsed.file, 'utf8')
@@ -1743,7 +2014,11 @@ export function spoolUnsavedRefusal(
       kind: 'note_ref',
       at: new Date().toISOString(),
       file: savedNote.file,
+      ...(Array.isArray(savedNote.files) && savedNote.files.length > 1 ? { files: savedNote.files } : {}),
       parts: savedNote.parts ?? 1,
+      ...(Number.isInteger(savedNote.firstPageBytes) && savedNote.firstPageBytes > 0
+        ? { first_page_bytes: savedNote.firstPageBytes }
+        : {}),
       fallback: Boolean(savedNote.fallback),
       ...(savedNote.reserved ? { reserved: true } : {}),
       ...(savedNote.compressed ? { compressed: savedNote.compressed } : {}),
@@ -1810,10 +2085,15 @@ export function spoolUnsavedRefusal(
           kind: 'note_ref',
           at: new Date().toISOString(),
           file: saved.file,
+          ...(Array.isArray(saved.files) && saved.files.length > 1 ? { files: saved.files } : {}),
           parts: saved.parts ?? 1,
+          ...(Number.isInteger(saved.firstPageBytes) && saved.firstPageBytes > 0
+            ? { first_page_bytes: saved.firstPageBytes }
+            : {}),
           fallback: Boolean(saved.fallback),
           ...(saved.reserved ? { reserved: true } : {}),
           ...(saved.compressed ? { compressed: saved.compressed } : {}),
+          ...(saved.frameNonce ? { frame_nonce: saved.frameNonce } : {}),
         }
         if (typeof reservedStore.writeSpoolPointer === 'function') {
           const fromSlot = reservedStore.writeSpoolPointer(refPayload)

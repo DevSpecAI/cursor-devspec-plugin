@@ -6193,4 +6193,364 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       'Pass-2 gzipped .md file MUST be cleaned up once surfaced cleanly by the fresh process',
     )
   })
+
+  it('transient note read error fallback command emits exact first_page_bytes (preserving continuation footer), AND incompressible >128 KiB refusals under ENOSPC survive durably via multi-slot gzip sharding and structured compaction across fresh processes (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { randomBytes } = await import('node:crypto')
+    const zlib = await import('node:zlib')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      fitsShellOutput,
+      reserveDiagnosticNoteSlots,
+      fitShellDiagnostic,
+      spoolUnsavedRefusal,
+      peekPendingUnsavedRefusals,
+      clearPendingUnsavedRefusals,
+      readNoteText,
+    } = await import('./hook-context-budget.mjs')
+    const { readWakes } = await import('./devspec-wake-tail.mjs')
+    const wakeTailUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+
+    // 1. Transient note read error fallback command MUST return the complete first page (including
+    //    `next part (2/N)` continuation) without cutting at 18,000 bytes!
+    {
+      const { home, dir } = mkHome()
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      const spoolKey = path.resolve(dir)
+      const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+      const reserved = reserveDiagnosticNoteSlots({ home, fallbackDir: diagDir, backupDir: dir, spoolKey })
+      assert.equal(reserved.ok, true)
+
+      const refusal = JSON.stringify({
+        code: 'blocked_by_items',
+        blocking_items: [
+          { id: 'blk-transient-first', detail: 'A'.repeat(180_000) },
+          { id: 'blk-transient-final', reason: 'must_reach_via_fallback_command' },
+        ],
+      })
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let fitted = null
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = () => { throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }) }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+          if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        fitted = fitShellDiagnostic('', refusal, {
+          home,
+          label: 'devspec-wake-tail',
+          fallbackDir: diagDir,
+          backupDir: dir,
+          reservedStore: reserved,
+          spoolKey,
+        })
+        spoolUnsavedRefusal(spoolKey, refusal, { ...spoolOpts, savedNote: fitted.note, reservedStore: reserved })
+      } finally {
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+        reserved.release()
+      }
+
+      // Trigger a transient read error on the saved gzip note file in a fresh OS process:
+      const hookBudgetUrl = new URL('./hook-context-budget.mjs', import.meta.url).href
+      fs.chmodSync(fitted.note.file, 0o000)
+      let fallbackEntries = []
+      try {
+        const childFallback = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `import { peekPendingUnsavedRefusals } from ${JSON.stringify(hookBudgetUrl)}; console.log(JSON.stringify(peekPendingUnsavedRefusals(${JSON.stringify(spoolKey)}, ${JSON.stringify(spoolOpts)})));`,
+          ],
+          { encoding: 'utf8' },
+        )
+        assert.equal(childFallback.status, 0, childFallback.stderr)
+        fallbackEntries = JSON.parse(childFallback.stdout)
+      } finally {
+        fs.chmodSync(fitted.note.file, 0o600)
+      }
+      assert.equal(fallbackEntries.length, 1)
+      const cmdMatch = /inspect directly with `([^`]+)`/.exec(fallbackEntries[0])
+      assert.ok(cmdMatch, `expected fallback command in: ${fallbackEntries[0]}`)
+
+      // Execute that EXACT fallback command and follow its continuation chain!
+      let cmd = cmdMatch[1]
+      let visited = 0
+      let allOut = ''
+      while (cmd) {
+        visited += 1
+        assert.ok(visited <= fitted.note.parts + 2)
+        const sh = spawnSync('sh', ['-c', cmd], { encoding: 'utf8' })
+        assert.equal(sh.status, 0, sh.stderr)
+        assert.equal(fitsShellOutput(sh.stdout), true, `fallback page ${visited} must fit Shell ceiling`)
+        allOut += sh.stdout
+        const next = /next part \(\d+\/\d+\): (gzip -dc [^\n]+ \| tail -c \+\d+ \| head -c \d+) ---\n$/.exec(sh.stdout)
+        cmd = next ? next[1] : null
+      }
+      assert.equal(visited, fitted.note.parts, 'fallback command MUST preserve continuation footer for every part')
+      assert.match(allOut, /blk-transient-final/, 'following fallback command continuations MUST reach final blocker')
+      clearPendingUnsavedRefusals(spoolKey, [refusal], spoolOpts)
+    }
+
+    // 2. Incompressible ~195 KiB refusal (~150 KiB gzipped > single 128 KiB slot) under ENOSPC:
+    //    sharded losslessly across multiple pre-allocated 128 KiB slots AND recovered byte-for-byte
+    //    by a fresh OS process!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('Incompressible sharded ENOSPC'))), { mode: 0o600 })
+
+      const randomBlob = randomBytes(145_000).toString('base64')
+      assert.ok(zlib.gzipSync(Buffer.from(randomBlob, 'utf8')).length > RESERVED_DIAGNOSTIC_SLOT_BYTES)
+
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      let pass1 = null
+      let pass1Stderr = ''
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        pass1 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (t) => { pass1Stderr += t },
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [
+                {
+                  command_message_id: 'msg-sharded-1',
+                  refusal: {
+                    code: 'blocked_by_items',
+                    blocking_items: [
+                      { id: 'blk-sharded-first', blob: randomBlob },
+                      { id: 'blk-sharded-final', reason: 'must_survive_sharded_gzip_enospc' },
+                    ],
+                  },
+                },
+              ],
+            }
+          },
+        })
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      assert.equal(pass1.marked, false)
+      assert.equal(pass1.pickup_diagnostic_note?.compressed, 'gzip')
+      assert.ok(Array.isArray(pass1.pickup_diagnostic_note?.files) && pass1.pickup_diagnostic_note.files.length >= 2)
+      assert.ok(pass1Stderr.includes('gzip -dc'), 'stderr must advertise sharded gzip read command')
+
+      // Execute sharded read command and follow EVERY continuation in sh!
+      let cmd = pass1.pickup_diagnostic_note.command
+      let pages = 0
+      let combined = ''
+      while (cmd) {
+        pages += 1
+        assert.ok(pages <= pass1.pickup_diagnostic_note.parts + 2)
+        const sh = spawnSync('sh', ['-c', cmd], { encoding: 'utf8' })
+        assert.equal(sh.status, 0, sh.stderr)
+        assert.ok(sh.stdout.length <= CURSOR_SHELL_OUTPUT_MAX_CHARS)
+        assert.equal(fitsShellOutput(sh.stdout), true)
+        combined += sh.stdout
+        const cont = /next part \(\d+\/\d+\): (cat [^\n]+ \| gzip -dc \| tail -c \+\d+ \| head -c \d+) ---\n$/.exec(sh.stdout)
+        cmd = cont ? cont[1] : null
+      }
+      assert.equal(pages, pass1.pickup_diagnostic_note.parts)
+      assert.match(combined, /blk-sharded-final/, 'sharded gzip chain MUST reach final blocker')
+
+      // Fresh OS process after disk space returns MUST recover the full refusal and surface it!
+      const child = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
+            import { readWakes } from ${JSON.stringify(wakeTailUrl)};
+            import { peekPendingUnsavedRefusals } from ${JSON.stringify(new URL('./hook-context-budget.mjs', import.meta.url).href)};
+            let stderr = '';
+            const res = await readWakes({
+              file: ${JSON.stringify(wakeFile)},
+              connectionId: ${JSON.stringify(CONN)},
+              home: ${JSON.stringify(home)},
+              dir: ${JSON.stringify(dir)},
+              settleMs: 0,
+              write: async () => {},
+              writeStderr: async (t) => { stderr += t; },
+              startCommands: async () => ({ ok: true, outcome: 'started', started: ['msg-sharded-1'], refusals: [] }),
+            });
+            const remaining = peekPendingUnsavedRefusals(${JSON.stringify(path.resolve(dir))}, { home: ${JSON.stringify(home)}, fallbackDir: ${JSON.stringify(diagDir)}, backupDir: ${JSON.stringify(dir)} });
+            console.log(JSON.stringify({ marked: res.marked, stderr, note: res.pickup_diagnostic_note ?? null, remaining }));
+          `,
+        ],
+        { encoding: 'utf8' },
+      )
+      assert.equal(child.status, 0, child.stderr)
+      const out = JSON.parse(child.stdout)
+      assert.equal(out.marked, true)
+      assert.ok(out.note?.id)
+      const noteText = readNoteText(out.note.id, { home })
+      assert.match(noteText, /blk-sharded-first/)
+      assert.match(noteText, /blk-sharded-final/)
+      assert.deepEqual(out.remaining, [], 'on-disk sharded spool entry MUST be cleared once surfaced cleanly')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+
+    // 3. Extreme incompressible refusal (>600 KiB random, > ALL pre-allocated slots combined!) under ENOSPC:
+    //    compacts only oversized string blobs while preserving EVERY blocking record (including final blocker)
+    //    durably on disk AND surfacing it in a fresh OS process once disk space returns!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('Extreme incompressible ENOSPC'))), { mode: 0o600 })
+
+      const hugeRandomBlob = randomBytes(550_000).toString('base64')
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      let pass1 = null
+      let pass1Stderr = ''
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        pass1 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (t) => { pass1Stderr += t },
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [
+                {
+                  command_message_id: 'msg-extreme-1',
+                  refusal: {
+                    code: 'blocked_by_items',
+                    blocking_items: [
+                      { id: 'blk-extreme-first', blob: hugeRandomBlob },
+                      { id: 'blk-extreme-final', reason: 'must_survive_extreme_enospc_compaction' },
+                    ],
+                  },
+                },
+              ],
+            }
+          },
+        })
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      assert.equal(pass1.marked, false)
+      assert.equal(pass1.pickup_diagnostic_note?.enospcCompacted, true)
+      assert.ok(pass1.pickup_diagnostic_note?.command, 'stderr MUST include a working read command for the compacted refusal note')
+      assert.ok(pass1Stderr.includes(pass1.pickup_diagnostic_note.command))
+      const shRead = spawnSync('sh', ['-c', pass1.pickup_diagnostic_note.command], { encoding: 'utf8' })
+      assert.equal(shRead.status, 0, shRead.stderr)
+      assert.match(shRead.stdout, /blk-extreme-first/)
+      assert.match(shRead.stdout, /blk-extreme-final/, 'saved compacted note MUST preserve final blocker')
+      assert.match(shRead.stdout, /enospc_compacted/)
+
+      // Fresh OS process after disk space returns MUST recover and surface the preserved refusal including blk-extreme-final!
+      const child = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
+            import { readWakes } from ${JSON.stringify(wakeTailUrl)};
+            import { peekPendingUnsavedRefusals } from ${JSON.stringify(new URL('./hook-context-budget.mjs', import.meta.url).href)};
+            let stderr = '';
+            const res = await readWakes({
+              file: ${JSON.stringify(wakeFile)},
+              connectionId: ${JSON.stringify(CONN)},
+              home: ${JSON.stringify(home)},
+              dir: ${JSON.stringify(dir)},
+              settleMs: 0,
+              write: async () => {},
+              writeStderr: async (t) => { stderr += t; },
+              startCommands: async () => ({ ok: true, outcome: 'started', started: ['msg-extreme-1'], refusals: [] }),
+            });
+            const remaining = peekPendingUnsavedRefusals(${JSON.stringify(path.resolve(dir))}, { home: ${JSON.stringify(home)}, fallbackDir: ${JSON.stringify(diagDir)}, backupDir: ${JSON.stringify(dir)} });
+            console.log(JSON.stringify({ marked: res.marked, stderr, note: res.pickup_diagnostic_note ?? null, remaining }));
+          `,
+        ],
+        { encoding: 'utf8' },
+      )
+      assert.equal(child.status, 0, child.stderr)
+      const out = JSON.parse(child.stdout)
+      assert.equal(out.marked, true)
+      const surfaced = out.note?.id ? readNoteText(out.note.id, { home }) : out.stderr
+      assert.match(surfaced, /recovered previously unsaved pickup refusal/)
+      assert.match(surfaced, /blk-extreme-first/)
+      assert.match(surfaced, /blk-extreme-final/, 'fresh process MUST surface final blocker after disk space returns')
+      assert.deepEqual(out.remaining, [], 'on-disk compacted spool entry MUST be cleared once surfaced cleanly')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+  })
 })

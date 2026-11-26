@@ -1021,7 +1021,10 @@ export async function readWakes({
       })
       pickupDiagnosticNote = fittedWithStdout.note
       const savedReadableNow =
-        (Boolean(fittedWithStdout.note) && !fittedWithStdout.note.pendingPermissionRecovery && !fittedWithStdout.note.compressed) ||
+        (Boolean(fittedWithStdout.note) &&
+          !fittedWithStdout.note.pendingPermissionRecovery &&
+          !fittedWithStdout.note.compressed &&
+          !fittedWithStdout.note.enospcCompacted) ||
         fitsShellOutput(printedStdout + effectiveRawDiag)
       const diagText =
         fittedWithStdout.text ||
@@ -1064,7 +1067,10 @@ export async function readWakes({
       })
       pickupDiagnosticNote = fitted.note
       const savedReadableNow =
-        (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery && !fitted.note.compressed) ||
+        (Boolean(fitted.note) &&
+          !fitted.note.pendingPermissionRecovery &&
+          !fitted.note.compressed &&
+          !fitted.note.enospcCompacted) ||
         fitsShellOutput(printedStdout + effectiveRawDiag)
       if (fitted.text) {
         await writeStderr(fitted.text)
