@@ -3728,4 +3728,62 @@ describe('typed-turn-sync (item da03801e)', () => {
     const afterStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true })
     assert.ok(afterStamped.deny, 'after retry, the same claim MUST STILL ask which work it serves instead of auto-stamping Alice')
   })
+
+  it('finishIdleRequests does not close a pending-opens recovered request when a pending launch is recorded before or during report_complete (3ea2b201 / ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const { requestForWake } = await import('./requests.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555b2'
+    const ATTEMPT_ID = '66666666-6666-4666-8666-6666666666b2'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Run background job from recovered open')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    // Server-opened request lives in `.pending-opens.json` (not yet in `.requests.jsonl`).
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const closeCalls = []
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state: { session_id: ROOM, local_turn: { attempt_id: ATTEMPT_ID, session_id: ROOM } },
+      connectionCapability: 'cap-secret',
+      callComplete: async () => {
+        // While awaiting report_complete, the open + background launch land in `.requests.jsonl`!
+        appendRequestEvent(CONN, { op: 'open', id: RECOVERED_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: RECOVERED_REQ }, { dir })
+        appendRequestEvent(
+          CONN,
+          { op: 'launch', key: 'bg-task-recovered-midwait', kind: 'background_task', request: RECOVERED_REQ },
+          { dir },
+        )
+        return { outcome: 'completed', phase: 'done' }
+      },
+      callRequest: async (args) => {
+        closeCalls.push(args)
+        return { status: 'closed' }
+      },
+      patchState: () => true,
+      dir,
+    })
+
+    assert.equal(res.localCompleted, true)
+    assert.deepEqual(closeCalls, [], 'MUST NOT close recovered request once a pending launch exists in .requests.jsonl')
+    assert.deepEqual(res.closed, [])
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(RECOVERED_REQ), true)
+    const wakeMatch = requestForWake({
+      origin: 'task-notification',
+      text: '<task-notification><task-id>bg-task-recovered-midwait</task-id></task-notification>',
+      state: after,
+    })
+    assert.equal(wakeMatch.ref, RECOVERED_REQ, 'later wake for recovered request must still resolve its requester')
+  })
 })

@@ -1874,12 +1874,33 @@ export async function finishIdleRequests({
         ? reqState.current
         : ([...reqState.open.keys()].find((id) => requestFinished(reqState, id, pending)) ?? null)
 
+  const hasPendingWorkForRequest = (rState, requestId) => {
+    if (!rState || !requestId) return false
+    const pendingSet = pendingWorkWithoutHostLists(rState)
+    if (pendingSet.has(requestId)) return true
+    if (rState.open.has(requestId) && !requestFinished(rState, requestId, pendingSet)) return true
+    for (const launch of new Set(rState.launches.values())) {
+      const namesIt = launch.request === requestId || (Array.isArray(launch.also) && launch.also.includes(requestId))
+      if (namesIt && (launch.kind === 'monitor' || (launch.notifies !== false && !launch.notified))) {
+        return true
+      }
+    }
+    for (const sched of rState.schedules) {
+      if (sched.request === requestId || (Array.isArray(sched.also) && sched.also.includes(requestId))) {
+        return true
+      }
+    }
+    return false
+  }
+
   // Also recover any server-accepted open whose local append previously failed so it is
-  // closed on DevSpec even if the turn ended before a local write retry succeeded (req 3ea2b201).
+  // closed on DevSpec even if the turn ended before a local write retry succeeded (req 3ea2b201),
+  // NEVER closing a recovered request that has pending launches/monitors/schedules (ce71a72b).
   const pendingEntries = pendingOpensForConnection(dir, connectionId)
+  const closeablePendingEntries = pendingEntries.filter(([, entry]) => !hasPendingWorkForRequest(reqState, entry.requestId))
   const pendingFallback =
-    !candidateId && pendingEntries.length > 0
-      ? pendingEntries.find(([, entry]) => active.key && entry.turnKey === active.key) ?? pendingEntries[0]
+    !candidateId && closeablePendingEntries.length > 0
+      ? closeablePendingEntries.find(([, entry]) => active.key && entry.turnKey === active.key) ?? closeablePendingEntries[0]
       : null
 
   const initialCurrent = reqState.current
@@ -2037,13 +2058,14 @@ export async function finishIdleRequests({
     }
     }
   } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
+    const [pendingKey, pendingEntry] = pendingFallback
     const preCloseState = readRequestState(connectionId, { dir })
     const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
     const preCloseStillIdle =
       !(preCloseState.readError && preCloseState.readError.code !== 'EISDIR') &&
-      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
+      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
+      !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
     if (preCloseStillIdle) {
-    const [pendingKey, pendingEntry] = pendingFallback
     let lastCloseResponse = null
     let lastCloseError = null
     let serverClosed = false
