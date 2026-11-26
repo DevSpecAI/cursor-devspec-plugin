@@ -495,6 +495,10 @@ function isFailedTurnDeterministicId(dir, connectionId, requestId, excludeKey) {
 
 function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
   const reqState = readRequestState(connectionId, { dir })
+  // Never treat a transient read failure (e.g. write-only/EACCES/EBUSY) as an empty
+  // request log here, or restoring `fg.current = null` would wipe a live room command
+  // from another person and mark the older turn synced (3ea2b201 / ce71a72b).
+  if (reqState.readError) return false
   if (!reqState.open.has(entry.requestId)) {
     const ok = appendRequestEvent(
       connectionId,
@@ -763,8 +767,17 @@ export async function syncTypedTurnFromTranscript({
   const effectiveCallRequest = boundedCall(callRequest)
   const effectiveCallPickup = boundedCall(callPickup)
 
+  let sawRequestLogReadError = false
+  const isBlockingReadError = (err) => {
+    if (!err) return false
+    sawRequestLogReadError = true
+    return err.code !== 'EISDIR'
+  }
   const canMarkSynced = () =>
-    !hasPendingFailedTypedTurns(dir, connectionId) && pendingOpensForConnection(dir, connectionId).length === 0
+    !sawRequestLogReadError &&
+    !hasPendingFailedTypedTurns(dir, connectionId) &&
+    pendingOpensForConnection(dir, connectionId).length === 0 &&
+    !readRequestState(connectionId, { dir }).readError
 
   const retryQueuedFailedTurn = async ({ excludeKey = null } = {}) => {
     const pendingEntries = pendingOpensForConnection(dir, connectionId).filter(
@@ -802,6 +815,13 @@ export async function syncTypedTurnFromTranscript({
     if (!queuedKey) return { ran: false, ok: canMarkSynced(), result: null }
 
     const reqState = readRequestState(connectionId, { dir })
+    if (isBlockingReadError(reqState.readError)) {
+      return {
+        ran: true,
+        ok: false,
+        result: { action: 'request_log_unreadable', key: queuedKey },
+      }
+    }
     if (reqState.seenTranscriptTurns.has(queuedKey)) {
       clearFailedTypedTurn(dir, connectionId, queuedKey)
       return {
@@ -826,6 +846,9 @@ export async function syncTypedTurnFromTranscript({
       dir,
       async () => {
         const lockedState = readRequestState(connectionId, { dir })
+        if (isBlockingReadError(lockedState.readError)) {
+          return { action: 'request_log_unreadable', key: queuedKey }
+        }
         if (lockedState.seenTranscriptTurns.has(queuedKey)) {
           clearFailedTypedTurn(dir, connectionId, queuedKey)
           return {
@@ -973,12 +996,6 @@ export async function syncTypedTurnFromTranscript({
   }
   // Never treat a transient `.requests.jsonl` read failure (e.g. EACCES/EBUSY/EIO)
   // as an empty log or mark the transcript checked (requirement 3ea2b201).
-  let sawRequestLogReadError = false
-  const isBlockingReadError = (err) => {
-    if (!err) return false
-    sawRequestLogReadError = true
-    return err.code !== 'EISDIR'
-  }
   const startReqState = readRequestState(connectionId, { dir })
   if (isBlockingReadError(startReqState.readError)) {
     log(
@@ -1366,7 +1383,12 @@ export async function syncTypedTurnFromTranscript({
   //  - a previously refused room admission is retried cleanly rather than sent through
   //    historical recovery and marked synced without admission (requirement 3ea2b201).
   let sameTurnTypedOutcome = null
-  if (active.kind !== 'typed' && liveTypedKey && !readRequestState(connectionId, { dir }).seenTranscriptTurns.has(liveTypedKey)) {
+  if (active.kind !== 'typed' && liveTypedKey) {
+    const liveTypedCheck = readRequestState(connectionId, { dir })
+    if (isBlockingReadError(liveTypedCheck.readError)) {
+      return { action: 'request_log_unreadable', key: liveTypedKey }
+    }
+    if (!liveTypedCheck.seenTranscriptTurns.has(liveTypedKey)) {
     sameTurnTypedOutcome = await syncLiveTypedTurn(liveTypedKey)
     if (!sameTurnTypedOutcome) return { action: 'lock_busy', key: liveTypedKey }
     if (
@@ -1395,6 +1417,7 @@ export async function syncTypedTurnFromTranscript({
       if (!liveRequestActive) {
         return sameTurnTypedOutcome
       }
+    }
     }
   }
 
@@ -1716,6 +1739,7 @@ export async function finishIdleRequests({
     if (!initialCurrent) return
     await withTypedSyncLock(connectionId, dir, async () => {
       const curState = readRequestState(connectionId, { dir })
+      if (curState.readError) return
       if (!curState.current || curState.current !== initialCurrent) return
       // Re-verify the transcript is still idle on the same ended turn so a new live
       // typed turn opened while awaiting report_complete/closeRequest is NEVER cleared (ce71a72b).

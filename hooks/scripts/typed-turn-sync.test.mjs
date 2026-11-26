@@ -3325,4 +3325,68 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(after.launches.get('bg-transient-1')?.notified, true)
     assert.equal(memo.synced, true)
   })
+
+  it('transient write-only request-log read failure during queued older-turn recovery never clears another person’s live room command or marks sync complete (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_BOB = '66666666-6666-4666-8666-6666666666fe'
+    const reqFile = path.join(dir, `${CONN}.requests.jsonl`)
+
+    // Turn 1 (typed) ended unseen before sync; now Turn 2 is Bob's live room command!
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_BOB }, { dir })
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Earlier missed terminal turn')}\n${turnEndedRow()}\n${cmdRow}\n`)
+
+    const memo = {}
+    let chmodApplied = false
+    try {
+      const pass1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          // Simulate a transient write-only read failure (`0o200`: appendFileSync works,
+          // readFileSync fails with EACCES!) right after DevSpec accepts the older turn open
+          // and right before flushPendingLocalOpenEntry runs!
+          fs.chmodSync(reqFile, 0o200)
+          chmodApplied = true
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+        },
+        dir,
+        memo,
+      })
+      assert.equal(pass1.retriedFailedTurn?.action, 'open_write_failed')
+      assert.equal(memo.synced, false, 'memo must stay unsynced after transient read failure in recovery')
+    } finally {
+      if (chmodApplied) fs.chmodSync(reqFile, 0o600)
+    }
+
+    // Bob's live room command MUST still be current (NOT wiped to null!)
+    const midState = readRequestState(CONN, { dir })
+    assert.equal(midState.current, CMD_BOB, 'live room command attribution MUST survive transient read failure during older-turn retry')
+    const midStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(midStamped.args?.request_ref, CMD_BOB, 'claims must still carry Bob’s live room command')
+
+    // Next pass after read recovery completes the older turn AND preserves Bob’s live room command!
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), true)
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('already opened on DevSpec') },
+      dir,
+      memo,
+    })
+    assert.equal(pass2.action, 'not_typed_live')
+    assert.equal(memo.synced, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_BOB, 'Bob’s live room command must remain current after older turn finishes flushing')
+    const afterStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(afterStamped.args?.request_ref, CMD_BOB)
+  })
 })
