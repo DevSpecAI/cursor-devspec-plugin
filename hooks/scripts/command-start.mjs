@@ -507,11 +507,13 @@ export function formatStructuredRefusalsFallback(
   const savedCmd = typeof savedNote?.command === 'string' && savedNote.command ? savedNote.command : null
   const savedEnospcIncomplete = Boolean(savedNote?.enospcIncomplete)
   const savedEnospcCompacted = Boolean(savedNote?.enospcCompacted)
+  const savedEnospcCompactedReasons = Boolean(savedNote?.enospcCompactedReasons)
   const savedMetaFields = savedCmd
     ? {
         read: savedCmd,
         ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}),
         ...(savedEnospcCompacted ? { enospc_compacted: true } : {}),
+        ...(savedEnospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
         ...(savedEnospcIncomplete
           ? {
               enospc_incomplete: true,
@@ -526,7 +528,9 @@ export function formatStructuredRefusalsFallback(
     ? savedEnospcIncomplete
       ? `Partial ENOSPC refusal saved (${Number.isInteger(savedNote.returnedRecords) && Number.isInteger(savedNote.totalRecords) ? `${savedNote.returnedRecords}/${savedNote.totalRecords} records, ${savedNote.omittedRecords} omitted` : 'some bytes omitted'} because disk is full); inspect saved excerpt with \`${savedCmd}\`, then free disk space and re-run wake read for the complete refusal.`
       : savedEnospcCompacted
-        ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized string blobs shortened); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged blobs.`
+        ? savedEnospcCompactedReasons
+          ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs and reason text shortened; actionable URLs preserved); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged details.`
+          : `ENOSPC-compacted refusal saved (all blocking records preserved; oversized string blobs shortened); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged blobs.`
         : `Read the complete original refusal with \`${savedCmd}\` (and any further parts it names); fix write permissions on ~/.devspec/notes.`
     : recovery
   const limitChars = typeof maxChars === 'number' && maxChars > 0 ? maxChars : CURSOR_SHELL_OUTPUT_MAX_CHARS
@@ -756,7 +760,10 @@ export function formatStructuredRefusalsFallback(
             ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
           }
         : savedEnospcCompacted
-          ? { enospc_compacted: true }
+          ? {
+              enospc_compacted: true,
+              ...(savedEnospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+            }
           : {}),
       read: savedCmd,
       recovery: savedEnospcIncomplete

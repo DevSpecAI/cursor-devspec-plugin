@@ -979,7 +979,10 @@ export function shellDiagnosticPointer(label, command, note = null) {
     return `${label}: partial ENOSPC refusal saved (${counts}; disk full) — run \`${command}\` (and any further parts), then free disk space and re-run wake read for the full refusal.\n`
   }
   if (note?.enospcCompacted) {
-    return `${label}: ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs shortened) — run \`${command}\` (and any further parts); free disk space and re-run wake read for unabridged blobs.\n`
+    const whatShortened = note.enospcCompactedReasons
+      ? 'oversized blobs and reason text shortened; actionable URLs preserved'
+      : 'oversized blobs shortened'
+    return `${label}: ENOSPC-compacted refusal saved (all blocking records preserved; ${whatShortened}) — run \`${command}\` (and any further parts); free disk space and re-run wake read for unabridged details.\n`
   }
   return `${label}: full details saved whole — run \`${command}\` (and any further parts).\n`
 }
@@ -1001,6 +1004,17 @@ export function shellDiagnosticPointer(label, command, note = null) {
  *     structured refusal fallback with blocking details without silently dropping output.
  */
 export const SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS = 600
+
+/**
+ * Minimum headroom (in UTF-16 code units) `shellDiagnosticReserve` MUST leave inside
+ * Cursor's 20,000-char Shell ceiling (`CURSOR_SHELL_OUTPUT_MAX_CHARS`) so a wake reader
+ * can ALWAYS fit its header, listener advice, and at least one short inline command or
+ * `wake_in_note` pointer — even when valid note paths expand heavily under shell quoting
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+export const MIN_SHELL_WAKE_HEADROOM_CHARS = 2_000
+export const MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS = CURSOR_SHELL_OUTPUT_MAX_CHARS - MIN_SHELL_WAKE_HEADROOM_CHARS
+export const MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES = CURSOR_SHELL_OUTPUT_MAX_BYTES - MIN_SHELL_WAKE_HEADROOM_CHARS * 2
 
 /**
  * Build one reserve string whose UTF-16 character length AND UTF-8 byte length are EACH
@@ -1033,8 +1047,9 @@ export function maxShellReserve(candidates, minChars = 0) {
  * boundary from the worst-case UTF-16 length and UTF-8 byte length across all note stores
  * (`~/.devspec/notes`, `os.tmpdir()`, `fallbackDir`, and `backupDir`) — including
  * multi-slot sharded gzip recovery commands (`cat <slot1> <slot2> ... | gzip -dc | head -c 40000`)
- * and ENOSPC partial/compacted pointer notices — plus `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`
- * so `stdout + stderr` always fits `fitsShellOutput` (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
+ * and ENOSPC partial/compacted pointer notices — plus `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`,
+ * bounded by `MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS` / `MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES` so
+ * heavily-quoted paths can NEVER starve wake delivery (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
  */
 export function shellDiagnosticReserve(
   label = 'devspec-wake-tail',
@@ -1058,11 +1073,18 @@ export function shellDiagnosticReserve(
   const pointerVariants = [
     null,
     { enospcCompacted: true },
+    { enospcCompacted: true, enospcCompactedReasons: true },
     { enospcIncomplete: true, returnedRecords: 99999, totalRecords: 99999, omittedRecords: 99999 },
   ]
   const addCommandCandidates = (candidates, command) => {
     for (const variant of pointerVariants) {
-      candidates.push(shellDiagnosticPointer(label, command, variant))
+      const ptr = shellDiagnosticPointer(label, command, variant)
+      if (
+        ptr.length <= MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS &&
+        Buffer.byteLength(ptr, 'utf8') <= MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES
+      ) {
+        candidates.push(ptr)
+      }
     }
   }
   const candidates = []
@@ -1077,7 +1099,18 @@ export function shellDiagnosticReserve(
     const shardedQuotedList = sampleFiles.map(shellQuotePath).join(' ')
     addCommandCandidates(candidates, `cat ${shardedQuotedList} | gzip -dc | head -c 40000`)
   }
-  return maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
+  const combined = maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
+  if (
+    combined.length <= MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS &&
+    Buffer.byteLength(combined, 'utf8') <= MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES
+  ) {
+    return combined
+  }
+  let out = combined.slice(0, MAX_SHELL_DIAGNOSTIC_RESERVE_CHARS)
+  while (out.length > 0 && Buffer.byteLength(out, 'utf8') > MAX_SHELL_DIAGNOSTIC_RESERVE_BYTES) {
+    out = out.slice(0, Math.max(0, out.length - 64))
+  }
+  return out
 }
 
 function shellQuotePath(value) {
@@ -1271,6 +1304,22 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     typeof v === 'string' &&
     v.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
     (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
+  const extractActionableUrls = (str) => {
+    if (typeof str !== 'string' || !str) return []
+    const matches = str.match(
+      /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)/g,
+    )
+    if (!matches) return []
+    const seen = new Set()
+    const out = []
+    for (const raw of matches) {
+      const cleaned = raw.replace(/[.,;:!?]+$/, '')
+      if (!cleaned || cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS || seen.has(cleaned)) continue
+      seen.add(cleaned)
+      out.push(cleaned)
+    }
+    return out
+  }
 
   const shrinkValue = (
     val,
@@ -1283,6 +1332,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       compactOpaqueInNarrative = false,
       includePunctuatedTokens = false,
       compactUrls = false,
+      tracker = null,
     },
   ) => {
     if (typeof val === 'string') {
@@ -1300,6 +1350,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           includePunctuated: includePunctuatedTokens,
         })
         if (res.changed) {
+          if (tracker) tracker.shortenedNarrative = true
           return {
             truncated_due_to_enospc: true,
             original_chars: val.length,
@@ -1311,6 +1362,8 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       }
       if (isNarrativeKey && !compactReasons && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       if (val.length <= maxVerbatimChars) return val
+      if (isNarrativeKey && tracker) tracker.shortenedNarrative = true
+      const embeddedUrls = !compactUrls ? extractActionableUrls(val) : []
       return {
         truncated_due_to_enospc: true,
         original_chars: val.length,
@@ -1321,6 +1374,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
               tail: val.slice(-previewChars),
             }
           : {}),
+        ...(embeddedUrls.length > 0 ? { preserved_urls: embeddedUrls } : {}),
       }
     }
     if (Array.isArray(val)) {
@@ -1333,6 +1387,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactOpaqueInNarrative,
           includePunctuatedTokens,
           compactUrls,
+          tracker,
         }),
       )
     }
@@ -1343,7 +1398,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
         const isProtected =
           ENOSPC_PRESERVED_ID_KEYS.has(k) ||
           ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k) ||
-          (!compactUrls && (isUrlKey(k) || isActionableUrlValue(v)))
+          (!compactUrls && (isUrlKey(k) || isActionableUrlValue(v) || extractActionableUrls(v).length > 0))
         if (structuralOnly && !isProtected && typeof v === 'string' && v.length > maxVerbatimChars) {
           omittedFields.push(k)
           continue
@@ -1357,6 +1412,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactOpaqueInNarrative,
           includePunctuatedTokens,
           compactUrls,
+          tracker,
         })
       }
       if (omittedFields.length > 0) {
@@ -1480,18 +1536,29 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: true },
     ]
     for (const tier of tiers) {
-      const tierNotice = tier.compactReasons
+      const tracker = { shortenedNarrative: false }
+      const provisionalNotice = tier.compactReasons
         ? {
             ...noticeAllPreserved,
             reason:
-              'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code and 100% of blocking records.',
+              'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code, actionable URLs, and 100% of blocking records.',
           }
         : noticeAllPreserved
-      const candidate = renderExtracted(extracted, tierNotice, (v) => shrinkValue(v, tier))
+      let candidate = renderExtracted(extracted, provisionalNotice, (v) => shrinkValue(v, { ...tier, tracker }))
+      const compactedReasons = Boolean(tier.compactReasons || tracker.shortenedNarrative)
+      if (compactedReasons && !tier.compactReasons) {
+        const truthfulNotice = {
+          ...noticeAllPreserved,
+          reason:
+            'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code, actionable URLs, and 100% of blocking records.',
+        }
+        candidate = renderExtracted(extracted, truthfulNotice, (v) => shrinkValue(v, tier))
+      }
       if (fitsCompressed(candidate)) {
         return {
           text: candidate,
           incomplete: false,
+          compactedReasons,
           totalRecords: null,
           returnedRecords: null,
           omittedRecords: 0,
@@ -2078,6 +2145,7 @@ export function reserveDiagnosticNoteSlots({
         )
         const compactMeta = {
           enospcCompacted: true,
+          ...(compacted.compactedReasons ? { enospcCompactedReasons: true } : {}),
           ...(compacted.incomplete
             ? {
                 enospcIncomplete: true,
@@ -2887,7 +2955,9 @@ export function fitShellDiagnostic(
   const statusTag = fallbackNote?.enospcIncomplete
     ? `partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry)`
     : fallbackNote?.enospcCompacted
-      ? 'compacted ENOSPC (all records; blobs shortened)'
+      ? fallbackNote.enospcCompactedReasons
+        ? 'compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved)'
+        : 'compacted ENOSPC (all records; blobs shortened)'
       : fallbackNote
         ? `saved in ${shardCount} file(s)`
         : 'note write failed'
@@ -2895,7 +2965,9 @@ export function fitShellDiagnostic(
     ? fallbackNote.enospcIncomplete
       ? ` Partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`.`
       : fallbackNote.enospcCompacted
-        ? ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
+        ? fallbackNote.enospcCompactedReasons
+          ? ` Compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved): \`${fallbackNote.command}\`.`
+          : ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
         : ` Read original: \`${fallbackNote.command}\`.`
     : ''
   const candidates = [

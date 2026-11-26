@@ -542,29 +542,53 @@ export function readerPage(wakes, { home = os.homedir(), skip = () => false, lis
   const total = kept.length
   if (total === 0) return { text: readerHeader(0, 0, NOTHING_UNREAD, listener), printed: 0, remaining: 0, through: wakes.length }
   const longest = readerHeader(total, total, null, listener)
-  const reservedHeader = longest + reserve
-  const fitted = []
-  let held = null
-  for (const i of kept) {
-    let wake = wakes[i]
-    if (!fitsShellOutput(reservedHeader + wake)) {
-      const out = wakeInNote(eventsOf(wake), { home })
-      if (out.error) {
-        held = out.error
-        break
+  const layoutWithReserve = (activeReserve) => {
+    const reservedHeader = longest + activeReserve
+    const fitted = []
+    let held = null
+    for (const i of kept) {
+      let wake = wakes[i]
+      if (!fitsShellOutput(reservedHeader + wake)) {
+        const out = wakeInNote(eventsOf(wake), { home })
+        if (out.error) {
+          held = out.error
+          break
+        }
+        wake = wakeLines(out.events)
       }
-      wake = wakeLines(out.events)
+      fitted.push(wake)
+      // Nothing after this one can go out with it: no note is written for a wake that waits.
+      if (!fitsShellOutput(reservedHeader + fitted.join(''))) break
     }
-    fitted.push(wake)
-    // Nothing after this one can go out with it: no note is written for a wake that waits.
-    if (!fitsShellOutput(reservedHeader + fitted.join(''))) break
+    const printed = wakesForOneOutput([reservedHeader, ...fitted]).count - 1
+    return { fitted, held, printed }
   }
-  const printed = wakesForOneOutput([reservedHeader, ...fitted]).count - 1
+  let { fitted, held, printed } = layoutWithReserve(reserve)
+  // If an oversized diagnostic `reserve` (e.g. heavily shell-quoted paths) starved even the
+  // first wake or its `wake_in_note` pointer, retry without the overflowing reserve so the
+  // queued wake still comes through whole instead of deadlocking at 0 of N (3c5147a7 / 91d7b47c).
+  if (printed === 0 && !held && reserve) {
+    ;({ fitted, held, printed } = layoutWithReserve(''))
+  }
   const remaining = total - printed
   const through = printed < total ? kept[printed] : wakes.length
   const printedWakes = fitted.slice(0, printed).map((text, idx) => ({ text, sourceIndex: kept[idx] }))
   if (printed === 0 && held) {
     return { text: readerHeader(0, remaining, heldNote(held), listener), printed, remaining, through, printedWakes: [] }
+  }
+  if (printed === 0 && remaining > 0) {
+    const firstWake = wakes[kept[0]]
+    const out = wakeInNote(eventsOf(firstWake), { home })
+    const overflowNote = out.note
+      ? `Wake output reserve (${reserve.length} chars) + header exceeded Cursor's Shell ceiling; first wake saved whole — run \`${out.note.command}\`.`
+      : `Wake output reserve (${reserve.length} chars) + header exceeded Cursor's Shell ceiling and saving a note failed; shorten note/connection paths and re-run.`
+    return {
+      text: readerHeader(0, remaining, overflowNote, listener),
+      printed: 0,
+      remaining,
+      through: kept[0],
+      printedWakes: [],
+    }
   }
   return {
     text: readerHeader(printed, remaining, null, listener) + fitted.slice(0, printed).join(''),
@@ -1141,6 +1165,7 @@ export async function readWakes({
             wakePositionVersion: POSITION_VERSION,
             wakeStart: blockedByCursorHold ? null : deferred.wakeStart,
             wakeThrough: blockedByCursorHold ? null : deferred.wakeThrough,
+            revokeCursorAdvance: blockedByCursorHold,
           },
           { dir },
         )

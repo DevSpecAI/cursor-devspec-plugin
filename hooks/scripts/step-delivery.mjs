@@ -105,6 +105,7 @@ import { appendWakeEvents, splitWakes, wakeLines } from './devspec-wake-file.mjs
 import {
   fitHookContext,
   fitsShellOutput,
+  hasPendingUnsavedRefusals,
   noteCommand,
   pointToNote,
   POST_TOOL_CONTEXT_SHARE,
@@ -246,6 +247,7 @@ export function registerPendingWakeNote(
     wakePositionVersion = 1,
     wakeStart = null,
     wakeThrough = null,
+    revokeCursorAdvance = false,
   },
   { dir = connectionsDirFor() } = {},
 ) {
@@ -255,47 +257,60 @@ export function registerPendingWakeNote(
   const steps = stepsDir(connectionId, dir)
   fs.mkdirSync(steps, { recursive: true, mode: 0o700 })
   const target = path.join(steps, `wake-note-${noteId}.json`)
-  const existing = readPrivateJson(target)
-  if (existing && existing.note === noteId) {
-    const nextStart =
-      typeof wakeStart === 'number'
-        ? typeof existing.wake_start === 'number'
-          ? Math.min(existing.wake_start, wakeStart)
-          : wakeStart
-        : existing.wake_start ?? null
-    const nextThrough =
-      typeof wakeThrough === 'number'
-        ? Math.max(existing.wake_through ?? 0, wakeThrough)
-        : existing.wake_through ?? null
-    if (
-      wakePositionPath &&
-      (nextThrough !== existing.wake_through || nextStart !== existing.wake_start || existing.wake_position_path !== wakePositionPath)
-    ) {
-      writePrivateJson(target, {
-        ...existing,
-        wake_file: wakeFile ?? existing.wake_file ?? null,
-        wake_position_path: wakePositionPath,
-        wake_position_version: wakePositionVersion,
-        wake_start: nextStart,
-        wake_through: nextThrough,
-      })
+  withWakeNoteLock(steps, () => {
+    const existing = readPrivateJson(target)
+    if (existing && existing.note === noteId) {
+      if (revokeCursorAdvance) {
+        if (existing.wake_position_path !== null || existing.wake_start !== null || existing.wake_through !== null) {
+          writePrivateJson(target, {
+            ...existing,
+            wake_position_path: null,
+            wake_start: null,
+            wake_through: null,
+          })
+        }
+        return
+      }
+      const nextStart =
+        typeof wakeStart === 'number'
+          ? typeof existing.wake_start === 'number'
+            ? Math.min(existing.wake_start, wakeStart)
+            : wakeStart
+          : existing.wake_start ?? null
+      const nextThrough =
+        typeof wakeThrough === 'number'
+          ? Math.max(existing.wake_through ?? 0, wakeThrough)
+          : existing.wake_through ?? null
+      if (
+        wakePositionPath &&
+        (nextThrough !== existing.wake_through || nextStart !== existing.wake_start || existing.wake_position_path !== wakePositionPath)
+      ) {
+        writePrivateJson(target, {
+          ...existing,
+          wake_file: wakeFile ?? existing.wake_file ?? null,
+          wake_position_path: wakePositionPath,
+          wake_position_version: wakePositionVersion,
+          wake_start: nextStart,
+          wake_through: nextThrough,
+        })
+      }
+      return
     }
-    return target
-  }
-  writePrivateJson(target, {
-    version: RECORD_VERSION,
-    note: noteId,
-    parts: [],
-    commands,
-    messages,
-    session_id: sessionId,
-    wake_file: wakeFile,
-    wake_position_path: wakePositionPath,
-    wake_position_version: wakePositionVersion,
-    wake_start: typeof wakeStart === 'number' ? wakeStart : null,
-    wake_through: typeof wakeThrough === 'number' ? wakeThrough : null,
-    completed: false,
-    at: new Date().toISOString(),
+    writePrivateJson(target, {
+      version: RECORD_VERSION,
+      note: noteId,
+      parts: [],
+      commands,
+      messages,
+      session_id: sessionId,
+      wake_file: wakeFile,
+      wake_position_path: revokeCursorAdvance ? null : wakePositionPath,
+      wake_position_version: wakePositionVersion,
+      wake_start: revokeCursorAdvance ? null : typeof wakeStart === 'number' ? wakeStart : null,
+      wake_through: revokeCursorAdvance ? null : typeof wakeThrough === 'number' ? wakeThrough : null,
+      completed: false,
+      at: new Date().toISOString(),
+    })
   })
   return target
 }
@@ -380,8 +395,22 @@ function scanWakeNoteFiles(steps) {
  * on the same wake file is also read and picked up; once the cursor passes them, their
  * marker files are deleted.
  */
-function advanceCompletedWakeNotePositions(steps) {
+function advanceCompletedWakeNotePositions(steps, { home = os.homedir(), dir = null } = {}) {
   withWakeNoteLock(steps, () => {
+    const connDir = dir ?? path.dirname(steps)
+    const effectiveHome = typeof home === 'string' && home ? home : os.homedir()
+    // Never advance the wake reader cursor while an unsurfaced spooled refusal is still
+    // pending recovery on disk (requirement 3ea2b201).
+    if (
+      connDir &&
+      hasPendingUnsavedRefusals(path.resolve(connDir), {
+        home: effectiveHome,
+        fallbackDir: path.join(connDir, 'diagnostic-notes'),
+        backupDir: connDir,
+      })
+    ) {
+      return
+    }
     const scan = scanWakeNoteFiles(steps)
     if (!scan.ok) return
     const { files, takenFiles } = scan
@@ -1466,7 +1495,7 @@ export async function stepDeliveryHook(
           }
         }
         if (hasPositionTrackedCompleted) {
-          withStepsLock(connectionId, connDir, () => advanceCompletedWakeNotePositions(steps))
+          withStepsLock(connectionId, connDir, () => advanceCompletedWakeNotePositions(steps, { home, dir: connDir }))
         }
       }
     } else {
