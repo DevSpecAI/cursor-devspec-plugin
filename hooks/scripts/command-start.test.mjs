@@ -5100,4 +5100,218 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(fs.existsSync(r2.file), true, 'concurrently appended entry2 file MUST remain untouched')
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [entry2])
   })
+
+  it('spool reader and readWakes recover oversized structured refusals saved in the preceding v1 spool file format (3c5147a7 / 4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { createHash } = await import('node:crypto')
+    const { peekPendingUnsavedRefusals, clearPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+
+    const wakeFile = path.join(home, `${CONN}.wakes`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Check legacy v1 spool recovery')))
+
+    const spoolKey = path.resolve(dir)
+    const scopeTag = createHash('sha256').update(spoolKey, 'utf8').digest('hex').slice(0, 12)
+    const legacyFile = path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+    const oversizedLegacyRefusal = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [
+        { id: 'blk-legacy-v1-a', title: 'Legacy blocking item A', detail: 'L'.repeat(35000) },
+        { id: 'blk-legacy-v1-b', title: 'Legacy blocking item B', reason: 'waiting_for_ok' },
+      ],
+    })
+    const secondLegacyEntry = JSON.stringify({ code: 'other_legacy_refusal', id: 'blk-legacy-v1-keep' })
+    fs.writeFileSync(
+      legacyFile,
+      JSON.stringify({ version: 1, scope: scopeTag, entries: [oversizedLegacyRefusal, secondLegacyEntry] }),
+      { mode: 0o600 },
+    )
+
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const peeked = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.deepEqual(peeked, [oversizedLegacyRefusal, secondLegacyEntry])
+
+    // Partial clear removes only the specified entry and keeps the other intact on disk.
+    clearPendingUnsavedRefusals(spoolKey, [secondLegacyEntry], spoolOpts)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [oversizedLegacyRefusal])
+    assert.equal(fs.existsSync(legacyFile), true)
+
+    // A successful readWakes retry surfaces the recovered v1 oversized refusal via a
+    // readable diagnostic note with its read reference on stderr and clears the v1 file!
+    const stderrChunks = []
+    const res = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      dir,
+      home,
+      settleMs: 1,
+      scriptPath: '/tmp/tail.mjs',
+      write: async () => {},
+      writeStderr: (chunk) => stderrChunks.push(chunk),
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+    })
+    assert.equal(res.marked, true)
+    assert.equal(res.pickup_diagnostic_written, true)
+    const stderrJoined = stderrChunks.join('')
+    assert.match(stderrJoined, /devspec-wake-tail:.*saved|cat /i, 'stderr MUST include read reference to saved note')
+    assert.ok(res.pickup_diagnostic_note?.file, 'oversized legacy refusal MUST be saved to a readable diagnostic note')
+    const readAllNoteParts = (note) => {
+      const parts = [fs.readFileSync(note.file, 'utf8')]
+      for (let p = 2; p <= (note.parts ?? 1); p += 1) {
+        const suffix = note.fallback ? `-part-${p}.md` : `.${p}.md`
+        parts.push(fs.readFileSync(note.file.replace(/\.md$/, suffix), 'utf8'))
+      }
+      return parts.join('\n')
+    }
+    const savedNote = readAllNoteParts(res.pickup_diagnostic_note)
+    assert.match(savedNote, /blk-legacy-v1-a/)
+    assert.match(savedNote, /blk-legacy-v1-b/)
+    assert.match(savedNote, /waiting_for_ok/)
+    assert.equal(fs.existsSync(legacyFile), false, 'legacy v1 spool file must be removed once surfaced')
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
+
+  it('runOneShotRoomCommandPickup and readWakes do NOT clear pending refusals before stderr publication succeeds, preserving them for the next retry (3ea2b201 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { spoolUnsavedRefusal, peekPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+    const { runOneShotRoomCommandPickup } = await import('./devspec-remote-wait.mjs')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const oversizedRefusal = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [{ id: 'blk-stderr-fail-1', title: 'Blocking item kept across EPIPE', padding: 'E'.repeat(35000) }],
+    })
+    spoolUnsavedRefusal(spoolKey, oversizedRefusal, spoolOpts)
+
+    const printedWakes = [buildOwnerMessageEvents(ownerBatch('Retry pickup after stderr failure'))]
+
+    // 1. runOneShotRoomCommandPickup: stderr throws EPIPE -> pending refusal MUST stay queued!
+    await assert.rejects(
+      () =>
+        runOneShotRoomCommandPickup({
+          connectionId: CONN,
+          printedWakes,
+          dir,
+          home,
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            refusals: [{ command_message_id: 'msg-stderr-1', refusal: { code: 'busy', blocking_items: [{ id: 'blk-live-1' }] } }],
+          }),
+          writeStderr: () => {
+            throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+          },
+        }),
+      /write EPIPE/,
+    )
+    const afterWaitFail = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.ok(afterWaitFail.includes(oversizedRefusal), 'original spooled refusal MUST remain queued when stderr fails in runOneShotRoomCommandPickup')
+    assert.ok(afterWaitFail.some((e) => e.includes('blk-live-1')), 'new refusal whose stderr reference failed MUST also be queued')
+
+    // 2. Next retry in runOneShotRoomCommandPickup succeeds -> publishes readable note & clears queue!
+    const waitStderr = []
+    const waitOk = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes,
+      dir,
+      home,
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (chunk) => waitStderr.push(chunk),
+    })
+    const readAllNoteParts = (note) => {
+      const parts = [fs.readFileSync(note.file, 'utf8')]
+      for (let p = 2; p <= (note.parts ?? 1); p += 1) {
+        const suffix = note.fallback ? `-part-${p}.md` : `.${p}.md`
+        parts.push(fs.readFileSync(note.file.replace(/\.md$/, suffix), 'utf8'))
+      }
+      return parts.join('\n')
+    }
+    assert.equal(waitOk.ok, true)
+    assert.ok(waitOk.diagnosticNote?.file, 'recovered refusals MUST be saved to readable note')
+    assert.match(waitStderr.join(''), /devspec-remote-wait:.*saved|cat /i)
+    const waitNoteBody = readAllNoteParts(waitOk.diagnosticNote)
+    assert.match(waitNoteBody, /blk-stderr-fail-1/)
+    assert.match(waitNoteBody, /blk-live-1/)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [], 'queue clears only after stderr write succeeds')
+
+    // 3. readWakes (refusal path): stderr throws EPIPE -> pending refusal MUST stay queued!
+    const oversizedRefusal2 = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [{ id: 'blk-wake-tail-epipe', title: 'Wake tail EPIPE item', padding: 'W'.repeat(35000) }],
+    })
+    spoolUnsavedRefusal(spoolKey, oversizedRefusal2, spoolOpts)
+    const wakeFile = path.join(home, `${CONN}-epipe.wakes`)
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Wake tail EPIPE retry')))
+
+    await assert.rejects(
+      () =>
+        readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          dir,
+          home,
+          settleMs: 1,
+          scriptPath: '/tmp/tail.mjs',
+          write: async () => {},
+          startCommands: async () => ({
+            ok: false,
+            outcome: 'refused',
+            refusals: [{ command_message_id: 'msg-stderr-2', refusal: { code: 'busy', blocking_items: [{ id: 'blk-wake-live-2' }] } }],
+          }),
+          writeStderr: () => {
+            throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+          },
+        }),
+      /write EPIPE/,
+    )
+    const afterWakeFail = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.ok(afterWakeFail.includes(oversizedRefusal2), 'original spooled refusal MUST remain queued when stderr fails in readWakes')
+    assert.ok(afterWakeFail.some((e) => e.includes('blk-wake-live-2')), 'new refusal whose stderr reference failed MUST also be queued in readWakes')
+
+    // 4. Next healthy readWakes retry succeeds -> surfaces readable note with read reference & clears queue!
+    const wakeStderr = []
+    const wakeOk = await readWakes({
+      file: wakeFile,
+      connectionId: CONN,
+      dir,
+      home,
+      settleMs: 1,
+      scriptPath: '/tmp/tail.mjs',
+      write: async () => {},
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (chunk) => wakeStderr.push(chunk),
+    })
+    assert.equal(wakeOk.marked, true)
+    assert.equal(wakeOk.pickup_diagnostic_written, true)
+    assert.ok(wakeOk.pickup_diagnostic_note?.file)
+    assert.match(wakeStderr.join(''), /devspec-wake-tail:.*saved|cat /i)
+    const wakeNoteBody = readAllNoteParts(wakeOk.pickup_diagnostic_note)
+    assert.match(wakeNoteBody, /blk-wake-tail-epipe/)
+    assert.match(wakeNoteBody, /blk-wake-live-2/)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
 })

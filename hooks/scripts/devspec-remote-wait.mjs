@@ -2007,11 +2007,6 @@ export async function runOneShotRoomCommandPickup({
     const savedReadableNow =
       (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
       fitsShellOutput(combinedPrior + effectiveRawDiag)
-    if (refusals && !savedReadableNow && !fitted.note?.pendingPermissionRecovery) {
-      spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
-    } else if (pendingSpoolEntries.length > 0 && savedReadableNow && fitted.text) {
-      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
-    }
     const diagText =
       fitted.text ||
       (refusals
@@ -2022,9 +2017,25 @@ export async function runOneShotRoomCommandPickup({
             noteError: fitted.noteError,
           })
         : '')
+    if (refusals && !savedReadableNow && !fitted.note?.pendingPermissionRecovery) {
+      spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+    }
     if (diagText) {
-      writeStderr(diagText)
-      stderrText = diagText
+      try {
+        writeStderr(diagText)
+        stderrText = diagText
+      } catch (err) {
+        if (refusals) {
+          spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+        }
+        throw err
+      }
+    }
+    // Clear pending spooled refusals ONLY AFTER publishing their diagnostic/read reference
+    // to stderr succeeds so an output error never drops them from the recovery queue
+    // (reqs 3ea2b201 / 91d7b47c).
+    if (pendingSpoolEntries.length > 0 && savedReadableNow && fitted.text && stderrText) {
+      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries, spoolOpts)
     }
   }
   return {

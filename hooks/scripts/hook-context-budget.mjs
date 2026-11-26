@@ -1032,6 +1032,10 @@ function spoolEntryFilePath(dir, scopeTag, entryHash) {
   return path.join(dir, `${spoolEntryFilePrefix(scopeTag)}${entryHash}.json`)
 }
 
+function legacySpoolFilePath(dir, scopeTag) {
+  return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+}
+
 /**
  * Reassemble a Pass-2 pending-refusal note losslessly by stripping ONLY the header and
  * page footers tagged with that file's exact per-file cryptographic `nonce`, then
@@ -1512,6 +1516,15 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    // Also read any oversized refusals saved in the preceding v1 shared spool format
+    // (`devspec-unsaved-refusals-<scope>.json`) so upgrades never silently drop pending
+    // structured refusals already on disk (reqs 3c5147a7 / 4e32d1a5).
+    const legacyParsed = readPrivateJson(legacySpoolFilePath(dir, scopeTag))
+    if (Array.isArray(legacyParsed?.entries)) {
+      for (const entry of legacyParsed.entries) pushUnique(entry)
+    } else if (typeof legacyParsed?.text === 'string' && legacyParsed.text) {
+      pushUnique(legacyParsed.text)
+    }
     let names = []
     try {
       names = fs.readdirSync(dir).sort()
@@ -1568,6 +1581,30 @@ export function clearPendingUnsavedRefusals(
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const legacyFile = legacySpoolFilePath(dir, scopeTag)
+    if (fs.existsSync(legacyFile)) {
+      try {
+        if (!clearedSet) {
+          fs.rmSync(legacyFile, { force: true })
+        } else {
+          const legacyParsed = readPrivateJson(legacyFile)
+          if (Array.isArray(legacyParsed?.entries)) {
+            const remaining = legacyParsed.entries.filter(
+              (entry) => typeof entry === 'string' && entry && !clearedSet.has(entry),
+            )
+            if (remaining.length === 0) {
+              fs.rmSync(legacyFile, { force: true })
+            } else if (remaining.length !== legacyParsed.entries.length) {
+              writePrivateJson(legacyFile, { version: 1, scope: scopeTag, entries: remaining })
+            }
+          } else if (typeof legacyParsed?.text === 'string' && clearedSet.has(legacyParsed.text)) {
+            fs.rmSync(legacyFile, { force: true })
+          }
+        }
+      } catch {
+        /* leave intact for next cleanup if transiently unreadable/unwritable */
+      }
+    }
     if (clearedHashes) {
       // Unlink ONLY the exact per-entry content-addressed files surfaced by this pass;
       // any newer refusal appended concurrently by another process lives under its own
