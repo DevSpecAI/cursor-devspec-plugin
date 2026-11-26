@@ -1216,7 +1216,7 @@ export async function syncTypedTurnFromTranscript({
       recordFailedTypedTurn(dir, connectionId, key)
     }
     for (let i = 0; i < pairCount; i += 1) {
-      if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: coveredUnseen[i], ref: matchedHooks[i], historical: true }, { dir })) {
+      if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: coveredUnseen[i], ref: matchedHooks[i], historical: true, mark_started: true }, { dir })) {
         return { ok: false, action: 'binding_write_failed' }
       }
     }
@@ -1374,6 +1374,12 @@ export async function syncTypedTurnFromTranscript({
             const postOpenActive = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
             if (postOpenActive?.budgetExhausted) {
               return { action: 'budget_exhausted', budget_ms: budgetMs }
+            }
+            if (!postOpenActive) {
+              log(
+                `typed-turn-sync: transcript unreadable after open_request for ${connectionId} (${turnKey}); deferring current binding and leaving turn unsynced\n`,
+              )
+              return { action: 'unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
             }
             const newerCurrentLanded =
               postOpenState.current !== reqState.current &&

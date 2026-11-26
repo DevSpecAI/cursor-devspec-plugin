@@ -4538,4 +4538,97 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(stamped.deny, undefined, 'next write must not fail or name Bob')
     assert.equal(stamped.args?.request_ref, CMD_ALICE, 'next write MUST name Alice’s live room request')
   })
+
+  it('syncLiveTypedTurn fails closed without setting current or marking synced when post-open transcript re-read is unreadable, then restores the newer background wake once readable (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111fc'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(
+      CONN,
+      { op: 'launch', key: 'alice-bg-after-unreadable', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] },
+      { dir },
+    )
+
+    const bobRow = typedRow('Bob terminal prompt that ends while open is in flight')
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>alice-bg-after-unreadable</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+
+    const memo = {}
+    const logs = []
+    let openCalls = 0
+    const origOpenSync = fs.openSync
+    let failTranscriptRead = false
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (failTranscriptRead && String(filePath) === transcriptPath) {
+        throw Object.assign(new Error('transient EACCES re-reading transcript'), { code: 'EACCES' })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    let res1 = null
+    try {
+      res1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async (args) => {
+          openCalls += 1
+          // While awaiting open_request, Bob's turn ends and Alice's background job wakes the agent,
+          // AND re-reading the transcript hits a transient read error!
+          fs.writeFileSync(transcriptPath, `${bobRow}\n${turnEndedRow()}\n${aliceWake}\n`)
+          failTranscriptRead = true
+          return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+        },
+        dir,
+        memo,
+        log: (line) => logs.push(line),
+      })
+      assert.equal(res1.action, 'unreadable', 'MUST report unreadable instead of advancing state')
+      assert.equal(memo.synced, false, 'MUST NOT mark pass complete when post-open transcript check failed')
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), true)
+      assert.ok(logs.some((l) => /transcript unreadable after open_request/i.test(l)))
+      const midState = readRequestState(CONN, { dir })
+      assert.equal(midState.current, null, 'MUST NOT make ended Bob request current while transcript re-read failed')
+      assert.equal(midState.seenTranscriptTurns.size, 0, 'MUST NOT mark turn seen on failed post-open transcript check')
+      const midStamp = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+      assert.equal(midStamp.args?.request_ref, undefined, 'write stamper MUST NOT misattribute to ended Bob request')
+    } finally {
+      failTranscriptRead = false
+      fs.openSync = origOpenSync
+    }
+
+    // Once the transcript is readable again, the next pass restores Alice's wake cleanly and binds Bob's ended turn historically without reopening!
+    const res2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        openCalls += 1
+        throw new Error('must not reopen already-opened Bob request')
+      },
+      dir,
+      memo,
+    })
+    assert.equal(res2.action, 'restored_wake_request')
+    assert.equal(openCalls, 1)
+    assert.equal(memo.synced, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'next readable pass MUST restore Alice’s background wake')
+    assert.equal(after.started.has(res1.requestId), true, 'ended Bob request must be bound historically as started for idle close')
+    const finalStamp = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(finalStamp.args?.request_ref, CMD_ALICE)
+  })
 })
