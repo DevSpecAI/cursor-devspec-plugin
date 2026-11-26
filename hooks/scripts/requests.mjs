@@ -220,6 +220,9 @@ export function reduceRequestLog(text) {
           const boundRef = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
           seenTranscriptTurns.set(event.key, boundRef)
           failedTranscriptTurns.delete(event.key)
+          if (event.mark_started === true && UUID.test(boundRef ?? '')) {
+            started.add(boundRef)
+          }
           // Once a transcript turn binds the wake-restored current request, mark
           // it bound by that wake so a subsequent unrelated wake clears it
           // (even for an unanswered room command) instead of inheriting it.

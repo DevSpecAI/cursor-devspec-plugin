@@ -1250,11 +1250,13 @@ export async function syncTypedTurnFromTranscript({
           pendingLookup.entries.find(([, entry]) => entry?.turnKey === turnKey)?.[1] ??
           getPendingLocalOpen(dir, connectionId, turnKey)
         const failPendingOpenCleanup = (entry, error) => {
+          const errRefusal = structuredRefusalFromError(error)
           const refusal = {
+            ...errRefusal,
+            ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
             code: 'pending_open_cleanup_failed',
             retryable: true,
             request_id: entry.requestId,
-            ...structuredRefusalFromError(error),
           }
           log(
             `typed-turn-sync: failed to remove pending local open for ${connectionId} (${turnKey}): ${JSON.stringify(refusal)}\n`,
@@ -1349,6 +1351,8 @@ export async function syncTypedTurnFromTranscript({
           }
         }
 
+        let supersededByNewerTurn = false
+        let effectiveMidTurn = midTurn
         if (!requestId && connectionCapability && typeof effectiveCallRequest === 'function') {
           const opened = await openTypedRequestPreservingRefusal({
             connectionId,
@@ -1359,13 +1363,40 @@ export async function syncTypedTurnFromTranscript({
           if (opened.ok) {
             requestId = opened.requestId
             openedNow = true
-            const currentWritten = appendRequestEvent(
-              connectionId,
-              midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-              { dir },
+            // Re-read BOTH `.requests.jsonl` and the transcript AFTER awaiting DevSpec's
+            // open reply so an older terminal open NEVER replaces a newer live room
+            // command (or newer turn) that became `current` while the open was in flight
+            // (decision ce71a72b).
+            const postOpenState = readRequestState(connectionId, { dir })
+            if (isBlockingReadError(postOpenState.readError)) {
+              return { action: 'request_log_unreadable', requestId, key: turnKey, midTurn: effectiveMidTurn }
+            }
+            const postOpenActive = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
+            if (postOpenActive?.budgetExhausted) {
+              return { action: 'budget_exhausted', budget_ms: budgetMs }
+            }
+            const newerCurrentLanded =
+              postOpenState.current !== reqState.current &&
+              postOpenState.current !== null &&
+              postOpenState.current !== requestId &&
+              (postOpenState.current === NO_REQUEST ||
+                (postOpenState.open.has(postOpenState.current) && !postOpenState.open.get(postOpenState.current)?.answered))
+            const transcriptMovedOn = Boolean(
+              postOpenActive &&
+                (postOpenActive.ended ||
+                  (postOpenActive.key !== turnKey && postOpenActive.liveTurnTypedKey !== turnKey)),
             )
-            if (!currentWritten) {
-              return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+            effectiveMidTurn = hasActiveRemoteCommandTurn(connectionId, postOpenState, dir, postOpenActive ?? active)
+            supersededByNewerTurn = newerCurrentLanded || transcriptMovedOn
+            if (!supersededByNewerTurn) {
+              const currentWritten = appendRequestEvent(
+                connectionId,
+                effectiveMidTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+                { dir },
+              )
+              if (!currentWritten) {
+                return { action: 'binding_write_failed', requestId, key: turnKey, midTurn: effectiveMidTurn }
+              }
             }
           } else if (opened.localPersistFailed) {
             if (opened.requestId) {
@@ -1414,7 +1445,8 @@ export async function syncTypedTurnFromTranscript({
             (state.local_turn.turn_key === turnKey ||
               (!openedNow && existingTyped === safeUnboundHook && !state.local_turn.turn_key))
           const scope =
-            !midTurn &&
+            !effectiveMidTurn &&
+            !supersededByNewerTurn &&
             sessionId &&
             connectionCapability &&
             typeof effectiveCallPickup === 'function' &&
@@ -1436,7 +1468,7 @@ export async function syncTypedTurnFromTranscript({
                 action: 'admission_failed',
                 requestId,
                 key: turnKey,
-                midTurn,
+                midTurn: effectiveMidTurn,
                 refusal: admission.refusal,
               }
             }
@@ -1456,33 +1488,48 @@ export async function syncTypedTurnFromTranscript({
                   action: 'state_write_failed',
                   requestId,
                   key: turnKey,
-                  midTurn,
+                  midTurn: effectiveMidTurn,
                 }
               }
             }
           }
 
-          const bound = appendRequestEvent(connectionId, { op: 'transcript_turn', key: turnKey, ref: requestId }, { dir })
+          const bound = appendRequestEvent(
+            connectionId,
+            supersededByNewerTurn
+              ? { op: 'transcript_turn', key: turnKey, ref: requestId, historical: true, mark_started: true }
+              : { op: 'transcript_turn', key: turnKey, ref: requestId },
+            { dir },
+          )
           if (!bound) {
             return {
               action: 'binding_write_failed',
               requestId,
               key: turnKey,
-              midTurn,
+              midTurn: effectiveMidTurn,
             }
           }
           return {
             action: openedNow ? 'opened' : 'adopted_hook_request',
             requestId,
             key: turnKey,
-            midTurn,
+            midTurn: effectiveMidTurn,
+            ...(supersededByNewerTurn ? { superseded: true } : {}),
           }
         }
 
         // Could not open a typed_prompt right now (offline / no capability / DevSpec refused):
         // still clear any stale foreground request so writes go out unstamped and DevSpec
-        // resolves who asked from the connection rather than stamping a closed command.
-        if (!midTurn && reqState.current !== null) {
+        // resolves who asked from the connection rather than stamping a closed command —
+        // re-reading first so we NEVER clear a newer live request that arrived mid-wait.
+        const latestBeforeClear = readRequestState(connectionId, { dir })
+        if (
+          !latestBeforeClear.readError &&
+          !effectiveMidTurn &&
+          !hasActiveRemoteCommandTurn(connectionId, latestBeforeClear, dir, active) &&
+          latestBeforeClear.current !== null &&
+          latestBeforeClear.current === reqState.current
+        ) {
           appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
         }
         return {
@@ -2014,8 +2061,10 @@ export async function finishIdleRequests({
 
   // Also recover any server-accepted open whose local append previously failed so it is
   // closed on DevSpec even if the turn ended before a local write retry succeeded (req 3ea2b201),
-  // NEVER closing a recovered request that has pending launches/monitors/schedules (ce71a72b).
-  const pendingEntries = pendingOpensForConnection(dir, connectionId)
+  // NEVER closing a recovered request that has pending launches/monitors/schedules (ce71a72b),
+  // and NEVER treating a transient `.pending-opens.json` read error as an empty queue (3ea2b201).
+  const initialPendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+  const pendingEntries = initialPendingLookup.entries
   const closeablePendingEntries = pendingEntries.filter(([, entry]) => !hasPendingWorkForRequest(reqState, entry.requestId))
   const pendingFallback =
     !candidateId && closeablePendingEntries.length > 0
@@ -2047,6 +2096,19 @@ export async function finishIdleRequests({
   }
 
   if (!candidateId && !pendingFallback && !localAttemptId) {
+    if (initialPendingLookup.readError) {
+      const errRefusal = structuredRefusalFromError(initialPendingLookup.readError)
+      const closeRefusal = {
+        ...errRefusal,
+        ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
+        code: 'pending_opens_unreadable',
+        retryable: true,
+      }
+      log(
+        `typed-turn-sync: idle cleanup could not read pending-opens recovery queue for ${connectionId}: ${JSON.stringify(closeRefusal)}\n`,
+      )
+      return { closed: [], localCompleted: false, closeRefusal }
+    }
     await clearEndedForeground()
     return { closed: [], localCompleted: false }
   }
@@ -2191,14 +2253,18 @@ export async function finishIdleRequests({
           }
         }
         // Remove matching `.pending-opens.json` recovery entry ONLY once local close is
-        // persisted, and fail closed (do NOT report closed) if removing the on-disk
-        // recovery entry fails (requirement 3ea2b201).
+        // persisted, re-reading `.pending-opens.json` under the lock so a transient read
+        // error is NEVER treated as an empty queue and any failure to inspect or remove
+        // the recovery entry fails closed (requirement 3ea2b201).
         let cleanupFailed = null
-        if (pendingEntry) {
+        const postPendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+        if (postPendingLookup.readError) {
+          cleanupFailed = postPendingLookup.readError
+        } else if (pendingEntry) {
           const removed = deletePendingLocalOpen(dir, connectionId, pendingKey, pendingEntry.turnKey, pendingEntry.requestId)
           if (!removed.ok) cleanupFailed = removed.error ?? new Error('failed to remove pending-open recovery entry')
         } else {
-          for (const [pKey, entry] of pendingEntries) {
+          for (const [pKey, entry] of postPendingLookup.entries) {
             if (entry.requestId === targetRequestId) {
               const removed = deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
               if (!removed.ok) cleanupFailed ??= removed.error ?? new Error('failed to remove pending-open recovery entry')
@@ -2206,13 +2272,15 @@ export async function finishIdleRequests({
           }
         }
         if (cleanupFailed) {
+          const errRefusal = structuredRefusalFromError(cleanupFailed)
           return {
             status: 'refused',
             refusal: {
+              ...errRefusal,
+              ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
               code: 'pending_open_cleanup_failed',
               retryable: true,
               request_id: targetRequestId,
-              ...structuredRefusalFromError(cleanupFailed),
             },
           }
         }
@@ -2339,6 +2407,17 @@ export async function finishIdleRequests({
         }
       }
     }
+  } else if (initialPendingLookup.readError) {
+    const errRefusal = structuredRefusalFromError(initialPendingLookup.readError)
+    closeRefusal = {
+      ...errRefusal,
+      ...(errRefusal.code ? { cause_code: errRefusal.code } : {}),
+      code: 'pending_opens_unreadable',
+      retryable: true,
+    }
+    log(
+      `typed-turn-sync: idle cleanup could not read pending-opens recovery queue for ${connectionId}: ${JSON.stringify(closeRefusal)}\n`,
+    )
   }
 
   if (!closeRefusal && !abortedClose) await clearEndedForeground()

@@ -4442,4 +4442,100 @@ describe('typed-turn-sync (item da03801e)', () => {
     assert.equal(p2.action, 'cleared_for_wake')
     assert.equal(readRequestState(CONN, { dir }).current, null, 'ended Bob prompt MUST NOT stay current across unrelated turn + summary')
   })
+
+  it('finishIdleRequests fails closed with pending_open_cleanup_failed when reading .pending-opens.json hits a transient error while closing a matching candidate request (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const REQ_ID = '55555555-5555-4555-8555-5555555555fb'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Idle sweep where pending-opens read fails transiently')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ID, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ID }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ID }, { dir })
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: REQ_ID, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const origReadFileSync = fs.readFileSync
+    fs.readFileSync = (filePath, ...rest) => {
+      if (String(filePath) === sidecar) {
+        throw Object.assign(new Error('transient EIO reading pending-opens.json'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    const logs = []
+    try {
+      const idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.deepEqual(idle1.closed, [], 'MUST NOT report request closed when reading .pending-opens.json failed')
+      assert.equal(idle1.closeRefusal?.code, 'pending_open_cleanup_failed')
+      assert.equal(fs.existsSync(sidecar), true, 'matching recovery entry remained on disk')
+      assert.ok(logs.some((l) => /pending_open_cleanup_failed/i.test(l)))
+    } finally {
+      fs.readFileSync = origReadFileSync
+    }
+
+    // Once readable again, next idle sweep removes the recovery entry and completes cleanly!
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => ({ status: 'closed' }),
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle2.closed, [REQ_ID])
+    assert.equal(idle2.closeRefusal, undefined)
+    assert.equal(fs.existsSync(sidecar), false)
+  })
+
+  it('syncLiveTypedTurn NEVER overwrites a newer live room command that became current while awaiting DevSpec’s open reply for an older terminal prompt (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111fb'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob older terminal prompt whose open reply arrives late')}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        // While awaiting DevSpec's reply opening Bob's older terminal prompt, Alice's newer
+        // live room command arrives and becomes `current` in `.requests.jsonl`!
+        appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: BOB }
+      },
+      dir,
+      memo,
+    })
+
+    assert.equal(res.action, 'opened')
+    assert.equal(res.superseded, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'older terminal open reply MUST NOT overwrite newer live room requester')
+    assert.equal(after.joined.size, 0, 'superseded older terminal request must not pollute newer live room command')
+    assert.equal(after.started.has(res.requestId), true, 'superseded older terminal request must still be marked started for idle cleanup')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined, 'next write must not fail or name Bob')
+    assert.equal(stamped.args?.request_ref, CMD_ALICE, 'next write MUST name Alice’s live room request')
+  })
 })
