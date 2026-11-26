@@ -1289,20 +1289,10 @@ export async function syncTypedTurnFromTranscript({
         let requestId = existingTyped
         let openedNow = false
         let openRefusal = null
-        const hasOtherLiveJoined = (rState, targetId) =>
-          [...(rState?.joined ?? [])].some(
-            (id) => id !== targetId && rState.open.has(id) && !rState.open.get(id)?.answered,
-          )
         if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
           const currentWritten = appendRequestEvent(
             connectionId,
-            midTurn
-              ? { op: 'joined', id: requestId }
-              : {
-                  op: 'current',
-                  ref: requestId,
-                  ...(hasOtherLiveJoined(reqState, requestId) ? { preserve_joined: true } : {}),
-                },
+            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
             { dir },
           )
           if (!currentWritten) {
@@ -1347,13 +1337,7 @@ export async function syncTypedTurnFromTranscript({
             if (needsBinding) {
               const currentWritten = appendRequestEvent(
                 connectionId,
-                midTurn
-                  ? { op: 'joined', id: pendingOpen.requestId }
-                  : {
-                      op: 'current',
-                      ref: pendingOpen.requestId,
-                      ...(hasOtherLiveJoined(reqState, pendingOpen.requestId) ? { preserve_joined: true } : {}),
-                    },
+                midTurn ? { op: 'joined', id: pendingOpen.requestId } : { op: 'current', ref: pendingOpen.requestId },
                 { dir },
               )
               if (!currentWritten) {
@@ -1411,7 +1395,16 @@ export async function syncTypedTurnFromTranscript({
             effectiveMidTurn = hasActiveRemoteCommandTurn(connectionId, postOpenState, dir, postOpenActive ?? active)
             supersededByNewerTurn = newerCurrentLanded || transcriptMovedOn
             if (!supersededByNewerTurn) {
-              const preserveJoined = hasOtherLiveJoined(postOpenState, requestId)
+              // Preserve ONLY requesters that NEWLY joined THIS running turn while
+              // `open_request` was in flight — never stale joined requesters left over
+              // from an earlier ended turn (decision ce71a72b).
+              const newlyJoinedIds = [...postOpenState.joined].filter(
+                (id) =>
+                  !reqState.joined.has(id) &&
+                  id !== requestId &&
+                  postOpenState.open.has(id) &&
+                  !postOpenState.open.get(id)?.answered,
+              )
               const currentWritten = appendRequestEvent(
                 connectionId,
                 effectiveMidTurn
@@ -1419,7 +1412,7 @@ export async function syncTypedTurnFromTranscript({
                   : {
                       op: 'current',
                       ref: requestId,
-                      ...(preserveJoined ? { preserve_joined: true } : {}),
+                      ...(newlyJoinedIds.length > 0 ? { preserve_joined_ids: newlyJoinedIds } : {}),
                     },
                 { dir },
               )
@@ -2321,7 +2314,7 @@ export async function finishIdleRequests({
           !postCloseState.open.has(targetRequestId) && Boolean(postCloseState.closed?.has(targetRequestId))
         const localClosed = alreadyClosedLocally
           ? true
-          : appendRequestEvent(connectionId, { op: 'close', id: targetRequestId }, { dir })
+          : appendRequestEvent(connectionId, { op: 'close', id: targetRequestId, if_idle: true }, { dir })
         if (!localClosed) {
           return {
             status: 'refused',
@@ -2331,6 +2324,27 @@ export async function finishIdleRequests({
               request_id: targetRequestId,
               error: 'DevSpec acknowledged close but local close record failed to persist',
             },
+          }
+        }
+        // Re-read `.requests.jsonl` AFTER writing `{ op: 'close', if_idle: true }`: if a
+        // concurrent hook appended a background launch/schedule between our read and our
+        // append, `reduceRequestLog` kept the request open (ignoring `if_idle: true`), so
+        // abort cleanly without reporting closed or deleting pending-open state (3ea2b201).
+        if (!alreadyClosedLocally) {
+          const verifyCloseState = readRequestState(connectionId, { dir })
+          if (verifyCloseState.readError) {
+            return {
+              status: 'refused',
+              refusal: {
+                code: 'request_log_unreadable',
+                retryable: true,
+                request_id: targetRequestId,
+                error: verifyCloseState.readError?.message ?? 'request log unreadable while verifying local close',
+              },
+            }
+          }
+          if (verifyCloseState.open.has(targetRequestId) || hasPendingWorkForRequest(verifyCloseState, targetRequestId)) {
+            return { status: 'aborted_pending_work' }
           }
         }
         // Remove matching `.pending-opens.json` recovery entry ONLY once local close is

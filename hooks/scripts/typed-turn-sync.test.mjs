@@ -4853,4 +4853,125 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny, 'next write MUST ask which requester it serves instead of stamping Bob alone')
   })
+
+  it('syncLiveTypedTurn does NOT inherit a room requester who joined the previous turn across an explicit turn_ended boundary (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const TURN1_BOB = '11111111-1111-4111-8111-1111111111a1'
+    const CMD_ALICE_PREV = '22222222-2222-4222-8222-2222222222a1'
+
+    // Turn 1 had Bob's typed prompt with Alice's room command joined mid-turn, then ended explicitly.
+    const turn1Row = typedRow('Bob turn 1 where Alice joined mid-turn')
+    const turn2Row = typedRow('Bob brand-new turn 2 after explicit turn_ended')
+    fs.writeFileSync(transcriptPath, `${turn1Row}\n${turnEndedRow()}\n${turn2Row}\n`)
+
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const keys = activeTranscriptTurn(transcriptPath).typedTurnKeys
+    assert.equal(keys.length, 2)
+
+    appendRequestEvent(CONN, { op: 'open', id: TURN1_BOB, kind: 'typed_prompt', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE_PREV, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: TURN1_BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: keys[0], ref: TURN1_BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'joined', id: CMD_ALICE_PREV }, { dir })
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo: {},
+    })
+
+    assert.equal(res.action, 'opened')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, res.requestId)
+    assert.equal(after.joined.has(CMD_ALICE_PREV), false, 'Turn 2 MUST NOT inherit Alice’s joined request from Turn 1 across turn_ended')
+    assert.equal(turnAmbiguity(after), null, 'Turn 2 serves Bob alone with no false ambiguity')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined, 'write hook MUST NOT refuse Turn 2 terminal write')
+    assert.equal(stamped.args?.request_ref, res.requestId)
+  })
+
+  it('finishIdleRequests does NOT close or lose requester attribution when a background launch is appended after its final read and right before saving close (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const REQ_ALICE = '55555555-5555-4555-8555-5555555555a2'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Alice turn whose background launch races commitServerClose')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ALICE }, { dir })
+
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    const origAppendFileSync = fs.appendFileSync
+    let injectedLaunch = false
+    fs.appendFileSync = (filePath, data, ...rest) => {
+      // Simulate a concurrent hook appending `{ op: 'launch' }` to `.requests.jsonl` AFTER
+      // commitServerClose's final readRequestState and IMMEDIATELY BEFORE it appends `{ op: 'close' }`!
+      if (!injectedLaunch && String(filePath) === reqLogPath && String(data).includes('"op":"close"')) {
+        injectedLaunch = true
+        origAppendFileSync(
+          filePath,
+          `${JSON.stringify({ op: 'launch', key: 'raced-bg-launch', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n`,
+          ...rest,
+        )
+      }
+      return origAppendFileSync(filePath, data, ...rest)
+    }
+
+    let idleRes = null
+    try {
+      idleRes = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+    } finally {
+      fs.appendFileSync = origAppendFileSync
+    }
+
+    assert.equal(injectedLaunch, true, 'test hook must have injected launch right before close write')
+    assert.deepEqual(idleRes.closed, [], 'idle sweep MUST NOT report request closed when a launch landed before close')
+    const afterIdle = readRequestState(CONN, { dir })
+    assert.equal(afterIdle.open.has(REQ_ALICE), true, 'request MUST remain open for the raced background launch')
+    assert.equal(afterIdle.closed?.has(REQ_ALICE) ?? false, false)
+
+    // When the background launch's wake later arrives, it MUST still resolve to Alice's original request!
+    const wakeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>raced-bg-launch</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+    const wakeSync = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo: {},
+    })
+    assert.equal(wakeSync.action, 'restored_wake_request')
+    assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.args?.request_ref, REQ_ALICE, 'wake write MUST still resolve to original requester')
+  })
 })

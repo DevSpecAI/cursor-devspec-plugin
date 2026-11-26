@@ -113,6 +113,7 @@ function uuids(value) {
 export function reduceRequestLog(text) {
   const open = new Map()
   const closed = new Set()
+  const idleClosedInfo = new Map()
   const started = new Set()
   const launches = new Map()
   const aliases = new Map()
@@ -126,6 +127,30 @@ export function reduceRequestLog(text) {
   let joined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
+  const hasActiveWorkFor = (requestId) => {
+    if (!UUID.test(requestId ?? '')) return false
+    for (const launch of launches.values()) {
+      const namesIt = launch.request === requestId || (Array.isArray(launch.also) && launch.also.includes(requestId))
+      if (namesIt && (launch.kind === 'monitor' || (launch.notifies !== false && !launch.notified))) {
+        return true
+      }
+    }
+    for (const sched of schedules) {
+      if (sched.request === requestId || (Array.isArray(sched.also) && sched.also.includes(requestId))) {
+        return true
+      }
+    }
+    return false
+  }
+  const restoreIdleClosedRefs = (primary, also) => {
+    for (const ref of [primary, ...(Array.isArray(also) ? also : [])]) {
+      if (UUID.test(ref ?? '') && !open.has(ref) && idleClosedInfo.has(ref)) {
+        open.set(ref, idleClosedInfo.get(ref))
+        closed.delete(ref)
+        idleClosedInfo.delete(ref)
+      }
+    }
+  }
   for (const line of String(text || '').split('\n')) {
     let event
     try {
@@ -137,6 +162,7 @@ export function reduceRequestLog(text) {
       case 'open':
         if (UUID.test(event.id ?? '')) {
           closed.delete(event.id)
+          idleClosedInfo.delete(event.id)
           open.set(event.id, {
             kind: event.kind,
             ...(event.message_id ? { message_id: event.message_id } : {}),
@@ -146,6 +172,17 @@ export function reduceRequestLog(text) {
         }
         break
       case 'close':
+        // Conditional idle close (`if_idle: true`): never close a request that gained a
+        // pending background launch, monitor, or schedule between the idle sweep's read
+        // and its append (requirements 3ea2b201 / ce71a72b).
+        if (event.if_idle === true && hasActiveWorkFor(event.id)) {
+          break
+        }
+        if (event.if_idle === true && UUID.test(event.id ?? '') && open.has(event.id)) {
+          idleClosedInfo.set(event.id, open.get(event.id))
+        } else if (UUID.test(event.id ?? '')) {
+          idleClosedInfo.delete(event.id)
+        }
         if (UUID.test(event.id ?? '')) closed.add(event.id)
         open.delete(event.id)
         started.delete(event.id)
@@ -158,9 +195,9 @@ export function reduceRequestLog(text) {
         }
         break
       case 'current':
-        // A new turn: what it carries starts again from what woke it, unless
-        // `preserve_joined` is set (when establishing a turn's foreground request
-        // after another requester already joined the same running turn).
+        // A new turn: what it carries starts again from what woke it, preserving ONLY
+        // explicit requester ids that newly joined the same running turn while its
+        // foreground request was opening (never stale joined requesters from prior turns).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
@@ -169,8 +206,9 @@ export function reduceRequestLog(text) {
             ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
             : [],
         )
-        if (event.preserve_joined) {
-          if (UUID.test(current ?? '')) joined.delete(current)
+        if (Array.isArray(event.preserve_joined_ids)) {
+          const keep = new Set(event.preserve_joined_ids.filter((id) => UUID.test(id ?? '') && id !== current))
+          joined = new Set([...joined].filter((id) => keep.has(id)))
         } else {
           joined = new Set()
         }
@@ -246,10 +284,12 @@ export function reduceRequestLog(text) {
         break
       case 'launch':
         if (KEY.test(event.key ?? '') && carriedRef(event.request)) {
+          const also = uuids(event.also)
+          restoreIdleClosedRefs(event.request, also)
           launches.set(event.key, {
             key: event.key,
             request: event.request,
-            also: uuids(event.also),
+            also,
             kind: String(event.kind || 'unknown'),
             notifies: event.notifies !== false,
             notified: false,
@@ -273,10 +313,12 @@ export function reduceRequestLog(text) {
       }
       case 'schedule':
         if (typeof event.prompt === 'string' && event.prompt.trim() && carriedRef(event.request)) {
+          const also = uuids(event.also)
+          restoreIdleClosedRefs(event.request, also)
           schedules.push({
             prompt: event.prompt.trim(),
             request: event.request,
-            also: uuids(event.also),
+            also,
             id: KEY.test(event.id ?? '') ? event.id : null,
           })
         }
