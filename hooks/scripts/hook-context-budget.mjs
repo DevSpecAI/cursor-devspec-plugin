@@ -864,25 +864,48 @@ export function shellDiagnosticPointer(label, command) {
 export const SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS = 600
 
 /**
+ * Build one reserve string whose UTF-16 character length AND UTF-8 byte length are EACH
+ * at least as large as every candidate in `candidates` (and at least `minChars`).
+ * Ensures `fitsShellOutput` (which enforces BOTH 20,000 UTF-16 code units AND 40,000 UTF-8
+ * bytes) leaves enough room for whichever diagnostic pointer is emitted, even when one
+ * unavailable store has a longer ASCII path and a writable store has a shorter multibyte
+ * UTF-8 path (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ */
+export function maxShellReserve(candidates, minChars = 0) {
+  let maxChars = Math.max(0, minChars)
+  let maxByteCandidate = ''
+  let maxBytes = 0
+  for (const raw of candidates) {
+    const text = String(raw ?? '')
+    if (text.length > maxChars) maxChars = text.length
+    const bytes = Buffer.byteLength(text, 'utf8')
+    if (bytes > maxBytes) {
+      maxBytes = bytes
+      maxByteCandidate = text
+    }
+  }
+  return maxByteCandidate.length >= maxChars
+    ? maxByteCandidate
+    : maxByteCandidate + ' '.repeat(maxChars - maxByteCandidate.length)
+}
+
+/**
  * Exact ceiling reservation for Shell post-stdout diagnostics, derived at one shared
- * boundary from the larger of `shellDiagnosticPointer` (primary or tmp fallback note)
- * and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS` so `stdout + stderr` always fits
- * `fitsShellOutput` even when neither note store is writable (reqs 3c5147a7 / 91d7b47c).
+ * boundary from the worst-case UTF-16 length and UTF-8 byte length across all note stores
+ * (`~/.devspec/notes`, `os.tmpdir()`, and `fallbackDir`) and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS`
+ * so `stdout + stderr` always fits `fitsShellOutput` (reqs 3c5147a7 / 91d7b47c / 4e32d1a5).
  */
 export function shellDiagnosticReserve(label = 'devspec-wake-tail', { fallbackDir = null } = {}) {
   const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
-  let base = fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
+  const candidates = [notePtr, fallbackPtr]
   if (fallbackDir) {
     const dirSampleFile = path.join(fallbackDir, `${'0'.repeat(16)}.md`)
-    const dirPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`)
-    if (dirPtr.length > base.length) base = dirPtr
+    candidates.push(shellDiagnosticPointer(label, `cat ${shellQuotePath(dirSampleFile)}`))
   }
-  return base.length >= SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS
-    ? base
-    : base + ' '.repeat(SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS - base.length)
+  return maxShellReserve(candidates, SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS)
 }
 
 function shellQuotePath(value) {

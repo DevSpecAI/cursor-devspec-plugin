@@ -123,6 +123,7 @@ import { resolveAgentTranscriptPath } from './work-trail.mjs'
 import { answerCursorAtExit } from './hook-answer.mjs'
 import {
   clearWakeListenerNeeded,
+  extractRoomCommandsFromWake,
   formatStructuredRefusalsFallback,
   isWakeListenerActive,
   startRoomCommands,
@@ -905,6 +906,7 @@ export async function stepDeliveryHook(
   let readChanged = false
   let completedOwnerItems = []
   let keptForPickupRetry = null
+  let unreadableInnerNoteRefusals = []
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
@@ -919,8 +921,60 @@ export async function stepDeliveryHook(
         record = done ? null : { ...kept, parts: next.parts }
         readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
         if (done) {
-          completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
-          keptForPickupRetry = { ...kept, parts: next.parts }
+          const immediateOwnerItems = []
+          for (const item of kept.items) {
+            if (item.kind !== 'owner_messages') continue
+            const hasInnerWakeNote =
+              Array.isArray(item.events) &&
+              item.events.some(
+                (event) =>
+                  event?.type === 'wake_in_note' &&
+                  Array.isArray(event.carries) &&
+                  event.carries.includes('owner_message'),
+              )
+            if (!hasInnerWakeNote) {
+              immediateOwnerItems.push(item)
+              continue
+            }
+            // The outer step note contained a `wake_in_note` pointer for an oversized
+            // room command whose body lives in an inner note. Do NOT trigger report_pickup
+            // or drop pending tracking yet: register each inner note via registerPendingWakeNote
+            // so pickup runs ONLY once the agent finishes reading the inner note whole (3ea2b201).
+            const extracted = extractRoomCommandsFromWake(wakeLines(item.events), { home })
+            for (const deferred of extracted.deferredNoteCommands) {
+              registerPendingWakeNote(
+                connectionId,
+                {
+                  noteId: deferred.noteId,
+                  commands: deferred.commands,
+                  messages: deferred.messages,
+                  sessionId: deferred.sessionId ?? item.session_id ?? null,
+                },
+                { dir: connDir },
+              )
+            }
+            for (const unreadable of extracted.unreadableNotes) {
+              unreadableInnerNoteRefusals.push({
+                command_message_id: null,
+                command_turn_id: null,
+                refusal: unreadable,
+              })
+            }
+            if (extracted.inlineCommands.length > 0) {
+              immediateOwnerItems.push({
+                ...item,
+                commands: extracted.inlineCommands,
+                messages: extracted.inlineMessages,
+              })
+            }
+          }
+          completedOwnerItems = immediateOwnerItems
+          keptForPickupRetry =
+            immediateOwnerItems.length > 0
+              ? { ...kept, items: immediateOwnerItems, parts: next.parts }
+              : unreadableInnerNoteRefusals.length > 0
+                ? { ...kept, parts: next.parts }
+                : null
         }
       }
     } else {
@@ -982,7 +1036,15 @@ export async function stepDeliveryHook(
   // call (no per-item loop, req c900f599). If report_pickup refuses, keep the record as
   // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
   // preserve/surface the full structured refusal details (req 4e32d1a5).
-  let pickupRefusals = null
+  let pickupRefusals = unreadableInnerNoteRefusals.length > 0 ? unreadableInnerNoteRefusals : null
+  if (unreadableInnerNoteRefusals.length > 0 && !record && keptForPickupRetry) {
+    record = {
+      ...keptForPickupRetry,
+      pickup_pending: true,
+      pickup_refusals: unreadableInnerNoteRefusals,
+    }
+    readChanged = true
+  }
   if (completedOwnerItems.length > 0 || completedWakeNotes.length > 0) {
     const combinedMessages = [
       ...completedOwnerItems.flatMap((item) =>

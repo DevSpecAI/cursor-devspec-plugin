@@ -2585,4 +2585,143 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs.rmSync(base, { recursive: true, force: true })
     }
   })
+
+  it('readWakes reserves BOTH max UTF-16 chars AND max UTF-8 bytes when TMPDIR is longer in ASCII chars while connections fallback path is longer in UTF-8 bytes (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-wake-utf8-'))
+    const blockedHome = path.join(base, 'home')
+    fs.mkdirSync(path.join(blockedHome, '.devspec'), { recursive: true })
+    fs.writeFileSync(path.join(blockedHome, '.devspec', 'notes'), 'not-a-directory\n')
+    // Unavailable ASCII TMPDIR: longer in UTF-16 characters (~550 ASCII chars = 550 bytes).
+    const longAsciiTmpParent = path.join(base, 'a'.repeat(180), 'b'.repeat(180), 'c'.repeat(180))
+    fs.mkdirSync(longAsciiTmpParent, { recursive: true })
+    const blockedTmp = path.join(longAsciiTmpParent, 'tmp-file')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    // Writable fallback dir: SHORTER in UTF-16 characters (~250 CJK chars) but LONGER in UTF-8 bytes (~750+ bytes)!
+    const utf8Dir = path.join(base, '中'.repeat(80), '文'.repeat(80), '径'.repeat(80))
+    fs.mkdirSync(utf8Dir, { recursive: true })
+
+    const wakeFile = path.join(utf8Dir, `${CONN}.wakes.jsonl`)
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    try {
+      const reserve = shellDiagnosticReserve('devspec-wake-tail', {
+        fallbackDir: path.join(utf8Dir, 'diagnostic-notes'),
+      })
+      const reserveBytes = Buffer.byteLength(reserve, 'utf8')
+      assert.ok(reserveBytes >= 800, `expected UTF-8 byte reserve >= 800, got ${reserveBytes}`)
+      // Build a CJK wake near the 40,000-byte UTF-8 Shell ceiling (fits under 20,000 chars!).
+      const targetBytes = 40_000 - reserveBytes - 300
+      let cjkCount = 5_000
+      for (let pass = 0; pass < 6; pass += 1) {
+        const measured = Buffer.byteLength(wakeLines(buildOwnerMessageEvents(ownerBatch('あ'.repeat(cjkCount)))), 'utf8')
+        cjkCount = Math.max(100, cjkCount + Math.floor((targetBytes - measured) / 6))
+      }
+      const built = buildOwnerMessageEvents(ownerBatch('あ'.repeat(cjkCount)))
+      appendWakeEvents(wakeFile, built)
+
+      let stdout = ''
+      let stderr = ''
+      const res = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home: blockedHome,
+        dir: utf8Dir,
+        settleMs: 10,
+        write: async (text) => { stdout += text },
+        writeStderr: (text) => { stderr += text },
+        startCommands: async () => ({
+          ok: false,
+          outcome: 'refused',
+          started: [],
+          pickedUp: 0,
+          refusals: [
+            {
+              command_message_id: MSG_ID,
+              command_turn_id: TURN_ID,
+              refusal: {
+                code: 'turn_busy_utf8_fallback',
+                blocking_items: [{ id: 'blk-utf8-1', reason: 'active_edit' }],
+                detail: 'd'.repeat(3_000),
+              },
+            },
+          ],
+        }),
+      })
+      assert.equal(res.marked, false)
+      assert.equal(res.pickup_diagnostic_written, true, `expected diagnostic to be written; stderr=${stderr}`)
+      assert.ok(fitsShellOutput(stdout + stderr))
+      const catMatch = /cat '([^']+)'/.exec(stderr)
+      assert.ok(catMatch, `stderr must contain exact cat read command; got: ${stderr}`)
+      const saved = fs.readFileSync(catMatch[1], 'utf8')
+      assert.match(saved, /turn_busy_utf8_fallback/)
+      assert.match(saved, /blk-utf8-1/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+      fs.rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it('stepDeliveryHook defers report_pickup for an oversized mid-turn command until the inner wake_in_note body is read whole (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Huge mid-turn command ' + 'm'.repeat(21_000))
+    const built = buildOwnerMessageEvents(batch)
+    // Simulate devspec-remote-wait wrapping the oversized command into an inner wake_in_note before holding for step!
+    const innerWrapped = wakeInNote(built, { home })
+    assert.equal(innerWrapped.events[0].type, 'wake_in_note')
+    const innerNoteId = innerWrapped.note.id
+
+    const held = holdForNextStep(CONN, batch, innerWrapped.events, { dir })
+    assert.equal(held.held, true)
+
+    const pickupCalls = []
+    const startCommands = async (opts) => {
+      pickupCalls.push(opts.commands)
+      return { ok: true, outcome: 'picked_up', started: opts.commands, pickedUp: opts.commands.length }
+    }
+
+    // Step 1: postToolUse hands over the OUTER step note pointing at the inner wake_in_note.
+    const handOverRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo work' }, tool_output: 'work' },
+      { home, dir, listenerActive: () => true, startCommands },
+    )
+    assert.ok(handOverRaw, 'expected outer step note hook output')
+    const handOverCtx = JSON.parse(handOverRaw).additional_context
+    assert.ok(handOverCtx)
+    const outerMatch = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(handOverCtx)
+    assert.ok(outerMatch, `expected outer step note command; got: ${handOverCtx}`)
+    const outerNoteId = outerMatch[1]
+    assert.notEqual(outerNoteId, innerNoteId)
+    assert.equal(pickupCalls.length, 0, 'handing over outer pointer must NOT trigger report_pickup')
+
+    // Step 2: Agent reads ONLY the OUTER step note (which contains ONLY the inner wake_in_note pointer!).
+    for (const file of noteFiles(home, outerNoteId)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands,
+      })
+    }
+    assert.equal(pickupCalls.length, 0, 'reading ONLY the outer step note must NOT trigger report_pickup before inner note is read')
+    const pendingInnerFile = path.join(dir, `${CONN}.steps`, `wake-note-${innerNoteId}.json`)
+    assert.equal(fs.existsSync(pendingInnerFile), true, 'inner wake_in_note must stay pending in steps dir until read whole')
+
+    // Step 3: Agent reads every part of the INNER wake_in_note whole -> NOW report_pickup runs once and clears pending!
+    for (const file of noteFiles(home, innerNoteId)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands,
+      })
+    }
+    assert.equal(pickupCalls.length, 1, 'reading inner wake_in_note whole must trigger report_pickup once')
+    assert.equal(pickupCalls[0][0].messageId, MSG_ID)
+    assert.equal(fs.existsSync(pendingInnerFile), false, 'pending inner wake-note record must clear once picked up')
+  })
 })

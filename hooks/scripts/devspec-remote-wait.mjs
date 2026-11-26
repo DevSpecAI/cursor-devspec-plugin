@@ -89,6 +89,7 @@ import {
   fitShellDiagnostic,
   fitsShellOutput,
   hasWritableDiagnosticNoteStore,
+  maxShellReserve,
   shellDiagnosticPointer,
   shellDiagnosticReserve,
   wakeInNote,
@@ -2031,10 +2032,7 @@ export function createOneShotRetryStderrWriter({
     shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
     recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry.',
   })}\n`
-  const flushReserveText = [diagnosticReserve, fallbackPointerReserve, unwritableCompactReserve].reduce(
-    (longest, candidate) => (candidate.length > longest.length ? candidate : longest),
-    '',
-  )
+  const flushReserveText = maxShellReserve([diagnosticReserve, fallbackPointerReserve, unwritableCompactReserve])
   const effectiveHeadroom =
     typeof headroom === 'string'
       ? headroom
