@@ -328,19 +328,36 @@ function pendingOpensFallbackPath(dir, connectionId) {
   return path.join(os.tmpdir(), `devspec-pending-opens-${uid}`, `${digest}.json`)
 }
 
-function readPendingOpensFile(filePath, { verifyOwnerDir = false } = {}) {
+function readPendingOpensFileDetailed(filePath, { verifyOwnerDir = false } = {}) {
   try {
-    if (!fs.existsSync(filePath)) return {}
     if (verifyOwnerDir) {
-      const dirStat = fs.lstatSync(path.dirname(filePath))
-      if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return {}
-      if (typeof process.getuid === 'function' && dirStat.uid !== process.getuid()) return {}
+      let dirStat
+      try {
+        dirStat = fs.lstatSync(path.dirname(filePath))
+      } catch (dirErr) {
+        return dirErr?.code === 'ENOENT' ? { entries: {}, readError: null } : { entries: {}, readError: dirErr }
+      }
+      if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return { entries: {}, readError: null }
+      if (typeof process.getuid === 'function' && dirStat.uid !== process.getuid()) return { entries: {}, readError: null }
     }
-    const parsed = readPrivateJson(filePath)
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
-  } catch {
-    return {}
+    let raw
+    try {
+      raw = fs.readFileSync(filePath, 'utf8')
+    } catch (readErr) {
+      return readErr?.code === 'ENOENT' ? { entries: {}, readError: null } : { entries: {}, readError: readErr }
+    }
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { entries: {}, readError: new Error(`invalid pending-opens JSON at ${filePath}`) }
+    }
+    return { entries: parsed, readError: null }
+  } catch (error) {
+    return { entries: {}, readError: error }
   }
+}
+
+function readPendingOpensFile(filePath, { verifyOwnerDir = false } = {}) {
+  return readPendingOpensFileDetailed(filePath, { verifyOwnerDir }).entries
 }
 
 function writePendingOpensFile(filePath, entriesObj, { verifyOwnerDir = false } = {}) {
@@ -525,6 +542,7 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       boundByWake: reqState.currentBoundByWake,
       wakeNotifiedKeys: [...(reqState.currentWakeNotifiedKeys ?? [])],
       joined: [...reqState.joined],
+      chosen: Boolean(reqState.chosen),
       currentRestored: false,
     }
     if (!reqState.started.has(entry.requestId)) {
@@ -562,9 +580,20 @@ function flushPendingLocalOpenEntry(connectionId, dir, pKey, entry) {
       }
     }
     if (entry.restoreForeground) {
+      // Re-read the request log AFTER `{ op: 'current', ... }` (which resets `joined`
+      // and `chosen`), never comparing against the stale pre-flush snapshot, so every
+      // joined second-person request and explicit serve choice is faithfully restored
+      // (decision ce71a72b).
+      const afterRestore = readRequestState(connectionId, { dir })
+      if (afterRestore.readError) return false
       for (const joinedId of fg.joined) {
-        if (reqState.joined.has(joinedId) && reqState.current === fg.current) continue
+        if (afterRestore.joined.has(joinedId) && afterRestore.current === fg.current) continue
         if (!appendRequestEvent(connectionId, { op: 'joined', id: joinedId }, { dir })) {
+          return false
+        }
+      }
+      if (fg.chosen && fg.current !== null && !afterRestore.chosen) {
+        if (!appendRequestEvent(connectionId, { op: 'serve', ref: fg.current }, { dir })) {
           return false
         }
       }
@@ -605,15 +634,17 @@ export function pendingWorkWithoutHostLists(reqState) {
   return pending
 }
 
-function pendingOpensForConnection(dir, connectionId) {
+function pendingOpensForConnectionDetailed(dir, connectionId) {
   const prefix = `${path.resolve(dir)}|${connectionId}|`
   const byKey = new Map()
+  let readError = null
   for (const [filePath, verifyOwnerDir] of [
     [pendingOpensFallbackPath(dir, connectionId), true],
     [pendingOpensSidecarPath(dir, connectionId), false],
   ]) {
-    const persisted = readPendingOpensFile(filePath, { verifyOwnerDir })
-    for (const [turnKey, entry] of Object.entries(persisted)) {
+    const detailed = readPendingOpensFileDetailed(filePath, { verifyOwnerDir })
+    if (detailed.readError && !readError) readError = detailed.readError
+    for (const [turnKey, entry] of Object.entries(detailed.entries)) {
       if (entry?.requestId && (entry?.turnKey || turnKey)) {
         const normalized = { ...entry, turnKey: entry.turnKey || turnKey }
         byKey.set(pendingOpenKey(dir, connectionId, normalized.turnKey), normalized)
@@ -623,7 +654,11 @@ function pendingOpensForConnection(dir, connectionId) {
   for (const [key, entry] of pendingLocalOpens) {
     if (key.startsWith(prefix)) byKey.set(key, entry)
   }
-  return [...byKey.entries()]
+  return { entries: [...byKey.entries()], readError }
+}
+
+function pendingOpensForConnection(dir, connectionId) {
+  return pendingOpensForConnectionDetailed(dir, connectionId).entries
 }
 
 /**
@@ -773,14 +808,18 @@ export async function syncTypedTurnFromTranscript({
     sawRequestLogReadError = true
     return err.code !== 'EISDIR'
   }
-  const canMarkSynced = () =>
-    !sawRequestLogReadError &&
-    !hasPendingFailedTypedTurns(dir, connectionId) &&
-    pendingOpensForConnection(dir, connectionId).length === 0 &&
-    !readRequestState(connectionId, { dir }).readError
+  const canMarkSynced = () => {
+    if (sawRequestLogReadError) return false
+    if (hasPendingFailedTypedTurns(dir, connectionId)) return false
+    const pendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+    if (pendingLookup.readError || pendingLookup.entries.length > 0) return false
+    if (readRequestState(connectionId, { dir }).readError) return false
+    return true
+  }
 
   const retryQueuedFailedTurn = async ({ excludeKey = null } = {}) => {
-    const pendingEntries = pendingOpensForConnection(dir, connectionId).filter(
+    const pendingLookup = pendingOpensForConnectionDetailed(dir, connectionId)
+    const pendingEntries = pendingLookup.entries.filter(
       ([, entry]) => !excludeKey || entry.turnKey !== excludeKey,
     )
     if (pendingEntries.length > 0) {
@@ -808,6 +847,19 @@ export async function syncTypedTurnFromTranscript({
             key: pendingEntries[0][1].turnKey ?? null,
           },
         }
+      }
+    }
+    if (pendingLookup.readError) {
+      log(
+        `typed-turn-sync: pending-opens retry queue unreadable for ${connectionId}: ${pendingLookup.readError?.message ?? 'read failed'}\n`,
+      )
+      return {
+        ran: true,
+        ok: false,
+        result: {
+          action: 'pending_opens_unreadable',
+          error: pendingLookup.readError?.message ?? 'read failed',
+        },
       }
     }
 

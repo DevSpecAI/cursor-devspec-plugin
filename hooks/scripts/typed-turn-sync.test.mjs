@@ -3389,4 +3389,101 @@ describe('typed-turn-sync (item da03801e)', () => {
     const afterStamped = stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home })
     assert.equal(afterStamped.args?.request_ref, CMD_BOB)
   })
+
+  it('retrying an older terminal request preserves joined second-person room command and two-person ambiguity on the live turn (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111e1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222e2'
+
+    // Turn 1 (older terminal turn) ended unseen; live Turn 2 carries BOTH Alice's room command
+    // AND Bob's joined room command (two-person ambiguity).
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'joined', id: CMD_BOB }, { dir })
+
+    const beforeStamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(beforeStamped.deny, 'before retry, write must ask which person it serves')
+
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${typedRow('Older missed turn')}\n${turnEndedRow()}\n${cmdRow}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+    })
+    assert.equal(res.retriedFailedTurn?.action, 'opened')
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'first person foreground request must remain current')
+    assert.equal(after.joined.has(CMD_BOB), true, 'second person joined room command MUST survive older-turn retry')
+    assert.equal(turnAmbiguity(after)?.length, 2, 'two-person ambiguity must remain intact after retry')
+    const afterStamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(afterStamped.deny, 'after retry, write must STILL ask which person it serves instead of auto-stamping person 1')
+  })
+
+  it('unreadable pending-opens retry queue file never marks sync complete so recovery with unchanged files still flushes the queued request (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const QUEUED_REQ = '77777777-7777-4777-8777-7777777777e3'
+    const turnText = 'Earlier queued turn in sidecar'
+    fs.writeFileSync(transcriptPath, `${typedRow(turnText)}\n${turnEndedRow()}\n`)
+    // Discover the turn key for the ended turn via a dry transcript read.
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const active = activeTranscriptTurn(transcriptPath)
+    const turnKey = active.typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    // Write the pending-opens sidecar file on disk (as a prior process would have done)
+    // and then make it transiently unreadable (chmod 0o000).
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: QUEUED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+    const origStat = fs.statSync(sidecar)
+    const memo = {}
+
+    fs.chmodSync(sidecar, 0o000)
+    try {
+      const failedPass = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => { throw new Error('should not open a duplicate') },
+        dir,
+        memo,
+      })
+      assert.equal(failedPass.action, 'pending_opens_unreadable')
+      assert.equal(memo.synced, false, 'unreadable retry queue must NEVER mark transcript sync complete')
+    } finally {
+      fs.chmodSync(sidecar, 0o600)
+      fs.utimesSync(sidecar, origStat.atime, origStat.mtime)
+    }
+
+    // After reads recover with files unchanged, typedTurnSyncPending MUST return true and flush QUEUED_REQ!
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), true)
+    const recovered = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('already opened on server') },
+      dir,
+      memo,
+    })
+    assert.equal(recovered.action, 'not_typed_live')
+    assert.equal(memo.synced, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(QUEUED_REQ), true, 'queued request must be persisted once retry queue reads recover')
+    assert.equal(after.seenTranscriptTurns.get(turnKey), QUEUED_REQ)
+  })
 })
