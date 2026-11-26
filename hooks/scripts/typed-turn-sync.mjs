@@ -28,6 +28,7 @@ import {
   readRequestState,
   requestFinished,
   requestForWake,
+  requestLogChangeStamp,
   requestsWithWorkPending,
   rotateRequestLog,
   UNSTATED,
@@ -161,8 +162,14 @@ function fileStamp(file) {
 export function typedTurnSyncPending({ transcriptPath, memo = null, connectionId = null, dir = DEFAULT_DIR } = {}) {
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return false
-  const reqFile = connectionId ? path.join(dir, `${connectionId}.requests.jsonl`) : memo?.reqFile ?? null
-  const reqStamp = reqFile ? (fileStamp(reqFile) ?? '') : (memo?.reqStamp ?? '')
+  const effectiveConnId = connectionId ?? memo?.connectionId ?? null
+  const effectiveDir = connectionId ? dir : (memo?.reqDir ?? dir)
+  const reqStamp = effectiveConnId
+    ? requestLogChangeStamp(effectiveConnId, { dir: effectiveDir })
+    : memo?.reqFile
+      ? (fileStamp(memo.reqFile) ?? '')
+      : (memo?.reqStamp ?? '')
+  if (reqStamp === null) return true
   if (memo && memo.stamp === stamp && (memo.reqStamp ?? '') === reqStamp && memo.synced === true) return false
   return true
 }
@@ -1075,9 +1082,16 @@ export async function syncTypedTurnFromTranscript({
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return { action: 'none' }
   const reqFile = path.join(dir, `${connectionId}.requests.jsonl`)
-  const currentReqStamp = () => fileStamp(reqFile) ?? ''
+  const currentReqStamp = () => requestLogChangeStamp(connectionId, { dir })
   const reqStampAtStart = currentReqStamp()
-  if (memo && memo.stamp === stamp && (memo.reqStamp ?? '') === reqStampAtStart && memo.synced && canMarkSynced()) {
+  if (
+    memo &&
+    memo.stamp === stamp &&
+    reqStampAtStart !== null &&
+    (memo.reqStamp ?? '') === reqStampAtStart &&
+    memo.synced &&
+    canMarkSynced()
+  ) {
     return { action: 'unchanged' }
   }
 
@@ -1119,26 +1133,39 @@ export async function syncTypedTurnFromTranscript({
 
   const markMemoSynced = () => {
     if (!memo) return
-    // Capture the request-log stamp BEFORE reading `.requests.jsonl` to confirm no
-    // previously unmatched `<task-notification>` now matches a launch appended while
-    // this pass awaited an earlier request/admission, and NEVER advance `memo.synced`
-    // if reading `.requests.jsonl` failed transiently (requirement 3ea2b201).
+    // Capture the request-log stamp (covering active, `.1` archive, and any `.rotating-*`
+    // staged logs) BEFORE reading request state to confirm no previously unmatched
+    // `<task-notification>` now matches a launch appended while this pass awaited an
+    // earlier request/admission, and NEVER advance `memo.synced` if reading or statting
+    // failed transiently (requirement 3ea2b201).
     const verifiedReqStamp = currentReqStamp()
     const verifyState = readRequestState(connectionId, { dir })
-    if (sawRequestLogReadError || verifyState.readError || hasUnseenMatchableNotification(verifyState) || !canMarkSynced()) {
+    if (
+      sawRequestLogReadError ||
+      verifiedReqStamp === null ||
+      verifyState.readError ||
+      hasUnseenMatchableNotification(verifyState) ||
+      !canMarkSynced()
+    ) {
       memo.stamp = active.stamp
+      memo.connectionId = connectionId
+      memo.reqDir = dir
       memo.reqFile = reqFile
       memo.reqStamp = reqStampAtStart
       memo.synced = false
       return
     }
     memo.stamp = active.stamp
+    memo.connectionId = connectionId
+    memo.reqDir = dir
     memo.reqFile = reqFile
     memo.reqStamp = verifiedReqStamp
     memo.synced = true
   }
   if (memo) {
     memo.stamp = active.stamp
+    memo.connectionId = connectionId
+    memo.reqDir = dir
     memo.reqFile = reqFile
     memo.reqStamp = reqStampAtStart
     memo.synced = false
@@ -1928,17 +1955,21 @@ export async function syncTypedTurnFromTranscript({
     active.kind === 'other' && notifiedKeys(active.rawText).length > 0
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
-    // A mid-turn Cursor `summary` row inside an active terminal prompt OR a turn whose
-    // own background wake bound `reqState.current` (with no intervening `turn_ended`) is
-    // housekeeping, NOT an unrelated wake: preserve the live turn's attribution while
-    // still clearing an ended prior turn's `typed_prompt` when an unrelated `other` row +
-    // `summary` arrives after `turn_ended` (ce71a72b).
-    const hasSameTurnBoundWake = sameTurnWakeRows.some(
-      (wakeRow) => wakeRow?.key && reqState.seenTranscriptTurns.get(wakeRow.key) === reqState.current,
-    )
+    // In the SAME live turn (no intervening `turn_ended`):
+    //  - A Cursor `summary` row is housekeeping, NOT an unrelated wake.
+    //  - A mid-turn `<task-notification>` whose launch record is still arriving
+    //    (`hasPendingUnmatchedNotificationId`) belongs to THIS running turn, so NEVER
+    //    clear the first notification's (or live terminal prompt's) restored requester
+    //    while waiting for the second launch record: once that launch lands, the second
+    //    notification will JOIN the first requester so both stay distinct (ce71a72b).
+    const hasSameTurnBoundWake = sameTurnWakeRows.some((wakeRow) => {
+      if (!wakeRow?.key) return false
+      const ref = reqState.seenTranscriptTurns.get(wakeRow.key)
+      return Boolean(ref) && (ref === reqState.current || reqState.joined.has(ref))
+    })
     if (
-      active.kind === 'summary' &&
       !active.precededByTurnEnded &&
+      (active.kind === 'summary' || hasPendingUnmatchedNotificationId) &&
       (active.liveTurnTypedKey || hasSameTurnBoundWake)
     ) {
       return false

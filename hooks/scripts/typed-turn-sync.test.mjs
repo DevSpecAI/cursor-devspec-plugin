@@ -5654,4 +5654,178 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, REQ_ALICE_OLD, 'wake MUST still resolve to Alice after later rotation')
   })
+
+  it('memo invalidation watches retained archive (.1) and staged (.rotating-*) logs so a launch appended after rotation triggers reconciliation even with cached memo (3ea2b201)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests, typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const REQ_ALICE = '55555555-5555-4555-8555-5555555555ac'
+
+    fs.writeFileSync(transcriptPath, `${turnEndedRow()}\n`)
+
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(dir, { recursive: true })
+    const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'pad-retained', ref: null, pad: 'r'.repeat(400) })}\n`
+    fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'command', requested_by: ALICE, message_id: 'msg-alice-retained' }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: REQ_ALICE }, { dir })
+
+    // Open fd BEFORE rotation, finish idle close + rotation so the old inode becomes `.requests.jsonl.1`.
+    const oldFd = fs.openSync(reqLogPath, 'a')
+    try {
+      const idleRes = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+      assert.deepEqual(idleRes.closed, [REQ_ALICE])
+      assert.equal(fs.existsSync(`${reqLogPath}.1`), true)
+
+      // Completion arrives in transcript BEFORE the launch record lands -> first poll caches `memo.synced = true`!
+      const wakeRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>retained-memo-launch</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+      const memo = {}
+      const poll1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(poll1.action, 'not_typed_live')
+      assert.equal(memo.synced, true)
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), false)
+
+      // Now the still-open fd appends the launch record into the retained `.requests.jsonl.1` log
+      // WITHOUT touching the active `.requests.jsonl` file!
+      fs.writeSync(
+        oldFd,
+        `${JSON.stringify({ op: 'launch', key: 'retained-memo-launch', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n`,
+      )
+
+      // Poller MUST detect the change in `.requests.jsonl.1` using the SAME cached `memo`!
+      assert.equal(
+        typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }),
+        true,
+        'typedTurnSyncPending MUST detect append to retained .1 log',
+      )
+      assert.equal(
+        typedTurnSyncPending({ transcriptPath, memo }),
+        true,
+        'typedTurnSyncPending via memo alone MUST also detect append to retained .1 log',
+      )
+      const poll2 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(poll2.action, 'restored_wake_request', 'reconciliation with cached memo MUST process the launch')
+      assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+      assert.equal(readRequestState(CONN, { dir }).launches.get('retained-memo-launch')?.notified, true)
+      assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, REQ_ALICE)
+    } finally {
+      fs.closeSync(oldFd)
+    }
+  })
+
+  it('same-turn second background notification whose launch is still arriving does NOT clear the first notification’s restored requester, and joins it once the second launch arrives (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111ad'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222ad'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE, message_id: 'msg-alice-wake1' }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB, message_id: 'msg-bob-wake2' }, { dir })
+    // Only Alice's launch record has landed so far; Bob's launch record is still arriving!
+    appendRequestEvent(CONN, { op: 'launch', key: 'alice-same-turn-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+
+    const wake1 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>alice-same-turn-1</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    const wake2 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>bob-same-turn-2</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+
+    const memo = {}
+    // Poll 1: Alice's notification arrives and restores CMD_ALICE.
+    fs.writeFileSync(transcriptPath, `${wake1}\n`)
+    const p1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(p1.action, 'restored_wake_request')
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE)
+
+    // Poll 2: Bob's notification arrives in the SAME turn (no turn_ended) while Bob's launch record is still in flight!
+    fs.appendFileSync(transcriptPath, `${wake2}\n`)
+    const p2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.notEqual(p2.action, 'cleared_for_wake', 'unmatched second same-turn notification MUST NOT clear Alice’s requester')
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE, 'Alice MUST remain current while Bob’s launch record arrives')
+
+    // Poll 3: Bob's launch record lands in `.requests.jsonl`!
+    appendRequestEvent(CONN, { op: 'launch', key: 'bob-same-turn-2', kind: 'shell', notifies: true, request: CMD_BOB, also: [] }, { dir })
+    const p3 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(p3.action, 'restored_wake_request')
+    assert.equal(p3.midTurn, true, 'Bob’s late-matched notification MUST join Alice’s live turn, not replace it')
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'Alice’s request must stay current')
+    assert.equal(after.joined.has(CMD_BOB), true, 'Bob’s request must be joined')
+    assert.equal(turnAmbiguity(after)?.length, 2, 'both requesters must stay distinct and require a choice')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write MUST ask which requester it serves instead of stamping Bob alone')
+    assert.match(stamped.deny, /msg-alice-wake1/)
+    assert.match(stamped.deny, /msg-bob-wake2/)
+  })
 })

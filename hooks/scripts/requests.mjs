@@ -444,6 +444,36 @@ function stagedRequestLogFiles(connectionId, dir) {
   return { files: matched.map((m) => m.fullPath), error: null }
 }
 
+/**
+ * Combined change stamp covering the active request log AND every retained
+ * archive (`.requests.jsonl.1`) and staged rotation file (`.requests.jsonl.rotating-*`)
+ * that `readRequestState` reads. Returns `null` on any non-ENOENT stat/readdir error
+ * so callers never skip reconciliation on a transient filesystem error (req 3ea2b201).
+ */
+export function requestLogChangeStamp(connectionId, { dir = DEFAULT_DIR } = {}) {
+  if (!connectionId) return ''
+  const file = requestLogPath(connectionId, dir)
+  const parts = []
+  const statTag = (label, target) => {
+    try {
+      const st = fs.statSync(target)
+      parts.push(`${label}=${st.ino}:${st.size}:${st.mtimeMs}`)
+      return true
+    } catch (error) {
+      if (error?.code === 'ENOENT') return true
+      return false
+    }
+  }
+  if (!statTag('active', file)) return null
+  if (!statTag('archive', `${file}.1`)) return null
+  const staged = stagedRequestLogFiles(connectionId, dir)
+  if (staged.error) return null
+  for (const stagedFile of staged.files) {
+    if (!statTag(`staged:${path.basename(stagedFile)}`, stagedFile)) return null
+  }
+  return parts.join('|')
+}
+
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
   const file = requestLogPath(connectionId, dir)
   let text = ''
