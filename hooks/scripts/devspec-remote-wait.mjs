@@ -2398,7 +2398,11 @@ async function main() {
                 }
               } else {
                 const retryReserve = retryStderr.pendingReserve()
-                const plan = planOneShot(frozen, { reserve: `${emittedStderr}${retryReserve}` })
+                const frozenHasOwnerMessage = frozen.some(
+                  (wake) => Array.isArray(wake) && wake.some((event) => event?.type === 'owner_message'),
+                )
+                const pickupReserve = frozenHasOwnerMessage ? oneShotDiagnosticReserve : ''
+                const plan = planOneShot(frozen, { reserve: `${emittedStderr}${retryReserve}${pickupReserve}` })
                 if (plan.held) {
                   return { count: 0, held: plan.error, pickupFailed: false, shot: null, pickup }
                 }
@@ -2566,7 +2570,8 @@ async function main() {
         // tried again every lap until it goes, with no cap: notes live in the same home
         // folder as the wake file, so this is a disk problem that clears, and the room is
         // told once (`tellRoomWakeHeld`).
-        const oneShotReserve = !args.follow ? `${emittedStderr}${retryStderr.pendingReserve()}` : ''
+        const pickupReserve = !args.follow && batch.type === 'owner_messages' ? oneShotDiagnosticReserve : ''
+        const oneShotReserve = !args.follow ? `${emittedStderr}${retryStderr.pendingReserve()}${pickupReserve}` : ''
         const out = recallWakeOut(built, batch?.turn_recall, { connectionId, reserve: oneShotReserve })
         if (out.held) {
           writeRetryStderr(
@@ -2590,7 +2595,7 @@ async function main() {
         if (args.follow) {
           for (const wake of out.wakes) for (const event of wake) await emitStdoutEvent(event)
         } else {
-          const plan = planOneShot(out.wakes, { reserve: `${emittedStderr}${retryStderr.pendingReserve()}` })
+          const plan = planOneShot(out.wakes, { reserve: `${emittedStderr}${retryStderr.pendingReserve()}${pickupReserve}` })
           if (plan.held) {
             writeRetryStderr(
               `devspec-remote-wait: holding a wake: it needs a note to fit beside stderr, and the note could not be written (${plan.error instanceof Error ? plan.error.message : String(plan.error)}); trying again\n`,
