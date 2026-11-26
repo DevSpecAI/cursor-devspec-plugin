@@ -101,6 +101,7 @@ import {
   wakeLines,
 } from './devspec-wake-file.mjs'
 import {
+  CURSOR_SHELL_OUTPUT_MAX_CHARS,
   fitShellDiagnostic,
   fitsShellOutput,
   shellDiagnosticReserve,
@@ -892,8 +893,23 @@ export async function readWakes({
         requireStructuredFallback: true,
       })
       pickupDiagnosticNote = fittedWithStdout.note
-      if (fittedWithStdout.text) {
-        writeStderr(fittedWithStdout.text)
+      let emittedDiag = fittedWithStdout.text
+      if (!emittedDiag) {
+        const codes = pickupRefusals.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
+        const emergency = `${JSON.stringify({
+          refused: 'report_pickup',
+          ...(codes.length > 0 ? { codes } : {}),
+          omitted_count: pickupRefusals.length,
+          shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+          note_write_failed: true,
+          recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry wake reader.',
+        })}\n`
+        if (fitsShellOutput(`${printedStdout}${emergency}`)) {
+          emittedDiag = emergency
+        }
+      }
+      if (emittedDiag) {
+        writeStderr(emittedDiag)
         pickupDiagnosticWritten = true
       }
     } else if (rawDiag) {

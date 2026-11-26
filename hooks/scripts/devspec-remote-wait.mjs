@@ -1977,9 +1977,27 @@ export async function runOneShotRoomCommandPickup({
       requireStructuredFallback: Boolean(refusals),
     })
     diagnosticNote = fitted.note
-    if (fitted.text) {
-      writeStderr(fitted.text)
-      stderrText = fitted.text
+    let emittedDiag = fitted.text
+    if (!emittedDiag && refusals) {
+      // Last-resort explicit refusal + omission disclosure if even the structured
+      // fallback could not fit (e.g. a single oversized non-shrinkable blocking item
+      // with both note stores unwritable) so stderr is NEVER silently empty on exit 1.
+      const codes = refusals.map((r) => r?.refusal?.code ?? r?.code ?? null).filter(Boolean)
+      const emergency = `${JSON.stringify({
+        refused: 'report_pickup',
+        ...(codes.length > 0 ? { codes } : {}),
+        omitted_count: refusals.length,
+        shell_limit_chars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+        note_write_failed: true,
+        recovery: 'Fix ~/.devspec/notes or temp dir permissions & retry devspec-remote-wait.',
+      })}\n`
+      if (fitsShellOutput(`${combinedPrior}${emergency}`)) {
+        emittedDiag = emergency
+      }
+    }
+    if (emittedDiag) {
+      writeStderr(emittedDiag)
+      stderrText = emittedDiag
     }
   }
   return {

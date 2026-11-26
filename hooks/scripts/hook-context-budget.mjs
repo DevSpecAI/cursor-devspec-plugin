@@ -846,16 +846,38 @@ export function shellDiagnosticPointer(label, command) {
 }
 
 /**
- * Exact ceiling reservation for `shellDiagnosticPointer` (16-hex note id), derived
- * directly from the pointer format so `stdout + stderr` always fits `fitsShellOutput`
- * at the shared Shell boundary (requirements 3c5147a7 / 91d7b47c).
+ * Minimum stderr headroom (in UTF-16 code units) reserved inside Cursor's 20,000-char
+ * Shell ceiling whenever a Shell command may emit a structured pickup refusal after
+ * stdout has already been written (`shellDiagnosticReserve`).
+ *
+ * Logical justification (requirements 3c5147a7 / 91d7b47c / 4e32d1a5 / 3ea2b201):
+ *   - When either note store (`~/.devspec/notes` or private `os.tmpdir()`) is writable,
+ *     a `shellDiagnosticPointer` (`cat ...`) requires ~110–160 characters.
+ *   - When neither note store is writable, `formatStructuredRefusalsFallback` must still
+ *     fit an inline structured refusal envelope carrying `refused`, `code`, at least one
+ *     real blocking item (`blocking_items` / `blocking_turn_id`), `omitted_count`,
+ *     `shell_limit_chars`, and `recovery` (~350–550 characters).
+ *   - Reserving 600 characters (3% of Cursor's 20,000-character Shell ceiling) at this
+ *     single shared boundary guarantees room for either a saved-note pointer OR a
+ *     structured refusal fallback with blocking details without silently dropping output.
+ */
+export const SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS = 600
+
+/**
+ * Exact ceiling reservation for Shell post-stdout diagnostics, derived at one shared
+ * boundary from the larger of `shellDiagnosticPointer` (primary or tmp fallback note)
+ * and `SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS` so `stdout + stderr` always fits
+ * `fitsShellOutput` even when neither note store is writable (reqs 3c5147a7 / 91d7b47c).
  */
 export function shellDiagnosticReserve(label = 'devspec-wake-tail') {
   const notePtr = shellDiagnosticPointer(label, noteCommand('0'.repeat(16)))
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const fallbackSampleFile = path.join(os.tmpdir(), `devspec-notes-${uid}`, `${'0'.repeat(16)}.md`)
   const fallbackPtr = shellDiagnosticPointer(label, `cat ${shellQuotePath(fallbackSampleFile)}`)
-  return fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
+  const base = fallbackPtr.length > notePtr.length ? fallbackPtr : notePtr
+  return base.length >= SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS
+    ? base
+    : base + ' '.repeat(SHELL_DIAGNOSTIC_FALLBACK_RESERVE_CHARS - base.length)
 }
 
 function shellQuotePath(value) {

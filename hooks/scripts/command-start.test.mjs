@@ -1109,7 +1109,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       }),
       { mode: 0o600 },
     )
-    const batch = ownerBatch('Near limit body ' + 'm'.repeat(8_800))
+    const batch = ownerBatch('Near limit body ' + 'm'.repeat(8_500))
     batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
     const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
     fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
@@ -1181,7 +1181,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       }),
       { mode: 0o600 },
     )
-    const batch = ownerBatch('Near limit nothing_open ' + 'm'.repeat(8_900))
+    const batch = ownerBatch('Near limit nothing_open ' + 'm'.repeat(8_550))
     batch.acceptance_key = canonicalAcceptanceKey(batch.ingress.envelope)
     const inbox = path.join(dir, `${CONN}.inbox.jsonl`)
     fs.writeFileSync(inbox, `${JSON.stringify(batch)}\n`, { mode: 0o600 })
