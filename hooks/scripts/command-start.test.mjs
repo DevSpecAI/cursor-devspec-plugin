@@ -4553,4 +4553,330 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.ok(combinedText.includes(MSG_OLD), 'older command must be delivered on next sweep')
     assert.ok(combinedText.includes(MSG_NEW), 'newer concurrent command must be delivered on next sweep')
   })
+
+  it('readWakes recovers an unabridged oversized refusal in a BRAND-NEW OS PROCESS after diagnostic .md writes failed mid-pickup and notesDir is restored (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { execSync, spawnSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wakes`)
+    const blockedNotes = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(path.dirname(blockedNotes), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(blockedNotes, 'not-a-directory\n')
+    const blockedTmp = path.join(home, 'tmp-cross-proc-spool')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { home, fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    let failMd = false
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (failMd && String(filePath).endsWith('.md')) {
+        throw Object.assign(new Error('ENOSPC creating .md'), { code: 'ENOSPC' })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    fs.writeFileSync = (filePath, ...rest) => {
+      if (failMd && String(filePath).includes('.md')) {
+        throw Object.assign(new Error('ENOSPC writing .md'), { code: 'ENOSPC' })
+      }
+      return origWriteFileSync(filePath, ...rest)
+    }
+    try {
+      const page1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async () => {},
+        writeStderr: () => {},
+        startCommands: async () => {
+          fs.rmSync(diagDir, { recursive: true, force: true })
+          fs.writeFileSync(diagDir, 'not-a-directory\n')
+          for (const name of fs.readdirSync(dir)) {
+            if (name.startsWith('d-') && name.endsWith('.md')) fs.rmSync(path.join(dir, name), { force: true })
+          }
+          failMd = true
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_cross_proc_spool',
+                  padding: 'p'.repeat(6_000),
+                  blocking_items: [{ id: 'blk-cross-process-spool-item', reason: 'must_survive_new_process' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      assert.equal(page1.marked, false)
+    } finally {
+      failMd = false
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+
+    // Restore ~/.devspec/notes and run retry in a BRAND-NEW OS PROCESS (zero shared memory!) where pickup SUCCEEDS.
+    fs.rmSync(blockedNotes, { force: true })
+    fs.mkdirSync(blockedNotes, { recursive: true, mode: 0o700 })
+    const wakeTailUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+    const childCode = `
+      import { readWakes } from ${JSON.stringify(wakeTailUrl)};
+      let err = '';
+      let out = '';
+      const page = await readWakes({
+        file: ${JSON.stringify(wakeFile)},
+        connectionId: ${JSON.stringify(CONN)},
+        home: ${JSON.stringify(home)},
+        dir: ${JSON.stringify(dir)},
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async (t) => { out += t },
+        writeStderr: (t) => { err += t },
+        startCommands: async ({ commands }) => ({
+          ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [],
+        }),
+      });
+      console.log(JSON.stringify({ marked: page.marked, noteCmd: page.pickup_diagnostic_note?.command ?? null, outLen: out.length, err }));
+    `
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', childCode], {
+      env: { ...process.env, HOME: home, TMPDIR: blockedTmp, TMP: blockedTmp, TEMP: blockedTmp },
+      encoding: 'utf8',
+    })
+    assert.equal(run.status, 0, run.stderr)
+    const result = JSON.parse(run.stdout.trim())
+    assert.equal(result.marked, true)
+    assert.ok(result.noteCmd, 'fresh OS process MUST recover and save a note for the prior process’s unsaved refusal')
+    assert.ok(result.err.includes(result.noteCmd))
+    assert.ok(fitsShellOutput('x'.repeat(result.outLen) + result.err))
+    const recovered = execSync(result.noteCmd.replace('~', home), { encoding: 'utf8' })
+    assert.match(recovered, /turn_busy_cross_proc_spool/)
+    assert.match(recovered, /blk-cross-process-spool-item/)
+    assert.match(recovered, /must_survive_new_process/)
+  })
+
+  it('readWakes persists complete refusal durably through pre-opened fd when all stores are chmod 0o000 mid-pickup, and a fresh OS process surfaces it once restored (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { execSync, spawnSync } = await import('node:child_process')
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(home, `${CONN}.wakes`)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const blockedTmp = path.join(home, 'tmp-chmod000-proc')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    fs.writeFileSync(diagDir, 'not-a-directory\n')
+
+    const reserveLen = shellDiagnosticReserve('devspec-wake-tail', { home, fallbackDir: diagDir }).length
+    const baseLen = wakeLines(buildOwnerMessageEvents(ownerBatch(''))).length
+    const perChar = (wakeLines(buildOwnerMessageEvents(ownerBatch('x'.repeat(100)))).length - baseLen) / 100
+    const padLen = Math.max(500, Math.floor((CURSOR_SHELL_OUTPUT_MAX_CHARS - reserveLen - baseLen - 200) / perChar))
+    appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('x'.repeat(padLen))))
+
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    const stderr1 = []
+    let page1 = null
+    try {
+      page1 = await readWakes({
+        file: wakeFile,
+        connectionId: CONN,
+        home,
+        dir,
+        settleMs: 1,
+        scriptPath: '/tmp/tail.mjs',
+        write: async () => {},
+        writeStderr: (t) => { stderr1.push(t) },
+        startCommands: async () => {
+          // Remove backup slot in `dir` and chmod 0o000 `notesDir` (leaving its pre-opened fd with nlink === 1!)
+          for (const name of fs.readdirSync(dir)) {
+            if (name.startsWith('d-') && name.endsWith('.md')) fs.rmSync(path.join(dir, name), { force: true })
+          }
+          fs.chmodSync(notesDir, 0o000)
+          // Also make backupDir (`dir`) unable to accept new `.md` writes during Pass 1 while keeping `.steps.lock` intact.
+          return {
+            ok: false,
+            outcome: 'refused',
+            started: [],
+            pickedUp: 0,
+            refusals: [
+              {
+                command_message_id: MSG_ID,
+                command_turn_id: TURN_ID,
+                refusal: {
+                  code: 'turn_busy_chmod000_durable',
+                  padding: 'q'.repeat(6_000),
+                  blocking_items: [{ id: 'blk-chmod000-cross-process-item', reason: 'persisted_via_open_fd' }],
+                },
+              },
+            ],
+          }
+        },
+      })
+      assert.equal(page1.marked, false)
+      assert.ok(page1.pickup_diagnostic_note?.command, 'Process 1 MUST return a durable read command')
+      assert.ok(stderr1.join('').includes(page1.pickup_diagnostic_note.command))
+    } finally {
+      fs.chmodSync(notesDir, 0o700)
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+
+    // After restoring chmod 0o700 on notesDir, the command printed by Process 1 works directly!
+    const directRead = execSync(page1.pickup_diagnostic_note.command, { encoding: 'utf8' })
+    assert.match(directRead, /turn_busy_chmod000_durable/)
+    assert.match(directRead, /blk-chmod000-cross-process-item/)
+
+    // AND if Process 1 used Pass 2 (pendingPermissionRecovery), a fresh OS process surfaces it too!
+    if (page1.pickup_diagnostic_note?.pendingPermissionRecovery) {
+      const wakeTailUrl = new URL('./devspec-wake-tail.mjs', import.meta.url).href
+      const childCode = `
+        import { readWakes } from ${JSON.stringify(wakeTailUrl)};
+        let err = '';
+        const page = await readWakes({
+          file: ${JSON.stringify(wakeFile)},
+          connectionId: ${JSON.stringify(CONN)},
+          home: ${JSON.stringify(home)},
+          dir: ${JSON.stringify(dir)},
+          settleMs: 1,
+          scriptPath: '/tmp/tail.mjs',
+          write: async () => {},
+          writeStderr: (t) => { err += t },
+          startCommands: async ({ commands }) => ({
+            ok: true, outcome: 'picked_up', started: commands, pickedUp: commands.length, refusals: [],
+          }),
+        });
+        console.log(JSON.stringify({ marked: page.marked, noteCmd: page.pickup_diagnostic_note?.command ?? null, err }));
+      `
+      const run = spawnSync(process.execPath, ['--input-type=module', '-e', childCode], {
+        env: { ...process.env, HOME: home, TMPDIR: blockedTmp, TMP: blockedTmp, TEMP: blockedTmp },
+        encoding: 'utf8',
+      })
+      assert.equal(run.status, 0, run.stderr)
+      const res = JSON.parse(run.stdout.trim())
+      assert.equal(res.marked, true)
+      assert.ok(res.noteCmd)
+      const recovered = execSync(res.noteCmd.replace('~', home), { encoding: 'utf8' })
+      assert.match(recovered, /blk-chmod000-cross-process-item/)
+    }
+  })
+
+  it('releaseAtIdle fails closed on initial transient read error of handed.json and ALWAYS runs isOpen on concurrent check jobs before marking handed or waking (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_ROOM = '33333333-3333-4333-8333-3333333333e1'
+    const TURN_ROOM = '77777777-7777-4777-8777-7777777777e1'
+    const CHECK_JOB_1 = 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1'
+    const CHECK_JOB_2 = 'cccccccc-cccc-4ccc-8ccc-ccccccccccc2'
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+    const handedPath = path.join(stepsFolder, 'handed.json')
+
+    const makeCheckBatch = (jobId) => ({
+      type: 'check_job_dispatches',
+      messages: [{ check_job_id: jobId, delivery_connection_id: CONN }],
+    })
+    const makeCheckEvents = (jobId) => [
+      { type: 'check_job', check_job_id: jobId, check_job: { id: jobId, delivery_connection_id: CONN }, instruction: `Rule check job ${jobId}` },
+    ]
+
+    // Sub-case A: handed.json holds CHECK_JOB_1 (already settled on DevSpec), and a newer waiting room message arrives.
+    holdForNextStep(CONN, makeCheckBatch(CHECK_JOB_1), makeCheckEvents(CHECK_JOB_1), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true, isOpen: async () => true },
+    )
+    const roomBatch = ownerBatch('Newer waiting room message', { messageId: MSG_ROOM, turnId: TURN_ROOM })
+    holdForNextStep(CONN, roomBatch, buildOwnerMessageEvents(roomBatch), { dir })
+
+    // Simulate an initial transient EIO when releaseAtIdle reads `handed.json.taken-*` (only the first read!).
+    const origReadFileSync = fs.readFileSync
+    let failTakenHandedOnce = true
+    fs.readFileSync = (filePath, ...rest) => {
+      if (failTakenHandedOnce && String(filePath).includes('handed.json.taken-')) {
+        failTakenHandedOnce = false
+        throw Object.assign(new Error('transient EIO reading taken handed.json'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    const checkedKeysPass1 = []
+    let res1 = null
+    try {
+      res1 = await releaseAtIdle(CONN, {
+        dir,
+        state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+        wakeFile,
+        home,
+        turnState: 'between',
+        isOpen: async (item) => {
+          checkedKeysPass1.push(item.key)
+          return item.kind !== 'check_job'
+        },
+      })
+    } finally {
+      fs.readFileSync = origReadFileSync
+    }
+
+    assert.equal(res1, null, 'MUST fail closed and return null when initial HANDED read hits a transient error')
+    assert.deepEqual(checkedKeysPass1, [], 'MUST NOT proceed on waiting items alone and later merge unchecked HANDED')
+    assert.equal(fs.existsSync(wakeFile), false, 'MUST NOT append any wake with an unchecked check job')
+    const handedAfterFail = JSON.parse(fs.readFileSync(handedPath, 'utf8'))
+    assert.notEqual(handedAfterFail.woken, true, 'MUST NOT mark unchecked check job woken')
+
+    // Sub-case B: on retry, ALSO race a parallel stepDeliveryHook writing CHECK_JOB_2 (also settled!) into handed.json
+    // while releaseAtIdle awaits isOpen on the room message. BOTH settled check jobs MUST be checked and dropped!
+    const checkedKeysPass2 = []
+    let injectedConcurrentCheck = false
+    const res2 = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+      isOpen: async (item) => {
+        checkedKeysPass2.push(item.key)
+        if (item.kind === 'owner_messages' && !injectedConcurrentCheck) {
+          injectedConcurrentCheck = true
+          holdForNextStep(CONN, makeCheckBatch(CHECK_JOB_2), makeCheckEvents(CHECK_JOB_2), { dir })
+          await stepDeliveryHook(
+            { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+            { home, dir, listenerActive: () => true, isOpen: async () => true },
+          )
+        }
+        return item.kind !== 'check_job'
+      },
+    })
+    assert.ok(res2?.note, 'open room message must be delivered')
+    assert.ok(checkedKeysPass2.some((k) => k.includes(CHECK_JOB_1)), 'older handed check job MUST have isOpen run')
+    assert.ok(checkedKeysPass2.some((k) => k.includes(CHECK_JOB_2)), 'concurrently written check job MUST have isOpen run')
+    assert.ok(res2.dropped.some((k) => k.includes(CHECK_JOB_1)), 'settled CHECK_JOB_1 must be dropped')
+    assert.ok(res2.dropped.some((k) => k.includes(CHECK_JOB_2)), 'settled concurrent CHECK_JOB_2 must be dropped')
+    const noteText = readNoteText(res2.note, { home })
+    assert.ok(noteText.includes(MSG_ROOM), 'wake note must contain the open room message')
+    assert.equal(noteText.includes(CHECK_JOB_1), false, 'wake note MUST NOT include settled CHECK_JOB_1')
+    assert.equal(noteText.includes(CHECK_JOB_2), false, 'wake note MUST NOT include settled concurrent CHECK_JOB_2')
+  })
 })

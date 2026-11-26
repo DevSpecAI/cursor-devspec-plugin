@@ -989,6 +989,47 @@ export function hasWritableDiagnosticNoteStore({ home = os.homedir(), fallbackDi
  *   `cat` read command.
  * - `release()` closes all fds and unlinks every unused slot so the happy path leaves zero files.
  */
+const PENDING_DIAGNOSTIC_REFUSAL_PREFIX = '# DevSpec Pending Diagnostic Refusal [scope:'
+
+function spoolScopeTag(spoolKey) {
+  return createHash('sha256').update(String(spoolKey ?? 'default')).digest('hex').slice(0, 12)
+}
+
+function pendingDiagnosticRefusalHeader(spoolKey) {
+  return `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${spoolScopeTag(spoolKey)}]\n`
+}
+
+function spoolCandidateDirs({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
+  const raw = [
+    backupDir,
+    fallbackDir,
+    home ? path.join(home, NOTES_DIR) : null,
+    home ? path.join(home, '.devspec', 'remote-control') : null,
+    path.join(os.tmpdir(), `devspec-notes-${uid}`),
+  ]
+  const seen = new Set()
+  const out = []
+  for (const dir of raw) {
+    if (typeof dir !== 'string' || !dir) continue
+    const resolved = path.resolve(dir)
+    if (seen.has(resolved)) continue
+    seen.add(resolved)
+    out.push(dir)
+  }
+  return out
+}
+
+function spoolFilePath(dir, scopeTag) {
+  return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+}
+
+function stripReservedPageFraming(text, header) {
+  let body = text.startsWith(header) ? text.slice(header.length) : text
+  body = body.replace(/\n\n--- part \d+\/\d+ \([^\n]*\) ---\n/g, '')
+  return body
+}
+
 export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const primaryCandidates = [
@@ -998,6 +1039,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
   ]
   const errors = []
   const slots = []
+  const openedDirs = new Set()
   const writeAllSync = (fd, buf) => {
     fs.ftruncateSync(fd, 0)
     let offset = 0
@@ -1064,10 +1106,17 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       throw error
     }
   }
+  // Open reserved slots in EVERY distinct writable primary store (not stopping after the
+  // first) so if one store is deleted or loses permissions mid-pickup, pre-opened slots in
+  // the remaining stores still survive (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  let primarySucceeded = false
   for (const candidate of primaryCandidates) {
+    const resolvedDir = path.resolve(candidate.dir)
+    if (openedDirs.has(resolvedDir)) continue
     try {
       slots.push(openSlotIn(candidate))
-      break
+      openedDirs.add(resolvedDir)
+      primarySucceeded = true
     } catch (error) {
       errors.push({
         store: candidate.store,
@@ -1076,7 +1125,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       })
     }
   }
-  if (slots.length === 0) {
+  if (!primarySucceeded) {
     return {
       ok: false,
       errors,
@@ -1085,11 +1134,95 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       release: () => {},
     }
   }
-  if (backupDir && path.resolve(backupDir) !== path.resolve(slots[0].dir)) {
+  if (backupDir && !openedDirs.has(path.resolve(backupDir))) {
     try {
       slots.push(openSlotIn({ store: 'connections_backup_slot', dir: backupDir, prefix: 'd-' }))
+      openedDirs.add(path.resolve(backupDir))
     } catch {
       /* optional backup slot: primary slot already passed preflight */
+    }
+  }
+  const writeFormattedToSlot = (activeSlot, payloadText, id, { requireReadableByPath = true, pendingPermissionRecovery = false } = {}) => {
+    const quoted = shellQuotePath(activeSlot.filePath)
+    const fitsOneRead = payloadText.length <= NOTE_PART_CHARS && Buffer.byteLength(payloadText) <= NOTE_PART_BYTES
+    if (fitsOneRead) {
+      const rawBuf = Buffer.from(payloadText, 'utf8')
+      writeAllSync(activeSlot.fd, rawBuf)
+      if (requireReadableByPath) {
+        if (!verifySlotReadableByPath(activeSlot, rawBuf.length)) {
+          throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+        }
+      } else {
+        const st = fs.fstatSync(activeSlot.fd)
+        if (st.nlink <= 0 || st.size !== rawBuf.length) {
+          throw new Error(`reserved diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+        }
+      }
+      activeSlot.used = true
+      return {
+        id,
+        file: activeSlot.filePath,
+        command: `cat ${quoted}`,
+        parts: 1,
+        fallback: true,
+        reserved: true,
+        ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
+      }
+    }
+    const totalChars = payloadText.length
+    const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999 ---\n`
+    const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
+    const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
+    if (pageMaxChars <= 0 || pageMaxBytes <= 0) return null
+    const pieces = splitText(payloadText, pageMaxChars, pageMaxBytes)
+    const totalParts = pieces.length
+    const nextLens = new Array(totalParts).fill(0)
+    const starts1 = new Array(totalParts).fill(1)
+    let pages = []
+    for (let pass = 0; pass < 4; pass += 1) {
+      const built = new Array(totalParts)
+      for (let i = totalParts - 1; i >= 0; i -= 1) {
+        const footer =
+          i + 1 < totalParts
+            ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]} ---\n`
+            : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
+        built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
+        nextLens[i] = built[i].length
+      }
+      let offset = 1
+      let changed = false
+      for (let i = 0; i < totalParts; i += 1) {
+        if (starts1[i] !== offset) {
+          starts1[i] = offset
+          changed = true
+        }
+        offset += built[i].length
+      }
+      pages = built
+      if (!changed && pass > 0) break
+    }
+    if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) return null
+    const contentBuf = Buffer.concat(pages)
+    writeAllSync(activeSlot.fd, contentBuf)
+    if (requireReadableByPath) {
+      if (!verifySlotReadableByPath(activeSlot, contentBuf.length)) {
+        throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
+      }
+    } else {
+      const st = fs.fstatSync(activeSlot.fd)
+      if (st.nlink <= 0 || st.size !== contentBuf.length) {
+        throw new Error(`reserved diagnostic slot unlinked or truncated after write: ${activeSlot.filePath}`)
+      }
+    }
+    activeSlot.used = true
+    return {
+      id,
+      file: activeSlot.filePath,
+      command: `head -c ${pages[0].length} ${quoted}`,
+      parts: totalParts,
+      fallback: true,
+      reserved: true,
+      ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
     }
   }
   return {
@@ -1097,15 +1230,15 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
     store: slots[0].store,
     dir: slots[0].dir,
     slots,
-    write(text) {
+    write(text, { spoolKey = null } = {}) {
       const raw = String(text ?? '')
       const id = createHash('sha256').update(raw).digest('hex').slice(0, 16)
-      for (const slot of slots) {
+      // Pass 1: prefer any slot immediately readable by path (or freshly re-opened in the same dir).
+      const initialCount = slots.length
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
         let activeSlot = slot
         if (activeSlot.fd === null || !verifySlotReadableByPath(activeSlot)) {
-          // If the pre-opened file was unlinked while its parent directory is still
-          // writable, attempt to re-open a fresh slot in the same directory before
-          // falling through to the next reserved slot (reqs 3c5147a7 / 4e32d1a5).
           try {
             const reopened = openSlotIn({ store: slot.store, dir: slot.dir, prefix: slot.prefix })
             slots.push(reopened)
@@ -1115,78 +1248,32 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
           }
         }
         try {
-          const quoted = shellQuotePath(activeSlot.filePath)
-          const fitsOneRead = raw.length <= NOTE_PART_CHARS && Buffer.byteLength(raw) <= NOTE_PART_BYTES
-          if (fitsOneRead) {
-            const rawBuf = Buffer.from(raw, 'utf8')
-            writeAllSync(activeSlot.fd, rawBuf)
-            if (!verifySlotReadableByPath(activeSlot, rawBuf.length)) {
-              throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
-            }
-            activeSlot.used = true
-            return {
-              id,
-              file: activeSlot.filePath,
-              command: `cat ${quoted}`,
-              parts: 1,
-              fallback: true,
-              reserved: true,
-            }
-          }
-          // Multi-part content inside a single pre-opened file: subtract the worst-case
-          // continuation footer (including the full quoted file path) from Cursor's Shell
-          // output ceiling BEFORE splitting so EVERY page + footer fits `fitsShellOutput`
-          // even under deep directory paths (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
-          const totalChars = raw.length
-          const worstFooter = `\n\n--- part 99999/99999 (${totalChars} chars total) · next part (99999/99999): tail -c +999999999999 ${quoted} | head -c 999999 ---\n`
-          const pageMaxChars = Math.min(NOTE_PART_CHARS, CURSOR_SHELL_OUTPUT_MAX_CHARS - worstFooter.length)
-          const pageMaxBytes = Math.min(NOTE_PART_BYTES, CURSOR_SHELL_OUTPUT_MAX_BYTES - Buffer.byteLength(worstFooter, 'utf8'))
-          if (pageMaxChars <= 0 || pageMaxBytes <= 0) continue
-          const pieces = splitText(raw, pageMaxChars, pageMaxBytes)
-          const totalParts = pieces.length
-          const nextLens = new Array(totalParts).fill(0)
-          const starts1 = new Array(totalParts).fill(1)
-          let pages = []
-          for (let pass = 0; pass < 4; pass += 1) {
-            const built = new Array(totalParts)
-            for (let i = totalParts - 1; i >= 0; i -= 1) {
-              const footer =
-                i + 1 < totalParts
-                  ? `\n\n--- part ${i + 1}/${totalParts} (${totalChars} chars total) · next part (${i + 2}/${totalParts}): tail -c +${starts1[i + 1]} ${quoted} | head -c ${nextLens[i + 1]} ---\n`
-                  : `\n\n--- part ${totalParts}/${totalParts} (end of ${totalChars} chars) ---\n`
-              built[i] = Buffer.from(`${pieces[i]}${footer}`, 'utf8')
-              nextLens[i] = built[i].length
-            }
-            let offset = 1
-            let changed = false
-            for (let i = 0; i < totalParts; i += 1) {
-              if (starts1[i] !== offset) {
-                starts1[i] = offset
-                changed = true
-              }
-              offset += built[i].length
-            }
-            pages = built
-            if (!changed && pass > 0) break
-          }
-          if (!pages.every((buf) => fitsShellOutput(buf.toString('utf8')))) continue
-          const contentBuf = Buffer.concat(pages)
-          writeAllSync(activeSlot.fd, contentBuf)
-          if (!verifySlotReadableByPath(activeSlot, contentBuf.length)) {
-            throw new Error(`reserved diagnostic slot unreadable after write: ${activeSlot.filePath}`)
-          }
-          activeSlot.used = true
-          return {
-            id,
-            file: activeSlot.filePath,
-            command: `head -c ${pages[0].length} ${quoted}`,
-            parts: totalParts,
-            fallback: true,
-            reserved: true,
-          }
+          const written = writeFormattedToSlot(activeSlot, raw, id, { requireReadableByPath: true })
+          if (written) return written
         } catch {
           try { fs.ftruncateSync(activeSlot.fd, 0) } catch { /* ignore */ }
-          /* try next reserved slot */
+        }
+      }
+      // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.
+      // `chmod 0o000`), still persist the complete refusal durably through any pre-opened
+      // fd whose directory entry remains linked on disk (`nlink > 0`). Once permissions are
+      // restored, BOTH the printed read command works directly AND a fresh CLI process
+      // discovers the tagged file on disk and surfaces it even if retry pickup succeeds
+      // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+      const header = pendingDiagnosticRefusalHeader(spoolKey ?? backupDir ?? home)
+      for (let idx = 0; idx < initialCount; idx += 1) {
+        const slot = slots[idx]
+        if (slot.fd === null) continue
+        try {
+          const preStat = fs.fstatSync(slot.fd)
+          if (preStat.nlink <= 0) continue
+          const written = writeFormattedToSlot(slot, `${header}${raw}`, id, {
+            requireReadableByPath: false,
+            pendingPermissionRecovery: true,
+          })
+          if (written) return written
+        } catch {
+          try { fs.ftruncateSync(slot.fd, 0) } catch { /* ignore */ }
         }
       }
       return null
@@ -1314,43 +1401,129 @@ export function formatDiagnosticStorePreflightError(label, errors = [], { priorT
 }
 
 /**
- * In-memory spool for unabridged oversized refusals when EVERY disk diagnostic store and
- * pre-opened slot vanished mid-pickup, so restoring a store and retrying recovers and
- * emits a working read command for the original refusal even if the retry pickup succeeds
- * (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ * Durable cross-process spool for unabridged oversized refusals when note stores fail
+ * mid-pickup: persists private JSON spool files on disk across separate CLI processes AND
+ * discovers Pass-2 open-fd pending-refusal notes once directory permissions are restored,
+ * so a retry in a brand-new OS process recovers and emits a working read command for the
+ * original refusal even when the retry pickup succeeds (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c).
  */
 const pendingUnsavedRefusals = new Map()
 
-export function spoolUnsavedRefusal(spoolKey, diagnosticText) {
+export function spoolUnsavedRefusal(spoolKey, diagnosticText, { home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
   const key = String(spoolKey ?? '')
   const text = String(diagnosticText ?? '')
-  if (!key || !text) return
+  if (!key || !text) return { persistedOnDisk: false, file: null }
   const existing = pendingUnsavedRefusals.get(key) ?? []
   if (!existing.includes(text)) {
     pendingUnsavedRefusals.set(key, [...existing, text])
   }
+  const scopeTag = spoolScopeTag(key)
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const file = spoolFilePath(dir, scopeTag)
+    try {
+      const prev = readPrivateJson(file)
+      const prevEntries = Array.isArray(prev?.entries) ? prev.entries.filter((e) => typeof e === 'string' && e) : []
+      const nextEntries = prevEntries.includes(text) ? prevEntries : [...prevEntries, text]
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writePrivateJson(file, { version: 1, scope: scopeTag, entries: nextEntries })
+      return { persistedOnDisk: true, file }
+    } catch {
+      /* try next candidate directory */
+    }
+  }
+  return { persistedOnDisk: false, file: null }
 }
 
-export function hasPendingUnsavedRefusals(spoolKey) {
-  const list = pendingUnsavedRefusals.get(String(spoolKey ?? ''))
-  return Array.isArray(list) && list.length > 0
+export function hasPendingUnsavedRefusals(spoolKey, opts = {}) {
+  return peekPendingUnsavedRefusals(spoolKey, opts).length > 0
 }
 
-export function peekPendingUnsavedRefusals(spoolKey) {
-  const list = pendingUnsavedRefusals.get(String(spoolKey ?? ''))
-  return Array.isArray(list) ? [...list] : []
-}
-
-export function clearPendingUnsavedRefusals(spoolKey, count = null) {
+export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
   const key = String(spoolKey ?? '')
+  if (!key) return []
+  const seen = new Set()
+  const out = []
+  const pushUnique = (text) => {
+    if (typeof text !== 'string' || !text || seen.has(text)) return
+    seen.add(text)
+    out.push(text)
+  }
+  const mem = pendingUnsavedRefusals.get(key)
+  if (Array.isArray(mem)) {
+    for (const entry of mem) pushUnique(entry)
+  }
+  const scopeTag = spoolScopeTag(key)
+  const header = pendingDiagnosticRefusalHeader(key)
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const jsonFile = spoolFilePath(dir, scopeTag)
+    const parsed = readPrivateJson(jsonFile)
+    if (Array.isArray(parsed?.entries)) {
+      for (const entry of parsed.entries) pushUnique(entry)
+    }
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      try {
+        const content = fs.readFileSync(fullPath, 'utf8')
+        if (!content.startsWith(header)) continue
+        pushUnique(stripReservedPageFraming(content, header))
+      } catch {
+        /* still unreadable or vanished */
+      }
+    }
+  }
+  return out
+}
+
+export function clearPendingUnsavedRefusals(
+  spoolKey,
+  count = null,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return
   if (count === null) {
     pendingUnsavedRefusals.delete(key)
-    return
+  } else {
+    const existing = pendingUnsavedRefusals.get(key) ?? []
+    const rest = existing.slice(count)
+    if (rest.length === 0) pendingUnsavedRefusals.delete(key)
+    else pendingUnsavedRefusals.set(key, rest)
   }
-  const existing = pendingUnsavedRefusals.get(key) ?? []
-  const rest = existing.slice(count)
-  if (rest.length === 0) pendingUnsavedRefusals.delete(key)
-  else pendingUnsavedRefusals.set(key, rest)
+  const scopeTag = spoolScopeTag(key)
+  const header = pendingDiagnosticRefusalHeader(key)
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const jsonFile = spoolFilePath(dir, scopeTag)
+    try {
+      if (fs.existsSync(jsonFile)) fs.rmSync(jsonFile, { force: true })
+    } catch {
+      /* leave for next cleanup if transiently unwritable */
+    }
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      try {
+        const content = fs.readFileSync(fullPath, 'utf8')
+        if (content.startsWith(header)) {
+          fs.rmSync(fullPath, { force: true })
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 /**
@@ -1373,6 +1546,7 @@ export function fitShellDiagnostic(
     fallbackDir = null,
     backupDir = null,
     reservedStore = null,
+    spoolKey = null,
   } = {},
 ) {
   const stdout = String(stdoutText ?? '')
@@ -1415,7 +1589,7 @@ export function fitShellDiagnostic(
   }
   if (!fallbackNote && reservedStore && typeof reservedStore.write === 'function') {
     try {
-      fallbackNote = reservedStore.write(diag)
+      fallbackNote = reservedStore.write(diag, { spoolKey })
     } catch {
       fallbackNote = null
     }

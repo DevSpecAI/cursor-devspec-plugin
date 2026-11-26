@@ -653,7 +653,8 @@ export async function readWakes({
         return ex.commands.length > 0 || ex.unreadableNotes.length > 0
       })
     const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
-    const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey)
+    const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
+    const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
     const hasSpool = pendingSpoolEntries.length > 0
     const page = readerPage(
       wakes.map((wake) => wake.text),
@@ -953,13 +954,16 @@ export async function readWakes({
         fallbackDir: fallbackNoteDir,
         backupDir: dir,
         reservedStore: reservedDiagnosticStore,
+        spoolKey,
       })
       pickupDiagnosticNote = fittedWithStdout.note
-      const savedOrVerbatim = Boolean(fittedWithStdout.note) || fitsShellOutput(printedStdout + effectiveRawDiag)
-      if (!savedOrVerbatim) {
-        spoolUnsavedRefusal(spoolKey, rawDiag)
-      } else if (pendingSpoolEntries.length > 0 && fittedWithStdout.text) {
-        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+      const savedReadableNow =
+        (Boolean(fittedWithStdout.note) && !fittedWithStdout.note.pendingPermissionRecovery) ||
+        fitsShellOutput(printedStdout + effectiveRawDiag)
+      if (!savedReadableNow && !fittedWithStdout.note?.pendingPermissionRecovery) {
+        spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+      } else if (pendingSpoolEntries.length > 0 && savedReadableNow && fittedWithStdout.text) {
+        clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
       }
       const diagText =
         fittedWithStdout.text ||
@@ -980,13 +984,17 @@ export async function readWakes({
         fallbackDir: fallbackNoteDir,
         backupDir: dir,
         reservedStore: reservedDiagnosticStore,
+        spoolKey,
       })
       pickupDiagnosticNote = fitted.note
       if (fitted.text) {
         writeStderr(fitted.text)
         pickupDiagnosticWritten = true
-        if (pendingSpoolEntries.length > 0 && (Boolean(fitted.note) || fitsShellOutput(printedStdout + effectiveRawDiag))) {
-          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+        const savedReadableNow =
+          (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
+          fitsShellOutput(printedStdout + effectiveRawDiag)
+        if (pendingSpoolEntries.length > 0 && savedReadableNow) {
+          clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
         }
       }
     }

@@ -1823,9 +1823,22 @@ export async function releaseAtIdle(
   if (now !== 'between') return null
 
   const takenRecord = take(handedPath)
-  const kept = takenRecord ? readPrivateJson(takenRecord.file) : null
-  const record = validRecord(kept) ? kept : null
-  if (takenRecord && !record) giveBack(takenRecord)
+  let record = null
+  if (takenRecord) {
+    const keptRes = readPrivateJsonResult(takenRecord.file)
+    if (keptRes.status === STATE_UNREADABLE) {
+      // Transient read error on HANDED at sweep start: restore it untouched and fail closed
+      // so this sweep NEVER proceeds on waiting items alone and later merges the unchecked
+      // older HANDED check job as a concurrent record (requirement 3ea2b201).
+      giveBack(takenRecord)
+      process.stderr.write(
+        `step-delivery: ${HANDED} could not be read during idle sweep for ${connectionId}; leaving queued for retry\n`,
+      )
+      return null
+    }
+    record = validRecord(keptRes.value) ? keptRes.value : null
+    if (!record) giveBack(takenRecord)
+  }
   const takenOverflows = retryOverflowFiles(steps).map(take).filter(Boolean)
   const memoryOverflows = unpersistedRetryOverflow.get(steps) ?? []
   if (memoryOverflows.length > 0) unpersistedRetryOverflow.delete(steps)
@@ -1934,9 +1947,16 @@ export async function releaseAtIdle(
   }
   const open = []
   const dropped = []
+  const checkedOpenKeys = new Set()
+  const checkedSettledKeys = new Set()
   for (const item of items) {
-    if (await isOpen(item, { connectionId, state })) open.push(item)
-    else dropped.push(item.key)
+    if (await isOpen(item, { connectionId, state })) {
+      open.push(item)
+      if (typeof item?.key === 'string' && item.key) checkedOpenKeys.add(item.key)
+    } else {
+      dropped.push(item.key)
+      if (typeof item?.key === 'string' && item.key) checkedSettledKeys.add(item.key)
+    }
   }
   const finish = () => {
     for (const each of validTaken) drop(each)
@@ -1974,157 +1994,208 @@ export async function releaseAtIdle(
   }
   // From the check that the connection is still live to appending the wake, under the
   // connection's steps lock, which every write that ends the connection takes too
-  // (`endConnectionSteps`).
-  return withStepsLock(connectionId, dir, () => {
-    // An end that landed during the lookups left these items to this hold: they are
-    // discarded and named as the end would have, and no record or wake is written.
-    if (connectionEnded(dir, connectionId)) {
-      for (const each of validTaken) giveBack(each)
-      for (const ov of consumedOverflows) giveBack(ov)
-      if (takenRecord && record) giveBack(takenRecord)
-      logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
-      return { pointed: [], dropped, note: null, discarded: true }
-    }
-    // Merge any concurrent HANDED record written by a parallel postToolUse hook while
-    // `releaseAtIdle` awaited `isOpen`, so the idle handoff NEVER overwrites or drops
-    // a newer command handed over concurrently (requirement 3ea2b201). If a concurrent
-    // HANDED file exists on disk but fails to read transiently, FAIL CLOSED: restore all
-    // taken items (preserving takenRecord into retry-*.json) and throw instead of treating
-    // it as absent and overwriting it!
-    const concurrentRes = readPrivateJsonResult(handedPath)
-    if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
-      for (const each of validTaken) giveBack(each)
-      for (const ov of consumedOverflows) giveBack(ov)
-      if (memoryOverflows.length > 0) {
-        const existingMem = unpersistedRetryOverflow.get(steps) ?? []
-        unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+  // (`endConnectionSteps`). If a concurrent `HANDED` record appears holding any `check_job`
+  // that this sweep has not yet verified via `isOpen`, release the lock and verify it first
+  // (bounded passes) so an unchecked check job is NEVER marked handed off or woken (3ea2b201).
+  for (let pass = 0; pass < 3; pass += 1) {
+    const stepOutcome = withStepsLock(connectionId, dir, () => {
+      // An end that landed during the lookups left these items to this hold: they are
+      // discarded and named as the end would have, and no record or wake is written.
+      if (connectionEnded(dir, connectionId)) {
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (takenRecord && record) giveBack(takenRecord)
+        logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
+        return { done: true, result: { pointed: [], dropped, note: null, discarded: true } }
       }
-      preserveTakenRecord()
-      process.stderr.write(
-        `step-delivery: concurrent ${HANDED} could not be read during idle handoff for ${connectionId}; refusing to overwrite\n`,
-      )
-      throw new Error(`concurrent ${HANDED} unreadable during idle handoff; refusing to overwrite`)
-    }
-    const concurrent = concurrentRes.value
-    const hasConcurrent = validRecord(concurrent)
-    const concurrentUnread = hasConcurrent && hasUnreadNote(concurrent) ? concurrent.items : []
-    const mergedOpen = []
-    const mergedKeys = new Set()
-    for (const item of [...open, ...concurrentUnread]) {
-      const key = typeof item?.key === 'string' && item.key ? item.key : null
-      if (key && mergedKeys.has(key)) continue
-      if (key) mergedKeys.add(key)
-      mergedOpen.push(item)
-    }
-    const cInner =
-      hasConcurrent && concurrent.inner_note_pending === true
-        ? Array.isArray(concurrent.inner_note_items)
-          ? concurrent.inner_note_items
-          : concurrent.items
-        : []
-    const rInner = Array.isArray(pendingRetryMeta.inner_note_items) ? pendingRetryMeta.inner_note_items : []
-    const mergedInner = [...cInner, ...rInner]
-    const cPickup =
-      hasConcurrent && concurrent.pickup_pending === true
-        ? Array.isArray(concurrent.pickup_items)
-          ? concurrent.pickup_items
-          : concurrent.items.filter((i) => i.kind === 'owner_messages')
-        : []
-    const rPickup = Array.isArray(pendingRetryMeta.pickup_items) ? pendingRetryMeta.pickup_items : []
-    const mergedPickup = [...cPickup, ...rPickup]
-    const mergedRefusals = [
-      ...(hasConcurrent && Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
-      ...(Array.isArray(pendingRetryMeta.pickup_refusals) ? pendingRetryMeta.pickup_refusals : []),
-    ]
-    const mergedPendingMeta = {
-      ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : {}),
-      ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : {}),
-      ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
-    }
-
-    if (mergedOpen.length === 0) {
-      for (const each of validTaken) drop(each)
-      if (hasConcurrent && hasPendingRetry) {
-        try {
-          writePrivateJson(handedPath, { ...concurrent, ...mergedPendingMeta })
-          for (const ov of consumedOverflows) drop(ov)
-          if (takenRecord && record) drop(takenRecord)
-        } catch {
-          for (const ov of consumedOverflows) giveBack(ov)
-          if (memoryOverflows.length > 0) {
-            const existingMem = unpersistedRetryOverflow.get(steps) ?? []
-            unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
-          }
-          preserveTakenRecord()
-        }
-      } else {
-        for (const ov of consumedOverflows) {
-          if (hasPendingRetry) giveBack(ov)
-          else drop(ov)
-        }
-        if (hasPendingRetry && memoryOverflows.length > 0) {
+      // Merge any concurrent HANDED record written by a parallel postToolUse hook while
+      // `releaseAtIdle` awaited `isOpen`, so the idle handoff NEVER overwrites or drops
+      // a newer command handed over concurrently (requirement 3ea2b201). If a concurrent
+      // HANDED file exists on disk but fails to read transiently, FAIL CLOSED: restore all
+      // taken items (preserving takenRecord into retry-*.json) and throw instead of treating
+      // it as absent and overwriting it!
+      const concurrentRes = readPrivateJsonResult(handedPath)
+      if (concurrentRes.status === STATE_UNREADABLE || (concurrentRes.value !== null && !validRecord(concurrentRes.value))) {
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
           const existingMem = unpersistedRetryOverflow.get(steps) ?? []
           unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
         }
-        if (takenRecord && record) {
-          if (hasPendingRetry) preserveTakenRecord()
-          else drop(takenRecord)
+        preserveTakenRecord()
+        process.stderr.write(
+          `step-delivery: concurrent ${HANDED} could not be read during idle handoff for ${connectionId}; refusing to overwrite\n`,
+        )
+        throw new Error(`concurrent ${HANDED} unreadable during idle handoff; refusing to overwrite`)
+      }
+      const concurrent = concurrentRes.value
+      const hasConcurrent = validRecord(concurrent)
+      const concurrentUnread = hasConcurrent && hasUnreadNote(concurrent) ? concurrent.items : []
+      const uncheckedConcurrentChecks = concurrentUnread.filter(
+        (item) =>
+          item?.kind === 'check_job' &&
+          typeof item.key === 'string' &&
+          !checkedOpenKeys.has(item.key) &&
+          !checkedSettledKeys.has(item.key),
+      )
+      if (uncheckedConcurrentChecks.length > 0) {
+        if (pass < 2) {
+          return { done: false, needCheck: uncheckedConcurrentChecks }
         }
+        // Still seeing new unchecked concurrent check jobs on the final pass: roll back
+        // without touching `HANDED` or waking unchecked items; next idle tick retries.
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
+          const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+          unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+        }
+        preserveTakenRecord()
+        return { done: true, result: null }
       }
-      return {
-        pointed: [],
-        dropped,
-        note: null,
-        ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+      const openConcurrentUnread = concurrentUnread.filter(
+        (item) => !(typeof item?.key === 'string' && checkedSettledKeys.has(item.key)),
+      )
+      const mergedOpen = []
+      const mergedKeys = new Set()
+      for (const item of [...open, ...openConcurrentUnread]) {
+        const key = typeof item?.key === 'string' && item.key ? item.key : null
+        if (key && mergedKeys.has(key)) continue
+        if (key) mergedKeys.add(key)
+        mergedOpen.push(item)
       }
-    }
-    let note = null
-    let wroteHanded = false
-    const previousConcurrent = hasConcurrent ? concurrent : null
-    try {
-      note = writeNote(stepNoteText(mergedOpen, { connectionId }), { home })
-      const wake = [idlePointer(note, mergedOpen, connectionId)]
-      // The pointer is a few hundred characters whatever the note holds; checked against
-      // Cursor's rules on one output all the same, in the one place they are kept.
-      if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
-      writePrivateJson(handedPath, {
-        version: RECORD_VERSION,
-        note: note.id,
-        parts: record?.note === note.id ? record.parts ?? [] : [],
-        items: mergedOpen,
-        at: new Date().toISOString(),
-        note_read: false,
-        woken: true,
-        ...mergedPendingMeta,
-      })
-      wroteHanded = true
-      append(wakeFile, wake)
-    } catch (error) {
-      if (wroteHanded) {
-        if (previousConcurrent) {
-          try { writePrivateJson(handedPath, previousConcurrent) } catch { /* ignore */ }
+      const cInner =
+        hasConcurrent && concurrent.inner_note_pending === true
+          ? Array.isArray(concurrent.inner_note_items)
+            ? concurrent.inner_note_items
+            : concurrent.items
+          : []
+      const rInner = Array.isArray(pendingRetryMeta.inner_note_items) ? pendingRetryMeta.inner_note_items : []
+      const mergedInner = [...cInner, ...rInner]
+      const cPickup =
+        hasConcurrent && concurrent.pickup_pending === true
+          ? Array.isArray(concurrent.pickup_items)
+            ? concurrent.pickup_items
+            : concurrent.items.filter((i) => i.kind === 'owner_messages')
+          : []
+      const rPickup = Array.isArray(pendingRetryMeta.pickup_items) ? pendingRetryMeta.pickup_items : []
+      const mergedPickup = [...cPickup, ...rPickup]
+      const mergedRefusals = [
+        ...(hasConcurrent && Array.isArray(concurrent.pickup_refusals) ? concurrent.pickup_refusals : []),
+        ...(Array.isArray(pendingRetryMeta.pickup_refusals) ? pendingRetryMeta.pickup_refusals : []),
+      ]
+      const mergedPendingMeta = {
+        ...(mergedInner.length > 0 ? { inner_note_pending: true, inner_note_items: mergedInner } : {}),
+        ...(mergedPickup.length > 0 ? { pickup_pending: true, pickup_items: mergedPickup } : {}),
+        ...(mergedRefusals.length > 0 ? { pickup_refusals: mergedRefusals } : {}),
+      }
+
+      if (mergedOpen.length === 0) {
+        for (const each of validTaken) drop(each)
+        if (hasConcurrent && hasPendingRetry) {
+          try {
+            writePrivateJson(handedPath, { ...concurrent, ...mergedPendingMeta })
+            for (const ov of consumedOverflows) drop(ov)
+            if (takenRecord && record) drop(takenRecord)
+          } catch {
+            for (const ov of consumedOverflows) giveBack(ov)
+            if (memoryOverflows.length > 0) {
+              const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+              unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+            }
+            preserveTakenRecord()
+          }
         } else {
-          fs.rmSync(handedPath, { force: true })
+          if (hasConcurrent && openConcurrentUnread.length === 0 && concurrentUnread.length > 0) {
+            // All concurrent unread items were verified settled; remove stale HANDED if no pending retries remain.
+            if (!mergedPendingMeta.pickup_pending && !mergedPendingMeta.inner_note_pending) {
+              try { fs.rmSync(handedPath, { force: true }) } catch { /* ignore */ }
+            }
+          }
+          for (const ov of consumedOverflows) {
+            if (hasPendingRetry) giveBack(ov)
+            else drop(ov)
+          }
+          if (hasPendingRetry && memoryOverflows.length > 0) {
+            const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+            unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+          }
+          if (takenRecord && record) {
+            if (hasPendingRetry) preserveTakenRecord()
+            else drop(takenRecord)
+          }
+        }
+        return {
+          done: true,
+          result: {
+            pointed: [],
+            dropped,
+            note: null,
+            ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+          },
         }
       }
-      for (const each of validTaken) giveBack(each)
-      for (const ov of consumedOverflows) giveBack(ov)
-      if (memoryOverflows.length > 0) {
-        const existingMem = unpersistedRetryOverflow.get(steps) ?? []
-        unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+      let note = null
+      let wroteHanded = false
+      const previousConcurrent = hasConcurrent ? concurrent : null
+      try {
+        note = writeNote(stepNoteText(mergedOpen, { connectionId }), { home })
+        const wake = [idlePointer(note, mergedOpen, connectionId)]
+        // The pointer is a few hundred characters whatever the note holds; checked against
+        // Cursor's rules on one output all the same, in the one place they are kept.
+        if (!fitsShellOutput(wakeLines(wake))) throw new Error(`the pointer to note ${note.id} does not fit one output`)
+        writePrivateJson(handedPath, {
+          version: RECORD_VERSION,
+          note: note.id,
+          parts: record?.note === note.id ? record.parts ?? [] : [],
+          items: mergedOpen,
+          at: new Date().toISOString(),
+          note_read: false,
+          woken: true,
+          ...mergedPendingMeta,
+        })
+        wroteHanded = true
+        append(wakeFile, wake)
+      } catch (error) {
+        if (wroteHanded) {
+          if (previousConcurrent) {
+            try { writePrivateJson(handedPath, previousConcurrent) } catch { /* ignore */ }
+          } else {
+            fs.rmSync(handedPath, { force: true })
+          }
+        }
+        for (const each of validTaken) giveBack(each)
+        for (const ov of consumedOverflows) giveBack(ov)
+        if (memoryOverflows.length > 0) {
+          const existingMem = unpersistedRetryOverflow.get(steps) ?? []
+          unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
+        }
+        preserveTakenRecord()
+        throw error
       }
-      preserveTakenRecord()
-      throw error
+      finish()
+      recordTurnWake(connectionId, turnWakeFromEvents(mergedOpen.flatMap((item) => item.events)), { dir })
+      return {
+        done: true,
+        result: {
+          pointed: mergedOpen.map((item) => item.key),
+          dropped,
+          note: note.id,
+          ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+        },
+      }
+    })
+    if (stepOutcome.done) return stepOutcome.result
+    for (const item of stepOutcome.needCheck) {
+      if (await isOpen(item, { connectionId, state })) {
+        checkedOpenKeys.add(item.key)
+      } else {
+        checkedSettledKeys.add(item.key)
+        dropped.push(item.key)
+      }
     }
-    finish()
-    recordTurnWake(connectionId, turnWakeFromEvents(mergedOpen.flatMap((item) => item.events)), { dir })
-    return {
-      pointed: mergedOpen.map((item) => item.key),
-      dropped,
-      note: note.id,
-      ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
-    }
-  })
+  }
+  return null
 }
 
 /**

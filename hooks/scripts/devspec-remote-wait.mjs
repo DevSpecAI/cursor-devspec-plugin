@@ -1912,10 +1912,13 @@ export async function runOneShotRoomCommandPickup({
     command_turn_id: null,
     refusal: note,
   }))
-  if (extracted.commands.length === 0 && noteRefusals.length === 0) {
+  const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
+  const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
+  const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
+  const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+  if (extracted.commands.length === 0 && noteRefusals.length === 0 && pendingSpoolEntries.length === 0) {
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
-  const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
   const ownedReservedStore = !callerReservedStore
     ? reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir })
     : null
@@ -1974,8 +1977,6 @@ export async function runOneShotRoomCommandPickup({
   }
   let stderrText = ''
   let diagnosticNote = null
-  const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
-  const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey)
   const spooledPrefix =
     pendingSpoolEntries.length > 0
       ? `devspec-remote-wait: recovered previously unsaved pickup refusal(s):\n${pendingSpoolEntries.join('\n')}\n`
@@ -2000,13 +2001,16 @@ export async function runOneShotRoomCommandPickup({
       fallbackDir: fallbackNoteDir,
       backupDir: dir,
       reservedStore: reservedStore.ok ? reservedStore : null,
+      spoolKey,
     })
     diagnosticNote = fitted.note
-    const savedOrVerbatim = Boolean(fitted.note) || fitsShellOutput(combinedPrior + effectiveRawDiag)
-    if (refusals && !savedOrVerbatim) {
-      spoolUnsavedRefusal(spoolKey, rawDiag)
-    } else if (pendingSpoolEntries.length > 0 && savedOrVerbatim && fitted.text) {
-      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length)
+    const savedReadableNow =
+      (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
+      fitsShellOutput(combinedPrior + effectiveRawDiag)
+    if (refusals && !savedReadableNow && !fitted.note?.pendingPermissionRecovery) {
+      spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+    } else if (pendingSpoolEntries.length > 0 && savedReadableNow && fitted.text) {
+      clearPendingUnsavedRefusals(spoolKey, pendingSpoolEntries.length, spoolOpts)
     }
     const diagText =
       fitted.text ||
