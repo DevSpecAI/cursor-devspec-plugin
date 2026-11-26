@@ -2624,4 +2624,96 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny, 'next write must ask which person it serves instead of stamping terminal owner')
   })
+
+  it('re-checks a completion notification once its delayed launch record arrives in .requests.jsonl instead of staying unchanged (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f1'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    const wakeRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>delayed-launch-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    // Notification arrives BEFORE the matching launch record is written!
+    fs.writeFileSync(transcriptPath, `${wakeRow}\n`)
+
+    const memo = {}
+    const poll1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(poll1.action, 'not_typed_live')
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+
+    // Matching launch record lands in .requests.jsonl afterward (transcript unchanged!).
+    appendRequestEvent(CONN, { op: 'launch', key: 'delayed-launch-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true, 'adding launch record must invalidate memo pending check')
+
+    const poll2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(poll2.action, 'restored_wake_request', 'must retry and restore instead of returning unchanged')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.launches.get('delayed-launch-1')?.notified, true, 'delayed launch must be marked notified')
+    assert.equal(after.current, CMD_ALICE)
+  })
+
+  it('clears a prompt-hook-restored room command from an earlier background completion when transcript sync first runs on a later unrelated wake (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { promptArrival } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f2'
+    const PROV_ALICE = '99999999-9999-4999-8999-9999999999f2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE, provenance_ref: PROV_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'hook-restored-bg', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+
+    // Turn 1: prompt hook restores CMD_ALICE for the background completion (`from_wake: true`).
+    const wakeText = '<task-notification><task-id>hook-restored-bg</task-id><status>completed</status></task-notification>'
+    const hookEvents = promptArrival({
+      fromAPerson: false,
+      origin: 'task-notification',
+      text: wakeText,
+      midTurn: false,
+      state: readRequestState(CONN, { dir }),
+    }).events
+    for (const ev of hookEvents) appendRequestEvent(CONN, ev, { dir })
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE)
+    assert.equal(readRequestState(CONN, { dir }).currentFromWake, true)
+
+    // Turn 1 finishes and Turn 2 starts with an unrelated timestamp-only wake BEFORE transcript sync ever ran!
+    const turn1Wake = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: wakeText }] },
+    })
+    const turn2Unrelated = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '[Thu Nov 26 2026 00:30:00 GMT+0000]' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${turn1Wake}\n${turnEndedRow()}\n${turn2Unrelated}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'cleared_for_wake', 'unrelated wake must clear the earlier turn’s hook-restored room command')
+    assert.equal(readRequestState(CONN, { dir }).current, null)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.deepEqual(stamped, { args: { task_id: 'x' } }, 'next write must NOT receive the previous command’s provenance_ref')
+  })
 })

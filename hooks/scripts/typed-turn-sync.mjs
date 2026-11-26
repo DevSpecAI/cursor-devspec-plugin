@@ -22,6 +22,7 @@ import {
   appendRequestEvent,
   closeRequest,
   NO_REQUEST,
+  notifiedKeys,
   openRequest,
   promptArrival,
   readRequestState,
@@ -157,10 +158,12 @@ function fileStamp(file) {
  * has changed since the last completed sync OR when the previous sync attempt did not
  * finish cleanly (`memo.synced !== true`, e.g. refused open/admission/write — req 3ea2b201).
  */
-export function typedTurnSyncPending({ transcriptPath, memo = null } = {}) {
+export function typedTurnSyncPending({ transcriptPath, memo = null, connectionId = null, dir = DEFAULT_DIR } = {}) {
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return false
-  if (memo && memo.stamp === stamp && memo.synced === true) return false
+  const reqFile = connectionId ? path.join(dir, `${connectionId}.requests.jsonl`) : memo?.reqFile ?? null
+  const reqStamp = reqFile ? (fileStamp(reqFile) ?? '') : (memo?.reqStamp ?? '')
+  if (memo && memo.stamp === stamp && (memo.reqStamp ?? '') === reqStamp && memo.synced === true) return false
   return true
 }
 
@@ -873,7 +876,12 @@ export async function syncTypedTurnFromTranscript({
 
   const stamp = fileStamp(transcriptPath)
   if (!stamp) return { action: 'none' }
-  if (memo && memo.stamp === stamp && memo.synced && canMarkSynced()) return { action: 'unchanged' }
+  const reqFile = path.join(dir, `${connectionId}.requests.jsonl`)
+  const currentReqStamp = () => fileStamp(reqFile) ?? ''
+  const reqStampAtStart = currentReqStamp()
+  if (memo && memo.stamp === stamp && (memo.reqStamp ?? '') === reqStampAtStart && memo.synced && canMarkSynced()) {
+    return { action: 'unchanged' }
+  }
 
   const active = activeTranscriptTurn(transcriptPath, { attempts, deadlineMs })
   if (active?.budgetExhausted) {
@@ -881,8 +889,17 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'budget_exhausted', budget_ms: budgetMs }
   }
   if (!active) return { action: 'unreadable' }
+  const markMemoSynced = () => {
+    if (!memo) return
+    memo.stamp = active.stamp
+    memo.reqFile = reqFile
+    memo.reqStamp = currentReqStamp()
+    memo.synced = true
+  }
   if (memo) {
     memo.stamp = active.stamp
+    memo.reqFile = reqFile
+    memo.reqStamp = reqStampAtStart
     memo.synced = false
   }
   const enqueueUnseenTypedTurns = (excludeLiveKey = null) => {
@@ -1214,7 +1231,25 @@ export async function syncTypedTurnFromTranscript({
             return { action: 'binding_write_failed', key: wakeRow.key, active }
           }
         }
-        if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: wakeRow.key, ref: null, historical: true }, { dir })) {
+        const wakeRef = wake.match.ref === UNSTATED ? null : wake.match.ref
+        // If a prompt hook restored `current` with `from_wake: true` for this earlier
+        // historical background completion and transcript sync first ran after a later
+        // unrelated wake started, consume `currentFromWake` -> `currentBoundByWake` on
+        // THIS historical row so the later unrelated wake clears it instead of inheriting
+        // the previous command's provenance reference (decision ce71a72b).
+        const consumesWakeCurrent =
+          reqState.currentFromWake &&
+          wakeRef !== null &&
+          reqState.current === wakeRef
+        if (
+          !appendRequestEvent(
+            connectionId,
+            consumesWakeCurrent
+              ? { op: 'transcript_turn', key: wakeRow.key, ref: wakeRef }
+              : { op: 'transcript_turn', key: wakeRow.key, ref: null, historical: true },
+            { dir },
+          )
+        ) {
           return { action: 'binding_write_failed', key: wakeRow.key, active }
         }
         return { action: 'reconciled_historical_wake', key: wakeRow.key }
@@ -1228,14 +1263,14 @@ export async function syncTypedTurnFromTranscript({
   if (active.ended || !active.key) {
     const flush = await retryQueuedFailedTurn({ excludeKey: null })
     if (flush.ran) {
-      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) markMemoSynced()
       return {
         ...flush.result,
         ...(active.ended ? { ended: true } : {}),
         active,
       }
     }
-    if (memo && canMarkSynced()) memo.synced = true
+    if (memo && canMarkSynced()) markMemoSynced()
     return { action: 'not_typed_live', active }
   }
 
@@ -1385,10 +1420,10 @@ export async function syncTypedTurnFromTranscript({
   if (initial.seenTranscriptTurns.has(active.key)) {
     const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey })
     if (flush.ran) {
-      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) markMemoSynced()
       return flush.result
     }
-    if (memo && canMarkSynced()) memo.synced = true
+    if (memo && canMarkSynced()) markMemoSynced()
     if (sameTurnTypedOutcome && sameTurnTypedOutcome.action !== 'already_synced') {
       return sameTurnTypedOutcome
     }
@@ -1410,7 +1445,7 @@ export async function syncTypedTurnFromTranscript({
         restored.action === 'already_synced'
       ) {
         const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
-        if (memo && flush.ok && canMarkSynced()) memo.synced = true
+        if (memo && flush.ok && canMarkSynced()) markMemoSynced()
         if (flush.ran) return { ...restored, retriedFailedTurn: flush.result }
       }
       return restored
@@ -1434,7 +1469,7 @@ export async function syncTypedTurnFromTranscript({
   if (active.kind !== 'typed') {
     if (!isClearableForUnrelatedWake(initial)) {
       const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
-      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) markMemoSynced()
       if (flush.ran) return { action: 'not_typed_live', active, retriedFailedTurn: flush.result }
       return { action: 'not_typed_live', active }
     }
@@ -1459,7 +1494,16 @@ export async function syncTypedTurnFromTranscript({
         if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
           return { action: 'binding_write_failed', key: active.key, active }
         }
-        if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })) {
+        // If this unmatched `other` row carries an explicit `<task-id>` / `<tool-use-id>`
+        // whose launch record has not yet landed in `.requests.jsonl`, leave `active.key`
+        // out of `seenTranscriptTurns` so appending the launch record later re-runs sync
+        // (via `reqStamp`) and reconciles the notification (requirement 3ea2b201).
+        const hasPendingUnmatchedNotificationId =
+          active.kind === 'other' && notifiedKeys(active.rawText).length > 0
+        if (
+          !hasPendingUnmatchedNotificationId &&
+          !appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })
+        ) {
           return { action: 'binding_write_failed', key: active.key, active }
         }
         return { action: 'cleared_for_wake', key: active.key, active }
@@ -1474,7 +1518,7 @@ export async function syncTypedTurnFromTranscript({
         outcome.action === 'not_typed_live')
     ) {
       const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
-      if (memo && flush.ok && canMarkSynced()) memo.synced = true
+      if (memo && flush.ok && canMarkSynced()) markMemoSynced()
       if (flush.ran) return { ...outcome, retriedFailedTurn: flush.result }
     }
     return outcome ?? { action: 'lock_busy' }
@@ -1488,7 +1532,7 @@ export async function syncTypedTurnFromTranscript({
   ) {
     clearFailedTypedTurn(dir, connectionId, active.key)
     const flush = await retryQueuedFailedTurn({ excludeKey: active.key })
-    if (memo && flush.ok && canMarkSynced()) memo.synced = true
+    if (memo && flush.ok && canMarkSynced()) markMemoSynced()
     if (flush.ran) return { ...result, retriedFailedTurn: flush.result }
   } else if (
     result &&
