@@ -4372,7 +4372,21 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     process.env.TMP = blockedTmp
     process.env.TEMP = blockedTmp
     const stderr1 = []
-    let dirChmod = false
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    let failDiagnosticWrites = false
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (failDiagnosticWrites && String(filePath).endsWith('.md')) {
+        throw Object.assign(new Error('ENOSPC creating diagnostic note'), { code: 'ENOSPC' })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    fs.writeFileSync = (filePath, ...rest) => {
+      if (failDiagnosticWrites && String(filePath).includes('.md')) {
+        throw Object.assign(new Error('ENOSPC writing diagnostic note'), { code: 'ENOSPC' })
+      }
+      return origWriteFileSync(filePath, ...rest)
+    }
     try {
       // Run 1: EVERY store + pre-opened backup slot vanishes during startCommands!
       const page1 = await readWakes({
@@ -4387,12 +4401,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         startCommands: async () => {
           fs.rmSync(diagDir, { recursive: true, force: true })
           fs.writeFileSync(diagDir, 'not-a-directory\n')
-          // Also delete the pre-opened backup slot in `dir` and make `dir` read-only!
+          // Delete every pre-opened backup slot in `dir` and fail any new diagnostic note creation!
           for (const name of fs.readdirSync(dir)) {
             if (name.startsWith('d-') && name.endsWith('.md')) fs.rmSync(path.join(dir, name), { force: true })
           }
-          fs.chmodSync(dir, 0o500)
-          dirChmod = true
+          failDiagnosticWrites = true
           return {
             ok: false,
             outcome: 'refused',
@@ -4413,12 +4426,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         },
       })
       assert.equal(page1.marked, false)
-      assert.equal(page1.pickup_diagnostic_note, null)
+      assert.equal(page1.pickup_diagnostic_note ?? null, null)
       assert.ok(stderr1.join('').length > 0)
 
-      // Restore diagnostic store permissions and re-run readWakes where pickup now SUCCEEDS!
-      fs.chmodSync(dir, 0o700)
-      dirChmod = false
+      // Restore diagnostic store and re-run readWakes where pickup now SUCCEEDS!
+      failDiagnosticWrites = false
       fs.rmSync(blockedNotes, { force: true })
       fs.mkdirSync(blockedNotes, { recursive: true, mode: 0o700 })
 
@@ -4452,7 +4464,9 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       assert.match(recovered, /blk-final-recovered-item/, 'restoring the store and retrying MUST recover the omitted blocking record')
       assert.match(recovered, /must_survive_store_restore/)
     } finally {
-      if (dirChmod) fs.chmodSync(dir, 0o700)
+      failDiagnosticWrites = false
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
       for (const [k, v] of Object.entries(prevTmp)) {
         if (v === undefined) delete process.env[k]
         else process.env[k] = v

@@ -1404,7 +1404,6 @@ export function fitShellDiagnostic(
   const fallbackBaseDirs = [
     null,
     ...(fallbackDir ? [fallbackDir] : []),
-    ...(backupDir ? [backupDir] : []),
   ]
   for (const baseDir of fallbackBaseDirs) {
     try {
@@ -1417,6 +1416,13 @@ export function fitShellDiagnostic(
   if (!fallbackNote && reservedStore && typeof reservedStore.write === 'function') {
     try {
       fallbackNote = reservedStore.write(diag)
+    } catch {
+      fallbackNote = null
+    }
+  }
+  if (!fallbackNote && backupDir) {
+    try {
+      fallbackNote = writeFallbackDiagnosticNote(diag, { baseDir: backupDir })
     } catch {
       fallbackNote = null
     }
