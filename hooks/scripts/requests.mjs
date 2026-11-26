@@ -125,6 +125,7 @@ export function reduceRequestLog(text) {
   let currentBoundByWake = false
   let unconsumedWakeCount = 0
   let currentWakeNotifiedKeys = new Set()
+  let currentWakePriorEndedKeys = new Set()
   let joined = new Set()
   let priorTurnJoined = new Set()
   let chosen = false
@@ -202,6 +203,7 @@ export function reduceRequestLog(text) {
           currentBoundByWake = false
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
         }
         break
       case 'current':
@@ -228,14 +230,20 @@ export function reduceRequestLog(text) {
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
-        // Count every non-sync wake arrival (`from_wake: true` OR an unstated wake
-        // `{ op: 'current', ref: null }` emitted by `promptArrival` without `from_sync`),
-        // resetting only on a real non-wake turn or an explicit sync clear (`from_sync: true`).
-        // That way an earlier wake with no known requester followed by a later scheduled wake
-        // with a known requester between sync passes has `unconsumedWakeCount === 2 > 1`
-        // and preserves the later wake's known requester (decision ce71a72b).
-        unconsumedWakeCount =
-          currentFromWake || (current === null && event.from_sync !== true)
+        // When the prompt hook recorded which non-typed wakes had ALREADY ended in the
+        // transcript before this wake started (`prior_ended_wake_keys`), those earlier
+        // ended wakes never consume this wake's attribution, and exactly 1 subsequent
+        // ended wake (not in `prior_ended_wake_keys`) consumes it. Otherwise fall back
+        // to counting non-sync wake arrivals (`from_wake: true` or unstated `{ ref: null }`
+        // without `from_sync: true`) so consecutive wakes between sync passes preserve
+        // the latest wake's known requester (decision ce71a72b).
+        const hasPriorEndedKeys = Boolean(currentFromWake && Array.isArray(event.prior_ended_wake_keys))
+        currentWakePriorEndedKeys = new Set(
+          hasPriorEndedKeys ? event.prior_ended_wake_keys.filter((k) => typeof k === 'string' && k) : [],
+        )
+        unconsumedWakeCount = hasPriorEndedKeys
+          ? 1
+          : currentFromWake || (current === null && event.from_sync !== true)
             ? unconsumedWakeCount + 1
             : 0
         currentWakeNotifiedKeys = new Set(
@@ -282,6 +290,7 @@ export function reduceRequestLog(text) {
           currentBoundByWake = false
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
@@ -301,6 +310,7 @@ export function reduceRequestLog(text) {
           currentBoundByWake = false
           unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
           // Any other requests already in `joined` belonged to this answered turn,
           // so a subsequent turn after `turn_ended` knows not to inherit them while
           // still preserving any fresh join that arrives after `current` became null.
@@ -328,6 +338,7 @@ export function reduceRequestLog(text) {
             currentFromWake = false
             unconsumedWakeCount = 0
             currentWakeNotifiedKeys = new Set()
+            currentWakePriorEndedKeys = new Set()
           } else if (event.consumes_ended_wake === true && unconsumedWakeCount > 0) {
             unconsumedWakeCount -= 1
           }
@@ -399,7 +410,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 /**
@@ -798,7 +809,15 @@ export function notifiedKeys(text) {
  * running turn so what it carries joins that turn rather than replacing what
  * the turn serves.
  */
-export function promptArrival({ fromAPerson, origin, text, midTurn = false, state, newId = randomUUID }) {
+export function promptArrival({
+  fromAPerson,
+  origin,
+  text,
+  midTurn = false,
+  state,
+  newId = randomUUID,
+  priorEndedWakeKeys = undefined,
+}) {
   const events = []
   if (fromAPerson) {
     const id = newId()
@@ -810,10 +829,15 @@ export function promptArrival({ fromAPerson, origin, text, midTurn = false, stat
     for (const id of [ref, ...also]) events.push({ op: 'joined', id })
   } else {
     const resolvedRef = ref === UNSTATED ? null : ref
+    const priorKeys =
+      resolvedRef !== null && Array.isArray(priorEndedWakeKeys)
+        ? priorEndedWakeKeys.filter((k) => typeof k === 'string' && k)
+        : null
     events.push({
       op: 'current',
       ref: resolvedRef,
       ...(resolvedRef !== null ? { from_wake: true } : {}),
+      ...(priorKeys !== null ? { prior_ended_wake_keys: priorKeys } : {}),
     })
     for (const id of also) events.push({ op: 'joined', id })
   }

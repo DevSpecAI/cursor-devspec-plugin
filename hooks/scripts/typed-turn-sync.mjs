@@ -1527,15 +1527,38 @@ export async function syncTypedTurnFromTranscript({
             Boolean(state?.local_turn) &&
             (state.local_turn.turn_key === turnKey ||
               (!openedNow && existingTyped === safeUnboundHook && !state.local_turn.turn_key))
+          const needsRoomAdmission =
+            !effectiveMidTurn && !supersededByNewerTurn && Boolean(sessionId) && !alreadyAdmittedForThisTurn
           const scope =
-            !effectiveMidTurn &&
-            !supersededByNewerTurn &&
-            sessionId &&
-            connectionCapability &&
-            typeof effectiveCallPickup === 'function' &&
-            !alreadyAdmittedForThisTurn
+            needsRoomAdmission && connectionCapability && typeof effectiveCallPickup === 'function'
               ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
               : null
+
+          if (needsRoomAdmission && !scope) {
+            // Never skip room admission and mark an attached terminal turn synced when the
+            // connection capability, pickup caller, or room attachment scope is temporarily
+            // unavailable — defer so restoring the credential retries admission (3ea2b201).
+            const code = !connectionCapability
+              ? 'missing_connection_capability'
+              : typeof effectiveCallPickup !== 'function'
+                ? 'missing_pickup_caller'
+                : 'missing_room_attachment_scope'
+            const refusal = {
+              code,
+              retryable: true,
+              error: `Cannot admit terminal turn for attached room ${sessionId} (${code}); deferring turn sync until admission succeeds.`,
+            }
+            log(
+              `typed-turn-sync: deferring local turn admission for ${connectionId} (${turnKey}): ${JSON.stringify(refusal)}\n`,
+            )
+            return {
+              action: 'admission_failed',
+              requestId,
+              key: turnKey,
+              midTurn: effectiveMidTurn,
+              refusal,
+            }
+          }
 
           if (scope) {
             const admission = await admitLocalTurnPreservingRefusal({
@@ -2041,7 +2064,9 @@ export async function syncTypedTurnFromTranscript({
             typeof active.rawText === 'string' &&
             active.rawText.trim().length > 0 &&
             requestForWake({ origin: 'scheduled-trigger', text: active.rawText, state: reqState }).ref === reqState.current
-          const unseenEndedWakes =
+          const priorEndedKeys =
+            reqState.currentWakePriorEndedKeys instanceof Set ? reqState.currentWakePriorEndedKeys : new Set()
+          const candidateEndedWakes =
             active.precededByTurnEnded && Array.isArray(active.endedNonTypedWakes)
               ? active.endedNonTypedWakes.filter((w) => {
                   if (!w?.key || reqState.seenTranscriptTurns.has(w.key)) return false
@@ -2056,8 +2081,25 @@ export async function syncTypedTurnFromTranscript({
                   return false
                 })
               : []
+          // Ended wakes already present in the transcript when `beforeSubmitPrompt` fired
+          // for the current wake (`prior_ended_wake_keys`) belong to earlier turns (even if
+          // those earlier turns never fired `beforeSubmitPrompt`): mark them seen without
+          // letting them consume the current wake's known attribution (decision ce71a72b).
+          const priorEndedWakes = candidateEndedWakes.filter((w) => priorEndedKeys.has(w.key))
+          const unseenEndedWakes = candidateEndedWakes.filter((w) => !priorEndedKeys.has(w.key))
           const wakeCount = typeof reqState.unconsumedWakeCount === 'number' ? reqState.unconsumedWakeCount : 1
           const staleFromEndedWake = !activeMatchesSchedule && unseenEndedWakes.length >= wakeCount
+          for (const endedWake of priorEndedWakes) {
+            if (
+              !appendRequestEvent(
+                connectionId,
+                { op: 'transcript_turn', key: endedWake.key, ref: null, historical: true },
+                { dir },
+              )
+            ) {
+              return { action: 'binding_write_failed', key: endedWake.key, active }
+            }
+          }
           for (const endedWake of unseenEndedWakes) {
             if (
               !appendRequestEvent(

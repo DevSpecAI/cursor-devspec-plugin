@@ -6262,4 +6262,250 @@ describe('typed-turn-sync (item da03801e)', () => {
       )
     }
   })
+
+  it('retry without connection capability after room admission refusal does NOT skip admission or mark the turn synced; restoring capability retries admission (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    fs.writeFileSync(transcriptPath, `${typedRow('Start task credential retry')}\n`)
+    const memo = { stamp: null, synced: false }
+    const logs = []
+    let openCalls = 0
+    let pickupCalls = 0
+    const state = {
+      connection_id: CONN,
+      session_id: ROOM,
+      speech_attachment_id: ATTACH,
+      attached_at: '2026-11-25T17:00:00.000Z',
+    }
+
+    // Pass 1: open succeeds, room refuses admission.
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        openCalls += 1
+        return { request_id: args.request_id, status: 'open', requested_by_user_id: ALI }
+      },
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'foreground_owned_by_command',
+        }
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(pass1.action, 'admission_failed')
+    assert.equal(memo.synced, false)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 0)
+
+    // Pass 2: retry while connectionCapability is temporarily missing — MUST NOT skip admission or mark synced!
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: null,
+      callRequest: async () => {
+        openCalls += 1
+        throw new Error('must not reopen')
+      },
+      callPickup: async () => {
+        pickupCalls += 1
+        throw new Error('must not call pickup without capability')
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(pass2.action, 'admission_failed')
+    assert.equal(pass2.refusal?.code, 'missing_connection_capability')
+    assert.equal(pass2.refusal?.retryable, true)
+    assert.equal(memo.synced, false, 'poller memo MUST stay unsynced when capability is missing on retry')
+    assert.equal(
+      readRequestState(CONN, { dir }).seenTranscriptTurns.size,
+      0,
+      'turn MUST NOT be recorded as synced when admission was skipped for missing capability',
+    )
+
+    // Pass 3: credential restored — MUST retry admission and mark synced once admitted!
+    let patched = null
+    const pass3 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        openCalls += 1
+        throw new Error('must reuse open request')
+      },
+      callPickup: async (args) => {
+        pickupCalls += 1
+        return {
+          connection_id: CONN,
+          expected_session_id: ROOM,
+          attempt_id: args.attempt_id,
+          status: 'working',
+        }
+      },
+      patchState: (patch) => {
+        patched = patch
+        return true
+      },
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(pass3.action, 'adopted_hook_request')
+    assert.equal(pass3.requestId, pass1.requestId)
+    assert.equal(openCalls, 1)
+    assert.equal(pickupCalls, 2, 'restoring capability MUST trigger another admission attempt')
+    assert.equal(memo.synced, true)
+    assert.ok(patched?.local_turn?.attempt_id)
+    assert.equal(readRequestState(CONN, { dir }).seenTranscriptTurns.size, 1)
+  })
+
+  it('a prior wake that ended without firing beforeSubmitPrompt does NOT consume a later known scheduled wake identified by mirror-turn.mjs, while a subsequent ended turn still clears it (ce71a72b)', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { fileURLToPath } = await import('node:url')
+    const mirrorTurnScript = fileURLToPath(new URL('./mirror-turn.mjs', import.meta.url))
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222b4'
+
+    const setupHookEnv = () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'devspec-hook-wake-'))
+      const dir = path.join(home, '.devspec', 'remote-control', 'connections')
+      fs.mkdirSync(dir, { recursive: true })
+      const transcriptDir = path.join(home, '.cursor', 'projects', 'demo', 'agent-transcripts', CONV)
+      fs.mkdirSync(transcriptDir, { recursive: true })
+      const transcriptPath = path.join(transcriptDir, `${CONV}.jsonl`)
+      fs.writeFileSync(
+        path.join(dir, `${CONN}.json`),
+        JSON.stringify({
+          enabled: true,
+          connection_id: CONN,
+          session_id: null,
+          local_id: CONV,
+          agent_name: 'Cursor',
+          token: 'test-token',
+          mcp_url: 'http://127.0.0.1:9/api/mcp',
+        }),
+        { mode: 0o600 },
+      )
+      appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+      appendRequestEvent(CONN, { op: 'schedule', id: 'sched-bob-hook', prompt: 'bob scheduled check', request: CMD_BOB, also: [] }, { dir })
+      return { home, dir, transcriptPath }
+    }
+
+    const runPromptHook = (home, payload) =>
+      spawnSync(process.execPath, [mirrorTurnScript, 'user_prompt'], {
+        input: JSON.stringify(payload),
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+        encoding: 'utf8',
+      })
+
+    // Case 1: Turn 1 ends WITHOUT firing beforeSubmitPrompt -> Turn 2 fires real mirror-turn.mjs
+    // user_prompt hook for Bob's scheduled wake -> sync runs -> Bob's attribution MUST survive;
+    // then Turn 2 ends and unrelated Turn 3 starts without hook -> sync MUST clear Bob's attribution.
+    {
+      const { home, dir, transcriptPath } = setupHookEnv()
+      const unhookedWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${unhookedWakeRow}\n${turnEndedRow()}\n`)
+
+      const hookRes = runPromptHook(home, {
+        conversation_id: CONV,
+        origin: { kind: 'scheduled-trigger' },
+        prompt: 'bob scheduled check',
+      })
+      assert.equal(hookRes.status, 0, hookRes.stderr)
+      const afterHook = readRequestState(CONN, { dir })
+      assert.equal(afterHook.current, CMD_BOB)
+      assert.equal(afterHook.currentFromWake, true)
+      assert.equal(afterHook.currentWakePriorEndedKeys.size, 1)
+
+      const bobWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${bobWakeRow}\n`)
+
+      const sync1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(sync1.action, 'preserved_wake_request', 'sync MUST preserve Bob’s scheduled wake requester despite earlier unhooked ended wake')
+      assert.equal(sync1.requestId, CMD_BOB)
+      assert.equal(
+        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+        CMD_BOB,
+        'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+      )
+
+      // Now Turn 2 finishes and Turn 3 (unrelated timestamp wake without hook) starts.
+      const unrelatedRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:25 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n${unrelatedRow}\n`)
+      const sync2 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(sync2.action, 'cleared_for_wake')
+      assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+        args: { task_id: 'x' },
+      })
+    }
+
+    // Case 2: Turn 1 ends without hook -> Turn 2 fires mirror-turn.mjs user_prompt AND ends before
+    // sync ever runs -> Turn 3 (unrelated timestamp wake, no hook) starts -> sync MUST STILL clear Bob!
+    {
+      const { home, dir, transcriptPath } = setupHookEnv()
+      const unhookedWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:10 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${unhookedWakeRow}\n${turnEndedRow()}\n`)
+
+      const hookRes = runPromptHook(home, {
+        conversation_id: CONV,
+        transcript_path: transcriptPath,
+        origin: { kind: 'scheduled-trigger' },
+        prompt: 'bob scheduled check',
+      })
+      assert.equal(hookRes.status, 0, hookRes.stderr)
+
+      const bobWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:15 PM (UTC)</timestamp>' }] },
+      })
+      const unrelatedRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:25 PM (UTC)</timestamp>' }] },
+      })
+      fs.appendFileSync(transcriptPath, `${bobWakeRow}\n${turnEndedRow()}\n${unrelatedRow}\n`)
+
+      const syncLate = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(syncLate.action, 'cleared_for_wake', 'finished scheduled wake MUST still clear for a later unrelated wake even after skipping an earlier unhooked wake')
+      assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }), {
+        args: { task_id: 'x' },
+      })
+    }
+  })
 })

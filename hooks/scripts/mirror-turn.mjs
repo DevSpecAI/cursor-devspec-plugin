@@ -57,6 +57,7 @@ import { readTurnActivity, turnActivityPath, turnIsLive } from './turn-liveness.
 import { postTurnFailure } from './turn-failure.mjs'
 import { hookTranscriptPath, noteUsageRefusalSent, observeTurnEnd, usageRefusalArgument } from './usage-refusal.mjs'
 import {
+  activeTranscriptTurn,
   claimTurnEnd,
   noteTurnEndCompleted,
   noteTurnEndTold,
@@ -567,6 +568,19 @@ export function prepareAgentMirrorText(text) {
   return fitRoomMessage(t, { whereRest: 'The full reply is in the Cursor conversation that wrote it.' })
 }
 
+/**
+ * Snapshot the keys of non-typed wakes that already ended (`turn_ended`) in
+ * `transcriptPath` before a prompt hook fired, so `syncTypedTurnFromTranscript`
+ * never lets an earlier wake that ended without firing `beforeSubmitPrompt`
+ * consume a later wake's known prompt-hook attribution (decision ce71a72b).
+ */
+export function priorEndedWakeKeysForTranscript(transcriptPath) {
+  if (!transcriptPath) return undefined
+  const snapshot = activeTranscriptTurn(transcriptPath, { attempts: 1 })
+  if (!snapshot || snapshot.budgetExhausted || !Array.isArray(snapshot.endedNonTypedWakes)) return undefined
+  return snapshot.endedNonTypedWakes.map((w) => w?.key).filter((k) => typeof k === 'string' && k)
+}
+
 async function main() {
   const raw = readStdin()
   if (mode === 'background_launch') {
@@ -622,12 +636,18 @@ async function main() {
   if (mode === 'user_prompt' && connectionId && (fromAPerson || origin)) {
     try {
       const midTurn = promptTurnId(raw) !== null
+      const hookTranscript =
+        !fromAPerson && origin && !midTurn
+          ? hookTranscriptPath(raw) ?? resolveAgentTranscriptPath(localId || conversationId)
+          : null
+      const priorEndedWakeKeys = hookTranscript ? priorEndedWakeKeysForTranscript(hookTranscript) : undefined
       const arrival = promptArrival({
         fromAPerson: fromAPerson && Boolean(text && String(text).trim()),
         origin,
         text,
         midTurn,
         state: readRequestState(connectionId, { dir: CONNECTIONS_DIR }),
+        ...(priorEndedWakeKeys !== undefined ? { priorEndedWakeKeys } : {}),
       })
       for (const event of arrival.events) appendRequestEvent(connectionId, event, { dir: CONNECTIONS_DIR })
       if (arrival.typedId) typedRequest = { id: arrival.typedId, midTurn }
