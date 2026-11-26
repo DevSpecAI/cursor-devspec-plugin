@@ -2825,4 +2825,77 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, CMD_ALICE, 'writes during scheduled wake must still carry CMD_ALICE request_ref')
   })
+
+  it('does not seal an unmatched live completion while preserving a scheduled wake and joins the second person once its late launch lands (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { promptArrival, turnAmbiguity } = await import('./requests.mjs')
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111f5'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222f5'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'sched-alice-2', prompt: 'watch alice deploy', request: CMD_ALICE, also: [] }, { dir })
+
+    // Turn 1 starts with Alice's scheduled wake, attributed by the prompt hook (`from_wake: true`).
+    const schedEvents = promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'watch alice deploy',
+      midTurn: false,
+      state: readRequestState(CONN, { dir }),
+    }).events
+    for (const ev of schedEvents) appendRequestEvent(CONN, ev, { dir })
+
+    const schedRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'watch alice deploy' }] },
+    })
+    // Mid-turn (no turn_ended): Bob's background completion arrives BEFORE Bob's launch record lands!
+    const bobNotifRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>bob-late-during-sched</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${schedRow}\n${bobNotifRow}\n`)
+
+    const memo = {}
+    const pass1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(pass1.action, 'preserved_wake_request')
+    assert.equal(readRequestState(CONN, { dir }).current, CMD_ALICE)
+
+    // Bob's matching launch record lands in `.requests.jsonl` afterward!
+    appendRequestEvent(
+      CONN,
+      { op: 'launch', key: 'bob-late-during-sched', kind: 'shell', notifies: true, request: CMD_BOB, also: [] },
+      { dir },
+    )
+    assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(pass2.action, 'restored_wake_request', 'must reconcile Bob’s late completion instead of skipping as already_synced')
+    assert.equal(pass2.midTurn, true, 'Bob’s mid-turn completion must JOIN Alice’s scheduled turn rather than replace it')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_ALICE, 'Alice’s scheduled wake stays foreground current')
+    assert.equal(after.joined.has(CMD_BOB), true, 'Bob’s request must be carried in joined')
+    assert.equal(after.launches.get('bob-late-during-sched')?.notified, true, 'Bob’s launch must be marked notified')
+    assert.ok(turnAmbiguity(after)?.length === 2, 'two-person ambiguity must be detected')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'writes must ask which person they serve instead of stamping Alice alone')
+  })
 })

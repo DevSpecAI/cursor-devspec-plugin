@@ -1387,10 +1387,18 @@ export async function syncTypedTurnFromTranscript({
           }
           return { action: 'already_carried_wake', requestId: reqState.current, key: wakeRow.key, active }
         }
+        const wakeRowNotifiedKeys = notifiedKeys(wakeRow.rawText)
+        const promptHookOwnedByThisWake =
+          reqState.currentFromWake &&
+          wakeRowNotifiedKeys.some((key) => reqState.currentWakeNotifiedKeys?.has(key))
+        const wakeRowIndex = sameTurnWakeRows.findIndex((row) => row?.key === wakeRow.key)
+        const hasEarlierSameTurnWake = wakeRowIndex > 0
         const hasActiveSameTurnWake =
           reqState.current !== null &&
           (reqState.current === NO_REQUEST || reqState.open.has(reqState.current)) &&
-          sameTurnWakeRows.some((other) => other.key !== wakeRow.key && reqState.seenTranscriptTurns.has(other.key))
+          (sameTurnWakeRows.some((other) => other.key !== wakeRow.key && reqState.seenTranscriptTurns.has(other.key)) ||
+            (hasEarlierSameTurnWake && (reqState.currentFromWake || reqState.currentBoundByWake)) ||
+            (!active.precededByTurnEnded && reqState.currentFromWake && !promptHookOwnedByThisWake))
         const midTurn =
           hasActiveRemoteCommandTurn(connectionId, reqState, dir) ||
           hasActiveTypedTurn(reqState, active) ||
@@ -1513,8 +1521,18 @@ export async function syncTypedTurnFromTranscript({
         if (!isClearableForUnrelatedWake(reqState)) {
           return { action: 'not_typed_live', active }
         }
+        // If this unmatched `other` row carries an explicit `<task-id>` / `<tool-use-id>`
+        // whose launch record has not yet landed in `.requests.jsonl`, leave `active.key`
+        // out of `seenTranscriptTurns` (both when preserving a foreground wake AND when
+        // clearing stale foreground state) so appending the launch record later re-runs
+        // sync (via `reqStamp`) and reconciles + joins the notification (3ea2b201 / ce71a72b).
+        const hasPendingUnmatchedNotificationId =
+          active.kind === 'other' && notifiedKeys(active.rawText).length > 0
         if (reqState.currentFromWake) {
           // Preserve attribution ONLY for a wake explicitly restored via promptArrival.
+          if (hasPendingUnmatchedNotificationId) {
+            return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
+          }
           if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: reqState.current }, { dir })) {
             return { action: 'binding_write_failed', requestId: reqState.current, key: active.key, active }
           }
@@ -1523,12 +1541,6 @@ export async function syncTypedTurnFromTranscript({
         if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
           return { action: 'binding_write_failed', key: active.key, active }
         }
-        // If this unmatched `other` row carries an explicit `<task-id>` / `<tool-use-id>`
-        // whose launch record has not yet landed in `.requests.jsonl`, leave `active.key`
-        // out of `seenTranscriptTurns` so appending the launch record later re-runs sync
-        // (via `reqStamp`) and reconciles the notification (requirement 3ea2b201).
-        const hasPendingUnmatchedNotificationId =
-          active.kind === 'other' && notifiedKeys(active.rawText).length > 0
         if (
           !hasPendingUnmatchedNotificationId &&
           !appendRequestEvent(connectionId, { op: 'transcript_turn', key: active.key, ref: null }, { dir })
