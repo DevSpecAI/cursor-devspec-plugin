@@ -2026,29 +2026,42 @@ export async function syncTypedTurnFromTranscript({
         // clearing stale foreground state) so appending the launch record later re-runs
         // sync (via `reqStamp`) and reconciles + joins the notification (3ea2b201 / ce71a72b).
         if (reqState.currentFromWake) {
-          // If an earlier non-typed/scheduled wake turn started AND ended (`turn_ended`)
-          // between sync passes and NOTHING links the current live turn (`active`) to
-          // `reqState.current`, that finished turn already consumed `currentFromWake`:
-          // mark the finished wake row(s) seen and clear `current` so a later unrelated
-          // timestamp-only wake NEVER inherits the finished wake's requester (ce71a72b).
+          // Compare the count of unseen ended non-typed wakes before `turn_ended` against
+          // `reqState.unconsumedWakeCount` (how many `promptArrival` wakes fired since the
+          // last bound turn):
+          //  - If `unconsumedWakeCount > unseenEndedWakes.length` (e.g. two scheduled wakes
+          //    from different requesters fired between sync passes: Alice ended, then Bob
+          //    started), mark the ended wake(s) seen and PRESERVE Bob's live wake requester!
+          //  - If `unconsumedWakeCount <= unseenEndedWakes.length` (and nothing in `active`
+          //    matches a live schedule for `reqState.current`), the finished wake turn(s)
+          //    already consumed every `from_wake` event: mark them seen and CLEAR `current`
+          //    so a later unrelated timestamp-only wake NEVER inherits a finished wake's
+          //    requester (decision ce71a72b).
           const activeMatchesSchedule =
             typeof active.rawText === 'string' &&
             active.rawText.trim().length > 0 &&
             requestForWake({ origin: 'scheduled-trigger', text: active.rawText, state: reqState }).ref === reqState.current
           const unseenEndedWakes =
-            active.precededByTurnEnded && !activeMatchesSchedule && Array.isArray(active.endedNonTypedWakes)
+            active.precededByTurnEnded && Array.isArray(active.endedNonTypedWakes)
               ? active.endedNonTypedWakes.filter((w) => {
                   if (!w?.key || reqState.seenTranscriptTurns.has(w.key)) return false
                   return w.kind === 'timestamp' || w.kind === 'other'
                 })
               : []
-          if (unseenEndedWakes.length > 0) {
-            for (const endedWake of unseenEndedWakes) {
-              if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: endedWake.key, ref: null, historical: true }, { dir })) {
-                return { action: 'binding_write_failed', key: endedWake.key, active }
-              }
+          const wakeCount = typeof reqState.unconsumedWakeCount === 'number' ? reqState.unconsumedWakeCount : 1
+          const staleFromEndedWake = !activeMatchesSchedule && unseenEndedWakes.length >= wakeCount
+          for (const endedWake of unseenEndedWakes) {
+            if (
+              !appendRequestEvent(
+                connectionId,
+                { op: 'transcript_turn', key: endedWake.key, ref: null, historical: true, consumes_ended_wake: true },
+                { dir },
+              )
+            ) {
+              return { action: 'binding_write_failed', key: endedWake.key, active }
             }
-          } else {
+          }
+          if (!staleFromEndedWake) {
             // Preserve attribution ONLY for a live wake explicitly restored via promptArrival.
             if (hasPendingUnmatchedNotificationId) {
               return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }

@@ -123,6 +123,7 @@ export function reduceRequestLog(text) {
   let current = null
   let currentFromWake = false
   let currentBoundByWake = false
+  let unconsumedWakeCount = 0
   let currentWakeNotifiedKeys = new Set()
   let joined = new Set()
   let priorTurnJoined = new Set()
@@ -199,6 +200,7 @@ export function reduceRequestLog(text) {
           current = null
           currentFromWake = false
           currentBoundByWake = false
+          unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
         }
         break
@@ -226,6 +228,7 @@ export function reduceRequestLog(text) {
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
+        unconsumedWakeCount = currentFromWake ? unconsumedWakeCount + 1 : 0
         currentWakeNotifiedKeys = new Set(
           currentFromWake && Array.isArray(event.wake_notified_keys)
             ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
@@ -268,6 +271,7 @@ export function reduceRequestLog(text) {
           current = next
           currentFromWake = false
           currentBoundByWake = false
+          unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
@@ -286,6 +290,7 @@ export function reduceRequestLog(text) {
           current = null
           currentFromWake = false
           currentBoundByWake = false
+          unconsumedWakeCount = 0
           currentWakeNotifiedKeys = new Set()
           // Any other requests already in `joined` belonged to this answered turn,
           // so a subsequent turn after `turn_ended` knows not to inherit them while
@@ -312,7 +317,10 @@ export function reduceRequestLog(text) {
           if (!event.historical && current !== null && boundRef === current) {
             if (currentFromWake) currentBoundByWake = true
             currentFromWake = false
+            unconsumedWakeCount = 0
             currentWakeNotifiedKeys = new Set()
+          } else if (event.consumes_ended_wake === true && unconsumedWakeCount > 0) {
+            unconsumedWakeCount -= 1
           }
         }
         break
@@ -382,7 +390,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 /**
@@ -1111,6 +1119,27 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
       return false
     }
     if (fileStat.size < minBytes) return false
+    // Snapshot EVERY retained archive's size BEFORE calling `readRequestState` so the
+    // carried-forward watermark NEVER advances past bytes appended after `readRequestState`
+    // checked the old archive: any append landing during or after `readRequestState` is
+    // strictly beyond `oldStat.size`, causing the post-rotation re-stat to report `false`
+    // and leaving those new bytes unread past the watermark for the next read (req 3ea2b201).
+    const priorArchives = archiveRequestLogFiles(connectionId, dir)
+    if (priorArchives.error) {
+      onError?.(priorArchives.error)
+      return false
+    }
+    const priorArchiveStats = new Map()
+    for (const oldArch of priorArchives.files) {
+      try {
+        priorArchiveStats.set(oldArch, fs.statSync(oldArch))
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          onError?.(error)
+          return false
+        }
+      }
+    }
     const effectiveState = readRequestState(connectionId, { dir })
     if (effectiveState.readError) {
       onError?.(effectiveState.readError)
@@ -1141,22 +1170,6 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
     for (const oldStaged of priorStaged.files) {
       try {
         priorStagedSizes.set(oldStaged, fs.statSync(oldStaged).size)
-      } catch (error) {
-        if (error?.code !== 'ENOENT') {
-          onError?.(error)
-          return false
-        }
-      }
-    }
-    const priorArchives = archiveRequestLogFiles(connectionId, dir)
-    if (priorArchives.error) {
-      onError?.(priorArchives.error)
-      return false
-    }
-    const priorArchiveStats = new Map()
-    for (const oldArch of priorArchives.files) {
-      try {
-        priorArchiveStats.set(oldArch, fs.statSync(oldArch))
       } catch (error) {
         if (error?.code !== 'ENOENT') {
           onError?.(error)

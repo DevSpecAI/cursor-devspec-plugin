@@ -5981,4 +5981,153 @@ describe('typed-turn-sync (item da03801e)', () => {
       )
     }
   })
+
+  it('a launch appended to the first archive AFTER readRequestState checks it during a second rotation is NOT swallowed by the carried-forward watermark (3ea2b201)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const { rotateRequestLog } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const REQ_ALICE = '11111111-1111-4111-8111-1111111111b1'
+    const REQ_SECOND = '22222222-2222-4222-8222-2222222222b1'
+
+    fs.writeFileSync(transcriptPath, `${turnEndedRow()}\n`)
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    fs.mkdirSync(dir, { recursive: true })
+    const padLine = `${JSON.stringify({ op: 'transcript_turn', key: 'old-pad', ref: null, pad: 'p'.repeat(400) })}\n`
+    fs.writeFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'command', requested_by: ALICE, message_id: 'msg-alice-race-wm' }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'answered', id: REQ_ALICE }, { dir })
+
+    const firstFd = fs.openSync(reqLogPath, 'a')
+    const origReadFileSync = fs.readFileSync
+    try {
+      const idle1 = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+      assert.deepEqual(idle1.closed, [REQ_ALICE])
+      assert.equal(fs.existsSync(`${reqLogPath}.1`), true)
+
+      fs.appendFileSync(reqLogPath, padLine.repeat(180), { mode: 0o600 })
+      appendRequestEvent(CONN, { op: 'open', id: REQ_SECOND, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'current', ref: REQ_SECOND }, { dir })
+      appendRequestEvent(CONN, { op: 'close', id: REQ_SECOND }, { dir })
+
+      // Inject a late launch into `.requests.jsonl.1` RIGHT AFTER `readRequestState` reads the
+      // active log during Rotation #2 (the exact window before `preBuf` / rename)!
+      let injected = false
+      fs.readFileSync = (target, ...rest) => {
+        const res = origReadFileSync(target, ...rest)
+        if (!injected && String(target) === reqLogPath) {
+          injected = true
+          fs.writeSync(
+            firstFd,
+            `${JSON.stringify({ op: 'launch', key: 'wm-race-launch-1', kind: 'shell', notifies: true, request: REQ_ALICE, also: [] })}\n`,
+          )
+        }
+        return res
+      }
+      const rotated2 = rotateRequestLog(CONN, { dir })
+      fs.readFileSync = origReadFileSync
+
+      assert.equal(injected, true, 'late launch injection during second rotation must have fired')
+      assert.equal(rotated2, false, 'second rotation MUST report false when first archive grew after pre-check snapshot')
+
+      const wakeRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>wm-race-launch-1</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      fs.appendFileSync(transcriptPath, `${wakeRow}\n`)
+      const memo = {}
+      const poll = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(poll.action, 'restored_wake_request', 'poller MUST reconcile the late launch instead of skipping it')
+      assert.equal(readRequestState(CONN, { dir }).current, REQ_ALICE)
+      assert.equal(readRequestState(CONN, { dir }).launches.get('wm-race-launch-1')?.notified, true)
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo }), false)
+    } finally {
+      fs.readFileSync = origReadFileSync
+      fs.closeSync(firstFd)
+    }
+  })
+
+  it('when two scheduled wakes from different requesters occur between sync passes, the second wake’s known prompt-hook requester is preserved (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { promptArrival } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111b2'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222b2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'sched-a', prompt: 'alice check', request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'schedule', id: 'sched-b', prompt: 'bob check', request: CMD_BOB, also: [] }, { dir })
+
+    // Turn 1: Alice's scheduled wake fires via promptArrival and ends (`turn_ended`) before sync runs.
+    for (const ev of promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'alice check',
+      midTurn: false,
+      state: readRequestState(CONN, { dir }),
+    }).events) {
+      appendRequestEvent(CONN, ev, { dir })
+    }
+    const aliceWakeRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:20 PM (UTC)</timestamp>' }] },
+    })
+
+    // Turn 2: Bob's scheduled wake fires via promptArrival (`from_wake: true`) while Turn 2 is live!
+    for (const ev of promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'bob check',
+      midTurn: false,
+      state: readRequestState(CONN, { dir }),
+    }).events) {
+      appendRequestEvent(CONN, ev, { dir })
+    }
+    const bobWakeRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:25 PM (UTC)</timestamp>' }] },
+    })
+
+    fs.writeFileSync(transcriptPath, `${aliceWakeRow}\n${turnEndedRow()}\n${bobWakeRow}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+    })
+    assert.equal(res.action, 'preserved_wake_request', 'sync MUST preserve Bob’s live scheduled wake requester instead of clearing it')
+    assert.equal(res.requestId, CMD_BOB)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, CMD_BOB, 'Bob’s request must stay current')
+    assert.equal(
+      stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+      CMD_BOB,
+      'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+    )
+  })
 })
