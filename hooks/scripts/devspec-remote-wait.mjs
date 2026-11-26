@@ -94,6 +94,7 @@ import {
   hasWritableDiagnosticNoteStore,
   maxShellReserve,
   peekPendingUnsavedRefusals,
+  peekPendingUnsavedRefusalsDetailed,
   reserveDiagnosticNoteSlots,
   shellDiagnosticPointer,
   shellDiagnosticReserve,
@@ -1973,7 +1974,9 @@ export async function runOneShotRoomCommandPickup({
   const fallbackNoteDir = dir ? path.join(dir, 'diagnostic-notes') : null
   const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
   const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
-  const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+  const spoolSnapshot = peekPendingUnsavedRefusalsDetailed(spoolKey, spoolOpts)
+  const pendingSpoolEntries = spoolSnapshot.entries
+  const unreadablePendingSpool = spoolSnapshot.hadReadError
   if (extracted.commands.length === 0 && noteRefusals.length === 0 && pendingSpoolEntries.length === 0) {
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
@@ -2103,10 +2106,10 @@ export async function runOneShotRoomCommandPickup({
     } else if (pendingSpoolEntries.length > 0 && !refusals) {
       ok = false
     }
-    if (ok && hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)) {
+    if (ok && (unreadablePendingSpool || hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts))) {
       ok = false
     }
-  } else if (ok && hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)) {
+  } else if (ok && (unreadablePendingSpool || hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts))) {
     ok = false
   }
   return {

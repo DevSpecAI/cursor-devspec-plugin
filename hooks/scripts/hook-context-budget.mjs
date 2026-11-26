@@ -1269,17 +1269,31 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
  * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
-  // Shared RFC-3986-aware URL patterns supporting IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`)
-  // and bracketed query parameters while trimming any unmatched trailing wrapper `]` (reqs 4e32d1a5 / 91d7b47c).
-  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`https?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>)\]/]+)(?:[^\s"'<>)]*)`
-  const ACTIONABLE_REL_URL_SOURCE = String.raw`\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)]+`
-  const trimUnmatchedTrailingBrackets = (url) => {
-    let cleaned = url.replace(/[.,;:!?]+$/, '')
-    while (cleaned.endsWith(']')) {
-      const opens = (cleaned.match(/\[/g) ?? []).length
-      const closes = (cleaned.match(/\]/g) ?? []).length
-      if (closes > opens) cleaned = cleaned.slice(0, -1).replace(/[.,;:!?]+$/, '')
-      else break
+  // Shared RFC-3986-aware URL patterns supporting IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`),
+  // balanced parentheses/brackets, and all valid RFC-3986 sub-delims (including trailing `!`, `,`, `;`,
+  // `:`, `.`, `?` in query tokens) without stripping valid URL characters (reqs 4e32d1a5 / 91d7b47c).
+  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`https?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>/]+)(?:[^\s"'<>]*)`
+  const ACTIONABLE_REL_URL_SOURCE = String.raw`\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>]+`
+  const trimUnmatchedTrailingWrappers = (url) => {
+    let cleaned = url
+    while (cleaned.length > 0) {
+      const last = cleaned[cleaned.length - 1]
+      if (last === ']') {
+        const opens = (cleaned.match(/\[/g) ?? []).length
+        const closes = (cleaned.match(/\]/g) ?? []).length
+        if (closes > opens) {
+          cleaned = cleaned.slice(0, -1)
+          continue
+        }
+      } else if (last === ')') {
+        const opens = (cleaned.match(/\(/g) ?? []).length
+        const closes = (cleaned.match(/\)/g) ?? []).length
+        if (closes > opens) {
+          cleaned = cleaned.slice(0, -1)
+          continue
+        }
+      }
+      break
     }
     return cleaned
   }
@@ -1332,7 +1346,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     const urls = []
     let oversizedCount = 0
     for (const raw of matches) {
-      const cleaned = trimUnmatchedTrailingBrackets(raw)
+      const cleaned = trimUnmatchedTrailingWrappers(raw)
       if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)
       if (cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS) {
@@ -2805,11 +2819,22 @@ export function hasPendingUnsavedRefusals(
   return false
 }
 
-export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+/**
+ * Single-pass inspection of pending unsaved refusals for `spoolKey`: returns BOTH all
+ * readable `entries` AND `hadReadError: true` if ANY candidate spool directory or
+ * scope-matching spool/pending-refusal file failed to read during this exact pass.
+ * Reading once eliminates the TOCTOU window where a file fails during peek and then
+ * recovers during a separate unreadability check without ever being surfaced (req 3ea2b201).
+ */
+export function peekPendingUnsavedRefusalsDetailed(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
   const key = String(spoolKey ?? '')
-  if (!key) return []
+  if (!key) return { entries: [], hadReadError: false }
   const seen = new Set()
   const out = []
+  let hadReadError = false
   const pushUnique = (text) => {
     if (typeof text !== 'string' || !text || seen.has(text)) return
     seen.add(text)
@@ -2823,8 +2848,20 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const claimPrefix = legacyClaimFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
+  const readJsonStrict = (filePath) => {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8')
+      if (raw.trim().length === 0) return { empty: true, parsed: null }
+      return { empty: false, parsed: JSON.parse(raw) }
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { missing: true, parsed: null }
+      hadReadError = true
+      return { error, parsed: null }
+    }
+  }
   const readLegacyEntries = (filePath) => {
-    const legacyParsed = readPrivateJson(filePath)
+    const res = readJsonStrict(filePath)
+    const legacyParsed = res.parsed
     if (Array.isArray(legacyParsed?.entries)) {
       for (const entry of legacyParsed.entries) pushUnique(entry)
     } else if (typeof legacyParsed?.text === 'string' && legacyParsed.text) {
@@ -2840,7 +2877,8 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
     let names = []
     try {
       names = fs.readdirSync(dir).sort()
-    } catch {
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') hadReadError = true
       continue
     }
     for (const name of names) {
@@ -2849,7 +2887,8 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
         continue
       }
       if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
-        const parsed = readPrivateJson(path.join(dir, name))
+        const res = readJsonStrict(path.join(dir, name))
+        const parsed = res.parsed
         if (parsed?.kind === 'note_ref') {
           const recoveredRef = recoverNoteRefPayload(parsed)
           if (recoveredRef?.text) pushUnique(recoveredRef.text)
@@ -2860,17 +2899,31 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
       }
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
+      let rawBuf = null
       try {
-        const content = readPendingMdFile(fullPath)
+        rawBuf = fs.readFileSync(fullPath)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') hadReadError = true
+        continue
+      }
+      try {
+        const content =
+          rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b
+            ? zlib.gunzipSync(rawBuf).toString('utf8')
+            : rawBuf.toString('utf8')
         if (!content.startsWith(scopePrefix)) continue
         const recovered = parsePendingDiagnosticRefusalFile(content, scopeTag)
         if (recovered?.body) pushUnique(recovered.body)
       } catch {
-        /* still unreadable or vanished */
+        /* ignore non-standalone gzip shards (e.g. part 1 of a multi-file sharded note) */
       }
     }
   }
-  return out
+  return { entries: out, hadReadError }
+}
+
+export function peekPendingUnsavedRefusals(spoolKey, opts = {}) {
+  return peekPendingUnsavedRefusalsDetailed(spoolKey, opts).entries
 }
 
 export function clearPendingUnsavedRefusals(

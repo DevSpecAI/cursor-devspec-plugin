@@ -908,6 +908,26 @@ function buildShortenedSavedNoteRecovery(
       recovery:
         'Find saved_note_basenames across ~/.devspec/notes, TMPDIR/devspec-notes-<uid>, and connections dir (concat + `gzip -dc` if gzip) or re-run wake read.',
     })}\n`,
+    // Ultra-compact structured and plain-text fallbacks for tight Shell budgets (e.g. <=300 chars)
+    // so an already-saved note NEVER falls through to a misleading "note storage failed" message
+    // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      ...savedStatusFields,
+      saved_note_count: savedFiles.length,
+      saved_note_basenames: basenames,
+      ...compressedMeta,
+      recovery: 'Open basenames in ~/.devspec/notes, TMPDIR, or connections dir; or re-run.',
+    })}\n`,
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      saved_note_basenames: basenames,
+      ...compressedMeta,
+      recovery: 'Open in notes/TMPDIR/connections or re-run.',
+    })}\n`,
+    `report_pickup refused: saved in ${savedFiles.length} file(s) (${basenames.join(', ')}) under ~/.devspec/notes, TMPDIR, or connections dir${savedNote.compressed ? ` (${savedNote.compressed})` : ''}; Shell limit cut read cmd; re-run.\n`,
+    `report_pickup refused: saved (${savedFiles.length} shards: ${basenames.join(',')})${savedNote.compressed ? ` [${savedNote.compressed}]` : ''} in notes/TMPDIR/connections; re-run.\n`,
+    `report_pickup refused: saved (${savedFiles.length} shards, first=${basenames[0]}); Shell limit; re-run.\n`,
   ]
   for (const candidate of candidates) {
     if (fits(candidate)) return candidate
@@ -992,6 +1012,21 @@ export function formatShellRefusalOmissionNotice(
       fits: (candidate) => fitsShellOutput(stdout + candidate),
     })
     if (shortened) return shortened
+    // A note WAS saved — NEVER fall through to misleading `note_write_failed` / permissions messages.
+    const savedFiles =
+      Array.isArray(savedNote.files) && savedNote.files.length > 0
+        ? savedNote.files.filter((f) => typeof f === 'string' && f)
+        : typeof savedNote.file === 'string' && savedNote.file
+          ? [savedNote.file]
+          : []
+    const fallbackSavedLines = [
+      `${label}: refused; saved in ${Math.max(1, savedFiles.length)} file(s) (Shell limit); re-run.\n`,
+      `${label}: refused; saved (Shell limit); re-run.\n`,
+    ]
+    for (const line of fallbackSavedLines) {
+      if (fitsShellOutput(stdout + line)) return line
+    }
+    return ''
   }
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'all diagnostic note stores unwritable')
   const candidates = [

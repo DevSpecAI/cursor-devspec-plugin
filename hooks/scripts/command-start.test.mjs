@@ -8315,6 +8315,25 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       assert.equal(parsed.saved_note_dirs_omitted_for_shell_limit, true)
       assert.deepEqual(parsed.saved_note_basenames, ['shard-a.md', 'shard-b.md', 'shard-c.md'])
       assert.match(parsed.recovery, /~\/\.devspec\/notes/, 'MUST name all diagnostic note stores when directory paths exceed budget')
+
+      // Even tighter 300-char remaining Shell budget with already-saved 3-shard note:
+      // MUST STILL identify the saved shards and NEVER report note storage failure / fix permissions!
+      const { formatShellRefusalOmissionNotice } = await import('./command-start.mjs')
+      const stdoutPad300 = 'x'.repeat(20_000 - 300)
+      const fb300 = formatStructuredRefusalsFallback(
+        [{ command_message_id: 'msg-multi-dir-300', refusal: { code: 'turn_busy' } }],
+        { stdoutText: stdoutPad300, savedNote, noteError: new Error('ENOSPC') },
+      )
+      assert.ok(typeof fb300 === 'string' && fb300.length > 0 && fitsShellOutput(stdoutPad300 + fb300))
+      assert.doesNotMatch(fb300, /note_write_failed|fix.*permissions/i, 'MUST NOT blame note storage when note was already saved')
+      assert.match(fb300, /shard-a\.md/, '300-char fallback MUST still name saved shard basenames')
+      const omit300 = formatShellRefusalOmissionNotice(
+        [{ command_message_id: 'msg-multi-dir-300', refusal: { code: 'turn_busy' } }],
+        { label: 'devspec-wake-tail', stdoutText: stdoutPad300, actualChars: 90_000, savedNote },
+      )
+      assert.ok(typeof omit300 === 'string' && omit300.length > 0 && fitsShellOutput(stdoutPad300 + omit300))
+      assert.doesNotMatch(omit300, /note_write_failed|fix.*permissions/i)
+      assert.match(omit300, /shard-a\.md/)
     }
 
     // 2. 1 readable spool refusal + 1 temporarily unreadable (`EIO`) spool refusal -> readWakes
@@ -8339,10 +8358,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs.writeFileSync(s1.file, s1Bytes, { mode: 0o600 })
       fs.writeFileSync(s2.file, s2Bytes, { mode: 0o600 })
       const origReadFileSync = fs.readFileSync
-      let failS2 = true
+      let s2FailCount = 1 // Fail ONLY on the very first read (later reads immediately succeed!)
       fs.readFileSync = (p, ...rest) => {
-        if (failS2 && String(p) === s2.file) {
-          throw Object.assign(new Error('temporary EIO reading spool refusal'), { code: 'EIO' })
+        if (s2FailCount > 0 && String(p) === s2.file) {
+          s2FailCount -= 1
+          throw Object.assign(new Error('first-read EIO reading spool refusal'), { code: 'EIO' })
         }
         return origReadFileSync(p, ...rest)
       }
@@ -8364,11 +8384,10 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
           }),
         })
         assert.match(stderr1, /readable refusal #1 payload/, 'first readable refusal should be surfaced')
-        assert.equal(r1.marked, false, 'cursor MUST NOT advance while second refusal file is temporarily unreadable')
-        assert.equal(fs.existsSync(posFile), false, 'posFile MUST NOT be written while unreadable refusal remains')
+        assert.equal(r1.marked, false, 'cursor MUST NOT advance when second refusal failed its first read even if later reads succeed')
+        assert.equal(fs.existsSync(posFile), false, 'posFile MUST NOT be written while missed refusal remains pending')
 
-        // Read error clears -> next read surfaces refusal #2 and advances cursor!
-        failS2 = false
+        // Next read now reads s2 cleanly, surfaces refusal #2, and advances cursor!
         let stderr2 = ''
         const r2 = await readWakes({
           file: wakeFile,
@@ -8385,10 +8404,10 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
             refusals: [],
           }),
         })
-        assert.match(stderr2, /unreadable refusal #2 payload/, 'second refusal MUST surface once readable')
+        assert.match(stderr2, /unreadable refusal #2 payload/, 'second refusal MUST surface on next read')
         assert.equal(r2.marked, true, 'cursor advances only after ALL spooled refusals are surfaced')
       } finally {
-        failS2 = false
+        s2FailCount = 0
         fs.readFileSync = origReadFileSync
         clearPendingUnsavedRefusals(spoolKey, null, { home, fallbackDir: diagDir, backupDir: dir })
       }
@@ -8405,7 +8424,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
       fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('ipv6 url enospc check'))), { mode: 0o600 })
 
-      const ipv6Url = 'https://[2001:db8:85a3::8a2e:370:7334]:8443/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-ipv6?token=ok123'
+      const ipv6Url = 'https://[2001:db8:85a3::8a2e:370:7334]:8443/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-ipv6?token=ok123!'
       const vocab = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango']
       const proseFor = (idx) => {
         const words = []

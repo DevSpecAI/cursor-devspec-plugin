@@ -110,6 +110,7 @@ import {
   hasUnreadablePendingUnsavedRefusals,
   hasWritableDiagnosticNoteStore,
   peekPendingUnsavedRefusals,
+  peekPendingUnsavedRefusalsDetailed,
   reserveDiagnosticNoteSlots,
   shellDiagnosticReserve,
   spoolUnsavedRefusal,
@@ -725,8 +726,9 @@ export async function readWakes({
       })
     const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
     const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
-    const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
-    const unreadablePendingSpool = hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)
+    const spoolSnapshot = peekPendingUnsavedRefusalsDetailed(spoolKey, spoolOpts)
+    const pendingSpoolEntries = spoolSnapshot.entries
+    const unreadablePendingSpool = spoolSnapshot.hadReadError
     const hasSpool = pendingSpoolEntries.length > 0 || unreadablePendingSpool
     const page = readerPage(
       wakes.map((wake) => wake.text),
