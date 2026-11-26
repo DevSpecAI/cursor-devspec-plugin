@@ -246,6 +246,15 @@ export const RESERVED_DIAGNOSTIC_SLOT_BYTES = 128 * 1024
  */
 export const RESERVED_SPOOL_POINTER_BYTES = 16 * 1024
 
+/**
+ * Head and tail character preview kept for each individual oversized opaque string blob
+ * (longer than 2 * 512 = 1,024 UTF-16 code units) during emergency `ENOSPC` diagnostic
+ * compaction (`compactDiagnosticForSlotBudget`) when the unabridged refusal exceeds every
+ * pre-allocated diagnostic slot even after gzip compression. Structured refusal envelopes,
+ * reason codes, and EVERY blocking record in arrays are NEVER sliced or dropped.
+ */
+export const ENOSPC_COMPACT_BLOB_PREVIEW_CHARS = 512
+
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
 const NOTE_ID = /^[0-9a-f]{16}$/
@@ -1102,42 +1111,36 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
 
 /**
  * When a diagnostic refusal STILL exceeds all pre-allocated diagnostic slots even after
- * gzip compression under mid-pickup `ENOSPC`, shrink only oversized high-entropy string
- * blobs inside embedded JSON structures while preserving EVERY refusal code and blocking
- * record (including the first and final blockers), head/tail previews, and exact omitted
- * byte counts so the refusal still fits in a pre-allocated slot and survives durably
- * across processes (reqs 3c5147a7 / 4e32d1a5 / 91d7b47c / 3ea2b201).
+ * gzip compression under mid-pickup `ENOSPC`, shrink ONLY oversized opaque string blobs
+ * inside embedded JSON structures while preserving 100% of every refusal code, metadata
+ * field, and EVERY blocking record in arrays (never slicing arrays of blocking items!)
+ * plus explicit omitted-byte counts so the refusal fits in pre-allocated slot capacity
+ * (plain or gzipped) and survives durably across processes (reqs 3c5147a7 / 4e32d1a5 /
+ * 91d7b47c / 3ea2b201).
  */
-function compactDiagnosticForSlotBudget(rawText, budgetBytes, { originalBytes, compressedBytes } = {}) {
-  const maxStrLen = 256
-  const shrinkValue = (val, depth = 0) => {
-    if (depth > 12) return '[max-depth]'
+function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
+  const shrinkValue = (val, previewChars) => {
     if (typeof val === 'string') {
-      if (val.length <= maxStrLen * 2 + 64) return val
+      if (val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       return {
         truncated_due_to_enospc: true,
         original_chars: val.length,
-        omitted_chars: val.length - maxStrLen * 2,
-        head: val.slice(0, maxStrLen),
-        tail: val.slice(-maxStrLen),
+        omitted_chars: val.length - previewChars * 2,
+        ...(previewChars > 0
+          ? {
+              head: val.slice(0, previewChars),
+              tail: val.slice(-previewChars),
+            }
+          : {}),
       }
     }
     if (Array.isArray(val)) {
-      if (val.length <= 200) return val.map((item) => shrinkValue(item, depth + 1))
-      return [
-        ...val.slice(0, 100).map((item) => shrinkValue(item, depth + 1)),
-        {
-          truncated_due_to_enospc: true,
-          omitted_items: val.length - 200,
-          total_items: val.length,
-        },
-        ...val.slice(-100).map((item) => shrinkValue(item, depth + 1)),
-      ]
+      return val.map((item) => shrinkValue(item, previewChars))
     }
     if (val && typeof val === 'object') {
       const out = {}
       for (const [k, v] of Object.entries(val)) {
-        out[k] = shrinkValue(v, depth + 1)
+        out[k] = shrinkValue(v, previewChars)
       }
       return out
     }
@@ -1147,18 +1150,29 @@ function compactDiagnosticForSlotBudget(rawText, budgetBytes, { originalBytes, c
   const notice = {
     enospc_compacted: true,
     reason:
-      'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized string fields were compacted while preserving structured refusal codes and blocking records (including first and final blockers).',
+      'Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized opaque string blobs were summarized while preserving every structured refusal code and every blocking record.',
     original_bytes: originalBytes ?? Buffer.byteLength(rawText, 'utf8'),
     compressed_bytes: compressedBytes ?? null,
-    reserved_slot_bytes: budgetBytes,
+    reserved_slot_bytes: totalCapacityBytes,
   }
 
-  const tryCompactJson = (str) => {
+  const fitsCompressed = (candidate) => {
+    if (!candidate) return false
+    const buf = Buffer.from(candidate, 'utf8')
+    if (buf.length <= totalCapacityBytes) return true
+    try {
+      return zlib.gzipSync(buf).length <= totalCapacityBytes
+    } catch {
+      return false
+    }
+  }
+
+  const tryCompactJson = (str, previewChars) => {
     const trimmed = str.trim()
     if (!trimmed) return null
     try {
       const parsed = JSON.parse(trimmed)
-      return JSON.stringify({ ...notice, preserved_refusal: shrinkValue(parsed) })
+      return JSON.stringify({ ...notice, preserved_refusal: shrinkValue(parsed, previewChars) })
     } catch {
       /* try prefix + embedded JSON */
     }
@@ -1175,23 +1189,28 @@ function compactDiagnosticForSlotBudget(rawText, budgetBytes, { originalBytes, c
           const parsed = JSON.parse(jsonPart)
           return `${prefix ? `${prefix}\n` : ''}${JSON.stringify({
             ...notice,
-            preserved_refusal: shrinkValue(parsed),
-            ...(suffix ? { trailing_text: suffix.slice(0, 512) } : {}),
+            preserved_refusal: shrinkValue(parsed, previewChars),
+            ...(suffix ? { trailing_text: shrinkValue(suffix, previewChars) } : {}),
           })}\n`
         } catch {
-          /* fall through to head + tail preservation */
+          /* fall through */
         }
       }
     }
     return null
   }
 
-  const compactedJson = tryCompactJson(rawText)
-  if (compactedJson && Buffer.byteLength(compactedJson, 'utf8') <= budgetBytes) {
-    return compactedJson
+  // Try full `ENOSPC_COMPACT_BLOB_PREVIEW_CHARS` first, stepping down ONLY oversized
+  // string-blob preview length (never dropping any structured blocking records!) if
+  // many multi-KB incompressible blobs still exceed compressed slot capacity.
+  for (const previewChars of [ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS / 8), 0]) {
+    const compactedJson = tryCompactJson(rawText, previewChars)
+    if (compactedJson && fitsCompressed(compactedJson)) {
+      return compactedJson
+    }
   }
-  const envelopeOverhead = 1024
-  const halfBudget = Math.max(512, Math.floor((budgetBytes - envelopeOverhead) / 2))
+  const envelopeOverhead = ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2
+  const halfBudget = Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS, Math.floor((totalCapacityBytes - envelopeOverhead) / 2))
   return `${JSON.stringify({
     ...notice,
     head_preview: rawText.slice(0, halfBudget),
@@ -1640,11 +1659,16 @@ export function reserveDiagnosticNoteSlots({
         if (sharded) return sharded
       }
       // Pass 1.75: if the refusal STILL exceeds all pre-allocated slots combined even after
-      // gzip under ENOSPC, compact only oversized string blobs while preserving EVERY
-      // refusal code and blocking record (including first and final blockers) + explicit
-      // ENOSPC disclosure inside a pre-allocated slot so it is durable across processes.
+      // gzip under ENOSPC, compact ONLY oversized opaque string blobs while preserving EVERY
+      // refusal code and EVERY blocking record (first, middle, and final — never slicing arrays)
+      // inside a pre-allocated slot (or sharded across multiple slots if needed) so it is
+      // durable across processes.
       if (readableSlots.length >= 1) {
         const targetSlot = readableSlots[0]
+        const totalReadableBytes = readableSlots.reduce(
+          (sum, s) => sum + (s.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES),
+          0,
+        )
         const rawBytes = Buffer.byteLength(raw, 'utf8')
         let compressedBytes = null
         try {
@@ -1654,7 +1678,7 @@ export function reserveDiagnosticNoteSlots({
         }
         const compacted = compactDiagnosticForSlotBudget(
           raw,
-          Math.max(4096, (targetSlot.allocatedBytes ?? RESERVED_DIAGNOSTIC_SLOT_BYTES) - 4096),
+          Math.max(ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 4, totalReadableBytes - ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 8),
           { originalBytes: rawBytes, compressedBytes },
         )
         try {
@@ -1663,7 +1687,11 @@ export function reserveDiagnosticNoteSlots({
           })
           if (written) return { ...written, enospcCompacted: true }
         } catch {
-          /* fall through to Pass 2 */
+          /* try sharded gzip across all readable slots if compacted still > 1 slot */
+        }
+        if (readableSlots.length >= 2) {
+          const shardedCompacted = writeShardedGzipToSlots(readableSlots, compacted, id)
+          if (shardedCompacted) return { ...shardedCompacted, enospcCompacted: true }
         }
       }
       // Pass 2: if EVERY store lost directory search/read permissions mid-pickup (e.g.

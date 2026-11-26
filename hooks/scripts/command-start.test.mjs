@@ -6449,6 +6449,14 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('Extreme incompressible ENOSPC'))), { mode: 0o600 })
 
       const hugeRandomBlob = randomBytes(550_000).toString('base64')
+      // Include 250 distinct structured blocking records (first, middle #125 with its own
+      // actionable reason, and final #250!) so compaction NEVER drops middle blocking items!
+      const manyBlockingItems = Array.from({ length: 250 }, (_, idx) => {
+        if (idx === 0) return { id: 'blk-extreme-first', blob: hugeRandomBlob }
+        if (idx === 125) return { id: 'blk-extreme-middle-125', reason: 'middle_blocker_actionable_reason_must_survive' }
+        if (idx === 249) return { id: 'blk-extreme-final', reason: 'must_survive_extreme_enospc_compaction' }
+        return { id: `blk-extreme-${String(idx).padStart(3, '0')}`, reason: `distinct_reason_${idx}` }
+      })
       const origOpenSync = fs.openSync
       const origWriteFileSync = fs.writeFileSync
       const origWriteSync = fs.writeSync
@@ -6489,10 +6497,7 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
                   command_message_id: 'msg-extreme-1',
                   refusal: {
                     code: 'blocked_by_items',
-                    blocking_items: [
-                      { id: 'blk-extreme-first', blob: hugeRandomBlob },
-                      { id: 'blk-extreme-final', reason: 'must_survive_extreme_enospc_compaction' },
-                    ],
+                    blocking_items: manyBlockingItems,
                   },
                 },
               ],
@@ -6510,13 +6515,27 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       assert.equal(pass1.pickup_diagnostic_note?.enospcCompacted, true)
       assert.ok(pass1.pickup_diagnostic_note?.command, 'stderr MUST include a working read command for the compacted refusal note')
       assert.ok(pass1Stderr.includes(pass1.pickup_diagnostic_note.command))
-      const shRead = spawnSync('sh', ['-c', pass1.pickup_diagnostic_note.command], { encoding: 'utf8' })
-      assert.equal(shRead.status, 0, shRead.stderr)
-      assert.match(shRead.stdout, /blk-extreme-first/)
-      assert.match(shRead.stdout, /blk-extreme-final/, 'saved compacted note MUST preserve final blocker')
-      assert.match(shRead.stdout, /enospc_compacted/)
+      // Follow EVERY page of the saved compacted note through sh and verify ALL 250 records (first, middle 125, final) survived!
+      let compactCmd = pass1.pickup_diagnostic_note.command
+      let compactOut = ''
+      let compactPages = 0
+      while (compactCmd) {
+        compactPages += 1
+        assert.ok(compactPages <= pass1.pickup_diagnostic_note.parts + 2)
+        const shRead = spawnSync('sh', ['-c', compactCmd], { encoding: 'utf8' })
+        assert.equal(shRead.status, 0, shRead.stderr)
+        assert.equal(fitsShellOutput(shRead.stdout), true, `compacted page ${compactPages} must fit Shell ceiling`)
+        compactOut += shRead.stdout
+        const next = /next part \(\d+\/\d+\): ([^\n]+ \| head -c \d+) ---\n$/.exec(shRead.stdout)
+        compactCmd = next ? next[1] : null
+      }
+      assert.match(compactOut, /blk-extreme-first/)
+      assert.match(compactOut, /blk-extreme-middle-125/, 'saved compacted note MUST NOT drop middle blocking records')
+      assert.match(compactOut, /middle_blocker_actionable_reason_must_survive/)
+      assert.match(compactOut, /blk-extreme-final/, 'saved compacted note MUST preserve final blocker')
+      assert.match(compactOut, /enospc_compacted/)
 
-      // Fresh OS process after disk space returns MUST recover and surface the preserved refusal including blk-extreme-final!
+      // Fresh OS process after disk space returns MUST recover and surface ALL 250 preserved blocking records!
       const child = spawnSync(
         process.execPath,
         [
@@ -6548,6 +6567,8 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       const surfaced = out.note?.id ? readNoteText(out.note.id, { home }) : out.stderr
       assert.match(surfaced, /recovered previously unsaved pickup refusal/)
       assert.match(surfaced, /blk-extreme-first/)
+      assert.match(surfaced, /blk-extreme-middle-125/, 'fresh process MUST surface middle blocking record #125')
+      assert.match(surfaced, /middle_blocker_actionable_reason_must_survive/)
       assert.match(surfaced, /blk-extreme-final/, 'fresh process MUST surface final blocker after disk space returns')
       assert.deepEqual(out.remaining, [], 'on-disk compacted spool entry MUST be cleared once surfaced cleanly')
       clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
