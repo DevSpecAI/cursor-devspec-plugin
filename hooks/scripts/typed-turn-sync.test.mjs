@@ -2531,4 +2531,97 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny)
   })
+
+  it('reconciles completed launch notifications even when turn_ended is already written by the first poll (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111d1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222d2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'ended-launch-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'ended-launch-2', kind: 'shell', notifies: true, request: CMD_BOB, also: [] }, { dir })
+
+    const wake1 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>ended-launch-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    const wake2 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>ended-launch-2</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${wake1}\n${wake2}\n${turnEndedRow()}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'not_typed_live')
+    assert.equal(memo.synced, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.launches.get('ended-launch-1')?.notified, true, 'first ended-turn launch must be marked notified')
+    assert.equal(after.launches.get('ended-launch-2')?.notified, true, 'second ended-turn launch must be marked notified')
+  })
+
+  it('does not treat a second same-turn notification as already carried when it adds another person via also (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111e1'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222e2'
+
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+    // Both launches share primary request CMD_BOB, while the second ALSO carries CMD_ALICE!
+    appendRequestEvent(CONN, { op: 'launch', key: 'shared-primary-1', kind: 'shell', notifies: true, request: CMD_BOB, also: [] }, { dir })
+    appendRequestEvent(CONN, { op: 'launch', key: 'shared-primary-2', kind: 'shell', notifies: true, request: CMD_BOB, also: [CMD_ALICE] }, { dir })
+
+    const bobRow = typedRow('Bob prompt before two notifications sharing primary request')
+    const wake1 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>shared-primary-1</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    const wake2 = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [{ type: 'text', text: '<task-notification><task-id>shared-primary-2</task-id><status>completed</status></task-notification>' }],
+      },
+    })
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${wake1}\n${wake2}\n`)
+
+    const memo = {}
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(res.action, 'restored_wake_request')
+    assert.equal(res.midTurn, true)
+    assert.equal(memo.synced, true)
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.joined.has(CMD_BOB), true)
+    assert.equal(after.joined.has(CMD_ALICE), true, 'secondary requester in also must be joined, not skipped as already_carried')
+    assert.equal(after.launches.get('shared-primary-1')?.notified, true)
+    assert.equal(after.launches.get('shared-primary-2')?.notified, true)
+    assert.ok(turnAmbiguity(after)?.length >= 2)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write must ask which person it serves instead of stamping terminal owner')
+  })
 })

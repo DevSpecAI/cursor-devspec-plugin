@@ -1071,6 +1071,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let lastNonResumedPrecededByTurnEnded = false
   let sameTurnTypedRowIndex = -1
   let sameTurnOtherRows = []
+  const allOtherRows = []
   const userRows = []
   let start = 0
   while (start < bytes.length) {
@@ -1117,7 +1118,9 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
             } else if (kind === 'other') {
-              sameTurnOtherRows.push({ rowIndex, digest: lastUser, rawText })
+              const otherEntry = { rowIndex, digest: lastUser, rawText }
+              sameTurnOtherRows.push(otherEntry)
+              allOtherRows.push(otherEntry)
             }
           }
           userRows.push({ start, kind, digest: lastUser })
@@ -1185,6 +1188,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     lastNonResumedPrecededByTurnEnded,
     sameTurnTypedRowIndex,
     sameTurnOtherRows,
+    allOtherRows,
   }
 }
 
@@ -1246,6 +1250,12 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
           rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
         }))
       : []
+  const notificationWakes = Array.isArray(read.allOtherRows)
+    ? read.allOtherRows.map((entry) => ({
+        key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+        rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+      }))
+    : []
   const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
   return {
     kind: lastRow ? lastRow.kind : 'none',
@@ -1254,6 +1264,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
     typedTurnKeys,
     liveTurnTypedKey,
     sameTurnWakes,
+    notificationWakes,
     precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
     stamp: read.stamp,
     turns: read.turns,

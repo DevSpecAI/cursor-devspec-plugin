@@ -1166,6 +1166,65 @@ export async function syncTypedTurnFromTranscript({
     return { action: 'binding_write_failed', key: active.key, active }
   }
 
+  // Resolve explicit host-injected `<task-notification>` wakes whose `<task-id>` /
+  // `<tool-use-id>` / `owner_message` / `automation_run` positively matches a recorded
+  // launch or command in `requests.mjs` (`requestForWake`, decision ce71a72b).
+  // Never guess from pending launches when a generic `command_turn` row or ID-less
+  // notification carries no matching job ID: leaving the requester unstated prevents
+  // misattributing another person's or unrelated background work (decisions ce71a72b / 2fcd26bd).
+  const resolveWakeForText = (rawText, reqState) => {
+    if (typeof rawText !== 'string' || !rawText) return null
+    const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
+    if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
+    return null
+  }
+
+  const sameTurnWakeRows = Array.isArray(active.sameTurnWakes) ? active.sameTurnWakes : []
+  const liveWakeKeySet = new Set(sameTurnWakeRows.map((w) => w?.key).filter(Boolean))
+  const historicalWakeRows = (Array.isArray(active.notificationWakes) ? active.notificationWakes : []).filter(
+    (w) => w?.key && (active.ended || !liveWakeKeySet.has(w.key)),
+  )
+
+  // Reconcile any unseen historical/ended `<task-notification>` rows BEFORE returning on
+  // an ended turn or setting `memo.synced = true`, marking completed launches `notified`
+  // without altering live turn foreground state (requirement 3ea2b201).
+  for (const wakeRow of historicalWakeRows) {
+    const preState = readRequestState(connectionId, { dir })
+    if (preState.seenTranscriptTurns.has(wakeRow.key)) continue
+    if (!resolveWakeForText(wakeRow.rawText, preState)) continue
+    const histRes = await withTypedSyncLock(
+      connectionId,
+      dir,
+      async () => {
+        const reqState = readRequestState(connectionId, { dir })
+        if (reqState.seenTranscriptTurns.has(wakeRow.key)) {
+          return { action: 'already_synced', key: wakeRow.key }
+        }
+        const wake = resolveWakeForText(wakeRow.rawText, reqState)
+        if (!wake) return { action: 'not_a_wake', key: wakeRow.key }
+        const notifiedEvents = promptArrival({
+          fromAPerson: false,
+          origin: wake.origin,
+          text: wake.text,
+          midTurn: true,
+          state: reqState,
+        }).events.filter((event) => event.op === 'notified')
+        for (const event of notifiedEvents) {
+          if (!appendRequestEvent(connectionId, event, { dir })) {
+            return { action: 'binding_write_failed', key: wakeRow.key, active }
+          }
+        }
+        if (!appendRequestEvent(connectionId, { op: 'transcript_turn', key: wakeRow.key, ref: null, historical: true }, { dir })) {
+          return { action: 'binding_write_failed', key: wakeRow.key, active }
+        }
+        return { action: 'reconciled_historical_wake', key: wakeRow.key }
+      },
+      { deadlineMs },
+    )
+    if (!histRes) return { action: 'lock_busy', key: wakeRow.key }
+    if (histRes.action === 'binding_write_failed') return histRes
+  }
+
   if (active.ended || !active.key) {
     const flush = await retryQueuedFailedTurn({ excludeKey: null })
     if (flush.ran) {
@@ -1220,20 +1279,6 @@ export async function syncTypedTurnFromTranscript({
     }
   }
 
-  // Resolve explicit host-injected `<task-notification>` wakes whose `<task-id>` /
-  // `<tool-use-id>` / `owner_message` / `automation_run` positively matches a recorded
-  // launch or command in `requests.mjs` (`requestForWake`, decision ce71a72b).
-  // Never guess from pending launches when a generic `command_turn` row or ID-less
-  // notification carries no matching job ID: leaving the requester unstated prevents
-  // misattributing another person's or unrelated background work (decisions ce71a72b / 2fcd26bd).
-  const resolveWakeForText = (rawText, reqState) => {
-    if (typeof rawText !== 'string' || !rawText) return null
-    const taskMatch = requestForWake({ origin: 'task-notification', text: rawText, state: reqState })
-    if (taskMatch.ref !== UNSTATED) return { origin: 'task-notification', text: rawText, match: taskMatch, direct: true }
-    return null
-  }
-
-  const sameTurnWakeRows = Array.isArray(active.sameTurnWakes) ? active.sameTurnWakes : []
   const applyTranscriptWakeRow = async (wakeRow) =>
     withTypedSyncLock(
       connectionId,
@@ -1246,9 +1291,12 @@ export async function syncTypedTurnFromTranscript({
         const wake = resolveWakeForText(wakeRow.rawText, reqState)
         if (!wake) return { action: 'not_a_wake' }
         const wakeRef = wake.match.ref === UNSTATED ? null : wake.match.ref
+        const alsoList = Array.isArray(wake.match.also) ? wake.match.also : []
+        const allAlsoCarried = alsoList.every((id) => reqState.current === id || reqState.joined.has(id))
         const alreadyCarried =
           wakeRef !== null &&
           reqState.current !== null &&
+          allAlsoCarried &&
           (reqState.joined.has(wakeRef) ||
             (reqState.current === wakeRef && (reqState.joined.size > 0 || reqState.chosen)))
         if (alreadyCarried) {
