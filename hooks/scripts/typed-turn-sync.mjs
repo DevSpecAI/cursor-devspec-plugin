@@ -1289,10 +1289,34 @@ export async function syncTypedTurnFromTranscript({
         let requestId = existingTyped
         let openedNow = false
         let openRefusal = null
+        // Requests that ALREADY joined this live terminal turn before registration ran:
+        // when `reqState.current === null` (idle / prior turn already cleared), any open
+        // unanswered id in `reqState.joined` not tagged as left over from an earlier
+        // answered turn (`priorTurnJoined`) joined THIS live turn before the poller
+        // opened the terminal request and MUST be preserved. Conversely, when
+        // `reqState.current !== null`, everything in `reqState.joined` belonged to that
+        // previous un-cleared turn and MUST NOT be inherited into the new turn (ce71a72b).
+        const preExistingLiveJoinedIds = (rState, targetId) =>
+          rState.current === null
+            ? [...rState.joined].filter(
+                (id) =>
+                  id !== targetId &&
+                  !rState.priorTurnJoined?.has(id) &&
+                  rState.open.has(id) &&
+                  !rState.open.get(id)?.answered,
+              )
+            : []
         if (alreadyOpenForTurn && !safeUnboundHook && reqState.current !== requestId) {
+          const keepJoined = preExistingLiveJoinedIds(reqState, requestId)
           const currentWritten = appendRequestEvent(
             connectionId,
-            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
+            midTurn
+              ? { op: 'joined', id: requestId }
+              : {
+                  op: 'current',
+                  ref: requestId,
+                  ...(keepJoined.length > 0 ? { preserve_joined_ids: keepJoined } : {}),
+                },
             { dir },
           )
           if (!currentWritten) {
@@ -1335,9 +1359,16 @@ export async function syncTypedTurnFromTranscript({
               ? reqState.current !== pendingOpen.requestId && !reqState.joined.has(pendingOpen.requestId)
               : reqState.current !== pendingOpen.requestId
             if (needsBinding) {
+              const keepJoined = preExistingLiveJoinedIds(reqState, pendingOpen.requestId)
               const currentWritten = appendRequestEvent(
                 connectionId,
-                midTurn ? { op: 'joined', id: pendingOpen.requestId } : { op: 'current', ref: pendingOpen.requestId },
+                midTurn
+                  ? { op: 'joined', id: pendingOpen.requestId }
+                  : {
+                      op: 'current',
+                      ref: pendingOpen.requestId,
+                      ...(keepJoined.length > 0 ? { preserve_joined_ids: keepJoined } : {}),
+                    },
                 { dir },
               )
               if (!currentWritten) {
@@ -1395,15 +1426,17 @@ export async function syncTypedTurnFromTranscript({
             effectiveMidTurn = hasActiveRemoteCommandTurn(connectionId, postOpenState, dir, postOpenActive ?? active)
             supersededByNewerTurn = newerCurrentLanded || transcriptMovedOn
             if (!supersededByNewerTurn) {
-              // Preserve ONLY requesters that NEWLY joined THIS running turn while
-              // `open_request` was in flight — never stale joined requesters left over
-              // from an earlier ended turn (decision ce71a72b).
-              const newlyJoinedIds = [...postOpenState.joined].filter(
+              // Preserve BOTH: (a) requesters that joined THIS live terminal turn BEFORE
+              // registration ran (when `reqState.current === null` and not in `priorTurnJoined`),
+              // and (b) requesters that NEWLY joined while `open_request` was in flight —
+              // never stale joined requesters left over from an earlier ended turn (ce71a72b).
+              const preJoinedSet = new Set(preExistingLiveJoinedIds(reqState, requestId))
+              const keepJoinedIds = [...postOpenState.joined].filter(
                 (id) =>
-                  !reqState.joined.has(id) &&
                   id !== requestId &&
                   postOpenState.open.has(id) &&
-                  !postOpenState.open.get(id)?.answered,
+                  !postOpenState.open.get(id)?.answered &&
+                  (preJoinedSet.has(id) || !reqState.joined.has(id)),
               )
               const currentWritten = appendRequestEvent(
                 connectionId,
@@ -1412,7 +1445,7 @@ export async function syncTypedTurnFromTranscript({
                   : {
                       op: 'current',
                       ref: requestId,
-                      ...(newlyJoinedIds.length > 0 ? { preserve_joined_ids: newlyJoinedIds } : {}),
+                      ...(keepJoinedIds.length > 0 ? { preserve_joined_ids: keepJoinedIds } : {}),
                     },
                 { dir },
               )
@@ -2314,7 +2347,17 @@ export async function finishIdleRequests({
           !postCloseState.open.has(targetRequestId) && Boolean(postCloseState.closed?.has(targetRequestId))
         const localClosed = alreadyClosedLocally
           ? true
-          : appendRequestEvent(connectionId, { op: 'close', id: targetRequestId, if_idle: true }, { dir })
+          : appendRequestEvent(
+              connectionId,
+              {
+                op: 'close',
+                id: targetRequestId,
+                if_idle: true,
+                expected_current: postCloseState.current,
+                allow_joined: postCloseState.joined.has(targetRequestId),
+              },
+              { dir },
+            )
         if (!localClosed) {
           return {
             status: 'refused',

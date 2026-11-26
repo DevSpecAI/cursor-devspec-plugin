@@ -125,6 +125,7 @@ export function reduceRequestLog(text) {
   let currentBoundByWake = false
   let currentWakeNotifiedKeys = new Set()
   let joined = new Set()
+  let priorTurnJoined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
   const hasActiveWorkFor = (requestId) => {
@@ -173,10 +174,16 @@ export function reduceRequestLog(text) {
         break
       case 'close':
         // Conditional idle close (`if_idle: true`): never close a request that gained a
-        // pending background launch, monitor, or schedule between the idle sweep's read
-        // and its append (requirements 3ea2b201 / ce71a72b).
-        if (event.if_idle === true && hasActiveWorkFor(event.id)) {
-          break
+        // pending background launch, monitor, or schedule, joined a live turn, or whose
+        // foreground turn changed between the idle sweep's read and its append
+        // (requirements 3ea2b201 / ce71a72b).
+        if (event.if_idle === true) {
+          const currentChanged =
+            Object.prototype.hasOwnProperty.call(event, 'expected_current') && current !== event.expected_current
+          const newlyJoined = joined.has(event.id) && event.allow_joined !== true
+          if (hasActiveWorkFor(event.id) || currentChanged || newlyJoined) {
+            break
+          }
         }
         if (event.if_idle === true && UUID.test(event.id ?? '') && open.has(event.id)) {
           idleClosedInfo.set(event.id, open.get(event.id))
@@ -187,6 +194,7 @@ export function reduceRequestLog(text) {
         open.delete(event.id)
         started.delete(event.id)
         joined.delete(event.id)
+        priorTurnJoined.delete(event.id)
         if (current === event.id) {
           current = null
           currentFromWake = false
@@ -196,8 +204,8 @@ export function reduceRequestLog(text) {
         break
       case 'current':
         // A new turn: what it carries starts again from what woke it, preserving ONLY
-        // explicit requester ids that newly joined the same running turn while its
-        // foreground request was opening (never stale joined requesters from prior turns).
+        // explicit requester ids that belong to THIS running turn (never stale joined
+        // requesters left over from an earlier ended turn).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
@@ -212,13 +220,16 @@ export function reduceRequestLog(text) {
         } else {
           joined = new Set()
         }
+        priorTurnJoined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
         break
       case 'joined':
         // Delivered into the running turn: the turn now carries it too.
         if (carriedRef(event.id) && event.id !== current) {
+          restoreIdleClosedRefs(event.id, [])
           joined.add(event.id)
+          priorTurnJoined.delete(event.id)
           chosen = false
           if (UUID.test(event.id)) started.add(event.id)
         }
@@ -255,8 +266,15 @@ export function reduceRequestLog(text) {
           currentFromWake = false
           currentBoundByWake = false
           currentWakeNotifiedKeys = new Set()
+          // Any other requests already in `joined` belonged to this answered turn,
+          // so a subsequent turn after `turn_ended` knows not to inherit them while
+          // still preserving any fresh join that arrives after `current` became null.
+          for (const jid of joined) {
+            if (jid !== event.id) priorTurnJoined.add(jid)
+          }
         }
         joined.delete(event.id)
+        priorTurnJoined.delete(event.id)
         break
       }
       case 'transcript_turn':
@@ -331,7 +349,7 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+  return { open, closed, started, launches, schedules, current, currentFromWake, currentBoundByWake, currentWakeNotifiedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {

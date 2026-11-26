@@ -4974,4 +4974,126 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, REQ_ALICE, 'wake write MUST still resolve to original requester')
   })
+
+  it('finishIdleRequests aborts conditional close without erasing a request that joined a live turn after its final read and right before saving close (3ea2b201 / ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const REQ_ALICE = '55555555-5555-4555-8555-5555555555a3'
+    const REQ_BOB_LIVE = '66666666-6666-4666-8666-6666666666a3'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Alice turn ended before Bob turn starts and joins Alice')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    appendRequestEvent(CONN, { op: 'open', id: REQ_ALICE, kind: 'typed_prompt', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: REQ_ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'transcript_turn', key: turnKey, ref: REQ_ALICE }, { dir })
+
+    const reqLogPath = path.join(dir, `${CONN}.requests.jsonl`)
+    const origAppendFileSync = fs.appendFileSync
+    let injectedJoin = false
+    fs.appendFileSync = (filePath, data, ...rest) => {
+      // Right after commitServerClose's last readRequestState and IMMEDIATELY BEFORE it writes
+      // `{ op: 'close', if_idle: true }`, a new live turn opens for Bob and joins REQ_ALICE!
+      if (!injectedJoin && String(filePath) === reqLogPath && String(data).includes('"op":"close"')) {
+        injectedJoin = true
+        origAppendFileSync(
+          filePath,
+          `${JSON.stringify({ op: 'open', id: REQ_BOB_LIVE, kind: 'typed_prompt', requested_by: BOB })}\n` +
+            `${JSON.stringify({ op: 'current', ref: REQ_BOB_LIVE })}\n` +
+            `${JSON.stringify({ op: 'joined', id: REQ_ALICE })}\n`,
+          ...rest,
+        )
+      }
+      return origAppendFileSync(filePath, data, ...rest)
+    }
+
+    let idleRes = null
+    try {
+      idleRes = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest: async () => ({ status: 'closed' }),
+        dir,
+        log: () => {},
+      })
+    } finally {
+      fs.appendFileSync = origAppendFileSync
+    }
+
+    assert.equal(injectedJoin, true, 'test hook must have injected live turn + join right before close write')
+    assert.deepEqual(idleRes.closed, [], 'idle sweep MUST NOT report closed when request joined a live turn before close')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.open.has(REQ_ALICE), true, 'joined request MUST stay open')
+    assert.equal(after.current, REQ_BOB_LIVE, 'live turn current request MUST stay intact')
+    assert.equal(after.joined.has(REQ_ALICE), true, 'joined requester MUST NOT be erased by conditional close')
+    assert.equal(turnAmbiguity(after)?.length, 2)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'writes MUST ask which requester they serve')
+  })
+
+  it('syncLiveTypedTurn preserves a room command that joined a live terminal turn BEFORE registration ran, while dropping stale joins from an earlier answered turn (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE_LIVE = '11111111-1111-4111-8111-1111111111a4'
+    const CMD_PREV_ANSWERED = '22222222-2222-4222-8222-2222222222a4'
+    const CMD_STALE_JOIN = '33333333-3333-4333-8333-3333333333a4'
+
+    // Part 1: Idle (`current === null`), Bob starts a live terminal turn, and Alice's room
+    // command joins the live turn BEFORE the poller opens Bob's terminal request!
+    fs.writeFileSync(transcriptPath, `${typedRow('Bob live terminal turn where Alice joined before poller opened it')}\n`)
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE_LIVE, kind: 'command', requested_by: ALICE }, { dir })
+    appendRequestEvent(CONN, { op: 'joined', id: CMD_ALICE_LIVE }, { dir })
+
+    const res1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo: {},
+    })
+    assert.equal(res1.action, 'opened')
+    const after1 = readRequestState(CONN, { dir })
+    assert.equal(after1.current, res1.requestId)
+    assert.equal(after1.joined.has(CMD_ALICE_LIVE), true, 'already-joined requester on this live turn MUST be preserved')
+    assert.equal(turnAmbiguity(after1)?.length, 2)
+    const stamp1 = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamp1.deny, 'next write MUST ask which requester it serves instead of stamping Bob alone')
+
+    // Part 2: Earlier turn answered its current command while CMD_STALE_JOIN was joined
+    // (leaving current === null and CMD_STALE_JOIN in priorTurnJoined), then turn_ended,
+    // then Bob starts a fresh terminal turn -> CMD_STALE_JOIN MUST NOT be inherited!
+    const { home: home2, dir: dir2, transcriptPath: tp2 } = makeEnv()
+    fs.writeFileSync(tp2, `${typedRow('Earlier turn that answered')}\n${turnEndedRow()}\n${typedRow('Fresh Bob terminal turn')}\n`)
+    appendRequestEvent(CONN, { op: 'open', id: CMD_PREV_ANSWERED, kind: 'command', requested_by: BOB }, { dir: dir2 })
+    appendRequestEvent(CONN, { op: 'open', id: CMD_STALE_JOIN, kind: 'command', requested_by: ALICE }, { dir: dir2 })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_PREV_ANSWERED }, { dir: dir2 })
+    appendRequestEvent(CONN, { op: 'joined', id: CMD_STALE_JOIN }, { dir: dir2 })
+    appendRequestEvent(CONN, { op: 'answered', id: CMD_PREV_ANSWERED }, { dir: dir2 })
+    assert.equal(readRequestState(CONN, { dir: dir2 }).current, null)
+
+    const res2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath: tp2,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir: dir2,
+      memo: {},
+    })
+    assert.equal(res2.action, 'opened')
+    const after2 = readRequestState(CONN, { dir: dir2 })
+    assert.equal(after2.current, res2.requestId)
+    assert.equal(after2.joined.has(CMD_STALE_JOIN), false, 'stale join from earlier answered turn MUST NOT be inherited')
+    const stamp2 = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home: home2 })
+    assert.equal(stamp2.deny, undefined)
+    assert.equal(stamp2.args?.request_ref, res2.requestId)
+  })
 })
