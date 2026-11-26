@@ -5133,10 +5133,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     const peeked = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
     assert.deepEqual(peeked, [oversizedLegacyRefusal, secondLegacyEntry])
 
-    // Partial clear removes only the specified entry and keeps the other intact on disk.
+    // Partial clear removes only the specified entry and migrates the unsurfaced entry to an
+    // immutable v2 per-entry file intact on disk while retiring the legacy v1 file.
     clearPendingUnsavedRefusals(spoolKey, [secondLegacyEntry], spoolOpts)
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [oversizedLegacyRefusal])
-    assert.equal(fs.existsSync(legacyFile), true)
+    assert.equal(fs.existsSync(legacyFile), false)
 
     // A successful readWakes retry surfaces the recovered v1 oversized refusal via a
     // readable diagnostic note with its read reference on stderr and clears the v1 file!
@@ -5313,5 +5314,163 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(wakeNoteBody, /blk-wake-tail-epipe/)
     assert.match(wakeNoteBody, /blk-wake-live-2/)
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
+
+  it('waits for async process.stderr flush before clearing pending refusals so async EPIPE never drops an oversized refusal (3ea2b201 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { spoolUnsavedRefusal, peekPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+    const { runOneShotRoomCommandPickup } = await import('./devspec-remote-wait.mjs')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const oversizedA = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [{ id: 'blk-async-stderr-wait', padding: 'A'.repeat(25000) }],
+    })
+    spoolUnsavedRefusal(spoolKey, oversizedA, spoolOpts)
+
+    const printedWakes = [buildOwnerMessageEvents(ownerBatch('Async stderr flush check'))]
+    const origStderrWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = (chunk, encoding, cb) => {
+      const done = typeof encoding === 'function' ? encoding : cb
+      setImmediate(() => done?.(Object.assign(new Error('async stderr EPIPE'), { code: 'EPIPE' })))
+      return true
+    }
+    try {
+      await assert.rejects(
+        () =>
+          runOneShotRoomCommandPickup({
+            connectionId: CONN,
+            printedWakes,
+            dir,
+            home,
+            startCommands: async ({ commands }) => ({
+              ok: true,
+              outcome: 'picked_up',
+              started: commands,
+              pickedUp: commands.length,
+              refusals: [],
+            }),
+          }),
+        /async stderr EPIPE/,
+      )
+      assert.deepEqual(
+        peekPendingUnsavedRefusals(spoolKey, spoolOpts),
+        [oversizedA],
+        'runOneShotRoomCommandPickup MUST keep refusal queued when default process.stderr fails asynchronously',
+      )
+
+      // Also verify readWakes default writeStderrChecked!
+      const wakeFile = path.join(home, `${CONN}-async-stderr.wakes`)
+      appendWakeEvents(wakeFile, buildOwnerMessageEvents(ownerBatch('Async stderr wake-tail check')))
+      await assert.rejects(
+        () =>
+          readWakes({
+            file: wakeFile,
+            connectionId: CONN,
+            dir,
+            home,
+            settleMs: 1,
+            scriptPath: '/tmp/tail.mjs',
+            write: async () => {},
+            startCommands: async ({ commands }) => ({
+              ok: true,
+              outcome: 'picked_up',
+              started: commands,
+              pickedUp: commands.length,
+              refusals: [],
+            }),
+          }),
+        /async stderr EPIPE/,
+      )
+      assert.deepEqual(
+        peekPendingUnsavedRefusals(spoolKey, spoolOpts),
+        [oversizedA],
+        'readWakes MUST keep refusal queued when default process.stderr fails asynchronously',
+      )
+    } finally {
+      process.stderr.write = origStderrWrite
+    }
+
+    // Next healthy retry publishes the read reference and drains the queue cleanly!
+    const okStderr = []
+    const ok = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes,
+      dir,
+      home,
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (t) => okStderr.push(t),
+    })
+    assert.equal(ok.ok, true)
+    assert.ok(ok.diagnosticNote?.file)
+    assert.match(okStderr.join(''), /cat /)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
+
+  it('legacy v1 spool cleanup uses atomic rename-claim + v2 migration so concurrent older-process appends are NEVER deleted (3c5147a7 / 4e32d1a5)', async () => {
+    const { home, dir } = mkHome()
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const { createHash } = await import('node:crypto')
+    const { peekPendingUnsavedRefusals, clearPendingUnsavedRefusals } = await import('./hook-context-budget.mjs')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const scopeTag = createHash('sha256').update(spoolKey, 'utf8').digest('hex').slice(0, 12)
+    const legacyFile = path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
+
+    const refusalOld = JSON.stringify({ code: 'old', blocking_items: [{ id: 'blk-legacy-old' }] })
+    const refusalBeforeClaim = JSON.stringify({
+      code: 'appended_before_claim',
+      blocking_items: [{ id: 'blk-legacy-before-claim', padding: 'B'.repeat(22000) }],
+    })
+    const refusalAfterClaim = JSON.stringify({
+      code: 'appended_after_claim',
+      blocking_items: [{ id: 'blk-legacy-after-claim', padding: 'C'.repeat(22000) }],
+    })
+
+    // Reader snapshots ONLY refusalOld. Before cleanup claims legacyFile, an older v1 process
+    // appends refusalBeforeClaim to legacyFile!
+    fs.writeFileSync(
+      legacyFile,
+      JSON.stringify({ version: 1, scope: scopeTag, entries: [refusalOld, refusalBeforeClaim] }),
+      { mode: 0o600 },
+    )
+
+    // And IMMEDIATELY AFTER cleanup atomically renames legacyFile to its claim path, another
+    // older v1 process writes refusalAfterClaim to legacyFile!
+    const origRenameSync = fs.renameSync
+    let wroteAfterClaim = false
+    fs.renameSync = (from, to) => {
+      origRenameSync(from, to)
+      if (!wroteAfterClaim && String(from) === legacyFile) {
+        wroteAfterClaim = true
+        fs.writeFileSync(
+          legacyFile,
+          JSON.stringify({ version: 1, scope: scopeTag, entries: [refusalAfterClaim] }),
+          { mode: 0o600 },
+        )
+      }
+    }
+    try {
+      clearPendingUnsavedRefusals(spoolKey, [refusalOld], spoolOpts)
+    } finally {
+      fs.renameSync = origRenameSync
+    }
+
+    assert.equal(wroteAfterClaim, true, 'test hook must have simulated concurrent v1 write after atomic claim')
+    const remaining = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
+    assert.equal(remaining.includes(refusalOld), false, 'surfaced refusalOld should be cleared')
+    assert.equal(remaining.includes(refusalBeforeClaim), true, 'refusalBeforeClaim MUST be migrated to v2 and preserved')
+    assert.equal(remaining.includes(refusalAfterClaim), true, 'refusalAfterClaim written after atomic claim MUST remain untouched')
   })
 })

@@ -1887,6 +1887,33 @@ export async function printOneShot(
   return plan
 }
 
+function writeStderrChecked(text) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onError = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
+    process.stderr.once('error', onError)
+    try {
+      process.stderr.write(text, (error) => {
+        process.stderr.removeListener('error', onError)
+        if (settled) return
+        settled = true
+        if (error) reject(error)
+        else resolve()
+      })
+    } catch (error) {
+      process.stderr.removeListener('error', onError)
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
+}
+
 /**
  * Start canonical room commands from ONLY the wakes printed in this one-shot Shell call,
  * capturing command-start logs and routing all stderr diagnostics once through the shared
@@ -1903,7 +1930,7 @@ export async function runOneShotRoomCommandPickup({
   home = os.homedir(),
   state = null,
   startCommands = startRoomCommands,
-  writeStderr = (text) => process.stderr.write(text),
+  writeStderr = writeStderrChecked,
   reservedStore: callerReservedStore = null,
 } = {}) {
   const extracted = printedRoomCommands(printedWakes, fallbackSessionId, { home })
@@ -2022,7 +2049,7 @@ export async function runOneShotRoomCommandPickup({
     }
     if (diagText) {
       try {
-        writeStderr(diagText)
+        await writeStderr(diagText)
         stderrText = diagText
       } catch (err) {
         if (refusals) {

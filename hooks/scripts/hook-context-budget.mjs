@@ -1036,6 +1036,10 @@ function legacySpoolFilePath(dir, scopeTag) {
   return path.join(dir, `devspec-unsaved-refusals-${scopeTag}.json`)
 }
 
+function legacyClaimFilePrefix(scopeTag) {
+  return `.devspec-legacy-claim-${scopeTag}-`
+}
+
 /**
  * Reassemble a Pass-2 pending-refusal note losslessly by stripping ONLY the header and
  * page footers tagged with that file's exact per-file cryptographic `nonce`, then
@@ -1514,17 +1518,22 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
   }
   const scopeTag = spoolScopeTag(key)
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
-  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
-    // Also read any oversized refusals saved in the preceding v1 shared spool format
-    // (`devspec-unsaved-refusals-<scope>.json`) so upgrades never silently drop pending
-    // structured refusals already on disk (reqs 3c5147a7 / 4e32d1a5).
-    const legacyParsed = readPrivateJson(legacySpoolFilePath(dir, scopeTag))
+  const readLegacyEntries = (filePath) => {
+    const legacyParsed = readPrivateJson(filePath)
     if (Array.isArray(legacyParsed?.entries)) {
       for (const entry of legacyParsed.entries) pushUnique(entry)
     } else if (typeof legacyParsed?.text === 'string' && legacyParsed.text) {
       pushUnique(legacyParsed.text)
     }
+  }
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    // Also read any oversized refusals saved in the preceding v1 shared spool format
+    // (`devspec-unsaved-refusals-<scope>.json`) or an in-flight legacy claim file so
+    // upgrades never silently drop pending structured refusals already on disk
+    // (reqs 3c5147a7 / 4e32d1a5).
+    readLegacyEntries(legacySpoolFilePath(dir, scopeTag))
     let names = []
     try {
       names = fs.readdirSync(dir).sort()
@@ -1532,6 +1541,10 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
       continue
     }
     for (const name of names) {
+      if (name.startsWith(claimPrefix) && name.endsWith('.json')) {
+        readLegacyEntries(path.join(dir, name))
+        continue
+      }
       if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
         const parsed = readPrivateJson(path.join(dir, name))
         if (typeof parsed?.text === 'string' && parsed.text) {
@@ -1579,31 +1592,57 @@ export function clearPendingUnsavedRefusals(
   }
   const scopeTag = spoolScopeTag(key)
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
   const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
+  // Atomically claim a legacy v1 spool file via `renameSync` before reading/migrating any
+  // unsurfaced entries to immutable v2 per-entry files, then unlink ONLY the claimed path.
+  // An older v1 process appending concurrently either lands inside our claimed file (where
+  // it is migrated to v2 and preserved) or writes a brand-new legacy file after our rename
+  // (which we never unlink), eliminating the upgrade TOCTOU window (reqs 3c5147a7 / 4e32d1a5).
+  const drainLegacySpoolFile = (dir, filePath, { claimFirst }) => {
+    let targetPath = filePath
+    if (claimFirst) {
+      const claimPath = path.join(dir, `${claimPrefix}${process.pid}-${randomBytes(8).toString('hex')}.json`)
+      try {
+        fs.renameSync(filePath, claimPath)
+        targetPath = claimPath
+      } catch {
+        return
+      }
+    }
+    try {
+      if (!clearedSet) {
+        fs.rmSync(targetPath, { force: true })
+        return
+      }
+      const legacyParsed = readPrivateJson(targetPath)
+      if (!legacyParsed) return
+      const entries = Array.isArray(legacyParsed.entries)
+        ? legacyParsed.entries.filter((e) => typeof e === 'string' && e)
+        : typeof legacyParsed.text === 'string' && legacyParsed.text
+          ? [legacyParsed.text]
+          : null
+      if (!entries) return
+      const remaining = entries.filter((entry) => !clearedSet.has(entry))
+      for (const entry of remaining) {
+        const entryHash = spoolEntryHash(entry)
+        writePrivateJson(spoolEntryFilePath(dir, scopeTag, entryHash), {
+          version: 2,
+          scope: scopeTag,
+          hash: entryHash,
+          at: new Date().toISOString(),
+          text: entry,
+        })
+      }
+      fs.rmSync(targetPath, { force: true })
+    } catch {
+      /* leave claimed file intact on disk so the next pass still recovers every entry */
+    }
+  }
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
     const legacyFile = legacySpoolFilePath(dir, scopeTag)
     if (fs.existsSync(legacyFile)) {
-      try {
-        if (!clearedSet) {
-          fs.rmSync(legacyFile, { force: true })
-        } else {
-          const legacyParsed = readPrivateJson(legacyFile)
-          if (Array.isArray(legacyParsed?.entries)) {
-            const remaining = legacyParsed.entries.filter(
-              (entry) => typeof entry === 'string' && entry && !clearedSet.has(entry),
-            )
-            if (remaining.length === 0) {
-              fs.rmSync(legacyFile, { force: true })
-            } else if (remaining.length !== legacyParsed.entries.length) {
-              writePrivateJson(legacyFile, { version: 1, scope: scopeTag, entries: remaining })
-            }
-          } else if (typeof legacyParsed?.text === 'string' && clearedSet.has(legacyParsed.text)) {
-            fs.rmSync(legacyFile, { force: true })
-          }
-        }
-      } catch {
-        /* leave intact for next cleanup if transiently unreadable/unwritable */
-      }
+      drainLegacySpoolFile(dir, legacyFile, { claimFirst: true })
     }
     if (clearedHashes) {
       // Unlink ONLY the exact per-entry content-addressed files surfaced by this pass;
@@ -1625,6 +1664,10 @@ export function clearPendingUnsavedRefusals(
       continue
     }
     for (const name of names) {
+      if (name.startsWith(claimPrefix) && name.endsWith('.json')) {
+        drainLegacySpoolFile(dir, path.join(dir, name), { claimFirst: false })
+        continue
+      }
       if (!clearedHashes && name.startsWith(entryPrefix) && name.endsWith('.json')) {
         try {
           fs.rmSync(path.join(dir, name), { force: true })

@@ -622,13 +622,40 @@ function writeStdout(text) {
  * (`listenerAdvice`, read from its lease under the same lock), the header says so and
  * names it by `scriptPath`, the copy this reader runs from.
  */
+function writeStderrChecked(text) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onError = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
+    process.stderr.once('error', onError)
+    try {
+      process.stderr.write(text, (error) => {
+        process.stderr.removeListener('error', onError)
+        if (settled) return
+        settled = true
+        if (error) reject(error)
+        else resolve()
+      })
+    } catch (error) {
+      process.stderr.removeListener('error', onError)
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
+}
+
 export async function readWakes({
   file,
   connectionId = null,
   home = os.homedir(),
   dir = connectionsDirFor(home),
   write = writeStdout,
-  writeStderr = (text) => process.stderr.write(text),
+  writeStderr = writeStderrChecked,
   settleMs = POLL_MS,
   scriptPath = SCRIPT_PATH,
   isAlive = pidAlive,
@@ -742,7 +769,7 @@ export async function readWakes({
       if (fittedWithStdout.text) {
         await write(page.text)
         pickupDiagnosticNote = fittedWithStdout.note
-        writeStderr(fittedWithStdout.text)
+        await writeStderr(fittedWithStdout.text)
         pickupDiagnosticWritten = true
       } else {
         const fittedFullBudget = fitShellDiagnostic('', noteDiag, {
@@ -768,7 +795,7 @@ export async function readWakes({
             noteError: fittedFullBudget.noteError,
           })
         if (fallbackNotice) {
-          writeStderr(fallbackNotice)
+          await writeStderr(fallbackNotice)
           pickupDiagnosticWritten = true
         }
       }
@@ -847,7 +874,7 @@ export async function readWakes({
       })
       if (!storeProbe.ok) {
         const preflightErr = formatDiagnosticStorePreflightError('devspec-wake-tail', storeProbe.errors)
-        if (preflightErr) writeStderr(preflightErr)
+        if (preflightErr) await writeStderr(preflightErr)
         return {
           ...page,
           text: pageText,
@@ -973,7 +1000,7 @@ export async function readWakes({
       }
       if (diagText) {
         try {
-          writeStderr(diagText)
+          await writeStderr(diagText)
           pickupDiagnosticWritten = true
         } catch (err) {
           spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
@@ -997,7 +1024,7 @@ export async function readWakes({
       })
       pickupDiagnosticNote = fitted.note
       if (fitted.text) {
-        writeStderr(fitted.text)
+        await writeStderr(fitted.text)
         pickupDiagnosticWritten = true
         const savedReadableNow =
           (Boolean(fitted.note) && !fitted.note.pendingPermissionRecovery) ||
