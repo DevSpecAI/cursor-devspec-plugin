@@ -2724,4 +2724,153 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.equal(pickupCalls[0][0].messageId, MSG_ID)
     assert.equal(fs.existsSync(pendingInnerFile), false, 'pending inner wake-note record must clear once picked up')
   })
+
+  it('stepDeliveryHook keeps unreadable inner wake_in_note as pending read (never triggering report_pickup on next unrelated step) until inner note is readable and read whole (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Oversized missing inner note ' + 'u'.repeat(21_000))
+    const built = buildOwnerMessageEvents(batch)
+    const innerWrapped = wakeInNote(built, { home })
+    const innerNoteId = innerWrapped.note.id
+    const innerFiles = noteFiles(home, innerNoteId)
+    const innerBackups = innerFiles.map((file) => ({ file, content: fs.readFileSync(file, 'utf8') }))
+
+    holdForNextStep(CONN, batch, innerWrapped.events, { dir })
+
+    let pickupCalls = 0
+    const startCommands = async (opts) => {
+      pickupCalls += 1
+      return { ok: true, outcome: 'picked_up', started: opts.commands, pickedUp: opts.commands.length }
+    }
+
+    // Step 1: hand over outer step note.
+    const handOverRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true, startCommands },
+    )
+    const outerNoteId = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOverRaw).additional_context)[1]
+
+    // Remove the inner note files BEFORE the outer note is read so the inner note is unreadable!
+    for (const file of innerFiles) fs.rmSync(file, { force: true })
+
+    // Step 2: Agent reads outer step note while inner note is missing -> MUST NOT call startCommands!
+    for (const file of noteFiles(home, outerNoteId)) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands,
+      })
+    }
+    assert.equal(pickupCalls, 0, 'reading outer note while inner note is missing must NOT call report_pickup')
+
+    // Step 3: Next UNRELATED tool step while inner note is STILL missing -> STILL must NOT call startCommands!
+    const retryRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo unrelated' }, tool_output: 'ok' },
+      { home, dir, listenerActive: () => true, startCommands },
+    )
+    assert.equal(pickupCalls, 0, 'next unrelated step while inner note is still missing must NOT call report_pickup')
+    assert.ok(retryRaw, 'should continue surfacing the unreadable inner-note refusal')
+
+    // Step 4: Restore inner note files -> next unrelated step registers pending inner wake note (STILL no pickup before reading inner note!).
+    for (const { file, content } of innerBackups) fs.writeFileSync(file, content, { mode: 0o600 })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo check' }, tool_output: 'ok' },
+      { home, dir, listenerActive: () => true, startCommands },
+    )
+    assert.equal(pickupCalls, 0, 'restoring inner note must register pending read, NOT immediately call report_pickup')
+    const pendingInnerFile = path.join(dir, `${CONN}.steps`, `wake-note-${innerNoteId}.json`)
+    assert.equal(fs.existsSync(pendingInnerFile), true)
+
+    // Step 5: Agent reads inner note whole -> NOW report_pickup runs once!
+    for (const file of innerFiles) {
+      await stepDeliveryHook(catCall(home, file, { conversation: CONVERSATION }), {
+        home,
+        dir,
+        listenerActive: () => true,
+        startCommands,
+      })
+    }
+    assert.equal(pickupCalls, 1)
+    assert.equal(fs.existsSync(pendingInnerFile), false)
+  })
+
+  it('stepDeliveryHook uses connections-directory diagnostic-notes fallback when HOME and TMPDIR note stores are unwritable so oversized refusals still return agent-facing context (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { home, dir } = mkHome()
+    const batch = ownerBatch('Mid-turn refusal with blocked HOME and TMPDIR')
+    const built = buildOwnerMessageEvents(batch)
+    holdForNextStep(CONN, batch, built, { dir })
+
+    // Hand over step note while HOME is still writable.
+    const handOverRaw = await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo hi' }, tool_output: 'hi' },
+      { home, dir, listenerActive: () => true },
+    )
+    const outerNoteId = /~\/\.devspec\/notes\/([0-9a-f]{16})\.md/.exec(JSON.parse(handOverRaw).additional_context)[1]
+    const outerParts = noteFiles(home, outerNoteId).map((file) => ({
+      file,
+      call: catCall(home, file, { conversation: CONVERSATION }),
+    }))
+
+    // Make TMPDIR unwritable now, and make ~/.devspec/notes unwritable inside startCommands
+    // (after readThrough verifies the outer note, right before formatPickupRefusals writes),
+    // leaving ONLY `dir/diagnostic-notes` writable!
+    const blockedTmp = path.join(dir, 'tmp-not-a-dir')
+    fs.writeFileSync(blockedTmp, 'not-a-directory\n')
+    const prevTmp = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP }
+    process.env.TMPDIR = blockedTmp
+    process.env.TMP = blockedTmp
+    process.env.TEMP = blockedTmp
+    try {
+      let lastRaw = null
+      for (const part of outerParts) {
+        lastRaw = await stepDeliveryHook(part.call, {
+          home,
+          dir,
+          share: 400,
+          listenerActive: () => true,
+          startCommands: async () => {
+            fs.rmSync(path.join(home, '.devspec', 'notes'), { recursive: true, force: true })
+            fs.writeFileSync(path.join(home, '.devspec', 'notes'), 'not-a-directory\n')
+            return {
+              ok: false,
+              outcome: 'refused',
+              started: [],
+              pickedUp: 0,
+              refusals: [
+                {
+                  command_message_id: MSG_ID,
+                  command_turn_id: TURN_ID,
+                  refusal: {
+                    code: 'turn_busy_step_fallback',
+                    blocking_items: [
+                      {
+                        id: 'blk-step-huge-1',
+                        reason: 'active_edit',
+                        f1: 'a', f2: 'b', f3: 'c', f4: 'd', f5: 'e', f6: 'f', f7: 'g', f8: 'h',
+                        f9: 'i', f10: 'j', f11: 'k', f12: 'l', f13: 'm', f14: 'n', f15: 'o', f16: 'p',
+                      },
+                    ],
+                    detail: 'x'.repeat(4_000),
+                  },
+                },
+              ],
+            }
+          },
+        })
+      }
+      assert.ok(lastRaw, 'stepDeliveryHook must NEVER return null when connections-directory fallback note store is writable')
+      const ctx = JSON.parse(lastRaw).additional_context
+      assert.ok(ctx && ctx.length <= 400, `context must fit hook share (400); got len=${ctx?.length}`)
+      const catMatch = /cat '([^']+)'/.exec(ctx)
+      assert.ok(catMatch, `hook context must include exact cat read command from connections fallback store; got: ${ctx}`)
+      const saved = fs.readFileSync(catMatch[1], 'utf8')
+      assert.match(saved, /turn_busy_step_fallback/)
+      assert.match(saved, /blk-step-huge-1/)
+    } finally {
+      for (const [k, v] of Object.entries(prevTmp)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+    }
+  })
 })

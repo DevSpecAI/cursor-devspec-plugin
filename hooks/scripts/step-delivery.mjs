@@ -110,6 +110,7 @@ import {
   POST_TOOL_CONTEXT_SHARE,
   postToolUseOutput,
   readThrough,
+  shellDiagnosticPointer,
   writeFallbackDiagnosticNote,
   writeNote,
 } from './hook-context-budget.mjs'
@@ -904,13 +905,89 @@ export async function stepDeliveryHook(
   const takenRecord = take(path.join(steps, HANDED))
   let record = null
   let readChanged = false
+  const partitionOwnerItems = (items) => {
+    const immediateOwnerItems = []
+    const unreadableItems = []
+    const unreadableRefusals = []
+    for (const item of items) {
+      if (item.kind !== 'owner_messages') continue
+      const hasInnerWakeNote =
+        Array.isArray(item.events) &&
+        item.events.some(
+          (event) =>
+            event?.type === 'wake_in_note' &&
+            Array.isArray(event.carries) &&
+            event.carries.includes('owner_message'),
+        )
+      if (!hasInnerWakeNote) {
+        immediateOwnerItems.push(item)
+        continue
+      }
+      // The outer step note contained a `wake_in_note` pointer for an oversized
+      // room command whose body lives in an inner note. Do NOT trigger report_pickup
+      // or drop pending tracking yet: register each inner note via registerPendingWakeNote
+      // so pickup runs ONLY once the agent finishes reading the inner note whole (3ea2b201).
+      const extracted = extractRoomCommandsFromWake(wakeLines(item.events), { home })
+      for (const deferred of extracted.deferredNoteCommands) {
+        registerPendingWakeNote(
+          connectionId,
+          {
+            noteId: deferred.noteId,
+            commands: deferred.commands,
+            messages: deferred.messages,
+            sessionId: deferred.sessionId ?? item.session_id ?? null,
+          },
+          { dir: connDir },
+        )
+      }
+      if (extracted.unreadableNotes.length > 0) {
+        unreadableItems.push(item)
+        for (const unreadable of extracted.unreadableNotes) {
+          unreadableRefusals.push({
+            command_message_id: null,
+            command_turn_id: null,
+            refusal: unreadable,
+          })
+        }
+      }
+      if (extracted.inlineCommands.length > 0) {
+        immediateOwnerItems.push({
+          ...item,
+          commands: extracted.inlineCommands,
+          messages: extracted.inlineMessages,
+        })
+      }
+    }
+    return { immediateOwnerItems, unreadableItems, unreadableRefusals }
+  }
+
   let completedOwnerItems = []
   let keptForPickupRetry = null
   let unreadableInnerNoteRefusals = []
+  let unreadableInnerNoteItems = []
   if (takenRecord) {
     const kept = readPrivateJson(takenRecord.file)
     if (validRecord(kept)) {
-      if (kept.pickup_pending === true) {
+      if (kept.inner_note_pending === true) {
+        // A previous step read the outer note whole, but the inner `wake_in_note` was
+        // missing/unreadable. Re-check the inner note without calling startCommands:
+        // once readable, register it as a pending wake note awaiting full agent read (3ea2b201).
+        const { unreadableItems, unreadableRefusals } = partitionOwnerItems(kept.items)
+        unreadableInnerNoteRefusals = unreadableRefusals
+        unreadableInnerNoteItems = unreadableItems
+        if (unreadableItems.length > 0) {
+          record = {
+            ...kept,
+            items: unreadableItems,
+            inner_note_pending: true,
+            pickup_pending: false,
+            pickup_refusals: unreadableRefusals,
+          }
+        } else {
+          record = null
+        }
+        readChanged = true
+      } else if (kept.pickup_pending === true) {
         // A previous step read this note whole, but report_pickup refused; retry pickup now
         // without re-prompting the agent to re-read the note.
         completedOwnerItems = kept.items.filter((item) => item.kind === 'owner_messages')
@@ -921,60 +998,24 @@ export async function stepDeliveryHook(
         record = done ? null : { ...kept, parts: next.parts }
         readChanged = done || next.parts.length !== (kept.parts?.length ?? 0)
         if (done) {
-          const immediateOwnerItems = []
-          for (const item of kept.items) {
-            if (item.kind !== 'owner_messages') continue
-            const hasInnerWakeNote =
-              Array.isArray(item.events) &&
-              item.events.some(
-                (event) =>
-                  event?.type === 'wake_in_note' &&
-                  Array.isArray(event.carries) &&
-                  event.carries.includes('owner_message'),
-              )
-            if (!hasInnerWakeNote) {
-              immediateOwnerItems.push(item)
-              continue
-            }
-            // The outer step note contained a `wake_in_note` pointer for an oversized
-            // room command whose body lives in an inner note. Do NOT trigger report_pickup
-            // or drop pending tracking yet: register each inner note via registerPendingWakeNote
-            // so pickup runs ONLY once the agent finishes reading the inner note whole (3ea2b201).
-            const extracted = extractRoomCommandsFromWake(wakeLines(item.events), { home })
-            for (const deferred of extracted.deferredNoteCommands) {
-              registerPendingWakeNote(
-                connectionId,
-                {
-                  noteId: deferred.noteId,
-                  commands: deferred.commands,
-                  messages: deferred.messages,
-                  sessionId: deferred.sessionId ?? item.session_id ?? null,
-                },
-                { dir: connDir },
-              )
-            }
-            for (const unreadable of extracted.unreadableNotes) {
-              unreadableInnerNoteRefusals.push({
-                command_message_id: null,
-                command_turn_id: null,
-                refusal: unreadable,
-              })
-            }
-            if (extracted.inlineCommands.length > 0) {
-              immediateOwnerItems.push({
-                ...item,
-                commands: extracted.inlineCommands,
-                messages: extracted.inlineMessages,
-              })
-            }
-          }
+          const { immediateOwnerItems, unreadableItems, unreadableRefusals } = partitionOwnerItems(kept.items)
           completedOwnerItems = immediateOwnerItems
+          unreadableInnerNoteRefusals = unreadableRefusals
+          unreadableInnerNoteItems = unreadableItems
           keptForPickupRetry =
             immediateOwnerItems.length > 0
               ? { ...kept, items: immediateOwnerItems, parts: next.parts }
-              : unreadableInnerNoteRefusals.length > 0
-                ? { ...kept, parts: next.parts }
-                : null
+              : null
+          if (unreadableItems.length > 0) {
+            record = {
+              ...kept,
+              items: unreadableItems,
+              parts: next.parts,
+              inner_note_pending: true,
+              pickup_pending: false,
+              pickup_refusals: unreadableRefusals,
+            }
+          }
         }
       }
     } else {
@@ -1037,14 +1078,6 @@ export async function stepDeliveryHook(
   // `pickup_pending` so the next step retries instead of dropping it (req 3ea2b201) and
   // preserve/surface the full structured refusal details (req 4e32d1a5).
   let pickupRefusals = unreadableInnerNoteRefusals.length > 0 ? unreadableInnerNoteRefusals : null
-  if (unreadableInnerNoteRefusals.length > 0 && !record && keptForPickupRetry) {
-    record = {
-      ...keptForPickupRetry,
-      pickup_pending: true,
-      pickup_refusals: unreadableInnerNoteRefusals,
-    }
-    readChanged = true
-  }
   if (completedOwnerItems.length > 0 || completedWakeNotes.length > 0) {
     const combinedMessages = [
       ...completedOwnerItems.flatMap((item) =>
@@ -1213,11 +1246,15 @@ export async function stepDeliveryHook(
       const refusalNotice =
         `DevSpec report_pickup was refused and will be retried on the next step; structured refusal details: ${JSON.stringify(pickupRefusals)}`
       const buildFallback = (budget, noteError) => {
+        const fallbackBaseDirs = [null, ...(connDir ? [path.join(connDir, 'diagnostic-notes')] : [])]
         let savedFallback = null
-        try {
-          savedFallback = writeFallbackDiagnosticNote(refusalNotice)
-        } catch {
-          savedFallback = null
+        for (const baseDir of fallbackBaseDirs) {
+          try {
+            savedFallback = writeFallbackDiagnosticNote(refusalNotice, { baseDir })
+            if (savedFallback) break
+          } catch {
+            savedFallback = null
+          }
         }
         const formatted = formatStructuredRefusalsFallback(pickupRefusals, {
           prefix: 'DevSpec report_pickup refused (note write failed; will retry next step): ',
@@ -1225,7 +1262,12 @@ export async function stepDeliveryHook(
           noteError,
           savedNote: savedFallback,
         })
-        return formatted ? formatted.trimEnd() : null
+        if (formatted) return formatted.trimEnd()
+        if (savedFallback) {
+          const ptr = shellDiagnosticPointer('step-delivery', savedFallback.command).trimEnd()
+          if (ptr.length <= budget) return ptr
+        }
+        return null
       }
       if (!existingContext) {
         if (priorNoteError) {
@@ -1317,7 +1359,7 @@ export async function stepDeliveryHook(
       recordTurnWake(connectionId, turnWakeFromEvents(adding.flatMap((each) => each.item.events)), { dir: connDir })
     }
     let context =
-      record && record.pickup_pending !== true
+      record && record.pickup_pending !== true && record.inner_note_pending !== true
         ? pointToNote({ id: record.note, command: noteCommand(record.note) }, { share, what: stepWhat(record.items), also: STEP_ALSO })
         : null
     context = formatPickupRefusals(context)
