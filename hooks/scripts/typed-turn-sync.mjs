@@ -237,6 +237,7 @@ function hasActiveRemoteCommandTurn(connectionId, reqState, dir, active = null) 
  */
 function hasActiveTypedTurn(reqState, active) {
   if (!reqState?.current || active?.precededByTurnEnded) return false
+  if (active?.liveTurnPrecededByTurnEnded && !active?.liveTurnTypedKey) return false
   if (reqState.currentFromWake || reqState.currentBoundByWake) return false
   return reqState.open.get(reqState.current)?.kind === 'typed_prompt'
 }
@@ -1228,11 +1229,35 @@ export async function syncTypedTurnFromTranscript({
         if (isBlockingReadError(reqState.readError)) {
           return { action: 'request_log_unreadable', key: turnKey }
         }
+        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir, active)
+        const pKey = pendingOpenKey(dir, connectionId, turnKey)
+        const pendingOpen = getPendingLocalOpen(dir, connectionId, turnKey)
+        const failPendingOpenCleanup = (entry, error) => {
+          const refusal = {
+            code: 'pending_open_cleanup_failed',
+            retryable: true,
+            request_id: entry.requestId,
+            ...structuredRefusalFromError(error),
+          }
+          log(
+            `typed-turn-sync: failed to remove pending local open for ${connectionId} (${turnKey}): ${JSON.stringify(refusal)}\n`,
+          )
+          return {
+            action: 'pending_open_cleanup_failed',
+            requestId: entry.requestId,
+            key: turnKey,
+            midTurn,
+            refusal,
+          }
+        }
         if (reqState.seenTranscriptTurns.has(turnKey)) {
+          if (pendingOpen) {
+            const removed = deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
+            if (!removed.ok) return failPendingOpenCleanup(pendingOpen, removed.error)
+          }
           return { action: 'already_synced', key: turnKey, ref: reqState.seenTranscriptTurns.get(turnKey) }
         }
 
-        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir, active)
         const deterministicId = deterministicTypedTurnRequestId(connectionId, turnKey)
         const alreadyOpenForTurn =
           reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
@@ -1255,43 +1280,55 @@ export async function syncTypedTurnFromTranscript({
             return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
           }
         }
-        const pKey = pendingOpenKey(dir, connectionId, turnKey)
-        const pendingOpen = !requestId ? getPendingLocalOpen(dir, connectionId, turnKey) : null
 
         if (pendingOpen) {
-          const persisted = appendRequestEvent(
-            connectionId,
-            {
-              op: 'open',
-              id: pendingOpen.requestId,
-              kind: 'typed_prompt',
-              ...(pendingOpen.requestedBy ? { requested_by: pendingOpen.requestedBy } : {}),
-            },
-            { dir },
-          )
-          if (!persisted) {
-            return {
-              action: 'open_write_failed',
-              requestId: pendingOpen.requestId,
-              key: turnKey,
-              midTurn,
-              refusal: {
-                code: 'local_open_persist_failed',
-                error: 'DevSpec opened request but local open record failed to persist',
-                request_id: pendingOpen.requestId,
-              },
+          if (reqState.closed?.has(pendingOpen.requestId)) {
+            const removed = deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
+            if (!removed.ok) return failPendingOpenCleanup(pendingOpen, removed.error)
+          } else {
+            if (!reqState.open.has(pendingOpen.requestId)) {
+              const persisted = appendRequestEvent(
+                connectionId,
+                {
+                  op: 'open',
+                  id: pendingOpen.requestId,
+                  kind: 'typed_prompt',
+                  ...(pendingOpen.requestedBy ? { requested_by: pendingOpen.requestedBy } : {}),
+                },
+                { dir },
+              )
+              if (!persisted) {
+                return {
+                  action: 'open_write_failed',
+                  requestId: pendingOpen.requestId,
+                  key: turnKey,
+                  midTurn,
+                  refusal: {
+                    code: 'local_open_persist_failed',
+                    error: 'DevSpec opened request but local open record failed to persist',
+                    request_id: pendingOpen.requestId,
+                  },
+                }
+              }
+              openedNow = true
             }
-          }
-          deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
-          requestId = pendingOpen.requestId
-          openedNow = true
-          const currentWritten = appendRequestEvent(
-            connectionId,
-            midTurn ? { op: 'joined', id: requestId } : { op: 'current', ref: requestId },
-            { dir },
-          )
-          if (!currentWritten) {
-            return { action: 'binding_write_failed', requestId, key: turnKey, midTurn }
+            const needsBinding = midTurn
+              ? reqState.current !== pendingOpen.requestId && !reqState.joined.has(pendingOpen.requestId)
+              : reqState.current !== pendingOpen.requestId
+            if (needsBinding) {
+              const currentWritten = appendRequestEvent(
+                connectionId,
+                midTurn ? { op: 'joined', id: pendingOpen.requestId } : { op: 'current', ref: pendingOpen.requestId },
+                { dir },
+              )
+              if (!currentWritten) {
+                return { action: 'binding_write_failed', requestId: pendingOpen.requestId, key: turnKey, midTurn }
+              }
+            }
+            const removed = deletePendingLocalOpen(dir, connectionId, pKey, turnKey, pendingOpen.requestId)
+            if (!removed.ok) return failPendingOpenCleanup(pendingOpen, removed.error)
+            requestId = pendingOpen.requestId
+            openedNow = true
           }
         }
 
@@ -1696,10 +1733,11 @@ export async function syncTypedTurnFromTranscript({
     )
 
   // Process EVERY unseen earlier same-turn background notification in chronological order
-  // BEFORE `active.key` or setting `memo.synced = true`, so two (or more) notifications
-  // arriving between poller reads all mark their launches notified and join the live turn
-  // (keeping two-person ambiguity intact — requirements 3ea2b201 / ce71a72b).
-  if (active.kind !== 'typed' && sameTurnWakeRows.length > 1) {
+  // BEFORE `active.key` or setting `memo.synced = true` — including a single background
+  // notification followed by a Cursor `summary` row — so every notification marks its
+  // launch notified and joins/restores attribution (requirements 3ea2b201 / ce71a72b).
+  let lastSameTurnWakeOutcome = null
+  if (active.kind !== 'typed' && sameTurnWakeRows.length > 0) {
     for (const wakeRow of sameTurnWakeRows) {
       if (!wakeRow?.key || wakeRow.key === active.key) continue
       const currentState = readRequestState(connectionId, { dir })
@@ -1709,6 +1747,9 @@ export async function syncTypedTurnFromTranscript({
       const earlier = await applyTranscriptWakeRow(wakeRow)
       if (!earlier) return { action: 'lock_busy', key: wakeRow.key }
       if (earlier.action === 'binding_write_failed' || earlier.action === 'request_log_unreadable') return earlier
+      if (earlier.action === 'restored_wake_request' || earlier.action === 'already_carried_wake') {
+        lastSameTurnWakeOutcome = earlier
+      }
     }
   }
 
@@ -1760,6 +1801,16 @@ export async function syncTypedTurnFromTranscript({
     active.kind === 'other' && notifiedKeys(active.rawText).length > 0
   const isClearableForUnrelatedWake = (reqState) => {
     if (!reqState?.current) return false
+    // A mid-turn Cursor `summary` row inside an active terminal prompt or background-wake
+    // turn (with no intervening `turn_ended`) is housekeeping, NOT an unrelated wake: it
+    // must never clear the live turn's requester or joined wake attribution (ce71a72b).
+    if (
+      active.kind === 'summary' &&
+      !active.precededByTurnEnded &&
+      (active.liveTurnTypedKey || sameTurnWakeRows.length > 0)
+    ) {
+      return false
+    }
     if (reqState.current === NO_REQUEST) return true
     if (reqState.currentFromWake || reqState.currentBoundByWake) return true
     const info = reqState.open.get(reqState.current)
@@ -1781,8 +1832,16 @@ export async function syncTypedTurnFromTranscript({
     if (!isClearableForUnrelatedWake(initial)) {
       const flush = await retryQueuedFailedTurn({ excludeKey: liveTypedKey ?? active.key })
       if (memo && flush.ok && canMarkSynced()) markMemoSynced()
-      if (flush.ran) return { action: 'not_typed_live', active, retriedFailedTurn: flush.result }
-      return { action: 'not_typed_live', active }
+      const preservedResult =
+        lastSameTurnWakeOutcome ??
+        (sameTurnTypedOutcome &&
+        sameTurnTypedOutcome.action !== 'already_synced' &&
+        sameTurnTypedOutcome.action !== 'opened' &&
+        sameTurnTypedOutcome.action !== 'adopted_hook_request'
+          ? sameTurnTypedOutcome
+          : { action: 'not_typed_live', active })
+      if (flush.ran) return { ...preservedResult, retriedFailedTurn: flush.result }
+      return preservedResult
     }
     const outcome = await withTypedSyncLock(
       connectionId,

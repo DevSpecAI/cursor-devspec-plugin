@@ -1254,7 +1254,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
   const liveTurnTypedKey =
     !read.end &&
     lastRow &&
-    lastRow.kind === 'other' &&
+    (lastRow.kind === 'other' || lastRow.kind === 'summary') &&
     !read.lastNonResumedPrecededByTurnEnded &&
     sameTurnIdx >= 0 &&
     sameTurnIdx < read.userRows.length

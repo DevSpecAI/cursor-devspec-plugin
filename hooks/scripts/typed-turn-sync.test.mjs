@@ -4175,4 +4175,168 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny, 'writes MUST STILL require a choice instead of auto-stamping Bob alone')
   })
+
+  it('live-turn pending-open recovery reports pending_open_cleanup_failed and leaves turn unsynced when removing .pending-opens.json fails, then retries and completes after disk recovers (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555f9'
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Live turn whose pending-open cleanup fails')}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).key
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const origRmSync = fs.rmSync
+    fs.rmSync = (targetPath, ...rest) => {
+      if (String(targetPath) === sidecar) {
+        throw Object.assign(new Error('EPERM removing pending-opens.json'), { code: 'EPERM' })
+      }
+      return origRmSync(targetPath, ...rest)
+    }
+
+    const logs = []
+    const memo = {}
+    let openCalls = 0
+    const callRequest = async () => {
+      openCalls += 1
+      throw new Error('must not reopen an already recovered live request')
+    }
+    try {
+      const pass1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        callRequest,
+        dir,
+        memo,
+        log: (line) => logs.push(line),
+      })
+      assert.equal(pass1.action, 'pending_open_cleanup_failed')
+      assert.equal(pass1.requestId, RECOVERED_REQ)
+      assert.equal(pass1.refusal?.code, 'pending_open_cleanup_failed')
+      assert.equal(memo.synced, false, 'MUST NOT mark memo synced while pending-open cleanup failed')
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo, connectionId: CONN, dir }), true)
+      assert.equal(fs.existsSync(sidecar), true)
+      assert.ok(logs.some((l) => /pending_open_cleanup_failed/i.test(l)))
+      const midState = readRequestState(CONN, { dir })
+      assert.equal(midState.open.has(RECOVERED_REQ), true)
+      assert.equal(midState.current, RECOVERED_REQ)
+      assert.equal(
+        midState.seenTranscriptTurns.has(turnKey),
+        false,
+        'MUST NOT mark transcript_turn seen when removing .pending-opens.json fails',
+      )
+    } finally {
+      fs.rmSync = origRmSync
+    }
+
+    // After disk recovers, the next pass MUST retry cleanup, remove .pending-opens.json, and complete sync!
+    const pass2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest,
+      dir,
+      memo,
+      log: (line) => logs.push(line),
+    })
+    assert.equal(pass2.action, 'opened', 'next pass must finish recovery rather than silently returning already_synced')
+    assert.equal(pass2.requestId, RECOVERED_REQ)
+    assert.equal(openCalls, 0, 'must NOT open a second request on DevSpec')
+    assert.equal(fs.existsSync(sidecar), false, '.pending-opens.json must be removed on retry')
+    assert.equal(memo.synced, true)
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, RECOVERED_REQ)
+    assert.equal(after.seenTranscriptTurns.get(turnKey), RECOVERED_REQ)
+  })
+
+  it('preserves terminal requester AND joins a single background completion when Cursor writes a summary row immediately afterward in a live turn (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111e5'
+
+    appendRequestEvent(
+      CONN,
+      { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE, message_id: 'msg-alice-summary' },
+      { dir },
+    )
+    appendRequestEvent(
+      CONN,
+      { op: 'launch', key: 'alice-bg-before-summary', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] },
+      { dir },
+    )
+
+    const bobRow = typedRow('Bob live terminal prompt before single wake and summary')
+    const aliceWake = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<task-notification><task-id>alice-bg-before-summary</task-id><status>completed</status></task-notification>',
+          },
+        ],
+      },
+    })
+    const summaryRow = JSON.stringify({
+      role: 'user',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: '<available_subagent_types>summary</available_subagent_types>\n<dynamic_tool_catalog>tools</dynamic_tool_catalog>',
+          },
+        ],
+      },
+    })
+
+    // First sync sees Bob's live terminal prompt; then single background completion + Cursor summary arrive together.
+    fs.writeFileSync(transcriptPath, `${bobRow}\n`)
+    const memo = {}
+    const poll1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: BOB }),
+      dir,
+      memo,
+    })
+    assert.equal(poll1.action, 'opened')
+    const TYPED_BOB = poll1.requestId
+
+    fs.writeFileSync(transcriptPath, `${bobRow}\n${aliceWake}\n${summaryRow}\n`)
+    const poll2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        throw new Error('must not reopen Bob request')
+      },
+      dir,
+      memo,
+    })
+    assert.equal(poll2.action, 'restored_wake_request')
+    assert.equal(poll2.midTurn, true)
+    assert.equal(memo.synced, true)
+
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, TYPED_BOB, 'summary row MUST NOT clear Bob’s live terminal requester')
+    assert.equal(after.joined.has(CMD_ALICE), true, 'single background wake before summary MUST be joined, not skipped')
+    assert.equal(after.launches.get('alice-bg-before-summary')?.notified, true)
+    assert.equal(turnAmbiguity(after)?.length, 2, 'two-person ambiguity between Bob and Alice must be preserved')
+
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.ok(stamped.deny, 'next write must require choosing between Bob and Alice instead of stamping neither')
+    assert.match(stamped.deny, /--terminal/)
+    assert.match(stamped.deny, /msg-alice-summary/)
+  })
 })
