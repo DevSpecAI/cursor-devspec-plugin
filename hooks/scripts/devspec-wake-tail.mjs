@@ -107,6 +107,7 @@ import {
   fitsShellOutput,
   formatDiagnosticStorePreflightError,
   hasPendingUnsavedRefusals,
+  hasUnreadablePendingUnsavedRefusals,
   hasWritableDiagnosticNoteStore,
   peekPendingUnsavedRefusals,
   reserveDiagnosticNoteSlots,
@@ -725,7 +726,8 @@ export async function readWakes({
     const spoolKey = dir ? path.resolve(dir) : path.resolve(home)
     const spoolOpts = { home, fallbackDir: fallbackNoteDir, backupDir: dir }
     const pendingSpoolEntries = peekPendingUnsavedRefusals(spoolKey, spoolOpts)
-    const hasSpool = pendingSpoolEntries.length > 0
+    const unreadablePendingSpool = hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)
+    const hasSpool = pendingSpoolEntries.length > 0 || unreadablePendingSpool
     const page = readerPage(
       wakes.map((wake) => wake.text),
       {
@@ -1027,9 +1029,7 @@ export async function readWakes({
         : ''
     const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
 
-    const unreadablePendingSpool =
-      pendingSpoolEntries.length === 0 && hasPendingUnsavedRefusals(spoolKey, spoolOpts)
-    let unsurfacedSpoolRemaining = unreadablePendingSpool
+    let unsurfacedSpoolRemaining = false
     if (pickupRefusals && effectiveRawDiag) {
       const fittedWithStdout = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
         home,
@@ -1111,6 +1111,15 @@ export async function readWakes({
       if (pendingSpoolEntries.length > 0 && (!pickupDiagnosticWritten || !savedReadableNow)) {
         unsurfacedSpoolRemaining = true
       }
+    }
+    // Always hold the wake cursor if any spool refusal file was temporarily unreadable
+    // (either at snapshot time OR after clearing readable entries), even when another
+    // readable refusal was surfaced on this pass (requirement 3ea2b201).
+    if (
+      !unsurfacedSpoolRemaining &&
+      (unreadablePendingSpool || hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts))
+    ) {
+      unsurfacedSpoolRemaining = true
     }
 
     const posFile = readPositionPath(key, dir)

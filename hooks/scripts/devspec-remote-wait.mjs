@@ -90,6 +90,7 @@ import {
   fitShellDiagnostic,
   fitsShellOutput,
   formatDiagnosticStorePreflightError,
+  hasUnreadablePendingUnsavedRefusals,
   hasWritableDiagnosticNoteStore,
   maxShellReserve,
   peekPendingUnsavedRefusals,
@@ -2102,6 +2103,11 @@ export async function runOneShotRoomCommandPickup({
     } else if (pendingSpoolEntries.length > 0 && !refusals) {
       ok = false
     }
+    if (ok && hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)) {
+      ok = false
+    }
+  } else if (ok && hasUnreadablePendingUnsavedRefusals(spoolKey, spoolOpts)) {
+    ok = false
   }
   return {
     ok,

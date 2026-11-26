@@ -861,29 +861,52 @@ function buildShortenedSavedNoteRecovery(
                 ? 'Open saved_note_basenames under saved_note_dir in order and gunzip (`gzip -dc`), or re-run wake read.'
                 : 'Open saved_note_basenames under saved_note_dir, or re-run wake read.',
           })}\n`,
+          `${JSON.stringify({
+            ...base,
+            saved_note_file: savedFiles[0],
+            saved_note_basenames: basenames,
+            recovery:
+              savedNote.compressed === 'gzip'
+                ? 'Open saved_note_file and sibling shards in the same directory listed in saved_note_basenames (concatenate + `gzip -dc`), or re-run wake read.'
+                : 'Open saved_note_file and sibling files in the same directory listed in saved_note_basenames, or re-run wake read.',
+          })}\n`,
         ]
-      : []),
-    `${JSON.stringify({
-      ...base,
-      saved_note_file: savedFiles[0],
-      saved_note_basenames: basenames,
-      recovery:
-        savedNote.compressed === 'gzip'
-          ? 'Open saved_note_file and sibling shards in saved_note_basenames (concatenate + `gzip -dc`), or re-run wake read.'
-          : 'Open saved_note_file and sibling files in saved_note_basenames, or re-run wake read.',
-    })}\n`,
+      : [
+          `${JSON.stringify({
+            ...base,
+            saved_note_dirs: uniqueDirs,
+            saved_note_shards: savedFiles.map((f) => [uniqueDirs.indexOf(path.dirname(f)), path.basename(f)]),
+            recovery:
+              savedNote.compressed === 'gzip'
+                ? 'Resolve each [dirIdx, name] in saved_note_shards against saved_note_dirs in order, concatenate + `gzip -dc`, or re-run wake read.'
+                : 'Resolve each [dirIdx, name] in saved_note_shards against saved_note_dirs, or re-run wake read.',
+          })}\n`,
+        ]),
     `${JSON.stringify({
       refused: 'report_pickup',
       ...savedStatusFields,
       read_command_omitted_for_shell_limit: true,
       ...(cmdChars !== null ? { read_command_chars: cmdChars } : {}),
       saved_note_count: savedFiles.length,
+      saved_note_distinct_dirs: uniqueDirs.length,
+      saved_note_dirs_omitted_for_shell_limit: true,
       saved_note_basenames: basenames,
       ...compressedMeta,
       recovery:
         savedNote.compressed === 'gzip'
-          ? 'Find saved_note_basenames in diagnostic note stores (~/.devspec/notes, TMPDIR, or connections dir), concatenate in order + `gzip -dc`, or re-run wake read.'
-          : 'Find saved_note_basenames in diagnostic note stores (~/.devspec/notes, TMPDIR, or connections dir) and open, or re-run wake read.',
+          ? 'Shard directories spanned multiple stores and exceeded Shell budget; find each name in saved_note_basenames across ~/.devspec/notes, TMPDIR/devspec-notes-<uid>, connections/diagnostic-notes, or connections dir, concatenate in order + `gzip -dc`, or re-run wake read.'
+          : 'Shard directories exceeded Shell budget; find each name in saved_note_basenames across ~/.devspec/notes, TMPDIR/devspec-notes-<uid>, connections/diagnostic-notes, or connections dir and open, or re-run wake read.',
+    })}\n`,
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      ...savedStatusFields,
+      read_command_omitted_for_shell_limit: true,
+      saved_note_count: savedFiles.length,
+      saved_note_dirs_omitted_for_shell_limit: true,
+      saved_note_basenames: basenames,
+      ...compressedMeta,
+      recovery:
+        'Find saved_note_basenames across ~/.devspec/notes, TMPDIR/devspec-notes-<uid>, and connections dir (concat + `gzip -dc` if gzip) or re-run wake read.',
     })}\n`,
   ]
   for (const candidate of candidates) {

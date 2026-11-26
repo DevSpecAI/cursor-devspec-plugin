@@ -1269,6 +1269,21 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
  * 3ea2b201).
  */
 function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalBytes, compressedBytes } = {}) {
+  // Shared RFC-3986-aware URL patterns supporting IPv6 bracketed hosts (`https://[2001:db8::1]:8443/...`)
+  // and bracketed query parameters while trimming any unmatched trailing wrapper `]` (reqs 4e32d1a5 / 91d7b47c).
+  const ACTIONABLE_HTTP_URL_SOURCE = String.raw`https?:\/\/(?:[^\s"'<>/@]+@)?(?:\[[0-9A-Fa-f:.%]+\]|[^\s"'<>)\]/]+)(?:[^\s"'<>)]*)`
+  const ACTIONABLE_REL_URL_SOURCE = String.raw`\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)]+`
+  const trimUnmatchedTrailingBrackets = (url) => {
+    let cleaned = url.replace(/[.,;:!?]+$/, '')
+    while (cleaned.endsWith(']')) {
+      const opens = (cleaned.match(/\[/g) ?? []).length
+      const closes = (cleaned.match(/\]/g) ?? []).length
+      if (closes > opens) cleaned = cleaned.slice(0, -1).replace(/[.,;:!?]+$/, '')
+      else break
+    }
+    return cleaned
+  }
+
   /**
    * Compact ONLY high-entropy opaque non-whitespace tokens (such as base64/hex blobs >= 48 chars)
    * inside narrative fields (`reason`, `title`, `message`, `error`) so every human-readable word,
@@ -1276,12 +1291,12 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
    * even under severe `ENOSPC` (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
    */
   const compactOpaqueTokensInString = (str, { tokenPreviewChars = 16, includePunctuated = false } = {}) => {
-    // Match full HTTP(S) URLs and relative app paths FIRST so actionable approval/review
-    // links inside structured reasons are NEVER treated as opaque base64/hex blobs
+    // Match full HTTP(S) URLs (including IPv6 hosts) and relative app paths FIRST so actionable
+    // approval/review links inside structured reasons are NEVER split or treated as opaque blobs
     // (requirements 4e32d1a5 / 3c5147a7 / 91d7b47c).
     const pattern = includePunctuated
-      ? /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)|([A-Za-z0-9+/=_-]{48,})/g
-      : /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)|([A-Za-z0-9+/=]{48,})/g
+      ? new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})|([A-Za-z0-9+/=_-]{48,})`, 'g')
+      : new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})|([A-Za-z0-9+/=]{48,})`, 'g')
     let changed = false
     let omittedTotal = 0
     const compacted = str.replace(pattern, (match, fullUrl, relUrl, tok) => {
@@ -1311,15 +1326,13 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
   const extractAllActionableUrls = (str) => {
     if (typeof str !== 'string' || !str) return { urls: [], oversizedCount: 0, totalCount: 0 }
-    const matches = str.match(
-      /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)/g,
-    )
+    const matches = str.match(new RegExp(`(${ACTIONABLE_HTTP_URL_SOURCE})|(${ACTIONABLE_REL_URL_SOURCE})`, 'g'))
     if (!matches) return { urls: [], oversizedCount: 0, totalCount: 0 }
     const seen = new Set()
     const urls = []
     let oversizedCount = 0
     for (const raw of matches) {
-      const cleaned = raw.replace(/[.,;:!?]+$/, '')
+      const cleaned = trimUnmatchedTrailingBrackets(raw)
       if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)
       if (cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS) {
@@ -2718,28 +2731,26 @@ export function spoolUnsavedRefusal(
 }
 
 /**
- * Fail-closed check for whether any unsurfaced spooled pickup refusal may still be
- * pending for `spoolKey`. Returns `true` whenever a refusal is queued in memory/on disk
- * OR when any spool directory or scope-matching spool/pending-note file exists and
- * cannot currently be read (e.g. temporary `EACCES`/`EIO`), so a later wake note NEVER
- * advances the wake cursor past an unreadable pending refusal (requirement 3ea2b201).
+ * Check whether any candidate spool directory or scope-matching spool/pending-refusal
+ * file exists and currently CANNOT be read (e.g. temporary `EIO`/`EACCES` or corrupted
+ * non-empty JSON). Used alongside `peekPendingUnsavedRefusals` so a wake reader that
+ * surfaces one readable refusal still holds the cursor when a second refusal file is
+ * temporarily unreadable (requirement 3ea2b201).
  */
-export function hasPendingUnsavedRefusals(
+export function hasUnreadablePendingUnsavedRefusals(
   spoolKey,
   { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
 ) {
   const key = String(spoolKey ?? '')
   if (!key) return false
-  if (peekPendingUnsavedRefusals(key, { home, fallbackDir, backupDir }).length > 0) return true
   const scopeTag = spoolScopeTag(key)
   const entryPrefix = spoolEntryFilePrefix(scopeTag)
   const claimPrefix = legacyClaimFilePrefix(scopeTag)
-  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
   for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
     const legacyFile = legacySpoolFilePath(dir, scopeTag)
     try {
       const legacyRaw = fs.readFileSync(legacyFile, 'utf8')
-      if (legacyRaw.trim().length > 0) return true
+      if (legacyRaw.trim().length > 0) JSON.parse(legacyRaw)
     } catch (error) {
       if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return true
     }
@@ -2755,16 +2766,8 @@ export function hasPendingUnsavedRefusals(
         const fullPath = path.join(dir, name)
         try {
           const raw = fs.readFileSync(fullPath, 'utf8')
-          // An unused pre-allocated spool slot is padded with ASCII spaces (`0x20`) until used.
           if (raw.trim().length === 0) continue
-          const parsed = JSON.parse(raw)
-          if (
-            parsed?.kind === 'note_ref' ||
-            (typeof parsed?.text === 'string' && parsed.text) ||
-            (Array.isArray(parsed?.entries) && parsed.entries.length > 0)
-          ) {
-            return true
-          }
+          JSON.parse(raw)
         } catch (error) {
           if (error?.code === 'ENOENT') continue
           return true
@@ -2773,24 +2776,32 @@ export function hasPendingUnsavedRefusals(
       }
       if (!name.endsWith('.md')) continue
       const fullPath = path.join(dir, name)
-      let rawBuf = null
       try {
-        rawBuf = fs.readFileSync(fullPath)
+        fs.readFileSync(fullPath)
       } catch (error) {
         if (error?.code === 'ENOENT') continue
         return true
       }
-      try {
-        const content =
-          rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b
-            ? zlib.gunzipSync(rawBuf).toString('utf8')
-            : rawBuf.toString('utf8')
-        if (content.startsWith(scopePrefix)) return true
-      } catch {
-        /* ignore non-standalone gzip shards (e.g. part 1 of a multi-file sharded note) */
-      }
     }
   }
+  return false
+}
+
+/**
+ * Fail-closed check for whether any unsurfaced spooled pickup refusal may still be
+ * pending for `spoolKey`. Returns `true` whenever a refusal is queued in memory/on disk
+ * OR when any spool directory or scope-matching spool/pending-note file exists and
+ * cannot currently be read (e.g. temporary `EACCES`/`EIO`), so a later wake note NEVER
+ * advances the wake cursor past an unreadable pending refusal (requirement 3ea2b201).
+ */
+export function hasPendingUnsavedRefusals(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return false
+  if (peekPendingUnsavedRefusals(key, { home, fallbackDir, backupDir }).length > 0) return true
+  if (hasUnreadablePendingUnsavedRefusals(key, { home, fallbackDir, backupDir })) return true
   return false
 }
 

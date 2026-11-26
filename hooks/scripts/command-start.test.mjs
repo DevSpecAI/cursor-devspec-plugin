@@ -8275,4 +8275,209 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
     }
   })
+
+  it('never claims sibling shards across different directories in tight 600-char recovery, holds cursor when a 2nd spool refusal is unreadable beside a 1st readable one, and preserves IPv6 approval URLs whole under ENOSPC (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const zlib = await import('node:zlib')
+    const { readPositionPath } = await import('./devspec-wake-tail.mjs')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      clearPendingUnsavedRefusals,
+      spoolUnsavedRefusal,
+    } = await import('./hook-context-budget.mjs')
+
+    // 1. Multi-directory shards under a 600-char remaining Shell budget: MUST NOT emit only
+    //    `saved_note_file` claiming "sibling shards"; MUST disclose distinct dirs / store hints!
+    {
+      const longSeg = 'dirseg-'.repeat(40)
+      const diffDirShards = [
+        `/home/alice/${longSeg}a/.devspec/notes/shard-a.md`,
+        `/tmp/${longSeg}b/devspec-notes-1000/shard-b.md`,
+        `/var/lib/${longSeg}c/connections/diagnostic-notes/shard-c.md`,
+      ]
+      const savedNote = {
+        id: 'abcdef0123456789',
+        file: diffDirShards[0],
+        files: diffDirShards,
+        command: `cat '${diffDirShards.join("' '")}' | gzip -dc | head -c 40000`,
+        parts: 3,
+        compressed: 'gzip',
+        fallback: true,
+        reserved: true,
+      }
+      const stdoutPad = 'x'.repeat(20_000 - 600)
+      const fb = formatStructuredRefusalsFallback(
+        [{ command_message_id: 'msg-multi-dir', refusal: { code: 'turn_busy' } }],
+        { stdoutText: stdoutPad, savedNote, noteError: new Error('ENOSPC') },
+      )
+      assert.ok(typeof fb === 'string' && fb.length > 0 && fitsShellOutput(stdoutPad + fb))
+      const parsed = JSON.parse(fb)
+      assert.doesNotMatch(parsed.recovery, /sibling/i, 'MUST NOT claim sibling shards when shards span different directories')
+      assert.equal(parsed.saved_note_dirs_omitted_for_shell_limit, true)
+      assert.deepEqual(parsed.saved_note_basenames, ['shard-a.md', 'shard-b.md', 'shard-c.md'])
+      assert.match(parsed.recovery, /~\/\.devspec\/notes/, 'MUST name all diagnostic note stores when directory paths exceed budget')
+    }
+
+    // 2. 1 readable spool refusal + 1 temporarily unreadable (`EIO`) spool refusal -> readWakes
+    //    surfaces the readable one, MUST STILL hold the wake cursor while the 2nd is unreadable!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const posFile = readPositionPath(CONN, dir)
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(path.join(home, '.devspec', 'notes'), { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('mixed spool read test'))), { mode: 0o600 })
+
+      const spoolKey = path.resolve(dir)
+      const s1 = spoolUnsavedRefusal(spoolKey, 'readable refusal #1 payload', { home, fallbackDir: diagDir, backupDir: dir })
+      const s2 = spoolUnsavedRefusal(spoolKey, 'unreadable refusal #2 payload', { home, fallbackDir: diagDir, backupDir: dir })
+      const s1Bytes = fs.readFileSync(s1.file)
+      const s2Bytes = fs.readFileSync(s2.file)
+      // Clear in-memory spool map so disk files are the sole source of truth, then simulate a
+      // temporary EIO read error on s2 while s1 remains readable.
+      clearPendingUnsavedRefusals(spoolKey, null, { home, fallbackDir: diagDir, backupDir: dir })
+      fs.writeFileSync(s1.file, s1Bytes, { mode: 0o600 })
+      fs.writeFileSync(s2.file, s2Bytes, { mode: 0o600 })
+      const origReadFileSync = fs.readFileSync
+      let failS2 = true
+      fs.readFileSync = (p, ...rest) => {
+        if (failS2 && String(p) === s2.file) {
+          throw Object.assign(new Error('temporary EIO reading spool refusal'), { code: 'EIO' })
+        }
+        return origReadFileSync(p, ...rest)
+      }
+      try {
+        let stderr1 = ''
+        const r1 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (c) => { stderr1 += String(c) },
+          startCommands: async ({ commands }) => ({
+            ok: true,
+            outcome: 'started',
+            started: commands.map((c) => c.messageId),
+            refusals: [],
+          }),
+        })
+        assert.match(stderr1, /readable refusal #1 payload/, 'first readable refusal should be surfaced')
+        assert.equal(r1.marked, false, 'cursor MUST NOT advance while second refusal file is temporarily unreadable')
+        assert.equal(fs.existsSync(posFile), false, 'posFile MUST NOT be written while unreadable refusal remains')
+
+        // Read error clears -> next read surfaces refusal #2 and advances cursor!
+        failS2 = false
+        let stderr2 = ''
+        const r2 = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (c) => { stderr2 += String(c) },
+          startCommands: async ({ commands }) => ({
+            ok: true,
+            outcome: 'started',
+            started: commands.map((c) => c.messageId),
+            refusals: [],
+          }),
+        })
+        assert.match(stderr2, /unreadable refusal #2 payload/, 'second refusal MUST surface once readable')
+        assert.equal(r2.marked, true, 'cursor advances only after ALL spooled refusals are surfaced')
+      } finally {
+        failS2 = false
+        fs.readFileSync = origReadFileSync
+        clearPendingUnsavedRefusals(spoolKey, null, { home, fallbackDir: diagDir, backupDir: dir })
+      }
+    }
+
+    // 3. IPv6 approval URL inside a Stage-2B ENOSPC structured reason MUST survive 100% intact
+    //    as one single usable link (never split at the IPv6 closing bracket `]`)!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('ipv6 url enospc check'))), { mode: 0o600 })
+
+      const ipv6Url = 'https://[2001:db8:85a3::8a2e:370:7334]:8443/projects/24c4abaa-2cb9-496a-8492-cf1f1aa1090b/reviews/approve-ipv6?token=ok123'
+      const vocab = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango']
+      const proseFor = (idx) => {
+        const words = []
+        let seed = (idx + 7) * 2654435761
+        for (let w = 0; w < 90; w += 1) {
+          seed = (seed * 1664525 + 1013904223) >>> 0
+          words.push(`${vocab[seed % vocab.length]}${(seed >>> 8) % 97}`)
+        }
+        return words.join(' ')
+      }
+      const records = Array.from({ length: 1800 }, (_, idx) => ({
+        id: `blk-ipv6-${String(idx).padStart(4, '0')}`,
+        reason:
+          idx === 500
+            ? `${proseFor(idx)} Open [${ipv6Url}] to approve ${proseFor(idx + 4000)}`
+            : `${proseFor(idx)} ${proseFor(idx + 2000)}`,
+      }))
+
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      let savedNote = null
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        const res = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async () => {},
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [{ command_message_id: 'msg-ipv6-1', refusal: { code: 'waiting_for_ok', blocking_items: records } }],
+            }
+          },
+        })
+        savedNote = res.pickup_diagnostic_note
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      assert.ok(savedNote?.file)
+      const rawBuf = Array.isArray(savedNote.files) && savedNote.files.length > 1
+        ? Buffer.concat(savedNote.files.map((f) => fs.readFileSync(f)))
+        : fs.readFileSync(savedNote.file)
+      const savedText = savedNote.compressed === 'gzip' ? zlib.gunzipSync(rawBuf).toString('utf8') : rawBuf.toString('utf8')
+      assert.ok(savedText.includes(ipv6Url), 'IPv6 approval URL MUST survive whole inside preserved_urls without splitting at `]`')
+      assert.doesNotMatch(savedText, /"https:\/\/\[2001:db8:85a3::8a2e:370:7334"/, 'IPv6 URL MUST NOT be split into an unusable fragment')
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+  })
 })
