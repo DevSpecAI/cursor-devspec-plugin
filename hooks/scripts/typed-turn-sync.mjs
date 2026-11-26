@@ -212,9 +212,12 @@ function unboundOpenTypedPrompt(reqState) {
 /**
  * Whether a live, unanswered room command owns the currently running turn (in which case
  * a typed prompt or wake added during it joins the turn rather than silently replacing it).
+ * Once the transcript has positively recorded `turn_ended` before the current turn started,
+ * a lingering `.turn` marker from that ended room command never makes the new turn look
+ * like part of the ended room command (decision ce71a72b).
  */
-function hasActiveRemoteCommandTurn(connectionId, reqState, dir) {
-  if (!reqState?.current) return false
+function hasActiveRemoteCommandTurn(connectionId, reqState, dir, active = null) {
+  if (!reqState?.current || active?.precededByTurnEnded || active?.liveTurnPrecededByTurnEnded) return false
   const info = reqState.open.get(reqState.current)
   if (!info || info.kind !== 'command' || info.answered) return false
   try {
@@ -1029,7 +1032,7 @@ export async function syncTypedTurnFromTranscript({
           return { action: 'already_synced', key: turnKey, ref: reqState.seenTranscriptTurns.get(turnKey) }
         }
 
-        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir)
+        const midTurn = hasActiveRemoteCommandTurn(connectionId, reqState, dir, active)
         const deterministicId = deterministicTypedTurnRequestId(connectionId, turnKey)
         const alreadyOpenForTurn =
           reqState.open.get(deterministicId)?.kind === 'typed_prompt' ? deterministicId : null
@@ -1426,7 +1429,7 @@ export async function syncTypedTurnFromTranscript({
             (hasEarlierSameTurnWake && (reqState.currentFromWake || reqState.currentBoundByWake)) ||
             (!active.precededByTurnEnded && reqState.currentFromWake && !promptHookOwnedByThisWake))
         const midTurn =
-          hasActiveRemoteCommandTurn(connectionId, reqState, dir) ||
+          hasActiveRemoteCommandTurn(connectionId, reqState, dir, active) ||
           hasActiveTypedTurn(reqState, active) ||
           hasActiveSameTurnWake
         const events = wake.direct
@@ -1717,20 +1720,41 @@ export async function finishIdleRequests({
           }
           log(`typed-turn-sync: idle report_complete returned unrecognized response for ${connectionId}: ${JSON.stringify(localCompleteRefusal)}\n`)
         } else if (typeof patchState === 'function') {
-          let saved = false
-          try {
-            saved = patchState({ local_turn: null }) === true
-          } catch (error) {
-            log(
-              `typed-turn-sync: failed to persist cleared local_turn for ${connectionId}: ${error instanceof Error ? error.message : String(error)}\n`,
-            )
-            saved = false
-          }
-          if (!saved) {
+          // Guard clearing `local_turn` under `withTypedSyncLock` and re-check BOTH
+          // persisted + in-memory `local_turn.attempt_id` and the transcript so a valid
+          // receipt for the previous turn NEVER erases a newer turn's saved attempt
+          // admitted while `await callComplete` was in flight (requirement 3ea2b201).
+          const clearOutcome = await withTypedSyncLock(connectionId, dir, async () => {
+            const diskState = readPrivateJson(path.join(dir, `${connectionId}.json`))
+            const diskAttemptId = diskState?.local_turn?.attempt_id ?? null
+            const memAttemptId = state?.local_turn?.attempt_id ?? null
+            const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
+            const supersededByAttempt =
+              (diskAttemptId && diskAttemptId !== localAttemptId) ||
+              (memAttemptId && memAttemptId !== localAttemptId)
+            const transcriptAdvanced =
+              !latestActive || !latestActive.ended || latestActive.stamp !== initialStamp
+            if (supersededByAttempt || transcriptAdvanced) {
+              return { status: 'superseded' }
+            }
+            let saved = false
+            try {
+              saved = patchState({ local_turn: null }) === true
+            } catch (error) {
+              log(
+                `typed-turn-sync: failed to persist cleared local_turn for ${connectionId}: ${error instanceof Error ? error.message : String(error)}\n`,
+              )
+              saved = false
+            }
+            return { status: saved ? 'cleared' : 'write_failed' }
+          })
+          if (!clearOutcome || clearOutcome.status === 'write_failed') {
             localCompleteRefusal = {
-              code: 'state_write_failed',
+              code: !clearOutcome ? 'lock_busy' : 'state_write_failed',
               retryable: true,
-              error: 'Failed to persist cleared local_turn after idle report_complete.',
+              error: !clearOutcome
+                ? 'Could not acquire typed-sync lock to persist cleared local_turn after idle report_complete.'
+                : 'Failed to persist cleared local_turn after idle report_complete.',
             }
             log(`typed-turn-sync: failed to persist cleared local_turn for ${connectionId}\n`)
           } else {

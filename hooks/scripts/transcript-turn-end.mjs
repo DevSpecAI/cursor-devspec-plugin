@@ -1069,6 +1069,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
   let lastNonResumedText = null
   let sawTurnEndedSinceLastNonResumed = false
   let lastNonResumedPrecededByTurnEnded = false
+  let liveTurnPrecededByTurnEnded = false
   let sameTurnTypedRowIndex = -1
   let sameTurnOtherRows = []
   const allOtherRows = []
@@ -1112,12 +1113,17 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
             lastNonResumedPrecededByTurnEnded = sawTurnEndedSinceLastNonResumed
             sawTurnEndedSinceLastNonResumed = false
             if (kind === 'typed') {
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sameTurnTypedRowIndex = rowIndex
               sameTurnOtherRows = []
             } else if (kind === 'command_turn' || kind === 'timestamp') {
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
               sameTurnTypedRowIndex = -1
               sameTurnOtherRows = []
             } else if (kind === 'other') {
+              if (sameTurnTypedRowIndex < 0 && sameTurnOtherRows.length === 0) {
+                liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              }
               const otherEntry = { rowIndex, digest: lastUser, rawText }
               sameTurnOtherRows.push(otherEntry)
               allOtherRows.push(otherEntry)
@@ -1139,6 +1145,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
           lastParsedRow = row
           if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
             sawTurnEndedSinceLastNonResumed = true
+            liveTurnPrecededByTurnEnded = false
             sameTurnTypedRowIndex = -1
             sameTurnOtherRows = []
           }
@@ -1186,6 +1193,7 @@ function scanTranscript(bytes, { deadlineMs = null } = {}) {
     userRows,
     lastNonResumedText,
     lastNonResumedPrecededByTurnEnded,
+    liveTurnPrecededByTurnEnded,
     sameTurnTypedRowIndex,
     sameTurnOtherRows,
     allOtherRows,
@@ -1266,6 +1274,7 @@ export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_AT
     sameTurnWakes,
     notificationWakes,
     precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
+    liveTurnPrecededByTurnEnded: Boolean(read.liveTurnPrecededByTurnEnded),
     stamp: read.stamp,
     turns: read.turns,
     rawText,

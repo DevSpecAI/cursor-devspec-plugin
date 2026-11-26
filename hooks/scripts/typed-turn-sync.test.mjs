@@ -3092,4 +3092,134 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.equal(stamped.args?.request_ref, TYPED_2, 'writes during Turn 2 must keep TYPED_2 attribution')
   })
+
+  it('finishIdleRequests does not erase a newer turn’s saved local_turn admitted while awaiting the previous turn’s completion receipt (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const SESSION = '77777777-7777-4777-8777-7777777777fa'
+    const state = {
+      connection_id: CONN,
+      session_id: SESSION,
+      speech_attachment_id: '55555555-5555-4555-8555-5555555555fa',
+      attached_at: '2026-11-26T00:00:00.000Z',
+      local_turn: null,
+    }
+    const persistState = (patch) => {
+      Object.assign(state, patch)
+      fs.writeFileSync(path.join(dir, `${CONN}.json`), JSON.stringify(state))
+      return true
+    }
+
+    // Turn 1 opens and gets admitted as firstAttemptId, then ends.
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn 1')}\n`)
+    const sync1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async (args) => ({ status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: SESSION }),
+      patchState: persistState,
+      dir,
+    })
+    assert.equal(sync1.action, 'opened')
+    const firstAttemptId = state.local_turn?.attempt_id
+    assert.ok(firstAttemptId)
+    fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n`)
+
+    // Start idle cleanup for Turn 1. While awaiting Turn 1's report_complete receipt,
+    // Turn 2 starts and is admitted with a brand-new attempt_id.
+    let secondAttemptId = null
+    const completedAttempts = []
+    let patchNullCalled = false
+    const idle1 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async (args) => {
+        completedAttempts.push(args.attempt_id)
+        fs.appendFileSync(transcriptPath, `${typedRow('Turn 2 admitted mid-complete')}\n`)
+        const sync2 = await syncTypedTurnFromTranscript({
+          connectionId: CONN,
+          transcriptPath,
+          state,
+          connectionCapability: 'cap-secret',
+          callRequest: async (r) => ({ request_id: r.request_id, status: 'open', requested_by_user_id: ALI }),
+          callPickup: async (p) => ({ status: 'working', connection_id: CONN, attempt_id: p.attempt_id, expected_session_id: SESSION }),
+          patchState: persistState,
+          dir,
+        })
+        assert.equal(sync2.action, 'opened')
+        secondAttemptId = state.local_turn?.attempt_id
+        assert.ok(secondAttemptId && secondAttemptId !== firstAttemptId)
+        return { phase: 'done', closed_as: 'completed' }
+      },
+      callRequest: async () => ({ status: 'closed' }),
+      patchState: (patch) => {
+        if (patch.local_turn === null) patchNullCalled = true
+        return persistState(patch)
+      },
+      dir,
+      log: () => {},
+    })
+    assert.equal(idle1.localCompleted, true)
+    assert.equal(patchNullCalled, false, 'cleanup for Turn 1 must NOT overwrite Turn 2’s saved local_turn with null')
+    assert.equal(state.local_turn?.attempt_id, secondAttemptId, 'Turn 2’s saved attempt must remain intact')
+
+    // Now Turn 2 ends: idle cleanup MUST send report_complete for Turn 2’s attempt_id!
+    fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n`)
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async (args) => {
+        completedAttempts.push(args.attempt_id)
+        return { phase: 'done', closed_as: 'completed' }
+      },
+      callRequest: async () => ({ status: 'closed' }),
+      patchState: persistState,
+      dir,
+      log: () => {},
+    })
+    assert.equal(idle2.localCompleted, true)
+    assert.deepEqual(completedAttempts, [firstAttemptId, secondAttemptId], 'both Turn 1 and Turn 2 must receive their own completion calls')
+    assert.equal(state.local_turn, null, 'local_turn clears once Turn 2 completes with no newer turn')
+  })
+
+  it('new terminal prompt after turn_ended replaces an ended room command as sole current even when its lingering .turn marker remains on disk (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { turnAmbiguity } = await import('./requests.mjs')
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ROOM = '44444444-4444-4444-8444-4444444444fb'
+    appendRequestEvent(CONN, { op: 'open', id: CMD_ROOM, kind: 'command', requested_by: BOB }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: CMD_ROOM }, { dir })
+    // Lingering .turn marker left on disk because Cursor CLI did not run the stop hook.
+    fs.writeFileSync(path.join(dir, `${CONN}.turn`), JSON.stringify({ remoteTurn: true, startedAt: Date.now() - 5_000 }))
+
+    // Transcript shows the room command turn ENDED, followed by a brand-new terminal prompt.
+    const cmdRow = JSON.stringify({
+      role: 'user',
+      message: { content: [{ type: 'text', text: 'Your background command finished: wake' }] },
+    })
+    fs.writeFileSync(transcriptPath, `${cmdRow}\n${turnEndedRow()}\n${typedRow('Fresh terminal task after room turn ended')}\n`)
+
+    const res = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      dir,
+    })
+    assert.equal(res.action, 'opened')
+    assert.equal(res.midTurn, false, 'terminal prompt after turn_ended must NOT join the ended room command')
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, res.requestId, 'new terminal prompt must replace ended room command as sole current')
+    assert.equal(after.joined.size, 0, 'must NOT treat the new turn as serving two people')
+    assert.equal(turnAmbiguity(after), null)
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.deny, undefined)
+    assert.equal(stamped.args?.request_ref, res.requestId, 'writes in the new turn must stamp only the terminal prompt')
+  })
 })
