@@ -40,7 +40,7 @@ import {
 } from './remote-ingress-test-fixtures.mjs'
 import { resolveSpaceFreeWakeFile, splitWakes, wakeLines, wakesWaitingEvent } from './devspec-wake-file.mjs'
 import { NOTHING_UNREAD, readerHeader } from './devspec-wake-tail.mjs'
-import { fitsShellOutput, readNoteText } from './hook-context-budget.mjs'
+import { fitsShellOutput, readNoteText, shellDiagnosticReserve } from './hook-context-budget.mjs'
 import { RECALL_IN_NEXT_WAKE, RECALL_UNSAVED_NOTE, seenRecallKeys, seenStoreFile } from './turn-recall.mjs'
 import { withoutEndedConnectionWakes } from './step-delivery.mjs'
 import { catCall, noteFiles } from '../../tests/helpers/note-reads.mjs'
@@ -51,6 +51,8 @@ const WAIT_SCRIPT = path.join(HERE, 'devspec-remote-wait.mjs')
 const TAIL_SCRIPT = path.join(HERE, 'devspec-wake-tail.mjs')
 const CONNECTION = FIXTURE_ID.connection
 const CHAT = 'cursor-chat-recall-test'
+const ONE_SHOT_PICKUP_RESERVE = shellDiagnosticReserve('devspec-remote-wait')
+const ONE_SHOT_RESERVE_LEN = ONE_SHOT_PICKUP_RESERVE.length
 
 /**
  * How long every DevSpec plugin waits for a turn's recall (DevSpecV2
@@ -481,8 +483,9 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      // A command wake that fits on its own but not with the pointer beside it, with room for the waiting line.
-      const body = bodyFor(19_870)
+      // A command wake that fits on its own (beside the one-shot pickup diagnostic reserve)
+      // but not with the pointer beside it, with room for the waiting line.
+      const body = bodyFor(19_870 - ONE_SHOT_RESERVE_LEN)
       run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(12) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
       const before = run.state().inbox_byte_offset
@@ -518,7 +521,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      const body = bodyFor(19_950)
+      const body = bodyFor(19_950 - ONE_SHOT_RESERVE_LEN)
       run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(13) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
       const before = run.state().inbox_byte_offset
@@ -528,7 +531,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
       assert.ok(fitsShellOutput(first.stdout()), `${first.stdout().length} characters in one result`)
       const one = first.events()
       assert.deepEqual(one.map((e) => e.type), ['owner_message', 'wake', RECALL_IN_NEXT_WAKE.type], 'the marker closes the result; the waiting line has no room')
-      assert.ok(!fitsShellOutput(first.stdout() + wakeLines([wakesWaitingEvent(1)])), 'the waiting line really would not fit')
+      assert.ok(!fitsShellOutput(first.stdout() + ONE_SHOT_PICKUP_RESERVE + wakeLines([wakesWaitingEvent(1)])), 'the waiting line really would not fit beside pickup reserve')
       assert.equal(one[0].body, body, 'the command, whole')
       assert.equal(run.state().inbox_byte_offset, before, 'the cursor stays at this delivery')
       assert.ok(run.state().wake_batch_progress, 'and the rest is kept for the re-arm')
@@ -568,7 +571,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      run.stub.serve(commandPoll(2, bodyFor(19_950), { turn_recall: mediumRecall(14) }))
+      run.stub.serve(commandPoll(2, bodyFor(19_950 - ONE_SHOT_RESERVE_LEN), { turn_recall: mediumRecall(14) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
       const first = run.startWait()
       assert.equal(await Promise.race([first.exited, sleep(10_000).then(() => 'timeout')]), 0, first.stderr())
@@ -624,7 +627,7 @@ describe('a command sent from a DevSpec room gets its project recall', () => {
     try {
       assert.ok(await until(() => run.stub.polls.length >= 1), `no poll; stderr:\n${run.stderr()}`)
       const bodyFor = await measuredBodies(run)
-      const body = bodyFor(19_870)
+      const body = bodyFor(19_870 - ONE_SHOT_RESERVE_LEN)
       run.stub.serve(commandPoll(2, body, { turn_recall: mediumRecall(13) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
 
@@ -759,7 +762,7 @@ describe('when notes cannot be written (a disk problem in the home folder)', () 
       const around = wakeLines(await run.nextWake()).length - 2 * 100
       run.patchState({ session_id: ROOM })
       breakNotes(run.home)
-      const tight = 'a'.repeat(Math.floor((19_870 - around - 2) / 2))
+      const tight = 'a'.repeat(Math.floor((19_870 - ONE_SHOT_RESERVE_LEN - around - 2) / 2))
       run.stub.serve(commandPoll(2, tight, { turn_recall: recall(23) }))
       assert.ok(await until(() => run.records().length === 2), `not kept; stderr:\n${run.stderr()}`)
       // Its recall's note cannot be saved: the line saying so goes beside it, and nothing waits.
