@@ -788,7 +788,10 @@ export async function readWakes({
         await write(page.text)
         pickupDiagnosticNote = fittedWithStdout.note
         const savedEarlyNote = Boolean(fittedWithStdout.note) || fitsShellOutput(page.text + noteDiag)
-        spoolUnsavedRefusal(spoolKey, noteDiag, spoolOpts)
+        spoolUnsavedRefusal(spoolKey, noteDiag, {
+          ...spoolOpts,
+          savedNote: fittedWithStdout.note,
+        })
         await writeStderr(fittedWithStdout.text)
         pickupDiagnosticWritten = true
         if (savedEarlyNote) {
@@ -818,7 +821,10 @@ export async function readWakes({
             actualChars: noteDiag.length,
             noteError: fittedFullBudget.noteError,
           })
-        spoolUnsavedRefusal(spoolKey, noteDiag, spoolOpts)
+        spoolUnsavedRefusal(spoolKey, noteDiag, {
+          ...spoolOpts,
+          savedNote: fittedFullBudget.note,
+        })
         if (fallbackNotice) {
           await writeStderr(fallbackNotice)
           pickupDiagnosticWritten = true
@@ -899,6 +905,7 @@ export async function readWakes({
         home,
         fallbackDir: fallbackNoteDir,
         backupDir: dir,
+        spoolKey,
       })
       if (!storeProbe.ok) {
         const preflightErr = formatDiagnosticStorePreflightError('devspec-wake-tail', storeProbe.errors)
@@ -1029,7 +1036,11 @@ export async function readWakes({
       // 91d7b47c / 3c5147a7).
       const spooledLiveAhead = Boolean(rawDiag && !fittedWithStdout.note?.pendingPermissionRecovery)
       if (spooledLiveAhead) {
-        spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+        spoolUnsavedRefusal(spoolKey, rawDiag, {
+          ...spoolOpts,
+          savedNote: fittedWithStdout.note,
+          reservedStore: reservedDiagnosticStore,
+        })
       }
       if (diagText) {
         await writeStderr(diagText)

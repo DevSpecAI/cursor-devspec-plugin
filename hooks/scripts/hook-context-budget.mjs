@@ -226,6 +226,23 @@ export function fitsShellOutput(text) {
 export const NOTE_PART_CHARS = 18_000
 export const NOTE_PART_BYTES = 36_000
 
+/**
+ * Pre-allocated size per reserved diagnostic note slot (128 KiB: >3x Cursor's 40,000-byte
+ * Shell move-to-file ceiling `CURSOR_SHELL_OUTPUT_MAX_BYTES`) so an oversized refusal
+ * saved after preflight can be overwritten in place without allocating new filesystem
+ * blocks even if the disk fills (`ENOSPC`) mid-pickup. Unlinked on clean `release()`.
+ */
+export const RESERVED_DIAGNOSTIC_SLOT_BYTES = 128 * 1024
+
+/**
+ * Pre-allocated size for the reserved pending-refusal spool pointer slot (4 KiB: one
+ * standard POSIX filesystem block, plenty for a ~250-byte `{ kind: 'note_ref', ... }`
+ * JSON pointer with trailing ASCII spaces) so even if the disk fills (`ENOSPC`) after a
+ * note is saved and `stderr` breaks (`EPIPE`), the pointer can be overwritten in place
+ * with zero new block allocation so the next OS process still discovers the saved note.
+ */
+export const RESERVED_SPOOL_POINTER_BYTES = 4096
+
 /** Where notes too long for a hook, or that must be seen read, are kept: one private folder. */
 const NOTES_DIR = path.join('.devspec', 'notes')
 const NOTE_ID = /^[0-9a-f]{16}$/
@@ -1076,7 +1093,12 @@ function parsePendingDiagnosticRefusalFile(content, expectedScopeTag) {
   return { ok: true, body }
 }
 
-export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+export function reserveDiagnosticNoteSlots({
+  home = os.homedir(),
+  fallbackDir = null,
+  backupDir = null,
+  spoolKey = null,
+} = {}) {
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'u'
   const primaryCandidates = [
     { store: 'home_notes', dir: path.join(home, NOTES_DIR), prefix: '' },
@@ -1085,9 +1107,12 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
   ]
   const errors = []
   const slots = []
+  const spoolSlots = []
   const openedDirs = new Set()
   const writeAllSync = (fd, buf) => {
-    fs.ftruncateSync(fd, 0)
+    // Write from offset 0 FIRST without truncating to 0 beforehand so overwriting a
+    // pre-allocated slot in place allocates ZERO new disk blocks even under `ENOSPC`,
+    // then trim trailing pre-allocated bytes only after the full payload is written.
     let offset = 0
     while (offset < buf.length) {
       const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset)
@@ -1096,10 +1121,29 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       }
       offset += written
     }
+    const postWriteStat = fs.fstatSync(fd)
+    if (postWriteStat.size > buf.length) {
+      fs.ftruncateSync(fd, buf.length)
+    }
     fs.fsyncSync(fd)
     const st = fs.fstatSync(fd)
     if (st.size !== buf.length) {
       throw new Error(`reserved diagnostic slot size mismatch (${st.size}/${buf.length} bytes on disk)`)
+    }
+  }
+  const writeFixedBlockSync = (fd, buf, expectedLen) => {
+    let offset = 0
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset)
+      if (!Number.isInteger(written) || written <= 0 || written > buf.length - offset) {
+        throw new Error(`short write to reserved spool slot (${offset}/${buf.length} bytes written)`)
+      }
+      offset += written
+    }
+    fs.fsyncSync(fd)
+    const st = fs.fstatSync(fd)
+    if (st.size !== expectedLen) {
+      throw new Error(`reserved spool slot size mismatch (${st.size}/${expectedLen} bytes on disk)`)
     }
   }
   const verifySlotReadableByPath = (slot, expectedBytes = null) => {
@@ -1125,6 +1169,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       }
     }
   }
+  const preallocDiagBuf = Buffer.alloc(RESERVED_DIAGNOSTIC_SLOT_BYTES, 0x20)
   const openSlotIn = (candidate) => {
     const hex = randomBytes(8).toString('hex')
     const fileName = candidate.prefix ? `${candidate.prefix}${hex.slice(0, 16 - candidate.prefix.length)}.md` : `${hex}.md`
@@ -1132,6 +1177,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
     fs.mkdirSync(candidate.dir, { recursive: true, mode: 0o700 })
     const fd = fs.openSync(filePath, 'wx', 0o600)
     try {
+      writeAllSync(fd, preallocDiagBuf)
       const st = fs.fstatSync(fd)
       const slot = {
         store: candidate.store,
@@ -1140,6 +1186,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
         filePath,
         fd,
         ino: st.ino,
+        allocatedBytes: RESERVED_DIAGNOSTIC_SLOT_BYTES,
         used: false,
       }
       if (!verifySlotReadableByPath(slot)) {
@@ -1150,6 +1197,24 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       try { fs.closeSync(fd) } catch { /* ignore */ }
       try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
       throw error
+    }
+  }
+  const openSpoolSlotIn = (dirPath, scopeTag) => {
+    const hex = randomBytes(8).toString('hex')
+    const filePath = path.join(dirPath, `${spoolEntryFilePrefix(scopeTag)}slot-${hex}.json`)
+    let fd = null
+    try {
+      fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 })
+      fd = fs.openSync(filePath, 'wx', 0o600)
+      const preallocBuf = Buffer.alloc(RESERVED_SPOOL_POINTER_BYTES, 0x20)
+      writeFixedBlockSync(fd, preallocBuf, RESERVED_SPOOL_POINTER_BYTES)
+      return { dir: dirPath, filePath, fd, scopeTag, used: false }
+    } catch {
+      if (fd !== null) {
+        try { fs.closeSync(fd) } catch { /* ignore */ }
+      }
+      try { fs.rmSync(filePath, { force: true }) } catch { /* ignore */ }
+      return null
     }
   }
   // Open reserved slots in EVERY distinct writable primary store (not stopping after the
@@ -1177,6 +1242,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       errors,
       slots: [],
       write: () => null,
+      writeSpoolPointer: () => ({ persistedOnDisk: false, file: null }),
       release: () => {},
     }
   }
@@ -1187,6 +1253,12 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
     } catch {
       /* optional backup slot: primary slot already passed preflight */
     }
+  }
+  const effectiveSpoolKey = String(spoolKey ?? backupDir ?? home)
+  const effectiveScopeTag = spoolScopeTag(effectiveSpoolKey)
+  for (const dirPath of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const sSlot = openSpoolSlotIn(dirPath, effectiveScopeTag)
+    if (sSlot) spoolSlots.push(sSlot)
   }
   const writeFormattedToSlot = (
     activeSlot,
@@ -1274,6 +1346,7 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       parts: totalParts,
       fallback: true,
       reserved: true,
+      ...(frameNonce ? { frameNonce } : {}),
       ...(pendingPermissionRecovery ? { pendingPermissionRecovery: true } : {}),
     }
   }
@@ -1300,7 +1373,9 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
           }
         }
         try {
-          const written = writeFormattedToSlot(activeSlot, raw, id, { requireReadableByPath: true })
+          const written = writeFormattedToSlot(activeSlot, raw, id, {
+            requireReadableByPath: true,
+          })
           if (written) return written
         } catch {
           try { fs.ftruncateSync(activeSlot.fd, 0) } catch { /* ignore */ }
@@ -1337,6 +1412,27 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
       }
       return null
     },
+    writeSpoolPointer(payload) {
+      const json = JSON.stringify(payload)
+      const jsonBuf = Buffer.from(json, 'utf8')
+      if (jsonBuf.length > RESERVED_SPOOL_POINTER_BYTES) {
+        return { persistedOnDisk: false, file: null }
+      }
+      const padded = Buffer.alloc(RESERVED_SPOOL_POINTER_BYTES, 0x20)
+      jsonBuf.copy(padded, 0)
+      for (const sSlot of spoolSlots) {
+        if (sSlot.fd === null || sSlot.used) continue
+        if (payload?.scope && sSlot.scopeTag !== payload.scope) continue
+        try {
+          writeFixedBlockSync(sSlot.fd, padded, RESERVED_SPOOL_POINTER_BYTES)
+          sSlot.used = true
+          return { persistedOnDisk: true, file: sSlot.filePath }
+        } catch {
+          /* try next pre-allocated spool slot */
+        }
+      }
+      return { persistedOnDisk: false, file: null }
+    },
     release() {
       for (const slot of slots) {
         if (slot.fd !== null) {
@@ -1345,6 +1441,15 @@ export function reserveDiagnosticNoteSlots({ home = os.homedir(), fallbackDir = 
         }
         if (!slot.used) {
           try { fs.rmSync(slot.filePath, { force: true }) } catch { /* ignore */ }
+        }
+      }
+      for (const sSlot of spoolSlots) {
+        if (sSlot.fd !== null) {
+          try { fs.closeSync(sSlot.fd) } catch { /* ignore */ }
+          sSlot.fd = null
+        }
+        if (!sSlot.used) {
+          try { fs.rmSync(sSlot.filePath, { force: true }) } catch { /* ignore */ }
         }
       }
     },
@@ -1469,7 +1574,61 @@ export function formatDiagnosticStorePreflightError(label, errors = [], { priorT
  */
 const pendingUnsavedRefusals = new Map()
 
-export function spoolUnsavedRefusal(spoolKey, diagnosticText, { home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
+function recoverNoteRefPayload(parsed) {
+  if (!parsed || parsed.kind !== 'note_ref' || typeof parsed.file !== 'string' || !parsed.file) return null
+  const partsCount = Number.isInteger(parsed.parts) && parsed.parts > 0 ? parsed.parts : 1
+  const readFallbackCmd = typeof parsed.command === 'string' && parsed.command ? parsed.command : `cat ${shellQuotePath(parsed.file)}`
+  try {
+    if (parsed.reserved) {
+      let content = fs.readFileSync(parsed.file, 'utf8')
+      const noncePat =
+        typeof parsed.frame_nonce === 'string' && /^[0-9a-f]{16}$/.test(parsed.frame_nonce)
+          ? ` \\[frame:${parsed.frame_nonce}\\]`
+          : ''
+      const quotedPath = shellQuotePath(parsed.file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const footerRe = new RegExp(
+        `\\n\\n--- part \\d+/\\d+ \\((?:\\d+ chars total|end of \\d+ chars)\\)(?: · next part \\(\\d+/\\d+\\): tail -c \\+\\d+ ${quotedPath} \\| head -c \\d+)?${noncePat} ---\\n`,
+        'g',
+      )
+      content = content.replace(footerRe, '')
+      if (content) return { ok: true, text: content }
+    } else if (parsed.fallback) {
+      const chunks = []
+      for (let p = 1; p <= partsCount; p += 1) {
+        const pFile = p === 1 ? parsed.file : parsed.file.replace(/\.md$/, `-part-${p}.md`)
+        let raw = fs.readFileSync(pFile, 'utf8')
+        raw = raw.replace(/\n\n--- next part \(\d+\/\d+\): cat [\s\S]*? ---\n$/, '')
+        if (p === partsCount && raw.endsWith('\n')) raw = raw.slice(0, -1)
+        chunks.push(raw)
+      }
+      const joined = chunks.join('')
+      if (joined) return { ok: true, text: joined }
+    } else {
+      const chunks = []
+      for (let p = 1; p <= partsCount; p += 1) {
+        const pFile = p === 1 ? parsed.file : parsed.file.replace(/\.md$/, `.${p}.md`)
+        const raw = fs.readFileSync(pFile, 'utf8')
+        const id = path.basename(parsed.file, '.md')
+        const unsealed = unseal(raw, partLabel(id, p, partsCount))
+        chunks.push(unsealed ?? raw)
+      }
+      const joined = chunks.join('')
+      if (joined) return { ok: true, text: joined }
+    }
+  } catch {
+    /* fall back to read pointer below */
+  }
+  return {
+    ok: false,
+    text: `Previously saved diagnostic note could not be re-read; inspect directly with \`${readFallbackCmd}\``,
+  }
+}
+
+export function spoolUnsavedRefusal(
+  spoolKey,
+  diagnosticText,
+  { home = os.homedir(), fallbackDir = null, backupDir = null, savedNote = null, reservedStore = null } = {},
+) {
   const key = String(spoolKey ?? '')
   const text = String(diagnosticText ?? '')
   if (!key || !text) return { persistedOnDisk: false, file: null }
@@ -1479,7 +1638,48 @@ export function spoolUnsavedRefusal(spoolKey, diagnosticText, { home = os.homedi
   }
   const scopeTag = spoolScopeTag(key)
   const entryHash = spoolEntryHash(text)
-  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+  const dirs = spoolCandidateDirs({ home, fallbackDir, backupDir })
+
+  // If the full diagnostic is ALREADY saved whole on disk in `savedNote`, persist a tiny
+  // ~250-byte `note_ref` pointer (trying candidate dirs + the note's own dir + the
+  // pre-allocated 4 KiB reserved spool slot) so even `ENOSPC` + `EPIPE` leaves the saved
+  // note discoverable by the next OS process without duplicating tens of KiB (3ea2b201 / 4e32d1a5).
+  if (savedNote && typeof savedNote.file === 'string' && savedNote.file) {
+    const refPayload = {
+      version: 2,
+      scope: scopeTag,
+      hash: entryHash,
+      kind: 'note_ref',
+      at: new Date().toISOString(),
+      file: savedNote.file,
+      command: savedNote.command,
+      parts: savedNote.parts ?? 1,
+      fallback: Boolean(savedNote.fallback),
+      ...(savedNote.reserved ? { reserved: true } : {}),
+      ...(savedNote.frameNonce ? { frame_nonce: savedNote.frameNonce } : {}),
+    }
+    const refDirs = [...dirs]
+    const noteDir = path.dirname(savedNote.file)
+    if (noteDir && !refDirs.some((d) => path.resolve(d) === path.resolve(noteDir))) {
+      refDirs.push(noteDir)
+    }
+    for (const dir of refDirs) {
+      const file = spoolEntryFilePath(dir, scopeTag, entryHash)
+      try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+        writePrivateJson(file, refPayload)
+        return { persistedOnDisk: true, file }
+      } catch {
+        /* try next dir or pre-allocated spool slot */
+      }
+    }
+    if (reservedStore && typeof reservedStore.writeSpoolPointer === 'function') {
+      const fromSlot = reservedStore.writeSpoolPointer(refPayload)
+      if (fromSlot?.persistedOnDisk) return fromSlot
+    }
+  }
+
+  for (const dir of dirs) {
     const file = spoolEntryFilePath(dir, scopeTag, entryHash)
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -1493,6 +1693,44 @@ export function spoolUnsavedRefusal(spoolKey, diagnosticText, { home = os.homedi
       return { persistedOnDisk: true, file }
     } catch {
       /* try next candidate directory */
+    }
+  }
+  // Last-resort pre-allocated fallback under `ENOSPC`: write into a pre-allocated 4 KiB
+  // spool slot if small, or into a pre-allocated 128 KiB diagnostic slot if oversized.
+  if (reservedStore && typeof reservedStore.writeSpoolPointer === 'function') {
+    const fromSlot = reservedStore.writeSpoolPointer({
+      version: 2,
+      scope: scopeTag,
+      hash: entryHash,
+      at: new Date().toISOString(),
+      text,
+    })
+    if (fromSlot?.persistedOnDisk) return fromSlot
+  }
+  if (!savedNote && reservedStore && typeof reservedStore.write === 'function') {
+    try {
+      const saved = reservedStore.write(text, { spoolKey: key })
+      if (saved?.file) {
+        const refPayload = {
+          version: 2,
+          scope: scopeTag,
+          hash: entryHash,
+          kind: 'note_ref',
+          at: new Date().toISOString(),
+          file: saved.file,
+          command: saved.command,
+          parts: saved.parts ?? 1,
+          fallback: Boolean(saved.fallback),
+          ...(saved.reserved ? { reserved: true } : {}),
+        }
+        if (typeof reservedStore.writeSpoolPointer === 'function') {
+          const fromSlot = reservedStore.writeSpoolPointer(refPayload)
+          if (fromSlot?.persistedOnDisk) return fromSlot
+        }
+        return { persistedOnDisk: true, file: saved.file }
+      }
+    } catch {
+      /* ignore */
     }
   }
   return { persistedOnDisk: false, file: null }
@@ -1547,7 +1785,10 @@ export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fall
       }
       if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
         const parsed = readPrivateJson(path.join(dir, name))
-        if (typeof parsed?.text === 'string' && parsed.text) {
+        if (parsed?.kind === 'note_ref') {
+          const recoveredRef = recoverNoteRefPayload(parsed)
+          if (recoveredRef?.text) pushUnique(recoveredRef.text)
+        } else if (typeof parsed?.text === 'string' && parsed.text) {
           pushUnique(parsed.text)
         }
         continue
@@ -1668,11 +1909,35 @@ export function clearPendingUnsavedRefusals(
         drainLegacySpoolFile(dir, path.join(dir, name), { claimFirst: false })
         continue
       }
-      if (!clearedHashes && name.startsWith(entryPrefix) && name.endsWith('.json')) {
-        try {
-          fs.rmSync(path.join(dir, name), { force: true })
-        } catch {
-          /* ignore */
+      if (name.startsWith(entryPrefix) && name.endsWith('.json')) {
+        const fullPath = path.join(dir, name)
+        if (!clearedHashes) {
+          try {
+            fs.rmSync(fullPath, { force: true })
+          } catch {
+            /* ignore */
+          }
+          continue
+        }
+        // Match pre-allocated `slot-<hex>.json` or `note_ref` spool entries ONLY when
+        // their hash or recovered text was actually in `clearedSet` (never deleting
+        // concurrently added entries or unreadable originals).
+        const parsed = readPrivateJson(fullPath)
+        if (!parsed) continue
+        const matchesHash = typeof parsed.hash === 'string' && clearedHashes.has(parsed.hash)
+        const matchesText =
+          (typeof parsed.text === 'string' && clearedSet?.has(parsed.text)) ||
+          (parsed.kind === 'note_ref' &&
+            (() => {
+              const rec = recoverNoteRefPayload(parsed)
+              return Boolean(rec?.ok && clearedSet?.has(rec.text))
+            })())
+        if (matchesHash || matchesText) {
+          try {
+            fs.rmSync(fullPath, { force: true })
+          } catch {
+            /* ignore */
+          }
         }
         continue
       }

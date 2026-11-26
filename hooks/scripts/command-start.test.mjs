@@ -5613,4 +5613,192 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
     assert.match(okTailStderr.join(''), /cat /)
     assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
   })
+
+  it('pre-allocated 128 KiB diagnostic slots and 4 KiB spool pointer slots survive mid-pickup ENOSPC + EPIPE so a fresh OS process still recovers every blocking item (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { Writable } = await import('node:stream')
+    const { home, dir } = mkHome()
+    const notesDir = path.join(home, '.devspec', 'notes')
+    fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+    const diagDir = path.join(dir, 'diagnostic-notes')
+    const {
+      reserveDiagnosticNoteSlots,
+      fitShellDiagnostic,
+      spoolUnsavedRefusal,
+      peekPendingUnsavedRefusals,
+      clearPendingUnsavedRefusals,
+    } = await import('./hook-context-budget.mjs')
+    const { runOneShotRoomCommandPickup, writeStderrChecked } = await import('./devspec-remote-wait.mjs')
+
+    const spoolKey = path.resolve(dir)
+    const spoolOpts = { home, fallbackDir: diagDir, backupDir: dir }
+    const hookBudgetUrl = new URL('./hook-context-budget.mjs', import.meta.url).href
+
+    // 1. Mid-pickup ENOSPC on creating any NEW file (disk fills after preflight):
+    //    pre-allocated 128 KiB slot STILL saves the complete 35 KB refusal in place AND
+    //    returns a working `head -c ...` read command containing the final blocking item!
+    const reserved1 = reserveDiagnosticNoteSlots({ home, fallbackDir: diagDir, backupDir: dir, spoolKey })
+    assert.equal(reserved1.ok, true)
+    const oversizedPayload = JSON.stringify({
+      code: 'blocked_by_items',
+      blocking_items: [
+        { id: 'blk-enospc-first', detail: 'F'.repeat(30000) },
+        { id: 'blk-enospc-final', reason: 'must_not_be_omitted_under_enospc' },
+      ],
+    })
+    const origOpenSync = fs.openSync
+    const origWriteFileSync = fs.writeFileSync
+    fs.openSync = (filePath, flags, ...rest) => {
+      if (flags !== 'r') {
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+      }
+      return origOpenSync(filePath, flags, ...rest)
+    }
+    fs.writeFileSync = () => {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    }
+    let fitted1 = null
+    let spoolRes1 = null
+    try {
+      fitted1 = fitShellDiagnostic('', oversizedPayload, {
+        home,
+        label: 'devspec-remote-wait',
+        fallbackDir: diagDir,
+        backupDir: dir,
+        reservedStore: reserved1,
+        spoolKey,
+      })
+      spoolRes1 = spoolUnsavedRefusal(spoolKey, oversizedPayload, {
+        ...spoolOpts,
+        savedNote: fitted1.note,
+        reservedStore: reserved1,
+      })
+    } finally {
+      fs.openSync = origOpenSync
+      fs.writeFileSync = origWriteFileSync
+      reserved1.release()
+    }
+    assert.ok(fitted1.note?.file, 'pre-allocated 128 KiB slot MUST save full refusal in place under ENOSPC')
+    assert.match(fitted1.note.command, /head -c |cat /)
+    const savedOnDisk = fs.readFileSync(fitted1.note.file, 'utf8')
+    assert.match(savedOnDisk, /blk-enospc-first/)
+    assert.match(savedOnDisk, /blk-enospc-final/, 'final blocking record MUST be preserved whole on disk')
+    assert.equal(spoolRes1.persistedOnDisk, true, 'pre-allocated 4 KiB spool slot MUST persist note_ref under ENOSPC')
+
+    // Verify a BRAND-NEW OS PROCESS discovers the saved note via the pre-allocated spool slot!
+    const childPeek = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { peekPendingUnsavedRefusals } from ${JSON.stringify(hookBudgetUrl)}; console.log(JSON.stringify(peekPendingUnsavedRefusals(${JSON.stringify(spoolKey)}, ${JSON.stringify(spoolOpts)})));`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(childPeek.status, 0, childPeek.stderr)
+    const childEntries = JSON.parse(childPeek.stdout)
+    assert.equal(childEntries.length, 1)
+    assert.match(childEntries[0], /blk-enospc-final/, 'fresh OS process MUST recover the final blocking record')
+    clearPendingUnsavedRefusals(spoolKey, childEntries, spoolOpts)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+
+    // 2. Saved note + ENOSPC on creating spool file + EPIPE on stderr in runOneShotRoomCommandPickup:
+    //    pre-allocated 4 KiB spool slot keeps the note discoverable across a fresh OS process!
+    const printedWakes = [buildOwnerMessageEvents(ownerBatch('ENOSPC spool + EPIPE stderr recovery'))]
+    const reserved2 = reserveDiagnosticNoteSlots({ home, fallbackDir: diagDir, backupDir: dir, spoolKey })
+    assert.equal(reserved2.ok, true)
+    const brokenStderr = new Writable({
+      write(_chunk, _enc, cb) {
+        cb(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      },
+    })
+    let blockSpoolWrites = false
+    const origRenameSync = fs.renameSync
+    fs.writeFileSync = (filePath, data, opts) => {
+      if (blockSpoolWrites && String(filePath).includes('devspec-unsaved-refusal')) {
+        throw Object.assign(new Error('ENOSPC writing spool file'), { code: 'ENOSPC' })
+      }
+      return origWriteFileSync(filePath, data, opts)
+    }
+    fs.renameSync = (from, to) => {
+      if (blockSpoolWrites && String(to).includes('devspec-unsaved-refusal')) {
+        throw Object.assign(new Error('ENOSPC renaming spool file'), { code: 'ENOSPC' })
+      }
+      return origRenameSync(from, to)
+    }
+    try {
+      await assert.rejects(
+        () =>
+          runOneShotRoomCommandPickup({
+            connectionId: CONN,
+            printedWakes,
+            dir,
+            home,
+            reservedStore: reserved2,
+            startCommands: async () => {
+              blockSpoolWrites = true
+              return {
+                ok: false,
+                outcome: 'refused',
+                refusals: [
+                  {
+                    command_message_id: 'msg-enospc-epipe',
+                    refusal: {
+                      code: 'blocked_by_items',
+                      blocking_items: [{ id: 'blk-note-ref-enospc-epipe', detail: 'Z'.repeat(26000) }],
+                    },
+                  },
+                ],
+              }
+            },
+            writeStderr: (text) => writeStderrChecked(text, brokenStderr),
+          }),
+        /write EPIPE/,
+      )
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      blockSpoolWrites = false
+      fs.writeFileSync = origWriteFileSync
+      fs.renameSync = origRenameSync
+      reserved2.release()
+    }
+
+    // Fresh OS process MUST still discover the saved note despite ENOSPC + EPIPE!
+    const childPeek2 = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { peekPendingUnsavedRefusals } from ${JSON.stringify(hookBudgetUrl)}; console.log(JSON.stringify(peekPendingUnsavedRefusals(${JSON.stringify(spoolKey)}, ${JSON.stringify(spoolOpts)})));`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(childPeek2.status, 0, childPeek2.stderr)
+    const childEntries2 = JSON.parse(childPeek2.stdout)
+    assert.ok(
+      childEntries2.some((e) => e.includes('blk-note-ref-enospc-epipe')),
+      'fresh OS process MUST discover saved note through pre-allocated spool slot after ENOSPC + EPIPE',
+    )
+
+    // Next healthy retry surfaces the recovered refusal and clears the pre-allocated spool slot!
+    const retryStderr = []
+    const retryRes = await runOneShotRoomCommandPickup({
+      connectionId: CONN,
+      printedWakes,
+      dir,
+      home,
+      startCommands: async ({ commands }) => ({
+        ok: true,
+        outcome: 'picked_up',
+        started: commands,
+        pickedUp: commands.length,
+        refusals: [],
+      }),
+      writeStderr: (t) => retryStderr.push(t),
+    })
+    assert.equal(retryRes.ok, true)
+    assert.ok(retryRes.diagnosticNote?.file)
+    assert.match(retryStderr.join(''), /cat /)
+    assert.deepEqual(peekPendingUnsavedRefusals(spoolKey, spoolOpts), [])
+  })
 })

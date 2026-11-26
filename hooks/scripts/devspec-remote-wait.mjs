@@ -1977,7 +1977,7 @@ export async function runOneShotRoomCommandPickup({
     return { ok: true, hadCommands: false, stderrText: '', diagnosticNote: null }
   }
   const ownedReservedStore = !callerReservedStore
-    ? reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir })
+    ? reserveDiagnosticNoteSlots({ home, fallbackDir: fallbackNoteDir, backupDir: dir, spoolKey })
     : null
   const reservedStore = callerReservedStore ?? ownedReservedStore
   try {
@@ -2080,7 +2080,11 @@ export async function runOneShotRoomCommandPickup({
     // 91d7b47c / 3c5147a7).
     const spooledLiveAhead = Boolean(refusals && rawDiag && !fitted.note?.pendingPermissionRecovery)
     if (spooledLiveAhead) {
-      spoolUnsavedRefusal(spoolKey, rawDiag, spoolOpts)
+      spoolUnsavedRefusal(spoolKey, rawDiag, {
+        ...spoolOpts,
+        savedNote: fitted.note,
+        reservedStore: reservedStore?.ok ? reservedStore : null,
+      })
     }
     if (diagText) {
       await writeStderr(diagText)
@@ -2531,6 +2535,7 @@ async function main() {
                     home: os.homedir(),
                     fallbackDir: diagnosticFallbackDir,
                     backupDir: CONNECTIONS_DIR,
+                    spoolKey: path.resolve(CONNECTIONS_DIR),
                   })
                   if (!storeProbe.ok) {
                     return { count: 0, noteStoreError: storeProbe, held: null, pickupFailed: false, shot: null, pickup }
@@ -2761,6 +2766,7 @@ async function main() {
               home: os.homedir(),
               fallbackDir: diagnosticFallbackDir,
               backupDir: CONNECTIONS_DIR,
+              spoolKey: path.resolve(CONNECTIONS_DIR),
             })
             if (!storeProbe.ok) {
               const preflightErr = formatDiagnosticStorePreflightError('devspec-remote-wait', storeProbe.errors, {
