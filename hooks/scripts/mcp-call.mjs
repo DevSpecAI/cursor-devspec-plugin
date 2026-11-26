@@ -233,6 +233,7 @@ async function performMcpToolsCall({
   }
 
   let res
+  let text
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
@@ -240,6 +241,9 @@ async function performMcpToolsCall({
       body: bodyText,
       signal: controller.signal,
     })
+    // Keep the timeout and owner-liveness abort timers armed through the response body
+    // read so a slow/stalled streaming body cannot outrun `timeoutMs` (req 3c5147a7).
+    text = await res.text()
   } catch (e) {
     if (abortCode) {
       const err = new Error(`MCP call ${name} aborted: ${abortCode}`)
@@ -252,7 +256,6 @@ async function performMcpToolsCall({
     if (aliveTimer) clearInterval(aliveTimer)
   }
 
-  const text = await res.text()
   if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
     // The message keeps its `MCP HTTP <status>: …` shape — logs and existing matching read it.

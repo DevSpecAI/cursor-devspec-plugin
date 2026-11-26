@@ -1130,8 +1130,11 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         child.on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }) })
       })
       assert.equal(code, 1)
-      assert.equal(stdout, '', 'stdout stays empty when pickup refuses so refusal diagnostic gets the full Shell budget')
-      assert.match(stderr, /busy_refusal/)
+      assert.ok(stdout.length > 0, 'wake reaches stdout before report_pickup runs (req 3ea2b201)')
+      const diagText = /notes\/([0-9a-f]{16})\.md/.test(stderr)
+        ? readNoteText(/notes\/([0-9a-f]{16})\.md/.exec(stderr)[1], { home })
+        : stderr
+      assert.match(diagText, /busy_refusal/, 'structured refusal preserved inline or in sealed diagnostic note')
       assert.ok(
         fitsShellOutput(stdout + stderr),
         `combined stdout (${stdout.length}) + stderr (${stderr.length}) = ${(stdout + stderr).length} must fit fitsShellOutput`,
@@ -1199,7 +1202,10 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
         child.on('close', (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }) })
       })
       assert.equal(code, 0, stderr)
-      assert.match(stderr, /nothing_open/)
+      const diagText = /notes\/([0-9a-f]{16})\.md/.test(stderr)
+        ? readNoteText(/notes\/([0-9a-f]{16})\.md/.exec(stderr)[1], { home })
+        : stderr
+      assert.match(diagText, /nothing_open/, 'nothing_open diagnostic preserved inline or in sealed diagnostic note')
       assert.ok(stdout.length > 0, 'wake is still delivered via sealed note or inline')
       assert.ok(
         fitsShellOutput(stdout + stderr),
