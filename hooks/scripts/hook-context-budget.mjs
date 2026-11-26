@@ -979,9 +979,13 @@ export function shellDiagnosticPointer(label, command, note = null) {
     return `${label}: partial ENOSPC refusal saved (${counts}; disk full) — run \`${command}\` (and any further parts), then free disk space and re-run wake read for the full refusal.\n`
   }
   if (note?.enospcCompacted) {
-    const whatShortened = note.enospcCompactedReasons
-      ? 'oversized blobs and reason text shortened; actionable URLs preserved'
-      : 'oversized blobs shortened'
+    const omittedUrls = Number.isInteger(note.enospcOmittedActionableUrls) ? note.enospcOmittedActionableUrls : 0
+    const whatShortened =
+      omittedUrls > 0
+        ? `blobs, reasons & ${omittedUrls} URL(s) omitted due to disk limit`
+        : note.enospcCompactedReasons
+          ? 'oversized blobs and reason text shortened; actionable URLs preserved'
+          : 'oversized blobs shortened'
     return `${label}: ENOSPC-compacted refusal saved (all blocking records preserved; ${whatShortened}) — run \`${command}\` (and any further parts); free disk space and re-run wake read for unabridged details.\n`
   }
   return `${label}: full details saved whole — run \`${command}\` (and any further parts).\n`
@@ -1074,6 +1078,7 @@ export function shellDiagnosticReserve(
     null,
     { enospcCompacted: true },
     { enospcCompacted: true, enospcCompactedReasons: true },
+    { enospcCompacted: true, enospcCompactedReasons: true, enospcOmittedActionableUrls: 99999 },
     { enospcIncomplete: true, returnedRecords: 99999, totalRecords: 99999, omittedRecords: 99999 },
   ]
   const addCommandCandidates = (candidates, command) => {
@@ -1304,21 +1309,26 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
     typeof v === 'string' &&
     v.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
     (/^\s*https?:\/\/\S+\s*$/i.test(v) || /^\s*\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/\S+\s*$/i.test(v))
-  const extractActionableUrls = (str) => {
-    if (typeof str !== 'string' || !str) return []
+  const extractAllActionableUrls = (str) => {
+    if (typeof str !== 'string' || !str) return { urls: [], oversizedCount: 0, totalCount: 0 }
     const matches = str.match(
       /(https?:\/\/[^\s"'<>)\]]+)|(\/(?:projects|sessions|tasks|memories|deployments|reviews|api)\/[^\s"'<>)\]]+)/g,
     )
-    if (!matches) return []
+    if (!matches) return { urls: [], oversizedCount: 0, totalCount: 0 }
     const seen = new Set()
-    const out = []
+    const urls = []
+    let oversizedCount = 0
     for (const raw of matches) {
       const cleaned = raw.replace(/[.,;:!?]+$/, '')
-      if (!cleaned || cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS || seen.has(cleaned)) continue
+      if (!cleaned || seen.has(cleaned)) continue
       seen.add(cleaned)
-      out.push(cleaned)
+      if (cleaned.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS) {
+        oversizedCount += 1
+        continue
+      }
+      urls.push(cleaned)
     }
-    return out
+    return { urls, oversizedCount, totalCount: urls.length + oversizedCount }
   }
 
   const shrinkValue = (
@@ -1332,18 +1342,20 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       compactOpaqueInNarrative = false,
       includePunctuatedTokens = false,
       compactUrls = false,
+      ultraCompactNonUrl = false,
       tracker = null,
     },
   ) => {
     if (typeof val === 'string') {
+      const urlKeyOrValue = isUrlKey(keyName) || isActionableUrlValue(val)
       const isActionableUrl =
         !compactUrls &&
         val.length <= ENOSPC_ACTIONABLE_URL_MAX_CHARS &&
-        (isUrlKey(keyName) || isActionableUrlValue(val))
+        urlKeyOrValue
       if (isActionableUrl) return val
       const isIdKey = keyName && ENOSPC_PRESERVED_ID_KEYS.has(keyName)
       const isNarrativeKey = keyName && ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(keyName)
-      if (isIdKey && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
+      if (isIdKey && !urlKeyOrValue && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       if (isNarrativeKey && compactOpaqueInNarrative) {
         const res = compactOpaqueTokensInString(val, {
           tokenPreviewChars: previewChars,
@@ -1363,7 +1375,41 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       if (isNarrativeKey && !compactReasons && val.length <= ENOSPC_COMPACT_BLOB_PREVIEW_CHARS * 2) return val
       if (val.length <= maxVerbatimChars) return val
       if (isNarrativeKey && tracker) tracker.shortenedNarrative = true
-      const embeddedUrls = !compactUrls ? extractActionableUrls(val) : []
+      const extractedUrls = extractAllActionableUrls(val)
+      if (compactUrls) {
+        const lostUrls = Math.max(urlKeyOrValue ? 1 : 0, extractedUrls.totalCount)
+        if (lostUrls > 0 && tracker) tracker.omittedActionableUrls += lostUrls
+        if (ultraCompactNonUrl) {
+          return lostUrls > 0
+            ? `[omitted:${val.length}c;urls_omitted:${lostUrls}]`
+            : `[omitted:${val.length}c]`
+        }
+        return {
+          truncated_due_to_enospc: true,
+          original_chars: val.length,
+          omitted_chars: Math.max(0, val.length - previewChars * 2),
+          ...(previewChars > 0
+            ? {
+                head: val.slice(0, previewChars),
+                tail: val.slice(-previewChars),
+              }
+            : {}),
+          ...(lostUrls > 0 ? { omitted_actionable_urls: lostUrls } : {}),
+        }
+      }
+      // URL-preserving mode (`compactUrls === false`): keep every URL up to
+      // `ENOSPC_ACTIONABLE_URL_MAX_CHARS` verbatim; only count URLs that exceeded that
+      // ceiling as omitted/shortened.
+      const lostOversizedUrls =
+        extractedUrls.oversizedCount > 0
+          ? extractedUrls.oversizedCount
+          : urlKeyOrValue && val.length > ENOSPC_ACTIONABLE_URL_MAX_CHARS
+            ? 1
+            : 0
+      if (lostOversizedUrls > 0 && tracker) tracker.omittedActionableUrls += lostOversizedUrls
+      if (ultraCompactNonUrl && extractedUrls.urls.length === 0 && lostOversizedUrls === 0) {
+        return `[omitted:${val.length}c]`
+      }
       return {
         truncated_due_to_enospc: true,
         original_chars: val.length,
@@ -1374,7 +1420,8 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
               tail: val.slice(-previewChars),
             }
           : {}),
-        ...(embeddedUrls.length > 0 ? { preserved_urls: embeddedUrls } : {}),
+        ...(extractedUrls.urls.length > 0 ? { preserved_urls: extractedUrls.urls } : {}),
+        ...(lostOversizedUrls > 0 ? { omitted_actionable_urls: lostOversizedUrls } : {}),
       }
     }
     if (Array.isArray(val)) {
@@ -1387,6 +1434,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactOpaqueInNarrative,
           includePunctuatedTokens,
           compactUrls,
+          ultraCompactNonUrl,
           tracker,
         }),
       )
@@ -1395,11 +1443,16 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       const out = {}
       const omittedFields = []
       for (const [k, v] of Object.entries(val)) {
+        const vUrls = typeof v === 'string' ? extractAllActionableUrls(v) : { urls: [], oversizedCount: 0, totalCount: 0 }
+        const vIsUrlBearing = typeof v === 'string' && (isUrlKey(k) || isActionableUrlValue(v) || vUrls.totalCount > 0)
         const isProtected =
           ENOSPC_PRESERVED_ID_KEYS.has(k) ||
           ENOSPC_NARRATIVE_STRUCTURAL_KEYS.has(k) ||
-          (!compactUrls && (isUrlKey(k) || isActionableUrlValue(v) || extractActionableUrls(v).length > 0))
+          (!compactUrls && vIsUrlBearing)
         if (structuralOnly && !isProtected && typeof v === 'string' && v.length > maxVerbatimChars) {
+          if (vIsUrlBearing && tracker) {
+            tracker.omittedActionableUrls += Math.max(1, vUrls.totalCount)
+          }
           omittedFields.push(k)
           continue
         }
@@ -1412,6 +1465,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           compactOpaqueInNarrative,
           includePunctuatedTokens,
           compactUrls,
+          ultraCompactNonUrl,
           tracker,
         })
       }
@@ -1532,26 +1586,45 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
       // every blocking record, its ID, code, actionable URLs (up to ENOSPC_ACTIONABLE_URL_MAX_CHARS),
       // and reason head+tail previews.
       ...ENOSPC_COMPACT_NARRATIVE_TIERS.map((t) => ({ ...t, structuralOnly: true, compactReasons: true, compactUrls: false })),
-      // Stage 2C: Last all-records tier ONLY if thousands of long URLs themselves overflow every slot.
-      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: true },
+      // Stage 2B-ultra: shrink non-URL truncated strings to minimal `[omitted:<N>c]` tokens while
+      // STILL keeping 100% of actionable URLs (`compactUrls: false`) so URLs survive even under
+      // extreme record counts before Stage 2C ever touches a URL (reqs 4e32d1a5 / 91d7b47c).
+      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: false, ultraCompactNonUrl: true },
+      // Stage 2C: Last all-records tier ONLY if actionable URLs themselves exceed every slot;
+      // truthfully discloses `enospc_omitted_actionable_urls` and NEVER claims URLs were preserved.
+      { maxVerbatimChars: 16, previewChars: 0, structuralOnly: true, compactReasons: true, compactUrls: true, ultraCompactNonUrl: true },
     ]
-    for (const tier of tiers) {
-      const tracker = { shortenedNarrative: false }
-      const provisionalNotice = tier.compactReasons
-        ? {
-            ...noticeAllPreserved,
-            reason:
-              'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code, actionable URLs, and 100% of blocking records.',
-          }
-        : noticeAllPreserved
-      let candidate = renderExtracted(extracted, provisionalNotice, (v) => shrinkValue(v, { ...tier, tracker }))
-      const compactedReasons = Boolean(tier.compactReasons || tracker.shortenedNarrative)
-      if (compactedReasons && !tier.compactReasons) {
-        const truthfulNotice = {
+    const buildTruthfulNotice = ({ compactedReasons, omittedActionableUrls }) => {
+      if (omittedActionableUrls > 0) {
+        return {
           ...noticeAllPreserved,
+          actionable_urls_preserved: false,
+          enospc_omitted_actionable_urls: omittedActionableUrls,
+          reason:
+            `Original refusal exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized blobs, reason text, and ${omittedActionableUrls} actionable URL(s) were omitted/shortened because they exceeded reserved disk space while preserving every structured refusal code and 100% of blocking records. Free disk space and re-run wake read for full links.`,
+        }
+      }
+      if (compactedReasons) {
+        return {
+          ...noticeAllPreserved,
+          actionable_urls_preserved: true,
           reason:
             'Original refusal blocking reasons exceeded all pre-allocated diagnostic slots even after gzip compression under ENOSPC; oversized reason strings were visibly shortened while preserving every structured refusal code, actionable URLs, and 100% of blocking records.',
         }
+      }
+      return noticeAllPreserved
+    }
+    for (const tier of tiers) {
+      const tracker = { shortenedNarrative: false, omittedActionableUrls: 0 }
+      const provisionalNotice = buildTruthfulNotice({
+        compactedReasons: Boolean(tier.compactReasons),
+        omittedActionableUrls: 0,
+      })
+      let candidate = renderExtracted(extracted, provisionalNotice, (v) => shrinkValue(v, { ...tier, tracker }))
+      const compactedReasons = Boolean(tier.compactReasons || tracker.shortenedNarrative)
+      const omittedActionableUrls = tracker.omittedActionableUrls
+      if ((compactedReasons && !tier.compactReasons) || omittedActionableUrls > 0) {
+        const truthfulNotice = buildTruthfulNotice({ compactedReasons, omittedActionableUrls })
         candidate = renderExtracted(extracted, truthfulNotice, (v) => shrinkValue(v, tier))
       }
       if (fitsCompressed(candidate)) {
@@ -1559,6 +1632,7 @@ function compactDiagnosticForSlotBudget(rawText, totalCapacityBytes, { originalB
           text: candidate,
           incomplete: false,
           compactedReasons,
+          omittedActionableUrls,
           totalRecords: null,
           returnedRecords: null,
           omittedRecords: 0,
@@ -2146,6 +2220,9 @@ export function reserveDiagnosticNoteSlots({
         const compactMeta = {
           enospcCompacted: true,
           ...(compacted.compactedReasons ? { enospcCompactedReasons: true } : {}),
+          ...(Number.isInteger(compacted.omittedActionableUrls) && compacted.omittedActionableUrls > 0
+            ? { enospcOmittedActionableUrls: compacted.omittedActionableUrls }
+            : {}),
           ...(compacted.incomplete
             ? {
                 enospcIncomplete: true,
@@ -2224,6 +2301,10 @@ export function reserveDiagnosticNoteSlots({
             return {
               ...written,
               enospcCompacted: true,
+              ...(compacted.compactedReasons ? { enospcCompactedReasons: true } : {}),
+              ...(Number.isInteger(compacted.omittedActionableUrls) && compacted.omittedActionableUrls > 0
+                ? { enospcOmittedActionableUrls: compacted.omittedActionableUrls }
+                : {}),
               ...(compacted.incomplete
                 ? {
                     enospcIncomplete: true,
@@ -2539,6 +2620,10 @@ export function spoolUnsavedRefusal(
       ...(savedNote.compressed ? { compressed: savedNote.compressed } : {}),
       ...(savedNote.frameNonce ? { frame_nonce: savedNote.frameNonce } : {}),
       ...(savedNote.enospcCompacted ? { enospc_compacted: true } : {}),
+      ...(savedNote.enospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+      ...(Number.isInteger(savedNote.enospcOmittedActionableUrls) && savedNote.enospcOmittedActionableUrls > 0
+        ? { enospc_omitted_actionable_urls: savedNote.enospcOmittedActionableUrls }
+        : {}),
       ...(savedNote.enospcIncomplete
         ? {
             enospc_incomplete: true,
@@ -2632,8 +2717,81 @@ export function spoolUnsavedRefusal(
   return { persistedOnDisk: false, file: null }
 }
 
-export function hasPendingUnsavedRefusals(spoolKey, opts = {}) {
-  return peekPendingUnsavedRefusals(spoolKey, opts).length > 0
+/**
+ * Fail-closed check for whether any unsurfaced spooled pickup refusal may still be
+ * pending for `spoolKey`. Returns `true` whenever a refusal is queued in memory/on disk
+ * OR when any spool directory or scope-matching spool/pending-note file exists and
+ * cannot currently be read (e.g. temporary `EACCES`/`EIO`), so a later wake note NEVER
+ * advances the wake cursor past an unreadable pending refusal (requirement 3ea2b201).
+ */
+export function hasPendingUnsavedRefusals(
+  spoolKey,
+  { home = os.homedir(), fallbackDir = null, backupDir = null } = {},
+) {
+  const key = String(spoolKey ?? '')
+  if (!key) return false
+  if (peekPendingUnsavedRefusals(key, { home, fallbackDir, backupDir }).length > 0) return true
+  const scopeTag = spoolScopeTag(key)
+  const entryPrefix = spoolEntryFilePrefix(scopeTag)
+  const claimPrefix = legacyClaimFilePrefix(scopeTag)
+  const scopePrefix = `${PENDING_DIAGNOSTIC_REFUSAL_PREFIX}${scopeTag}] `
+  for (const dir of spoolCandidateDirs({ home, fallbackDir, backupDir })) {
+    const legacyFile = legacySpoolFilePath(dir, scopeTag)
+    try {
+      const legacyRaw = fs.readFileSync(legacyFile, 'utf8')
+      if (legacyRaw.trim().length > 0) return true
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return true
+    }
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
+      return true
+    }
+    for (const name of names) {
+      if ((name.startsWith(entryPrefix) || name.startsWith(claimPrefix)) && name.endsWith('.json')) {
+        const fullPath = path.join(dir, name)
+        try {
+          const raw = fs.readFileSync(fullPath, 'utf8')
+          // An unused pre-allocated spool slot is padded with ASCII spaces (`0x20`) until used.
+          if (raw.trim().length === 0) continue
+          const parsed = JSON.parse(raw)
+          if (
+            parsed?.kind === 'note_ref' ||
+            (typeof parsed?.text === 'string' && parsed.text) ||
+            (Array.isArray(parsed?.entries) && parsed.entries.length > 0)
+          ) {
+            return true
+          }
+        } catch (error) {
+          if (error?.code === 'ENOENT') continue
+          return true
+        }
+        continue
+      }
+      if (!name.endsWith('.md')) continue
+      const fullPath = path.join(dir, name)
+      let rawBuf = null
+      try {
+        rawBuf = fs.readFileSync(fullPath)
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        return true
+      }
+      try {
+        const content =
+          rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b
+            ? zlib.gunzipSync(rawBuf).toString('utf8')
+            : rawBuf.toString('utf8')
+        if (content.startsWith(scopePrefix)) return true
+      } catch {
+        /* ignore non-standalone gzip shards (e.g. part 1 of a multi-file sharded note) */
+      }
+    }
+  }
+  return false
 }
 
 export function peekPendingUnsavedRefusals(spoolKey, { home = os.homedir(), fallbackDir = null, backupDir = null } = {}) {
@@ -2952,12 +3110,17 @@ export function fitShellDiagnostic(
       ? `${fallbackNote.returnedRecords}/${fallbackNote.totalRecords} records, ${fallbackNote.omittedRecords ?? Math.max(0, fallbackNote.totalRecords - fallbackNote.returnedRecords)} omitted`
       : null
   const shardCount = Array.isArray(fallbackNote?.files) && fallbackNote.files.length > 1 ? fallbackNote.files.length : 1
+  const omittedUrls = Number.isInteger(fallbackNote?.enospcOmittedActionableUrls)
+    ? fallbackNote.enospcOmittedActionableUrls
+    : 0
   const statusTag = fallbackNote?.enospcIncomplete
     ? `partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry)`
     : fallbackNote?.enospcCompacted
-      ? fallbackNote.enospcCompactedReasons
-        ? 'compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved)'
-        : 'compacted ENOSPC (all records; blobs shortened)'
+      ? omittedUrls > 0
+        ? `compacted ENOSPC (all records; blobs, reason text & ${omittedUrls} actionable URL(s) omitted/shortened due to disk limit)`
+        : fallbackNote.enospcCompactedReasons
+          ? 'compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved)'
+          : 'compacted ENOSPC (all records; blobs shortened)'
       : fallbackNote
         ? `saved in ${shardCount} file(s)`
         : 'note write failed'
@@ -2965,9 +3128,11 @@ export function fitShellDiagnostic(
     ? fallbackNote.enospcIncomplete
       ? ` Partial ENOSPC (${partialCounts ?? 'incomplete'}; free disk & retry): \`${fallbackNote.command}\`.`
       : fallbackNote.enospcCompacted
-        ? fallbackNote.enospcCompactedReasons
-          ? ` Compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved): \`${fallbackNote.command}\`.`
-          : ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
+        ? omittedUrls > 0
+          ? ` Compacted ENOSPC (all records; blobs, reason text & ${omittedUrls} actionable URL(s) omitted/shortened due to disk limit): \`${fallbackNote.command}\`.`
+          : fallbackNote.enospcCompactedReasons
+            ? ` Compacted ENOSPC (all records; blobs & reason text shortened; URLs preserved): \`${fallbackNote.command}\`.`
+            : ` Compacted ENOSPC (all records; blobs shortened): \`${fallbackNote.command}\`.`
         : ` Read original: \`${fallbackNote.command}\`.`
     : ''
   const candidates = [

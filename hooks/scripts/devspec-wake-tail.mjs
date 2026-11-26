@@ -845,6 +845,7 @@ export async function readWakes({
             stdoutText: '',
             actualChars: noteDiag.length,
             noteError: fittedFullBudget.noteError,
+            savedNote: fittedFullBudget.note,
           })
         spoolUnsavedRefusal(spoolKey, noteDiag, {
           ...spoolOpts,
@@ -1026,7 +1027,9 @@ export async function readWakes({
         : ''
     const effectiveRawDiag = spooledPrefix ? (rawDiag ? `${spooledPrefix}${rawDiag}` : spooledPrefix) : rawDiag
 
-    let unsurfacedSpoolRemaining = false
+    const unreadablePendingSpool =
+      pendingSpoolEntries.length === 0 && hasPendingUnsavedRefusals(spoolKey, spoolOpts)
+    let unsurfacedSpoolRemaining = unreadablePendingSpool
     if (pickupRefusals && effectiveRawDiag) {
       const fittedWithStdout = fitShellDiagnostic(printedStdout, effectiveRawDiag, {
         home,
@@ -1058,6 +1061,7 @@ export async function readWakes({
           stdoutText: printedStdout,
           actualChars: effectiveRawDiag.length,
           noteError: fittedWithStdout.noteError,
+          savedNote: fittedWithStdout.note,
         })
       // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a
       // fatal broken-pipe crash mid-write leaves the refusal durably queued for the next
@@ -1305,6 +1309,7 @@ async function main() {
                 label: 'devspec-wake-tail',
                 stdoutText: page.text,
                 actualChars: said.length,
+                savedNote: page.pickup_diagnostic_note ?? null,
               })
             : 'devspec-wake-tail: wake read incomplete (error omitted for Shell limit); fix note permissions & re-run.\n'
         if (fallbackSaid && fitsShellOutput(page.text + fallbackSaid)) {

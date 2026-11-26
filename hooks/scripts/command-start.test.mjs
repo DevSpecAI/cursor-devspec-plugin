@@ -8027,4 +8027,252 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
     }
   })
+
+  it('returns shortened recovery pointer when 3-file sharded command exceeds headroom, fails closed on unreadable spool files, and labels ENOSPC URL omissions truthfully (3c5147a7 / 3ea2b201 / 4e32d1a5 / 91d7b47c)', async () => {
+    const zlib = await import('node:zlib')
+    const { formatShellRefusalOmissionNotice } = await import('./command-start.mjs')
+    const { readPositionPath } = await import('./devspec-wake-tail.mjs')
+    const {
+      RESERVED_DIAGNOSTIC_SLOT_BYTES,
+      clearPendingUnsavedRefusals,
+      hasPendingUnsavedRefusals,
+      spoolUnsavedRefusal,
+    } = await import('./hook-context-budget.mjs')
+    // 1. Saved 3-file sharded gzip note whose shell-quoted read command is ~15,400 chars while
+    //    only 5,419 chars remain in Shell headroom -> MUST emit shortened recovery pointer, never empty!
+    {
+      const quotedSeg = `a'b`.repeat(400) // 1,200 raw chars -> ~2,400 shell-quoted chars per file
+      const shardFiles = [
+        `/tmp/${quotedSeg}/slot-1.md`,
+        `/tmp/${quotedSeg}/slot-2.md`,
+        `/tmp/${quotedSeg}/slot-3.md`,
+      ]
+      const shellQuote = (p) => `'${p.replaceAll("'", `'\\''`)}'`
+      const longCmd = `cat ${shardFiles.map(shellQuote).join(' ')} | gzip -dc | head -c 40000`
+      assert.ok(longCmd.length > 7_000, `expected long shell-quoted command, got ${longCmd.length}`)
+      const stdoutPad = 'x'.repeat(20_000 - 5_419)
+      const savedNote = {
+        id: '1234567890abcdef',
+        file: shardFiles[0],
+        files: shardFiles,
+        command: longCmd,
+        parts: 3,
+        firstPageBytes: 18_000,
+        compressed: 'gzip',
+        fallback: true,
+        reserved: true,
+      }
+      const refusals = [{ command_message_id: 'msg-sharded', refusal: { code: 'turn_busy', blocking_turn_id: 'blk-1' } }]
+      const fb = formatStructuredRefusalsFallback(refusals, {
+        stdoutText: stdoutPad,
+        savedNote,
+        noteError: new Error('ENOSPC'),
+      })
+      assert.ok(typeof fb === 'string' && fb.length > 0, 'formatStructuredRefusalsFallback MUST NOT return empty when saved note exists')
+      assert.ok(fitsShellOutput(stdoutPad + fb), 'shortened recovery pointer MUST fit within Shell output ceiling')
+      const parsedFb = JSON.parse(fb)
+      assert.equal(parsedFb.read_command_omitted_for_shell_limit, true)
+      assert.equal(parsedFb.saved_note_compressed, 'gzip')
+      assert.equal(parsedFb.saved_note_count, 3)
+      assert.ok(
+        Array.isArray(parsedFb.saved_note_files) || Array.isArray(parsedFb.saved_note_basenames),
+        'shortened recovery pointer MUST name how to open the saved shard files',
+      )
+
+      // Also verify formatShellRefusalOmissionNotice directly preserves savedNote recovery!
+      const omitNotice = formatShellRefusalOmissionNotice(refusals, {
+        label: 'devspec-wake-tail',
+        stdoutText: stdoutPad,
+        actualChars: 90_000,
+        savedNote,
+      })
+      assert.ok(typeof omitNotice === 'string' && omitNotice.length > 0)
+      assert.ok(fitsShellOutput(stdoutPad + omitNotice))
+      assert.match(omitNotice, /slot-1\.md/, 'omission notice MUST retain a way to open the saved note')
+    }
+
+    // 2. Temporary read error (`chmod 0o000`) on a saved spool file -> `hasPendingUnsavedRefusals`
+    //    MUST fail closed (`true`) so reading a later wake note NEVER advances the wake cursor!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const posFile = readPositionPath(CONN, dir)
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(path.join(home, '.devspec', 'notes'), { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+
+      const noteMsgId = '33333333-3333-4333-8333-3333333333d9'
+      const noteTurnId = '77777777-7777-4777-8777-7777777777d9'
+      const noteBatch = ownerBatch('later wake note under temporary spool read error', {
+        messageId: noteMsgId,
+        turnId: noteTurnId,
+      })
+      const note = writeNote(wakeLines(buildOwnerMessageEvents(noteBatch)), { home })
+      fs.writeFileSync(
+        wakeFile,
+        wakeLines([{ type: 'wake_in_note', carries: ['owner_message'], read: note.command, note: 'Read note' }]),
+        { mode: 0o600 },
+      )
+      const wakeLen = fs.statSync(wakeFile).size
+      const { registerPendingWakeNote } = await import('./step-delivery.mjs')
+      registerPendingWakeNote(
+        CONN,
+        {
+          noteId: note.id,
+          commands: [{ messageId: noteMsgId, turnId: noteTurnId }],
+          messages: noteBatch.messages,
+          sessionId: noteBatch.session_id,
+          wakeFile,
+          wakePositionPath: posFile,
+          wakePositionVersion: 1,
+          wakeStart: 0,
+          wakeThrough: wakeLen,
+        },
+        { dir },
+      )
+
+      const spoolKey = path.resolve(dir)
+      const spoolRes = spoolUnsavedRefusal(spoolKey, 'earlier unsurfaced refusal payload', {
+        home,
+        fallbackDir: diagDir,
+        backupDir: dir,
+      })
+      assert.equal(spoolRes.persistedOnDisk, true)
+      // Simulate a fresh process (in-memory cache cleared) where the spool file on disk suffers a
+      // temporary `chmod 0o000` read error!
+      clearPendingUnsavedRefusals(spoolKey, null, { home: '/nonexistent-clear-mem-only' })
+      // Re-create the spool file ONLY on disk without populating in-memory cache by writing directly:
+      const savedFilePath = spoolRes.file
+      const savedBytes = fs.readFileSync(savedFilePath)
+      clearPendingUnsavedRefusals(spoolKey, null, { home, fallbackDir: diagDir, backupDir: dir })
+      fs.writeFileSync(savedFilePath, savedBytes, { mode: 0o000 })
+      try {
+        assert.equal(
+          hasPendingUnsavedRefusals(spoolKey, { home, fallbackDir: diagDir, backupDir: dir }),
+          true,
+          'hasPendingUnsavedRefusals MUST fail closed (true) on an unreadable spool file',
+        )
+        const noteContent = fs.readFileSync(note.file, 'utf8')
+        await stepDeliveryHook(
+          {
+            conversation_id: CONVERSATION,
+            tool_name: 'Shell',
+            tool_input: { command: note.command },
+            tool_output: { exitCode: 0, output: noteContent },
+          },
+          {
+            home,
+            dir,
+            startCommands: async ({ commands }) => ({
+              ok: true,
+              outcome: 'started',
+              started: commands.map((c) => c.messageId),
+              refusals: [],
+            }),
+          },
+        )
+        assert.equal(
+          fs.existsSync(posFile),
+          false,
+          'wake cursor MUST NOT advance when an older spooled refusal file is temporarily unreadable',
+        )
+      } finally {
+        fs.chmodSync(savedFilePath, 0o600)
+        fs.rmSync(savedFilePath, { force: true })
+      }
+    }
+
+    // 3. When actionable URLs themselves exceed every pre-allocated diagnostic slot under ENOSPC,
+    //    Stage-2C MUST disclose `actionable_urls_preserved: false` and `enospc_omitted_actionable_urls > 0`
+    //    and NEVER claim "actionable URLs preserved" in the note OR stderr/fallback notice!
+    {
+      const { home, dir } = mkHome()
+      const wakeFile = path.join(dir, `${CONN}.wakes.jsonl`)
+      const notesDir = path.join(home, '.devspec', 'notes')
+      const diagDir = path.join(dir, 'diagnostic-notes')
+      fs.mkdirSync(notesDir, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(diagDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(wakeFile, wakeLines(buildOwnerMessageEvents(ownerBatch('stage2c url overflow check'))), { mode: 0o600 })
+
+      // 2,500 blocking items each carrying a unique high-entropy 300-char approval URL (~750 KiB incompressible > 3*128 KiB slots)
+      const hexNoise = (idx) => {
+        let out = ''
+        let seed = (idx + 1) * 2654435761
+        while (out.length < 260) {
+          seed = (seed * 1664525 + 1013904223) >>> 0
+          out += seed.toString(16).padStart(8, '0')
+        }
+        return out.slice(0, 260)
+      }
+      const records = Array.from({ length: 2500 }, (_, idx) => ({
+        id: `blk-url-${String(idx).padStart(4, '0')}`,
+        approval_url: `https://app.devspecstaging.com/reviews/${idx}/${hexNoise(idx)}`,
+        reason: `Waiting on approval at https://app.devspecstaging.com/approve/${idx}/${hexNoise(idx + 9999)}`,
+      }))
+
+      const origOpenSync = fs.openSync
+      const origWriteFileSync = fs.writeFileSync
+      const origWriteSync = fs.writeSync
+      let faultActive = false
+      let firstStderr = ''
+      let savedNote = null
+      try {
+        fs.openSync = (p, flags, ...rest) => {
+          if (faultActive && flags !== 'r') throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origOpenSync(p, flags, ...rest)
+        }
+        fs.writeFileSync = (p, d, o) => {
+          if (faultActive) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          return origWriteFileSync(p, d, o)
+        }
+        fs.writeSync = (fd, buf, offset, length, position) => {
+          if (faultActive) {
+            const endPos = (typeof position === 'number' ? position : 0) + (typeof length === 'number' ? length : buf.length)
+            if (endPos > RESERVED_DIAGNOSTIC_SLOT_BYTES) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
+          }
+          return origWriteSync(fd, buf, offset, length, position)
+        }
+        const res = await readWakes({
+          file: wakeFile,
+          connectionId: CONN,
+          home,
+          dir,
+          settleMs: 0,
+          write: async () => {},
+          writeStderr: async (c) => { firstStderr += String(c) },
+          startCommands: async () => {
+            faultActive = true
+            return {
+              ok: false,
+              outcome: 'refused',
+              refusals: [{ command_message_id: 'msg-s2c-1', refusal: { code: 'waiting_for_ok', blocking_items: records } }],
+            }
+          },
+        })
+        savedNote = res.pickup_diagnostic_note
+      } finally {
+        faultActive = false
+        fs.openSync = origOpenSync
+        fs.writeFileSync = origWriteFileSync
+        fs.writeSync = origWriteSync
+      }
+
+      assert.ok(savedNote?.enospcCompacted, 'expected ENOSPC-compacted note')
+      assert.ok(
+        savedNote.enospcOmittedActionableUrls > 0,
+        `expected enospcOmittedActionableUrls > 0 when approval links exceed disk slots, got ${savedNote.enospcOmittedActionableUrls}`,
+      )
+      assert.doesNotMatch(firstStderr, /actionable URLs preserved/i, 'stderr MUST NOT claim actionable URLs were preserved when URLs were omitted')
+      assert.match(firstStderr, /actionable URL\(s\) omitted|URL\(s\) omitted|enospc_omitted_actionable_urls/i, 'stderr MUST truthfully disclose omitted actionable URLs')
+      // Verify the saved file itself ALSO says actionable_urls_preserved: false and enospc_omitted_actionable_urls > 0!
+      const rawBuf = Array.isArray(savedNote.files) && savedNote.files.length > 1
+        ? Buffer.concat(savedNote.files.map((f) => fs.readFileSync(f)))
+        : fs.readFileSync(savedNote.file)
+      const savedText = savedNote.compressed === 'gzip' ? zlib.gunzipSync(rawBuf).toString('utf8') : rawBuf.toString('utf8')
+      assert.doesNotMatch(savedText, /preserving every structured refusal code, actionable URLs/i, 'saved ENOSPC payload MUST NOT claim actionable URLs were preserved')
+      assert.match(savedText, /"actionable_urls_preserved":false/)
+      assert.match(savedText, /"enospc_omitted_actionable_urls":[1-9]\d*/)
+      clearPendingUnsavedRefusals(path.resolve(dir), null, { home, fallbackDir: diagDir, backupDir: dir })
+    }
+  })
 })

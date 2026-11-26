@@ -2075,6 +2075,7 @@ export async function runOneShotRoomCommandPickup({
             stdoutText: combinedPrior,
             actualChars: effectiveRawDiag.length,
             noteError: fitted.noteError,
+            savedNote: fitted.note,
           })
         : '')
     // Write-ahead spool: persist any new live refusal BEFORE writing stderr so even a

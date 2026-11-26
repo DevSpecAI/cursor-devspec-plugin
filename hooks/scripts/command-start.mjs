@@ -508,29 +508,41 @@ export function formatStructuredRefusalsFallback(
   const savedEnospcIncomplete = Boolean(savedNote?.enospcIncomplete)
   const savedEnospcCompacted = Boolean(savedNote?.enospcCompacted)
   const savedEnospcCompactedReasons = Boolean(savedNote?.enospcCompactedReasons)
+  const savedEnospcOmittedUrls = Number.isInteger(savedNote?.enospcOmittedActionableUrls)
+    ? savedNote.enospcOmittedActionableUrls
+    : 0
+  const savedStatusFields = savedEnospcIncomplete
+    ? {
+        enospc_incomplete: true,
+        ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+        ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+        ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
+      }
+    : savedEnospcCompacted
+      ? {
+          enospc_compacted: true,
+          ...(savedEnospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+          ...(savedEnospcOmittedUrls > 0
+            ? { actionable_urls_preserved: false, enospc_omitted_actionable_urls: savedEnospcOmittedUrls }
+            : {}),
+        }
+      : {}
   const savedMetaFields = savedCmd
     ? {
         read: savedCmd,
         ...(savedNote.parts > 1 ? { saved_parts: savedNote.parts } : {}),
-        ...(savedEnospcCompacted ? { enospc_compacted: true } : {}),
-        ...(savedEnospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
-        ...(savedEnospcIncomplete
-          ? {
-              enospc_incomplete: true,
-              ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
-              ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
-              ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
-            }
-          : {}),
+        ...savedStatusFields,
       }
     : {}
   const effectiveRecovery = savedCmd
     ? savedEnospcIncomplete
       ? `Partial ENOSPC refusal saved (${Number.isInteger(savedNote.returnedRecords) && Number.isInteger(savedNote.totalRecords) ? `${savedNote.returnedRecords}/${savedNote.totalRecords} records, ${savedNote.omittedRecords} omitted` : 'some bytes omitted'} because disk is full); inspect saved excerpt with \`${savedCmd}\`, then free disk space and re-run wake read for the complete refusal.`
       : savedEnospcCompacted
-        ? savedEnospcCompactedReasons
-          ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs and reason text shortened; actionable URLs preserved); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged details.`
-          : `ENOSPC-compacted refusal saved (all blocking records preserved; oversized string blobs shortened); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged blobs.`
+        ? savedEnospcOmittedUrls > 0
+          ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs, reason text, and ${savedEnospcOmittedUrls} actionable URL(s) omitted/shortened due to disk limit); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for full links and details.`
+          : savedEnospcCompactedReasons
+            ? `ENOSPC-compacted refusal saved (all blocking records preserved; oversized blobs and reason text shortened; actionable URLs preserved); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged details.`
+            : `ENOSPC-compacted refusal saved (all blocking records preserved; oversized string blobs shortened); inspect with \`${savedCmd}\` (and any further parts), and free disk space + re-run wake read for unabridged blobs.`
         : `Read the complete original refusal with \`${savedCmd}\` (and any further parts it names); fix write permissions on ~/.devspec/notes.`
     : recovery
   const limitChars = typeof maxChars === 'number' && maxChars > 0 ? maxChars : CURSOR_SHELL_OUTPUT_MAX_CHARS
@@ -752,27 +764,30 @@ export function formatStructuredRefusalsFallback(
     if (fits(ultraReadOnly)) return ultraReadOnly
     const minimalWithMeta = `${JSON.stringify({
       refused: 'report_pickup',
-      ...(savedEnospcIncomplete
-        ? {
-            enospc_incomplete: true,
-            ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
-            ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
-            ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
-          }
-        : savedEnospcCompacted
-          ? {
-              enospc_compacted: true,
-              ...(savedEnospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
-            }
-          : {}),
+      ...savedStatusFields,
       read: savedCmd,
       recovery: savedEnospcIncomplete
         ? 'Partial ENOSPC; free disk & retry.'
         : savedEnospcCompacted
-          ? 'Compacted ENOSPC; free disk & retry.'
+          ? savedEnospcOmittedUrls > 0
+            ? `Compacted ENOSPC (${savedEnospcOmittedUrls} URL(s) omitted); free disk & retry.`
+            : 'Compacted ENOSPC; free disk & retry.'
           : 'Read `read`; fix ~/.devspec/notes.',
     })}\n`
-    return fits(minimalWithMeta) ? minimalWithMeta : null
+    if (fits(minimalWithMeta)) return minimalWithMeta
+
+    // When `savedNote.command` itself expanded past remaining Shell headroom (e.g. a
+    // multi-file sharded gzip note whose paths expanded 4x under shell single-quoting),
+    // NEVER return null: emit the richest shortened structured recovery pointer that
+    // fits within `fits(...)` so callers STILL have an exact way to open the saved note
+    // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+    const shortened = buildShortenedSavedNoteRecovery(savedNote, {
+      savedStatusFields,
+      limitChars,
+      codes: allCodes,
+      fits,
+    })
+    return shortened
   }
   // When no fallback note could be saved AND the refusal carried blocking details, require
   // at least one non-empty blocking detail to survive rather than returning a code-only
@@ -789,12 +804,103 @@ export function formatStructuredRefusalsFallback(
 }
 
 /**
+ * Build the richest Shell-bounded structured recovery pointer for an already-saved
+ * diagnostic note whose full shell-quoted `read` command exceeded remaining Shell
+ * headroom (e.g. a multi-file sharded gzip note whose paths expanded under shell
+ * single-quoting). Tries raw unquoted `saved_note_files`, shared `saved_note_dir` +
+ * `saved_note_basenames`, first file + basenames, and finally basenames + store hint
+ * so callers ALWAYS have a way to open the saved note (reqs 3c5147a7 / 91d7b47c).
+ */
+function buildShortenedSavedNoteRecovery(
+  savedNote,
+  { savedStatusFields = {}, limitChars = CURSOR_SHELL_OUTPUT_MAX_CHARS, codes = [], fits } = {},
+) {
+  if (!savedNote || typeof fits !== 'function') return null
+  const savedFiles =
+    Array.isArray(savedNote.files) && savedNote.files.length > 0
+      ? savedNote.files.filter((f) => typeof f === 'string' && f)
+      : typeof savedNote.file === 'string' && savedNote.file
+        ? [savedNote.file]
+        : []
+  if (savedFiles.length === 0) return null
+  const basenames = savedFiles.map((f) => path.basename(f))
+  const uniqueDirs = [...new Set(savedFiles.map((f) => path.dirname(f)))]
+  const cmdChars = typeof savedNote.command === 'string' ? savedNote.command.length : null
+  const compressedMeta = savedNote.compressed ? { saved_note_compressed: savedNote.compressed } : {}
+  const partsMeta = {
+    ...(Number.isInteger(savedNote.parts) && savedNote.parts > 1 ? { saved_note_parts: savedNote.parts } : {}),
+    ...(Number.isInteger(savedNote.firstPageBytes) && savedNote.firstPageBytes > 0
+      ? { saved_note_first_page_bytes: savedNote.firstPageBytes }
+      : {}),
+  }
+  const howToOpen =
+    savedNote.compressed === 'gzip'
+      ? 'Concatenate saved_note_files in order and gunzip (`gzip -dc`) to read the saved refusal, or re-run wake read.'
+      : 'Open saved_note_files directly to read the saved refusal, or re-run wake read.'
+  const base = {
+    refused: 'report_pickup',
+    ...(codes.length > 0 ? { codes } : {}),
+    ...savedStatusFields,
+    read_command_omitted_for_shell_limit: true,
+    ...(cmdChars !== null ? { read_command_chars: cmdChars } : {}),
+    shell_limit_chars: limitChars,
+    saved_note_count: savedFiles.length,
+    ...compressedMeta,
+    ...partsMeta,
+  }
+  const candidates = [
+    `${JSON.stringify({ ...base, saved_note_files: savedFiles, recovery: howToOpen })}\n`,
+    ...(uniqueDirs.length === 1
+      ? [
+          `${JSON.stringify({
+            ...base,
+            saved_note_dir: uniqueDirs[0],
+            saved_note_basenames: basenames,
+            recovery:
+              savedNote.compressed === 'gzip'
+                ? 'Open saved_note_basenames under saved_note_dir in order and gunzip (`gzip -dc`), or re-run wake read.'
+                : 'Open saved_note_basenames under saved_note_dir, or re-run wake read.',
+          })}\n`,
+        ]
+      : []),
+    `${JSON.stringify({
+      ...base,
+      saved_note_file: savedFiles[0],
+      saved_note_basenames: basenames,
+      recovery:
+        savedNote.compressed === 'gzip'
+          ? 'Open saved_note_file and sibling shards in saved_note_basenames (concatenate + `gzip -dc`), or re-run wake read.'
+          : 'Open saved_note_file and sibling files in saved_note_basenames, or re-run wake read.',
+    })}\n`,
+    `${JSON.stringify({
+      refused: 'report_pickup',
+      ...savedStatusFields,
+      read_command_omitted_for_shell_limit: true,
+      ...(cmdChars !== null ? { read_command_chars: cmdChars } : {}),
+      saved_note_count: savedFiles.length,
+      saved_note_basenames: basenames,
+      ...compressedMeta,
+      recovery:
+        savedNote.compressed === 'gzip'
+          ? 'Find saved_note_basenames in diagnostic note stores (~/.devspec/notes, TMPDIR, or connections dir), concatenate in order + `gzip -dc`, or re-run wake read.'
+          : 'Find saved_note_basenames in diagnostic note stores (~/.devspec/notes, TMPDIR, or connections dir) and open, or re-run wake read.',
+    })}\n`,
+  ]
+  for (const candidate of candidates) {
+    if (fits(candidate)) return candidate
+  }
+  return null
+}
+
+/**
  * Last-resort Shell-output-bounded omission + recovery notice used when a pickup refusal
  * cannot fit inside the remaining Shell budget AND every diagnostic note store became
- * unwritable after preflight (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+ * unwritable after preflight (or a saved note's full read command exceeded remaining
+ * headroom) (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
  *
- * Returns the richest structured omission notice (falling back down to an explicit
- * one-line omission + recovery message) that satisfies `fitsShellOutput(stdoutText + notice)`.
+ * Returns the richest structured omission notice (preserving a shortened recovery pointer
+ * whenever `savedNote` exists, falling back down to an explicit one-line omission +
+ * recovery message) that satisfies `fitsShellOutput(stdoutText + notice)`.
  */
 export function formatShellRefusalOmissionNotice(
   refusals,
@@ -804,6 +910,7 @@ export function formatShellRefusalOmissionNotice(
     actualChars = null,
     noteError = null,
     recovery = null,
+    savedNote = null,
   } = {},
 ) {
   const list = Array.isArray(refusals) ? refusals : refusals ? [refusals] : []
@@ -827,6 +934,42 @@ export function formatShellRefusalOmissionNotice(
       }),
     ),
   ]
+  if (savedNote) {
+    const savedStatusFields = savedNote.enospcIncomplete
+      ? {
+          enospc_incomplete: true,
+          ...(Number.isInteger(savedNote.totalRecords) ? { saved_total_records: savedNote.totalRecords } : {}),
+          ...(Number.isInteger(savedNote.returnedRecords) ? { saved_returned_records: savedNote.returnedRecords } : {}),
+          ...(Number.isInteger(savedNote.omittedRecords) ? { saved_omitted_records: savedNote.omittedRecords } : {}),
+        }
+      : savedNote.enospcCompacted
+        ? {
+            enospc_compacted: true,
+            ...(savedNote.enospcCompactedReasons ? { enospc_compacted_reasons: true } : {}),
+            ...(Number.isInteger(savedNote.enospcOmittedActionableUrls) && savedNote.enospcOmittedActionableUrls > 0
+              ? { actionable_urls_preserved: false, enospc_omitted_actionable_urls: savedNote.enospcOmittedActionableUrls }
+              : {}),
+          }
+        : {}
+    const directRead =
+      typeof savedNote.command === 'string' && savedNote.command
+        ? `${label}: ${JSON.stringify({
+            refused: 'report_pickup',
+            ...savedStatusFields,
+            ...(codes.length > 0 ? { codes } : {}),
+            read: savedNote.command,
+            recovery: recovery ?? 'Inspect saved refusal via `read` or re-run wake read.',
+          })}\n`
+        : null
+    if (directRead && fitsShellOutput(stdout + directRead)) return directRead
+    const shortened = buildShortenedSavedNoteRecovery(savedNote, {
+      savedStatusFields,
+      limitChars: CURSOR_SHELL_OUTPUT_MAX_CHARS,
+      codes,
+      fits: (candidate) => fitsShellOutput(stdout + candidate),
+    })
+    if (shortened) return shortened
+  }
   const why = noteError instanceof Error ? noteError.message : String(noteError ?? 'all diagnostic note stores unwritable')
   const candidates = [
     `${label}: ${JSON.stringify({
