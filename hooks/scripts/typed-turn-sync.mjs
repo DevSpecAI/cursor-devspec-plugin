@@ -836,7 +836,7 @@ export async function syncTypedTurnFromTranscript({
   const isBlockingReadError = (err) => {
     if (!err) return false
     sawRequestLogReadError = true
-    return err.code !== 'EISDIR'
+    return true
   }
   const canMarkSynced = () => {
     if (sawRequestLogReadError) return false
@@ -1855,7 +1855,14 @@ export async function finishIdleRequests({
 } = {}) {
   if (!connectionId || !transcriptPath) return { closed: [], localCompleted: false }
   const reqState = readRequestState(connectionId, { dir })
-  if (reqState.readError && reqState.readError.code !== 'EISDIR') return { closed: [], localCompleted: false }
+  if (reqState.readError) {
+    const closeRefusal = {
+      code: 'request_log_unreadable',
+      error: reqState.readError?.message ?? 'request log unreadable',
+    }
+    log(`typed-turn-sync: idle cleanup skipped because request log is unreadable for ${connectionId}: ${JSON.stringify(closeRefusal)}\n`)
+    return { closed: [], localCompleted: false, closeRefusal }
+  }
   const sessionId = state?.session_id || null
   const localAttemptId = localTurnToComplete(state?.local_turn, sessionId)
   const pending = pendingWorkWithoutHostLists(reqState)
@@ -2008,15 +2015,26 @@ export async function finishIdleRequests({
 
   const closed = []
   let closeRefusal = null
+  const maybeRotateLog = () => {
+    const remainingPending = pendingOpensForConnectionDetailed(dir, connectionId)
+    if (!remainingPending.readError && remainingPending.entries.length === 0) {
+      rotateRequestLog(connectionId, { dir })
+    }
+  }
   if (candidateId && connectionCapability && typeof callRequest === 'function') {
     // Re-read `.requests.jsonl` and transcript AFTER awaiting `callComplete` so a
     // background launch, schedule, or new turn recorded during that wait is NEVER
     // closed prematurely (requirements 3ea2b201 / ce71a72b).
     const preCloseState = readRequestState(connectionId, { dir })
+    if (preCloseState.readError) {
+      closeRefusal = {
+        code: 'request_log_unreadable',
+        error: preCloseState.readError?.message ?? 'request log unreadable before close',
+      }
+      log(`typed-turn-sync: idle close skipped because request log is unreadable for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
+    } else {
     const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
-    const preCloseStillIdle =
-      !preCloseState.readError &&
-      Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
+    const preCloseStillIdle = Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp)
     const preClosePending = preCloseStillIdle ? pendingWorkWithoutHostLists(preCloseState) : null
     const stillFinished =
       preCloseStillIdle && requestFinished(preCloseState, candidateId, preClosePending)
@@ -2048,7 +2066,7 @@ export async function finishIdleRequests({
       for (const [pKey, entry] of pendingEntries) {
         if (entry.requestId === candidateId) deletePendingLocalOpen(dir, connectionId, pKey, entry.turnKey, entry.requestId)
       }
-      rotateRequestLog(connectionId, { dir })
+      maybeRotateLog()
     } else {
       closeRefusal =
         refusalFromResponse(lastCloseResponse) ??
@@ -2057,12 +2075,19 @@ export async function finishIdleRequests({
       log(`typed-turn-sync: idle closeRequest refused/incomplete for ${connectionId} (${candidateId}): ${JSON.stringify(closeRefusal)}\n`)
     }
     }
+    }
   } else if (pendingFallback && connectionCapability && typeof callRequest === 'function') {
     const [pendingKey, pendingEntry] = pendingFallback
     const preCloseState = readRequestState(connectionId, { dir })
+    if (preCloseState.readError) {
+      closeRefusal = {
+        code: 'request_log_unreadable',
+        error: preCloseState.readError?.message ?? 'request log unreadable before fallback close',
+      }
+      log(`typed-turn-sync: idle pending-open close skipped because request log is unreadable for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+    } else {
     const preCloseActive = activeTranscriptTurn(transcriptPath, { attempts })
     const preCloseStillIdle =
-      !(preCloseState.readError && preCloseState.readError.code !== 'EISDIR') &&
       Boolean(preCloseActive && preCloseActive.ended && preCloseActive.stamp === initialStamp) &&
       !hasPendingWorkForRequest(preCloseState, pendingEntry.requestId)
     if (preCloseStillIdle) {
@@ -2087,13 +2112,14 @@ export async function finishIdleRequests({
       // Best-effort close record if disk is writable again; request was never opened on disk.
       appendRequestEvent(connectionId, { op: 'close', id: pendingEntry.requestId }, { dir })
       closed.push(pendingEntry.requestId)
-      rotateRequestLog(connectionId, { dir })
+      maybeRotateLog()
     } else {
       closeRefusal =
         refusalFromResponse(lastCloseResponse) ??
         (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
         (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
       log(`typed-turn-sync: idle pending-open close refused/incomplete for ${connectionId} (${pendingEntry.requestId}): ${JSON.stringify(closeRefusal)}\n`)
+    }
     }
     }
   }

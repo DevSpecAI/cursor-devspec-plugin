@@ -765,6 +765,21 @@ export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = R
     if (fs.statSync(file).size < minBytes) return false
     const state = reduceRequestLog(fs.readFileSync(file, 'utf8'))
     if (state.open.size > 0 || state.failedTranscriptTurns.size > 0) return false
+    // Never rotate while a `.pending-opens.json` recovery file exists or while any
+    // unnotified launch/monitor/schedule for a request awaiting recovery sits in the log
+    // (decision ce71a72b / requirement 3ea2b201).
+    if (fs.existsSync(path.join(dir, `${connectionId}.pending-opens.json`))) return false
+    for (const launch of new Set(state.launches.values())) {
+      if (
+        launch.request !== NO_REQUEST &&
+        (launch.kind === 'monitor' || (launch.notifies !== false && !launch.notified))
+      ) {
+        return false
+      }
+    }
+    for (const schedule of state.schedules) {
+      if (schedule.request !== NO_REQUEST) return false
+    }
     fs.renameSync(file, `${file}.1`)
     for (const launch of new Set(state.launches.values())) {
       if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {

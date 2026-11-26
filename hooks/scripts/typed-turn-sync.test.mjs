@@ -632,8 +632,8 @@ describe('typed-turn-sync (item da03801e)', () => {
     const { dir, transcriptPath } = makeEnv()
     fs.writeFileSync(transcriptPath, `${typedRow('Transient local open persist failure')}\n`)
     const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
-    // Make requests.jsonl a directory so appendFileSync fails transiently with EISDIR.
-    fs.mkdirSync(reqLog, { recursive: true })
+    // Make requests.jsonl read-only so readRequestState succeeds while appendFileSync fails transiently.
+    fs.writeFileSync(reqLog, '', { mode: 0o400 })
     const memo = { stamp: null, synced: false }
     const logs = []
     let openCalls = 0
@@ -656,6 +656,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.equal(memo.synced, false, 'memo must stay unsynced so next pass retries')
       assert.equal(openCalls, 1)
     } finally {
+      try { fs.chmodSync(reqLog, 0o600) } catch { /* ignore */ }
       fs.rmSync(reqLog, { recursive: true, force: true })
     }
 
@@ -971,7 +972,7 @@ describe('typed-turn-sync (item da03801e)', () => {
     const { dir, transcriptPath } = makeEnv()
     fs.writeFileSync(transcriptPath, `${typedRow('Turn that ends after local open fail')}\n`)
     const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
-    fs.mkdirSync(reqLog, { recursive: true }) // block appendRequestEvent
+    fs.writeFileSync(reqLog, '', { mode: 0o400 }) // block appendRequestEvent while keeping log readable
     const memo = {}
     let openedId = null
     try {
@@ -1004,7 +1005,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.equal(endedSync.action, 'open_write_failed')
       assert.equal(memo.synced, false, 'must NOT mark memo synced while an unpersisted server open remains')
 
-      // Idle cleanup closes the still-open server request even if disk is still blocked.
+      // Idle cleanup closes the still-open server request when the log is readable (proving zero pending launches) even if append is blocked.
       const closedIds = []
       const idle = await finishIdleRequests({
         connectionId: CONN,
@@ -1020,6 +1021,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.deepEqual(closedIds, [openedId])
       assert.deepEqual(idle.closed, [openedId])
     } finally {
+      try { fs.chmodSync(reqLog, 0o600) } catch { /* ignore */ }
       fs.rmSync(reqLog, { recursive: true, force: true })
     }
   })
@@ -1145,7 +1147,7 @@ describe('typed-turn-sync (item da03801e)', () => {
     const { dir, transcriptPath } = makeEnv()
     fs.writeFileSync(transcriptPath, `${typedRow('Turn whose disk recovers before end')}\n`)
     const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
-    fs.mkdirSync(reqLog)
+    fs.writeFileSync(reqLog, '', { mode: 0o400 })
     const memo = { stamp: null, synced: false }
     let openedId = null
     try {
@@ -1165,6 +1167,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.ok(openedId)
 
       // Disk recovers and the turn ends BEFORE the next sync runs.
+      fs.chmodSync(reqLog, 0o600)
       fs.rmSync(reqLog, { recursive: true, force: true })
       fs.writeFileSync(transcriptPath, `${typedRow('Turn whose disk recovers before end')}\n${turnEndedRow('success')}\n`)
 
@@ -1243,7 +1246,7 @@ describe('typed-turn-sync (item da03801e)', () => {
     const JOINED_REQ = '88888888-8888-4888-8888-888888888888'
     fs.writeFileSync(transcriptPath, `${typedRow('Turn whose restore hits disk error')}\n`)
     const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
-    fs.mkdirSync(reqLog)
+    fs.writeFileSync(reqLog, '', { mode: 0o400 })
     const memo = { stamp: null, synced: false }
     let openedId = null
     const origAppend = fs.appendFileSync
@@ -1264,6 +1267,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.ok(openedId)
 
       // Disk recovers with an unrelated live foreground command + joined request, and the typed turn ends.
+      fs.chmodSync(reqLog, 0o600)
       fs.rmSync(reqLog, { recursive: true, force: true })
       appendRequestEvent(CONN, { op: 'open', id: PRIOR_CMD, kind: 'command', requested_by: ALI }, { dir })
       appendRequestEvent(CONN, { op: 'open', id: JOINED_REQ, kind: 'typed_prompt', requested_by: ALI }, { dir })
@@ -1831,7 +1835,7 @@ describe('typed-turn-sync (item da03801e)', () => {
   it('persists server-opened typed requests across separate OS processes when local open fails before turn_ended (3ea2b201)', async () => {
     const { dir, transcriptPath } = makeEnv()
     const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
-    fs.mkdirSync(reqLog, { recursive: true }) // force appendRequestEvent to fail
+    fs.writeFileSync(reqLog, '', { mode: 0o400 }) // force appendRequestEvent to fail while keeping log readable
     fs.writeFileSync(transcriptPath, `${typedRow('Cross-process local open failure')}\n`)
     let openedId = null
     const memo1 = {}
@@ -1889,6 +1893,7 @@ describe('typed-turn-sync (item da03801e)', () => {
       assert.equal(blockedRun.synced, false)
 
       // Restore disk writability; fresh process #2 MUST persist the server-opened request & mark synced.
+      fs.chmodSync(reqLog, 0o600)
       fs.rmSync(reqLog, { recursive: true, force: true })
       const recoveredRun = runFreshPoller()
       assert.equal(recoveredRun.synced, true)
@@ -3785,5 +3790,141 @@ describe('typed-turn-sync (item da03801e)', () => {
       state: after,
     })
     assert.equal(wakeMatch.ref, RECOVERED_REQ, 'later wake for recovered request must still resolve its requester')
+  })
+
+  it('finishIdleRequests fails closed with closeRefusal when the request log returns EISDIR before the final check of a recovered request (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const RECOVERED_REQ = '55555555-5555-4555-8555-5555555555c1'
+    const ATTEMPT_ID = '66666666-6666-4666-8666-6666666666c1'
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+
+    fs.writeFileSync(transcriptPath, `${typedRow('Recovered request with EISDIR mid-sweep')}\n${turnEndedRow()}\n`)
+    const turnKey = activeTranscriptTurn(transcriptPath).typedTurnKeys[0]
+    assert.ok(turnKey)
+
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({ [turnKey]: { requestId: RECOVERED_REQ, requestedBy: ALI, turnKey } }),
+      { mode: 0o600 },
+    )
+
+    const closeCalls = []
+    const logs = []
+    try {
+      const res = await finishIdleRequests({
+        connectionId: CONN,
+        transcriptPath,
+        state: { session_id: ROOM, local_turn: { attempt_id: ATTEMPT_ID, session_id: ROOM } },
+        connectionCapability: 'cap-secret',
+        callComplete: async () => {
+          // Make `.requests.jsonl` return EISDIR right before the final pre-close check!
+          fs.rmSync(reqLog, { recursive: true, force: true })
+          fs.mkdirSync(reqLog, { recursive: true })
+          return { outcome: 'completed', phase: 'done' }
+        },
+        callRequest: async (args) => {
+          closeCalls.push(args)
+          return { status: 'closed' }
+        },
+        patchState: () => true,
+        dir,
+        log: (line) => logs.push(line),
+      })
+      assert.deepEqual(closeCalls, [], 'MUST NOT close recovered request when request log returns EISDIR')
+      assert.deepEqual(res.closed, [])
+      assert.equal(res.closeRefusal?.code, 'request_log_unreadable')
+      assert.equal(fs.existsSync(sidecar), true, 'retry entry MUST remain in .pending-opens.json')
+      assert.ok(logs.some((l) => /request_log_unreadable|unreadable/i.test(l)))
+    } finally {
+      fs.rmSync(reqLog, { recursive: true, force: true })
+    }
+  })
+
+  it('closing one recovered request never rotates .requests.jsonl while another recovered request still awaits recovery with a recorded launch (ce71a72b)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const { activeTranscriptTurn } = await import('./transcript-turn-end.mjs')
+    const { requestForWake } = await import('./requests.mjs')
+    const REQ_1 = '55555555-5555-4555-8555-5555555555d1'
+    const REQ_2 = '55555555-5555-4555-8555-5555555555d2'
+
+    fs.writeFileSync(
+      transcriptPath,
+      `${typedRow('First recovered turn')}\n${turnEndedRow()}\n${typedRow('Second recovered turn with launch')}\n${turnEndedRow()}\n`,
+    )
+    const keys = activeTranscriptTurn(transcriptPath).typedTurnKeys
+    assert.equal(keys.length, 2)
+    const [turnKey1, turnKey2] = keys
+
+    // Pad .requests.jsonl past ROTATE_BYTES (64 KB) and record a pending background launch for REQ_2!
+    const reqLog = path.join(dir, `${CONN}.requests.jsonl`)
+    const padLine = JSON.stringify({ op: 'note', pad: 'p'.repeat(4_000) }) + '\n'
+    fs.writeFileSync(reqLog, padLine.repeat(20), { mode: 0o600 })
+    appendRequestEvent(
+      CONN,
+      { op: 'launch', key: 'bg-launch-for-req-2', kind: 'background_task', request: REQ_2 },
+      { dir },
+    )
+
+    // Both REQ_1 (no pending work) and REQ_2 (has recorded launch in .requests.jsonl!) sit in .pending-opens.json.
+    const sidecar = path.join(dir, `${CONN}.pending-opens.json`)
+    fs.writeFileSync(
+      sidecar,
+      JSON.stringify({
+        [turnKey1]: { requestId: REQ_1, requestedBy: ALI, turnKey: turnKey1 },
+        [turnKey2]: { requestId: REQ_2, requestedBy: ALI, turnKey: turnKey2 },
+      }),
+      { mode: 0o600 },
+    )
+
+    // Idle pass closes REQ_1, MUST NOT rotate .requests.jsonl and MUST NOT drop REQ_2's recorded launch!
+    const closedIds = []
+    const idle1 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.action === 'close') closedIds.push(args.request_id)
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle1.closed, [REQ_1])
+    assert.equal(fs.existsSync(`${reqLog}.1`), false, 'MUST NOT rotate .requests.jsonl while REQ_2 awaits recovery')
+
+    // Now sync restores REQ_2 into .requests.jsonl: its recorded launch MUST STILL resolve its wake
+    // and the next idle pass MUST NOT close REQ_2!
+    await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async () => { throw new Error('already opened') },
+      dir,
+    })
+    const stateAfterRestore = readRequestState(CONN, { dir })
+    assert.equal(stateAfterRestore.open.has(REQ_2), true)
+    const wakeMatch = requestForWake({
+      origin: 'task-notification',
+      text: '<task-notification><task-id>bg-launch-for-req-2</task-id></task-notification>',
+      state: stateAfterRestore,
+    })
+    assert.equal(wakeMatch.ref, REQ_2, 'REQ_2 wake MUST still resolve to REQ_2 after REQ_1 closed')
+
+    const idle2 = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => {
+        if (args.action === 'close') closedIds.push(args.request_id)
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(idle2.closed, [], 'next idle pass MUST NOT close REQ_2 while its launch is pending')
   })
 })
