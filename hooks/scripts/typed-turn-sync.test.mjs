@@ -6130,4 +6130,136 @@ describe('typed-turn-sync (item da03801e)', () => {
       'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
     )
   })
+
+  it('wake-count cleanup NEVER marks an ended unmatched background notification seen so a later-arriving launch is still reconciled, and NEVER counts an earlier unknown wake against a later known scheduled wake (3ea2b201 / ce71a72b)', async () => {
+    const { promptArrival } = await import('./requests.mjs')
+    const { typedTurnSyncPending } = await import('./typed-turn-sync.mjs')
+    const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const CMD_ALICE = '11111111-1111-4111-8111-1111111111b3'
+    const CMD_BOB = '22222222-2222-4222-8222-2222222222b3'
+
+    // 1. Ended unmatched `<task-notification>` before a live scheduled wake:
+    //    MUST NOT mark the unmatched notification seen; once its launch arrives later,
+    //    poller MUST reconcile it and mark the launch notified!
+    {
+      const { home, dir, transcriptPath } = makeEnv()
+      appendRequestEvent(CONN, { op: 'open', id: CMD_ALICE, kind: 'command', requested_by: ALICE }, { dir })
+      appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+      appendRequestEvent(CONN, { op: 'schedule', id: 'sched-bob-notif', prompt: 'bob deploy check', request: CMD_BOB, also: [] }, { dir })
+
+      const endedNotifRow = JSON.stringify({
+        role: 'user',
+        message: {
+          content: [
+            {
+              type: 'text',
+              text: '<task-notification><task-id>late-ended-launch-1</task-id><status>completed</status></task-notification>',
+            },
+          ],
+        },
+      })
+      for (const ev of promptArrival({
+        fromAPerson: false,
+        origin: 'scheduled-trigger',
+        text: 'bob deploy check',
+        midTurn: false,
+        state: readRequestState(CONN, { dir }),
+      }).events) {
+        appendRequestEvent(CONN, ev, { dir })
+      }
+      const bobTimestampWake = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:40 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${endedNotifRow}\n${turnEndedRow()}\n${bobTimestampWake}\n`)
+
+      const memo = {}
+      const pass1 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.equal(pass1.action, 'preserved_wake_request', 'ended unmatched notification MUST NOT steal Bob’s scheduled wake requester')
+      assert.equal(pass1.requestId, CMD_BOB)
+      assert.equal(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref, CMD_BOB)
+
+      // Now Alice's launch record for `late-ended-launch-1` lands!
+      appendRequestEvent(
+        CONN,
+        { op: 'launch', key: 'late-ended-launch-1', kind: 'shell', notifies: true, request: CMD_ALICE, also: [] },
+        { dir },
+      )
+      assert.equal(typedTurnSyncPending({ transcriptPath, memo }), true)
+      const pass2 = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+        memo,
+      })
+      assert.notEqual(pass2.action, 'unchanged')
+      assert.equal(
+        readRequestState(CONN, { dir }).launches.get('late-ended-launch-1')?.notified,
+        true,
+        'ended background notification MUST be reconciled once its launch arrives instead of being pre-marked seen',
+      )
+    }
+
+    // 2. Earlier wake with NO known requester (via promptArrival -> ref: null) followed by
+    //    turn_ended, then a later scheduled wake whose requester promptArrival DID identify:
+    //    MUST preserve the later wake's known requester!
+    {
+      const { home, dir, transcriptPath } = makeEnv()
+      appendRequestEvent(CONN, { op: 'open', id: CMD_BOB, kind: 'command', requested_by: BOB }, { dir })
+      appendRequestEvent(CONN, { op: 'schedule', id: 'sched-bob-after-unknown', prompt: 'bob later check', request: CMD_BOB, also: [] }, { dir })
+
+      // Turn 1: unknown wake -> promptArrival emits `{ op: 'current', ref: null }`, ends with turn_ended.
+      for (const ev of promptArrival({
+        fromAPerson: false,
+        origin: 'channel',
+        text: 'unrelated channel ping',
+        midTurn: false,
+        state: readRequestState(CONN, { dir }),
+      }).events) {
+        appendRequestEvent(CONN, ev, { dir })
+      }
+      const unknownWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:42 PM (UTC)</timestamp>' }] },
+      })
+
+      // Turn 2: Bob's scheduled wake -> promptArrival identifies CMD_BOB (`from_wake: true`).
+      for (const ev of promptArrival({
+        fromAPerson: false,
+        origin: 'scheduled-trigger',
+        text: 'bob later check',
+        midTurn: false,
+        state: readRequestState(CONN, { dir }),
+      }).events) {
+        appendRequestEvent(CONN, ev, { dir })
+      }
+      const bobWakeRow = JSON.stringify({
+        role: 'user',
+        message: { content: [{ type: 'text', text: '<timestamp>Wednesday, Nov 25, 2026, 6:45 PM (UTC)</timestamp>' }] },
+      })
+      fs.writeFileSync(transcriptPath, `${unknownWakeRow}\n${turnEndedRow()}\n${bobWakeRow}\n`)
+
+      const res = await syncTypedTurnFromTranscript({
+        connectionId: CONN,
+        transcriptPath,
+        connectionCapability: 'cap-secret',
+        dir,
+      })
+      assert.equal(res.action, 'preserved_wake_request', 'earlier unknown wake MUST NOT clear later scheduled wake’s known requester')
+      assert.equal(res.requestId, CMD_BOB)
+      assert.equal(
+        stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home }).args?.request_ref,
+        CMD_BOB,
+        'next write during Bob’s scheduled wake MUST carry Bob’s request_ref',
+      )
+    }
+  })
 })

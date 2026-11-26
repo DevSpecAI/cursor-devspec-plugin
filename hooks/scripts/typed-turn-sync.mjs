@@ -1615,7 +1615,7 @@ export async function syncTypedTurnFromTranscript({
         ) {
           appendRequestEvent(
             connectionId,
-            { op: 'current', ref: null, expected_current: latestBeforeClear.current },
+            { op: 'current', ref: null, from_sync: true, expected_current: latestBeforeClear.current },
             { dir },
           )
         }
@@ -2045,7 +2045,15 @@ export async function syncTypedTurnFromTranscript({
             active.precededByTurnEnded && Array.isArray(active.endedNonTypedWakes)
               ? active.endedNonTypedWakes.filter((w) => {
                   if (!w?.key || reqState.seenTranscriptTurns.has(w.key)) return false
-                  return w.kind === 'timestamp' || w.kind === 'other'
+                  // NEVER mark an unmatched `<task-notification>` as seen or count it against
+                  // a scheduled wake: its launch record may still be arriving, and
+                  // `historicalWakeRows` reconciles it once its launch lands (3ea2b201 / ce71a72b).
+                  if (w.kind === 'other' && notifiedKeys(w.rawText).length > 0) return false
+                  if (w.kind === 'timestamp') return true
+                  if (w.kind === 'other') {
+                    return requestForWake({ origin: 'scheduled-trigger', text: w.rawText, state: reqState }).ref !== UNSTATED
+                  }
+                  return false
                 })
               : []
           const wakeCount = typeof reqState.unconsumedWakeCount === 'number' ? reqState.unconsumedWakeCount : 1
@@ -2072,7 +2080,7 @@ export async function syncTypedTurnFromTranscript({
             return { action: 'preserved_wake_request', requestId: reqState.current, key: active.key, active }
           }
         }
-        if (!appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })) {
+        if (!appendRequestEvent(connectionId, { op: 'current', ref: null, from_sync: true }, { dir })) {
           return { action: 'binding_write_failed', key: active.key, active }
         }
         if (
@@ -2219,7 +2227,7 @@ export async function finishIdleRequests({
         curState.currentBoundByWake ||
         curInfo?.kind === 'typed_prompt'
       if (shouldClear) {
-        appendRequestEvent(connectionId, { op: 'current', ref: null, expected_current: curState.current }, { dir })
+        appendRequestEvent(connectionId, { op: 'current', ref: null, from_sync: true, expected_current: curState.current }, { dir })
       }
     })
   }

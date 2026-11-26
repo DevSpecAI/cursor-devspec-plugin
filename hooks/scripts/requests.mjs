@@ -228,7 +228,16 @@ export function reduceRequestLog(text) {
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
         currentFromWake = Boolean(event.from_wake && current !== null)
         currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
-        unconsumedWakeCount = currentFromWake ? unconsumedWakeCount + 1 : 0
+        // Count every non-sync wake arrival (`from_wake: true` OR an unstated wake
+        // `{ op: 'current', ref: null }` emitted by `promptArrival` without `from_sync`),
+        // resetting only on a real non-wake turn or an explicit sync clear (`from_sync: true`).
+        // That way an earlier wake with no known requester followed by a later scheduled wake
+        // with a known requester between sync passes has `unconsumedWakeCount === 2 > 1`
+        // and preserves the later wake's known requester (decision ce71a72b).
+        unconsumedWakeCount =
+          currentFromWake || (current === null && event.from_sync !== true)
+            ? unconsumedWakeCount + 1
+            : 0
         currentWakeNotifiedKeys = new Set(
           currentFromWake && Array.isArray(event.wake_notified_keys)
             ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
