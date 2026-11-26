@@ -4125,4 +4125,176 @@ describe('room-message mid-turn step delivery, honest Working pickup, and wake l
       'HANDED record must still track newer command',
     )
   })
+
+  it('writeNote and writeFallbackDiagnosticNote never reuse a cached multi-part note whose continuation page is missing: repair when writable, fall back when read-only (3c5147a7 / 4e32d1a5 / 91d7b47c)', async () => {
+    const { fitShellDiagnostic, writeFallbackDiagnosticNote } = await import('./hook-context-budget.mjs')
+    const { home, dir } = mkHome()
+    const refusalText = JSON.stringify({
+      code: 'turn_busy_cached_note',
+      padding: 'k'.repeat(25_000),
+      blocking_items: [{ id: 'blk-second-page-tail', reason: 'must_reach_part_2' }],
+    })
+
+    // 1. Primary ~/.devspec/notes: seed cached 2-part note, delete part 2, make notes dir read-only -> fitShellDiagnostic MUST fall back to writable store!
+    const seeded = writeNote(refusalText, { home })
+    assert.ok(seeded.parts >= 2)
+    const part2Primary = path.join(home, '.devspec', 'notes', `${seeded.id}.2.md`)
+    assert.equal(fs.existsSync(part2Primary), true)
+    fs.rmSync(part2Primary)
+    const notesDir = path.join(home, '.devspec', 'notes')
+    const fallbackDir = path.join(dir, 'diagnostic-notes')
+    fs.chmodSync(notesDir, 0o500)
+    let fittedPrimary = null
+    try {
+      fittedPrimary = fitShellDiagnostic('x'.repeat(18_000), refusalText, {
+        home,
+        label: 'devspec-wake-tail',
+        fallbackDir,
+      })
+    } finally {
+      fs.chmodSync(notesDir, 0o700)
+    }
+    assert.ok(fittedPrimary.note?.fallback, 'must NOT reuse broken cached primary note when part 2 is missing and notes dir is read-only')
+    const fbPart1 = fs.readFileSync(fittedPrimary.note.file, 'utf8')
+    const fbNextMatch = /cat '([^']+)'/.exec(fbPart1)
+    assert.ok(fbNextMatch, 'fallback note part 1 must point to part 2')
+    const fbPart2 = fs.readFileSync(fbNextMatch[1], 'utf8')
+    assert.match(fbPart2, /blk-second-page-tail/, 'fallback note part 2 must be present and carry the blocking record')
+
+    // 2. When ~/.devspec/notes IS writable again and part 2 is still missing: writeNote MUST repair part 2!
+    assert.equal(fs.existsSync(part2Primary), false)
+    const repaired = writeNote(refusalText, { home })
+    assert.equal(fs.existsSync(part2Primary), true, 'writeNote must recreate missing part 2 when writable')
+    assert.match(readNoteText(repaired.id, { home }), /blk-second-page-tail/)
+
+    // 3. Fallback store cached 2-part note with part 2 deleted and fallback dir read-only -> throws so fitShellDiagnostic moves to next store!
+    const fbDirA = path.join(dir, 'fb-store-a')
+    const fbDirB = path.join(dir, 'fb-store-b')
+    const seededFb = writeFallbackDiagnosticNote(refusalText, { baseDir: fbDirA })
+    assert.ok(seededFb.parts >= 2)
+    const fbAPart2 = path.join(fbDirA, `${seededFb.id}-part-2.md`)
+    assert.equal(fs.existsSync(fbAPart2), true)
+    fs.rmSync(fbAPart2)
+    fs.chmodSync(fbDirA, 0o500)
+    try {
+      assert.throws(
+        () => writeFallbackDiagnosticNote(refusalText, { baseDir: fbDirA }),
+        /EACCES|ENOENT|permission/i,
+        'writeFallbackDiagnosticNote MUST NOT return broken cached note when part 2 is missing and dir is read-only',
+      )
+    } finally {
+      fs.chmodSync(fbDirA, 0o700)
+    }
+    // And when fbDirA is writable again, writeFallbackDiagnosticNote repairs part 2!
+    const repairedFb = writeFallbackDiagnosticNote(refusalText, { baseDir: fbDirA })
+    assert.equal(fs.existsSync(fbAPart2), true, 'writeFallbackDiagnosticNote must recreate missing part 2 when writable')
+    assert.match(fs.readFileSync(fbAPart2, 'utf8'), /blk-second-page-tail/)
+    assert.ok(repairedFb.command.includes(seededFb.id))
+    assert.ok(fbDirB)
+  })
+
+  it('releaseAtIdle keeps an unreadable retry overflow file queued and reports the skip rather than deleting it, then delivers the older command once readable again (3ea2b201)', async () => {
+    const { home, dir } = mkHome()
+    const wakeFile = path.join(dir, `${CONN}.wakes`)
+    const MSG_OLD = '33333333-3333-4333-8333-3333333333c1'
+    const TURN_OLD = '77777777-7777-4777-8777-7777777777c1'
+    const MSG_NEW = '33333333-3333-4333-8333-3333333333c2'
+    const TURN_NEW = '77777777-7777-4777-8777-7777777777c2'
+
+    // Step 1: hand over older unread command 1 into HANDED.
+    const batchOld = ownerBatch('Older unread command moved to retry file', { messageId: MSG_OLD, turnId: TURN_OLD })
+    holdForNextStep(CONN, batchOld, buildOwnerMessageEvents(batchOld), { dir })
+    await stepDeliveryHook(
+      { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 1' }, tool_output: '1' },
+      { home, dir, listenerActive: () => true },
+    )
+
+    // Step 2: fail idle append after concurrent hook hands over newer command 2 -> older command goes to retry-*.json!
+    let concurrentHanded = false
+    await assert.rejects(
+      () =>
+        releaseAtIdle(CONN, {
+          dir,
+          state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+          wakeFile,
+          home,
+          turnState: 'between',
+          isOpen: async () => {
+            if (!concurrentHanded) {
+              concurrentHanded = true
+              const batchNew = ownerBatch('Newer concurrent command', { messageId: MSG_NEW, turnId: TURN_NEW })
+              holdForNextStep(CONN, batchNew, buildOwnerMessageEvents(batchNew), { dir })
+              await stepDeliveryHook(
+                { conversation_id: CONVERSATION, tool_name: 'Shell', tool_input: { command: 'echo 2' }, tool_output: '2' },
+                { home, dir, listenerActive: () => true },
+              )
+            }
+            return true
+          },
+          append: () => {
+            throw new Error('simulated append failure')
+          },
+        }),
+      /simulated append failure/,
+    )
+
+    const stepsFolder = path.join(dir, `${CONN}.steps`)
+    const retryFiles = fs.readdirSync(stepsFolder).filter((n) => n.startsWith('retry-'))
+    assert.equal(retryFiles.length, 1, 'rollback must place older unread command in retry-*.json')
+    const retryName = retryFiles[0]
+
+    // Step 3: simulate transient EIO when reading the retry file during the next idle sweep!
+    const origReadFileSync = fs.readFileSync
+    const origStderrWrite = process.stderr.write.bind(process.stderr)
+    const stderrLogs = []
+    fs.readFileSync = (filePath, ...rest) => {
+      if (String(filePath).includes(retryName)) {
+        throw Object.assign(new Error('transient EIO reading retry file'), { code: 'EIO' })
+      }
+      return origReadFileSync(filePath, ...rest)
+    }
+    process.stderr.write = (chunk, ...rest) => {
+      stderrLogs.push(String(chunk))
+      return origStderrWrite(chunk, ...rest)
+    }
+    let sweep1 = null
+    try {
+      sweep1 = await releaseAtIdle(CONN, {
+        dir,
+        state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+        wakeFile,
+        home,
+        turnState: 'between',
+      })
+    } finally {
+      fs.readFileSync = origReadFileSync
+      process.stderr.write = origStderrWrite
+    }
+
+    assert.ok(sweep1?.note, 'sweep 1 delivers newer command')
+    assert.deepEqual(sweep1.skipped_unreadable_overflows, [retryName], 'sweep 1 must report the skipped unreadable retry file')
+    assert.ok(
+      stderrLogs.some((l) => l.includes(retryName) && /could not be read/i.test(l)),
+      'sweep 1 must log that the retry file could not be read and stayed queued',
+    )
+    assert.equal(
+      fs.existsSync(path.join(stepsFolder, retryName)),
+      true,
+      'unreadable retry file MUST NOT be deleted after delivering only the newer command',
+    )
+
+    // Step 4: once the transient read error clears, the next idle sweep delivers the older command!
+    const sweep2 = await releaseAtIdle(CONN, {
+      dir,
+      state: { enabled: true, connection_id: CONN, local_id: CONVERSATION, session_id: ROOM },
+      wakeFile,
+      home,
+      turnState: 'between',
+    })
+    assert.ok(sweep2?.note, 'next sweep must wake and deliver the previously unreadable retry command')
+    const sweep2Text = readNoteText(sweep2.note, { home })
+    assert.ok(sweep2Text.includes(MSG_OLD), 'older command MUST be delivered once retry file is readable again')
+    assert.ok(sweep2Text.includes(MSG_NEW), 'newer command remains preserved too')
+    assert.equal(fs.existsSync(path.join(stepsFolder, retryName)), false, 'retry file is deleted ONLY once actually read and delivered')
+  })
 })

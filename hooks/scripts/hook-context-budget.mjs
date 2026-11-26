@@ -362,11 +362,29 @@ export function writeNote(text, { home = os.homedir() } = {}) {
   const id = createHash('sha256').update(text).digest('hex').slice(0, 16)
   const pieces = splitText(text)
   const first = partFile(id, 1, home)
-  // The same text is the same note: written once, the first part last, so a first
-  // part on disk means every part is.
-  if (!fs.existsSync(first)) {
-    for (let part = pieces.length; part >= 1; part -= 1) {
-      writePrivateText(partFile(id, part, home), partContent(id, part, pieces.length, pieces[part - 1]))
+  // Verify every part is present, readable, and intact; rewrite any missing or damaged
+  // part (highest part first so part 1 is still written last) and verify every part by
+  // path before returning so a cached note with a missing continuation is NEVER reused
+  // as complete (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  for (let part = pieces.length; part >= 1; part -= 1) {
+    const target = partFile(id, part, home)
+    const expected = partContent(id, part, pieces.length, pieces[part - 1])
+    let matches = false
+    try {
+      matches = fs.readFileSync(target, 'utf8') === expected
+    } catch {
+      matches = false
+    }
+    if (!matches) {
+      writePrivateText(target, expected)
+    }
+  }
+  for (let part = 1; part <= pieces.length; part += 1) {
+    const target = partFile(id, part, home)
+    const expected = partContent(id, part, pieces.length, pieces[part - 1])
+    const actual = fs.readFileSync(target, 'utf8')
+    if (actual !== expected) {
+      throw new Error(`note ${id} part ${part} verification failed on disk`)
     }
   }
   return { id, file: first, command: noteCommand(id), parts: pieces.length }
@@ -1194,25 +1212,40 @@ export function writeFallbackDiagnosticNote(text, { baseDir = null } = {}) {
   }
   const pieces = splitText(raw, pageMaxChars, pageMaxBytes)
   const firstFile = partPath(1)
-  if (!fs.existsSync(firstFile)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-    for (let part = pieces.length; part >= 1; part -= 1) {
-      const nextCmd = part < pieces.length ? `\n\n--- next part (${part + 1}/${pieces.length}): cat ${shellQuotePath(partPath(part + 1))} ---\n` : '\n'
-      const partText = `${pieces[part - 1]}${nextCmd}`
-      if (!fitsShellOutput(partText)) {
-        throw new Error(`fallback diagnostic part ${part} exceeds Shell output limit`)
-      }
-      writePrivateText(partPath(part), partText)
+  const partTexts = pieces.map((piece, idx) => {
+    const part = idx + 1
+    const nextCmd = part < pieces.length ? `\n\n--- next part (${part + 1}/${pieces.length}): cat ${shellQuotePath(partPath(part + 1))} ---\n` : '\n'
+    const partText = `${piece}${nextCmd}`
+    if (!fitsShellOutput(partText)) {
+      throw new Error(`fallback diagnostic part ${part} exceeds Shell output limit`)
+    }
+    return partText
+  })
+  // Verify every part exists, is readable, and matches expected content; rewrite any
+  // missing or damaged part (and verify all parts by path before returning) so a cached
+  // fallback note whose continuation part is missing is NEVER advertised as complete
+  // (requirements 3c5147a7 / 4e32d1a5 / 91d7b47c).
+  for (let part = pieces.length; part >= 1; part -= 1) {
+    const target = partPath(part)
+    const expected = partTexts[part - 1]
+    let matches = false
+    try {
+      matches = fs.readFileSync(target, 'utf8') === expected
+    } catch {
+      matches = false
+    }
+    if (!matches) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      writePrivateText(target, expected)
     }
   }
-  const verifyFd = fs.openSync(firstFile, 'r')
-  try {
-    const st = fs.fstatSync(verifyFd)
-    if (st.size <= 0 && raw.length > 0) {
-      throw new Error(`fallback diagnostic file is empty on disk: ${firstFile}`)
+  for (let part = 1; part <= pieces.length; part += 1) {
+    const target = partPath(part)
+    const expected = partTexts[part - 1]
+    const actual = fs.readFileSync(target, 'utf8')
+    if (actual !== expected) {
+      throw new Error(`fallback diagnostic part ${part} verification failed on disk: ${target}`)
     }
-  } finally {
-    try { fs.closeSync(verifyFd) } catch { /* ignore */ }
   }
   return {
     id,

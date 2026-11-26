@@ -1134,8 +1134,18 @@ export async function stepDeliveryHook(
       }
     }
   }
+  const consumedOverflows = []
   for (const ov of takenOverflows) {
-    consumeOverflowEntry(readPrivateJson(ov.file))
+    const parsed = readPrivateJson(ov.file)
+    if (!parsed || typeof parsed !== 'object') {
+      giveBack(ov)
+      process.stderr.write(
+        `step-delivery: retry overflow file ${path.basename(ov.original)} could not be read; leaving queued for next retry\n`,
+      )
+      continue
+    }
+    consumedOverflows.push(ov)
+    consumeOverflowEntry(parsed)
   }
   for (const ov of memoryOverflows) {
     consumeOverflowEntry(ov)
@@ -1668,7 +1678,7 @@ export async function stepDeliveryHook(
     } catch (deliveryWriteError) {
       // Not handed over, so not taken: everything goes back for the next step.
       for (const each of adding) giveBack(each.taken)
-      for (const ov of takenOverflows) giveBack(ov)
+      for (const ov of consumedOverflows) giveBack(ov)
       if (memoryOverflows.length > 0) {
         const existingMem = unpersistedRetryOverflow.get(steps) ?? []
         unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
@@ -1732,7 +1742,7 @@ export async function stepDeliveryHook(
       return null
     }
     for (const each of checked) drop(each.taken)
-    for (const ov of takenOverflows) drop(ov)
+    for (const ov of consumedOverflows) drop(ov)
     if (takenRecord) {
       if (record && adding.length === 0 && reclaimedUnreadItems.length === 0 && !readChanged && !mergedConcurrent) giveBack(takenRecord)
       else drop(takenRecord)
@@ -1840,18 +1850,43 @@ export async function releaseAtIdle(
       overflowRefusals.push(...entry.pickup_refusals)
     }
   }
-  for (const ov of takenOverflows) collectOverflow(readPrivateJson(ov.file))
+  const consumedOverflows = []
+  const skippedUnreadableOverflows = []
+  for (const ov of takenOverflows) {
+    const parsed = readPrivateJson(ov.file)
+    if (!parsed || typeof parsed !== 'object') {
+      // Transient read error: NEVER delete an unreadable retry overflow file; restore it
+      // to disk and report that it remained queued for retry (requirement 3ea2b201).
+      giveBack(ov)
+      skippedUnreadableOverflows.push(path.basename(ov.original))
+      process.stderr.write(
+        `step-delivery: retry overflow file ${path.basename(ov.original)} could not be read during idle sweep; leaving queued for retry\n`,
+      )
+      continue
+    }
+    consumedOverflows.push(ov)
+    collectOverflow(parsed)
+  }
   for (const ov of memoryOverflows) collectOverflow(ov)
 
   const taken = waitingFiles(steps).map(take).filter(Boolean)
+  const validTaken = []
   const fresh = []
   for (const each of taken) {
     const item = readPrivateJson(each.file)
-    if (validItem(item)) fresh.push(item)
+    if (validItem(item)) {
+      fresh.push(item)
+      validTaken.push(each)
+    } else {
+      giveBack(each)
+      process.stderr.write(
+        `step-delivery: waiting file ${path.basename(each.original)} could not be read during idle sweep; leaving queued for retry\n`,
+      )
+    }
   }
   if (record?.woken === true && fresh.length === 0 && overflowUnreadItems.length === 0) {
-    for (const each of taken) giveBack(each)
-    for (const ov of takenOverflows) giveBack(ov)
+    for (const each of validTaken) giveBack(each)
+    for (const ov of consumedOverflows) giveBack(ov)
     if (memoryOverflows.length > 0) {
       const existingMem = unpersistedRetryOverflow.get(steps) ?? []
       unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
@@ -1900,8 +1935,8 @@ export async function releaseAtIdle(
     else dropped.push(item.key)
   }
   const finish = () => {
-    for (const each of taken) drop(each)
-    for (const ov of takenOverflows) drop(ov)
+    for (const each of validTaken) drop(each)
+    for (const ov of consumedOverflows) drop(ov)
     if (takenRecord && record) drop(takenRecord)
   }
   const preserveTakenRecord = () => {
@@ -1940,8 +1975,8 @@ export async function releaseAtIdle(
     // An end that landed during the lookups left these items to this hold: they are
     // discarded and named as the end would have, and no record or wake is written.
     if (connectionEnded(dir, connectionId)) {
-      for (const each of taken) giveBack(each)
-      for (const ov of takenOverflows) giveBack(ov)
+      for (const each of validTaken) giveBack(each)
+      for (const ov of consumedOverflows) giveBack(ov)
       if (takenRecord && record) giveBack(takenRecord)
       logDiscarded('releaseAtIdle', connectionId, discardLocked(connectionId, dir))
       return { pointed: [], dropped, note: null, discarded: true }
@@ -1987,14 +2022,14 @@ export async function releaseAtIdle(
     }
 
     if (mergedOpen.length === 0) {
-      for (const each of taken) drop(each)
+      for (const each of validTaken) drop(each)
       if (hasConcurrent && hasPendingRetry) {
         try {
           writePrivateJson(handedPath, { ...concurrent, ...mergedPendingMeta })
-          for (const ov of takenOverflows) drop(ov)
+          for (const ov of consumedOverflows) drop(ov)
           if (takenRecord && record) drop(takenRecord)
         } catch {
-          for (const ov of takenOverflows) giveBack(ov)
+          for (const ov of consumedOverflows) giveBack(ov)
           if (memoryOverflows.length > 0) {
             const existingMem = unpersistedRetryOverflow.get(steps) ?? []
             unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
@@ -2002,7 +2037,7 @@ export async function releaseAtIdle(
           preserveTakenRecord()
         }
       } else {
-        for (const ov of takenOverflows) {
+        for (const ov of consumedOverflows) {
           if (hasPendingRetry) giveBack(ov)
           else drop(ov)
         }
@@ -2015,7 +2050,12 @@ export async function releaseAtIdle(
           else drop(takenRecord)
         }
       }
-      return { pointed: [], dropped, note: null }
+      return {
+        pointed: [],
+        dropped,
+        note: null,
+        ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+      }
     }
     let note = null
     let wroteHanded = false
@@ -2046,8 +2086,8 @@ export async function releaseAtIdle(
           fs.rmSync(handedPath, { force: true })
         }
       }
-      for (const each of taken) giveBack(each)
-      for (const ov of takenOverflows) giveBack(ov)
+      for (const each of validTaken) giveBack(each)
+      for (const ov of consumedOverflows) giveBack(ov)
       if (memoryOverflows.length > 0) {
         const existingMem = unpersistedRetryOverflow.get(steps) ?? []
         unpersistedRetryOverflow.set(steps, [...existingMem, ...memoryOverflows])
@@ -2057,7 +2097,12 @@ export async function releaseAtIdle(
     }
     finish()
     recordTurnWake(connectionId, turnWakeFromEvents(mergedOpen.flatMap((item) => item.events)), { dir })
-    return { pointed: mergedOpen.map((item) => item.key), dropped, note: note.id }
+    return {
+      pointed: mergedOpen.map((item) => item.key),
+      dropped,
+      note: note.id,
+      ...(skippedUnreadableOverflows.length > 0 ? { skipped_unreadable_overflows: skippedUnreadableOverflows } : {}),
+    }
   })
 }
 
