@@ -233,6 +233,7 @@ async function performMcpToolsCall({
   }
 
   let res
+  let text
   try {
     res = await fetch(mcpUrl, {
       method: 'POST',
@@ -240,6 +241,7 @@ async function performMcpToolsCall({
       body: bodyText,
       signal: controller.signal,
     })
+    text = await res.text()
   } catch (e) {
     if (abortCode) {
       const err = new Error(`MCP call ${name} aborted: ${abortCode}`)
@@ -252,7 +254,6 @@ async function performMcpToolsCall({
     if (aliveTimer) clearInterval(aliveTimer)
   }
 
-  const text = await res.text()
   if (measurement) { measurement.response_bytes = Buffer.byteLength(text); measurement.httpStatus = res.status }
   if (!res.ok) {
     // The message keeps its `MCP HTTP <status>: …` shape — logs and existing matching read it.
@@ -284,7 +285,11 @@ async function performMcpToolsCall({
     throw Object.assign(new Error(`Unparseable MCP response: ${bodyExcerpt(text)}`), { body: text })
   }
   if (payload.error) {
-    throw new Error(payload.error.message || JSON.stringify(payload.error))
+    const err = new Error(payload.error.message || JSON.stringify(payload.error))
+    if (payload.error.code !== undefined) err.code = payload.error.code
+    if (payload.error.data !== undefined) err.data = payload.error.data
+    err.rpcError = payload.error
+    throw err
   }
 
   // tools/call result content is usually { content: [{ type:'text', text:'...' }], isError? }.

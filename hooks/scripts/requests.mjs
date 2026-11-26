@@ -101,20 +101,60 @@ function uuids(value) {
  *   launches: Map<string, { key: string, request: string, also: string[], kind: string, notifies: boolean, notified: boolean, absent: number }>,
  *   schedules: Array<{ prompt: string, request: string, also: string[], id: string|null }>,
  *   current: string|null,
+ *   currentFromWake: boolean,
+ *   currentBoundByWake: boolean,
+ *   currentWakeNotifiedKeys: Set<string>,
  *   joined: Set<string>,
  *   chosen: boolean,
+ *   seenTranscriptTurns: Map<string, string|null>,
+ *   failedTranscriptTurns: Set<string>,
  * }}
  */
 export function reduceRequestLog(text) {
   const open = new Map()
+  const closed = new Set()
+  const idleClosedInfo = new Map()
   const started = new Set()
   const launches = new Map()
   const aliases = new Map()
   const schedules = []
+  const seenTranscriptTurns = new Map()
+  const failedTranscriptTurns = new Set()
   let current = null
+  let currentSeq = 0
+  let currentFromWake = false
+  let currentBoundByWake = false
+  let unconsumedWakeCount = 0
+  let currentWakeNotifiedKeys = new Set()
+  let currentWakePriorEndedKeys = new Set()
   let joined = new Set()
+  let priorTurnJoined = new Set()
   let chosen = false
   const launchOf = (key) => launches.get(key) ?? launches.get(aliases.get(key))
+  const hasActiveWorkFor = (requestId) => {
+    if (!UUID.test(requestId ?? '')) return false
+    for (const launch of launches.values()) {
+      const namesIt = launch.request === requestId || (Array.isArray(launch.also) && launch.also.includes(requestId))
+      if (namesIt && (launch.kind === 'monitor' || (launch.notifies !== false && !launch.notified))) {
+        return true
+      }
+    }
+    for (const sched of schedules) {
+      if (sched.request === requestId || (Array.isArray(sched.also) && sched.also.includes(requestId))) {
+        return true
+      }
+    }
+    return false
+  }
+  const restoreIdleClosedRefs = (primary, also) => {
+    for (const ref of [primary, ...(Array.isArray(also) ? also : [])]) {
+      if (UUID.test(ref ?? '') && !open.has(ref) && idleClosedInfo.has(ref)) {
+        open.set(ref, idleClosedInfo.get(ref))
+        closed.delete(ref)
+        idleClosedInfo.delete(ref)
+      }
+    }
+  }
   for (const line of String(text || '').split('\n')) {
     let event
     try {
@@ -125,6 +165,8 @@ export function reduceRequestLog(text) {
     switch (event?.op) {
       case 'open':
         if (UUID.test(event.id ?? '')) {
+          closed.delete(event.id)
+          idleClosedInfo.delete(event.id)
           open.set(event.id, {
             kind: event.kind,
             ...(event.message_id ? { message_id: event.message_id } : {}),
@@ -134,22 +176,111 @@ export function reduceRequestLog(text) {
         }
         break
       case 'close':
+        // Conditional idle close (`if_idle: true`): never close a request that gained a
+        // pending background launch, monitor, or schedule, joined a live turn, or whose
+        // foreground turn changed between the idle sweep's read and its append
+        // (requirements 3ea2b201 / ce71a72b).
+        if (event.if_idle === true) {
+          const currentChanged =
+            Object.prototype.hasOwnProperty.call(event, 'expected_current') && current !== event.expected_current
+          const newlyJoined = joined.has(event.id) && event.allow_joined !== true
+          if (hasActiveWorkFor(event.id) || currentChanged || newlyJoined) {
+            break
+          }
+        }
+        if (event.if_idle === true && UUID.test(event.id ?? '') && open.has(event.id)) {
+          idleClosedInfo.set(event.id, open.get(event.id))
+        } else if (UUID.test(event.id ?? '')) {
+          idleClosedInfo.delete(event.id)
+        }
+        if (UUID.test(event.id ?? '')) closed.add(event.id)
         open.delete(event.id)
         started.delete(event.id)
         joined.delete(event.id)
-        if (current === event.id) current = null
+        priorTurnJoined.delete(event.id)
+        if (current === event.id) {
+          current = null
+          currentSeq += 1
+          currentFromWake = false
+          currentBoundByWake = false
+          unconsumedWakeCount = 0
+          currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
+        }
         break
       case 'current':
-        // A new turn: what it carries starts again from what woke it.
+        // Compare-and-swap guard: when `expected_current` is specified and another
+        // request (e.g. a different sender's live room command) became `current`
+        // between the caller's last read and this append, do NOT replace it! Still
+        // record a newly opened UUID ref in `started` so idle cleanup can close it
+        // cleanly (decision ce71a72b).
+        if (
+          typeof event.expected_current_seq === 'number' &&
+          currentSeq !== event.expected_current_seq
+        ) {
+          if (UUID.test(event.ref ?? '')) started.add(event.ref)
+          break
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(event, 'expected_current') &&
+          current !== event.expected_current &&
+          current !== event.ref &&
+          current !== null
+        ) {
+          if (UUID.test(event.ref ?? '')) started.add(event.ref)
+          break
+        }
+        // A new turn: what it carries starts again from what woke it. When
+        // `preserve_live_joined` is set (establishing the foreground request for a
+        // live terminal turn), drop ONLY stale joined ids explicitly listed in
+        // `drop_joined_ids` (plus `priorTurnJoined` and `current`) so a room command
+        // joining the same live turn even immediately before this event is written
+        // NEVER disappears from `joined` (decision ce71a72b).
         current = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
-        joined = new Set()
+        currentSeq += 1
+        currentFromWake = Boolean(event.from_wake && current !== null)
+        currentBoundByWake = Boolean(event.bound_by_wake && current !== null)
+        // When the prompt hook recorded which non-typed wakes had ALREADY ended in the
+        // transcript before this wake started (`prior_ended_wake_keys`), those earlier
+        // ended wakes never consume this wake's attribution, and exactly 1 subsequent
+        // ended wake (not in `prior_ended_wake_keys`) consumes it. Otherwise fall back
+        // to counting non-sync wake arrivals (`from_wake: true` or unstated `{ ref: null }`
+        // without `from_sync: true`) so consecutive wakes between sync passes preserve
+        // the latest wake's known requester (decision ce71a72b).
+        const hasPriorEndedKeys = Boolean(currentFromWake && Array.isArray(event.prior_ended_wake_keys))
+        currentWakePriorEndedKeys = new Set(
+          hasPriorEndedKeys ? event.prior_ended_wake_keys.filter((k) => typeof k === 'string' && k) : [],
+        )
+        unconsumedWakeCount = hasPriorEndedKeys
+          ? 1
+          : currentFromWake || (current === null && event.from_sync !== true)
+            ? unconsumedWakeCount + 1
+            : 0
+        currentWakeNotifiedKeys = new Set(
+          currentFromWake && Array.isArray(event.wake_notified_keys)
+            ? event.wake_notified_keys.filter((k) => typeof k === 'string' && k)
+            : [],
+        )
+        if (event.preserve_live_joined === true) {
+          const drop = new Set(Array.isArray(event.drop_joined_ids) ? event.drop_joined_ids : [])
+          if (UUID.test(current ?? '')) drop.add(current)
+          joined = new Set([...joined].filter((id) => !drop.has(id) && !priorTurnJoined.has(id)))
+        } else if (Array.isArray(event.preserve_joined_ids)) {
+          const keep = new Set(event.preserve_joined_ids.filter((id) => UUID.test(id ?? '') && id !== current))
+          joined = new Set([...joined].filter((id) => keep.has(id)))
+        } else {
+          joined = new Set()
+        }
+        priorTurnJoined = new Set()
         chosen = false
         if (UUID.test(current ?? '')) started.add(current)
         break
       case 'joined':
         // Delivered into the running turn: the turn now carries it too.
         if (carriedRef(event.id) && event.id !== current) {
+          restoreIdleClosedRefs(event.id, [])
           joined.add(event.id)
+          priorTurnJoined.delete(event.id)
           chosen = false
           if (UUID.test(event.id)) started.add(event.id)
         }
@@ -165,24 +296,79 @@ export function reduceRequestLog(text) {
           if (previous !== (next ?? UNSTATED)) joined.add(previous)
           joined.delete(next ?? UNSTATED)
           current = next
+          currentSeq += 1
+          currentFromWake = false
+          currentBoundByWake = false
+          unconsumedWakeCount = 0
+          currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
           chosen = true
           if (UUID.test(current ?? '')) started.add(current)
         }
         break
       case 'answered': {
         // The agent posted its final answer to this room command
-        // (post_session_message with complete_turn), so once its work is done
-        // the command is finished. Until then it stays open (item 984ca8b4).
+        // (post_session_message with complete_turn). DevSpec closes the command's
+        // delivery immediately, so it must no longer serve as the foreground turn's
+        // current request (item da03801e). It stays in `open` until closed so any
+        // background subagent it launched keeps naming its request_ref while its
+        // work runs on (item 984ca8b4).
         const info = open.get(event.id)
         if (info) info.answered = true
+        if (current === event.id) {
+          current = null
+          currentSeq += 1
+          currentFromWake = false
+          currentBoundByWake = false
+          unconsumedWakeCount = 0
+          currentWakeNotifiedKeys = new Set()
+          currentWakePriorEndedKeys = new Set()
+          // Any other requests already in `joined` belonged to this answered turn,
+          // so a subsequent turn after `turn_ended` knows not to inherit them while
+          // still preserving any fresh join that arrives after `current` became null.
+          for (const jid of joined) {
+            if (jid !== event.id) priorTurnJoined.add(jid)
+          }
+        }
+        joined.delete(event.id)
+        priorTurnJoined.delete(event.id)
         break
       }
+      case 'transcript_turn':
+        if (typeof event.key === 'string' && event.key) {
+          const boundRef = event.ref === NO_REQUEST || UUID.test(event.ref ?? '') ? event.ref : null
+          seenTranscriptTurns.set(event.key, boundRef)
+          failedTranscriptTurns.delete(event.key)
+          if (event.mark_started === true && UUID.test(boundRef ?? '')) {
+            started.add(boundRef)
+          }
+          // Once a transcript turn binds the wake-restored current request, mark
+          // it bound by that wake so a subsequent unrelated wake clears it
+          // (even for an unanswered room command) instead of inheriting it.
+          if (!event.historical && current !== null && boundRef === current) {
+            if (currentFromWake) currentBoundByWake = true
+            currentFromWake = false
+            unconsumedWakeCount = 0
+            currentWakeNotifiedKeys = new Set()
+            currentWakePriorEndedKeys = new Set()
+          } else if (event.consumes_ended_wake === true && unconsumedWakeCount > 0) {
+            unconsumedWakeCount -= 1
+          }
+        }
+        break
+      case 'typed_turn_failed':
+        if (typeof event.key === 'string' && event.key && !seenTranscriptTurns.has(event.key)) {
+          failedTranscriptTurns.add(event.key)
+        }
+        break
       case 'launch':
         if (KEY.test(event.key ?? '') && carriedRef(event.request)) {
+          const also = uuids(event.also)
+          restoreIdleClosedRefs(event.request, also)
           launches.set(event.key, {
             key: event.key,
             request: event.request,
-            also: uuids(event.also),
+            also,
             kind: String(event.kind || 'unknown'),
             notifies: event.notifies !== false,
             notified: false,
@@ -194,6 +380,9 @@ export function reduceRequestLog(text) {
       case 'notified': {
         const launch = launchOf(event.key)
         if (launch) launch.notified = true
+        if (currentFromWake && !event.historical && KEY.test(event.key ?? '')) {
+          currentWakeNotifiedKeys.add(event.key)
+        }
         break
       }
       case 'absent': {
@@ -203,12 +392,26 @@ export function reduceRequestLog(text) {
       }
       case 'schedule':
         if (typeof event.prompt === 'string' && event.prompt.trim() && carriedRef(event.request)) {
-          schedules.push({
-            prompt: event.prompt.trim(),
-            request: event.request,
-            also: uuids(event.also),
-            id: KEY.test(event.id ?? '') ? event.id : null,
-          })
+          const also = uuids(event.also)
+          restoreIdleClosedRefs(event.request, also)
+          const trimmedPrompt = event.prompt.trim()
+          const schedId = KEY.test(event.id ?? '') ? event.id : null
+          const alreadyListed = schedules.some(
+            (s) =>
+              s.prompt === trimmedPrompt &&
+              s.request === event.request &&
+              s.id === schedId &&
+              s.also.length === also.length &&
+              s.also.every((x, i) => x === also[i]),
+          )
+          if (!alreadyListed) {
+            schedules.push({
+              prompt: trimmedPrompt,
+              request: event.request,
+              also,
+              id: schedId,
+            })
+          }
         }
         break
       default:
@@ -219,17 +422,224 @@ export function reduceRequestLog(text) {
   for (const [alias, key] of aliases) {
     if (!launches.has(alias) && launches.has(key)) launches.set(alias, launches.get(key))
   }
-  return { open, started, launches, schedules, current, joined, chosen }
+  return { open, closed, started, launches, schedules, current, currentSeq, currentFromWake, currentBoundByWake, unconsumedWakeCount, currentWakeNotifiedKeys, currentWakePriorEndedKeys, joined, priorTurnJoined, chosen, seenTranscriptTurns, failedTranscriptTurns }
+}
+
+/**
+ * Extract all `{ op: 'rotated', archive_name?, archive_bytes, archive_ino, archive_dev }`
+ * watermarks written into the active request log by `rotateRequestLog`. Returns a map
+ * keyed by archive file basename (legacy watermarks without `archive_name` default to
+ * `${connectionId}.requests.jsonl.1`) plus an inode map keyed by `${dev}:${ino}`, keeping
+ * the latest watermark recorded for each archive.
+ */
+function archiveWatermarks(text, connectionId) {
+  const defaultName = `${connectionId}.requests.jsonl.1`
+  const byName = new Map()
+  const byIno = new Map()
+  const rawLines = []
+  for (const line of String(text || '').split('\n')) {
+    if (!line.includes('"rotated"')) continue
+    try {
+      const event = JSON.parse(line)
+      if (
+        event?.op === 'rotated' &&
+        typeof event.archive_bytes === 'number' &&
+        Number.isFinite(event.archive_bytes) &&
+        event.archive_bytes >= 0
+      ) {
+        const archiveName =
+          typeof event.archive_name === 'string' && event.archive_name ? event.archive_name : defaultName
+        const wm = {
+          archive_name: archiveName,
+          archive_bytes: event.archive_bytes,
+          archive_ino: typeof event.archive_ino === 'number' ? event.archive_ino : null,
+          archive_dev: typeof event.archive_dev === 'number' ? event.archive_dev : null,
+        }
+        byName.set(archiveName, wm)
+        if (wm.archive_ino !== null) {
+          byIno.set(`${wm.archive_dev ?? ''}:${wm.archive_ino}`, wm)
+        }
+        rawLines.push(wm)
+      }
+    } catch {
+      /* ignore torn line */
+    }
+  }
+  return { byName, byIno, latest: [...byName.values()] }
+}
+
+/**
+ * Find any leftover `.requests.jsonl.rotating-*` staged files in `dir` for
+ * `connectionId`, sorted oldest-first. Returns `{ files, error }` so callers
+ * fail closed if `dir` itself cannot be listed.
+ */
+function stagedRequestLogFiles(connectionId, dir) {
+  const prefix = `${connectionId}.requests.jsonl.rotating-`
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { files: [], error: null }
+    return { files: [], error }
+  }
+  const matched = []
+  for (const name of entries) {
+    if (!name.startsWith(prefix)) continue
+    const fullPath = path.join(dir, name)
+    let mtimeMs = 0
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      return { files: [], error }
+    }
+    matched.push({ fullPath, name, mtimeMs })
+  }
+  matched.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+  return { files: matched.map((m) => m.fullPath), error: null }
+}
+
+/**
+ * Find every retained archive file for `connectionId` in `dir`: both the primary
+ * `.requests.jsonl.1` archive and any `.requests.jsonl.archive-*` archives created by
+ * subsequent rotations (which NEVER overwrite or unlink earlier archives so an already-open
+ * writer fd on any prior archive remains visible — requirement 3ea2b201 / decision ce71a72b).
+ */
+function archiveRequestLogFiles(connectionId, dir) {
+  const legacyName = `${connectionId}.requests.jsonl.1`
+  const archivePrefix = `${connectionId}.requests.jsonl.archive-`
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { files: [], error: null }
+    return { files: [], error }
+  }
+  const matched = []
+  for (const name of entries) {
+    if (name !== legacyName && !name.startsWith(archivePrefix)) continue
+    const fullPath = path.join(dir, name)
+    let mtimeMs = 0
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      return { files: [], error }
+    }
+    matched.push({ fullPath, name, mtimeMs })
+  }
+  matched.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+  return { files: matched.map((m) => m.fullPath), error: null }
+}
+
+/**
+ * Combined change stamp covering the active request log AND every retained archive
+ * (`.requests.jsonl.1` and `.requests.jsonl.archive-*`) and staged rotation file
+ * (`.requests.jsonl.rotating-*`) that `readRequestState` reads. Returns `null` on any
+ * non-ENOENT stat/readdir error so callers never skip reconciliation on a transient
+ * filesystem error (req 3ea2b201).
+ */
+export function requestLogChangeStamp(connectionId, { dir = DEFAULT_DIR } = {}) {
+  if (!connectionId) return ''
+  const file = requestLogPath(connectionId, dir)
+  const parts = []
+  const statTag = (label, target) => {
+    try {
+      const st = fs.statSync(target)
+      parts.push(`${label}=${st.ino}:${st.size}:${st.mtimeMs}`)
+      return true
+    } catch (error) {
+      if (error?.code === 'ENOENT') return true
+      return false
+    }
+  }
+  if (!statTag('active', file)) return null
+  const archives = archiveRequestLogFiles(connectionId, dir)
+  if (archives.error) return null
+  for (const archiveFile of archives.files) {
+    if (!statTag(`archive:${path.basename(archiveFile)}`, archiveFile)) return null
+  }
+  const staged = stagedRequestLogFiles(connectionId, dir)
+  if (staged.error) return null
+  for (const stagedFile of staged.files) {
+    if (!statTag(`staged:${path.basename(stagedFile)}`, stagedFile)) return null
+  }
+  return parts.join('|')
 }
 
 export function readRequestState(connectionId, { dir = DEFAULT_DIR } = {}) {
+  const file = requestLogPath(connectionId, dir)
   let text = ''
-  try {
-    text = fs.readFileSync(requestLogPath(connectionId, dir), 'utf8')
-  } catch {
-    /* no log yet: nothing open */
+  let readError = null
+  const stagedTexts = []
+  const staged = stagedRequestLogFiles(connectionId, dir)
+  if (staged.error) {
+    readError = staged.error
+  } else {
+    for (const stagedFile of staged.files) {
+      try {
+        stagedTexts.push(fs.readFileSync(stagedFile, 'utf8'))
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          readError = error
+          break
+        }
+      }
+    }
   }
-  return reduceRequestLog(text)
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') readError ??= error
+  }
+  // If a writer that already had ANY rotated log's fd open appended after
+  // `rotateRequestLog`'s final read (even across multiple subsequent rotations),
+  // that retained archive (`.requests.jsonl.1` or `.requests.jsonl.archive-*`) will
+  // have grown past its recorded watermark `archive_bytes` (or lack a watermark).
+  // Replay every such archive ahead of the active log so NO late `launch`, `schedule`,
+  // `open`, or `typed_turn_failed` is ever missed (requirement 3ea2b201 / decision ce71a72b).
+  const archiveTexts = []
+  if (!readError) {
+    const archives = archiveRequestLogFiles(connectionId, dir)
+    if (archives.error) {
+      readError = archives.error
+    } else if (archives.files.length > 0) {
+      const watermarks = archiveWatermarks(text, connectionId)
+      for (const archiveFile of archives.files) {
+        try {
+          const archStat = fs.statSync(archiveFile)
+          const base = path.basename(archiveFile)
+          const byInoWm =
+            watermarks.byIno.get(`${archStat.dev ?? ''}:${archStat.ino}`) ??
+            watermarks.byIno.get(`:${archStat.ino}`) ??
+            null
+          const byNameWm = watermarks.byName.get(base) ?? null
+          const wm =
+            byInoWm ??
+            (byNameWm &&
+            (byNameWm.archive_ino == null ||
+              (archStat.ino === byNameWm.archive_ino &&
+                (byNameWm.archive_dev == null || archStat.dev === byNameWm.archive_dev)))
+              ? byNameWm
+              : null)
+          if (!wm) {
+            archiveTexts.push(fs.readFileSync(archiveFile, 'utf8'))
+          } else if (archStat.size > wm.archive_bytes) {
+            const tailReplay = carryForwardTailLines(fs.readFileSync(archiveFile), wm.archive_bytes)
+            if (tailReplay) archiveTexts.push(tailReplay)
+          }
+        } catch (error) {
+          if (error?.code !== 'ENOENT') {
+            readError = error
+            break
+          }
+        }
+      }
+    }
+  }
+  const combined = [...stagedTexts, ...archiveTexts, ...(text ? [text] : [])].join('\n')
+  const state = reduceRequestLog(combined)
+  return readError ? { ...state, readError } : state
 }
 
 /**
@@ -269,7 +679,7 @@ export async function openRequest({
   }
   const requestId = UUID.test(result?.request_id ?? '') ? result.request_id : null
   if (!requestId || result.status !== 'open') return null
-  appendRequestEvent(
+  const persisted = appendRequestEvent(
     connectionId,
     {
       op: 'open',
@@ -281,7 +691,7 @@ export async function openRequest({
     },
     { dir },
   )
-  return requestId
+  return persisted ? requestId : null
 }
 
 /**
@@ -411,7 +821,15 @@ export function notifiedKeys(text) {
  * running turn so what it carries joins that turn rather than replacing what
  * the turn serves.
  */
-export function promptArrival({ fromAPerson, origin, text, midTurn = false, state, newId = randomUUID }) {
+export function promptArrival({
+  fromAPerson,
+  origin,
+  text,
+  midTurn = false,
+  state,
+  newId = randomUUID,
+  priorEndedWakeKeys = undefined,
+}) {
   const events = []
   if (fromAPerson) {
     const id = newId()
@@ -422,7 +840,17 @@ export function promptArrival({ fromAPerson, origin, text, midTurn = false, stat
   if (midTurn) {
     for (const id of [ref, ...also]) events.push({ op: 'joined', id })
   } else {
-    events.push({ op: 'current', ref: ref === UNSTATED ? null : ref })
+    const resolvedRef = ref === UNSTATED ? null : ref
+    const priorKeys =
+      resolvedRef !== null && Array.isArray(priorEndedWakeKeys)
+        ? priorEndedWakeKeys.filter((k) => typeof k === 'string' && k)
+        : null
+    events.push({
+      op: 'current',
+      ref: resolvedRef,
+      ...(resolvedRef !== null ? { from_wake: true } : {}),
+      ...(priorKeys !== null ? { prior_ended_wake_keys: priorKeys } : {}),
+    })
     for (const id of also) events.push({ op: 'joined', id })
   }
   const kind = typeof origin === 'string' ? origin : origin?.kind
@@ -489,7 +917,8 @@ export function requestRefForWrite(state, agentId = null) {
 
 /**
  * The delivery `provenance_ref` of the room command a write made now serves, or
- * null when the write serves a typed terminal prompt, nobody's request, or an
+ * null when the write serves a typed terminal prompt, nobody's request, an
+ * already-answered command (whose delivery DevSpec closed on final answer), or an
  * unknown request.
  */
 export function provenanceRefForWrite(state, agentId = null) {
@@ -497,7 +926,8 @@ export function provenanceRefForWrite(state, agentId = null) {
   const ref = requestRefForWrite(state, agentId)
   if (!ref || ref === NO_REQUEST) return null
   const info = state.open.get(ref)
-  return typeof info?.provenance_ref === 'string' && UUID.test(info.provenance_ref) ? info.provenance_ref : null
+  if (!info || info.answered) return null
+  return typeof info.provenance_ref === 'string' && UUID.test(info.provenance_ref) ? info.provenance_ref : null
 }
 
 /**
@@ -688,37 +1118,275 @@ export async function finishTurnRequests({
 }
 
 /**
+ * Build lines to carry forward any tail appended to a rotated log past `knownBytes`,
+ * including `open` restoration lines for any `if_idle`-closed request re-opened by
+ * a late `launch`, `schedule`, or `joined` in that tail.
+ */
+function carryForwardTailLines(fullBuf, knownBytes) {
+  if (fullBuf.length <= knownBytes) return ''
+  const fullText = fullBuf.toString('utf8')
+  const extraText = fullBuf.subarray(knownBytes).toString('utf8')
+  const fullState = reduceRequestLog(fullText)
+  const extraState = reduceRequestLog(extraText)
+  const restoredLines = []
+  for (const [id, info] of fullState.open) {
+    if (!extraState.open.has(id)) {
+      restoredLines.push(
+        `${JSON.stringify({
+          op: 'open',
+          id,
+          kind: info.kind,
+          ...(info.message_id ? { message_id: info.message_id } : {}),
+          ...(info.provenance_ref ? { provenance_ref: info.provenance_ref } : {}),
+          ...(info.requested_by ? { requested_by: info.requested_by } : {}),
+          at: new Date().toISOString(),
+        })}\n`,
+      )
+    }
+  }
+  const normalizedExtra = extraText.endsWith('\n') ? extraText : `${extraText}\n`
+  return `${restoredLines.join('')}${normalizedExtra}`
+}
+
+/**
  * Start the log afresh once it has grown and carries no open request. Launches
  * and schedules made for nobody's request are carried over while they may still
  * wake the agent, so their wakes stay positively nobody's.
  */
-export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = ROTATE_BYTES } = {}) {
+export function rotateRequestLog(connectionId, { dir = DEFAULT_DIR, minBytes = ROTATE_BYTES, onError = null } = {}) {
   const file = requestLogPath(connectionId, dir)
   try {
-    if (fs.statSync(file).size < minBytes) return false
-    const state = reduceRequestLog(fs.readFileSync(file, 'utf8'))
-    if (state.open.size > 0) return false
-    fs.renameSync(file, `${file}.1`)
-    for (const launch of new Set(state.launches.values())) {
-      if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {
-        appendRequestEvent(
-          connectionId,
-          { op: 'launch', key: launch.key, kind: launch.kind, notifies: true, request: NO_REQUEST, also: [] },
-          { dir },
-        )
+    let fileStat
+    try {
+      fileStat = fs.statSync(file)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') onError?.(error)
+      return false
+    }
+    if (fileStat.size < minBytes) return false
+    // Snapshot EVERY retained archive's size BEFORE calling `readRequestState` so the
+    // carried-forward watermark NEVER advances past bytes appended after `readRequestState`
+    // checked the old archive: any append landing during or after `readRequestState` is
+    // strictly beyond `oldStat.size`, causing the post-rotation re-stat to report `false`
+    // and leaving those new bytes unread past the watermark for the next read (req 3ea2b201).
+    const priorArchives = archiveRequestLogFiles(connectionId, dir)
+    if (priorArchives.error) {
+      onError?.(priorArchives.error)
+      return false
+    }
+    const priorArchiveStats = new Map()
+    for (const oldArch of priorArchives.files) {
+      try {
+        priorArchiveStats.set(oldArch, fs.statSync(oldArch))
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          onError?.(error)
+          return false
+        }
       }
     }
-    for (const schedule of state.schedules) {
-      if (schedule.request === NO_REQUEST) {
-        appendRequestEvent(
-          connectionId,
-          { op: 'schedule', prompt: schedule.prompt, id: schedule.id, request: NO_REQUEST, also: [] },
-          { dir },
-        )
+    const effectiveState = readRequestState(connectionId, { dir })
+    if (effectiveState.readError) {
+      onError?.(effectiveState.readError)
+      return false
+    }
+    if (effectiveState.open.size > 0 || effectiveState.failedTranscriptTurns.size > 0) return false
+    // Never rotate while a `.pending-opens.json` recovery file exists or while any
+    // unnotified launch/monitor/schedule for a request awaiting recovery sits in the log
+    // (or in a late-appended archive tail) (decision ce71a72b / requirement 3ea2b201).
+    if (fs.existsSync(path.join(dir, `${connectionId}.pending-opens.json`))) return false
+    for (const launch of new Set(effectiveState.launches.values())) {
+      if (
+        launch.request !== NO_REQUEST &&
+        (launch.kind === 'monitor' || (launch.notifies !== false && !launch.notified))
+      ) {
+        return false
       }
     }
-    return true
-  } catch {
+    for (const schedule of effectiveState.schedules) {
+      if (schedule.request !== NO_REQUEST) return false
+    }
+    const priorStaged = stagedRequestLogFiles(connectionId, dir)
+    if (priorStaged.error) {
+      onError?.(priorStaged.error)
+      return false
+    }
+    const priorStagedSizes = new Map()
+    for (const oldStaged of priorStaged.files) {
+      try {
+        priorStagedSizes.set(oldStaged, fs.statSync(oldStaged).size)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          onError?.(error)
+          return false
+        }
+      }
+    }
+    const preBuf = fs.readFileSync(file)
+    const preText = preBuf.toString('utf8')
+    const preState = reduceRequestLog(preText)
+    if (preState.open.size > 0 || preState.failedTranscriptTurns.size > 0) return false
+    const carriedWatermarks = archiveWatermarks(preText, connectionId).latest
+    // Atomically claim the active log into a unique staging file BEFORE archiving it,
+    // then re-read the claimed file to catch ANY concurrent `launch`, `schedule`,
+    // `typed_turn_failed`, or `open` appended between our read and our rename. NEVER
+    // overwrite or unlink an existing archive (`.requests.jsonl.1` or prior
+    // `.requests.jsonl.archive-*`): if `.1` already exists, place the new archive at a
+    // unique `.archive-*` path and carry forward every prior archive's watermark
+    // advanced to the exact size already verified clean by `effectiveState` so a
+    // writer holding an already-open fd to ANY earlier archive remains visible across
+    // arbitrary subsequent rotations without resurrecting already-closed work
+    // (requirements 3ea2b201 / ce71a72b).
+    const staged = `${file}.rotating-${process.pid}-${randomUUID().slice(0, 8)}`
+    fs.renameSync(file, staged)
+    try {
+      const stagedStat = fs.statSync(staged)
+      const stagedBuf = fs.readFileSync(staged)
+      const hasExtraTail = stagedBuf.length > preBuf.length
+      const primaryArchive = `${file}.1`
+      const archiveFile = fs.existsSync(primaryArchive)
+        ? `${file}.archive-${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+        : primaryArchive
+      const archiveName = path.basename(archiveFile)
+      const initialLines = []
+      const emittedArchiveNames = new Set()
+      for (const [oldArch, oldStat] of priorArchiveStats) {
+        const oldName = path.basename(oldArch)
+        emittedArchiveNames.add(oldName)
+        initialLines.push(
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: oldName,
+            archive_bytes: oldStat.size,
+            archive_ino: oldStat.ino,
+            archive_dev: oldStat.dev,
+            at: new Date().toISOString(),
+          })}\n`,
+        )
+      }
+      for (const priorWm of carriedWatermarks) {
+        if (emittedArchiveNames.has(priorWm.archive_name)) continue
+        initialLines.push(
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: priorWm.archive_name,
+            archive_bytes: priorWm.archive_bytes,
+            archive_ino: priorWm.archive_ino,
+            archive_dev: priorWm.archive_dev,
+            at: new Date().toISOString(),
+          })}\n`,
+        )
+      }
+      initialLines.push(
+        `${JSON.stringify({
+          op: 'rotated',
+          archive_name: archiveName,
+          archive_bytes: stagedBuf.length,
+          archive_ino: stagedStat.ino,
+          archive_dev: stagedStat.dev,
+          at: new Date().toISOString(),
+        })}\n`,
+      )
+      if (hasExtraTail) {
+        initialLines.push(carryForwardTailLines(stagedBuf, preBuf.length))
+      }
+      for (const launch of new Set(effectiveState.launches.values())) {
+        if (launch.request === NO_REQUEST && launch.notifies && !launch.notified) {
+          initialLines.push(
+            `${JSON.stringify({
+              op: 'launch',
+              key: launch.key,
+              kind: launch.kind,
+              notifies: true,
+              request: NO_REQUEST,
+              also: [],
+              at: new Date().toISOString(),
+            })}\n`,
+          )
+        }
+      }
+      for (const schedule of effectiveState.schedules) {
+        if (schedule.request === NO_REQUEST) {
+          initialLines.push(
+            `${JSON.stringify({
+              op: 'schedule',
+              prompt: schedule.prompt,
+              id: schedule.id,
+              request: NO_REQUEST,
+              also: [],
+              at: new Date().toISOString(),
+            })}\n`,
+          )
+        }
+      }
+      fs.appendFileSync(file, initialLines.join(''), { mode: 0o600 })
+      // Guard against a concurrent rotator creating `${file}.1` between our `existsSync`
+      // check and rename: never overwrite an existing `.1` archive.
+      let finalArchiveFile = archiveFile
+      if (finalArchiveFile === primaryArchive && fs.existsSync(primaryArchive)) {
+        finalArchiveFile = `${file}.archive-${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+      }
+      fs.renameSync(staged, finalArchiveFile)
+      if (finalArchiveFile !== archiveFile) {
+        fs.appendFileSync(
+          file,
+          `${JSON.stringify({
+            op: 'rotated',
+            archive_name: path.basename(finalArchiveFile),
+            archive_bytes: stagedBuf.length,
+            archive_ino: stagedStat.ino,
+            archive_dev: stagedStat.dev,
+            at: new Date().toISOString(),
+          })}\n`,
+          { mode: 0o600 },
+        )
+      }
+      // NEVER delete older `.rotating-*` or prior archive files: a writer may still
+      // hold an open fd to one of them and append a `launch` or `typed_turn_failed` at
+      // any time. Verify none of them grew or became unreadable during this rotation
+      // (requirements 3ea2b201 / ce71a72b).
+      let priorGrew = false
+      for (const [oldStaged, beforeSize] of priorStagedSizes) {
+        const afterStat = fs.statSync(oldStaged)
+        if (afterStat.size > beforeSize) priorGrew = true
+      }
+      for (const [oldArch, oldStat] of priorArchiveStats) {
+        const afterStat = fs.statSync(oldArch)
+        if (afterStat.size > oldStat.size) priorGrew = true
+      }
+      // Re-stat the newly archived inode immediately after moving it into place: if a
+      // writer with an already-open fd appended after `readFileSync(staged)`, carry those
+      // bytes + restored open refs into the active log right away and advance its
+      // watermark (requirements 3ea2b201 / ce71a72b).
+      const postArchStat = fs.statSync(finalArchiveFile)
+      if (postArchStat.size > stagedBuf.length) {
+        const postArchBuf = fs.readFileSync(finalArchiveFile)
+        const lateCarry = carryForwardTailLines(postArchBuf, stagedBuf.length)
+        const updatedWatermark = `${JSON.stringify({
+          op: 'rotated',
+          archive_name: path.basename(finalArchiveFile),
+          archive_bytes: postArchBuf.length,
+          archive_ino: postArchStat.ino,
+          archive_dev: postArchStat.dev,
+          at: new Date().toISOString(),
+        })}\n`
+        fs.appendFileSync(file, `${lateCarry}${updatedWatermark}`, { mode: 0o600 })
+        return false
+      }
+      return !hasExtraTail && !priorGrew
+    } catch (error) {
+      onError?.(error)
+      try {
+        if (!fs.existsSync(file) && fs.existsSync(staged)) {
+          fs.renameSync(staged, file)
+        }
+      } catch {
+        /* ignore rollback failure; `readRequestState` still reads `.rotating-*` */
+      }
+      return false
+    }
+  } catch (error) {
+    onError?.(error)
     return false
   }
 }

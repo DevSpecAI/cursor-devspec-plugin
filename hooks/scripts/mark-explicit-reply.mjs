@@ -32,7 +32,24 @@ import {
   explicitReplyMarkerPath,
   clearTurnMarker,
 } from './mirror-turn.mjs'
-import { appendRequestEvent, commandsAnsweredNow, readRequestState } from './requests.mjs'
+import {
+  appendRequestEvent,
+  closeRequest,
+  commandsAnsweredNow,
+  readRequestState,
+  requestFinished,
+  requestsWithWorkPending,
+  rotateRequestLog,
+} from './requests.mjs'
+import {
+  pendingWorkWithoutHostLists,
+  refusalFromResponse,
+  structuredRefusalFromError,
+  TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+} from './typed-turn-sync.mjs'
+import { connectionCredential } from './resolve-mcp-auth.mjs'
+import { readConnectionCapability } from './manage-plan-bridge.mjs'
+import { mcpToolsCall } from './mcp-call.mjs'
 import { isDevspecPostSessionTool } from './work-trail.mjs'
 import {
   currentTurnNoticeIds,
@@ -144,12 +161,71 @@ export async function handleExplicitReply(rawInput, env = process.env, { dir } =
     /* non-fatal */
   }
 
-  // If the message completed the turn (or was marked complete), clear the .turn marker immediately
-  // and mark the turn's room commands answered so Stop can close them once their work finishes.
+  // If the message completed the turn (or was marked complete), clear the .turn marker immediately,
+  // mark the turn's room commands answered, and close the turn's single primary answered command on
+  // DevSpec when it has no pending background work (no dynamic multi-record loop; item da03801e).
   const isCompleteTurn = args?.complete_turn === true || args?.completeTurn === true
   if (isCompleteTurn) {
     clearTurnMarker(connectionId)
+    const beforeState = readRequestState(connectionId, { dir: connDir })
+    const primaryAnsweredId =
+      beforeState.current && beforeState.open.get(beforeState.current)?.kind === 'command'
+        ? beforeState.current
+        : null
     markCommandsAnswered(connectionId, dir ? { dir } : {})
+    if (primaryAnsweredId && state) {
+      try {
+        const reqState = readRequestState(connectionId, { dir: connDir })
+        const pending = pendingWorkWithoutHostLists(reqState)
+        if (requestFinished(reqState, primaryAnsweredId, pending)) {
+          const credential = connectionCredential(state)
+          const capability = state.connection_capability || readConnectionCapability(connectionId)
+          if (credential.ok && capability) {
+            let lastCloseResponse = null
+            let lastCloseError = null
+            const closed = await closeRequest({
+              connectionId,
+              requestId: primaryAnsweredId,
+              dir: connDir,
+              call: async (reqArgs) => {
+                lastCloseResponse = null
+                lastCloseError = null
+                try {
+                  const res = await mcpToolsCall({
+                    mcpUrl: credential.mcp_url,
+                    token: credential.token,
+                    connectionCapability: capability,
+                    name: 'report_request',
+                    arguments: reqArgs,
+                    timeoutMs: TYPED_SYNC_BACKGROUND_TIMEOUT_MS,
+                  })
+                  lastCloseResponse = res
+                  return res
+                } catch (err) {
+                  lastCloseError = err
+                  throw err
+                }
+              },
+            })
+            if (closed) {
+              rotateRequestLog(connectionId, { dir: connDir })
+            } else {
+              const closeRefusal =
+                refusalFromResponse(lastCloseResponse) ??
+                (lastCloseResponse && typeof lastCloseResponse === 'object' ? lastCloseResponse : null) ??
+                (lastCloseError ? structuredRefusalFromError(lastCloseError) : { status: 'not_closed' })
+              process.stderr.write(
+                `mark-explicit-reply: closeRequest refused/incomplete for answered command ${primaryAnsweredId}; leaving open for idle retry: ${JSON.stringify(closeRefusal)}\n`,
+              )
+            }
+          }
+        }
+      } catch (error) {
+        process.stderr.write(
+          `mark-explicit-reply: closeRequest failed for answered command ${primaryAnsweredId}; leaving open for idle retry: ${JSON.stringify(structuredRefusalFromError(error))}\n`,
+        )
+      }
+    }
   }
 
   return true

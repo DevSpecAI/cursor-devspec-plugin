@@ -128,6 +128,8 @@ import {
   emitConnectPhase,
   resolveLaunchId,
 } from './connect-phase-timing.mjs'
+import { resolveAgentTranscriptPath } from './work-trail.mjs'
+import { recordConnectTurnBaseline } from './typed-turn-sync.mjs'
 
 const DEVSPEC_DIR = path.join(os.homedir(), '.devspec')
 const LEGACY_PATH = path.join(DEVSPEC_DIR, 'remote-control.json')
@@ -2434,6 +2436,13 @@ export async function writeConnectionState(opts) {
   const perPath = connectionPath(connectionId)
   writeJson(perPath, state)
   writeJson(LEGACY_PATH, state)
+  if (localId) {
+    try {
+      recordConnectTurnBaseline(connectionId, resolveAgentTranscriptPath(localId))
+    } catch {
+      /* non-fatal */
+    }
+  }
 
   let bond = null
   if (localId) {

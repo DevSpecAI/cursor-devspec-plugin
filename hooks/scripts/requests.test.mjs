@@ -368,7 +368,32 @@ describe('opening and naming requests', () => {
     assert.equal(requestFinished(state, A, new Set()), true)
     assert.equal(requestFinished(state, A, new Set([A])), false, 'not while its work still runs')
     assert.deepEqual(markCommandsAnswered(CONN, { dir }), [], 'answered once')
-    assert.equal(selectableRequests(state).some((entry) => entry.id === A), true, 'still carried this turn')
+    assert.equal(state.current, null, 'an answered command is no longer the foreground current request')
+    assert.equal(requestRefForWrite(state), null, 'foreground writes never stamp an answered command')
+    assert.equal(provenanceRefForWrite(state), null, 'provenance_ref is never stamped after the command was answered')
+    assert.equal(selectableRequests(state)?.some((entry) => entry.id === A) ?? false, false, 'answered command is no longer selectable')
+  })
+
+  it('never stamps an answered command onto foreground writes or claim_work_item (item da03801e)', () => {
+    const { home, dir } = tempHome()
+    for (const event of [openA, { op: 'current', ref: A }, { op: 'answered', id: A }]) {
+      appendRequestEvent(CONN, event, { dir })
+    }
+    const state = readRequestState(CONN, { dir })
+    assert.equal(state.current, null)
+    assert.equal(requestRefForWrite(state), null)
+    assert.equal(provenanceRefForWrite(state), null)
+    assert.deepEqual(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    assert.deepEqual(stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }), {
+      args: { task_id: 'x' },
+    })
+    // A subsequent room command starts fresh as current rather than joining the answered command.
+    appendRequestEvent(CONN, openB, { dir })
+    const batch = recordDeliveredBatchRequests(CONN, { type: 'owner_messages', messages: [{ message_id: MSG_B }] }, { dir })
+    assert.deepEqual(batch, [{ op: 'current', ref: B }])
+    assert.equal(stampRequest('claim_work_item', { task_id: 'x' }, CONN, null, { home, includeProvenance: true }).args.provenance_ref, DELIVERY_B)
   })
 
   it('an unknown turn clears the current request instead of keeping the last one', () => {
@@ -530,7 +555,9 @@ describe('what reaches a running turn joins it', () => {
 
   it('the same delivered as a new turn starts from it', () => {
     const state = reduceRequestLog(log(openA, openB, { op: 'current', ref: A }))
-    assert.deepEqual(promptArrival({ origin: 'task-notification', text: wakeFor(MSG_B), midTurn: false, state }).events, [{ op: 'current', ref: B }])
+    assert.deepEqual(promptArrival({ origin: 'task-notification', text: wakeFor(MSG_B), midTurn: false, state }).events, [
+      { op: 'current', ref: B, from_wake: true },
+    ])
   })
 
   it('a prompt typed over a running turn joins it as the owner\'s typed request', () => {
@@ -558,7 +585,7 @@ describe('what reaches a running turn joins it', () => {
   it('marks the jobs a wake reports as notified', () => {
     const state = reduceRequestLog(log(openT, { op: 'launch', key: 'job', kind: 'shell', notifies: true, request: T, also: [] }))
     assert.deepEqual(promptArrival({ origin: 'task-notification', text: notification('job'), midTurn: false, state }).events,
-      [{ op: 'current', ref: T }, { op: 'notified', key: 'job' }])
+      [{ op: 'current', ref: T, from_wake: true }, { op: 'notified', key: 'job' }])
   })
 })
 
@@ -652,5 +679,40 @@ describe('offering nobody\'s request', () => {
     assert.match(serveMain(['--connection-id', CONN, '--none'], { dir }).error, /not one of the requests/)
     assert.equal(serveMain(['--connection-id', CONN, '--unstated'], { dir }).ok, true)
     assert.equal(requestRefForWrite(readRequestState(CONN, { dir })), null)
+  })
+})
+
+describe('scheduled wake continuation after room command answer (ce71a72b)', () => {
+  it('clears answered command from foreground current, then restores request_ref (not closed provenance_ref) on scheduled wake', () => {
+    const afterAnswer = reduceRequestLog(
+      log(
+        openA,
+        { op: 'current', ref: A },
+        { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: A, also: [] },
+        { op: 'answered', id: A },
+      ),
+    )
+    assert.equal(afterAnswer.current, null)
+    assert.equal(requestRefForWrite(afterAnswer), null)
+    assert.equal(provenanceRefForWrite(afterAnswer), null)
+
+    const arrival = promptArrival({
+      fromAPerson: false,
+      origin: 'scheduled-trigger',
+      text: 'Check deploy',
+      state: afterAnswer,
+    })
+    const duringWake = reduceRequestLog(
+      log(
+        openA,
+        { op: 'current', ref: A },
+        { op: 'schedule', id: 'cron-1', prompt: 'Check deploy', request: A, also: [] },
+        { op: 'answered', id: A },
+        ...arrival.events,
+      ),
+    )
+    assert.equal(duringWake.current, A)
+    assert.equal(requestRefForWrite(duringWake), A)
+    assert.equal(provenanceRefForWrite(duringWake), null)
   })
 })

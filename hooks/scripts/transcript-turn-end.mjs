@@ -409,6 +409,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { STATE_ABSENT, STATE_OK, readPrivateJson, readPrivateJsonResult, writePrivateJson } from './private-state.mjs'
 
 const CONNECTIONS_DIR = path.join(os.homedir(), '.devspec', 'remote-control', 'connections')
@@ -427,6 +428,18 @@ const LINE_READ_CHUNK_BYTES = 64 * 1024
 
 /** A whole-transcript read goes in pieces this size, so a long transcript is never held at once. */
 const READ_CHUNK_BYTES = 1024 * 1024
+
+/**
+ * Smaller I/O and scan step used only when a caller supplies a wall-clock `deadlineMs`
+ * (e.g. synchronous `preToolUse` typed-turn sync). Each 64 KB step completes in <1 ms so
+ * `deadlineMs` is enforced mid-file and mid-row without cutting or limiting row length
+ * (requirements 3c5147a7 / 91d7b47c).
+ */
+const BOUNDED_STEP_BYTES = 64 * 1024
+
+const ROLE_USER_MARKER = Buffer.from('"role":"user"')
+const TURN_ENDED_MARKER = Buffer.from('"turn_ended"')
+const BUDGET_EXHAUSTED_TOKEN = Symbol('budget_exhausted')
 
 /**
  * A read of the whole transcript counts only when the file has not changed while it was
@@ -565,7 +578,8 @@ export function turnEndFailure(end) {
  * changed under the read. An empty file is Cursor's rewrite caught between truncating
  * it and writing it: Cursor never leaves a transcript empty.
  */
-function readWholeOnce(transcriptPath) {
+function readWholeOnce(transcriptPath, { deadlineMs = null } = {}) {
+  if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
   let fd
   try {
     fd = fs.openSync(transcriptPath, 'r')
@@ -575,10 +589,12 @@ function readWholeOnce(transcriptPath) {
   try {
     const before = fs.fstatSync(fd)
     if (before.size === 0) return null
+    const stepBytes = deadlineMs !== null ? BOUNDED_STEP_BYTES : READ_CHUNK_BYTES
     const chunks = []
     let offset = 0
     while (offset < before.size) {
-      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, before.size - offset))
+      if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
+      const chunk = Buffer.alloc(Math.min(stepBytes, before.size - offset))
       const read = fs.readSync(fd, chunk, 0, chunk.length, offset)
       if (read <= 0) break
       chunks.push(read === chunk.length ? chunk : chunk.subarray(0, read))
@@ -640,13 +656,15 @@ const SUMMARY_ROW = /^<available_subagent_types>[\s\S]*<\/dynamic_tool_catalog>$
 function userRowKind(text) {
   for (const sentence of COMMAND_TURN_SENTENCES) {
     if (text === sentence) continue // a start row always carries its timestamp
-    const form = new RegExp(`^${TIMESTAMP}\\n\\n<user_query>${escapeRegExp(sentence)}</user_query>$`)
-    if (form.test(text)) return 'command_turn'
+    if (text.endsWith(`</user_query>`) && text.includes(sentence)) {
+      const form = new RegExp(`^${TIMESTAMP}\\n\\n<user_query>${escapeRegExp(sentence)}</user_query>$`)
+      if (form.test(text)) return 'command_turn'
+    }
   }
-  if (new RegExp(`^${TIMESTAMP}$`).test(text)) return 'timestamp'
+  if (text.startsWith('<timestamp>') && text.endsWith('</timestamp>') && new RegExp(`^${TIMESTAMP}$`).test(text)) return 'timestamp'
   if (text === RESUMED_TURN_SENTENCE) return 'resumed'
-  if (TYPED_PROMPT.test(text)) return 'typed'
-  if (SUMMARY_ROW.test(text) && !text.includes('<user_query>')) return 'summary'
+  if (text.endsWith('\n</user_query>') && text.includes('<timestamp>') && TYPED_PROMPT.test(text)) return 'typed'
+  if (text.startsWith('<available_subagent_types>') && text.endsWith('</dynamic_tool_catalog>') && !text.includes('<user_query>')) return 'summary'
   return 'other'
 }
 
@@ -673,66 +691,516 @@ function userRowText(row) {
  * and `userRows` each user row's byte offset and kind (userRowKind). `{ missing: true }`
  * when there is no transcript yet, or null when no clean read could be had.
  */
-export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS } = {}) {
+export function readTranscriptTurns(transcriptPath, { attempts = STABLE_READ_ATTEMPTS, deadlineMs = null } = {}) {
   if (typeof transcriptPath !== 'string' || !transcriptPath) return null
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0) sleepSync(STABLE_READ_GAP_MS)
-    const whole = readWholeOnce(transcriptPath)
+    if (deadlineMs !== null && Date.now() >= deadlineMs) return { budgetExhausted: true }
+    if (attempt > 0) {
+      if (deadlineMs !== null && Date.now() + STABLE_READ_GAP_MS > deadlineMs) return { budgetExhausted: true }
+      sleepSync(STABLE_READ_GAP_MS)
+    }
+    const whole = readWholeOnce(transcriptPath, { deadlineMs })
+    if (whole?.budgetExhausted) return { budgetExhausted: true }
     if (whole?.missing) return { missing: true }
     if (!whole) continue
     // Still the same file a moment later: not a piece of a rewrite in progress.
+    if (deadlineMs !== null && Date.now() + STABLE_READ_GAP_MS > deadlineMs) return { budgetExhausted: true }
     sleepSync(STABLE_READ_GAP_MS)
     if (fileStamp(transcriptPath) !== whole.stamp) continue
-    const bytes = Buffer.concat(whole.chunks)
-    const parsed = scanTranscript(bytes)
+    const bytes = concatChunksBounded(whole.chunks, deadlineMs)
+    if (bytes === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+    const parsed = scanTranscript(bytes, { deadlineMs })
+    if (parsed?.budgetExhausted) return { budgetExhausted: true }
     if (parsed) return { ...parsed, bytes, size: bytes.length, stamp: whole.stamp, atMs: whole.atMs }
   }
   return null
 }
 
+function concatChunksBounded(chunks, deadlineMs) {
+  if (deadlineMs === null) return Buffer.concat(chunks)
+  let total = 0
+  for (const c of chunks) total += c.length
+  const out = Buffer.allocUnsafe(total)
+  let offset = 0
+  for (const c of chunks) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    c.copy(out, offset)
+    offset += c.length
+  }
+  return out
+}
+
+function findByteBounded(bytes, byte, start, end, deadlineMs) {
+  if (deadlineMs === null) {
+    const idx = bytes.indexOf(byte, start)
+    return idx >= 0 && idx < end ? idx : -1
+  }
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    const limit = Math.min(pos + BOUNDED_STEP_BYTES, end)
+    const idx = bytes.subarray(pos, limit).indexOf(byte)
+    if (idx >= 0) return pos + idx
+  }
+  return -1
+}
+
+function trimSliceBounds(bytes, start, end, deadlineMs = null) {
+  let s = start
+  let e = end
+  if (deadlineMs === null) {
+    while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) s += 1
+    while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) e -= 1
+    return { s, e }
+  }
+  let nextCheck = s + BOUNDED_STEP_BYTES
+  while (s < e && (bytes[s] === 0x20 || bytes[s] === 0x09 || bytes[s] === 0x0d || bytes[s] === 0x0a)) {
+    s += 1
+    if (s >= nextCheck) {
+      if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+      nextCheck = s + BOUNDED_STEP_BYTES
+    }
+  }
+  let prevCheck = e - BOUNDED_STEP_BYTES
+  while (e > s && (bytes[e - 1] === 0x20 || bytes[e - 1] === 0x09 || bytes[e - 1] === 0x0d || bytes[e - 1] === 0x0a)) {
+    e -= 1
+    if (e <= prevCheck) {
+      if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+      prevCheck = e - BOUNDED_STEP_BYTES
+    }
+  }
+  return { s, e }
+}
+
+function sliceContainsMarker(bytes, start, end, marker, deadlineMs = null) {
+  if (deadlineMs === null) {
+    const idx = bytes.indexOf(marker, start)
+    return idx >= 0 && idx + marker.length <= end
+  }
+  const overlap = Math.max(0, marker.length - 1)
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    const windowStart = Math.max(start, pos - overlap)
+    const windowEnd = Math.min(pos + BOUNDED_STEP_BYTES, end)
+    if (bytes.subarray(windowStart, windowEnd).indexOf(marker) >= 0) return true
+  }
+  return false
+}
+
+function digestSliceBounded(bytes, start, end, deadlineMs) {
+  const hash = crypto.createHash('sha256')
+  if (deadlineMs === null) {
+    hash.update(bytes.subarray(start, end))
+    return hash.digest('hex').slice(0, 16)
+  }
+  for (let pos = start; pos < end; pos += BOUNDED_STEP_BYTES) {
+    if (Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    hash.update(bytes.subarray(pos, Math.min(pos + BOUNDED_STEP_BYTES, end)))
+  }
+  return hash.digest('hex').slice(0, 16)
+}
+
+/**
+ * Deadline-checked RFC-8259 JSON parser used for oversized rows (> BOUNDED_STEP_BYTES)
+ * when a caller enforces `deadlineMs`. Checks the wall-clock deadline every
+ * `BOUNDED_STEP_BYTES` inside large string literals and containers so a single huge row
+ * cannot overrun the caller's deadline while still parsing losslessly when budget remains.
+ */
+function parseJsonSliceBounded(bytes, start, end, deadlineMs) {
+  if (deadlineMs === null || end - start <= BOUNDED_STEP_BYTES) {
+    if (deadlineMs !== null && Date.now() >= deadlineMs) return BUDGET_EXHAUSTED_TOKEN
+    return JSON.parse(bytes.toString('utf8', start, end))
+  }
+  let pos = start
+  let nextCheck = start + BOUNDED_STEP_BYTES
+
+  const checkBudget = () => {
+    if (pos >= nextCheck) {
+      nextCheck = pos + BOUNDED_STEP_BYTES
+      if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+    }
+  }
+  const skipWs = () => {
+    while (pos < end) {
+      const b = bytes[pos]
+      if (b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a) {
+        pos += 1
+        checkBudget()
+      } else {
+        break
+      }
+    }
+  }
+  const readString = () => {
+    pos += 1 // opening '"'
+    const parts = []
+    const decoder = new StringDecoder('utf8')
+    let segStart = pos
+    while (pos < end) {
+      const b = bytes[pos]
+      if (b === 0x22) {
+        if (pos > segStart) parts.push(decoder.write(bytes.subarray(segStart, pos)))
+        const tail = decoder.end()
+        if (tail) parts.push(tail)
+        pos += 1
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+        return parts.length <= 1 ? (parts[0] ?? '') : parts.join('')
+      }
+      if (b === 0x5c) {
+        if (pos > segStart) parts.push(decoder.write(bytes.subarray(segStart, pos)))
+        const tail = decoder.end()
+        if (tail) parts.push(tail)
+        pos += 1
+        if (pos >= end) throw new SyntaxError('Unterminated escape')
+        const esc = bytes[pos++]
+        if (esc === 0x22) parts.push('"')
+        else if (esc === 0x5c) parts.push('\\')
+        else if (esc === 0x2f) parts.push('/')
+        else if (esc === 0x62) parts.push('\b')
+        else if (esc === 0x66) parts.push('\f')
+        else if (esc === 0x6e) parts.push('\n')
+        else if (esc === 0x72) parts.push('\r')
+        else if (esc === 0x74) parts.push('\t')
+        else if (esc === 0x75) {
+          if (pos + 4 > end) throw new SyntaxError('Invalid unicode escape')
+          const code = Number.parseInt(bytes.toString('ascii', pos, pos + 4), 16)
+          if (!Number.isFinite(code)) throw new SyntaxError('Invalid unicode escape')
+          pos += 4
+          parts.push(String.fromCharCode(code))
+        } else {
+          throw new SyntaxError('Invalid escape')
+        }
+        segStart = pos
+        checkBudget()
+        continue
+      }
+      pos += 1
+      if (pos >= nextCheck) {
+        if (pos > segStart) {
+          parts.push(decoder.write(bytes.subarray(segStart, pos)))
+          segStart = pos
+        }
+        nextCheck = pos + BOUNDED_STEP_BYTES
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+      }
+    }
+    throw new SyntaxError('Unterminated string')
+  }
+  // RFC-8259 numeric literal parser bounded by BOUNDED_STEP_BYTES so a multi-megabyte
+  // numeric field cannot overrun deadlineMs; retains enough significant decimal digits
+  // and exponent range to preserve IEEE-754 double precision (~17 digits, exponent +-308).
+  const readBoundedNumber = (litStart, litEnd) => {
+    let p = litStart
+    let litCheck = p + BOUNDED_STEP_BYTES
+    const checkLit = () => {
+      if (p >= litCheck) {
+        litCheck = p + BOUNDED_STEP_BYTES
+        if (Date.now() >= deadlineMs) throw BUDGET_EXHAUSTED_TOKEN
+      }
+    }
+    const isDigit = (c) => c >= 0x30 && c <= 0x39
+    let sign = ''
+    if (p < litEnd && bytes[p] === 0x2d) {
+      sign = '-'
+      p += 1
+    }
+    if (p >= litEnd) throw new SyntaxError('Invalid number')
+    let sig = ''
+    let intDigits = 0
+    let fracLeadingZeros = 0
+    let sawNonZero = false
+    if (bytes[p] === 0x30) {
+      p += 1
+      if (p < litEnd && isDigit(bytes[p])) throw new SyntaxError('Leading zero in number')
+    } else if (bytes[p] >= 0x31 && bytes[p] <= 0x39) {
+      while (p < litEnd && isDigit(bytes[p])) {
+        const d = bytes[p]
+        if (sig.length < 25) sig += String.fromCharCode(d)
+        sawNonZero = true
+        intDigits += 1
+        p += 1
+        checkLit()
+      }
+    } else {
+      throw new SyntaxError('Invalid number')
+    }
+    if (p < litEnd && bytes[p] === 0x2e) {
+      p += 1
+      if (p >= litEnd || !isDigit(bytes[p])) throw new SyntaxError('Invalid fraction')
+      while (p < litEnd && isDigit(bytes[p])) {
+        const d = bytes[p]
+        if (!sawNonZero && d === 0x30) {
+          fracLeadingZeros += 1
+        } else {
+          sawNonZero = true
+          if (sig.length < 25) sig += String.fromCharCode(d)
+        }
+        p += 1
+        checkLit()
+      }
+    }
+    let explicitExp = 0
+    if (p < litEnd && (bytes[p] === 0x65 || bytes[p] === 0x45)) {
+      p += 1
+      let expSign = 1
+      if (p < litEnd && (bytes[p] === 0x2b || bytes[p] === 0x2d)) {
+        if (bytes[p] === 0x2d) expSign = -1
+        p += 1
+      }
+      if (p >= litEnd || !isDigit(bytes[p])) throw new SyntaxError('Invalid exponent')
+      let expMag = 0
+      while (p < litEnd && isDigit(bytes[p])) {
+        if (expMag < 1e9) expMag = expMag * 10 + (bytes[p] - 0x30)
+        p += 1
+        checkLit()
+      }
+      explicitExp = expSign * expMag
+    }
+    if (p !== litEnd) throw new SyntaxError('Invalid number')
+    if (!sawNonZero) return sign ? -0 : 0
+    const shift = intDigits > 0 ? intDigits - 1 : -(fracLeadingZeros + 1)
+    const totalExp = shift + explicitExp
+    if (totalExp > 400) return sign ? -Infinity : Infinity
+    if (totalExp < -400) return sign ? -0 : 0
+    const mantissa = sig.length > 1 ? `${sig[0]}.${sig.slice(1)}` : sig
+    return Number(`${sign}${mantissa}e${totalExp}`)
+  }
+  const readValue = () => {
+    skipWs()
+    if (pos >= end) throw new SyntaxError('Unexpected end')
+    const b = bytes[pos]
+    if (b === 0x22) return readString()
+    if (b === 0x7b) {
+      pos += 1
+      const obj = {}
+      skipWs()
+      if (pos < end && bytes[pos] === 0x7d) {
+        pos += 1
+        return obj
+      }
+      while (pos < end) {
+        skipWs()
+        if (bytes[pos] !== 0x22) throw new SyntaxError('Expected key')
+        const key = readString()
+        skipWs()
+        if (bytes[pos] !== 0x3a) throw new SyntaxError('Expected colon')
+        pos += 1
+        obj[key] = readValue()
+        skipWs()
+        if (bytes[pos] === 0x2c) {
+          pos += 1
+          checkBudget()
+          continue
+        }
+        if (bytes[pos] === 0x7d) {
+          pos += 1
+          return obj
+        }
+        throw new SyntaxError('Expected comma or }')
+      }
+      throw new SyntaxError('Unterminated object')
+    }
+    if (b === 0x5b) {
+      pos += 1
+      const arr = []
+      skipWs()
+      if (pos < end && bytes[pos] === 0x5d) {
+        pos += 1
+        return arr
+      }
+      while (pos < end) {
+        arr.push(readValue())
+        skipWs()
+        if (bytes[pos] === 0x2c) {
+          pos += 1
+          checkBudget()
+          continue
+        }
+        if (bytes[pos] === 0x5d) {
+          pos += 1
+          return arr
+        }
+        throw new SyntaxError('Expected comma or ]')
+      }
+      throw new SyntaxError('Unterminated array')
+    }
+    const litStart = pos
+    while (pos < end) {
+      const ch = bytes[pos]
+      if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x09 || ch === 0x0d || ch === 0x0a) break
+      pos += 1
+      checkBudget()
+    }
+    const len = pos - litStart
+    if (len === 4 && bytes[litStart] === 0x74 && bytes[litStart + 1] === 0x72 && bytes[litStart + 2] === 0x75 && bytes[litStart + 3] === 0x65) {
+      return true
+    }
+    if (len === 5 && bytes[litStart] === 0x66 && bytes[litStart + 1] === 0x61 && bytes[litStart + 2] === 0x6c && bytes[litStart + 3] === 0x73 && bytes[litStart + 4] === 0x65) {
+      return false
+    }
+    if (len === 4 && bytes[litStart] === 0x6e && bytes[litStart + 1] === 0x75 && bytes[litStart + 2] === 0x6c && bytes[litStart + 3] === 0x6c) {
+      return null
+    }
+    return readBoundedNumber(litStart, pos)
+  }
+  try {
+    const val = readValue()
+    skipWs()
+    if (pos !== end) throw new SyntaxError('Trailing JSON tokens')
+    return val
+  } catch (err) {
+    if (err === BUDGET_EXHAUSTED_TOKEN) return BUDGET_EXHAUSTED_TOKEN
+    throw err
+  }
+}
+
 /**
  * Null when the file does not end in a complete line (it is being written). A user row
- * is a line whose top-level `role` is "user"; the substring test only skips parsing lines
- * that cannot be one.
+ * is a line whose top-level `role` is "user"; the byte-marker test only skips parsing
+ * lines that cannot be one.
  */
-function scanTranscript(bytes) {
+function scanTranscript(bytes, { deadlineMs = null } = {}) {
   // Cursor ends every row with a newline: anything after the last one is half written.
   if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) return null
   let turns = 0
   let lastUser = null
-  let last = null
+  let lastSpan = null
+  let lastParsedRow = null
   let lastStart = 0
+  let lastNonResumedText = null
+  let sawTurnEndedSinceLastNonResumed = false
+  let lastNonResumedPrecededByTurnEnded = false
+  let liveTurnPrecededByTurnEnded = false
+  let sameTurnTypedRowIndex = -1
+  let sameTurnOtherRows = []
+  let currentTurnNonTypedRows = []
+  const endedNonTypedRows = []
+  const allOtherRows = []
   const userRows = []
   let start = 0
   while (start < bytes.length) {
-    const newline = bytes.indexOf(0x0a, start)
-    const text = bytes.toString('utf8', start, newline).trim()
-    if (text) {
-      last = text
+    if (deadlineMs !== null && Date.now() >= deadlineMs) {
+      return { budgetExhausted: true }
+    }
+    const newline = findByteBounded(bytes, 0x0a, start, bytes.length, deadlineMs)
+    if (newline === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+    if (newline < 0) return null
+    const trimmed = trimSliceBounds(bytes, start, newline, deadlineMs)
+    if (trimmed === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+    const { s, e } = trimmed
+    if (s < e) {
+      lastSpan = { s, e }
+      lastParsedRow = null
       lastStart = start
-      if (text.includes('"role":"user"')) {
+      const hasUserMarker = sliceContainsMarker(bytes, s, e, ROLE_USER_MARKER, deadlineMs)
+      if (hasUserMarker === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+      if (hasUserMarker) {
         let row = null
         try {
-          row = JSON.parse(text)
+          row = parseJsonSliceBounded(bytes, s, e, deadlineMs)
         } catch {
           /* not a whole row */
         }
+        if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+        lastParsedRow = row
         if (row?.role === 'user') {
           turns += 1
-          lastUser = digest(text)
-          userRows.push({ start, kind: userRowKind(userRowText(row)) })
+          const userDigest = digestSliceBounded(bytes, s, e, deadlineMs)
+          if (userDigest === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+          lastUser = userDigest
+          const rawText = userRowText(row)
+          const kind = userRowKind(rawText)
+          const rowIndex = userRows.length
+          if (kind !== 'resumed') {
+            lastNonResumedText = rawText
+            lastNonResumedPrecededByTurnEnded = sawTurnEndedSinceLastNonResumed
+            if (kind === 'typed') {
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              sawTurnEndedSinceLastNonResumed = false
+              sameTurnTypedRowIndex = rowIndex
+              sameTurnOtherRows = []
+              currentTurnNonTypedRows = []
+            } else if (kind === 'command_turn') {
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              sawTurnEndedSinceLastNonResumed = false
+              sameTurnTypedRowIndex = -1
+              sameTurnOtherRows = []
+              currentTurnNonTypedRows = []
+            } else if (kind === 'timestamp') {
+              // Housekeeping rows (`timestamp`, `summary`) never start a new user turn
+              // and must not wipe `sawTurnEndedSinceLastNonResumed` before the next
+              // typed prompt arrives (decision ce71a72b). Still record them in
+              // `currentTurnNonTypedRows` so a timestamp-only or scheduled wake that
+              // ends with `turn_ended` between sync passes is recognized as an ended wake.
+              liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              sameTurnTypedRowIndex = -1
+              sameTurnOtherRows = []
+              currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText, hasModelOutputAfter: false })
+            } else if (kind === 'other') {
+              if (sameTurnTypedRowIndex < 0 && sameTurnOtherRows.length === 0) {
+                liveTurnPrecededByTurnEnded = lastNonResumedPrecededByTurnEnded
+              }
+              sawTurnEndedSinceLastNonResumed = false
+              const otherEntry = { rowIndex, digest: lastUser, rawText }
+              sameTurnOtherRows.push(otherEntry)
+              allOtherRows.push(otherEntry)
+              if (sameTurnTypedRowIndex < 0) {
+                currentTurnNonTypedRows.push({ rowIndex, digest: lastUser, kind, rawText, hasModelOutputAfter: false })
+              }
+            }
+          }
+          userRows.push({ start, kind, digest: lastUser })
+        }
+      } else {
+        const hasTurnEndedMarker = sliceContainsMarker(bytes, s, e, TURN_ENDED_MARKER, deadlineMs)
+        if (hasTurnEndedMarker === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+        let matchedTurnEnded = false
+        if (hasTurnEndedMarker) {
+          let row = null
+          try {
+            row = parseJsonSliceBounded(bytes, s, e, deadlineMs)
+          } catch {
+            /* not a whole row */
+          }
+          if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
+          lastParsedRow = row
+          if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
+            matchedTurnEnded = true
+            sawTurnEndedSinceLastNonResumed = true
+            liveTurnPrecededByTurnEnded = false
+            sameTurnTypedRowIndex = -1
+            sameTurnOtherRows = []
+            if (currentTurnNonTypedRows.length > 0) {
+              endedNonTypedRows.push(...currentTurnNonTypedRows)
+              currentTurnNonTypedRows = []
+            }
+          }
+        }
+        // Any non-user, non-turn_ended row (e.g. assistant output / tool result) after a
+        // live non-typed wake proves that wake ALREADY ran the model — so a subsequent
+        // `beforeSubmitPrompt` hook cannot possibly be firing for that row (ce71a72b).
+        if (!matchedTurnEnded && currentTurnNonTypedRows.length > 0) {
+          for (const entry of currentTurnNonTypedRows) {
+            entry.hasModelOutputAfter = true
+          }
         }
       }
     }
     start = newline + 1
   }
+  if (deadlineMs !== null && Date.now() >= deadlineMs) {
+    return { budgetExhausted: true }
+  }
   let end = null
-  if (last) {
-    let row = null
-    try {
-      row = JSON.parse(last)
-    } catch {
-      return null
+  let lastLineDigest = null
+  if (lastSpan) {
+    let row = lastParsedRow
+    if (row === null) {
+      try {
+        row = parseJsonSliceBounded(bytes, lastSpan.s, lastSpan.e, deadlineMs)
+      } catch {
+        return null
+      }
+      if (row === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
     }
     if (row?.type === 'turn_ended' && TURN_END_STATUSES.has(row.status)) {
       end = {
@@ -740,12 +1208,132 @@ function scanTranscript(bytes) {
         error: typeof row.error === 'string' && row.error.trim() ? row.error.trim() : null,
       }
     }
+    lastLineDigest =
+      lastUser !== null && userRows.length > 0 && userRows[userRows.length - 1].start === lastStart
+        ? lastUser
+        : digestSliceBounded(bytes, lastSpan.s, lastSpan.e, deadlineMs)
+    if (lastLineDigest === BUDGET_EXHAUSTED_TOKEN) return { budgetExhausted: true }
   }
-  return { turns, lastUser, end, lastLineStart: lastStart, lastLineDigest: last ? digest(last) : null, userRows }
+  if (deadlineMs !== null && Date.now() >= deadlineMs) {
+    return { budgetExhausted: true }
+  }
+  return {
+    turns,
+    lastUser,
+    end,
+    lastLineStart: lastStart,
+    lastLineDigest,
+    userRows,
+    lastNonResumedText,
+    lastNonResumedPrecededByTurnEnded,
+    liveTurnPrecededByTurnEnded,
+    sameTurnTypedRowIndex,
+    sameTurnOtherRows,
+    allOtherRows,
+    currentTurnNonTypedRows,
+    endedNonTypedRows,
+  }
 }
 
 function digest(text) {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)
+}
+
+function extractUserQueryText(rawText) {
+  if (typeof rawText !== 'string' || !rawText) return null
+  const match = rawText.match(/<user_query>([\s\S]*?)<\/user_query>/)
+  return match ? match[1].trim() : null
+}
+
+/**
+ * The latest non-resumed user row in `transcriptPath`, whether that turn has ended
+ * (`ended`: final line is `turn_ended`), and a stable key for it across the whole turn.
+ * Only intra-turn `resumed` rows are skipped; a `timestamp`-only wake row is returned
+ * as `kind: 'timestamp'` so it never falls back to an earlier typed prompt.
+ * Also reports all `typed` user row keys in chronological order (`typedTurnKeys`),
+ * whether a `turn_ended` row separated the latest non-resumed row from the turn before it,
+ * and `liveTurnTypedKey` when an in-progress non-typed row (`kind: 'other'`, e.g. a
+ * mid-turn `<task-notification>`) shares its live turn with an earlier `typed` row.
+ * Returns `{ budgetExhausted: true }` when `deadlineMs` expires before a clean read
+ * completes, or null when the transcript cannot be read or does not exist yet.
+ */
+export function activeTranscriptTurn(transcriptPath, { attempts = STABLE_READ_ATTEMPTS, deadlineMs = null } = {}) {
+  const conversation = transcriptConversation(transcriptPath)
+  if (!conversation) return null
+  const read = readTranscriptTurns(transcriptPath, { attempts, deadlineMs })
+  if (read?.budgetExhausted) return { budgetExhausted: true }
+  if (!read || read.missing) return null
+  let lastIndex = -1
+  let lastRow = null
+  const typedTurnKeys = []
+  for (let i = 0; i < read.userRows.length; i += 1) {
+    const row = read.userRows[i]
+    if (row.kind === 'typed') {
+      typedTurnKeys.push(`${conversation}#${i + 1}#${row.digest}`)
+    }
+    if (row.kind !== 'resumed') {
+      lastIndex = i + 1
+      lastRow = row
+    }
+  }
+  const sameTurnIdx = typeof read.sameTurnTypedRowIndex === 'number' ? read.sameTurnTypedRowIndex : -1
+  const liveTurnTypedKey =
+    !read.end &&
+    lastRow &&
+    (lastRow.kind === 'other' || lastRow.kind === 'summary') &&
+    !read.lastNonResumedPrecededByTurnEnded &&
+    sameTurnIdx >= 0 &&
+    sameTurnIdx < read.userRows.length
+      ? `${conversation}#${sameTurnIdx + 1}#${read.userRows[sameTurnIdx].digest}`
+      : null
+  const sameTurnWakes =
+    !read.end && Array.isArray(read.sameTurnOtherRows)
+      ? read.sameTurnOtherRows.map((entry) => ({
+          key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+          rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+        }))
+      : []
+  const notificationWakes = Array.isArray(read.allOtherRows)
+    ? read.allOtherRows.map((entry) => ({
+        key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+        rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+      }))
+    : []
+  const liveNonTypedWakes =
+    !read.end && Array.isArray(read.currentTurnNonTypedRows)
+      ? read.currentTurnNonTypedRows.map((entry) => ({
+          key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+          kind: entry.kind,
+          rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+          hasModelOutputAfter: Boolean(entry.hasModelOutputAfter),
+        }))
+      : []
+  const endedNonTypedWakes = Array.isArray(read.endedNonTypedRows)
+    ? read.endedNonTypedRows.map((entry) => ({
+        key: `${conversation}#${entry.rowIndex + 1}#${entry.digest}`,
+        kind: entry.kind,
+        rawText: typeof entry.rawText === 'string' ? entry.rawText : '',
+        hasModelOutputAfter: Boolean(entry.hasModelOutputAfter),
+      }))
+    : []
+  const rawText = typeof read.lastNonResumedText === 'string' ? read.lastNonResumedText : null
+  return {
+    kind: lastRow ? lastRow.kind : 'none',
+    ended: Boolean(read.end),
+    key: lastRow ? `${conversation}#${lastIndex}#${lastRow.digest}` : null,
+    typedTurnKeys,
+    liveTurnTypedKey,
+    sameTurnWakes,
+    notificationWakes,
+    liveNonTypedWakes,
+    endedNonTypedWakes,
+    precededByTurnEnded: Boolean(read.lastNonResumedPrecededByTurnEnded),
+    liveTurnPrecededByTurnEnded: Boolean(read.liveTurnPrecededByTurnEnded),
+    stamp: read.stamp,
+    turns: read.turns,
+    rawText,
+    queryText: extractUserQueryText(rawText),
+  }
 }
 
 /**
