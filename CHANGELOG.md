@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.2
+
+- **Inventory Map connections are now recorded directly as live editable links.** Updated Cursor's DevSpec rule to use `devspec__manage_inventory_connections` with `action: "record"` (with codebase/config evidence) so verified connections appear directly on the Inventory Map without a confirmation step.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.34.1
 
 - **Your Cursor agent can now propose and manage Inventory Map connections with proper request attribution.** Added `manage_inventory_connections` to request-attribution hooks and added concise Inventory guidance covering plain human-readable names, accurate resource types, curated `profile_fields` lookups, companion Document/Memory links, duplicate previews (`preview_ack`), and verified connections with code or config evidence.
