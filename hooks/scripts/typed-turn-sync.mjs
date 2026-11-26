@@ -1152,8 +1152,16 @@ export async function syncTypedTurnFromTranscript({
           // Only mark the transcript turn synced once admission, state persistence, and binding
           // write all succeed; on refusal or write failure, preserve details and retry next tick.
           const sessionId = state?.session_id || null
+          const alreadyAdmittedForThisTurn =
+            Boolean(state?.local_turn) &&
+            (state.local_turn.turn_key === turnKey ||
+              (!openedNow && existingTyped === safeUnboundHook && !state.local_turn.turn_key))
           const scope =
-            !midTurn && sessionId && connectionCapability && typeof effectiveCallPickup === 'function' && !state?.local_turn
+            !midTurn &&
+            sessionId &&
+            connectionCapability &&
+            typeof effectiveCallPickup === 'function' &&
+            !alreadyAdmittedForThisTurn
               ? localTurnScope({ ...state, connection_capability: connectionCapability }, sessionId)
               : null
 
@@ -1178,7 +1186,7 @@ export async function syncTypedTurnFromTranscript({
             if (typeof patchState === 'function') {
               let saved = false
               try {
-                saved = patchState({ local_turn: admission.admitted }) === true
+                saved = patchState({ local_turn: { ...admission.admitted, turn_key: turnKey } }) === true
               } catch (error) {
                 log(
                   `typed-turn-sync: failed to persist local_turn state for ${connectionId} (${turnKey}): ${error instanceof Error ? error.message : String(error)}\n`,
@@ -1662,21 +1670,30 @@ export async function finishIdleRequests({
       ? pendingEntries.find(([, entry]) => active.key && entry.turnKey === active.key) ?? pendingEntries[0]
       : null
 
-  const clearEndedForeground = () => {
-    const curState = readRequestState(connectionId, { dir })
-    if (!curState.current) return
-    const curInfo = curState.open.get(curState.current)
-    const shouldClear =
-      curState.currentFromWake ||
-      curState.currentBoundByWake ||
-      curInfo?.kind === 'typed_prompt'
-    if (shouldClear) {
-      appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
-    }
+  const initialCurrent = reqState.current
+  const initialStamp = active.stamp
+  const clearEndedForeground = async () => {
+    if (!initialCurrent) return
+    await withTypedSyncLock(connectionId, dir, async () => {
+      const curState = readRequestState(connectionId, { dir })
+      if (!curState.current || curState.current !== initialCurrent) return
+      // Re-verify the transcript is still idle on the same ended turn so a new live
+      // typed turn opened while awaiting report_complete/closeRequest is NEVER cleared (ce71a72b).
+      const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
+      if (!latestActive || !latestActive.ended || latestActive.stamp !== initialStamp) return
+      const curInfo = curState.open.get(curState.current)
+      const shouldClear =
+        curState.currentFromWake ||
+        curState.currentBoundByWake ||
+        curInfo?.kind === 'typed_prompt'
+      if (shouldClear) {
+        appendRequestEvent(connectionId, { op: 'current', ref: null }, { dir })
+      }
+    })
   }
 
   if (!candidateId && !pendingFallback && !localAttemptId) {
-    clearEndedForeground()
+    await clearEndedForeground()
     return { closed: [], localCompleted: false }
   }
 
@@ -1699,9 +1716,28 @@ export async function finishIdleRequests({
             response: res ?? null,
           }
           log(`typed-turn-sync: idle report_complete returned unrecognized response for ${connectionId}: ${JSON.stringify(localCompleteRefusal)}\n`)
+        } else if (typeof patchState === 'function') {
+          let saved = false
+          try {
+            saved = patchState({ local_turn: null }) === true
+          } catch (error) {
+            log(
+              `typed-turn-sync: failed to persist cleared local_turn for ${connectionId}: ${error instanceof Error ? error.message : String(error)}\n`,
+            )
+            saved = false
+          }
+          if (!saved) {
+            localCompleteRefusal = {
+              code: 'state_write_failed',
+              retryable: true,
+              error: 'Failed to persist cleared local_turn after idle report_complete.',
+            }
+            log(`typed-turn-sync: failed to persist cleared local_turn for ${connectionId}\n`)
+          } else {
+            localCompleted = true
+          }
         } else {
           localCompleted = true
-          if (typeof patchState === 'function') patchState({ local_turn: null })
         }
       } catch (error) {
         localCompleteRefusal = structuredRefusalFromError(error)
@@ -1786,7 +1822,7 @@ export async function finishIdleRequests({
     }
   }
 
-  if (!closeRefusal) clearEndedForeground()
+  if (!closeRefusal) await clearEndedForeground()
 
   return {
     closed,

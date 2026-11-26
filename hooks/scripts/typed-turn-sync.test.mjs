@@ -2995,4 +2995,101 @@ describe('typed-turn-sync (item da03801e)', () => {
     const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
     assert.ok(stamped.deny, 'writes must ask which person they serve instead of stamping Alice alone')
   })
+
+  it('finishIdleRequests does not report localCompleted when patchState fails, and a stale local_turn never suppresses admission for the next typed turn (3ea2b201)', async () => {
+    const { dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const ATTEMPT_1 = '99999999-9999-4999-8999-9999999999f8'
+    const ATTEMPT_2 = '88888888-8888-4888-8888-8888888888f8'
+    const SESSION = '77777777-7777-4777-8777-7777777777f8'
+    const state = {
+      connection_id: CONN,
+      session_id: SESSION,
+      speech_attachment_id: '55555555-5555-4555-8555-5555555555f8',
+      attached_at: '2026-11-26T00:00:00.000Z',
+      local_turn: null,
+    }
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn 1')}\n`)
+    const sync1 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async (args) => ({ status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: SESSION }),
+      patchState: (patch) => { Object.assign(state, patch); return true },
+      dir,
+    })
+    assert.equal(sync1.action, 'opened')
+    const firstAttemptId = state.local_turn?.attempt_id
+    assert.ok(firstAttemptId)
+
+    fs.appendFileSync(transcriptPath, `${turnEndedRow()}\n`)
+    let closeCalls = 0
+    const idleRes = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callComplete: async () => ({ phase: 'done', closed_as: 'completed' }),
+      callRequest: async () => { closeCalls += 1; return { status: 'closed' } },
+      patchState: () => false,
+      dir,
+      log: () => {},
+    })
+    assert.equal(idleRes.localCompleted, false, 'must NOT report localCompleted when saving cleared local_turn fails')
+    assert.equal(idleRes.localCompleteRefusal?.code, 'state_write_failed')
+    assert.equal(closeCalls, 0, 'must NOT close request when clearing local_turn failed to persist')
+
+    // Even with stale state.local_turn still present, Turn 2 MUST still send report_pickup!
+    fs.appendFileSync(transcriptPath, `${typedRow('Turn 2 after failed state write')}\n`)
+    const pickupCalls = []
+    const sync2 = await syncTypedTurnFromTranscript({
+      connectionId: CONN,
+      transcriptPath,
+      state,
+      connectionCapability: 'cap-secret',
+      callRequest: async (args) => ({ request_id: args.request_id, status: 'open', requested_by_user_id: ALI }),
+      callPickup: async (args) => {
+        pickupCalls.push(args)
+        return { status: 'working', connection_id: CONN, attempt_id: args.attempt_id, expected_session_id: SESSION }
+      },
+      patchState: (patch) => { Object.assign(state, patch); return true },
+      dir,
+    })
+    assert.equal(sync2.action, 'opened')
+    assert.equal(pickupCalls.length, 1, 'stale local_turn from previous turn must NOT suppress admission for Turn 2')
+    assert.ok(state.local_turn?.attempt_id && state.local_turn.attempt_id !== firstAttemptId)
+  })
+
+  it('finishIdleRequests never clears a new live typed request opened while awaiting the previous request’s close receipt (ce71a72b)', async () => {
+    const { home, dir, transcriptPath } = makeEnv()
+    const { finishIdleRequests } = await import('./typed-turn-sync.mjs')
+    const TYPED_1 = '11111111-1111-4111-8111-1111111111f9'
+    const TYPED_2 = '22222222-2222-4222-8222-2222222222f9'
+    appendRequestEvent(CONN, { op: 'open', id: TYPED_1, kind: 'typed_prompt', requested_by: ALI }, { dir })
+    appendRequestEvent(CONN, { op: 'current', ref: TYPED_1 }, { dir })
+    fs.writeFileSync(transcriptPath, `${typedRow('Turn 1 finished')}\n${turnEndedRow()}\n`)
+
+    const res = await finishIdleRequests({
+      connectionId: CONN,
+      transcriptPath,
+      state: { session_id: ROOM, local_turn: null },
+      connectionCapability: 'cap-secret',
+      callRequest: async () => {
+        // While awaiting closeRequest for Turn 1, Turn 2 arrives and opens TYPED_2!
+        fs.appendFileSync(transcriptPath, `${typedRow('Turn 2 opened mid-cleanup')}\n`)
+        appendRequestEvent(CONN, { op: 'open', id: TYPED_2, kind: 'typed_prompt', requested_by: ALI }, { dir })
+        appendRequestEvent(CONN, { op: 'current', ref: TYPED_2 }, { dir })
+        return { status: 'closed' }
+      },
+      dir,
+      log: () => {},
+    })
+    assert.deepEqual(res.closed, [TYPED_1])
+    const after = readRequestState(CONN, { dir })
+    assert.equal(after.current, TYPED_2, 'cleanup must NOT clear newly opened live typed request TYPED_2')
+    const stamped = stampRequest('record_implementation', { task_id: 'x' }, CONN, null, { home })
+    assert.equal(stamped.args?.request_ref, TYPED_2, 'writes during Turn 2 must keep TYPED_2 attribution')
+  })
 })
