@@ -28,6 +28,7 @@ import {
   PUSH_HEALTHY_MS,
   PUSH_SAFETY_MS,
   createPushGate,
+  pollCheckedNothing,
   nextPushReconnectDelayMs,
   openPushChannel,
   parseSseFrame,
@@ -770,6 +771,17 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     idle.acknowledge(idle.beginPoll(25_000).ticket)
     assert.equal(idle.hasWakePending(), false)
     assert.equal(await sleepsUntilSafety(idle), true)
+  })
+
+  it('reads a no-change answer as unchecked only when DevSpec says its room read failed (2540fd35, 9aba1f97)', () => {
+    assert.equal(pollCheckedNothing({ changed: false, marker_read: 'unavailable' }), true)
+    assert.equal(pollCheckedNothing({ changed: false, marker_read: 'ok' }), false)
+    // A server from before the field (production until DevSpecV2 #1681 releases):
+    // read as checked, or every no-change answer would re-poll at once.
+    assert.equal(pollCheckedNothing({ changed: false }), false)
+    // A delivered change is judged by whether it was applied, never by this field.
+    assert.equal(pollCheckedNothing({ changed: true, marker_read: 'unavailable' }), false)
+    assert.equal(pollCheckedNothing(null), false)
   })
 })
 

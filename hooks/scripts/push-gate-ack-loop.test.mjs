@@ -9,11 +9,14 @@
  *   looks at the live end straight away instead of sleeping until its 45 s safety tick;
  * - an answer on the interaction-event lane alone carries no room ingress, so it does
  *   not handle a room nudge either;
- * - a poll that fails is retried after the error back-off, not slept on.
+ * - a poll that fails is retried after the error back-off, not slept on;
+ * - a "no change" DevSpec could not check (marker_read: 'unavailable') is a failed
+ *   poll, while one without the field (an older server) is a checked one;
+ * - a room page whose dispatch batch is rejected handles nothing.
  *
- * Both used to wait for the safety tick: every poll cleared the nudge as it started,
- * including history pages and polls that then failed. The windows asserted below are a
- * few seconds, far inside the 45 s tick, so the old behaviour fails them.
+ * The first three used to wait for the safety tick: every poll cleared the nudge as it
+ * started, including history pages and polls that then failed. The windows asserted
+ * below are a few seconds, far inside the 45 s tick, so that behaviour fails them.
  * Run: node --test hooks/scripts/push-gate-ack-loop.test.mjs
  */
 import assert from 'node:assert/strict'
@@ -215,6 +218,100 @@ describe('a nudge is handled only by a poll that looked at the live end (item 25
       const settled = stub.polls.length
       await sleep(1_500)
       assert.equal(stub.polls.length, settled, 'the room read that followed handled it; the poller sleeps again')
+    } finally {
+      poller.stop()
+      await stub.close()
+    }
+  })
+
+  it('a "no change" DevSpec could not check is a failed poll; one without the field is a checked one', async () => {
+    // Server answers queued per pushed nudge; everything else is a plain quiet answer.
+    const queued = []
+    const answeredAt = []
+    const stub = await stubServer(async () => {
+      const next = queued.shift()
+      if (next) {
+        answeredAt.push(Date.now())
+        return next
+      }
+      return { connection_id: CONNECTION, session_id: null, changed: false, marker_read: 'ok' }
+    })
+    const poller = startPoller(stub)
+    try {
+      assert.ok(await until(() => stub.world.stream && stub.polls.length > 0), `the poller opened the stream and polled\n${poller.stderr()}`)
+      await sleep(500)
+
+      // 1. marker_read 'unavailable': nothing was checked, so the nudge is still owed and
+      //    the poll is retried after the error back-off (2 s), then the poller sleeps.
+      queued.push({ connection_id: CONNECTION, session_id: null, changed: false, marker_read: 'unavailable' })
+      stub.world.stream.send('wake', {})
+      assert.ok(await until(() => answeredAt.length === 1, 3_000), `the pushed wake sent a poll\n${poller.stderr()}`)
+      const afterUnchecked = stub.polls.length
+      assert.ok(
+        await until(() => stub.polls.length > afterUnchecked, 4_500),
+        `an unchecked "no change" is retried after the back-off\n${poller.stderr()}`,
+      )
+      const retry = stub.polls[afterUnchecked]
+      assert.ok(retry.at - answeredAt[0] >= 1_500, `the retry waited for the error back-off (${retry.at - answeredAt[0]}ms)`)
+      assert.match(poller.stderr(), /without being able to check the room — retrying in 2000ms/)
+      let settled = stub.polls.length
+      await sleep(1_500)
+      assert.equal(stub.polls.length, settled, 'the checked retry handled it; asleep again')
+
+      // 2. No marker_read at all (a server from before the field): read as checked, so
+      //    the nudge is handled and nothing more is polled. Absence must never re-poll.
+      queued.push({ connection_id: CONNECTION, session_id: null, changed: false })
+      stub.world.stream.send('wake', {})
+      assert.ok(await until(() => answeredAt.length === 2, 3_000), `the second pushed wake sent a poll\n${poller.stderr()}`)
+      settled = stub.polls.length
+      await sleep(2_500)
+      assert.equal(stub.polls.length, settled, `an answer without marker_read is a checked one: no further poll; saw ${stub.polls.length - settled}`)
+    } finally {
+      poller.stop()
+      await stub.close()
+    }
+  })
+
+  it('a room page whose dispatch batch is rejected does not handle the nudge', async () => {
+    // The canonical room page is valid, but the automation-run batch beside it is not
+    // (it names another connection), so the whole response is refused. Nothing was
+    // applied, so the nudge stays owed and the next lap polls after the short
+    // empty-turn back-off instead of sleeping until the safety tick.
+    let rejectNext = false
+    let rejectedAt = null
+    const stub = await stubServer(async () => {
+      if (rejectNext) {
+        rejectNext = false
+        rejectedAt = Date.now()
+        return {
+          status: 'live', session_id: SESSION, changed: true, cursor: null,
+          cursor_v2: 'after:live-2', dispatch_cursor: 'dispatch-2',
+          ingress: historyPage(40, null),
+          dispatches: [{ kind: 'automation_run', id: 'not-a-valid-dispatch', target_connection_id: FIXTURE_ID.siblingConnection }],
+        }
+      }
+      return quietLive()
+    })
+    const poller = startPoller(stub, { sessionId: SESSION })
+    try {
+      assert.ok(await until(() => stub.world.stream && stub.polls.length > 0), `the poller opened the stream and polled\n${poller.stderr()}`)
+      await sleep(800)
+      const idleBefore = stub.polls.length
+      await sleep(1_000)
+      assert.equal(stub.polls.length, idleBefore, 'idle on the open stream: no polls')
+
+      rejectNext = true
+      stub.world.stream.send('wake', {})
+      assert.ok(await until(() => rejectedAt !== null, 3_000), `the pushed wake sent a poll\n${poller.stderr()}`)
+      const afterRejected = stub.polls.length
+      assert.ok(
+        await until(() => stub.polls.length > afterRejected, 3_500),
+        `the nudge is still owed after a refused response\n${poller.stderr()}`,
+      )
+      assert.match(poller.stderr(), /poll acceptance rejected/)
+      const settled = stub.polls.length
+      await sleep(1_500)
+      assert.equal(stub.polls.length, settled, 'the accepted poll that followed handled it; asleep again')
     } finally {
       poller.stop()
       await stub.close()

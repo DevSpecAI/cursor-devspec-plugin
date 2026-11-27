@@ -1063,6 +1063,23 @@ export function createPushGate({
   }
 }
 
+/**
+ * Did DevSpec answer "nothing new" without having been able to look (item 9aba1f97)?
+ *
+ * A server whose marker reads fail keeps the hold going rather than ending the
+ * connection, so it can still answer changed:false; since DevSpecV2 #1681 it says so
+ * with `marker_read: 'unavailable'`. That answer covers nothing: a nudge it was
+ * answering is still owed, and the loop treats it as a failed poll.
+ *
+ * An ABSENT field (a server from before #1681, such as production until that
+ * release) is read as checked, exactly as before. Reading absence as a failure would
+ * make every no-change answer from an older server re-poll straight away with the
+ * stream open: a hot loop.
+ */
+export function pollCheckedNothing(res) {
+  return Boolean(res) && res.changed !== true && res.marker_read === 'unavailable'
+}
+
 export function nextPushReconnectDelayMs({ attempt, openedAtMs, nowMs = Date.now() }) {
   const effectiveAttempt =
     openedAtMs !== null && openedAtMs !== undefined && nowMs - openedAtMs >= PUSH_HEALTHY_MS
@@ -2914,6 +2931,33 @@ async function main() {
   }
 
   const pushGate = createPushGate()
+
+  /**
+   * A poll that looked at nothing: count it toward the error back-off and owe the
+   * retry, so the next lap polls after the back-off instead of sleeping until the next
+   * nudge or the 45 s safety tick (item 2540fd35). errorBackoffMs grows and caps at
+   * 30 s, so an outage still costs at most one poll per 30 s per agent.
+   */
+  async function retryAfterFailedPoll({ reason, message, rateLimited = false }) {
+    consecutiveErrors++
+    const backoff = errorBackoffMs(consecutiveErrors, { rateLimited })
+    process.stderr.write(
+      `devspec-remote-poll: poll failed (${consecutiveErrors}): ${message} — retrying in ${backoff}ms\n`,
+    )
+    logRemoteControlStory({
+      phase: 'poll_error',
+      outcome: 'error',
+      connectionId,
+      sessionId,
+      agent: AGENT_NAME,
+      tool: 'poll_connection',
+      reason,
+      data: { consecutiveErrors, backoff_ms: backoff },
+    })
+    pushGate.requestPoll()
+    await sleep(backoff)
+  }
+
   if (process.env.DEVSPEC_DISABLE_SSE !== '1') {
     openPushChannel({
       mcpUrl,
@@ -3234,7 +3278,9 @@ async function main() {
         checkTier: tier.checkTier,
         catchUp: needsSeed || drainingCatchUp,
       })
-      consecutiveErrors = 0
+      // A "nothing new" DevSpec could not actually check is a failed poll: it keeps
+      // the error streak growing (handled after the attachment check below).
+      if (!pollCheckedNothing(res)) consecutiveErrors = 0
       credentialRefusals = 0
       if (sentControlAck && pendingControlAck === sentControlAck) {
         pendingControlAck = null
@@ -3277,28 +3323,13 @@ async function main() {
         patchState({ ingress_catch_up_cursor: null })
         continue
       }
-      consecutiveErrors++
+      // The failed poll looked at nothing, so whatever sent it is still unhandled.
       const rateLimited = /rate limit/i.test(e?.message || '')
-      const backoff = errorBackoffMs(consecutiveErrors, { rateLimited })
-      process.stderr.write(
-        `devspec-remote-poll: poll failed (${consecutiveErrors}): ${e.message} — retrying in ${backoff}ms\n`,
-      )
-      logRemoteControlStory({
-        phase: 'poll_error',
-        outcome: 'error',
-        connectionId,
-        sessionId,
-        agent: AGENT_NAME,
-        tool: 'poll_connection',
+      await retryAfterFailedPoll({
         reason: rateLimited ? 'rate_limited' : 'poll_failed',
-        data: { consecutiveErrors, backoff_ms: backoff },
+        message: e.message,
+        rateLimited,
       })
-      // The failed poll looked at nothing, so whatever sent it is still unhandled: retry
-      // after the back-off instead of sleeping until the next nudge or the 45 s safety
-      // tick (item 2540fd35). errorBackoffMs grows and caps at 30 s, so an outage still
-      // costs at most one poll per 30 s per agent.
-      pushGate.requestPoll()
-      await sleep(backoff)
       continue
     }
 
@@ -3425,6 +3456,16 @@ async function main() {
       patchState(attachmentRecord)
     }
 
+    // "Nothing new", but DevSpec could not read the room to say so (pollCheckedNothing):
+    // the nudge this poll was answering is still owed, so it is a failed poll.
+    if (pollCheckedNothing(res)) {
+      await retryAfterFailedPoll({
+        reason: 'marker_read_unavailable',
+        message: 'DevSpec answered no change without being able to check the room',
+      })
+      continue
+    }
+
     // Directed-question answers first: an event-only response deliberately carries no
     // canonical ingress, so reading it as a room page would reject a valid delivery.
     const interaction = await consumeInteractionEvents(res)
@@ -3442,15 +3483,21 @@ async function main() {
 
     const delivered = await consumePollResult(res, { drainingCatchUp })
     // The nudges this poll started with are handled only once it has actually read the
-    // live end of the room: its canonical room ingress (or a clean changed:false live
-    // answer) was accepted and applied. Nothing else counts (item 2540fd35):
+    // live end of the room. lastIngressAccepted is set only at the two ends of
+    // consumePollResult that commit the WHOLE response: a clean changed:false live
+    // answer, or a changed:true answer whose canonical room page was applied AND whose
+    // automation-run and check-job batches were all accepted and saved. A batch that
+    // fails validation rejects the response, and one that cannot be saved returns
+    // before that point. Nothing else counts (item 2540fd35):
     // - a backward history page (catch_up_cursor) read only older messages and never
     //   moves the live cursor, so a nudge that landed during the drain stays pending and
     //   the lap after the drain looks at once;
     // - an interaction-event-only answer (the lane above `continue`s before here) carries
     //   no room ingress at all, delivered or not;
-    // - a rejected ingress read nothing, and is retried after its empty-turn back-off;
-    // - a failed poll, a server-side end and an attachment change never reach here.
+    // - a rejected or unsaved response read nothing, and is retried after its
+    //   empty-turn back-off;
+    // - a failed poll, a "no change" DevSpec could not check (marker_read:
+    //   'unavailable'), a server-side end and an attachment change never reach here.
     if (lastIngressAccepted && !drainingCatchUp) pushGate.acknowledge(pollTicket)
     if (lastIngressAccepted) needsSeed = false
     if (delivered || (lastIngressAccepted && res.changed !== true)) {
