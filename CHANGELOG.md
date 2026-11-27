@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.34.4
+
+- **A check-in that DevSpec could not actually complete is retried, not trusted.** When DevSpec answers "nothing new" but could not read the room to be sure (it now says so), the agent treats that like a failed check-in and tries again after its short back-off, so a message waiting for it is not left until the next routine check 45 seconds later. Older DevSpec servers that do not report this are treated exactly as before.
+- **A message is only counted as seen once everything that came with it was saved.** If a reply from DevSpec carries a room message together with an automation run or a check that the agent could not accept or save, the agent checks again shortly instead of treating the room as read.
+- Start a new `cursor-agent` session to pick this up.
+
+## 0.34.3
+
+- **A message sent while your Cursor agent is catching up on a busy room is picked up straight away.** When the agent joins or resumes a room with plenty of earlier conversation, it reads that history in several steps. A message sent during those steps used to be noticed and then forgotten by the next step, so the agent sat on "Waiting" for up to 45 seconds after it finished catching up. It now keeps the message in mind until it has actually looked for new messages, and looks the moment it has caught up.
+- **A check-in that fails is retried after a short pause.** If one of the agent's quick check-ins with DevSpec failed or timed out, it went back to sleep until its next routine check, up to 45 seconds later. It now retries after its usual short back-off (2 seconds at first, growing to at most 30 seconds while DevSpec stays unreachable). An agent with nothing to do checks in exactly as often as before, so this costs no extra model requests.
+- Start a new `cursor-agent` session to pick this up.
+
 ## 0.34.2
 
 - **Inventory Map connections are now recorded directly as live editable links.** Updated Cursor's DevSpec rule to use `devspec__manage_inventory_connections` with `action: "record"` (with codebase/config evidence) so verified connections appear directly on the Inventory Map without a confirmation step.

@@ -13,7 +13,7 @@
       "displayName": "DevSpec for Cursor CLI",
       "source": "./",
       "description": "DevSpec for Cursor CLI (cursor-agent). Built for developers who already have a Cursor subscription and want to connect it to DevSpec for shared team memory, structured tasks, automatic commit tracking, and live remote control. The Cursor editor is not supported.",
-      "version": "0.34.2",
+      "version": "0.34.4",
       "keywords": [
         "devspec",
         "cursor-cli",

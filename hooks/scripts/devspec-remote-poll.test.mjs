@@ -28,6 +28,7 @@ import {
   PUSH_HEALTHY_MS,
   PUSH_SAFETY_MS,
   createPushGate,
+  pollCheckedNothing,
   nextPushReconnectDelayMs,
   openPushChannel,
   parseSseFrame,
@@ -657,16 +658,16 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     const gate = createPushGate({ safetyMs: 80, localCheckMs: 10 })
 
     assert.equal(gate.isConnected(), false)
-    assert.equal(gate.consumePollWaitMs(25_000), 25_000)
+    assert.equal(gate.beginPoll(25_000).waitMs, 25_000)
 
     gate.onEvent({ kind: 'hello' })
     assert.equal(gate.isConnected(), true)
-    assert.equal(gate.consumePollWaitMs(25_000), 0)
+    assert.equal(gate.beginPoll(25_000).waitMs, 0)
 
     const startSafety = Date.now()
     await gate.waitIfIdle()
     assert.ok(Date.now() - startSafety >= 55, 'waitIfIdle sleeps until safetyMs when quiet')
-    assert.equal(gate.consumePollWaitMs(25_000), 0)
+    assert.equal(gate.beginPoll(25_000).waitMs, 0)
 
     for (const kind of ['wake', 'system_notice', 'interaction_event', 'question_dismissal_event']) {
       const gateFrame = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
@@ -675,7 +676,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
       const t0 = Date.now()
       await gateFrame.waitIfIdle()
       assert.ok(Date.now() - t0 < 500, `SSE ${kind} frame wakes waitIfIdle immediately`)
-      assert.equal(gateFrame.consumePollWaitMs(25_000), 0)
+      assert.equal(gateFrame.beginPoll(25_000).waitMs, 0)
     }
 
     let localTurnChanged = false
@@ -687,7 +688,7 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     const tLocal = Date.now()
     await gateLocal.waitIfIdle({ shouldWakeImmediately: () => localTurnChanged })
     assert.ok(Date.now() - tLocal < 500, 'local state change wakes waitIfIdle immediately')
-    assert.equal(gateLocal.consumePollWaitMs(25_000), 0)
+    assert.equal(gateLocal.beginPoll(25_000).waitMs, 0)
 
     const gateDrop = createPushGate({ safetyMs: 5_000, localCheckMs: 500 })
     gateDrop.onEvent({ kind: 'hello' })
@@ -696,7 +697,91 @@ describe('SSE push channel (parseSseFrame, pushChannelUrl, nextPushReconnectDela
     await gateDrop.waitIfIdle()
     assert.ok(Date.now() - tDrop < 500, 'disconnect wakes waitIfIdle immediately')
     assert.equal(gateDrop.isConnected(), false)
-    assert.equal(gateDrop.consumePollWaitMs(25_000), 25_000)
+    assert.equal(gateDrop.beginPoll(25_000).waitMs, 25_000)
+  })
+
+  it('keeps a nudge pending until a poll that started after it has looked at the live end (2540fd35)', async () => {
+    const sleepsUntilSafety = async (gate) => {
+      const t0 = Date.now()
+      await gate.waitIfIdle()
+      return Date.now() - t0 >= 55
+    }
+
+    // A nudge during a backward history drain survives the drain. The loop never
+    // acknowledges a history page, so after the last page it looks at once.
+    const drain = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    drain.onEvent({ kind: 'hello' })
+    const seed = drain.beginPoll(25_000)
+    drain.acknowledge(seed.ticket)
+    drain.beginPoll(25_000) // history page 1
+    drain.onEvent({ kind: 'wake' }) // a message lands mid-drain
+    drain.beginPoll(25_000) // history page 2: not acknowledged
+    drain.beginPoll(25_000) // last history page: not acknowledged
+    assert.equal(drain.hasWakePending(), true, 'the mid-drain nudge is still pending after the drain')
+    assert.equal(await sleepsUntilSafety(drain), false, 'the lap after the drain does not sleep')
+    const live = drain.beginPoll(25_000)
+    assert.equal(live.waitMs, 0)
+    drain.acknowledge(live.ticket)
+    assert.equal(drain.hasWakePending(), false, 'the live poll handled it')
+    assert.equal(await sleepsUntilSafety(drain), true, 'and then it sleeps again')
+
+    // A failed poll acknowledges nothing; the loop owes itself a retry.
+    const failed = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    failed.onEvent({ kind: 'hello' })
+    failed.onEvent({ kind: 'wake' })
+    failed.beginPoll(25_000) // this poll throws: no acknowledge
+    assert.equal(failed.hasWakePending(), true, 'the nudge behind a failed poll is not lost')
+    // Even a poll the safety tick started (no nudge at all) is retried after a failure.
+    const quiet = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    quiet.onEvent({ kind: 'hello' })
+    quiet.beginPoll(25_000) // fails
+    quiet.requestPoll()
+    assert.equal(await sleepsUntilSafety(quiet), false, 'a failed poll is retried, not slept on')
+    const retry = quiet.beginPoll(25_000)
+    quiet.acknowledge(retry.ticket)
+    assert.equal(quiet.hasWakePending(), false, 'one successful retry settles what was owed')
+
+    // A nudge that lands while a live poll is in flight costs exactly one more poll.
+    const inflight = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    inflight.onEvent({ kind: 'hello' })
+    const first = inflight.beginPoll(25_000)
+    inflight.onEvent({ kind: 'wake' })
+    inflight.acknowledge(first.ticket)
+    assert.equal(inflight.hasWakePending(), true, 'the nudge after the poll started is still owed')
+    const second = inflight.beginPoll(25_000)
+    inflight.acknowledge(second.ticket)
+    assert.equal(inflight.hasWakePending(), false, 'one more poll settles it')
+    assert.equal(await sleepsUntilSafety(inflight), true)
+
+    // An acknowledgement can never run ahead of what arrived or go backwards.
+    const stale = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    stale.onEvent({ kind: 'hello' })
+    stale.onEvent({ kind: 'wake' })
+    const t = stale.beginPoll(25_000).ticket
+    stale.acknowledge(t)
+    stale.acknowledge(t - 1)
+    stale.acknowledge(null)
+    assert.equal(stale.hasWakePending(), false)
+    stale.onEvent({ kind: 'wake' })
+    assert.equal(stale.hasWakePending(), true, 'a later nudge is pending again')
+
+    // Idle: with nothing pending, nothing is owed and the gate sleeps to its safety tick.
+    const idle = createPushGate({ safetyMs: 80, localCheckMs: 10 })
+    idle.onEvent({ kind: 'hello' })
+    idle.acknowledge(idle.beginPoll(25_000).ticket)
+    assert.equal(idle.hasWakePending(), false)
+    assert.equal(await sleepsUntilSafety(idle), true)
+  })
+
+  it('reads a no-change answer as unchecked only when DevSpec says its room read failed (2540fd35, 9aba1f97)', () => {
+    assert.equal(pollCheckedNothing({ changed: false, marker_read: 'unavailable' }), true)
+    assert.equal(pollCheckedNothing({ changed: false, marker_read: 'ok' }), false)
+    // A server from before the field (production until DevSpecV2 #1681 releases):
+    // read as checked, or every no-change answer would re-poll at once.
+    assert.equal(pollCheckedNothing({ changed: false }), false)
+    // A delivered change is judged by whether it was applied, never by this field.
+    assert.equal(pollCheckedNothing({ changed: true, marker_read: 'unavailable' }), false)
+    assert.equal(pollCheckedNothing(null), false)
   })
 })
 
