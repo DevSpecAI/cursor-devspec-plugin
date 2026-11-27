@@ -2451,7 +2451,7 @@ export async function finishIdleRequests({
       // Re-verify the transcript FIRST, then `.requests.jsonl` immediately after, so a
       // new live typed turn OR prompt hook arriving while reading the transcript is
       // NEVER cleared — even if the new scheduled wake carries the same request ID
-      // (compare-and-swap via `expected_current_seq`, decision ce71a72b).
+      // (a compare-and-swap on the `expected_current_seq` field, decision ce71a72b).
       const latestActive = activeTranscriptTurn(transcriptPath, { attempts })
       if (!latestActive || !latestActive.ended || latestActive.stamp !== initialStamp) return
       const curState = readRequestState(connectionId, { dir })
